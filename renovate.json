@@ -5,7 +5,8 @@
     "helpers:pinGitHubActionDigests"
   ],
   "ignorePaths": [
-    "vendor/**"
+    "vendor/**",
+    "bench/**"
   ],
   "packageRules": [
     {
