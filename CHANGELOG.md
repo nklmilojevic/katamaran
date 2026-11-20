@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.0 - 2026-11-20
+
+This release makes it easier to get Katamaran. It also fixes the `binfmt_misc` mask in `kat-init`.
+
+### New features
+
+- The site `katamaran.rs` now has a **Download for macOS** button on the landing page. The `/download/` page and the install page link directly to the latest `Katamaran.dmg`.
+
+### Fixes
+
+- `kat-init` now matches `EI_DATA` and `EI_VERSION` in the `binfmt_misc` mask. This makes the ELF binary check more exact.
+
+### Other changes
+
+- The documentation site now loads from the root of `katamaran.rs`.
+- The `toml` crate is now at version 1.2.1.
+
 ## v0.3.0 - 2026-11-20
 
 This release adds a guide for coding agents. An agent can now learn how to use katamaran with the `kat skill` command.
