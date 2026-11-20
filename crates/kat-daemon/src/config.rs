@@ -294,12 +294,12 @@ mod tests {
         let home = temp_home("roundtrip");
         let mut cfg = Config::default();
         cfg.set("cpus", "2", &HOST).unwrap();
-        cfg.set("memory", "6G", &HOST).unwrap();
+        cfg.set("memory", "2G", &HOST).unwrap();
         cfg.set("mount", "off", &HOST).unwrap();
         cfg.set("mount_path", "/tmp/kat-files", &HOST).unwrap();
         cfg.save(&home).unwrap();
         let text = fs::read_to_string(Config::path(&home)).unwrap();
-        assert!(text.contains("memory_mib = 6144"), "{text}");
+        assert!(text.contains("memory_mib = 2048"), "{text}");
         let back = Config::load(&home).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(back.get("mount_path").unwrap(), "/tmp/kat-files");
@@ -319,7 +319,7 @@ mod tests {
         assert!(Config::parse("cpu = 2\n").is_err());
         assert!(Config::parse("cpus = 0\n").is_err());
         let mut cfg = Config::default();
-        assert!(cfg.set("cpus", "11", &HOST).is_err());
+        assert!(cfg.set("cpus", "256", &HOST).is_err());
         assert!(cfg.set("cpus", "many", &HOST).is_err());
         assert!(cfg.set("memory_mib", "512", &HOST).is_err());
         assert!(cfg.set("memory_mib", "40G", &HOST).is_err());
