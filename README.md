@@ -4,6 +4,8 @@ katamaran runs Docker containers and Linux machines on Apple silicon Macs inside
 
 katamaran is free software licensed under the GNU Affero General Public License, version 3 or later (AGPL-3.0).
 
+![Katamaran macOS app showing Docker Compose stacks and live container logs](docs/src/assets/screenshots/containers.png)
+
 ## Why katamaran exists
 
 Most Docker runtimes on macOS pair QEMU or Apple Virtualization.framework with a general file-sharing server such as virtiofs, sshfs, or 9p. That architecture stalls on real development projects that store tens of thousands of small files on a bind mount, such as a PHP `vendor/` directory or a JavaScript `node_modules/` tree.
@@ -39,6 +41,14 @@ Waking a halted vCPU from WFI on Hypervisor.framework costs tens of microseconds
 katamaran runs full LXC Linux distributions (`ubuntu`, `debian`, `alpine`, `fedora`, `arch`, and others) inside the same VM with `kat shell` and an integrated SSH proxy (`ssh dev@katamaran`). An in-guest NFSv3 server (`kat-nfs`) mounts Docker volumes, running containers, and machine files at `~/Katamaran` in Finder.
 
 For `linux/amd64` images, katamaran shares Apple Rosetta for Linux read-only into the guest and toggles hardware total store ordering (`ACTLR_EL1.EnTSO`) per task on context switch so native arm64 code pays no TSO overhead. QEMU user-mode emulation is bundled as a fallback.
+
+## Screenshots
+
+| Container inspection | VM and container activity |
+|---|---|
+| ![Container details, ports, mounts, and environment](docs/src/assets/screenshots/containers-info.png) | ![Live VM CPU, memory, and per-container usage](docs/src/assets/screenshots/activity.png) |
+
+![Linux machines running Ubuntu and Alpine inside the VM](docs/src/assets/screenshots/machines.png)
 
 ## Benchmarks
 
@@ -125,10 +135,10 @@ Or install from the signed release disk image:
 2. Drag `Katamaran.app` into `/Applications`.
 3. Open **Katamaran**.
 
-On first launch, **Katamaran** runs `kat setup` automatically. Setup installs:
+On first launch, **Katamaran** runs `kat setup --default` automatically. Setup installs:
 
 - A LaunchAgent that starts the daemon and VM when you log in
-- A Docker context named `katamaran`
+- A Docker context named `katamaran` (set as the default Docker context whenever Katamaran launches)
 - A symlink at `~/.local/bin/kat` pointing to the `katamaran` binary
 
 Add `~/.local/bin` to your `PATH` to run `kat` from any terminal. To remove the LaunchAgent, Docker context, and symlink while keeping your data under `~/.katamaran`, run `kat uninstall`.
@@ -148,14 +158,13 @@ kat restart
 
 ### Run Docker containers
 
-Switch to the `katamaran` context and run a container:
+Launching **Katamaran** or running `kat start` sets `katamaran` as the default Docker context automatically:
 
 ```sh
-docker context use katamaran
 docker run --rm hello-world
 ```
 
-To make `katamaran` the default context during setup, run `kat setup --default`. For tools that read `DOCKER_HOST` instead of Docker contexts, export the socket path:
+If you switched to another Docker context, switch back with `docker context use katamaran`. For tools that read `DOCKER_HOST` instead of Docker contexts, export the socket path:
 
 ```sh
 export DOCKER_HOST="unix://$HOME/.katamaran/run/docker.sock"

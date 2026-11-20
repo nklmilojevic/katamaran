@@ -7,7 +7,7 @@ In this tutorial, you start the katamaran VM, serve a file from your Mac inside 
 
 Make sure you have completed [Install katamaran](/katamaran/install/) before starting.
 
-## 1. Start the VM and select the Docker context
+## 1. Start the VM
 
 Start the VM and wait until Docker reports ready:
 
@@ -15,13 +15,7 @@ Start the VM and wait until Docker reports ready:
 kat start
 ```
 
-You should see confirmation that the daemon and Docker are ready. Switch your Docker CLI to the `katamaran` context:
-
-```sh
-docker context use katamaran
-```
-
-Check the VM state:
+You should see confirmation that the daemon and Docker are ready. Both `kat start` and launching **Katamaran** set the active Docker context to `katamaran` automatically. Check the VM state:
 
 ```sh
 kat status

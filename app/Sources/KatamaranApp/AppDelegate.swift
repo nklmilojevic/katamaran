@@ -63,15 +63,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let setupKey = "firstRunSetupDone"
 
-    /// The first launch of an installed app runs `katamaran setup` once: the
-    /// LaunchAgent that keeps the daemon running, the `katamaran` Docker context
-    /// and the `kat` link. Development builds under target/ are left alone.
+    /// The first launch of an installed app runs `katamaran setup --default` once:
+    /// the LaunchAgent that keeps the daemon running, the `katamaran` Docker context
+    /// (set as the default) and the `kat` link. Subsequent launches make sure the
+    /// `katamaran` context is active. Development builds under target/ are left alone.
     private func runFirstSetupIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: Self.setupKey),
-              FirstRun.shouldRun(bundlePath: Bundle.main.bundlePath,
+        guard FirstRun.shouldRun(bundlePath: Bundle.main.bundlePath,
                                  env: ProcessInfo.processInfo.environment) else { return }
+        if UserDefaults.standard.bool(forKey: Self.setupKey) {
+            DispatchQueue.global().async {
+                _ = try? AppModel.runCLI(["use-context"])
+            }
+            return
+        }
         DispatchQueue.global().async { [weak self] in
-            let result = Result { try AppModel.runCLI(["setup"]) }
+            let result = Result { try AppModel.runCLI(["setup", "--default"]) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {

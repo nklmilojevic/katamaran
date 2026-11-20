@@ -53,6 +53,9 @@ enum Command {
     Config(cli::ConfigCmd),
     /// Install the LaunchAgent, the Docker context and the `kat` link.
     Setup(setup::SetupArgs),
+    /// Ensure the `katamaran` Docker context exists and is the default.
+    #[command(hide = true)]
+    UseContext,
     /// Remove what `setup` installed (your data stays).
     Uninstall(setup::UninstallArgs),
     /// Create, list, start, stop and delete Linux machines.
@@ -87,6 +90,7 @@ fn main() -> anyhow::Result<()> {
         Command::Logs(args) => cli::logs(args),
         Command::Config(cmd) => cli::config(cmd),
         Command::Setup(args) => setup::setup(args),
+        Command::UseContext => setup::ensure_default_docker_context(),
         Command::Uninstall(args) => setup::uninstall(args),
         Command::Machine(cmd) => machine_cli::machine(cmd),
         Command::Shell(args) => machine_cli::shell(args),

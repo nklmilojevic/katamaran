@@ -17,6 +17,8 @@ import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 katamaran pairs a custom Hypervisor.framework virtual machine monitor (based on libkrun) with a native Swift and AppKit macOS app and the `kat` command-line tool. Shared folders run through a macOS virtio-fs server with direct hypercalls and FSEvents cache invalidation. Networking runs in-process with gvproxy, and unused guest memory returns to macOS in 64 KiB blocks.
 
+![Katamaran macOS app showing Docker Compose stacks and live container logs](../../assets/screenshots/containers.png)
+
 <CardGrid>
   <LinkCard title="Install katamaran" href="/katamaran/install/" description="Check system requirements, install the macOS app, and run first-time setup." />
   <LinkCard title="Quickstart tutorial" href="/katamaran/quickstart/" description="Start the VM, run a container with a bind mount, and open a Linux machine shell." />

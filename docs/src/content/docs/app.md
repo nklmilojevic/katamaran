@@ -29,14 +29,22 @@ The main window sidebar groups management views into three sections.
 - **Builds**: Monitor active and recent Docker BuildKit builds with step progress.
 - **Networks**: Inspect Docker bridge networks and attached containers.
 
+![Containers list with live logs](../../assets/screenshots/containers.png)
+
+![Container inspection showing ports, mounts, and environment](../../assets/screenshots/containers-info.png)
+
 ### Linux
 
 - **Machines**: Create, start, stop, delete, and open interactive terminals into LXC Linux machines.
+
+![Linux machines view](../../assets/screenshots/machines.png)
 
 ### General
 
 - **Activity**: View live CPU and memory usage of the VM.
 - **Logs**: Stream live logs from the daemon, guest console, VM monitor, and gvproxy.
+
+![Activity view with live VM CPU, memory, and per-container usage](../../assets/screenshots/activity.png)
 
 ## Settings window
 
