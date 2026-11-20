@@ -1,0 +1,81 @@
+# Using katamaran
+
+`kat` and `katamaran` are the same binary. Katamaran runs Docker (`containerd` and `dockerd`) and LXC Linux machines inside one lightweight Linux VM on Apple silicon Macs. It does not include Kubernetes.
+
+## VM lifecycle
+
+```sh
+kat status                # VM state, CPU/memory, Docker socket, mount, ports
+kat status --json         # Machine-readable status
+kat start                 # Start daemon and VM, wait until Docker is ready
+kat stop                  # Stop VM (daemon stays running)
+kat restart               # Restart VM and apply pending config changes
+```
+
+`kat start` and launching `Katamaran.app` set the active Docker context to `katamaran` automatically (for the default `~/.katamaran` home).
+
+## Docker and networking
+
+- Default Docker context: `katamaran` (`unix://$HOME/.katamaran/run/docker.sock`).
+- Tools that ignore Docker contexts can set `DOCKER_HOST="unix://$HOME/.katamaran/run/docker.sock"`.
+- Both published (`-p`) and unpublished container ports forward to `127.0.0.1` on macOS when `auto_forward` is enabled (the default).
+- Containers reach services on macOS via `host.docker.internal`.
+- Host directories under `/Users` are bind-mounted at the same path inside containers with FSEvents-driven inotify and cache invalidation.
+- `linux/amd64` images run under Apple Rosetta with per-task hardware TSO by default (`amd64 = "auto"`).
+
+## Isolated throwaway VMs
+
+Set `KATAMARAN_HOME` to a temporary directory to boot a completely separate VM without touching `~/.katamaran`, the user's Docker context, or `~/Katamaran`:
+
+```sh
+KATAMARAN_HOME=/tmp/kat-test kat start
+DOCKER_HOST="unix:///tmp/kat-test/run/docker.sock" docker run --rm alpine true
+KATAMARAN_HOME=/tmp/kat-test kat stop
+```
+
+## Linux machines (LXC)
+
+Run full Linux distributions inside the same VM (`ubuntu`, `debian`, `alpine`, `fedora`, `arch`, or any image from `images.linuxcontainers.org`):
+
+```sh
+kat machine create dev                 # Ubuntu by default
+kat machine create box --distro alpine
+kat machine list
+kat shell dev                          # Interactive shell
+kat shell dev -- uname -a              # Run a single command
+kat ssh dev                            # Connect over SSH proxy
+kat machine stop dev
+kat machine delete dev
+```
+
+## Configuration
+
+Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`).
+
+```sh
+kat config get
+kat config set cpus=8 memory=12G pause_on_sleep=on
+kat restart
+```
+
+Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`.
+
+## Files in Finder
+
+When `mount` is enabled, `~/Katamaran` exposes Linux files over NFS:
+
+- `~/Katamaran/docker/volumes/<name>` — named Docker volumes
+- `~/Katamaran/docker/containers/<name>` — running container filesystems
+- `~/Katamaran/machines/<name>` — Linux machine filesystems
+
+## Logs and troubleshooting
+
+```sh
+kat logs                  # Daemon log
+kat logs -f               # Follow daemon log
+kat logs --console        # Linux guest console log
+kat logs --source vm      # VMM (katamaran-vm) log
+kat logs --source gvproxy # Networking log
+```
+
+If `docker` cannot reach katamaran, check `kat status`, `docker context ls`, and whether `DOCKER_HOST` is overriding the active context.
