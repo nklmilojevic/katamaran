@@ -22,7 +22,7 @@ const QEMU: &str = "/usr/bin/qemu-x86_64";
 /// DYN, `e_machine` 0x3e. The mask ignores the OS ABI and padding bytes.
 const MAGIC: &[u8] = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00";
 const MASK: &[u8] =
-    b"\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff";
+    b"\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff";
 
 /// P keeps argv[0] (both handle AT_FLAGS_PRESERVE_ARGV0), O and C give
 /// set-user-ID binaries their credentials, F opens the interpreter at
