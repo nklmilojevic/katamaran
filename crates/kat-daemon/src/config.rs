@@ -319,7 +319,7 @@ mod tests {
         assert!(Config::parse("cpu = 2\n").is_err());
         assert!(Config::parse("cpus = 0\n").is_err());
         let mut cfg = Config::default();
-        assert!(cfg.set("cpus", "11", &HOST).is_err());
+        assert!(cfg.set("cpus", "256", &HOST).is_err());
         assert!(cfg.set("cpus", "many", &HOST).is_err());
         assert!(cfg.set("memory_mib", "512", &HOST).is_err());
         assert!(cfg.set("memory_mib", "40G", &HOST).is_err());

@@ -403,31 +403,6 @@ pub fn smoke(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn info_plist_is_valid() {
-        let dir = std::env::temp_dir().join(format!("xtask-plist-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("Info.plist");
-        std::fs::write(&f, super::info_plist("1.2.3")).unwrap();
-        let out = std::process::Command::new("plutil")
-            .arg("-lint")
-            .arg(&f)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        let text = std::fs::read_to_string(&f).unwrap();
-        assert!(text.contains("<key>LSUIElement</key>\n\t<true/>"));
-        assert!(text.contains("<string>1.2.3</string>"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
-
 /// `cargo xtask dmg`: target/dist/Katamaran-<version>.dmg with the app and an
 /// Applications link, built from a fresh bundle in target/dist.
 pub fn dmg(root: &Path) -> anyhow::Result<PathBuf> {
@@ -462,4 +437,29 @@ pub fn dmg(root: &Path) -> anyhow::Result<PathBuf> {
     crate::run(Command::new("hdiutil").args(["verify"]).arg(&out))?;
     println!("built {} from {}", out.display(), bundle.display());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn info_plist_is_valid() {
+        let dir = std::env::temp_dir().join(format!("xtask-plist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Info.plist");
+        std::fs::write(&f, super::info_plist("1.2.3")).unwrap();
+        let out = std::process::Command::new("plutil")
+            .arg("-lint")
+            .arg(&f)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("<key>LSUIElement</key>\n\t<true/>"));
+        assert!(text.contains("<string>1.2.3</string>"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
