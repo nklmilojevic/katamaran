@@ -3,8 +3,7 @@ import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
 
 export default defineConfig({
-	site: 'https://nklmilojevic.github.io',
-	base: '/katamaran',
+	site: 'https://katamaran.rs',
 	trailingSlash: 'always',
 	integrations: [
 		starlight({

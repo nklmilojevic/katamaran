@@ -89,7 +89,7 @@ kat config set cpus 6
 kat config set cpus=6 memory=8G mount=off
 ```
 
-See [Configuration reference](/katamaran/configuration/) for every valid key and value format.
+See [Configuration reference](/configuration/) for every valid key and value format.
 
 ## Setup commands
 
