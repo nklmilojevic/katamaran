@@ -16,6 +16,7 @@ mod nfs;
 mod power;
 mod run;
 mod setup;
+mod skill;
 mod sparse;
 mod ssh;
 mod state;
@@ -53,6 +54,9 @@ enum Command {
     Config(cli::ConfigCmd),
     /// Install the LaunchAgent, the Docker context and the `kat` link.
     Setup(setup::SetupArgs),
+    /// Manage the coding-agent skill (`show`, `setup`, `status`, `remove`).
+    #[command(subcommand)]
+    Skill(skill::SkillCmd),
     /// Ensure the `katamaran` Docker context exists and is the default.
     #[command(hide = true)]
     UseContext,
@@ -90,6 +94,7 @@ fn main() -> anyhow::Result<()> {
         Command::Logs(args) => cli::logs(args),
         Command::Config(cmd) => cli::config(cmd),
         Command::Setup(args) => setup::setup(args),
+        Command::Skill(cmd) => skill::run(cmd),
         Command::UseContext => setup::ensure_default_docker_context(),
         Command::Uninstall(args) => setup::uninstall(args),
         Command::Machine(cmd) => machine_cli::machine(cmd),

@@ -114,6 +114,17 @@ Remove the LaunchAgent, Docker context, and `kat` symlink installed by `kat setu
 kat uninstall [--suffix <SUFFIX>]
 ```
 
+### `kat skill`
+
+Manage the coding-agent skill for Claude Code (`~/.claude/skills/katamaran`) and Codex, OpenCode, and Pi (`~/.agents/skills/katamaran`). Installed agents receive a small stub that runs `kat skill show`, so upgrading katamaran updates the guide automatically.
+
+```sh
+kat skill setup [--agent claude|agents]
+kat skill show
+kat skill status [--agent claude|agents] [--json]
+kat skill remove [--agent claude|agents]
+```
+
 ## Linux machine commands
 
 ### `kat machine create`

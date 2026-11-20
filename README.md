@@ -235,6 +235,17 @@ kat logs --source vm
 kat logs --source gvproxy
 ```
 
+### Coding-agent skill
+
+Install the [katamaran skill](skills/katamaran/SKILL.md) for Claude Code (`~/.claude/skills`) and Codex, OpenCode, and Pi (`~/.agents/skills`):
+
+```sh
+kat skill setup
+kat skill show
+kat skill status
+kat skill remove
+```
+
 ## Documentation
 
 Full guides, CLI and configuration references, architecture notes, and benchmark tables live in `docs/` as an Astro and Starlight site.
