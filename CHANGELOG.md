@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.0 - 2026-11-20
+
+This release adds a guide for coding agents. An agent can now learn how to use katamaran with the `kat skill` command.
+
+### New features
+
+- Add the `kat skill` command. Use `kat skill show` to print a guide for coding agents. The guide covers VM use, Docker, networking, and more.
+- Add `kat skill setup`, `kat skill status`, and `kat skill remove` to manage the skill for Claude Code, Codex, OpenCode, and Pi. The installed skill is a small stub that calls `kat skill show`, so the guide stays current when you upgrade katamaran.
+
 ## v0.2.0 - 2026-11-20
 
 This release makes `katamaran` the default Docker context when you start the app. It also updates the documentation site with screenshots and a new design.
