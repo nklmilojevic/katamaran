@@ -2,7 +2,7 @@
 
 :root {
 	--sl-font: 'Allo', ui-sans-serif, system-ui, -apple-system, sans-serif;
-	--sl-font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+	--sl-font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, monospace;
 
 	--sl-content-width: 46rem;
 	--sl-line-height: 1.72;

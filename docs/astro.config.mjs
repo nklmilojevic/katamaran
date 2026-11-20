@@ -20,15 +20,14 @@ export default defineConfig({
 			},
 			customCss: [
 				'allo-font/allo.css',
-				'@fontsource/ibm-plex-mono/400.css',
-				'@fontsource/ibm-plex-mono/500.css',
+				'@fontsource-variable/jetbrains-mono',
 				'./src/styles/custom.css',
 			],
 			expressiveCode: {
 				themes: ['vitesse-light', 'vitesse-dark'],
 				styleOverrides: {
 					borderRadius: '0.375rem',
-					codeFontFamily: "'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace",
+					codeFontFamily: "'JetBrains Mono Variable', ui-monospace, SFMono-Regular, monospace",
 					codeFontSize: '0.85rem',
 					uiFontFamily: "'Allo', ui-sans-serif, system-ui, sans-serif",
 					frames: {
