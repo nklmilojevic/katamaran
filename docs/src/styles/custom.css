@@ -1,9 +1,8 @@
 /* Warm editorial paper theme: cream archival paper light mode + charcoal ink dark mode. */
 
 :root {
-	--sl-font: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, sans-serif;
+	--sl-font: 'Allo', ui-sans-serif, system-ui, -apple-system, sans-serif;
 	--sl-font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
-	--kat-font-serif: 'Newsreader Variable', Georgia, 'Times New Roman', serif;
 
 	--sl-content-width: 46rem;
 	--sl-line-height: 1.72;
@@ -79,7 +78,7 @@ header.header {
 }
 
 .site-title {
-	font-family: var(--kat-font-serif);
+	font-family: var(--sl-font);
 	font-size: 1.32rem;
 	font-weight: 500;
 	letter-spacing: -0.015em;
@@ -93,11 +92,11 @@ header.header {
 	border-radius: 0.35rem;
 }
 
-/* Serif display headings */
+/* Display headings */
 h1,
 .hero h1,
 .sl-markdown-content h2 {
-	font-family: var(--kat-font-serif);
+	font-family: var(--sl-font);
 	font-weight: 500;
 	letter-spacing: -0.02em;
 	color: var(--sl-color-white);
@@ -216,7 +215,7 @@ h1,
 }
 
 .sl-link-card .title {
-	font-family: var(--kat-font-serif);
+	font-family: var(--sl-font);
 	font-size: 1.18rem;
 	font-weight: 500;
 	letter-spacing: -0.01em;

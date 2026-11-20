@@ -19,8 +19,7 @@ export default defineConfig({
 				baseUrl: 'https://github.com/nklmilojevic/katamaran/edit/main/docs/',
 			},
 			customCss: [
-				'@fontsource-variable/newsreader',
-				'@fontsource-variable/inter',
+				'allo-font/allo.css',
 				'@fontsource/ibm-plex-mono/400.css',
 				'@fontsource/ibm-plex-mono/500.css',
 				'./src/styles/custom.css',
@@ -31,7 +30,7 @@ export default defineConfig({
 					borderRadius: '0.375rem',
 					codeFontFamily: "'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace",
 					codeFontSize: '0.85rem',
-					uiFontFamily: "'Inter Variable', ui-sans-serif, system-ui, sans-serif",
+					uiFontFamily: "'Allo', ui-sans-serif, system-ui, sans-serif",
 					frames: {
 						frameBoxShadowCssValue: 'none',
 					},
