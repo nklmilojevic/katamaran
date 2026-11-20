@@ -24,6 +24,7 @@ export default defineConfig({
 				'./src/styles/custom.css',
 			],
 			expressiveCode: {
+				emitExternalStylesheet: false,
 				themes: ['github-light', 'tokyo-night'],
 				styleOverrides: {
 					borderRadius: '0.5rem',
