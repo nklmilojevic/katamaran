@@ -117,6 +117,13 @@ pub type Result<T> = result::Result<T, Error>;
 ///
 /// # Safety
 ///
+/// From `<mach/vm_statistics.h>`: application-specific VM tags for `mmap(MAP_ANON)`.
+const VM_MEMORY_APPLICATION_SPECIFIC_1: u8 = 240;
+
+const fn vm_make_tag(id: u8) -> libc::c_int {
+    (id as libc::c_int) << 24
+}
+
 /// The range must be within one region of guest memory, whose contents the caller gives up.
 unsafe fn map_fresh_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io::Result<()> {
     let end = guest_addr + len;
@@ -132,8 +139,9 @@ unsafe fn map_fresh_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io:
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
                 // Alternate VM tags so XNU keeps adjacent blocks in separate map entries.
-                libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8
-                    + ((addr / RECLAIM_BLOCK_SIZE) % 2) as u8) as libc::c_int,
+                vm_make_tag(
+                    VM_MEMORY_APPLICATION_SPECIFIC_1 + ((addr / RECLAIM_BLOCK_SIZE) % 2) as u8,
+                ),
                 0,
             )
         };
@@ -155,10 +163,8 @@ unsafe fn map_fresh_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io:
 ///
 /// The range must be within one untouched region of guest memory whose contents the caller gives up.
 unsafe fn map_initial_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io::Result<()> {
-    let tag1 =
-        unsafe { libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8) } as libc::c_int;
-    let tag2 = unsafe { libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8 + 1) }
-        as libc::c_int;
+    let tag1 = vm_make_tag(VM_MEMORY_APPLICATION_SPECIFIC_1);
+    let tag2 = vm_make_tag(VM_MEMORY_APPLICATION_SPECIFIC_1 + 1);
     let ret = unsafe {
         libc::mmap(
             host_addr.cast(),
