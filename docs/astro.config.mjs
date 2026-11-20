@@ -11,6 +11,28 @@ export default defineConfig({
 			description: 'Fast Docker containers and Linux machines on Apple silicon Macs.',
 			logo: { src: './src/assets/icon.png', alt: '' },
 			favicon: '/favicon.png',
+			head: [
+				{
+					tag: 'meta',
+					attrs: { property: 'og:image', content: 'https://katamaran.rs/og.png' },
+				},
+				{
+					tag: 'meta',
+					attrs: { property: 'og:image:width', content: '1200' },
+				},
+				{
+					tag: 'meta',
+					attrs: { property: 'og:image:height', content: '630' },
+				},
+				{
+					tag: 'meta',
+					attrs: { name: 'twitter:card', content: 'summary_large_image' },
+				},
+				{
+					tag: 'meta',
+					attrs: { name: 'twitter:image', content: 'https://katamaran.rs/og.png' },
+				},
+			],
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/nklmilojevic/katamaran' },
 			],
