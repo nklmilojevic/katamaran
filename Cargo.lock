@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "kat-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "kat-init"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kat-nfs",
  "kat-proto",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "kat-nfs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde_json",
@@ -1110,18 +1110,18 @@ dependencies = [
 
 [[package]]
 name = "kat-proto"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "kat-term"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ghostty-vt-rs-sys",
 ]
 
 [[package]]
 name = "kat-vmm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
