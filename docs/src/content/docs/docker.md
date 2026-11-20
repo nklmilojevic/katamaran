@@ -7,13 +7,13 @@ katamaran runs `containerd` and `dockerd` inside the Linux guest and relays the 
 
 ## Select the Docker context
 
-`kat setup` creates a Docker context named `katamaran`. Use it for one command:
+Launching **Katamaran** or running `kat start` creates the `katamaran` Docker context and sets it as the default automatically. To target it for a single command when another context is active:
 
 ```sh
 docker --context katamaran ps
 ```
 
-Switch to it for all commands:
+To switch back manually:
 
 ```sh
 docker context use katamaran

@@ -101,6 +101,7 @@ pub fn start(args: StartArgs) -> anyhow::Result<()> {
     let mut c = ensure_daemon()?;
     let status: Status = serde_json::from_value(c.call(&Call::Start)?)?;
     if status.docker.state == DockerState::Ready {
+        let _ = crate::setup::ensure_default_docker_context();
         println!("katamaran is already running");
         return Ok(());
     }
@@ -109,6 +110,7 @@ pub fn start(args: StartArgs) -> anyhow::Result<()> {
         let s = c.status()?;
         match (s.state, s.docker.state) {
             (_, DockerState::Ready) => {
+                let _ = crate::setup::ensure_default_docker_context();
                 println!(
                     "katamaran: Docker ready in {:.2} s ({})",
                     t.elapsed().as_secs_f64(),

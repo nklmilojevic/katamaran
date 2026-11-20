@@ -391,12 +391,52 @@ fn wait_gone(sock: &Path, timeout: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn find_docker() -> PathBuf {
+    let candidates = [
+        Some(PathBuf::from("/opt/homebrew/bin/docker")),
+        Some(PathBuf::from("/usr/local/bin/docker")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nix-profile/bin/docker")),
+        Some(PathBuf::from("/run/current-system/sw/bin/docker")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/docker")),
+        Some(PathBuf::from(
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+        )),
+    ];
+    for path in candidates.into_iter().flatten() {
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("docker")
+}
+
 fn docker(args: &[&str]) -> anyhow::Result<std::process::Output> {
-    Command::new("docker")
+    match Command::new("docker")
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .context("the docker CLI is not on PATH")
+    {
+        Ok(out) => Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Command::new(find_docker())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("the docker CLI is not on PATH"),
+        Err(e) => Err(e).context("the docker CLI is not on PATH"),
+    }
+}
+
+/// Ensure the `katamaran` Docker context exists and is set as the default.
+/// No-op for suffixed/isolated homes (`KATAMARAN_HOME` / `KATAMARAN_LABEL_SUFFIX`)
+/// so development copies and tests never hijack the user's Docker context.
+pub fn ensure_default_docker_context() -> anyhow::Result<()> {
+    let id = Identity::resolve(None)?;
+    if id.suffix.is_some() {
+        return Ok(());
+    }
+    let home = crate::state_dir()?;
+    docker_context(&id.context(), &home.join("run/docker.sock"), true)?;
+    Ok(())
 }
 
 fn docker_ok(args: &[&str]) -> anyhow::Result<String> {
