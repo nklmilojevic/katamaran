@@ -113,7 +113,15 @@ softwareupdate --install-rosetta
 
 ## Install
 
-1. Download and open the signed `Katamaran-<version>.dmg` release disk image.
+Install with Homebrew:
+
+```sh
+brew install --cask nklmilojevic/katamaran/katamaran
+```
+
+Or install from the signed release disk image:
+
+1. Download and open `Katamaran-<version>.dmg` from the GitHub releases page.
 2. Drag `Katamaran.app` into `/Applications`.
 3. Open **Katamaran**.
 
