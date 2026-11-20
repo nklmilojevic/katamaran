@@ -25,7 +25,7 @@ softwareupdate --install-rosetta
 
 ## Install from the disk image
 
-1. Download and open the signed `Katamaran-<version>.dmg` release disk image. To build the disk image yourself, follow [Build from source](/build-from-source/).
+1. Download and open the signed `Katamaran-<version>.dmg` release disk image. To build the disk image yourself, follow [Build from source](/katamaran/build-from-source/).
 2. Drag `Katamaran.app` into `/Applications`.
 3. Open **Katamaran** from `/Applications`.
 

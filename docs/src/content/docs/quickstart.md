@@ -5,7 +5,7 @@ description: Start the VM, run a Docker container with a shared folder and port,
 
 In this tutorial, you start the katamaran VM, serve a file from your Mac inside a container, verify live file changes, and open a shell inside an Ubuntu Linux machine.
 
-Make sure you have completed [Install katamaran](/install/) before starting.
+Make sure you have completed [Install katamaran](/katamaran/install/) before starting.
 
 ## 1. Start the VM and select the Docker context
 
@@ -107,6 +107,6 @@ kat machine delete dev
 
 ## Next steps
 
-- Read [Use Docker](/docker/) for Compose, storage, and socket details.
-- Read [File sharing](/file-sharing/) to inspect Linux files in Finder and tune bind mounts.
-- Read [Configuration reference](/configuration/) to adjust CPU, memory, and sleep settings.
+- Read [Use Docker](/katamaran/docker/) for Compose, storage, and socket details.
+- Read [File sharing](/katamaran/file-sharing/) to inspect Linux files in Finder and tune bind mounts.
+- Read [Configuration reference](/katamaran/configuration/) to adjust CPU, memory, and sleep settings.

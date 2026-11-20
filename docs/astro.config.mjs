@@ -3,6 +3,8 @@ import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
 
 export default defineConfig({
+	site: 'https://nklmilojevic.github.io',
+	base: '/katamaran',
 	trailingSlash: 'always',
 	integrations: [
 		starlight({
@@ -10,6 +12,12 @@ export default defineConfig({
 			description: 'Fast Docker containers and Linux machines on Apple silicon Macs.',
 			logo: { src: './src/assets/icon.png', alt: '' },
 			favicon: '/favicon.png',
+			social: [
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/nklmilojevic/katamaran' },
+			],
+			editLink: {
+				baseUrl: 'https://github.com/nklmilojevic/katamaran/edit/main/docs/',
+			},
 			customCss: [
 				'@fontsource-variable/newsreader',
 				'@fontsource-variable/inter',

@@ -67,4 +67,4 @@ kat config set cpus=8 memory=12G
 kat restart
 ```
 
-See [Configuration reference](/configuration/) for all VM settings.
+See [Configuration reference](/katamaran/configuration/) for all VM settings.
