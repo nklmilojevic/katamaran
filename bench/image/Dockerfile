@@ -1,7 +1,7 @@
 # katbench image. The tag is derived from a hash of this directory, so any edit here yields a new image.
 FROM node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS node
 
-FROM rust:1.100.0@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31
+FROM rust:1.100.0@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends fio inotify-tools procps xz-utils \
