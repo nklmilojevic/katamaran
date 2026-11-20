@@ -1,4 +1,4 @@
-/* Warm editorial paper theme: cream archival paper light mode + charcoal ink dark mode. */
+/* Cool maritime slate theme: crisp porcelain light mode + deep midnight-indigo dark mode. */
 
 :root {
 	--sl-font: 'Allo', ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -8,67 +8,67 @@
 	--sl-line-height: 1.72;
 }
 
-/* Light mode: warm cream paper, stone linen sidebar, burnished terracotta accent */
+/* Light mode: crisp cool paper, mist sidebar, deep marine blue accent */
 :root[data-theme='light'] {
-	--sl-color-white: #1c1917;
-	--sl-color-gray-1: #292524;
-	--sl-color-gray-2: #44403c;
-	--sl-color-gray-3: #57534e;
-	--sl-color-gray-4: #78716c;
-	--sl-color-gray-5: #d6cfc4;
-	--sl-color-gray-6: #efeae2;
-	--sl-color-gray-7: #f5f1ea;
-	--sl-color-black: #faf8f5;
+	--sl-color-white: #141926;
+	--sl-color-gray-1: #232a3b;
+	--sl-color-gray-2: #3e475c;
+	--sl-color-gray-3: #556078;
+	--sl-color-gray-4: #76829c;
+	--sl-color-gray-5: #cbd3e3;
+	--sl-color-gray-6: #e8edf5;
+	--sl-color-gray-7: #f1f4fa;
+	--sl-color-black: #f8fafd;
 
-	--sl-color-bg: #faf8f5;
-	--sl-color-bg-nav: rgb(250 248 245 / 0.9);
-	--sl-color-bg-sidebar: #f3efe8;
-	--sl-color-bg-inline-code: #efeae0;
-	--sl-color-hairline-light: #e6dfd5;
-	--sl-color-hairline: #d8d0c4;
-	--sl-color-hairline-shade: #e6dfd5;
+	--sl-color-bg: #f8fafd;
+	--sl-color-bg-nav: rgb(248 250 253 / 0.9);
+	--sl-color-bg-sidebar: #f0f4fa;
+	--sl-color-bg-inline-code: #e8eef7;
+	--sl-color-hairline-light: #dfe6f2;
+	--sl-color-hairline: #cdd7e8;
+	--sl-color-hairline-shade: #dfe6f2;
 
-	--sl-color-accent-low: #f4e4dc;
-	--sl-color-accent: #b4532a;
-	--sl-color-accent-high: #7c3214;
-	--sl-color-text-accent: #a64620;
-	--sl-color-text-invert: #faf8f5;
+	--sl-color-accent-low: #e1ecff;
+	--sl-color-accent: #2b6cb0;
+	--sl-color-accent-high: #1a4578;
+	--sl-color-text-accent: #245ca0;
+	--sl-color-text-invert: #f8fafd;
 
-	--kat-card-bg: #f6f2eb;
-	--kat-card-hover: #efe9de;
-	--kat-rule: #e4ddd2;
-	--kat-rule-strong: #c9bfb0;
+	--kat-card-bg: #f2f5fb;
+	--kat-card-hover: #e9eff8;
+	--kat-rule: #dde4f0;
+	--kat-rule-strong: #c0cbe0;
 }
 
-/* Dark mode: warm charcoal ink, obsidian linen sidebar, warm terracotta coral accent */
+/* Dark mode: deep midnight-indigo slate, cool steel borders, sky-blue accent */
 :root[data-theme='dark'] {
-	--sl-color-white: #f2ede6;
-	--sl-color-gray-1: #e4ddd3;
-	--sl-color-gray-2: #c5bdb1;
-	--sl-color-gray-3: #9c9488;
-	--sl-color-gray-4: #756e64;
-	--sl-color-gray-5: #38332d;
-	--sl-color-gray-6: #24211d;
-	--sl-color-black: #161513;
+	--sl-color-white: #edf1f9;
+	--sl-color-gray-1: #dbe2f0;
+	--sl-color-gray-2: #b4bfd6;
+	--sl-color-gray-3: #8894b0;
+	--sl-color-gray-4: #5f6b87;
+	--sl-color-gray-5: #2d354d;
+	--sl-color-gray-6: #1c2233;
+	--sl-color-black: #151926;
 
-	--sl-color-bg: #161513;
-	--sl-color-bg-nav: rgb(22 21 19 / 0.9);
-	--sl-color-bg-sidebar: #1b1916;
-	--sl-color-bg-inline-code: #25221d;
-	--sl-color-hairline-light: #2d2924;
-	--sl-color-hairline: #36312b;
-	--sl-color-hairline-shade: #11100e;
+	--sl-color-bg: #151926;
+	--sl-color-bg-nav: rgb(21 25 38 / 0.88);
+	--sl-color-bg-sidebar: #111521;
+	--sl-color-bg-inline-code: #1e2436;
+	--sl-color-hairline-light: #252c40;
+	--sl-color-hairline: #2d354d;
+	--sl-color-hairline-shade: #0d101a;
 
-	--sl-color-accent-low: #2e1e17;
-	--sl-color-accent: #e07a52;
-	--sl-color-accent-high: #f3b59c;
-	--sl-color-text-accent: #e4845e;
-	--sl-color-text-invert: #161513;
+	--sl-color-accent-low: #1d2b45;
+	--sl-color-accent: #6ea8fe;
+	--sl-color-accent-high: #b8d4ff;
+	--sl-color-text-accent: #7ab3ff;
+	--sl-color-text-invert: #111521;
 
-	--kat-card-bg: #1d1b18;
-	--kat-card-hover: #25221e;
-	--kat-rule: #2e2a25;
-	--kat-rule-strong: #4a433a;
+	--kat-card-bg: #1a2030;
+	--kat-card-hover: #21283c;
+	--kat-rule: #252c40;
+	--kat-rule-strong: #37415e;
 }
 
 /* Header and wordmark */
