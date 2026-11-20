@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 15:17:55 +0100
+Subject: [PATCH 3/6] transport: connect the vfkit datagram socket to its peer
+
+WriteTo with a path makes the kernel resolve the path and connect the
+socket for every frame. Connect once at accept and write(2) instead.
+---
+ pkg/transport/unixgram_unix.go      |  8 ++-
+ pkg/transport/unixgram_unix_test.go | 85 +++++++++++++++++++++++++++++
+ 2 files changed, 92 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/transport/unixgram_unix_test.go
+
+diff --git a/pkg/transport/unixgram_unix.go b/pkg/transport/unixgram_unix.go
+index dd43791..b5aebfb 100644
+--- a/pkg/transport/unixgram_unix.go
++++ b/pkg/transport/unixgram_unix.go
+@@ -23,6 +23,12 @@ func connectListeningUnixgramConn(conn *net.UnixConn, remoteAddr *net.UnixAddr)
+ 		return nil, err
+ 	}
+ 	err = rawConn.Control(func(fd uintptr) {
++		// Connect to the peer so frames go out with write(2): sendto(2)
++		// with a path resolves and connects the socket on every call,
++		// which costs about as much as copying a 64 KiB frame.
++		if err = syscall.Connect(int(fd), &syscall.SockaddrUnix{Name: remoteAddr.Name}); err != nil { // #nosec G115 - fd always fits in int
++			return
++		}
+ 		if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 1*1024*1024); err != nil { // #nosec G115 - fd always fits in int
+ 			return
+ 		}
+@@ -45,7 +51,7 @@ func (conn *connectedUnixgramConn) RemoteAddr() net.Addr {
+ }
+ 
+ func (conn *connectedUnixgramConn) Write(b []byte) (int, error) {
+-	return conn.WriteTo(b, conn.remoteAddr)
++	return conn.UnixConn.Write(b)
+ }
+ 
+ func peekAddress(listeningConn *net.UnixConn) (*net.UnixAddr, error) {
+diff --git a/pkg/transport/unixgram_unix_test.go b/pkg/transport/unixgram_unix_test.go
+new file mode 100644
+index 0000000..3b65048
+--- /dev/null
++++ b/pkg/transport/unixgram_unix_test.go
+@@ -0,0 +1,85 @@
++//go:build !windows
++
++package transport
++
++import (
++	"net"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestAcceptVfkitConnectsToThePeer(t *testing.T) {
++	dir, err := os.MkdirTemp("", "gvx")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++	listenPath := filepath.Join(dir, "l.sock")
++	listener, err := ListenUnixgram("unixgram://" + listenPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++
++	peerAddr := &net.UnixAddr{Name: filepath.Join(dir, "p.sock"), Net: "unixgram"}
++	peer, err := net.DialUnix("unixgram", peerAddr, &net.UnixAddr{Name: listenPath, Net: "unixgram"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer peer.Close()
++	// As libkrun does; macOS defaults to 4 KiB for datagram sockets.
++	if err := peer.SetReadBuffer(1 << 20); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := peer.Write([]byte("VFKT")); err != nil {
++		t.Fatal(err)
++	}
++
++	conn, err := AcceptVfkit(listener)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := conn.RemoteAddr().String(); got != peerAddr.Name {
++		t.Fatalf("remote address %q, want %q", got, peerAddr.Name)
++	}
++
++	frame := make([]byte, 65000)
++	frame[0], frame[len(frame)-1] = 1, 2
++	if _, err := conn.Write(frame); err != nil {
++		t.Fatal(err)
++	}
++	buf := make([]byte, 70000)
++	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
++	n, err := peer.Read(buf)
++	if err != nil || n != len(frame) || buf[0] != 1 || buf[n-1] != 2 {
++		t.Fatalf("peer read %d bytes, err %v", n, err)
++	}
++
++	if _, err := peer.Write([]byte("frame from the guest")); err != nil {
++		t.Fatal(err)
++	}
++	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
++	n, err = conn.Read(buf)
++	if err != nil || string(buf[:n]) != "frame from the guest" {
++		t.Fatalf("read %q, err %v", buf[:n], err)
++	}
++
++	// Connected, so writes need no address.
++	raw, err := conn.(*connectedUnixgramConn).SyscallConn()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var peerName syscall.Sockaddr
++	_ = raw.Control(func(fd uintptr) {
++		peerName, err = syscall.Getpeername(int(fd)) // #nosec G115
++	})
++	if err != nil {
++		t.Fatalf("getpeername: %v", err)
++	}
++	if u, ok := peerName.(*syscall.SockaddrUnix); !ok || u.Name != peerAddr.Name {
++		t.Fatalf("connected to %#v, want %s", peerName, peerAddr.Name)
++	}
++}

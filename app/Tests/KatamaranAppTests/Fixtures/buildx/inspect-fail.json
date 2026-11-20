@@ -1,0 +1,26 @@
+{
+  "Name": "b-fail",
+  "Ref": "p6df9n1jbtf5cyhodsew1sg69",
+  "Context": "/Users/dev/src/b-fail",
+  "Dockerfile": "Dockerfile",
+  "StartedAt": "2026-11-19T10:49:05.057058426+01:00",
+  "CompletedAt": "2026-11-19T10:49:05.600671634+01:00",
+  "Duration": 543613208,
+  "Status": "failed",
+  "Error": {
+    "Code": 2,
+    "Message": "process \"/bin/sh -c echo \\\"about to fail\\\" && ls /nope\" did not complete successfully: exit code: 1",
+    "Name": "[3/3] RUN echo \"about to fail\" && ls /nope",
+    "Logs": [
+      "about to fail",
+      "ls: /nope: No such file or directory"
+    ],
+    "Sources": "RG9ja2VyZmlsZTozCi0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgIDEgfCAgICAgRlJPTSBhbHBpbmU6My4yMAogICAyIHwgICAgIFJVTiBlY2hvIHN0YXJ0aW5nCiAgIDMgfCA+Pj4gUlVOIGVjaG8gImFib3V0IHRvIGZhaWwiICYmIGxzIC9ub3BlCiAgIDQgfCAgICAgCi0tLS0tLS0tLS0tLS0tLS0tLS0tCgo="
+  },
+  "NumCompletedSteps": 6,
+  "NumTotalSteps": 6,
+  "NumCachedSteps": 1,
+  "Config": {
+    "ImageResolveMode": "local"
+  }
+}

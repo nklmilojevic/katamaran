@@ -1,0 +1,62 @@
+diff --git a/src/devices/src/virtio/balloon/macos.rs b/src/devices/src/virtio/balloon/macos.rs
+--- a/src/devices/src/virtio/balloon/macos.rs
++++ b/src/devices/src/virtio/balloon/macos.rs
+@@ -68,8 +68,19 @@
+         ranges: Vec<FreeRange>,
+     ) -> bool {
+         self.release_with(mem, head, ranges, |range| {
++            // MADV_FREE_REUSABLE takes the pages out of the process's footprint right away and
++            // lets the system take them without writing them out; MADV_FREE only does the
++            // latter, so the footprint keeps every page the guest ever touched. A later access
++            // by the guest faults the page back in (zeroed if the system took it), which
++            // counts it again.
+             // SAFETY: the range is guest memory, whose contents the guest has given up.
+-            unsafe { libc::madvise(range.host_addr.cast(), range.len, libc::MADV_FREE) };
++            unsafe {
++                libc::madvise(
++                    range.host_addr.cast(),
++                    range.len,
++                    libc::MADV_FREE_REUSABLE,
++                )
++            };
+         })
+     }
+ 
+@@ -732,15 +743,19 @@
+         dev.report(&report);
+         assert!(dev.balloon.process_frq());
+ 
+-        // MADV_FREE clears the modified state of the pages without marking them as reusable,
+-        // which MADV_FREE_REUSABLE does. MADV_DONTNEED doesn't touch it.
++        // MADV_FREE_REUSABLE clears the modified state of the pages and marks them as reusable,
++        // which takes them out of the footprint. MADV_FREE only does the former.
+         let pages = page_query::pages(host_addr, PAGES * PAGE);
+         for (block, pages) in pages.chunks(pages.len() / PAGES).enumerate() {
+             let is_released = released
+                 .iter()
+                 .any(|&(first, blocks)| (first..first + blocks).contains(&block));
+             for &(modified, reusable) in pages {
+-                assert_eq!((modified, reusable), (!is_released, false), "page {block}");
++                assert_eq!(
++                    (modified, reusable),
++                    (!is_released, is_released),
++                    "page {block}"
++                );
+             }
+         }
+     }
+diff --git a/src/devices/src/virtio/balloon/mod.rs b/src/devices/src/virtio/balloon/mod.rs
+--- a/src/devices/src/virtio/balloon/mod.rs
++++ b/src/devices/src/virtio/balloon/mod.rs
+@@ -41,8 +41,9 @@
+ #[repr(u32)]
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub enum FreePageReportingMode {
+-    /// madvise() the reported pages on Linux and macOS, and DiscardVirtualMemory() them on
+-    /// Windows. On macOS, this doesn't release the pages that the guest has written to.
++    /// madvise() the reported pages on Linux and macOS (MADV_FREE_REUSABLE there, which takes
++    /// them out of the footprint and lets the system take them), and DiscardVirtualMemory()
++    /// them on Windows.
+     #[default]
+     Default = 0,
+     /// On macOS, have the VMM replace the reported pages with fresh memory, which releases them

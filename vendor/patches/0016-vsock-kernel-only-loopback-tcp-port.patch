@@ -1,0 +1,244 @@
+diff --git a/src/devices/src/virtio/vsock/kernel_peer.rs b/src/devices/src/virtio/vsock/kernel_peer.rs
+--- a/src/devices/src/virtio/vsock/kernel_peer.rs
++++ b/src/devices/src/virtio/vsock/kernel_peer.rs
+@@ -1,16 +1,24 @@
+-//! Host Unix listeners that only the host kernel may connect to.
++//! Host listeners that only the host kernel may connect to.
+ //!
+ //! Some host listeners serve a client inside the host kernel, such as the
+-//! macOS NFS client mounting a socket with `proto=ticotsord`. A socket the
+-//! kernel connects by itself has no owning process: macOS reports peer pid 0
+-//! (`kernel_task`), and so does Linux. Any user process has a pid of its own,
+-//! root's included, so a pid of 0 admits the kernel and nobody else.
++//! macOS NFS client. A socket the kernel connects by itself has no owning
++//! process: macOS reports peer pid 0 (`kernel_task`), and so does Linux. Any
++//! user process has a pid of its own, root's included, so a pid of 0 admits
++//! the kernel and nobody else.
++//!
++//! Such a listener is a Unix socket, or a TCP port on 127.0.0.1 whose number
++//! is written to the listener's path. A TCP peer has no peer credentials,
++//! but over loopback macOS reports the pid owning the other end with the
++//! private `TCP_PEER_PID` option.
+ 
++#[cfg(target_os = "macos")]
++use std::net::Ipv4Addr;
+ use std::os::unix::io::RawFd;
+ use std::path::{Path, PathBuf};
+ use std::sync::Mutex;
+ 
+ static KERNEL_ONLY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
++static LOOPBACK_TCP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+ 
+ /// Admit only the kernel on the listener bound at `path`.
+ pub fn restrict_to_kernel(path: &Path) {
+@@ -20,13 +28,81 @@
+     }
+ }
+ 
++/// Listen on a TCP port of 127.0.0.1 instead of a Unix socket at `path`,
++/// and write the port's number to `path`.
++pub fn listen_on_loopback_tcp(path: &Path) {
++    let mut paths = LOOPBACK_TCP.lock().unwrap();
++    if !paths.iter().any(|p| p == path) {
++        paths.push(path.to_path_buf());
++    }
++}
++
++pub fn is_loopback_tcp(path: &Path) -> bool {
++    LOOPBACK_TCP.lock().unwrap().iter().any(|p| p == path)
++}
++
+ /// Whether a connection accepted on the listener at `path` may proceed.
+ pub fn admits(path: &Path, fd: RawFd) -> bool {
+     let restricted = KERNEL_ONLY.lock().unwrap().iter().any(|p| p == path);
+-    !restricted || peer_pid(fd) == Some(0)
++    if !restricted {
++        return true;
++    }
++    if is_loopback_tcp(path) {
++        tcp_peer_pid(fd) == Some(0)
++    } else {
++        peer_pid(fd) == Some(0)
++    }
+ }
+ 
++/// `TCP_PEER_PID` in xnu's `tcp_private.h`.
+ #[cfg(target_os = "macos")]
++const TCP_PEER_PID: libc::c_int = 0x204;
++
++#[cfg(target_os = "macos")]
++fn is_loopback(fd: RawFd, peer: bool) -> bool {
++    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
++    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
++    let sap = &mut sa as *mut libc::sockaddr_in as *mut libc::sockaddr;
++    // SAFETY: the call writes at most `len` bytes into `sa`.
++    let rc = unsafe {
++        if peer {
++            libc::getpeername(fd, sap, &mut len)
++        } else {
++            libc::getsockname(fd, sap, &mut len)
++        }
++    };
++    rc == 0
++        && sa.sin_family as i32 == libc::AF_INET
++        && u32::from_be(sa.sin_addr.s_addr) == u32::from(Ipv4Addr::LOCALHOST)
++}
++
++/// The pid owning the other end of a TCP connection over 127.0.0.1.
++#[cfg(target_os = "macos")]
++fn tcp_peer_pid(fd: RawFd) -> Option<libc::pid_t> {
++    if !is_loopback(fd, false) || !is_loopback(fd, true) {
++        return None;
++    }
++    let mut pid: libc::pid_t = -1;
++    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
++    // SAFETY: getsockopt writes at most `len` bytes into `pid`.
++    let rc = unsafe {
++        libc::getsockopt(
++            fd,
++            libc::IPPROTO_TCP,
++            TCP_PEER_PID,
++            &mut pid as *mut libc::pid_t as *mut libc::c_void,
++            &mut len,
++        )
++    };
++    (rc == 0).then_some(pid)
++}
++
++#[cfg(not(target_os = "macos"))]
++fn tcp_peer_pid(_fd: RawFd) -> Option<libc::pid_t> {
++    None
++}
++
++#[cfg(target_os = "macos")]
+ fn peer_pid(fd: RawFd) -> Option<libc::pid_t> {
+     let mut pid: libc::pid_t = -1;
+     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+@@ -68,6 +144,8 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[cfg(target_os = "macos")]
++    use std::net::{TcpListener, TcpStream};
+     use std::os::unix::io::AsRawFd;
+     use std::os::unix::net::{UnixListener, UnixStream};
+ 
+@@ -90,4 +168,20 @@
+         assert!(admits(&dir.join("other"), conn.as_raw_fd()));
+         std::fs::remove_dir_all(&dir).unwrap();
+     }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn a_loopback_tcp_peer_is_a_user_process() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (conn, _) = listener.accept().unwrap();
++        assert_eq!(
++            tcp_peer_pid(conn.as_raw_fd()),
++            Some(std::process::id() as libc::pid_t)
++        );
++        let path = std::env::temp_dir().join(format!("krun-kpeer-tcp-{}", std::process::id()));
++        listen_on_loopback_tcp(&path);
++        restrict_to_kernel(&path);
++        assert!(!admits(&path, conn.as_raw_fd()));
++    }
+ }
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/unix.rs b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+--- a/src/devices/src/virtio/vsock/unix_proxy/unix.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+@@ -1,4 +1,5 @@
+ use std::fs;
++use std::net::{Ipv4Addr, TcpListener};
+ use std::num::Wrapping;
+ use std::os::fd::{FromRawFd, OwnedFd};
+ use std::os::unix::fs::{FileTypeExt, MetadataExt};
+@@ -411,6 +412,9 @@
+     path: &Path,
+     peer_port: u32,
+ ) -> Result<super::UnixAcceptorProxy, ProxyError> {
++    if kernel_peer::is_loopback_tcp(path) {
++        return new_loopback_tcp_acceptor(id, path, peer_port);
++    }
+     let fd = socket(
+         AddressFamily::Unix,
+         SockType::Stream,
+@@ -440,6 +444,50 @@
+     Ok(proxy)
+ }
+ 
++/// A listener on a free TCP port of 127.0.0.1, whose number is written to
++/// `path` (through a rename, so a reader never sees half of it).
++fn new_loopback_tcp_acceptor(
++    id: u64,
++    path: &Path,
++    peer_port: u32,
++) -> Result<super::UnixAcceptorProxy, ProxyError> {
++    let listener =
++        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(ProxyError::CreatingSocket)?;
++    let port = listener
++        .local_addr()
++        .map_err(ProxyError::CreatingSocket)?
++        .port();
++    let tmp = path.with_extension("tmp");
++    fs::write(&tmp, format!("{port}\n"))
++        .and_then(|()| fs::rename(&tmp, path))
++        .map_err(ProxyError::CreatingSocket)?;
++    let metadata = fs::symlink_metadata(path).map_err(ProxyError::CreatingSocket)?;
++    Ok(super::UnixAcceptorProxy {
++        id,
++        fd: OwnedFd::from(listener),
++        peer_port,
++        path: path.to_path_buf(),
++        identity: (metadata.dev(), metadata.ino()),
++    })
++}
++
++fn set_nodelay(fd: &OwnedFd) {
++    let on: libc::c_int = 1;
++    // SAFETY: plain setsockopt with an int value on a socket we own.
++    let ret = unsafe {
++        libc::setsockopt(
++            fd.as_raw_fd(),
++            libc::IPPROTO_TCP,
++            libc::TCP_NODELAY,
++            &on as *const _ as *const libc::c_void,
++            std::mem::size_of_val(&on) as libc::socklen_t,
++        )
++    };
++    if ret != 0 {
++        warn!("setting TCP_NODELAY: {}", std::io::Error::last_os_error());
++    }
++}
++
+ fn remove_stale_socket(path: &Path) -> bool {
+     let Ok(original) = fs::symlink_metadata(path) else {
+         return false;
+@@ -516,6 +564,9 @@
+                 // Safe because we've just obtained the FD from the `accept` call above.
+                 let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
+                 set_stream_buffers(&new_fd);
++                if kernel_peer::is_loopback_tcp(&proxy.path) {
++                    set_nodelay(&new_fd);
++                }
+                 update.new_proxy = Some((
+                     proxy.peer_port,
+                     new_fd,
+diff --git a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+--- a/src/libkrun/src/api/device_builders.rs
++++ b/src/libkrun/src/api/device_builders.rs
+@@ -1605,6 +1605,14 @@
+     pub fn add_unix_port_kernel_only(&mut self, port: u32, path: &str) {
+         kernel_peer::restrict_to_kernel(Path::new(path));
+         self.add_unix_port(port, path, true);
++    }
++
++    /// Like `add_unix_port_kernel_only`, but listen on a free TCP port of
++    /// 127.0.0.1 and write its number to `port_file`. The macOS NFS client
++    /// names a server reached over TCP, unlike one behind a Unix socket.
++    pub fn add_tcp_port_kernel_only(&mut self, port: u32, port_file: &str) {
++        kernel_peer::listen_on_loopback_tcp(Path::new(port_file));
++        self.add_unix_port_kernel_only(port, port_file);
+     }
+ }
+ 

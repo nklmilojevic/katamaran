@@ -1,0 +1,2822 @@
+{
+ "schema": "vs-1",
+ "run_id": "20261120c",
+ "date": "2026-11-20",
+ "engine": "katamaran",
+ "engine_info": {
+  "context": "katamaran-bench",
+  "docker_server": "29.10.0",
+  "kernel": "6.18.64",
+  "os": "Alpine Linux v3.24",
+  "ncpu": 14,
+  "mem_gib": 15.68,
+  "version": "katamaran 0.1.0",
+  "binary_sha256": [
+   "590e2bc91c3a94f4e711b7d4a237f965264d7d476437544a4bf1cfb8d6008854",
+   "27a5cc8544586713f96e78d7faa847dc490ac433db2ac22f0420dd50bc819b93",
+   "3010b20f2c65f2a714c3981edac9ad3c6b5dcd321397fb4ddd565b54e672ce4c",
+   "cf944ec8b20f7aac6e20d868f0b7341ae961773a86795ae72339a59ebe57ce96",
+   "4b6b0162e8dbe6e5279c74ca2c865a429b61b34f5072798fefaf1dc84ffd5fff",
+   "ebd0d9b821f29c3013b7f78f6ccbebed4b6fb28f28510ef070d62025fc170e8d"
+  ],
+  "vm_args": [
+   "run",
+   "--cpus",
+   "14",
+   "--memory-mib",
+   "16384",
+   "--mount",
+   "/Users/nkl/Katamaran-bench"
+  ]
+ },
+ "machine": {
+  "chip": "Apple M3 Max",
+  "cores": 14,
+  "perf_cores": 10,
+  "eff_cores": 4,
+  "ram_gib": 36,
+  "macos": "27.2.1 (26B131)",
+  "model": "Mac15,10"
+ },
+ "blocks": {
+  "idle_start": {
+   "started": "2026-11-20T16:50:10+01:00",
+   "load_before": 2.9,
+   "finished": "2026-11-20T16:55:21+01:00",
+   "load_after": 2.43
+  },
+  "idlewarm": {
+   "started": "2026-11-20T16:24:41+01:00",
+   "load_before": 1.76,
+   "finished": "2026-11-20T16:36:54+01:00",
+   "load_after": 2.98
+  },
+  "mem": {
+   "started": "2026-11-20T17:55:26+01:00",
+   "load_before": 4.44,
+   "finished": "2026-11-20T18:10:03+01:00",
+   "load_after": 1.67
+  },
+  "fs": {
+   "started": "2026-11-20T16:55:21+01:00",
+   "load_before": 2.43,
+   "finished": "2026-11-20T17:25:23+01:00",
+   "load_after": 2.36
+  },
+  "coldstat": {
+   "started": "2026-11-20T17:25:23+01:00",
+   "load_before": 2.36,
+   "finished": "2026-11-20T17:27:22+01:00",
+   "load_after": 2.62
+  },
+  "dev": {
+   "started": "2026-11-20T17:27:22+01:00",
+   "load_before": 2.62,
+   "finished": "2026-11-20T17:40:48+01:00",
+   "load_after": 5.03
+  },
+  "net": {
+   "started": "2026-11-20T17:40:48+01:00",
+   "load_before": 5.03,
+   "finished": "2026-11-20T17:42:36+01:00",
+   "load_after": 4.42
+  },
+  "nfs": {
+   "started": "2026-11-20T17:42:36+01:00",
+   "load_before": 4.42,
+   "finished": "2026-11-20T17:49:13+01:00",
+   "load_after": 7.41
+  },
+  "amd64": {
+   "started": "2026-11-20T17:49:13+01:00",
+   "load_before": 7.41,
+   "finished": "2026-11-20T17:55:26+01:00",
+   "load_after": 4.44
+  },
+  "dockerrun": {
+   "started": "2026-11-20T18:10:03+01:00",
+   "load_before": 1.67,
+   "finished": "2026-11-20T18:10:09+01:00",
+   "load_after": 2.5
+  },
+  "idle_end": {
+   "started": "2026-11-20T18:10:09+01:00",
+   "load_before": 2.5,
+   "finished": "2026-11-20T18:15:20+01:00",
+   "load_after": 1.52
+  },
+  "coldstart": {
+   "started": "2026-11-20T18:15:20+01:00",
+   "load_before": 1.52,
+   "finished": "2026-11-20T18:16:50+01:00",
+   "load_after": 5.85
+  }
+ },
+ "notes": [],
+ "records": [
+  {
+   "block": "idlewarm",
+   "case": "idle_then_warm",
+   "engine": "katamaran",
+   "metric": "find_warm",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    149.0,
+    141.0,
+    177.0,
+    147.0,
+    142.0
+   ],
+   "n": 5,
+   "median": 147.0,
+   "p95": 177.0,
+   "min": 141.0,
+   "max": 177.0,
+   "mean": 151.2,
+   "extra": {
+    "load_start": 1.76,
+    "idle_s": 120
+   }
+  },
+  {
+   "block": "idlewarm",
+   "case": "idle_then_warm",
+   "engine": "katamaran",
+   "metric": "git_status_warm",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    176.0,
+    166.0,
+    179.0,
+    171.0,
+    176.0
+   ],
+   "n": 5,
+   "median": 176.0,
+   "p95": 179.0,
+   "min": 166.0,
+   "max": 179.0,
+   "mean": 173.6,
+   "extra": {
+    "load_start": 1.76,
+    "idle_s": 120
+   }
+  },
+  {
+   "block": "idlewarm",
+   "case": "idle_then_warm",
+   "engine": "katamaran",
+   "metric": "find_after_idle",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    139.0,
+    139.0,
+    143.0,
+    143.0,
+    155.0
+   ],
+   "n": 5,
+   "median": 143.0,
+   "p95": 155.0,
+   "min": 139.0,
+   "max": 155.0,
+   "mean": 143.8,
+   "extra": {
+    "load_start": 1.76,
+    "idle_s": 120
+   }
+  },
+  {
+   "block": "idlewarm",
+   "case": "idle_then_warm",
+   "engine": "katamaran",
+   "metric": "git_status_after_idle",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    174.0,
+    170.0,
+    170.0,
+    177.0,
+    178.0
+   ],
+   "n": 5,
+   "median": 174.0,
+   "p95": 178.0,
+   "min": 170.0,
+   "max": 178.0,
+   "mean": 173.8,
+   "extra": {
+    "load_start": 1.76,
+    "idle_s": 120
+   }
+  },
+  {
+   "block": "idle_start",
+   "case": "idle",
+   "engine": "katamaran",
+   "metric": "cpu_pct",
+   "unit": "% of one core",
+   "better": "lower",
+   "values": [
+    2.13,
+    1.03,
+    1.53,
+    1.47,
+    1.1
+   ],
+   "n": 5,
+   "median": 1.47,
+   "p95": 2.13,
+   "min": 1.03,
+   "max": 2.13,
+   "mean": 1.452,
+   "extra": {
+    "pids": [
+     51674,
+     51664
+    ],
+    "window_s": 30
+   }
+  },
+  {
+   "block": "idle_start",
+   "case": "idle",
+   "engine": "katamaran",
+   "metric": "footprint",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    945,
+    945,
+    922,
+    882,
+    880
+   ],
+   "n": 5,
+   "median": 922,
+   "p95": 945,
+   "min": 880,
+   "max": 945,
+   "mean": 914.8,
+   "extra": {}
+  },
+  {
+   "block": "idle_start",
+   "case": "idle_after_drop_caches",
+   "engine": "katamaran",
+   "metric": "footprint",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    889,
+    895,
+    899
+   ],
+   "n": 3,
+   "median": 895,
+   "p95": 899,
+   "min": 889,
+   "max": 899,
+   "mean": 894.3333333333334,
+   "extra": {}
+  },
+  {
+   "block": "fs",
+   "case": "microbench",
+   "engine": "katamaran",
+   "metric": "stat",
+   "unit": "ns/op",
+   "better": "lower",
+   "values": [
+    356.45,
+    340.19,
+    350.63,
+    345.96,
+    340.67
+   ],
+   "n": 5,
+   "median": 345.96,
+   "p95": 356.45,
+   "min": 340.19,
+   "max": 356.45,
+   "mean": 346.78000000000003,
+   "extra": {
+    "load_start": 2.25,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-microbench.json",
+    "case_wall_s": 151,
+    "ops": 1000000,
+    "files": 91159
+   }
+  },
+  {
+   "block": "fs",
+   "case": "microbench",
+   "engine": "katamaran",
+   "metric": "open_close",
+   "unit": "ns/op",
+   "better": "lower",
+   "values": [
+    24518.05,
+    23976.13,
+    24286.16,
+    24911.51,
+    24535.79
+   ],
+   "n": 5,
+   "median": 24518.05,
+   "p95": 24911.51,
+   "min": 23976.13,
+   "max": 24911.51,
+   "mean": 24445.528,
+   "extra": {
+    "load_start": 2.25,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-microbench.json",
+    "case_wall_s": 151,
+    "ops": 1000000,
+    "files": 91159
+   }
+  },
+  {
+   "block": "fs",
+   "case": "find_node_modules",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    0.117780625,
+    0.112956375,
+    0.112417625,
+    0.111665542,
+    0.115598417
+   ],
+   "n": 5,
+   "median": 0.112956375,
+   "p95": 0.117780625,
+   "min": 0.111665542,
+   "max": 0.117780625,
+   "mean": 0.1140837168,
+   "extra": {
+    "load_start": 1.94,
+    "waited_s": 0,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-find_node_modules.json",
+    "case_wall_s": 2,
+    "files": 33598
+   }
+  },
+  {
+   "block": "fs",
+   "case": "git_status",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    0.166621,
+    0.161094375,
+    0.166040708,
+    0.1593945,
+    0.167108834
+   ],
+   "n": 5,
+   "median": 0.166040708,
+   "p95": 0.167108834,
+   "min": 0.1593945,
+   "max": 0.167108834,
+   "mean": 0.16405188340000001,
+   "extra": {
+    "load_start": 1.92,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-git_status.json",
+    "case_wall_s": 9
+   }
+  },
+  {
+   "block": "fs",
+   "case": "untar",
+   "engine": "katamaran",
+   "metric": "extract",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    13.787671943,
+    13.3900109,
+    13.801996276,
+    13.308224609,
+    14.377357069
+   ],
+   "n": 5,
+   "median": 13.787671943,
+   "p95": 14.377357069,
+   "min": 13.308224609,
+   "max": 14.377357069,
+   "mean": 13.7330521594,
+   "extra": {
+    "load_start": 1.94,
+    "waited_s": 0,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-untar.json",
+    "case_wall_s": 120
+   }
+  },
+  {
+   "block": "fs",
+   "case": "untar",
+   "engine": "katamaran",
+   "metric": "rm_rf",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    5.679748636,
+    5.706850511,
+    5.723998719,
+    5.676510595,
+    6.352779429
+   ],
+   "n": 5,
+   "median": 5.706850511,
+   "p95": 6.352779429,
+   "min": 5.676510595,
+   "max": 6.352779429,
+   "mean": 5.8279775780000005,
+   "extra": {
+    "load_start": 1.94,
+    "waited_s": 0,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-untar.json",
+    "case_wall_s": 120
+   }
+  },
+  {
+   "block": "fs",
+   "case": "npm_ci",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    3.288956464,
+    3.231377048,
+    3.221475132,
+    3.210417673,
+    3.258329673
+   ],
+   "n": 5,
+   "median": 3.231377048,
+   "p95": 3.288956464,
+   "min": 3.210417673,
+   "max": 3.288956464,
+   "mean": 3.242111198,
+   "extra": {
+    "load_start": 3.32,
+    "waited_s": 45,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-npm_ci.json",
+    "case_wall_s": 39
+   }
+  },
+  {
+   "block": "fs",
+   "case": "pnpm_install",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    2.333019462,
+    2.31068563,
+    2.324454546,
+    2.316724963,
+    2.342047567
+   ],
+   "n": 5,
+   "median": 2.324454546,
+   "p95": 2.342047567,
+   "min": 2.31068563,
+   "max": 2.342047567,
+   "mean": 2.3253864336,
+   "extra": {
+    "load_start": 3.74,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-pnpm_install.json",
+    "case_wall_s": 32
+   }
+  },
+  {
+   "block": "fs",
+   "case": "cargo_build",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "s",
+   "better": "lower",
+   "values": [
+    3.53999734,
+    3.521388173,
+    3.502703673,
+    3.502464549,
+    3.506702715
+   ],
+   "n": 5,
+   "median": 3.506702715,
+   "p95": 3.53999734,
+   "min": 3.502464549,
+   "max": 3.53999734,
+   "mean": 3.5146512899999998,
+   "extra": {
+    "load_start": 4.13,
+    "waited_s": 45,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-cargo_build.json",
+    "case_wall_s": 23
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "seq_read_1m_mb_s",
+   "unit": "MB/s",
+   "better": "higher",
+   "values": [
+    4112.313555,
+    4088.303566,
+    4079.507887,
+    4091.973215,
+    4094.070157
+   ],
+   "n": 5,
+   "median": 4091.973215,
+   "p95": 4112.313555,
+   "min": 4079.507887,
+   "max": 4112.313555,
+   "mean": 4093.233676,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "seq_read_1m_iops",
+   "unit": "IOPS",
+   "better": "higher",
+   "values": [
+    3921.807819,
+    3898.910109,
+    3890.521896,
+    3902.409759,
+    3904.409559
+   ],
+   "n": 5,
+   "median": 3902.409759,
+   "p95": 3921.807819,
+   "min": 3890.521896,
+   "max": 3921.807819,
+   "mean": 3903.6118284000004,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "seq_write_1m_mb_s",
+   "unit": "MB/s",
+   "better": "higher",
+   "values": [
+    1248.414601,
+    3484.384182,
+    2006.459245,
+    4226.28237,
+    1561.338321
+   ],
+   "n": 5,
+   "median": 2006.459245,
+   "p95": 4226.28237,
+   "min": 1248.414601,
+   "max": 4226.28237,
+   "mean": 2505.3757438000002,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "seq_write_1m_iops",
+   "unit": "IOPS",
+   "better": "higher",
+   "values": [
+    1190.580942,
+    3322.967703,
+    1913.508649,
+    4030.49695,
+    1489.008256
+   ],
+   "n": 5,
+   "median": 1913.508649,
+   "p95": 4030.49695,
+   "min": 1190.580942,
+   "max": 4030.49695,
+   "mean": 2389.3125,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "rand_read_4k_mb_s",
+   "unit": "MB/s",
+   "better": "higher",
+   "values": [
+    1092.821482,
+    1102.228234,
+    1106.459389,
+    1097.583835,
+    1093.303124
+   ],
+   "n": 5,
+   "median": 1097.583835,
+   "p95": 1106.459389,
+   "min": 1092.821482,
+   "max": 1106.459389,
+   "mean": 1098.4792128000001,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "rand_read_4k_iops",
+   "unit": "IOPS",
+   "better": "higher",
+   "values": [
+    266802.119788,
+    269098.690131,
+    270131.686831,
+    267964.80352,
+    266919.708029
+   ],
+   "n": 5,
+   "median": 267964.80352,
+   "p95": 270131.686831,
+   "min": 266802.119788,
+   "max": 270131.686831,
+   "mean": 268183.40165980003,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "rand_write_4k_mb_s",
+   "unit": "MB/s",
+   "better": "higher",
+   "values": [
+    747.231465,
+    749.297254,
+    741.715114,
+    749.670542,
+    741.174906
+   ],
+   "n": 5,
+   "median": 747.231465,
+   "p95": 749.670542,
+   "min": 741.174906,
+   "max": 749.670542,
+   "mean": 745.8178561999999,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "rand_write_4k_iops",
+   "unit": "IOPS",
+   "better": "higher",
+   "values": [
+    182429.557044,
+    182933.9,
+    181082.791721,
+    183025.034909,
+    180950.90491
+   ],
+   "n": 5,
+   "median": 182429.557044,
+   "p95": 183025.034909,
+   "min": 180950.90491,
+   "max": 183025.034909,
+   "mean": 182084.4377168,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "fsync_write_4k_mb_s",
+   "unit": "MB/s",
+   "better": "higher",
+   "values": [
+    26.919087,
+    26.967415,
+    26.076624,
+    27.164413,
+    25.889046
+   ],
+   "n": 5,
+   "median": 26.919087,
+   "p95": 27.164413,
+   "min": 25.889046,
+   "max": 27.164413,
+   "mean": 26.603316999999997,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "fio",
+   "engine": "katamaran",
+   "metric": "fsync_write_4k_iops",
+   "unit": "IOPS",
+   "better": "higher",
+   "values": [
+    6572.042796,
+    6583.841616,
+    6366.363364,
+    6631.936806,
+    6320.567943
+   ],
+   "n": 5,
+   "median": 6572.042796,
+   "p95": 6631.936806,
+   "min": 6320.567943,
+   "max": 6631.936806,
+   "mean": 6494.950505,
+   "extra": {
+    "load_start": 3.65,
+    "waited_s": 30,
+    "order": [
+     "katamaran",
+     "orbstack"
+    ],
+    "harness_file": "harness-20261120c-katamaran-fio.json",
+    "case_wall_s": 316
+   }
+  },
+  {
+   "block": "fs",
+   "case": "inotify",
+   "engine": "katamaran",
+   "metric": "latency",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    8.995125,
+    1425.589667,
+    1659.1045,
+    2.883833,
+    1747.621041,
+    1792.794042,
+    2.626542,
+    1930.619959,
+    25.839333,
+    32.959625,
+    53.451166,
+    83.642708,
+    100.170708,
+    121.878042,
+    167.982167,
+    180.879667,
+    235.111667,
+    278.438875,
+    286.475083,
+    368.195042,
+    7.060375,
+    410.134792,
+    455.0045,
+    579.322125,
+    588.346041,
+    752.382667,
+    785.212959,
+    817.168125,
+    933.443167,
+    4.307542,
+    1101.9315,
+    2.58475,
+    1155.196375,
+    4.307791,
+    1240.497875,
+    4.271042,
+    1155.425,
+    1479.568709,
+    1592.298458,
+    1620.245542,
+    2.783667,
+    1886.474292,
+    1896.554834,
+    37.339167,
+    2.607583,
+    818.091791,
+    12.218625,
+    11.426292,
+    13.210667,
+    11.662375,
+    11.396708,
+    12.254416,
+    13.045708,
+    11.744875,
+    13.977292,
+    14.171541,
+    14.375667,
+    13.204667,
+    13.264125,
+    12.239875,
+    12.13,
+    13.574208,
+    12.477167,
+    13.408667,
+    13.157459,
+    13.51775,
+    13.91225,
+    12.202791,
+    12.862375,
+    12.724959,
+    13.184167,
+    14.054125,
+    12.727458,
+    13.053459,
+    13.615625,
+    13.857542,
+    13.88525,
+    13.948875,
+    13.728584,
+    13.81325,
+    14.244208,
+    13.82175,
+    13.938833,
+    13.864625,
+    13.785916,
+    14.186666,
+    13.796834,
+    14.044875,
+    13.575792,
+    13.262125,
+    13.07675,
+    13.927291,
+    14.380542,
+    12.542084,
+    13.984541,
+    12.172708,
+    11.1925,
+    12.013042,
+    12.174208,
+    12.728416,
+    13.988667,
+    12.267291,
+    14.119,
+    13.945875,
+    12.200375,
+    13.023333,
+    13.953041,
+    11.853,
+    12.180333,
+    12.648209,
+    13.410833,
+    13.602459,
+    13.765542,
+    12.426583,
+    13.7245,
+    14.20475,
+    14.138542,
+    13.9265,
+    14.065917,
+    13.9315,
+    14.139417,
+    13.594875,
+    12.541416,
+    12.799375,
+    12.175375,
+    11.995833,
+    14.27375,
+    13.441792,
+    13.668875,
+    13.488459,
+    12.843834,
+    12.697166,
+    12.619125,
+    12.726541,
+    13.699666,
+    13.588583,
+    13.606875,
+    14.5215,
+    13.825417,
+    13.141083,
+    13.722,
+    12.744125,
+    11.597917,
+    11.7185,
+    13.519083,
+    15.087958,
+    11.179291,
+    12.535667,
+    12.729708,
+    13.738375,
+    13.774,
+    13.743792,
+    12.56725,
+    13.271583,
+    12.043833,
+    13.692042,
+    11.772917,
+    3.566834,
+    13.445958,
+    12.697625,
+    13.709708,
+    13.576208,
+    12.462834,
+    13.6455,
+    13.336958,
+    12.342209,
+    11.85725,
+    13.682291,
+    13.5325,
+    14.083458,
+    13.974833,
+    14.263083,
+    12.058375,
+    13.805875,
+    13.954041,
+    13.243,
+    13.958958,
+    14.163916,
+    13.7905,
+    12.755667,
+    2.17675,
+    14.358709,
+    13.49225,
+    13.937416,
+    13.338625,
+    12.927,
+    13.569959,
+    13.69575,
+    11.964,
+    13.775917,
+    13.638083,
+    12.946958,
+    13.133458,
+    14.427458,
+    14.074875,
+    8.950334,
+    14.37325,
+    13.092375,
+    12.848959
+   ],
+   "n": 199,
+   "median": 13.615625,
+   "p95": 1425.589667,
+   "min": 2.17675,
+   "max": 1930.619959,
+   "mean": 159.99695937688443,
+   "extra": {
+    "load_start": 2.71,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-inotify.json",
+    "case_wall_s": 53,
+    "timeouts": 1
+   }
+  },
+  {
+   "block": "fs",
+   "case": "inotify",
+   "engine": "katamaran",
+   "metric": "pipeline_floor",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    2.024625,
+    2.011958,
+    2.139,
+    1.520167,
+    1.207083,
+    1.509,
+    1.444708,
+    1.443166,
+    2.130542,
+    1.077334,
+    1.930042,
+    1.172792,
+    1.098625,
+    1.323291,
+    1.857667,
+    1.220166,
+    1.269541,
+    0.787958,
+    0.913792,
+    2.124708,
+    2.141709,
+    1.624458,
+    1.267917,
+    1.464833,
+    1.535125,
+    1.636125,
+    1.472542,
+    1.398459,
+    1.501791,
+    2.777709,
+    1.549375,
+    2.682916,
+    1.503417,
+    1.626916,
+    1.157417,
+    3.486791,
+    2.045,
+    2.979791,
+    1.474375,
+    0.723209,
+    0.67075,
+    0.878334,
+    1.840542,
+    2.176708,
+    1.728042,
+    1.355084,
+    1.964667,
+    1.5785,
+    1.609666,
+    1.607792
+   ],
+   "n": 50,
+   "median": 1.527646,
+   "p95": 2.777709,
+   "min": 0.67075,
+   "max": 3.486791,
+   "mean": 1.6333224999999998,
+   "extra": {
+    "load_start": 2.71,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-inotify.json",
+    "case_wall_s": 53
+   }
+  },
+  {
+   "block": "fs",
+   "case": "inotify",
+   "engine": "katamaran",
+   "metric": "latency_timeouts",
+   "unit": "events",
+   "better": "lower",
+   "values": [
+    1
+   ],
+   "n": 1,
+   "median": 1,
+   "p95": 1,
+   "min": 1,
+   "max": 1,
+   "mean": 1.0,
+   "extra": {
+    "load_start": 2.71,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-inotify.json",
+    "case_wall_s": 53
+   }
+  },
+  {
+   "block": "fs",
+   "case": "inotify",
+   "engine": "katamaran",
+   "metric": "burst_lost",
+   "unit": "events",
+   "better": "lower",
+   "values": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "n": 5,
+   "median": 0,
+   "p95": 0,
+   "min": 0,
+   "max": 0,
+   "mean": 0.0,
+   "extra": {
+    "load_start": 2.71,
+    "waited_s": 0,
+    "order": [
+     "orbstack",
+     "katamaran"
+    ],
+    "harness_file": "harness-20261120c-katamaran-inotify.json",
+    "case_wall_s": 53
+   }
+  },
+  {
+   "block": "coldstat",
+   "case": "stat_91k_files",
+   "engine": "katamaran",
+   "metric": "stat_cold_us",
+   "unit": "\u00b5s/file",
+   "better": "lower",
+   "values": [
+    6.346,
+    6.334,
+    6.447,
+    6.492,
+    6.439
+   ],
+   "n": 5,
+   "median": 6.439,
+   "p95": 6.492,
+   "min": 6.334,
+   "max": 6.492,
+   "mean": 6.4116,
+   "extra": {
+    "load_start": 2.36,
+    "waited_s": 0,
+    "load_per_round": [
+     2.36,
+     2.89,
+     3.54,
+     3.42,
+     3.42,
+     3.54
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "coldstat",
+   "case": "stat_91k_files",
+   "engine": "katamaran",
+   "metric": "stat_warm_us",
+   "unit": "\u00b5s/file",
+   "better": "lower",
+   "values": [
+    4.851,
+    4.644,
+    0.392,
+    1.245,
+    2.654
+   ],
+   "n": 5,
+   "median": 2.654,
+   "p95": 4.851,
+   "min": 0.392,
+   "max": 4.851,
+   "mean": 2.7572,
+   "extra": {
+    "load_start": 2.36,
+    "waited_s": 0,
+    "load_per_round": [
+     2.36,
+     2.89,
+     3.54,
+     3.42,
+     3.42,
+     3.54
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "coldstat",
+   "case": "git_status_linux",
+   "engine": "katamaran",
+   "metric": "git_status_cold",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    6403.0,
+    6842.0,
+    6432.0,
+    6843.0,
+    6386.0
+   ],
+   "n": 5,
+   "median": 6432.0,
+   "p95": 6843.0,
+   "min": 6386.0,
+   "max": 6843.0,
+   "mean": 6581.2,
+   "extra": {
+    "load_start": 3.54,
+    "waited_s": 0,
+    "load_per_round": [
+     3.54,
+     3.14,
+     2.66,
+     2.51,
+     2.47,
+     2.31
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "coldstat",
+   "case": "git_status_linux",
+   "engine": "katamaran",
+   "metric": "git_status_warm",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    175.0,
+    180.0,
+    176.0,
+    174.0,
+    181.0
+   ],
+   "n": 5,
+   "median": 176.0,
+   "p95": 181.0,
+   "min": 174.0,
+   "max": 181.0,
+   "mean": 177.2,
+   "extra": {
+    "load_start": 3.54,
+    "waited_s": 0,
+    "load_per_round": [
+     3.54,
+     3.14,
+     2.66,
+     2.51,
+     2.47,
+     2.31
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "composer_install_warm",
+   "engine": "katamaran",
+   "metric": "composer_install",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    3544.0,
+    3487.0,
+    3566.0,
+    3543.0,
+    3545.0
+   ],
+   "n": 5,
+   "median": 3544.0,
+   "p95": 3566.0,
+   "min": 3487.0,
+   "max": 3566.0,
+   "mean": 3537.0,
+   "extra": {
+    "load_start": 2.53,
+    "waited_s": 0,
+    "load_per_round": [
+     2.53,
+     2.78,
+     2.43,
+     4.42,
+     4.92,
+     4.64
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "bun_install_warm",
+   "engine": "katamaran",
+   "metric": "bun_install",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    3979.0,
+    3949.0,
+    3784.0,
+    3957.0,
+    3670.0
+   ],
+   "n": 5,
+   "median": 3949.0,
+   "p95": 3979.0,
+   "min": 3670.0,
+   "max": 3979.0,
+   "mean": 3867.8,
+   "extra": {
+    "load_start": 3.92,
+    "waited_s": 30,
+    "load_per_round": [
+     3.92,
+     3.46,
+     3.23,
+     3.71,
+     4.05,
+     4.47
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "vite_build",
+   "engine": "katamaran",
+   "metric": "vite_build",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    6329.0,
+    6260.0,
+    6166.0,
+    6498.0,
+    6221.0
+   ],
+   "n": 5,
+   "median": 6260.0,
+   "p95": 6498.0,
+   "min": 6166.0,
+   "max": 6498.0,
+   "mean": 6294.8,
+   "extra": {
+    "load_start": 3.94,
+    "waited_s": 30,
+    "load_per_round": [
+     3.94,
+     4.42,
+     4.75,
+     4.45,
+     4.37,
+     4.73
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "migrate_seed",
+   "engine": "katamaran",
+   "metric": "migrate_fresh",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    767.0,
+    817.0,
+    803.0,
+    772.0,
+    770.0
+   ],
+   "n": 5,
+   "median": 772.0,
+   "p95": 817.0,
+   "min": 767.0,
+   "max": 817.0,
+   "mean": 785.8,
+   "extra": {
+    "load_start": 3.48,
+    "waited_s": 30,
+    "load_per_round": [
+     3.48,
+     2.45,
+     3.32,
+     2.95,
+     2.54,
+     2.27
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "migrate_seed",
+   "engine": "katamaran",
+   "metric": "seed_total",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    7351.0,
+    8913.0,
+    7783.0,
+    7395.0,
+    7592.0
+   ],
+   "n": 5,
+   "median": 7592.0,
+   "p95": 8913.0,
+   "min": 7351.0,
+   "max": 8913.0,
+   "mean": 7806.8,
+   "extra": {
+    "load_start": 3.48,
+    "waited_s": 30,
+    "load_per_round": [
+     3.48,
+     2.45,
+     3.32,
+     2.95,
+     2.54,
+     2.27
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "migrate_seed",
+   "engine": "katamaran",
+   "metric": "factory_inserts_ms",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    5606.0,
+    6806.0,
+    5952.0,
+    5594.0,
+    5905.0
+   ],
+   "n": 5,
+   "median": 5905.0,
+   "p95": 6806.0,
+   "min": 5594.0,
+   "max": 6806.0,
+   "mean": 5972.6,
+   "extra": {
+    "load_start": 3.48,
+    "waited_s": 30,
+    "load_per_round": [
+     3.48,
+     2.45,
+     3.32,
+     2.95,
+     2.54,
+     2.27
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "migrate_seed",
+   "engine": "katamaran",
+   "metric": "transactions_3000_ms",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    1597.0,
+    1951.0,
+    1670.0,
+    1647.0,
+    1533.0
+   ],
+   "n": 5,
+   "median": 1647.0,
+   "p95": 1951.0,
+   "min": 1533.0,
+   "max": 1951.0,
+   "mean": 1679.6,
+   "extra": {
+    "load_start": 3.48,
+    "waited_s": 30,
+    "load_per_round": [
+     3.48,
+     2.45,
+     3.32,
+     2.95,
+     2.54,
+     2.27
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "laravel_request_opcache_off",
+   "engine": "katamaran",
+   "metric": "per_request",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    156.12,
+    155.4,
+    156.3,
+    155.22,
+    155.12
+   ],
+   "n": 5,
+   "median": 155.4,
+   "p95": 156.3,
+   "min": 155.12,
+   "max": 156.3,
+   "mean": 155.632,
+   "extra": {
+    "load_start": 2.04,
+    "waited_s": 0,
+    "load_per_round": [
+     2.04,
+     1.96,
+     2.04,
+     1.81,
+     2.03,
+     2.16
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "laravel_request_opcache_on",
+   "engine": "katamaran",
+   "metric": "per_request",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    26.58,
+    26.06,
+    26.3,
+    26.24,
+    26.62
+   ],
+   "n": 5,
+   "median": 26.3,
+   "p95": 26.62,
+   "min": 26.06,
+   "max": 26.62,
+   "mean": 26.360000000000003,
+   "extra": {
+    "load_start": 2.48,
+    "waited_s": 0,
+    "load_per_round": [
+     2.48,
+     2.92,
+     2.85,
+     2.7,
+     2.8,
+     2.74
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "parallel_unzip_x10",
+   "engine": "katamaran",
+   "metric": "parallel_unzip",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    981.0,
+    986.0,
+    975.0,
+    991.0,
+    974.0
+   ],
+   "n": 5,
+   "median": 981.0,
+   "p95": 991.0,
+   "min": 974.0,
+   "max": 991.0,
+   "mean": 981.4,
+   "extra": {
+    "load_start": 2.6,
+    "waited_s": 0,
+    "load_per_round": [
+     2.6,
+     2.63,
+     2.82,
+     8.54,
+     8.1,
+     7.93
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "parallel_unzip_x10",
+   "engine": "katamaran",
+   "metric": "zips",
+   "unit": "zips",
+   "better": "lower",
+   "values": [
+    240.0,
+    240.0,
+    240.0,
+    240.0,
+    240.0
+   ],
+   "n": 5,
+   "median": 240.0,
+   "p95": 240.0,
+   "min": 240.0,
+   "max": 240.0,
+   "mean": 240.0,
+   "extra": {
+    "load_start": 2.6,
+    "waited_s": 0,
+    "load_per_round": [
+     2.6,
+     2.63,
+     2.82,
+     8.54,
+     8.1,
+     7.93
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "parallel_unzip_x10",
+   "engine": "katamaran",
+   "metric": "files",
+   "unit": "files",
+   "better": "lower",
+   "values": [
+    18515.0,
+    18515.0,
+    18515.0,
+    18515.0,
+    18515.0
+   ],
+   "n": 5,
+   "median": 18515.0,
+   "p95": 18515.0,
+   "min": 18515.0,
+   "max": 18515.0,
+   "mean": 18515.0,
+   "extra": {
+    "load_start": 2.6,
+    "waited_s": 0,
+    "load_per_round": [
+     2.6,
+     2.63,
+     2.82,
+     8.54,
+     8.1,
+     7.93
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "dev",
+   "case": "container_to_container_redis",
+   "engine": "katamaran",
+   "metric": "round_trip_us",
+   "unit": "\u00b5s",
+   "better": "lower",
+   "values": [
+    6.6,
+    6.1,
+    6.15,
+    6.25,
+    6.15
+   ],
+   "n": 5,
+   "median": 6.15,
+   "p95": 6.6,
+   "min": 6.1,
+   "max": 6.6,
+   "mean": 6.25,
+   "extra": {
+    "load_start": 5.49,
+    "waited_s": 45,
+    "load_per_round": [
+     5.49,
+     5.29,
+     5.29,
+     5.29,
+     5.29,
+     5.29
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "down",
+   "unit": "MiB/s",
+   "better": "higher",
+   "values": [
+    4488.0,
+    4458.0,
+    4424.0,
+    3913.0,
+    4440.0
+   ],
+   "n": 5,
+   "median": 4440.0,
+   "p95": 4488.0,
+   "min": 3913.0,
+   "max": 4488.0,
+   "mean": 4344.6,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "up",
+   "unit": "MiB/s",
+   "better": "higher",
+   "values": [
+    5636.0,
+    5601.0,
+    5698.0,
+    6138.0,
+    5958.0
+   ],
+   "n": 5,
+   "median": 5698.0,
+   "p95": 6138.0,
+   "min": 5601.0,
+   "max": 6138.0,
+   "mean": 5806.2,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "pub",
+   "unit": "MiB/s",
+   "better": "higher",
+   "values": [
+    5114.0,
+    5131.0,
+    5077.0,
+    5155.0,
+    5213.0
+   ],
+   "n": 5,
+   "median": 5131.0,
+   "p95": 5213.0,
+   "min": 5077.0,
+   "max": 5213.0,
+   "mean": 5138.0,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "lat-keepalive-p50",
+   "unit": "\u00b5s",
+   "better": "lower",
+   "values": [
+    94.5,
+    95.8,
+    90.7,
+    98.3,
+    95.6
+   ],
+   "n": 5,
+   "median": 95.6,
+   "p95": 98.3,
+   "min": 90.7,
+   "max": 98.3,
+   "mean": 94.97999999999999,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "lat-keepalive-p99",
+   "unit": "\u00b5s",
+   "better": "lower",
+   "values": [
+    146.3,
+    146.6,
+    151.3,
+    154.0,
+    152.1
+   ],
+   "n": 5,
+   "median": 151.3,
+   "p95": 154.0,
+   "min": 146.3,
+   "max": 154.0,
+   "mean": 150.06,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "lat-newconn-p50",
+   "unit": "\u00b5s",
+   "better": "lower",
+   "values": [
+    333.5,
+    331.8,
+    319.0,
+    336.1,
+    333.8
+   ],
+   "n": 5,
+   "median": 333.5,
+   "p95": 336.1,
+   "min": 319.0,
+   "max": 336.1,
+   "mean": 330.84000000000003,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "netperf",
+   "engine": "katamaran",
+   "metric": "lat-newconn-p99",
+   "unit": "\u00b5s",
+   "better": "lower",
+   "values": [
+    654.0,
+    633.9,
+    628.1,
+    651.1,
+    675.3
+   ],
+   "n": 5,
+   "median": 651.1,
+   "p95": 675.3,
+   "min": 628.1,
+   "max": 675.3,
+   "mean": 648.48,
+   "extra": {
+    "load_start": 3.88,
+    "waited_s": 30,
+    "load_per_round": [
+     3.88,
+     5.6,
+     5.23,
+     5.38,
+     5.56,
+     5.51
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "dns_getaddrinfo",
+   "engine": "katamaran",
+   "metric": "lookup_same_name_us",
+   "unit": "\u00b5s",
+   "better": "lower",
+   "values": [
+    88.0,
+    102.7,
+    91.5,
+    96.6,
+    90.8
+   ],
+   "n": 5,
+   "median": 91.5,
+   "p95": 102.7,
+   "min": 88.0,
+   "max": 102.7,
+   "mean": 93.92,
+   "extra": {
+    "load_start": 3.85,
+    "waited_s": 30,
+    "load_per_round": [
+     3.85,
+     4.42,
+     4.42,
+     4.42,
+     4.42,
+     4.42
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "net",
+   "case": "dns_getaddrinfo",
+   "engine": "katamaran",
+   "metric": "eight_hosts_ms",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    0.56,
+    0.59,
+    0.53,
+    0.61,
+    0.5
+   ],
+   "n": 5,
+   "median": 0.56,
+   "p95": 0.61,
+   "min": 0.5,
+   "max": 0.61,
+   "mean": 0.558,
+   "extra": {
+    "load_start": 3.85,
+    "waited_s": 30,
+    "load_per_round": [
+     3.85,
+     4.42,
+     4.42,
+     4.42,
+     4.42,
+     4.42
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_r100",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    58.4,
+    119.4,
+    101.9,
+    102.8,
+    94.8
+   ],
+   "n": 5,
+   "median": 101.9,
+   "p95": 119.4,
+   "min": 58.4,
+   "max": 119.4,
+   "mean": 95.46000000000001,
+   "extra": {
+    "load_start": 3.69,
+    "waited_s": 0
+   }
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_r100",
+   "engine": "katamaran",
+   "metric": "throughput",
+   "unit": "MiB/s",
+   "better": "higher",
+   "values": [
+    1712.3,
+    837.5,
+    981.4,
+    972.8,
+    1054.9
+   ],
+   "n": 5,
+   "median": 981.4,
+   "p95": 1712.3,
+   "min": 837.5,
+   "max": 1712.3,
+   "mean": 1111.78,
+   "extra": {}
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_w100",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    72.2,
+    129.1,
+    91.7,
+    80.6,
+    99.8
+   ],
+   "n": 5,
+   "median": 91.7,
+   "p95": 129.1,
+   "min": 72.2,
+   "max": 129.1,
+   "mean": 94.67999999999999,
+   "extra": {
+    "load_start": 3.69,
+    "waited_s": 0
+   }
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_w100",
+   "engine": "katamaran",
+   "metric": "throughput",
+   "unit": "MiB/s",
+   "better": "higher",
+   "values": [
+    1385.0,
+    774.6,
+    1090.5,
+    1240.7,
+    1002.0
+   ],
+   "n": 5,
+   "median": 1090.5,
+   "p95": 1385.0,
+   "min": 774.6,
+   "max": 1385.0,
+   "mean": 1098.56,
+   "extra": {}
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_small",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    3169.4,
+    3467.0,
+    3553.7,
+    3617.9,
+    3732.8
+   ],
+   "n": 5,
+   "median": 3553.7,
+   "p95": 3732.8,
+   "min": 3169.4,
+   "max": 3732.8,
+   "mean": 3508.16,
+   "extra": {
+    "load_start": 3.69,
+    "waited_s": 0
+   }
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_lsR",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    3407.2,
+    4086.0,
+    3962.2,
+    4081.1,
+    4119.1
+   ],
+   "n": 5,
+   "median": 4081.1,
+   "p95": 4119.1,
+   "min": 3407.2,
+   "max": 4119.1,
+   "mean": 3931.12,
+   "extra": {
+    "load_start": 3.69,
+    "waited_s": 0
+   }
+  },
+  {
+   "block": "nfs",
+   "case": "nfs_cpR",
+   "engine": "katamaran",
+   "metric": "time",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    12872.5,
+    12764.1,
+    12840.5,
+    12849.6,
+    12734.8
+   ],
+   "n": 5,
+   "median": 12840.5,
+   "p95": 12872.5,
+   "min": 12734.8,
+   "max": 12872.5,
+   "mean": 12812.3,
+   "extra": {
+    "load_start": 3.69,
+    "waited_s": 0
+   }
+  },
+  {
+   "block": "amd64",
+   "case": "amd64_rosetta",
+   "engine": "katamaran",
+   "metric": "exec200",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    495.0,
+    498.0,
+    490.0,
+    495.0,
+    494.0
+   ],
+   "n": 5,
+   "median": 495.0,
+   "p95": 498.0,
+   "min": 490.0,
+   "max": 498.0,
+   "mean": 494.4,
+   "extra": {
+    "load_start": 4.66,
+    "waited_s": 45,
+    "load_per_round": [
+     4.66,
+     3.35,
+     2.81,
+     2.23,
+     2.1,
+     2.33
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "amd64",
+   "case": "amd64_rosetta",
+   "engine": "katamaran",
+   "metric": "python",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    850.0,
+    847.0,
+    851.0,
+    849.0,
+    848.0
+   ],
+   "n": 5,
+   "median": 849.0,
+   "p95": 851.0,
+   "min": 847.0,
+   "max": 851.0,
+   "mean": 849.0,
+   "extra": {
+    "load_start": 4.66,
+    "waited_s": 45,
+    "load_per_round": [
+     4.66,
+     3.35,
+     2.81,
+     2.23,
+     2.1,
+     2.33
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "amd64",
+   "case": "amd64_rosetta",
+   "engine": "katamaran",
+   "metric": "node",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    1179.0,
+    1174.0,
+    1182.0,
+    1180.0,
+    1176.0
+   ],
+   "n": 5,
+   "median": 1179.0,
+   "p95": 1182.0,
+   "min": 1174.0,
+   "max": 1182.0,
+   "mean": 1178.2,
+   "extra": {
+    "load_start": 4.66,
+    "waited_s": 45,
+    "load_per_round": [
+     4.66,
+     3.35,
+     2.81,
+     2.23,
+     2.1,
+     2.33
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "amd64",
+   "case": "amd64_rosetta",
+   "engine": "katamaran",
+   "metric": "gcc",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    20235.0,
+    20394.0,
+    20169.0,
+    20167.0,
+    20182.0
+   ],
+   "n": 5,
+   "median": 20182.0,
+   "p95": 20394.0,
+   "min": 20167.0,
+   "max": 20394.0,
+   "mean": 20229.4,
+   "extra": {
+    "load_start": 4.66,
+    "waited_s": 45,
+    "load_per_round": [
+     4.66,
+     3.35,
+     2.81,
+     2.23,
+     2.1,
+     2.33
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "amd64",
+   "case": "amd64_rosetta",
+   "engine": "katamaran",
+   "metric": "node_start",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    3292.0,
+    3302.0,
+    3306.0,
+    3306.0,
+    3302.0
+   ],
+   "n": 5,
+   "median": 3302.0,
+   "p95": 3306.0,
+   "min": 3292.0,
+   "max": 3306.0,
+   "mean": 3301.6,
+   "extra": {
+    "load_start": 4.66,
+    "waited_s": 45,
+    "load_per_round": [
+     4.66,
+     3.35,
+     2.81,
+     2.23,
+     2.1,
+     2.33
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "before",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    1745,
+    1643,
+    1643,
+    1540,
+    1540
+   ],
+   "n": 5,
+   "median": 1643,
+   "p95": 1745,
+   "min": 1540,
+   "max": 1745,
+   "mean": 1622.2,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "peak",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    5739,
+    5636,
+    5636,
+    5636,
+    5636
+   ],
+   "n": 5,
+   "median": 5636,
+   "p95": 5739,
+   "min": 5636,
+   "max": 5739,
+   "mean": 5656.6,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "after_10s",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    3281,
+    2974,
+    2769,
+    2769,
+    2667
+   ],
+   "n": 5,
+   "median": 2769,
+   "p95": 3281,
+   "min": 2667,
+   "max": 3281,
+   "mean": 2892.0,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "after_30s",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    1643,
+    1643,
+    1540,
+    1540,
+    1540
+   ],
+   "n": 5,
+   "median": 1540,
+   "p95": 1643,
+   "min": 1540,
+   "max": 1643,
+   "mean": 1581.2,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "after_60s",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    1643,
+    1643,
+    1540,
+    1540,
+    1540
+   ],
+   "n": 5,
+   "median": 1540,
+   "p95": 1643,
+   "min": 1540,
+   "max": 1643,
+   "mean": 1581.2,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "returned",
+   "unit": "MiB",
+   "better": "higher",
+   "values": [
+    4096,
+    3994,
+    4096,
+    4096,
+    4096
+   ],
+   "n": 5,
+   "median": 4096,
+   "p95": 4096,
+   "min": 3994,
+   "max": 4096,
+   "mean": 4075.6,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "mem",
+   "case": "mem_4gib",
+   "engine": "katamaran",
+   "metric": "retained",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    -102,
+    0,
+    -102,
+    0,
+    0
+   ],
+   "n": 5,
+   "median": 0,
+   "p95": 0,
+   "min": -102,
+   "max": 0,
+   "mean": -40.8,
+   "extra": {
+    "load_start": 3.66,
+    "waited_s": 15
+   }
+  },
+  {
+   "block": "dockerrun",
+   "case": "docker_run_rm_alpine_true",
+   "engine": "katamaran",
+   "metric": "wall",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    292.1,
+    257.8,
+    328.0,
+    253.4,
+    311.4,
+    338.2,
+    346.5,
+    265.4,
+    289.0,
+    319.9
+   ],
+   "n": 10,
+   "median": 301.75,
+   "p95": 346.5,
+   "min": 253.4,
+   "max": 346.5,
+   "mean": 300.16999999999996,
+   "extra": {
+    "load_start": 1.67,
+    "waited_s": 0,
+    "load_per_round": [
+     1.67,
+     1.67,
+     1.67,
+     1.67,
+     1.67,
+     2.5,
+     2.5,
+     2.5,
+     2.5,
+     2.5,
+     2.5,
+     2.5
+    ],
+    "after_failure": false
+   }
+  },
+  {
+   "block": "idle_end",
+   "case": "idle",
+   "engine": "katamaran",
+   "metric": "cpu_pct",
+   "unit": "% of one core",
+   "better": "lower",
+   "values": [
+    1.13,
+    1.23,
+    1.63,
+    1.07,
+    1.13
+   ],
+   "n": 5,
+   "median": 1.13,
+   "p95": 1.63,
+   "min": 1.07,
+   "max": 1.63,
+   "mean": 1.238,
+   "extra": {
+    "pids": [
+     51674,
+     51664
+    ],
+    "window_s": 30
+   }
+  },
+  {
+   "block": "idle_end",
+   "case": "idle",
+   "engine": "katamaran",
+   "metric": "footprint",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    1540,
+    1540,
+    1540,
+    1540,
+    1540
+   ],
+   "n": 5,
+   "median": 1540,
+   "p95": 1540,
+   "min": 1540,
+   "max": 1540,
+   "mean": 1540.0,
+   "extra": {}
+  },
+  {
+   "block": "idle_end",
+   "case": "idle_after_drop_caches",
+   "engine": "katamaran",
+   "metric": "footprint",
+   "unit": "MiB",
+   "better": "lower",
+   "values": [
+    1438,
+    1438,
+    1438
+   ],
+   "n": 3,
+   "median": 1438,
+   "p95": 1438,
+   "min": 1438,
+   "max": 1438,
+   "mean": 1438.0,
+   "extra": {}
+  },
+  {
+   "block": "coldstart",
+   "case": "cold_start",
+   "engine": "katamaran",
+   "metric": "ready",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    671,
+    657,
+    668,
+    670,
+    634
+   ],
+   "n": 5,
+   "median": 668,
+   "p95": 671,
+   "min": 634,
+   "max": 671,
+   "mean": 660.0,
+   "extra": {}
+  },
+  {
+   "block": "coldstart",
+   "case": "cold_start",
+   "engine": "katamaran",
+   "metric": "first_container",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    978,
+    967,
+    972,
+    963,
+    932
+   ],
+   "n": 5,
+   "median": 967,
+   "p95": 978,
+   "min": 932,
+   "max": 978,
+   "mean": 962.4,
+   "extra": {}
+  },
+  {
+   "block": "coldstart",
+   "case": "cold_start",
+   "engine": "katamaran",
+   "metric": "stop",
+   "unit": "ms",
+   "better": "lower",
+   "values": [
+    116,
+    120,
+    122,
+    130,
+    113
+   ],
+   "n": 5,
+   "median": 120,
+   "p95": 130,
+   "min": 113,
+   "max": 130,
+   "mean": 120.2,
+   "extra": {}
+  }
+ ],
+ "errors": []
+}

@@ -1,0 +1,82 @@
+Subject: [PATCH] fuse: answer access(2) and keep atime locally on owner_caller shares
+
+On owner_caller shares the host answers FUSE_ACCESS from the file mode
+alone, as if the caller owned the file. The guest caches that mode, so
+answer access(2) locally instead of a round trip per call: PHP's
+file_exists(), is_readable() and is_writable() are all access(2), and
+Composer's autoloader calls file_exists() for every class it resolves
+through PSR-4.
+
+Also stop dropping the cached atime after reads on these shares. It made
+the next stat() of a file that was just read go to the host, a GETATTR for
+every file PHP includes on every request.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/fs/fuse/dir.c b/fs/fuse/dir.c
+--- a/fs/fuse/dir.c	2026-11-18 22:30:24
++++ b/fs/fuse/dir.c	2026-11-18 22:30:39
+@@ -141,7 +141,12 @@
+  */
+ void fuse_invalidate_atime(struct inode *inode)
+ {
+-	if (!IS_RDONLY(inode))
++	/*
++	 * owner_caller shares do not track atime in the guest: dropping it
++	 * after every read made the next stat() of the file a round trip to
++	 * the host, which PHP pays for every file it includes.
++	 */
++	if (!IS_RDONLY(inode) && !get_fuse_conn(inode)->owner_caller)
+ 		fuse_invalidate_attr_mask(inode, STATX_ATIME);
+ }
+ 
+@@ -1580,6 +1585,37 @@
+ }
+ 
+ /*
++ * owner_caller: the host answers access(2) as if the caller owned the file,
++ * from its mode alone (any of the owner, group or other bits grants a
++ * permission; root may read and write anything). The guest caches the mode,
++ * so answer here instead of asking the host on every call: PHP's
++ * file_exists(), is_readable() and is_writable() are access(2).
++ */
++static int fuse_owner_caller_access(struct inode *inode, int mask)
++{
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	bool root = from_kuid(fc->user_ns, current_fsuid()) == 0;
++	umode_t mode;
++	int err;
++
++	if (READ_ONCE(fi->inval_mask) & STATX_MODE ||
++	    time_before64(fi->i_time, get_jiffies_64())) {
++		err = fuse_perm_getattr(inode, mask);
++		if (err)
++			return err;
++	}
++	mode = READ_ONCE(inode->i_mode);
++	if ((mask & MAY_READ) && !root && !(mode & 0444))
++		return -EACCES;
++	if ((mask & MAY_WRITE) && !root && !(mode & 0222))
++		return -EACCES;
++	if ((mask & MAY_EXEC) && !(mode & 0111))
++		return -EACCES;
++	return 0;
++}
++
++/*
+  * Check permission.  The two basic access models of FUSE are:
+  *
+  * 1) Local access checking ('default_permissions' mount option) based
+@@ -1641,7 +1677,10 @@
+ 		   noticed immediately, only after the attribute
+ 		   timeout has expired */
+ 	} else if (mask & (MAY_ACCESS | MAY_CHDIR)) {
+-		err = fuse_access(inode, mask);
++		if (fc->owner_caller)
++			err = fuse_owner_caller_access(inode, mask);
++		else
++			err = fuse_access(inode, mask);
+ 	} else if ((mask & MAY_EXEC) && S_ISREG(inode->i_mode)) {
+ 		if (!(inode->i_mode & S_IXUGO)) {
+ 			if (refreshed)

@@ -1,0 +1,240 @@
+Subject: [PATCH] arm64: per-task TSO for Rosetta; auxv and virtio_fs fixes for it
+
+Rosetta for Linux translates x86 code that assumes total store ordering.
+It asks for it with prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO) (the
+interface Asahi Linux proposed). Apple cores provide TSO through
+ACTLR_EL1.EnTSO, which only the host can set on a vCPU, so the task's
+model is kept in thread_struct and __switch_to asks the host to switch
+the vCPU with the vendor call 0xC6004B10 (an SMC, x1 = 1 for TSO) whenever
+the next task's model differs from the one the CPU runs. Native tasks
+never pay for TSO, and a CPU that only runs native tasks never traps.
+The call is probed once at boot; without host support the prctl fails
+with EINVAL as before. exec resets the task to the default model.
+
+Rosetta also aborts on auxv types it does not know ("unhandled auxillary
+vector type 29"). AT_HWCAP3 and AT_HWCAP4 are zero on arm64 today, so
+leave them out when they carry nothing (same idea as kiri's patch 0005).
+
+virtio_fs: KAT_FS_DRAIN (patch 0002) is one global call, so with a
+second virtio-fs device (the Rosetta share) the host drained the wrong
+device's queue and a request on the other one was never answered. Pass
+the queue's descriptor table address in x2, which the host matches to
+the device that owns it.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+--- a/arch/arm64/include/asm/processor.h	2026-11-17 11:11:40
++++ b/arch/arm64/include/asm/processor.h	2026-11-19 11:11:28
+@@ -170,6 +170,7 @@
+ 	unsigned int		vl_onexec[ARM64_VEC_MAX]; /* vl after next exec */
+ 	unsigned long		fault_address;	/* fault info */
+ 	unsigned long		fault_code;	/* ESR_EL1 value */
++	bool			tso;		/* PR_SET_MEM_MODEL_TSO */
+ 	struct debug_info	debug;		/* debugging */
+ 
+ 	struct user_fpsimd_state	kernel_fpsimd_state;
+@@ -436,6 +437,9 @@
+ int set_tsc_mode(unsigned int val);
+ #define GET_TSC_CTL(adr)        get_tsc_mode((adr))
+ #define SET_TSC_CTL(val)        set_tsc_mode((val))
++
++int arch_prctl_mem_model_get(struct task_struct *t);
++int arch_prctl_mem_model_set(struct task_struct *t, unsigned long model);
+ 
+ #endif /* __ASSEMBLY__ */
+ #endif /* __ASM_PROCESSOR_H */
+diff -ruN a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+--- a/arch/arm64/kernel/process.c	2026-11-17 11:11:40
++++ b/arch/arm64/kernel/process.c	2026-11-19 11:22:58
+@@ -42,6 +42,8 @@
+ #include <linux/thread_info.h>
+ #include <linux/prctl.h>
+ #include <linux/stacktrace.h>
++#include <linux/arm-smccc.h>
++#include <linux/jump_label.h>
+ 
+ #include <asm/alternative.h>
+ #include <asm/arch_timer.h>
+@@ -753,6 +755,72 @@
+ }
+ 
+ /*
++ * katamaran: per-task TSO. The vCPU's memory model (ACTLR_EL1.EnTSO) is
++ * owned by the host, which switches it on this vendor call (an SMC, like
++ * the other katamaran calls, since libkrun's PSCI 0.2 leaves no SMCCC 1.1
++ * conduit to discover). Only
++ * tasks that ask for TSO (Rosetta) run with it.
++ */
++#define KAT_SET_MEM_MODEL	0xC6004B10UL
++
++static DEFINE_STATIC_KEY_FALSE(kat_tso_available);
++static DEFINE_PER_CPU(bool, kat_tso_active);
++
++static int __init kat_tso_probe(void)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(KAT_SET_MEM_MODEL, 0, 0, 0, 0, 0, 0, 0, &res);
++	if (res.a0 == 0)
++		static_branch_enable(&kat_tso_available);
++	return 0;
++}
++early_initcall(kat_tso_probe);
++
++static void kat_tso_thread_switch(struct task_struct *next)
++{
++	struct arm_smccc_res res;
++	bool tso = next->thread.tso;
++
++	if (!static_branch_unlikely(&kat_tso_available) ||
++	    __this_cpu_read(kat_tso_active) == tso)
++		return;
++	arm_smccc_smc(KAT_SET_MEM_MODEL, tso, 0, 0, 0, 0, 0, 0, &res);
++	__this_cpu_write(kat_tso_active, tso);
++}
++
++static void kat_tso_set_current(bool tso)
++{
++	current->thread.tso = tso;
++	preempt_disable();
++	kat_tso_thread_switch(current);
++	preempt_enable();
++}
++
++int arch_prctl_mem_model_get(struct task_struct *t)
++{
++	if (!static_branch_unlikely(&kat_tso_available))
++		return -EINVAL;
++	return t->thread.tso ? PR_SET_MEM_MODEL_TSO : PR_SET_MEM_MODEL_DEFAULT;
++}
++
++int arch_prctl_mem_model_set(struct task_struct *t, unsigned long model)
++{
++	if (!static_branch_unlikely(&kat_tso_available))
++		return -EINVAL;
++	switch (model) {
++	case PR_SET_MEM_MODEL_TSO:
++		kat_tso_set_current(true);
++		return 0;
++	case PR_SET_MEM_MODEL_DEFAULT:
++		kat_tso_set_current(false);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
+  * Thread switching.
+  */
+ __notrace_funcgraph __sched
+@@ -787,6 +855,7 @@
+ 	 * registers.
+ 	 */
+ 	mte_thread_switch(next);
++	kat_tso_thread_switch(next);
+ 	/* avoid expensive SCTLR_EL1 accesses if no change */
+ 	if (prev->thread.sctlr_user != next->thread.sctlr_user)
+ 		update_sctlr_el1(next->thread.sctlr_user);
+@@ -865,6 +934,9 @@
+ void arch_setup_new_exec(void)
+ {
+ 	unsigned long mmflags = 0;
++
++	if (current->thread.tso)
++		kat_tso_set_current(false);
+ 
+ 	if (is_compat_task()) {
+ 		mmflags = MMCF_AARCH32;
+diff -ruN a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+--- a/fs/binfmt_elf.c	2026-11-17 11:11:40
++++ b/fs/binfmt_elf.c	2026-11-19 11:11:28
+@@ -266,11 +266,17 @@
+ #ifdef ELF_HWCAP2
+ 	NEW_AUX_ENT(AT_HWCAP2, ELF_HWCAP2);
+ #endif
++	/*
++	 * Rosetta for Linux aborts on auxv types it does not know; a zero
++	 * HWCAP3/4 carries no information, so leave those entries out.
++	 */
+ #ifdef ELF_HWCAP3
+-	NEW_AUX_ENT(AT_HWCAP3, ELF_HWCAP3);
++	if (ELF_HWCAP3)
++		NEW_AUX_ENT(AT_HWCAP3, ELF_HWCAP3);
+ #endif
+ #ifdef ELF_HWCAP4
+-	NEW_AUX_ENT(AT_HWCAP4, ELF_HWCAP4);
++	if (ELF_HWCAP4)
++		NEW_AUX_ENT(AT_HWCAP4, ELF_HWCAP4);
+ #endif
+ 	NEW_AUX_ENT(AT_EXECFN, bprm->exec);
+ 	if (k_platform) {
+diff -ruN a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+--- a/fs/fuse/virtio_fs.c	2026-11-19 11:23:02
++++ b/fs/fuse/virtio_fs.c	2026-11-19 11:38:46
+@@ -1441,7 +1441,12 @@
+ {
+ 	struct arm_smccc_res res;
+ 
+-	arm_smccc_smc(KAT_FS_DRAIN, vq->index, 0, 0, 0, 0, 0, 0, &res);
++	/*
++	 * The call is global and every virtio-fs device has its own queues, so
++	 * the descriptor table's address tells the host which device this is.
++	 */
++	arm_smccc_smc(KAT_FS_DRAIN, vq->index, virtqueue_get_desc_addr(vq),
++		      0, 0, 0, 0, 0, &res);
+ 	return res.a0 == 0;
+ }
+ 
+diff -ruN a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+--- a/include/uapi/linux/prctl.h	2026-11-17 11:11:40
++++ b/include/uapi/linux/prctl.h	2026-11-19 11:11:28
+@@ -386,4 +386,10 @@
+ # define PR_FUTEX_HASH_SET_SLOTS	1
+ # define PR_FUTEX_HASH_GET_SLOTS	2
+ 
++/* Memory model of the calling task (x86 emulation needs TSO) */
++#define PR_GET_MEM_MODEL		0x6d4d444c
++#define PR_SET_MEM_MODEL		0x4d4d444c
++# define PR_SET_MEM_MODEL_DEFAULT	0
++# define PR_SET_MEM_MODEL_TSO		1
++
+ #endif /* _LINUX_PRCTL_H */
+diff -ruN a/kernel/sys.c b/kernel/sys.c
+--- a/kernel/sys.c	2026-11-17 11:11:40
++++ b/kernel/sys.c	2026-11-19 11:11:28
+@@ -2376,6 +2376,16 @@
+ 	return -EINVAL;
+ }
+ 
++int __weak arch_prctl_mem_model_get(struct task_struct *t)
++{
++	return -EINVAL;
++}
++
++int __weak arch_prctl_mem_model_set(struct task_struct *t, unsigned long model)
++{
++	return -EINVAL;
++}
++
+ int __weak arch_get_shadow_stack_status(struct task_struct *t, unsigned long __user *status)
+ {
+ 	return -EINVAL;
+@@ -2867,6 +2877,16 @@
+ 		if (arg3 || arg4 || arg5)
+ 			return -EINVAL;
+ 		error = posixtimer_create_prctl(arg2);
++		break;
++	case PR_GET_MEM_MODEL:
++		if (arg2 || arg3 || arg4 || arg5)
++			return -EINVAL;
++		error = arch_prctl_mem_model_get(me);
++		break;
++	case PR_SET_MEM_MODEL:
++		if (arg3 || arg4 || arg5)
++			return -EINVAL;
++		error = arch_prctl_mem_model_set(me, arg2);
+ 		break;
+ 	case PR_FUTEX_HASH:
+ 		error = futex_hash_prctl(arg2, arg3, arg4);

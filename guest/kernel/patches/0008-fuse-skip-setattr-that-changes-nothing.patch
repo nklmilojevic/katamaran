@@ -1,0 +1,74 @@
+Subject: [PATCH] fuse: skip a chmod or chown that changes nothing
+
+unzip, tar and package managers chmod every file they extract to the
+mode it was created with, and a chown to the current owner is as common.
+Each was a FUSE_SETATTR round trip to the host that changed nothing.
+When the cached attributes are valid and already show the requested
+mode, owner and group, return without asking the server. A chown of a
+set-user-ID or set-group-ID file still goes to the server, which clears
+those bits. On owner_caller shares the owner shown is the caller, so
+that is what a chown is compared with.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/fs/fuse/dir.c b/fs/fuse/dir.c
+--- a/fs/fuse/dir.c	2026-11-18 23:53:54
++++ b/fs/fuse/dir.c	2026-11-18 23:54:11
+@@ -2200,6 +2200,47 @@
+ 	return err;
+ }
+ 
++/*
++ * Whether a chmod or chown would leave the file as it is: the mode, owner
++ * and group it asks for are the ones the cached attributes already show.
++ * Extracting an archive or installing packages does a chmod per file to
++ * the mode the file was just created with, and each one was a round trip
++ * to the server. Only trusted while the cached attributes are valid, and
++ * never when a chown would have to clear set-user-ID or set-group-ID.
++ */
++static bool fuse_setattr_changes_nothing(struct mnt_idmap *idmap,
++					 struct inode *inode,
++					 const struct iattr *attr)
++{
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	unsigned int ia_valid = attr->ia_valid;
++	unsigned int ownership = ATTR_UID | ATTR_GID;
++
++	if (!(ia_valid & (ATTR_MODE | ownership)) ||
++	    ia_valid & ~(ATTR_MODE | ownership | ATTR_CTIME | ATTR_KILL_SUID |
++			 ATTR_KILL_SGID))
++		return false;
++	if (READ_ONCE(fi->inval_mask) & (STATX_MODE | STATX_UID | STATX_GID) ||
++	    time_before64(fi->i_time, get_jiffies_64()))
++		return false;
++	if ((ia_valid & ATTR_MODE) && attr->ia_mode != inode->i_mode)
++		return false;
++	if ((ia_valid & ownership) && (inode->i_mode & (S_ISUID | S_ISGID)))
++		return false;
++	if (ia_valid & ATTR_UID &&
++	    !(fc->owner_caller ?
++		      vfsuid_eq_kuid(attr->ia_vfsuid, current_fsuid()) :
++		      vfsuid_eq(attr->ia_vfsuid, i_uid_into_vfsuid(idmap, inode))))
++		return false;
++	if (ia_valid & ATTR_GID &&
++	    !(fc->owner_caller ?
++		      vfsgid_eq_kgid(attr->ia_vfsgid, current_fsgid()) :
++		      vfsgid_eq(attr->ia_vfsgid, i_gid_into_vfsgid(idmap, inode))))
++		return false;
++	return true;
++}
++
+ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
+ 			struct iattr *attr)
+ {
+@@ -2213,6 +2254,9 @@
+ 
+ 	if (!fuse_allow_current_process(get_fuse_conn(inode)))
+ 		return -EACCES;
++
++	if (fuse_setattr_changes_nothing(idmap, inode, attr))
++		return 0;
+ 
+ 	if (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID)) {
+ 		attr->ia_valid &= ~(ATTR_KILL_SUID | ATTR_KILL_SGID |

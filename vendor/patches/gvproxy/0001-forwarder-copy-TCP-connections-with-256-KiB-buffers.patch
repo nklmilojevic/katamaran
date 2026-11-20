@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 15:16:36 +0100
+Subject: [PATCH 1/6] forwarder: copy TCP connections with 256 KiB buffers
+
+On macOS io.Copy between a *net.TCPConn and gonet falls back to a 32 KiB
+buffer, so gVisor sends 32 KiB segments even with a 64 KiB MTU. Copy with
+256 KiB buffers instead, keeping tcpproxy's half-close and keepalive
+behaviour.
+---
+ pkg/services/forwarder/copy.go      |  51 +++++++++++
+ pkg/services/forwarder/copy_test.go | 134 ++++++++++++++++++++++++++++
+ pkg/services/forwarder/tcp.go       |   9 +-
+ 3 files changed, 186 insertions(+), 8 deletions(-)
+ create mode 100644 pkg/services/forwarder/copy.go
+ create mode 100644 pkg/services/forwarder/copy_test.go
+
+diff --git a/pkg/services/forwarder/copy.go b/pkg/services/forwarder/copy.go
+new file mode 100644
+index 0000000..f14d605
+--- /dev/null
++++ b/pkg/services/forwarder/copy.go
+@@ -0,0 +1,51 @@
++package forwarder
++
++import (
++	"io"
++	"net"
++	"time"
++)
++
++// copyBufferSize is the size of each read from one side of a forwarded
++// connection and so of each write to the other. io.Copy would use 32 KiB on
++// macOS (no splice), and gVisor then sends segments of at most that size even
++// when the MTU allows 64 KiB, doubling the per-frame cost on the guest link.
++const copyBufferSize = 256 << 10
++
++const hostKeepAlive = time.Minute
++
++// halfCloser is a connection whose directions can be shut down separately,
++// as both *net.TCPConn and gVisor's *gonet.TCPConn are.
++type halfCloser interface {
++	net.Conn
++	CloseRead() error
++	CloseWrite() error
++}
++
++// The wrappers hide ReadFrom and WriteTo, so io.CopyBuffer uses our buffer
++// instead of falling back to its own 32 KiB one.
++type readerOnly struct{ io.Reader }
++type writerOnly struct{ io.Writer }
++
++// proxyConns copies both ways between a guest connection and a host one until
++// both directions are done, passing each EOF on as a half-close, like
++// tcpproxy.DialProxy.HandleConn which it replaces.
++func proxyConns(guest, host halfCloser) {
++	if tcp, ok := host.(*net.TCPConn); ok {
++		_ = tcp.SetKeepAlive(true)
++		_ = tcp.SetKeepAlivePeriod(hostKeepAlive)
++	}
++	done := make(chan struct{}, 2)
++	pump := func(dst, src halfCloser) {
++		_, _ = io.CopyBuffer(writerOnly{dst}, readerOnly{src}, make([]byte, copyBufferSize))
++		_ = src.CloseRead()
++		_ = dst.CloseWrite()
++		done <- struct{}{}
++	}
++	go pump(guest, host)
++	go pump(host, guest)
++	<-done
++	<-done
++	_ = guest.Close()
++	_ = host.Close()
++}
+diff --git a/pkg/services/forwarder/copy_test.go b/pkg/services/forwarder/copy_test.go
+new file mode 100644
+index 0000000..5802091
+--- /dev/null
++++ b/pkg/services/forwarder/copy_test.go
+@@ -0,0 +1,134 @@
++package forwarder
++
++import (
++	"bytes"
++	"crypto/rand"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++// tcpPair returns the two ends of a loopback TCP connection.
++func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	accepted := make(chan net.Conn, 1)
++	go func() {
++		c, _ := ln.Accept()
++		accepted <- c
++	}()
++	a, err := net.Dial("tcp", ln.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	b := <-accepted
++	if b == nil {
++		t.Fatal("accept failed")
++	}
++	return a.(*net.TCPConn), b.(*net.TCPConn)
++}
++
++func randomBytes(t *testing.T, n int) []byte {
++	t.Helper()
++	b := make([]byte, n)
++	if _, err := rand.Read(b); err != nil {
++		t.Fatal(err)
++	}
++	return b
++}
++
++// The guest app talks to guestApp; proxyConns sits between guestProxy and
++// hostProxy; the host app talks to hostApp.
++func TestProxyConnsCopiesBothWaysWithHalfClose(t *testing.T) {
++	guestApp, guestProxy := tcpPair(t)
++	hostProxy, hostApp := tcpPair(t)
++	done := make(chan struct{})
++	go func() {
++		proxyConns(guestProxy, hostProxy)
++		close(done)
++	}()
++
++	up := randomBytes(t, 5*copyBufferSize+123)
++	down := randomBytes(t, 3*copyBufferSize+7)
++
++	// The guest sends everything and half-closes; the host must see EOF
++	// while it can still answer.
++	go func() {
++		_, _ = guestApp.Write(up)
++		_ = guestApp.CloseWrite()
++	}()
++	got, err := io.ReadAll(hostApp)
++	if err != nil || !bytes.Equal(got, up) {
++		t.Fatalf("host received %d bytes (err %v), want %d", len(got), err, len(up))
++	}
++	if _, err := hostApp.Write(down); err != nil {
++		t.Fatal(err)
++	}
++	_ = hostApp.CloseWrite()
++	got, err = io.ReadAll(guestApp)
++	if err != nil || !bytes.Equal(got, down) {
++		t.Fatalf("guest received %d bytes (err %v), want %d", len(got), err, len(down))
++	}
++
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("proxyConns did not return after both sides closed")
++	}
++	// Both proxy ends are closed.
++	if _, err := guestProxy.Write([]byte{1}); err == nil {
++		t.Fatal("guest side still open")
++	}
++	if _, err := hostProxy.Write([]byte{1}); err == nil {
++		t.Fatal("host side still open")
++	}
++}
++
++// writeRecorder records the size of each write.
++type writeRecorder struct {
++	halfCloser
++	sizes []int
++}
++
++func (w *writeRecorder) Write(p []byte) (int, error) {
++	w.sizes = append(w.sizes, len(p))
++	return w.halfCloser.Write(p)
++}
++
++func TestProxyConnsWritesLargeChunks(t *testing.T) {
++	guestApp, guestProxy := tcpPair(t)
++	hostProxy, hostApp := tcpPair(t)
++	rec := &writeRecorder{halfCloser: guestProxy}
++	done := make(chan struct{})
++	go func() {
++		proxyConns(rec, hostProxy)
++		close(done)
++	}()
++	_ = guestApp.CloseWrite()
++
++	// Give the host side time to queue everything, so reads are not
++	// limited by how fast the test writes.
++	payload := randomBytes(t, 8*copyBufferSize)
++	go func() {
++		_, _ = hostApp.Write(payload)
++		_ = hostApp.CloseWrite()
++	}()
++	time.Sleep(100 * time.Millisecond)
++	got, err := io.ReadAll(guestApp)
++	if err != nil || !bytes.Equal(got, payload) {
++		t.Fatalf("guest received %d bytes (err %v)", len(got), err)
++	}
++	<-done
++	largest := 0
++	for _, s := range rec.sizes {
++		largest = max(largest, s)
++	}
++	if largest <= 32<<10 {
++		t.Fatalf("largest write was %d bytes; the 32 KiB io.Copy buffer is still in use", largest)
++	}
++}
+diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
+index 6a1f548..5ba9461 100644
+--- a/pkg/services/forwarder/tcp.go
++++ b/pkg/services/forwarder/tcp.go
+@@ -1,13 +1,11 @@
+ package forwarder
+ 
+ import (
+-	"context"
+ 	"fmt"
+ 	"net"
+ 	"sync"
+ 	"time"
+ 
+-	"github.com/inetaf/tcpproxy"
+ 	log "github.com/sirupsen/logrus"
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+ 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+@@ -63,12 +61,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			return
+ 		}
+ 
+-		remote := tcpproxy.DialProxy{
+-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+-				return outbound, nil
+-			},
+-		}
+-		remote.HandleConn(gonet.NewTCPConn(&wq, ep))
++		proxyConns(gonet.NewTCPConn(&wq, ep), outbound.(*net.TCPConn))
+ 	})
+ }
+ 

@@ -1,0 +1,271 @@
+/* Warm editorial paper theme: cream archival paper light mode + charcoal ink dark mode. */
+
+:root {
+	--sl-font: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, sans-serif;
+	--sl-font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+	--kat-font-serif: 'Newsreader Variable', Georgia, 'Times New Roman', serif;
+
+	--sl-content-width: 46rem;
+	--sl-line-height: 1.72;
+}
+
+/* Light mode: warm cream paper, stone linen sidebar, burnished terracotta accent */
+:root[data-theme='light'] {
+	--sl-color-white: #1c1917;
+	--sl-color-gray-1: #292524;
+	--sl-color-gray-2: #44403c;
+	--sl-color-gray-3: #57534e;
+	--sl-color-gray-4: #78716c;
+	--sl-color-gray-5: #d6cfc4;
+	--sl-color-gray-6: #efeae2;
+	--sl-color-gray-7: #f5f1ea;
+	--sl-color-black: #faf8f5;
+
+	--sl-color-bg: #faf8f5;
+	--sl-color-bg-nav: rgb(250 248 245 / 0.9);
+	--sl-color-bg-sidebar: #f3efe8;
+	--sl-color-bg-inline-code: #efeae0;
+	--sl-color-hairline-light: #e6dfd5;
+	--sl-color-hairline: #d8d0c4;
+	--sl-color-hairline-shade: #e6dfd5;
+
+	--sl-color-accent-low: #f4e4dc;
+	--sl-color-accent: #b4532a;
+	--sl-color-accent-high: #7c3214;
+	--sl-color-text-accent: #a64620;
+	--sl-color-text-invert: #faf8f5;
+
+	--kat-card-bg: #f6f2eb;
+	--kat-card-hover: #efe9de;
+	--kat-rule: #e4ddd2;
+	--kat-rule-strong: #c9bfb0;
+}
+
+/* Dark mode: warm charcoal ink, obsidian linen sidebar, warm terracotta coral accent */
+:root[data-theme='dark'] {
+	--sl-color-white: #f2ede6;
+	--sl-color-gray-1: #e4ddd3;
+	--sl-color-gray-2: #c5bdb1;
+	--sl-color-gray-3: #9c9488;
+	--sl-color-gray-4: #756e64;
+	--sl-color-gray-5: #38332d;
+	--sl-color-gray-6: #24211d;
+	--sl-color-black: #161513;
+
+	--sl-color-bg: #161513;
+	--sl-color-bg-nav: rgb(22 21 19 / 0.9);
+	--sl-color-bg-sidebar: #1b1916;
+	--sl-color-bg-inline-code: #25221d;
+	--sl-color-hairline-light: #2d2924;
+	--sl-color-hairline: #36312b;
+	--sl-color-hairline-shade: #11100e;
+
+	--sl-color-accent-low: #2e1e17;
+	--sl-color-accent: #e07a52;
+	--sl-color-accent-high: #f3b59c;
+	--sl-color-text-accent: #e4845e;
+	--sl-color-text-invert: #161513;
+
+	--kat-card-bg: #1d1b18;
+	--kat-card-hover: #25221e;
+	--kat-rule: #2e2a25;
+	--kat-rule-strong: #4a433a;
+}
+
+/* Header and wordmark */
+header.header {
+	backdrop-filter: blur(10px);
+	border-bottom: 1px solid var(--sl-color-hairline-light);
+}
+
+.site-title {
+	font-family: var(--kat-font-serif);
+	font-size: 1.32rem;
+	font-weight: 500;
+	letter-spacing: -0.015em;
+	color: var(--sl-color-white);
+	gap: 0.55rem;
+}
+
+.site-title img {
+	height: 1.65rem;
+	width: 1.65rem;
+	border-radius: 0.35rem;
+}
+
+/* Serif display headings */
+h1,
+.hero h1,
+.sl-markdown-content h2 {
+	font-family: var(--kat-font-serif);
+	font-weight: 500;
+	letter-spacing: -0.02em;
+	color: var(--sl-color-white);
+}
+
+.content-panel h1#_top {
+	font-size: clamp(2.25rem, 4vw, 3rem);
+	line-height: 1.08;
+	font-weight: 500;
+}
+
+.sl-markdown-content h2 {
+	font-size: 1.7rem;
+	line-height: 1.2;
+	margin-top: 2.75rem;
+	padding-bottom: 0.35rem;
+	border-bottom: 1px solid var(--kat-rule);
+}
+
+.sl-markdown-content h3 {
+	font-family: var(--sl-font);
+	font-size: 1.08rem;
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin-top: 2rem;
+	color: var(--sl-color-white);
+}
+
+/* Splash hero: calm paper proportions, no grid or glow */
+.hero {
+	padding-block: clamp(2.5rem, 6vw, 4.5rem) clamp(1.5rem, 3.5vw, 2.25rem);
+}
+
+.hero h1 {
+	font-size: clamp(2.85rem, 5.8vw, 4.25rem);
+	line-height: 1.02;
+	letter-spacing: -0.025em;
+	font-weight: 450;
+}
+
+.hero .tagline {
+	font-size: clamp(1.06rem, 1.5vw, 1.2rem);
+	max-width: 42rem;
+	color: var(--sl-color-gray-2);
+	line-height: 1.6;
+}
+
+/* Editorial links and inline code */
+.sl-markdown-content a:not(.sl-link-card, .sl-link-button) {
+	color: var(--sl-color-text-accent);
+	text-decoration-color: color-mix(in srgb, var(--sl-color-text-accent) 42%, transparent);
+	text-underline-offset: 3px;
+}
+
+.sl-markdown-content a:not(.sl-link-card, .sl-link-button):hover {
+	text-decoration-color: var(--sl-color-text-accent);
+}
+
+.sl-markdown-content :not(pre) > code {
+	font-size: 0.87em;
+	padding: 0.08em 0.34em;
+	border-radius: 3px;
+	border: 1px solid var(--kat-rule);
+}
+
+/* Bookish horizontal-rule tables (no heavy outer box) */
+.sl-markdown-content table {
+	display: table;
+	width: 100%;
+	border-collapse: collapse;
+	border-top: 1.5px solid var(--kat-rule-strong);
+	border-bottom: 1.5px solid var(--kat-rule-strong);
+	font-variant-numeric: tabular-nums;
+	font-size: 0.92rem;
+}
+
+.sl-markdown-content th {
+	background: transparent;
+	color: var(--sl-color-gray-3);
+	font-family: var(--sl-font);
+	font-weight: 600;
+	font-size: 0.78rem;
+	text-transform: uppercase;
+	letter-spacing: 0.05em;
+	border-top: 0;
+	border-left: 0;
+	border-right: 0;
+	border-bottom: 1px solid var(--kat-rule-strong);
+	padding: 0.65rem 0.75rem;
+}
+
+.sl-markdown-content td {
+	border-left: 0;
+	border-right: 0;
+	border-top: 0;
+	border-bottom: 1px solid var(--kat-rule);
+	padding: 0.58rem 0.75rem;
+}
+
+.sl-markdown-content tbody tr:last-child td {
+	border-bottom: 0;
+}
+
+/* Warm linen link cards */
+.sl-link-card {
+	background: var(--kat-card-bg);
+	border: 1px solid var(--kat-rule);
+	border-radius: 0.4rem;
+	box-shadow: none;
+	transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.sl-link-card:hover {
+	background: var(--kat-card-hover);
+	border-color: var(--kat-rule-strong);
+}
+
+.sl-link-card .title {
+	font-family: var(--kat-font-serif);
+	font-size: 1.18rem;
+	font-weight: 500;
+	letter-spacing: -0.01em;
+}
+
+/* Sidebar */
+.sidebar-content a {
+	border-radius: 0.25rem;
+	font-size: 0.9rem;
+}
+
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover {
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-text-accent);
+	font-weight: 500;
+}
+
+.sidebar-content summary .large {
+	font-size: 0.74rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	color: var(--sl-color-gray-4);
+}
+
+/* Buttons */
+.sl-link-button {
+	border-radius: 0.35rem;
+	font-weight: 500;
+}
+
+.sl-link-button.primary {
+	background: var(--sl-color-accent);
+	border-color: var(--sl-color-accent);
+	color: var(--sl-color-text-invert);
+}
+
+.sl-link-button.primary:hover {
+	filter: brightness(0.92);
+}
+
+.sl-link-button.minimal {
+	color: var(--sl-color-gray-1);
+}
+
+/* Subtle warm border for code blocks */
+.expressive-code .frame {
+	border: 1px solid var(--kat-rule);
+	border-radius: 0.375rem;
+	overflow: hidden;
+}

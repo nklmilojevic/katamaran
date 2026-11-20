@@ -1,0 +1,40 @@
+[package]
+name = "krun-init-blob"
+version = "0.1.0-2.0.0-dev"
+edition = "2024"
+description = "Default init binary blob for libkrun guests"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
+build = "build.rs"
+
+[features]
+amd-sev = []
+tdx = []
+timesync = []
+default = ["krun"]
+# `krun` links libkrun and uses its Rust types directly, which is what an
+# in-tree consumer wants. It is implicit from the optional dependency, so
+# building the cdylib passes --no-default-features to leave it out.
+#
+# `ffi` replaces those types with the generated client. The linking mode of
+# that client is the final binary's choice, so nothing is selected here.
+ffi = ["dep:libkrun-via-libc"]
+
+[dependencies]
+ffier = { workspace = true }
+krun = { path = "../../src/libkrun", package = "libkrun", optional = true }
+libkrun-via-libc = { path = "../../bindings/libkrun-via-libc", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+krun-init-common = { path = "../common" }
+
+[target.'cfg(unix)'.dev-dependencies]
+krun-init-common = { path = "../common", features = ["server"] }
+
+[lib]
+name = "krun_init"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]

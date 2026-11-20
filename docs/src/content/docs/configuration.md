@@ -1,0 +1,66 @@
+---
+title: Configuration reference
+description: Settings in ~/.katamaran/config.toml and environment variables recognized by katamaran.
+---
+
+katamaran stores daemon and VM settings in `~/.katamaran/config.toml` (or `$KATAMARAN_HOME/config.toml` when `KATAMARAN_HOME` is set). The daemon reads `config.toml` every time the VM starts.
+
+## File format
+
+```toml
+# katamaran settings; applied at the next VM start.
+cpus = 14
+memory_mib = 16384
+mount = true
+launch_at_login = true
+pause_on_sleep = false
+auto_forward = true
+amd64 = "auto"
+```
+
+Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart`.
+
+## Settings keys
+
+| Key | Type | Default | Valid values |
+|---|---|---|---|
+| `cpus` | integer | All host cores | `1` to the number of host CPU cores |
+| `memory_mib` | integer | Half of host RAM, clamped to `2048` to `16384` | `1024` to `(host RAM - 2048)` MiB. `kat config set` also accepts `memory=8G` or `memory=4096M`. |
+| `mount` | boolean | `true` | `true`, `false`, `on`, `off`, `yes`, `no`, `1`, `0` |
+| `mount_path` | string (optional) | `~/Katamaran` (unset) | Any absolute path, or empty string to reset to default |
+| `launch_at_login` | boolean | `true` | Boolean |
+| `pause_on_sleep` | boolean | `false` | Boolean. Freezes vCPUs and adjusts virtual timer offsets across macOS sleep. |
+| `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
+| `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
+
+`memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
+
+## State directory layout
+
+All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
+
+| Path | Contents |
+|---|---|
+| `config.toml` | Saved configuration |
+| `data/data.img` | Sparse btrfs disk image for Docker, containerd, and LXC machines |
+| `run/docker.sock` | Docker Engine Unix socket relayed from the guest |
+| `run/daemon.sock` | Control socket used by the CLI and macOS app |
+| `run/vm.json` | Generated VM launch configuration passed to `katamaran-vm` |
+| `logs/` | Logs for `daemon`, `console`, `vm`, and `gvproxy` |
+| `ssh/` | Managed SSH host key, `known_hosts`, and `config` file |
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `KATAMARAN_HOME` | Overrides the state directory (default `~/.katamaran`). Isolates a separate VM instance, Docker socket, and data disk. |
+| `KATAMARAN_MOUNT` | Overrides the macOS NFS mount path when `mount_path` is unset. |
+| `KATAMARAN_LABEL_SUFFIX` | Default `--suffix` value for `kat setup` and `kat uninstall`. |
+| `KATAMARAN_BUILD_CONTEXT` | Docker context used by `cargo xtask kernel`, `rootfs`, and `disk`. |
+| `KATAMARAN_FS_CACHE` | Set to `0` to disable long virtio-fs metadata caching and FSEvents invalidation. |
+| `KATAMARAN_FS_DIRECT` | Set to `0` to disable `KAT_FS_DIRECT` hypercalls and route all FUSE requests over virtqueues. |
+| `KATAMARAN_FS_BULK` | Set to `0` to fall back from `getattrlistbulk` to `readdir` and `lstat`. |
+| `KATAMARAN_FS_PINS` | Set to `0` to disable pinned `O_EVTONLY` directory file descriptors. |
+| `KATAMARAN_FS_TIMEOUT` | Override virtio-fs entry and attribute cache timeout in seconds. |
+| `KATAMARAN_FS_NEGATIVE` | Override virtio-fs negative lookup cache timeout in seconds. |
+| `KATAMARAN_BALLOON_MODE` | Set free-page reporting mode (`replace` default, `default`, or `off`). |

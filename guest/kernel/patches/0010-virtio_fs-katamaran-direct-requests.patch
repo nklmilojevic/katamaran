@@ -1,0 +1,261 @@
+Subject: [PATCH] virtio_fs: send small foreground requests in a katamaran hypercall
+
+When the host advertises ABI version 1 (KAT_FS_PROBE with x1 = 1 answers
+KAT_FS_MAGIC | 1 << 32), a foreground request that expects a reply is
+sent in a KAT_FS_DIRECT hypercall: a per-CPU table of the guest-physical
+segments the virtqueue would carry (in header, in args, in pages, out
+header, out args, out pages; at most 4 + 128). The host runs it through
+its FUSE server, writes the reply and returns its length, and the
+request ends right there: no descriptors, rings, notify or interrupt.
+When the host declines (a request that may block, a malformed table) it
+returns a status of 1 << 32 or above and the request takes the virtqueue
+as before, without a drain call (requests that do not fit the table
+still use the drain). Background and may_block requests, and
+resubmissions, are not sent directly. An older host keeps the drain
+path; an older guest passes x1 = 0 and gets the plain magic.
+
+SPDX-License-Identifier: GPL-2.0
+---
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1448,16 +1448,166 @@
+ 	arm_smccc_smc(KAT_FS_DRAIN, vq->index, virtqueue_get_desc_addr(vq),
+ 		      0, 0, 0, 0, 0, &res);
+ 	return res.a0 == 0;
++}
++
++/*
++ * KAT_FS_DIRECT: a foreground request goes to the host in the hypercall
++ * itself, as a table of the guest-physical segments that make it up (the
++ * same ones the virtqueue would carry), and the host writes the reply and
++ * returns its length. No descriptor, avail or used ring is touched. The host
++ * returns a value of KAT_FS_DIRECT_STATUS or above when it will not run the
++ * request on this vCPU (it may block, or the table is malformed); the
++ * request then goes through the virtqueue unchanged.
++ *
++ * ABI version 1, probed with KAT_FS_PROBE(x1 = 1): the host answers
++ * KAT_FS_MAGIC | version << 32. An older host answers the bare magic and
++ * the direct path stays off; an older guest passes x1 = 0 and gets the bare
++ * magic it checks for.
++ */
++#define KAT_FS_DIRECT		0xC6004B02UL
++#define KAT_FS_ABI_DIRECT	1
++/* Header, args and out header in each direction, and up to 128 pages. */
++#define KAT_FS_DIRECT_SEGS	(4 + 128)
++#define KAT_FS_DIRECT_STATUS	(1UL << 32)
++
++struct kat_fs_direct_seg {
++	__le64 addr;
++	__le32 len;
++	__le32 reserved;
++};
++
++struct kat_fs_direct_req {
++	__le16 version;
++	__le16 nsegs;
++	/* segs[0..nin) are read by the host, segs[nin..nsegs) written */
++	__le16 nin;
++	__le16 reserved;
++	struct kat_fs_direct_seg segs[KAT_FS_DIRECT_SEGS];
++};
++
++static bool virtio_fs_kat_direct_on;
++/* Linear-map buffers, so virt_to_phys() works (the stack is vmapped). */
++static DEFINE_PER_CPU(struct kat_fs_direct_req *, kat_fs_direct_buf);
++
++static int kat_fs_direct_seg(struct kat_fs_direct_req *d, unsigned int *n,
++			     phys_addr_t addr, unsigned int len)
++{
++	if (!len)
++		return 0;
++	if (*n == KAT_FS_DIRECT_SEGS)
++		return -E2BIG;
++	d->segs[*n].addr = cpu_to_le64(addr);
++	d->segs[*n].len = cpu_to_le32(len);
++	d->segs[*n].reserved = 0;
++	(*n)++;
++	return 0;
++}
++
++static int kat_fs_direct_folios(struct kat_fs_direct_req *d, unsigned int *n,
++				struct fuse_args_pages *ap,
++				unsigned int total_len)
++{
++	unsigned int i, this_len;
++	int err = 0;
++
++	for (i = 0; i < ap->num_folios && total_len && !err; i++) {
++		this_len = min(ap->descs[i].length, total_len);
++		err = kat_fs_direct_seg(d, n,
++					PFN_PHYS(folio_pfn(ap->folios[i])) +
++						ap->descs[i].offset,
++					this_len);
++		total_len -= this_len;
++	}
++	return err;
++}
++
++/*
++ * Send @req in the hypercall. Returns 1 when the reply is in place and
++ * checked, 0 when the host declined it and -1 when it was not sent; on 0 and
++ * -1 the request must take the virtqueue. req->argbuf must be filled.
++ */
++static int virtio_fs_kat_direct(struct virtio_fs_vq *fsvq, struct fuse_req *req)
++{
++	struct fuse_args *args = req->args;
++	struct fuse_args_pages *ap = container_of(args, typeof(*ap), args);
++	unsigned int in_len, out_len, n = 0, nin;
++	struct kat_fs_direct_req *d;
++	struct arm_smccc_res res;
++	int err = 0;
++
++	in_len = fuse_len_args(args->in_numargs - args->in_pages,
++			       (struct fuse_arg *)args->in_args);
++	out_len = fuse_len_args(args->out_numargs - args->out_pages,
++				args->out_args);
++
++	d = *get_cpu_ptr(&kat_fs_direct_buf);
++	err |= kat_fs_direct_seg(d, &n, virt_to_phys(&req->in.h),
++				 sizeof(req->in.h));
++	if (in_len)
++		err |= kat_fs_direct_seg(d, &n, virt_to_phys(req->argbuf), in_len);
++	if (args->in_pages)
++		err |= kat_fs_direct_folios(d, &n, ap,
++				args->in_args[args->in_numargs - 1].size);
++	nin = n;
++	err |= kat_fs_direct_seg(d, &n, virt_to_phys(&req->out.h),
++				 sizeof(req->out.h));
++	if (out_len)
++		err |= kat_fs_direct_seg(d, &n,
++					 virt_to_phys(req->argbuf + in_len), out_len);
++	if (args->out_pages)
++		err |= kat_fs_direct_folios(d, &n, ap,
++				args->out_args[args->out_numargs - 1].size);
++	if (!err) {
++		d->version = cpu_to_le16(KAT_FS_ABI_DIRECT);
++		d->nsegs = cpu_to_le16(n);
++		d->nin = cpu_to_le16(nin);
++		d->reserved = 0;
++		arm_smccc_smc(KAT_FS_DIRECT, virt_to_phys(d),
++			      offsetof(struct kat_fs_direct_req, segs[n]),
++			      virtqueue_get_desc_addr(fsvq->vq), 0, 0, 0, 0, &res);
++	}
++	put_cpu_ptr(&kat_fs_direct_buf);
++
++	if (err)
++		return -1;
++	if (res.a0 >= KAT_FS_DIRECT_STATUS)
++		return 0;
++	if (!virtio_fs_verify_response(req, res.a0)) {
++		req->out.h.error = -EIO;
++		req->out.h.len = sizeof(struct fuse_out_header);
++	}
++	return 1;
+ }
+ 
++static bool virtio_fs_kat_direct_alloc(void)
++{
++	unsigned int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct kat_fs_direct_req *d;
++
++		d = kzalloc_node(sizeof(*d), GFP_KERNEL, cpu_to_node(cpu));
++		if (!d)
++			return false;
++		per_cpu(kat_fs_direct_buf, cpu) = d;
++	}
++	return true;
++}
++
+ static void virtio_fs_kat_probe(void)
+ {
+ 	struct arm_smccc_res res;
+ 
+-	arm_smccc_smc(KAT_FS_PROBE, 0, 0, 0, 0, 0, 0, 0, &res);
+-	virtio_fs_kat_sync = res.a0 == KAT_FS_MAGIC;
++	arm_smccc_smc(KAT_FS_PROBE, KAT_FS_ABI_DIRECT, 0, 0, 0, 0, 0, 0, &res);
++	virtio_fs_kat_sync = lower_32_bits(res.a0) == KAT_FS_MAGIC &&
++			     res.a0 != ~0UL;
+ 	if (virtio_fs_kat_sync)
+ 		pr_info("virtio-fs: katamaran synchronous submission enabled\n");
++	if (virtio_fs_kat_sync && upper_32_bits(res.a0) >= KAT_FS_ABI_DIRECT &&
++	    virtio_fs_kat_direct_alloc()) {
++		virtio_fs_kat_direct_on = true;
++		pr_info("virtio-fs: katamaran direct requests enabled\n");
++	}
+ }
+ 
+ static int virtio_fs_enqueue_req(struct virtio_fs_vq *fsvq,
+@@ -1478,7 +1628,46 @@
+ 	unsigned int i, hash;
+ 	int ret;
+ 	bool notify;
++	bool direct_tried = false;
+ 	struct fuse_pqueue *fpq;
++	int direct;
++
++	/*
++	 * Background requests are excluded for the reason given at the drain
++	 * below; requests that complete in a worker (may_block) keep doing so.
++	 */
++	if (virtio_fs_kat_direct_on && !in_flight &&
++	    test_bit(FR_ISREPLY, &req->flags) &&
++	    !test_bit(FR_BACKGROUND, &req->flags) && !args->may_block &&
++	    sg_count_fuse_req(req) <= KAT_FS_DIRECT_SEGS) {
++		ret = copy_args_to_argbuf(req, gfp);
++		if (ret < 0)
++			goto out;
++		spin_lock(&fsvq->lock);
++		if (!fsvq->connected) {
++			spin_unlock(&fsvq->lock);
++			ret = -ENOTCONN;
++			goto out;
++		}
++		inc_in_flight_req(fsvq);
++		spin_unlock(&fsvq->lock);
++		set_bit(FR_SENT, &req->flags);
++		direct = virtio_fs_kat_direct(fsvq, req);
++		if (direct > 0) {
++			virtio_fs_request_complete(req, fsvq);
++			return 0;
++		}
++		/*
++		 * The virtqueue takes it from here. It counts the request in
++		 * flight itself (or the caller does, on -ENOSPC).
++		 */
++		clear_bit(FR_SENT, &req->flags);
++		spin_lock(&fsvq->lock);
++		dec_in_flight_req(fsvq);
++		spin_unlock(&fsvq->lock);
++		/* A request the host declined would be declined by a drain too. */
++		direct_tried = direct == 0;
++	}
+ 
+ 	/* Does the sglist fit on the stack? */
+ 	total_sgs = sg_count_fuse_req(req);
+@@ -1492,9 +1681,11 @@
+ 	}
+ 
+ 	/* Use a bounce buffer since stack args cannot be mapped */
+-	ret = copy_args_to_argbuf(req, gfp);
+-	if (ret < 0)
+-		goto out;
++	if (!req->argbuf) {
++		ret = copy_args_to_argbuf(req, gfp);
++		if (ret < 0)
++			goto out;
++	}
+ 
+ 	/* Request elements */
+ 	sg_init_one(&sg[out_sgs++], &req->in.h, sizeof(req->in.h));
+@@ -1554,7 +1745,8 @@
+ 		 * Background requests are sent under fc->bg_lock, which completing
+ 		 * a request takes, so only foreground requests finish inline.
+ 		 */
+-		if (virtio_fs_kat_sync && !test_bit(FR_BACKGROUND, &req->flags) &&
++		if (virtio_fs_kat_sync && !direct_tried &&
++		    !test_bit(FR_BACKGROUND, &req->flags) &&
+ 		    virtio_fs_kat_drain(vq))
+ 			virtio_fs_requests_done_work(&fsvq->done_work);
+ 		else

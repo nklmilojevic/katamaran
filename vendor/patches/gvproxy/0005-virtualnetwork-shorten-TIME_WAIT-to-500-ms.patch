@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 15:37:34 +0100
+Subject: [PATCH 5/6] virtualnetwork: shorten TIME_WAIT to 500 ms
+
+gVisor passes a SYN for a 4-tuple in TIME_WAIT only to a listening
+endpoint; through tcp.Forwarder it is dropped until TIME_WAIT ends (60 s),
+so a container reusing a source port fails to connect. On the local
+guest link no delayed duplicate can arrive; 500 ms lets the guest's first
+SYN retransmit (1 s) succeed.
+---
+ pkg/virtualnetwork/tuning.go      | 18 ++++++++++++++++--
+ pkg/virtualnetwork/tuning_test.go |  7 ++++++-
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/pkg/virtualnetwork/tuning.go b/pkg/virtualnetwork/tuning.go
+index 3f334e9..dd4801c 100644
+--- a/pkg/virtualnetwork/tuning.go
++++ b/pkg/virtualnetwork/tuning.go
+@@ -2,6 +2,7 @@ package virtualnetwork
+ 
+ import (
+ 	"fmt"
++	"time"
+ 
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+ 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+@@ -16,19 +17,32 @@ const (
+ 	tcpBufferMax     = 16 << 20
+ )
+ 
++// timeWait is how long a connection the stack closed first stays in
++// TIME_WAIT. gVisor hands a new SYN for a 4-tuple in TIME_WAIT to a listening
++// endpoint, but connections reach gvproxy through a tcp.Forwarder, which is
++// not one: the SYN is dropped until TIME_WAIT ends, 60 s by default, and the
++// guest's connect times out. Containers reuse source ports (each starts with
++// the same port sequence, and NAT keeps them), so this hits short-lived
++// connections from successive containers. The guest link is local and
++// lossless, so no delayed duplicate can arrive; 500 ms is under Linux's 1 s
++// initial SYN retransmit, so a colliding connect succeeds on its first retry.
++const timeWait = 500 * time.Millisecond
++
+ // tuneTCP adapts gVisor's TCP to a lossless, low-latency virtual link:
+ //   - SACK, so a rare loss does not stall a 16 MiB window;
+ //   - classic loss detection instead of RACK-TLP: TLP's probe timeout is
+ //     twice the smoothed RTT with no floor, so any scheduling hiccup over
+ //     ~200 us on the host fires spurious retransmits and recoveries;
+-//   - larger send and receive buffers, with receive buffer moderation.
++//   - larger send and receive buffers, with receive buffer moderation;
++//   - a short TIME_WAIT (see timeWait).
+ func tuneTCP(s *stack.Stack) error {
+ 	sack := tcpip.TCPSACKEnabled(true)
+ 	recovery := tcpip.TCPRecovery(0)
+ 	moderate := tcpip.TCPModerateReceiveBufferOption(true)
+ 	send := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcpBufferDefault, Max: tcpBufferMax}
+ 	receive := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcpBufferDefault, Max: tcpBufferMax}
+-	for _, opt := range []tcpip.SettableTransportProtocolOption{&sack, &recovery, &moderate, &send, &receive} {
++	tw := tcpip.TCPTimeWaitTimeoutOption(timeWait)
++	for _, opt := range []tcpip.SettableTransportProtocolOption{&sack, &recovery, &moderate, &send, &receive, &tw} {
+ 		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
+ 			return fmt.Errorf("set TCP option %T: %s", opt, err)
+ 		}
+diff --git a/pkg/virtualnetwork/tuning_test.go b/pkg/virtualnetwork/tuning_test.go
+index 5d438d0..03a16f7 100644
+--- a/pkg/virtualnetwork/tuning_test.go
++++ b/pkg/virtualnetwork/tuning_test.go
+@@ -2,6 +2,7 @@ package virtualnetwork
+ 
+ import (
+ 	"testing"
++	"time"
+ 
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+ 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+@@ -22,7 +23,8 @@ func TestTuneTCP(t *testing.T) {
+ 	var moderate tcpip.TCPModerateReceiveBufferOption
+ 	var send tcpip.TCPSendBufferSizeRangeOption
+ 	var receive tcpip.TCPReceiveBufferSizeRangeOption
+-	for _, opt := range []tcpip.GettableTransportProtocolOption{&sack, &recovery, &moderate, &send, &receive} {
++	var tw tcpip.TCPTimeWaitTimeoutOption
++	for _, opt := range []tcpip.GettableTransportProtocolOption{&sack, &recovery, &moderate, &send, &receive, &tw} {
+ 		if err := s.TransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
+ 			t.Fatalf("get %T: %s", opt, err)
+ 		}
+@@ -30,6 +32,9 @@ func TestTuneTCP(t *testing.T) {
+ 	if !bool(sack) || recovery != 0 || !bool(moderate) {
+ 		t.Fatalf("sack=%v recovery=%v moderate=%v", sack, recovery, moderate)
+ 	}
++	if time.Duration(tw) != timeWait || timeWait >= time.Second {
++		t.Fatalf("TIME_WAIT %v; must stay under the guest's 1 s SYN retransmit", time.Duration(tw))
++	}
+ 	if send.Default != tcpBufferDefault || send.Max != tcpBufferMax || receive.Max != tcpBufferMax {
+ 		t.Fatalf("send=%+v receive=%+v", send, receive)
+ 	}

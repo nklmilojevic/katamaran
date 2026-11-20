@@ -1,0 +1,39 @@
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 156B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/alpine:3.20
+#2 DONE 5.8s
+
+#3 [internal] load .dockerignore
+#3 DONE 0.0s
+
+#4 [internal] load build context
+#4 transferring context: 195B done
+#4 DONE 0.0s
+
+#5 [base 1/2] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#5 resolve docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc 0.0s done
+#5 sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78 4.09MB / 4.09MB 0.3s done
+#5 extracting sha256:3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78 0.0s done
+#5 DONE 0.3s
+
+#6 [base 2/2] RUN echo hello > /hello
+#6 DONE 0.1s
+
+#7 [stage-1 1/2] RUN echo "hey" && sleep 1
+#7 0.213 hey
+#7 DONE 1.2s
+
+#8 [stage-1 2/2] COPY . /src
+#8 DONE 0.0s
+
+#9 exporting to image
+#9 exporting layers 0.1s done
+#9 exporting manifest sha256:cdfead9be605aa218672a1844bd1b0b913a448e75ef5b92f32a30443bb58a79b done
+#9 exporting config sha256:2866087503eff8b2acbcb969f9831f19bf3009309a2d946b5819e210d83fc47e done
+#9 exporting attestation manifest sha256:f40e9c802920f29b0065660c3e59815713e0e9bc0b611d4800c53ac8e7019ad5 done
+#9 exporting manifest list sha256:aa9d0e714b9e45b6acd43255e81bfce87dbd339a35f4ec7d7d4ed2751dac22c4 done
+#9 naming to docker.io/demo/ok:latest done
+#9 unpacking to docker.io/demo/ok:latest 0.1s done
+#9 DONE 0.2s

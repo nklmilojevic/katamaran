@@ -1,0 +1,587 @@
+Subject: virtio/fs, hvf: Rosetta for Linux share, per-task TSO, per-device sync drain
+
+Rosetta for Linux checks that it runs in a Rosetta-enabled VM with
+ioctls on its own binary: a key it compares with a string embedded in
+the binary (_IOR('a', nr, char[69])), the AOT cache config
+(_IOR('a', 0x23, char[128])) and, when the guest kernel cannot switch
+the memory model, a TSO request (_IO('a', 0x24)). Fs::set_rosetta()
+(FsDevice::set_rosetta()) makes a share of the RosettaLinux directory
+answer them: the key is read from the shared rosetta binary at setup,
+the AOT config is all zeros (no rosettad: containers live in other
+network namespaces, so its abstract socket is out of reach) and the TSO
+request succeeds.
+
+hvf: the vendor call 0xC600_4B10 (x1 = 1 TSO, 0 default) sets
+ACTLR_EL1.EnTSO on the calling vCPU (HV_SYS_REG_ACTLR_EL1, macOS 15+).
+The guest kernel makes it on context switch only for tasks that asked
+for TSO, so native code keeps the weak model. KATAMARAN_TSO=0 refuses
+the call, for comparison.
+
+virtio/fs: KAT_FS_DRAIN was registered once per device, so with a
+second device the last one activated took every drain and requests on
+the other device's queues were never answered (the guest hung in
+request_wait_answer on /Users). Devices now go into one registry, and
+the guest names the queue by index and descriptor table address (x2),
+which picks the device; a guest without the address is served only
+when there is a single device.
+
+---
+diff -ruN a/src/devices/src/virtio/fs/augment_fs.rs b/src/devices/src/virtio/fs/augment_fs.rs
+--- a/src/devices/src/virtio/fs/augment_fs.rs	2026-11-18 15:40:26
++++ b/src/devices/src/virtio/fs/augment_fs.rs	2026-11-19 11:10:07
+@@ -29,6 +29,7 @@
+ };
+ use super::fuse;
+ use super::inode_alloc::InodeAllocator;
++use super::rosetta::Rosetta;
+ use super::virtual_entry::{VIRTUAL_BLKSIZE, VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+ #[cfg(target_os = "windows")]
+ use super::windows::fs_utils;
+@@ -56,6 +57,7 @@
+     /// Maps virtual inode number → (mode, inode data). One-shot entries are
+     /// removed from this map on release.
+     inodes: RwLock<HashMap<Inode, VirtualEntry<'static>>>,
++    rosetta: Option<Arc<Rosetta>>,
+ }
+ 
+ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
+@@ -84,9 +86,16 @@
+             inner,
+             name_to_inode: RwLock::new(name_to_inode),
+             inodes: RwLock::new(inodes),
++            rosetta: None,
+         }
+     }
+ 
++    /// Answer Rosetta's ioctls on every file of this filesystem.
++    pub fn with_rosetta(mut self, rosetta: Option<Arc<Rosetta>>) -> Self {
++        self.rosetta = rosetta;
++        self
++    }
++
+     fn register_entries(
+         parent: Inode,
+         entries: Vec<VirtualDirEntry<'static>>,
+@@ -768,6 +777,9 @@
+         // and we need the value from Linux.
+         const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
+ 
++        if let Some(reply) = self.rosetta.as_ref().and_then(|r| r.ioctl(cmd, out_size)) {
++            return reply;
++        }
+         match cmd {
+             VIRTIO_IOC_EXIT_CODE_REQ => {
+                 exit_code.store(arg as i32, Ordering::SeqCst);
+diff -ruN a/src/devices/src/virtio/fs/device.rs b/src/devices/src/virtio/fs/device.rs
+--- a/src/devices/src/virtio/fs/device.rs	2026-11-18 23:16:30
++++ b/src/devices/src/virtio/fs/device.rs	2026-11-19 11:38:08
+@@ -3,6 +3,7 @@
+ use std::cmp;
+ use std::io::Write;
+ use std::mem::size_of;
++use std::path::Path;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+ use std::thread::JoinHandle;
+@@ -20,6 +21,7 @@
+ };
+ use super::ExportTable;
+ use super::passthrough;
++use super::rosetta::Rosetta;
+ use super::virtual_entry::VirtualDirEntry;
+ use super::worker::{FsCore, FsWorker};
+ use super::{CachePolicy, PermissionSemantics, defs, defs::uapi};
+@@ -53,6 +55,7 @@
+     passthrough_cfg: Option<passthrough::Config>,
+     read_only: bool,
+     virtual_entries: Vec<VirtualDirEntry<'static>>,
++    rosetta: Option<Arc<Rosetta>>,
+     worker_thread: Option<JoinHandle<()>>,
+     worker_stopfd: EventFd,
+     /// Set when request-queue notifications are processed on the notifying
+@@ -102,6 +105,7 @@
+             passthrough_cfg: fs_cfg,
+             read_only,
+             virtual_entries,
++            rosetta: None,
+             worker_thread: None,
+             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
+             inline_core: None,
+@@ -279,6 +283,24 @@
+         cfg.export_fsid
+     }
+ 
++    /// Answer Rosetta for Linux's ioctls, for a share of the RosettaLinux
++    /// directory; fails when the shared directory holds no Rosetta binary.
++    pub fn set_rosetta(&mut self) -> bool {
++        let Some(cfg) = self.passthrough_cfg.as_ref() else {
++            return false;
++        };
++        match Rosetta::load(Path::new(&cfg.root_dir)) {
++            Ok(r) => {
++                self.rosetta = Some(Arc::new(r));
++                true
++            }
++            Err(e) => {
++                error!("virtio_fs: {}: {e}", cfg.root_dir);
++                false
++            }
++        }
++    }
++
+     pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
+         self.virtual_entries.push(entry);
+     }
+@@ -374,6 +396,7 @@
+             self.passthrough_cfg.clone(),
+             self.read_only,
+             virtual_entries,
++            self.rosetta.clone(),
+             self.worker_stopfd.try_clone().unwrap(),
+             self.exit_code.clone(),
+             #[cfg(target_os = "macos")]
+@@ -386,7 +409,7 @@
+         if std::env::var("KATAMARAN_FS_INLINE").as_deref() != Ok("0") {
+             self.inline_core = Some(worker.core());
+             #[cfg(target_os = "macos")]
+-            register_sync_calls(worker.core());
++            super::sync_calls::register(worker.core());
+         }
+         super::worker::start_stats_reporter();
+         self.worker_thread = Some(worker.run());
+@@ -422,9 +445,11 @@
+     }
+ 
+     fn reset(&mut self) -> bool {
+-        self.inline_core = None;
+         #[cfg(target_os = "macos")]
+-        hvf::vendor_call::unregister(KAT_FS_DRAIN);
++        if let Some(core) = self.inline_core.take() {
++            super::sync_calls::unregister(&core);
++        }
++        self.inline_core = None;
+         if let Some(worker) = self.worker_thread.take() {
+             let _ = self.worker_stopfd.write(1);
+             if let Err(e) = worker.join() {
+@@ -661,18 +686,5 @@
+ /// Guest probe: returns [`KAT_FS_MAGIC`] when synchronous submission works.
+ #[cfg(target_os = "macos")]
+ const KAT_FS_PROBE: u64 = 0xC600_4B00;
+-/// Guest call after queueing requests: process the request queue on this
+-/// vCPU without raising an interrupt. Returns 0 when done, 1 when the queue is
+-/// busy on another thread (the guest then notifies the queue as usual).
+ #[cfg(target_os = "macos")]
+-const KAT_FS_DRAIN: u64 = 0xC600_4B01;
+-#[cfg(target_os = "macos")]
+ const KAT_FS_MAGIC: u64 = 0x4B41_544D;
+-
+-#[cfg(target_os = "macos")]
+-fn register_sync_calls(core: Arc<FsCore>) {
+-    hvf::vendor_call::register(KAT_FS_DRAIN, move |[queue, ..]| {
+-        super::worker::note_sync(1);
+-        core.drain_sync(queue as usize)
+-    });
+-}
+diff -ruN a/src/devices/src/virtio/fs/mod.rs b/src/devices/src/virtio/fs/mod.rs
+--- a/src/devices/src/virtio/fs/mod.rs	2026-11-18 23:16:30
++++ b/src/devices/src/virtio/fs/mod.rs	2026-11-19 11:38:08
+@@ -8,6 +8,9 @@
+ mod multikey;
+ mod null_fs;
+ mod read_only;
++pub mod rosetta;
++#[cfg(target_os = "macos")]
++mod sync_calls;
+ mod server;
+ mod sync_policy;
+ pub mod virtual_entry;
+diff -ruN a/src/devices/src/virtio/fs/rosetta.rs b/src/devices/src/virtio/fs/rosetta.rs
+--- a/src/devices/src/virtio/fs/rosetta.rs	1970-01-01 01:00:00
++++ b/src/devices/src/virtio/fs/rosetta.rs	2026-11-19 11:09:52
+@@ -0,0 +1,108 @@
++//! The ioctls Rosetta for Linux makes on its own binary (`/proc/self/exe`)
++//! to check that it runs in a Rosetta-enabled VM. Virtualization.framework's
++//! Rosetta share answers them; a share of the RosettaLinux directory with this
++//! layer answers them the same way.
++
++use std::fs;
++use std::io;
++use std::path::Path;
++
++/// `_IOC_READ`, type `'a'`: the key check (`_IOR('a', nr, char[69])`), with
++/// the number varying across Rosetta versions.
++const KEY_CMD_MASK: u32 = 0xffff_ff00;
++const KEY_CMD: u32 = 0x8045_6100;
++/// `_IOR('a', 0x23, char[128])`: where to reach the AOT cache daemon.
++const AOT_CONFIG: u32 = 0x8080_6123;
++/// `_IO('a', 0x24)`: Rosetta asks the host for TSO when the guest kernel
++/// cannot switch the memory model itself.
++const TSO_FALLBACK: u32 = 0x6124;
++
++const AOT_CONFIG_LEN: usize = 128;
++/// The key is a NUL-terminated string embedded in the Rosetta binary, which
++/// compares the ioctl's answer with it.
++const KEY_PREFIX: &[u8] = b"Our hard work\n";
++const KEY_LEN: usize = 69;
++
++pub struct Rosetta {
++    key: Vec<u8>,
++}
++
++impl Rosetta {
++    /// Reads the key from `dir/rosetta`, the binary the guest will run.
++    pub fn load(dir: &Path) -> io::Result<Self> {
++        Self::from_binary(&fs::read(dir.join("rosetta"))?)
++    }
++
++    fn from_binary(binary: &[u8]) -> io::Result<Self> {
++        binary
++            .windows(KEY_PREFIX.len())
++            .position(|w| w == KEY_PREFIX)
++            .and_then(|at| binary.get(at..at + KEY_LEN))
++            .filter(|key| key.last() == Some(&0))
++            .map(|key| Self { key: key.to_vec() })
++            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no Rosetta key"))
++    }
++
++    /// The answer to `cmd`, or `None` when it is not a Rosetta ioctl.
++    pub fn ioctl(&self, cmd: u32, out_size: u32) -> Option<io::Result<Vec<u8>>> {
++        let out_size = out_size as usize;
++        match cmd {
++            AOT_CONFIG => Some(Ok(vec![0; AOT_CONFIG_LEN.min(out_size)])),
++            TSO_FALLBACK => Some(Ok(Vec::new())),
++            c if c & KEY_CMD_MASK == KEY_CMD => Some(if out_size <= self.key.len() {
++                Ok(self.key[..out_size].to_vec())
++            } else {
++                Err(io::Error::from_raw_os_error(libc::ENOTTY))
++            }),
++            _ => None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn binary() -> Vec<u8> {
++        let mut b = b"\x7fELF padding ".to_vec();
++        b.extend_from_slice(KEY_PREFIX);
++        b.extend(std::iter::repeat_n(b'k', KEY_LEN - KEY_PREFIX.len() - 1));
++        b.push(0);
++        b.extend_from_slice(b"trailing");
++        b
++    }
++
++    #[test]
++    fn finds_the_key_in_the_binary() {
++        let r = Rosetta::from_binary(&binary()).unwrap();
++        assert_eq!(r.key.len(), KEY_LEN);
++        assert!(r.key.starts_with(KEY_PREFIX));
++        assert_eq!(r.key[KEY_LEN - 1], 0);
++    }
++
++    #[test]
++    fn rejects_a_binary_without_a_terminated_key() {
++        assert!(Rosetta::from_binary(b"no key here").is_err());
++        let mut b = binary();
++        let at = b.iter().rposition(|&c| c == 0).unwrap();
++        b[at] = b'x';
++        assert!(Rosetta::from_binary(&b).is_err());
++    }
++
++    #[test]
++    fn answers_rosetta_ioctls_only() {
++        let r = Rosetta::from_binary(&binary()).unwrap();
++        for nr in [0x22, 0x25] {
++            let got = r.ioctl(KEY_CMD | nr, KEY_LEN as u32).unwrap().unwrap();
++            assert_eq!(got, r.key);
++        }
++        assert!(r.ioctl(KEY_CMD | 0x22, 4096).unwrap().is_err());
++        assert_eq!(
++            r.ioctl(AOT_CONFIG, 128).unwrap().unwrap(),
++            vec![0; AOT_CONFIG_LEN]
++        );
++        assert!(r.ioctl(TSO_FALLBACK, 0).unwrap().unwrap().is_empty());
++        assert!(r.ioctl(0x7602, 0).is_none());
++        assert!(r.ioctl(0x8045_6200, KEY_LEN as u32).is_none());
++    }
++}
+diff -ruN a/src/devices/src/virtio/fs/sync_calls.rs b/src/devices/src/virtio/fs/sync_calls.rs
+--- a/src/devices/src/virtio/fs/sync_calls.rs	1970-01-01 01:00:00
++++ b/src/devices/src/virtio/fs/sync_calls.rs	2026-11-19 11:38:31
+@@ -0,0 +1,55 @@
++//! KAT_FS_DRAIN, the call a katamaran guest makes after queueing virtio-fs
++//! requests: process the request queue on the calling vCPU without raising an
++//! interrupt. Returns [`DRAIN_DONE`] when done, [`DRAIN_BUSY`] when the queue
++//! is busy on another thread or unknown (the guest then notifies the queue as
++//! usual).
++//!
++//! The call is global but every virtio-fs device has its own queues, so the
++//! guest names the queue by its index (`x1`) and the guest address of its
++//! descriptor table (`x2`), which is unique to one device.
++
++use std::sync::{Arc, RwLock};
++
++use super::worker::{DRAIN_BUSY, FsCore, note_sync};
++
++const KAT_FS_DRAIN: u64 = 0xC600_4B01;
++
++static CORES: RwLock<Vec<Arc<FsCore>>> = RwLock::new(Vec::new());
++
++pub fn register(core: Arc<FsCore>) {
++    CORES.write().unwrap().push(core);
++    hvf::vendor_call::register(KAT_FS_DRAIN, |[queue, desc_table, _]| {
++        drain(queue as usize, desc_table)
++    });
++}
++
++pub fn unregister(core: &Arc<FsCore>) {
++    let mut cores = CORES.write().unwrap();
++    cores.retain(|c| !Arc::ptr_eq(c, core));
++    if cores.is_empty() {
++        hvf::vendor_call::unregister(KAT_FS_DRAIN);
++    }
++}
++
++fn drain(queue: usize, desc_table: u64) -> u64 {
++    let core = find(&CORES.read().unwrap(), queue, desc_table);
++    match core {
++        Some(core) => {
++            note_sync(1);
++            core.drain_sync(queue)
++        }
++        None => DRAIN_BUSY,
++    }
++}
++
++/// The device that owns the queue. A guest that passes no address (an older
++/// kernel) is only served when there is a single device.
++pub(super) fn find(cores: &[Arc<FsCore>], queue: usize, desc_table: u64) -> Option<Arc<FsCore>> {
++    match cores {
++        [only] if desc_table == 0 => Some(only.clone()),
++        _ => cores
++            .iter()
++            .find(|c| c.owns_queue(queue, desc_table))
++            .cloned(),
++    }
++}
+diff -ruN a/src/devices/src/virtio/fs/worker.rs b/src/devices/src/virtio/fs/worker.rs
+--- a/src/devices/src/virtio/fs/worker.rs	2026-11-18 23:16:30
++++ b/src/devices/src/virtio/fs/worker.rs	2026-11-19 12:02:44
+@@ -29,6 +29,7 @@
+ use super::null_fs::NullFs;
+ use super::passthrough::{self, PassthroughFs};
+ use super::read_only::PassthroughFsRo;
++use super::rosetta::Rosetta;
+ use super::server::Server;
+ use super::sync_policy::{Peek, Route, SyncPolicy};
+ use super::virtual_entry::VirtualDirEntry;
+@@ -107,6 +108,9 @@
+     /// One lock per queue, so vCPUs that submit on different request queues
+     /// do not wait for each other.
+     queues: Vec<Mutex<Queue>>,
++    /// Guest address of each queue's descriptor table, which names the queue
++    /// across devices in the guest's synchronous submission call.
++    desc_tables: Vec<u64>,
+     interrupt: InterruptTransport,
+     mem: GuestMemoryMmap,
+     allow_idmap: bool,
+@@ -170,6 +174,7 @@
+         passthrough_cfg: Option<passthrough::Config>,
+         read_only: bool,
+         virtual_entries: Vec<VirtualDirEntry<'static>>,
++        rosetta: Option<Arc<Rosetta>>,
+         stop_fd: EventFd,
+         exit_code: Arc<AtomicI32>,
+         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+@@ -180,14 +185,14 @@
+             Some(cfg) if read_only => {
+                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
+                 FsServer::ReadOnly(Server::with_policy(
+-                    AugmentFs::new(inner, &inode_alloc, virtual_entries),
++                    AugmentFs::new(inner, &inode_alloc, virtual_entries).with_rosetta(rosetta),
+                     policy.clone(),
+                 ))
+             }
+             Some(cfg) => {
+                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+                 FsServer::ReadWrite(Server::with_policy(
+-                    AugmentFs::new(inner, &inode_alloc, virtual_entries),
++                    AugmentFs::new(inner, &inode_alloc, virtual_entries).with_rosetta(rosetta),
+                     policy.clone(),
+                 ))
+             }
+@@ -197,6 +202,7 @@
+             )),
+         };
+         let core = Arc::new(FsCore {
++            desc_tables: queues.iter().map(|q| q.desc_table.0).collect(),
+             queues: queues.into_iter().map(Mutex::new).collect(),
+             interrupt,
+             mem,
+@@ -440,6 +446,12 @@
+     /// vCPU thread on KATAMARAN's KAT_FS_DRAIN: process without raising an
+     /// interrupt, the guest collects the replies itself on return. Stops at
+     /// the first request that may block and returns [`DRAIN_BUSY`].
++    /// Whether queue `queue_index` of this device has its descriptor table at
++    /// `desc_table` in guest memory.
++    pub fn owns_queue(&self, queue_index: usize, desc_table: u64) -> bool {
++        self.desc_tables.get(queue_index) == Some(&desc_table)
++    }
++
+     pub fn drain_sync(&self, queue_index: usize) -> u64 {
+         // A queue the guest does not use for requests: let it notify instead.
+         if queue_index < REQ_INDEX {
+@@ -700,6 +712,7 @@
+             }),
+             false,
+             Vec::new(),
++            None,
+             EventFd::new(EFD_NONBLOCK).unwrap(),
+             Arc::new(AtomicI32::new(0)),
+             #[cfg(target_os = "macos")]
+@@ -723,5 +736,66 @@
+         assert_eq!(core.drain_sync(REQ_INDEX + 2), DRAIN_BUSY);
+         assert!(!core.try_drain_notified(REQ_INDEX + 2));
+         core.stop_pool();
++    }
++
++    fn core_with_queues(mem: &GuestMemoryMmap, bases: &[u64]) -> Arc<FsCore> {
++        let queues: Vec<Queue> = bases
++            .iter()
++            .map(|&b| VirtQueue::new(GuestAddress(b), mem, 16).create_queue())
++            .collect();
++        FsWorker::new(
++            queues,
++            bases
++                .iter()
++                .map(|_| Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
++                .collect(),
++            InterruptTransport::new(DummyIrqChip::new().into(), "fs test".into()).unwrap(),
++            mem.clone(),
++            false,
++            None,
++            Some(passthrough::Config {
++                root_dir: "/".into(),
++                ..Default::default()
++            }),
++            false,
++            Vec::new(),
++            None,
++            EventFd::new(EFD_NONBLOCK).unwrap(),
++            Arc::new(AtomicI32::new(0)),
++            #[cfg(target_os = "macos")]
++            None,
++        )
++        .unwrap()
++        .core()
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn sync_drain_finds_the_device_that_owns_the_queue() {
++        use super::super::sync_calls::find;
++
++        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
++        let users = core_with_queues(&mem, &[0x1000, 0x2000]);
++        let rosetta = core_with_queues(&mem, &[0x3000, 0x4000]);
++        let desc = |base: u64| {
++            VirtQueue::new(GuestAddress(base), &mem, 16)
++                .create_queue()
++                .desc_table
++                .0
++        };
++        let cores = [users.clone(), rosetta.clone()];
++
++        let hit = |q, d| find(&cores, q, d).map(|c| Arc::as_ptr(&c));
++        assert_eq!(hit(1, desc(0x2000)), Some(Arc::as_ptr(&users)));
++        assert_eq!(hit(1, desc(0x4000)), Some(Arc::as_ptr(&rosetta)));
++        assert_eq!(hit(0, desc(0x4000)), None);
++        assert_eq!(hit(1, 0), None);
++        // An older guest passes no address; that only works with one device.
++        assert_eq!(
++            find(&cores[..1], 1, 0).map(|c| Arc::as_ptr(&c)),
++            Some(Arc::as_ptr(&users))
++        );
++        users.stop_pool();
++        rosetta.stop_pool();
+     }
+ }
+diff -ruN a/src/hvf/src/lib.rs b/src/hvf/src/lib.rs
+--- a/src/hvf/src/lib.rs	2026-11-18 12:59:09
++++ b/src/hvf/src/lib.rs	2026-11-19 11:09:25
+@@ -10,6 +10,7 @@
+ #[allow(non_upper_case_globals)]
+ #[allow(deref_nullptr)]
+ pub mod bindings;
++pub mod tso;
+ pub mod vendor_call;
+ 
+ #[macro_use]
+@@ -654,6 +655,11 @@
+                 let context_id = self.read_reg(hv_reg_t_HV_REG_X3)?;
+                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
+                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
++            }
++            tso::SET_MEM_MODEL => {
++                let model = self.read_reg(hv_reg_t_HV_REG_X1)?;
++                self.write_reg(hv_reg_t_HV_REG_X0, tso::set_mem_model(self.vcpuid, model))?;
++                Ok(VcpuExit::PsciHandled)
+             }
+             val => {
+                 let args = [
+diff -ruN a/src/hvf/src/tso.rs b/src/hvf/src/tso.rs
+--- a/src/hvf/src/tso.rs	1970-01-01 01:00:00
++++ b/src/hvf/src/tso.rs	2026-11-19 11:09:29
+@@ -0,0 +1,30 @@
++//! Per-task memory model. x86 code translated by Rosetta assumes total store
++//! ordering; Apple cores provide it through ACTLR_EL1.EnTSO, which
++//! Hypervisor.framework exposes per vCPU. A guest kernel that tracks the model
++//! per task makes this vendor call on the vCPU it switches, so only Rosetta's
++//! threads pay for TSO.
++
++use std::env;
++use std::sync::LazyLock;
++
++use crate::bindings::{HV_SUCCESS, hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1, hv_vcpu_set_sys_reg};
++use crate::vendor_call::NOT_SUPPORTED;
++
++/// `x1` = 1 selects TSO, 0 the default arm64 model. Returns 0, or
++/// [`NOT_SUPPORTED`] when the host cannot switch.
++pub const SET_MEM_MODEL: u64 = 0xC600_4B10;
++
++const ACTLR_EL1_EN_TSO: u64 = 1 << 1;
++
++static ENABLED: LazyLock<bool> = LazyLock::new(|| env::var("KATAMARAN_TSO").as_deref() != Ok("0"));
++
++/// Must run on the thread that owns `vcpuid`.
++pub fn set_mem_model(vcpuid: u64, model: u64) -> u64 {
++    if !*ENABLED || model > 1 {
++        return NOT_SUPPORTED;
++    }
++    let actlr = if model == 1 { ACTLR_EL1_EN_TSO } else { 0 };
++    // SAFETY: plain register write on the calling thread's own vCPU.
++    let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1, actlr) };
++    if ret == HV_SUCCESS { 0 } else { NOT_SUPPORTED }
++}
+diff -ruN a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+--- a/src/libkrun/src/api/device_builders.rs	2026-11-18 23:16:30
++++ b/src/libkrun/src/api/device_builders.rs	2026-11-19 11:10:12
+@@ -806,6 +806,16 @@
+         self.inner.lock().unwrap().guest_cache()
+     }
+ 
++    /// Answer the ioctls Rosetta for Linux makes on its binary, for a share of
++    /// `/Library/Apple/usr/libexec/oah/RosettaLinux`. Fails when the shared
++    /// directory has no usable `rosetta` binary.
++    pub fn set_rosetta(&mut self) -> Result<(), VmmError> {
++        if !self.inner.lock().unwrap().set_rosetta() {
++            return Err(VmmError::InvalidParam());
++        }
++        Ok(())
++    }
++
+     /// Offer the guest writeback caching. Only for shares that nothing else
+     /// changes while the guest runs. Off by default.
+     pub fn set_writeback(&mut self, writeback: bool) -> Result<(), VmmError> {

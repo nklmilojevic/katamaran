@@ -1,0 +1,985 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 22:10:29 +0100
+Subject: [PATCH 11/12] dns: cache upstream answers and coalesce identical
+ lookups
+
+Every query used to go upstream and every answer went out with a TTL of
+0, so clients could not cache either. Add an answer cache, keyed by name
+(case-insensitively), type and class, that keeps an answer for its
+smallest TTL (between 2 s and 10 min), a negative one for its SOA's
+TTL capped by the SOA MINIMUM (RFC 2308) or the source's negative TTL
+(between 1 s and 5 min), holds at most 4096 answers (least recently
+used out first), and never keeps failures. Answers go out with their
+TTLs counted down and capped at how long the cache still keeps them.
+Concurrent askers of the same question share one upstream lookup,
+which an asker giving up does not cancel. A watch on the host's DNS
+configuration can empty the cache, and lookups in flight across such a
+change are not stored.
+
+The handler asks a resolver built on this cache, when it has one, for
+every name no local zone owns, falling back to the existing paths if
+the resolver is unavailable. Answers carry the owner name as the client
+spelled it. For sources that cannot tell NXDOMAIN from NODATA, the
+resolver probes the name's other address types through the cache: a
+name with an A or AAAA record exists. That keeps AAAA for an
+IPv4-only name NODATA, which musl needs (an NXDOMAIN there fails the
+whole getaddrinfo), and the probe reuses the A answer the client asks
+for alongside.
+---
+ pkg/services/dns/cache.go      | 347 ++++++++++++++++++++++
+ pkg/services/dns/cache_test.go | 517 +++++++++++++++++++++++++++++++++
+ pkg/services/dns/dns.go        |  39 +++
+ 3 files changed, 903 insertions(+)
+ create mode 100644 pkg/services/dns/cache.go
+ create mode 100644 pkg/services/dns/cache_test.go
+
+diff --git a/pkg/services/dns/cache.go b/pkg/services/dns/cache.go
+new file mode 100644
+index 0000000..b176c0d
+--- /dev/null
++++ b/pkg/services/dns/cache.go
+@@ -0,0 +1,347 @@
++package dns
++
++import (
++	"container/list"
++	"context"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/miekg/dns"
++)
++
++// lookupResult is the upstream answer to one question.
++type lookupResult struct {
++	Rcode  int
++	Answer []dns.RR
++	Ns     []dns.RR
++	// NegativeTTL is how long, in seconds, a negative result (no record of
++	// the asked type) may be cached when Ns has no SOA to take it from.
++	NegativeTTL uint32
++	// ambiguous marks a negative result whose source cannot tell a name
++	// that does not exist (NXDOMAIN) from one without records of the asked
++	// type (NODATA). Rcode is RcodeNameError until resolve decides.
++	ambiguous bool
++}
++
++// lookupFunc asks the upstream resolver one question.
++type lookupFunc func(ctx context.Context, q dns.Question) (*lookupResult, error)
++
++type cacheConfig struct {
++	// MinTTL and MaxTTL bound how long a positive answer is kept.
++	MinTTL, MaxTTL time.Duration
++	// MinNegativeTTL and MaxNegativeTTL bound how long a negative answer
++	// is kept.
++	MinNegativeTTL, MaxNegativeTTL time.Duration
++	// MaxEntries bounds the cache; the least recently used entry goes
++	// first.
++	MaxEntries int
++	// Timeout bounds one upstream lookup.
++	Timeout time.Duration
++}
++
++var defaultCacheConfig = cacheConfig{
++	MinTTL:         2 * time.Second,
++	MaxTTL:         10 * time.Minute,
++	MinNegativeTTL: time.Second,
++	MaxNegativeTTL: 5 * time.Minute,
++	MaxEntries:     4096,
++	Timeout:        5 * time.Second,
++}
++
++type cacheKey struct {
++	name          string
++	qtype, qclass uint16
++}
++
++type cacheEntry struct {
++	key     cacheKey
++	res     *lookupResult
++	stored  time.Time
++	expires time.Time
++	elem    *list.Element
++}
++
++// flight is one upstream lookup that every concurrent asker of the same
++// question waits for.
++type flight struct {
++	done     chan struct{}
++	res      *lookupResult
++	lifetime time.Duration
++	err      error
++	waiters  int // askers that joined, guarded by answerCache.mu
++}
++
++// answerCache keeps upstream answers for as long as their TTLs allow and
++// sends each question upstream once however many ask it at the same time.
++type answerCache struct {
++	upstream lookupFunc
++	cfg      cacheConfig
++	now      func() time.Time
++	// changed, when set, reports whether the host's DNS configuration
++	// changed since it was last called; the cache is then emptied.
++	changed func() bool
++
++	mu      sync.Mutex
++	entries map[cacheKey]*cacheEntry
++	lru     *list.List // of *cacheEntry, most recently used first
++	flights map[cacheKey]*flight
++	gen     uint64 // bumped when emptied, so older lookups are not stored
++}
++
++func newAnswerCache(upstream lookupFunc, cfg cacheConfig, changed func() bool) *answerCache {
++	return &answerCache{
++		upstream: upstream,
++		cfg:      cfg,
++		now:      time.Now,
++		changed:  changed,
++		entries:  make(map[cacheKey]*cacheEntry),
++		lru:      list.New(),
++		flights:  make(map[cacheKey]*flight),
++	}
++}
++
++// lookup answers q from the cache, or from upstream on a miss. The result
++// is the caller's own copy, with TTLs counting down from when it was
++// fetched.
++func (c *answerCache) lookup(ctx context.Context, q dns.Question) (*lookupResult, error) {
++	if c.changed != nil && c.changed() {
++		c.flush()
++	}
++	key := cacheKey{strings.ToLower(dns.Fqdn(q.Name)), q.Qtype, q.Qclass}
++	c.mu.Lock()
++	if e, ok := c.entries[key]; ok {
++		now := c.now()
++		if now.Before(e.expires) {
++			c.lru.MoveToFront(e.elem)
++			res := e.res.copyAged(now.Sub(e.stored), e.expires.Sub(now))
++			c.mu.Unlock()
++			return res, nil
++		}
++		c.removeLocked(e)
++	}
++	f, ok := c.flights[key]
++	if !ok {
++		f = &flight{done: make(chan struct{})}
++		c.flights[key] = f
++		go c.fetch(key, q, f, c.gen)
++	}
++	f.waiters++
++	c.mu.Unlock()
++
++	select {
++	case <-f.done:
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	if f.err != nil {
++		return nil, f.err
++	}
++	return f.res.copyAged(0, f.lifetime), nil
++}
++
++// fetch runs one upstream lookup on behalf of everyone waiting on f. It is
++// not tied to any one asker's context, so an asker giving up does not fail
++// the others.
++func (c *answerCache) fetch(key cacheKey, q dns.Question, f *flight, gen uint64) {
++	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Timeout)
++	res, err := c.upstream(ctx, q)
++	cancel()
++
++	c.mu.Lock()
++	if c.flights[key] == f {
++		delete(c.flights, key)
++	}
++	if err == nil {
++		lifetime, cacheable := c.lifetime(q, res)
++		if !cacheable {
++			lifetime = c.cfg.MaxTTL
++		} else if gen == c.gen && lifetime > 0 {
++			c.storeLocked(key, res, lifetime)
++		}
++		f.res, f.lifetime = res, lifetime
++	}
++	f.err = err
++	c.mu.Unlock()
++	close(f.done)
++}
++
++// lifetime is how long res may be cached: the smallest TTL in its answer
++// and, for a negative result, the negative TTL (RFC 2308: the SOA's TTL
++// capped by its MINIMUM), clamped to the configured bounds. Failures are
++// not cached.
++func (c *answerCache) lifetime(q dns.Question, res *lookupResult) (time.Duration, bool) {
++	if res.Rcode != dns.RcodeSuccess && res.Rcode != dns.RcodeNameError {
++		return 0, false
++	}
++	ttl, haveTTL := uint32(0), false
++	lower := func(t uint32) {
++		if !haveTTL || t < ttl {
++			ttl, haveTTL = t, true
++		}
++	}
++	for _, rr := range res.Answer {
++		lower(rr.Header().Ttl)
++	}
++	if !res.negative(q) {
++		return clampTTL(ttl, c.cfg.MinTTL, c.cfg.MaxTTL), true
++	}
++	neg, haveNeg := res.NegativeTTL, false
++	for _, rr := range res.Ns {
++		if soa, ok := rr.(*dns.SOA); ok {
++			neg, haveNeg = min(soa.Hdr.Ttl, soa.Minttl), true
++			break
++		}
++	}
++	if haveNeg || res.NegativeTTL > 0 {
++		lower(neg)
++	}
++	return clampTTL(ttl, c.cfg.MinNegativeTTL, c.cfg.MaxNegativeTTL), true
++}
++
++func clampTTL(ttl uint32, lo, hi time.Duration) time.Duration {
++	return min(max(time.Duration(ttl)*time.Second, lo), hi)
++}
++
++func (c *answerCache) storeLocked(key cacheKey, res *lookupResult, lifetime time.Duration) {
++	if old, ok := c.entries[key]; ok {
++		c.removeLocked(old)
++	}
++	now := c.now()
++	e := &cacheEntry{key: key, res: res, stored: now, expires: now.Add(lifetime)}
++	e.elem = c.lru.PushFront(e)
++	c.entries[key] = e
++	for c.lru.Len() > c.cfg.MaxEntries {
++		c.removeLocked(c.lru.Back().Value.(*cacheEntry))
++	}
++}
++
++func (c *answerCache) removeLocked(e *cacheEntry) {
++	c.lru.Remove(e.elem)
++	delete(c.entries, e.key)
++}
++
++// flush forgets every answer, and makes lookups already on their way
++// upstream finish without being stored or joined, since they may have
++// gone to resolvers that no longer apply.
++func (c *answerCache) flush() {
++	c.mu.Lock()
++	c.entries = make(map[cacheKey]*cacheEntry)
++	c.lru.Init()
++	c.flights = make(map[cacheKey]*flight)
++	c.gen++
++	c.mu.Unlock()
++}
++
++func (c *answerCache) len() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return len(c.entries)
++}
++
++// negative reports whether res holds no record of the type q asks for.
++func (res *lookupResult) negative(q dns.Question) bool {
++	if res.Rcode == dns.RcodeNameError {
++		return true
++	}
++	for _, rr := range res.Answer {
++		if t := rr.Header().Rrtype; t == q.Qtype || q.Qtype == dns.TypeANY {
++			return false
++		}
++	}
++	return true
++}
++
++// copyAged copies res with every TTL reduced by elapsed and capped at
++// remaining, the time the cache still keeps it.
++func (res *lookupResult) copyAged(elapsed, remaining time.Duration) *lookupResult {
++	out := *res
++	age := uint32(elapsed / time.Second)
++	limit := uint32((remaining + time.Second - 1) / time.Second)
++	aged := func(rrs []dns.RR) []dns.RR {
++		if rrs == nil {
++			return nil
++		}
++		cp := make([]dns.RR, len(rrs))
++		for i, rr := range rrs {
++			cp[i] = dns.Copy(rr)
++			h := cp[i].Header()
++			h.Ttl = min(h.Ttl-min(h.Ttl, age), limit)
++		}
++		return cp
++	}
++	out.Answer = aged(res.Answer)
++	out.Ns = aged(res.Ns)
++	return &out
++}
++
++// cachingResolver answers questions from an answerCache, settling the
++// rcode of ambiguous negative answers.
++type cachingResolver struct {
++	cache *answerCache
++}
++
++func newCachingResolver(upstream lookupFunc, cfg cacheConfig, changed func() bool) *cachingResolver {
++	return &cachingResolver{cache: newAnswerCache(upstream, cfg, changed)}
++}
++
++func (r *cachingResolver) resolve(ctx context.Context, q dns.Question) (*lookupResult, error) {
++	res, err := r.cache.lookup(ctx, q)
++	if err != nil {
++		return nil, err
++	}
++	if res.ambiguous && res.Rcode == dns.RcodeNameError && r.nameExists(ctx, q, lastName(q.Name, res.Answer)) {
++		res.Rcode = dns.RcodeSuccess
++	}
++	return res, nil
++}
++
++// nameExists tells NODATA from NXDOMAIN for an ambiguous negative answer
++// by asking for the name's other address types: a name with an A or AAAA
++// record
++// exists. This is right for the questions that matter (musl fails a whole
++// getaddrinfo when AAAA says NXDOMAIN for a name with only an A record);
++// names that only have other types read as NXDOMAIN. A failed probe counts
++// as existing, since NODATA is the safer of the two answers. The probes
++// share the cache, so the A query a client sends alongside AAAA is asked
++// upstream once.
++func (r *cachingResolver) nameExists(ctx context.Context, q dns.Question, name string) bool {
++	var probes []uint16
++	for _, t := range []uint16{dns.TypeA, dns.TypeAAAA} {
++		if t != q.Qtype {
++			probes = append(probes, t)
++		}
++	}
++	found := make(chan bool, len(probes))
++	for _, t := range probes {
++		go func(t uint16) {
++			pq := dns.Question{Name: name, Qtype: t, Qclass: q.Qclass}
++			res, err := r.cache.lookup(ctx, pq)
++			found <- err != nil || !res.negative(pq)
++		}(t)
++	}
++	exists := false
++	for range probes {
++		exists = <-found || exists
++	}
++	return exists
++}
++
++// lastName follows the CNAME chain in answer from name to the name it
++// ends at.
++func lastName(name string, answer []dns.RR) string {
++	for range answer {
++		next := ""
++		for _, rr := range answer {
++			if cname, ok := rr.(*dns.CNAME); ok && strings.EqualFold(cname.Hdr.Name, name) {
++				next = cname.Target
++				break
++			}
++		}
++		if next == "" {
++			break
++		}
++		name = next
++	}
++	return name
++}
+diff --git a/pkg/services/dns/cache_test.go b/pkg/services/dns/cache_test.go
+new file mode 100644
+index 0000000..8567910
+--- /dev/null
++++ b/pkg/services/dns/cache_test.go
+@@ -0,0 +1,517 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"net"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"github.com/foxcpp/go-mockdns"
++	"github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++var testCacheConfig = cacheConfig{
++	MinTTL:         2 * time.Second,
++	MaxTTL:         10 * time.Minute,
++	MinNegativeTTL: time.Second,
++	MaxNegativeTTL: 5 * time.Minute,
++	MaxEntries:     100,
++	Timeout:        5 * time.Second,
++}
++
++// fakeUpstream answers from a function and counts the questions asked.
++type fakeUpstream struct {
++	mu     sync.Mutex
++	calls  map[string]int
++	answer func(q dns.Question) (*lookupResult, error)
++	gate   chan struct{} // when set, lookups wait for it to close
++}
++
++func newFakeUpstream(answer func(q dns.Question) (*lookupResult, error)) *fakeUpstream {
++	return &fakeUpstream{calls: make(map[string]int), answer: answer}
++}
++
++func questionKey(q dns.Question) string {
++	return strings.ToLower(q.Name) + " " + dns.TypeToString[q.Qtype]
++}
++
++func (f *fakeUpstream) lookup(ctx context.Context, q dns.Question) (*lookupResult, error) {
++	f.mu.Lock()
++	f.calls[questionKey(q)]++
++	gate := f.gate
++	f.mu.Unlock()
++	if gate != nil {
++		select {
++		case <-gate:
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	return f.answer(q)
++}
++
++func (f *fakeUpstream) count(name string, qtype uint16) int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.calls[questionKey(dns.Question{Name: name, Qtype: qtype})]
++}
++
++type fakeClock struct {
++	mu sync.Mutex
++	t  time.Time
++}
++
++func (c *fakeClock) now() time.Time {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.t
++}
++
++func (c *fakeClock) advance(d time.Duration) {
++	c.mu.Lock()
++	c.t = c.t.Add(d)
++	c.mu.Unlock()
++}
++
++func newTestCache(up *fakeUpstream, changed func() bool) (*answerCache, *fakeClock) {
++	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
++	c := newAnswerCache(up.lookup, testCacheConfig, changed)
++	c.now = clock.now
++	return c, clock
++}
++
++func mustRR(t testing.TB, s string) dns.RR {
++	t.Helper()
++	rr, err := dns.NewRR(s)
++	require.NoError(t, err)
++	return rr
++}
++
++func question(name string, qtype uint16) dns.Question {
++	return dns.Question{Name: name, Qtype: qtype, Qclass: dns.ClassINET}
++}
++
++func positive(rrs ...dns.RR) *lookupResult {
++	return &lookupResult{Rcode: dns.RcodeSuccess, Answer: rrs}
++}
++
++func lookupOK(t *testing.T, c *answerCache, q dns.Question) *lookupResult {
++	t.Helper()
++	res, err := c.lookup(context.Background(), q)
++	require.NoError(t, err)
++	return res
++}
++
++func TestCacheKeepsAnswersForTheirTTL(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		return positive(mustRR(t, q.Name+" 300 IN A 192.0.2.1")), nil
++	})
++	c, clock := newTestCache(up, nil)
++	q := question("example.org.", dns.TypeA)
++
++	res := lookupOK(t, c, q)
++	require.Equal(t, uint32(300), res.Answer[0].Header().Ttl)
++
++	clock.advance(100 * time.Second)
++	res = lookupOK(t, c, q)
++	require.Equal(t, 1, up.count("example.org.", dns.TypeA))
++	require.Equal(t, uint32(200), res.Answer[0].Header().Ttl, "TTLs count down while cached")
++
++	clock.advance(200 * time.Second)
++	res = lookupOK(t, c, q)
++	require.Equal(t, 2, up.count("example.org.", dns.TypeA), "an expired answer is asked again")
++	require.Equal(t, uint32(300), res.Answer[0].Header().Ttl)
++}
++
++func TestCacheBoundsPositiveTTLs(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		if q.Name == "zero.example." {
++			return positive(mustRR(t, q.Name+" 0 IN A 192.0.2.1")), nil
++		}
++		return positive(mustRR(t, q.Name+" 604800 IN A 192.0.2.2"), mustRR(t, q.Name+" 86400 IN A 192.0.2.3")), nil
++	})
++	c, clock := newTestCache(up, nil)
++
++	zero := question("zero.example.", dns.TypeA)
++	require.Equal(t, uint32(0), lookupOK(t, c, zero).Answer[0].Header().Ttl)
++	lookupOK(t, c, zero)
++	require.Equal(t, 1, up.count("zero.example.", dns.TypeA), "a TTL of 0 is still kept for the floor")
++	clock.advance(testCacheConfig.MinTTL)
++	lookupOK(t, c, zero)
++	require.Equal(t, 2, up.count("zero.example.", dns.TypeA))
++
++	long := question("long.example.", dns.TypeA)
++	for _, rr := range lookupOK(t, c, long).Answer {
++		require.Equal(t, uint32(600), rr.Header().Ttl, "TTLs are capped at how long the cache keeps the answer")
++	}
++	clock.advance(testCacheConfig.MaxTTL - time.Second)
++	for _, rr := range lookupOK(t, c, long).Answer {
++		require.Equal(t, uint32(1), rr.Header().Ttl)
++	}
++	require.Equal(t, 1, up.count("long.example.", dns.TypeA))
++	clock.advance(time.Second)
++	lookupOK(t, c, long)
++	require.Equal(t, 2, up.count("long.example.", dns.TypeA), "the smallest TTL in the answer sets its lifetime")
++}
++
++func TestCacheKeepsNegativeAnswersForTheSOAMinimum(t *testing.T) {
++	soa := func(name string, ttl, minttl int) dns.RR {
++		return mustRR(t, name+" "+strconv.Itoa(ttl)+" IN SOA ns.example. host.example. 1 7200 3600 1209600 "+strconv.Itoa(minttl))
++	}
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		switch q.Name {
++		case "nx.example.":
++			return &lookupResult{Rcode: dns.RcodeNameError, Ns: []dns.RR{soa("example.", 3600, 60)}}, nil
++		case "nodata.example.":
++			return &lookupResult{Rcode: dns.RcodeSuccess, Ns: []dns.RR{soa("example.", 30, 900)}}, nil
++		case "sd.example.":
++			return &lookupResult{Rcode: dns.RcodeNameError, NegativeTTL: 20, ambiguous: true}, nil
++		default:
++			return &lookupResult{Rcode: dns.RcodeNameError, Ns: []dns.RR{soa("example.", 86400, 86400)}}, nil
++		}
++	})
++	c, clock := newTestCache(up, nil)
++
++	for _, tc := range []struct {
++		name  string
++		rcode int
++		keep  time.Duration
++	}{
++		{"nx.example.", dns.RcodeNameError, 60 * time.Second},   // SOA MINIMUM below its TTL
++		{"nodata.example.", dns.RcodeSuccess, 30 * time.Second}, // SOA TTL below its MINIMUM
++		{"sd.example.", dns.RcodeNameError, 20 * time.Second},   // no SOA, the source's negative TTL
++		{"long.example.", dns.RcodeNameError, 5 * time.Minute},  // capped
++	} {
++		q := question(tc.name, dns.TypeAAAA)
++		res := lookupOK(t, c, q)
++		require.Equal(t, tc.rcode, res.Rcode, tc.name)
++		clock.advance(tc.keep - time.Second)
++		res = lookupOK(t, c, q)
++		require.Equal(t, tc.rcode, res.Rcode, tc.name)
++		require.Equal(t, 1, up.count(tc.name, dns.TypeAAAA), "%s is cached", tc.name)
++		for _, rr := range res.Ns {
++			require.LessOrEqual(t, rr.Header().Ttl, uint32(1), "%s: the SOA's TTL ends with the cached answer", tc.name)
++		}
++		clock.advance(time.Second)
++		lookupOK(t, c, q)
++		require.Equal(t, 2, up.count(tc.name, dns.TypeAAAA), "%s expires", tc.name)
++	}
++}
++
++func TestCacheDoesNotKeepFailures(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		if q.Qtype == dns.TypeA {
++			return &lookupResult{Rcode: dns.RcodeServerFailure}, nil
++		}
++		return nil, errors.New("unreachable")
++	})
++	c, _ := newTestCache(up, nil)
++	for range 3 {
++		require.Equal(t, dns.RcodeServerFailure, lookupOK(t, c, question("example.org.", dns.TypeA)).Rcode)
++		_, err := c.lookup(context.Background(), question("example.org.", dns.TypeAAAA))
++		require.Error(t, err)
++	}
++	require.Equal(t, 3, up.count("example.org.", dns.TypeA))
++	require.Equal(t, 3, up.count("example.org.", dns.TypeAAAA))
++	require.Zero(t, c.len())
++}
++
++func TestCacheKeysIgnoreNameCaseButNotTypeOrClass(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		return positive(mustRR(t, q.Name+" 300 IN TXT \"x\"")), nil
++	})
++	c, _ := newTestCache(up, nil)
++	lookupOK(t, c, question("Example.ORG.", dns.TypeTXT))
++	lookupOK(t, c, question("example.org.", dns.TypeTXT))
++	lookupOK(t, c, question("example.org", dns.TypeTXT))
++	require.Equal(t, 1, up.count("example.org.", dns.TypeTXT))
++	lookupOK(t, c, question("example.org.", dns.TypeMX))
++	lookupOK(t, c, dns.Question{Name: "example.org.", Qtype: dns.TypeTXT, Qclass: dns.ClassCHAOS})
++	require.Equal(t, 3, c.len())
++}
++
++func TestCacheEvictsTheLeastRecentlyUsed(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		return positive(mustRR(t, q.Name+" 300 IN A 192.0.2.1")), nil
++	})
++	c, _ := newTestCache(up, nil)
++	c.cfg.MaxEntries = 2
++	lookupOK(t, c, question("a.example.", dns.TypeA))
++	lookupOK(t, c, question("b.example.", dns.TypeA))
++	lookupOK(t, c, question("a.example.", dns.TypeA))
++	lookupOK(t, c, question("c.example.", dns.TypeA))
++	require.Equal(t, 2, c.len())
++
++	lookupOK(t, c, question("a.example.", dns.TypeA))
++	lookupOK(t, c, question("c.example.", dns.TypeA))
++	require.Equal(t, 1, up.count("a.example.", dns.TypeA))
++	require.Equal(t, 1, up.count("c.example.", dns.TypeA))
++	lookupOK(t, c, question("b.example.", dns.TypeA))
++	require.Equal(t, 2, up.count("b.example.", dns.TypeA), "b was evicted")
++}
++
++// waitForWaiters blocks until n askers wait on the lookup of q.
++func waitForWaiters(t *testing.T, c *answerCache, q dns.Question, n int) {
++	t.Helper()
++	key := cacheKey{strings.ToLower(q.Name), q.Qtype, q.Qclass}
++	require.Eventually(t, func() bool {
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		f := c.flights[key]
++		return f != nil && f.waiters == n
++	}, 5*time.Second, time.Millisecond)
++}
++
++func TestCacheCoalescesConcurrentLookups(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		// Not cacheable, so only coalescing keeps this to one call.
++		return &lookupResult{Rcode: dns.RcodeServerFailure, Answer: []dns.RR{mustRR(t, q.Name+" 300 IN A 192.0.2.1")}}, nil
++	})
++	up.gate = make(chan struct{})
++	c, _ := newTestCache(up, nil)
++	q := question("example.org.", dns.TypeA)
++
++	const n = 20
++	results := make([]*lookupResult, n)
++	var wg sync.WaitGroup
++	for i := range n {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			res, err := c.lookup(context.Background(), q)
++			if err == nil {
++				results[i] = res
++			}
++		}()
++	}
++	// One asker gives up early; the others still get the answer.
++	ctx, cancel := context.WithCancel(context.Background())
++	gaveUp := make(chan error, 1)
++	go func() {
++		_, err := c.lookup(ctx, q)
++		gaveUp <- err
++	}()
++	waitForWaiters(t, c, q, n+1)
++	cancel()
++	require.ErrorIs(t, <-gaveUp, context.Canceled)
++	close(up.gate)
++	wg.Wait()
++
++	require.Equal(t, 1, up.count("example.org.", dns.TypeA))
++	for i, res := range results {
++		require.NotNil(t, res, "asker %d", i)
++		require.Len(t, res.Answer, 1)
++	}
++	results[0].Answer[0].Header().Name = "changed."
++	require.Equal(t, "example.org.", results[1].Answer[0].Header().Name, "each asker gets its own copy")
++}
++
++func TestCacheEmptiesWhenTheConfigurationChanges(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		return positive(mustRR(t, q.Name+" 300 IN A 192.0.2.1")), nil
++	})
++	var mu sync.Mutex
++	changed := false
++	c, _ := newTestCache(up, func() bool {
++		mu.Lock()
++		defer mu.Unlock()
++		was := changed
++		changed = false
++		return was
++	})
++	q := question("example.org.", dns.TypeA)
++	lookupOK(t, c, q)
++	lookupOK(t, c, q)
++	require.Equal(t, 1, up.count("example.org.", dns.TypeA))
++
++	mu.Lock()
++	changed = true
++	mu.Unlock()
++	lookupOK(t, c, q)
++	require.Equal(t, 2, up.count("example.org.", dns.TypeA))
++
++	// A lookup that started before a change is not stored after it.
++	up.gate = make(chan struct{})
++	stale := question("stale.example.", dns.TypeA)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		_, _ = c.lookup(context.Background(), stale)
++	}()
++	waitForWaiters(t, c, stale, 1)
++	c.flush()
++	close(up.gate)
++	<-done
++	require.Zero(t, c.len())
++}
++
++func TestResolverTellsNXDOMAINFromNODATA(t *testing.T) {
++	negative := &lookupResult{Rcode: dns.RcodeNameError, NegativeTTL: 60, ambiguous: true}
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		switch {
++		case q.Name == "v4only.example." && q.Qtype == dns.TypeA:
++			return positive(mustRR(t, "v4only.example. 300 IN A 192.0.2.1")), nil
++		case q.Name == "v6only.example." && q.Qtype == dns.TypeAAAA:
++			return positive(mustRR(t, "v6only.example. 300 IN AAAA 2001:db8::1")), nil
++		case q.Name == "alias.example.":
++			res := *negative
++			res.Answer = []dns.RR{mustRR(t, "alias.example. 300 IN CNAME v4only.example.")}
++			return &res, nil
++		case q.Name == "broken-alias.example.":
++			res := *negative
++			res.Answer = []dns.RR{mustRR(t, "broken-alias.example. 300 IN CNAME nothing.example.")}
++			return &res, nil
++		case q.Name == "flaky.example." && q.Qtype == dns.TypeA:
++			return nil, errors.New("timed out")
++		default:
++			return negative, nil
++		}
++	})
++	r := newCachingResolver(up.lookup, testCacheConfig, nil)
++	resolve := func(name string, qtype uint16) *lookupResult {
++		t.Helper()
++		res, err := r.resolve(context.Background(), question(name, qtype))
++		require.NoError(t, err)
++		return res
++	}
++
++	res := resolve("v4only.example.", dns.TypeAAAA)
++	require.Equal(t, dns.RcodeSuccess, res.Rcode, "an IPv4-only name has no AAAA, but exists")
++	require.Empty(t, res.Answer)
++	require.Equal(t, dns.RcodeSuccess, resolve("v4only.example.", dns.TypeA).Rcode)
++	require.Equal(t, 1, up.count("v4only.example.", dns.TypeA), "the client's own A query reuses the probe's answer")
++
++	require.Equal(t, dns.RcodeSuccess, resolve("v6only.example.", dns.TypeA).Rcode)
++	require.Equal(t, dns.RcodeSuccess, resolve("v4only.example.", dns.TypeMX).Rcode)
++	require.Equal(t, dns.RcodeNameError, resolve("nothing.example.", dns.TypeA).Rcode)
++	require.Equal(t, dns.RcodeNameError, resolve("nothing.example.", dns.TypeAAAA).Rcode)
++	require.Equal(t, dns.RcodeNameError, resolve("nothing.example.", dns.TypeTXT).Rcode)
++
++	res = resolve("alias.example.", dns.TypeAAAA)
++	require.Equal(t, dns.RcodeSuccess, res.Rcode, "the name a CNAME leads to is the one probed")
++	require.Len(t, res.Answer, 1)
++	res = resolve("broken-alias.example.", dns.TypeA)
++	require.Equal(t, dns.RcodeNameError, res.Rcode, "RFC 6604: the rcode is the last name's")
++	require.Len(t, res.Answer, 1)
++
++	require.Equal(t, dns.RcodeSuccess, resolve("flaky.example.", dns.TypeAAAA).Rcode, "a failed probe answers NODATA")
++}
++
++func TestLastNameFollowsCNAMEs(t *testing.T) {
++	answer := []dns.RR{
++		mustRR(t, "b.example. 60 IN CNAME c.example."),
++		mustRR(t, "A.example. 60 IN CNAME b.example."),
++		mustRR(t, "c.example. 60 IN A 192.0.2.1"),
++	}
++	require.Equal(t, "c.example.", lastName("a.example.", answer))
++	require.Equal(t, "x.example.", lastName("x.example.", answer))
++	loop := []dns.RR{
++		mustRR(t, "a.example. 60 IN CNAME b.example."),
++		mustRR(t, "b.example. 60 IN CNAME a.example."),
++	}
++	require.Contains(t, []string{"a.example.", "b.example."}, lastName("a.example.", loop))
++}
++
++func TestHandlerAnswersFromTheResolver(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		switch strings.ToLower(q.Name) {
++		case "example.org.":
++			if q.Qtype == dns.TypeA {
++				return positive(mustRR(t, "example.org. 300 IN A 192.0.2.1")), nil
++			}
++			return &lookupResult{Rcode: dns.RcodeNameError, NegativeTTL: 60, ambiguous: true}, nil
++		case "unreachable.example.":
++			return nil, errors.New("timed out")
++		default:
++			return nil, errResolverUnavailable
++		}
++	})
++	h := &dnsHandler{
++		zones: []types.Zone{{
++			Name:    "containers.internal.",
++			Records: []types.Record{{Name: "host", IP: net.ParseIP("192.168.127.254")}},
++		}},
++		upstream: &mockdns.Resolver{Zones: map[string]mockdns.Zone{
++			"fallback.example.": {A: []string{"192.0.2.9"}},
++		}},
++		client:   &dns.Client{},
++		resolver: newCachingResolver(up.lookup, testCacheConfig, nil),
++	}
++	query := func(name string, qtype uint16) *dns.Msg {
++		m := new(dns.Msg)
++		m.SetQuestion(name, qtype)
++		h.addAnswers(m)
++		return m
++	}
++
++	m := query("host.containers.internal.", dns.TypeA)
++	require.Equal(t, dns.RcodeSuccess, m.Rcode)
++	require.Len(t, m.Answer, 1)
++	require.Equal(t, "192.168.127.254", m.Answer[0].(*dns.A).A.String())
++	require.Equal(t, uint32(0), m.Answer[0].Header().Ttl, "local zones answer as before")
++	m = query("host.containers.internal.", dns.TypeAAAA)
++	require.Equal(t, dns.RcodeSuccess, m.Rcode)
++	require.Empty(t, m.Answer)
++	require.Equal(t, dns.RcodeNameError, query("nothing.containers.internal.", dns.TypeA).Rcode)
++	require.Zero(t, up.count("host.containers.internal.", dns.TypeA)+up.count("host.containers.internal.", dns.TypeAAAA))
++
++	m = query("ExAmple.org.", dns.TypeA)
++	require.Equal(t, dns.RcodeSuccess, m.Rcode)
++	require.Len(t, m.Answer, 1)
++	require.Equal(t, "ExAmple.org.", m.Answer[0].Header().Name, "answers carry the name as asked")
++	require.Equal(t, uint32(300), m.Answer[0].Header().Ttl)
++	m = query("example.org.", dns.TypeAAAA)
++	require.Equal(t, dns.RcodeSuccess, m.Rcode)
++	require.Empty(t, m.Answer)
++
++	require.Equal(t, dns.RcodeServerFailure, query("unreachable.example.", dns.TypeA).Rcode)
++
++	m = query("fallback.example.", dns.TypeA)
++	require.Equal(t, dns.RcodeSuccess, m.Rcode, "without the system resolver, questions go the old way")
++	require.Len(t, m.Answer, 1)
++	require.Equal(t, "192.0.2.9", m.Answer[0].(*dns.A).A.String())
++}
++
++func TestServerSendsCachedTTLs(t *testing.T) {
++	up := newFakeUpstream(func(q dns.Question) (*lookupResult, error) {
++		return positive(
++			mustRR(t, "www.example.org. 3600 IN CNAME example.org."),
++			mustRR(t, "example.org. 120 IN A 192.0.2.1"),
++		), nil
++	})
++	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
++	require.NoError(t, err)
++	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	defer udpConn.Close()
++	defer tcpLn.Close()
++	server, err := NewWithUpstreamResolver(udpConn, tcpLn, nil, &mockdns.Resolver{})
++	require.NoError(t, err)
++	server.handler.resolver = newCachingResolver(up.lookup, testCacheConfig, nil)
++	go func() { _ = server.Serve() }()
++	go func() { _ = server.ServeTCP() }()
++
++	for _, network := range []string{"udp", "tcp"} {
++		addr := udpConn.LocalAddr().String()
++		if network == "tcp" {
++			addr = tcpLn.Addr().String()
++		}
++		m := new(dns.Msg)
++		m.SetQuestion("www.example.org.", dns.TypeA)
++		client := &dns.Client{Net: network, Timeout: 5 * time.Second}
++		resp, _, err := client.Exchange(m, addr)
++		require.NoError(t, err, network)
++		require.Equal(t, dns.RcodeSuccess, resp.Rcode)
++		require.True(t, resp.RecursionAvailable)
++		require.Len(t, resp.Answer, 2)
++		require.Equal(t, uint32(120), resp.Answer[0].Header().Ttl, "%s: capped at how long the answer is cached", network)
++		require.Equal(t, uint32(120), resp.Answer[1].Header().Ttl, network)
++	}
++	require.Equal(t, 1, up.count("www.example.org.", dns.TypeA))
++}
+diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
+index aeeb976..2e2ae9a 100644
+--- a/pkg/services/dns/dns.go
++++ b/pkg/services/dns/dns.go
+@@ -3,6 +3,7 @@ package dns
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/http"
+@@ -36,8 +37,15 @@ type dnsHandler struct {
+ 	// look up directly (SOA, PTR, AAAA, CAA, ...).
+ 	nameservers []string
+ 	client      *dns.Client
++	// resolver, when set, answers every question no local zone owns, in
++	// place of upstream and nameservers.
++	resolver *cachingResolver
+ }
+ 
++// errResolverUnavailable is returned by a resolver that cannot be reached
++// at all; the question then goes the way it would without one.
++var errResolverUnavailable = errors.New("system resolver unavailable")
++
+ func (h *dnsHandler) handle(w dns.ResponseWriter, r *dns.Msg, responseMessageSize int) {
+ 	m := new(dns.Msg)
+ 	m.SetReply(r)
+@@ -134,6 +142,12 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+ 		if done := h.addLocalAnswers(m, q); done {
+ 			return
+ 		}
++		if h.resolver != nil && h.addResolvedAnswers(m, q) {
++			if m.Rcode != dns.RcodeSuccess {
++				return
++			}
++			continue
++		}
+ 
+ 		resolver := h.upstream
+ 		switch q.Qtype {
+@@ -254,6 +268,31 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+ 	}
+ }
+ 
++// addResolvedAnswers answers q from h.resolver. It returns false, leaving m
++// alone, when the resolver is unavailable.
++func (h *dnsHandler) addResolvedAnswers(m *dns.Msg, q dns.Question) bool {
++	res, err := h.resolver.resolve(context.Background(), q)
++	if errors.Is(err, errResolverUnavailable) {
++		return false
++	}
++	if err != nil {
++		log.Debugf("dns: resolving %s %s: %v", q.Name, dns.TypeToString[q.Qtype], err)
++		m.Rcode = dns.RcodeServerFailure
++		return true
++	}
++	// Answer under the name exactly as asked, in case the client checks
++	// its case (DNS 0x20).
++	for _, rr := range res.Answer {
++		if hdr := rr.Header(); strings.EqualFold(hdr.Name, q.Name) {
++			hdr.Name = q.Name
++		}
++	}
++	m.Answer = append(m.Answer, res.Answer...)
++	m.Ns = append(m.Ns, res.Ns...)
++	m.Rcode = res.Rcode
++	return true
++}
++
+ // addAnswersFromNameservers forwards the raw query q to the host's upstream
+ // nameservers and copies the response back into m. It is used as the fallback
+ // for record types that the typed net.Resolver cannot resolve.

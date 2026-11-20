@@ -1,0 +1,117 @@
+diff --git a/src/utils/src/worker_message.rs b/src/utils/src/worker_message.rs
+--- a/src/utils/src/worker_message.rs
++++ b/src/utils/src/worker_message.rs
+@@ -1,7 +1,7 @@
+ /// The granularity of [`WorkerMessage::ReclaimMemory`] in guest physical addresses: the VMM
+ /// replaces whole blocks only, and the balloon only asks for ranges of whole blocks.
+ #[cfg(target_os = "macos")]
+-pub const RECLAIM_BLOCK_SIZE: u64 = 2 << 20;
++pub const RECLAIM_BLOCK_SIZE: u64 = 64 << 10;
+ 
+ #[derive(Debug)]
+ pub struct MemoryProperties {
+diff --git a/src/libkrun/src/vmm/builder.rs b/src/libkrun/src/vmm/builder.rs
+--- a/src/libkrun/src/vmm/builder.rs
++++ b/src/libkrun/src/vmm/builder.rs
+@@ -2016,16 +2016,16 @@
+     match map(guest_mem, ram.clone()) {
+         Ok(()) => {
+             info!(
+-                "guest RAM: mapped in {} blocks of {} MiB",
++                "guest RAM: mapped in {} blocks of {} KiB",
+                 (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+-                RECLAIM_BLOCK_SIZE >> 20
++                RECLAIM_BLOCK_SIZE >> 10
+             );
+             true
+         }
+         Err(e) => {
+             warn!(
+-                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+-                RECLAIM_BLOCK_SIZE >> 20
++                "guest RAM: couldn't map it in blocks of {} KiB: {e}",
++                RECLAIM_BLOCK_SIZE >> 10
+             );
+             false
+         }
+diff --git a/src/devices/src/virtio/balloon/macos.rs b/src/devices/src/virtio/balloon/macos.rs
+--- a/src/devices/src/virtio/balloon/macos.rs
++++ b/src/devices/src/virtio/balloon/macos.rs
+@@ -360,12 +360,13 @@
+ 
+     #[test]
+     fn test_reclaimable() {
+-        assert!(reclaimable(GuestAddress(0x8000_0000), 2 << 20));
+-        assert!(reclaimable(GuestAddress(0x8020_0000), 4 << 20));
+-        assert!(!reclaimable(GuestAddress(0x8000_0000), 0));
+-        assert!(!reclaimable(GuestAddress(0x8000_0000), 1 << 20));
+-        assert!(!reclaimable(GuestAddress(0x8000_0000), 3 << 20));
+-        assert!(!reclaimable(GuestAddress(0x8010_0000), 2 << 20));
++        let base = GuestAddress(0x8001_0000);
++        assert!(reclaimable(base, 64 << 10));
++        assert!(reclaimable(base, 2 << 20));
++        assert!(!reclaimable(base, 0));
++        assert!(!reclaimable(base, 32 << 10));
++        assert!(!reclaimable(base, 96 << 10));
++        assert!(!reclaimable(GuestAddress(0x8000_8000), 64 << 10));
+     }
+ 
+     #[test]
+@@ -483,7 +484,7 @@
+     fn test_small_reports_released_right_away() {
+         let mem = guest_memory();
+         let mut dev = TestDevice::new(&mem, Some(FreePageReportingMode::Replace));
+-        dev.report(&[(0x40_0000, 1 << 20), (0x80_1000, 2 << 20)]);
++        dev.report(&[(0x40_0000, 32 << 10), (0x80_1000, 2 << 20)]);
+         assert!(dev.balloon.process_frq());
+         assert_eq!(dev.used(), 1);
+         assert!(dev.worker.try_recv().is_err());
+diff --git a/src/libkrun/src/vmm/macos/vstate.rs b/src/libkrun/src/vmm/macos/vstate.rs
+--- a/src/libkrun/src/vmm/macos/vstate.rs
++++ b/src/libkrun/src/vmm/macos/vstate.rs
+@@ -980,12 +980,13 @@
+     #[test]
+     fn test_map_fresh_blocks_follows_guest_physical_blocks() {
+         // RAM that starts and ends in the middle of a block has a shorter first and last block.
+-        let start = DRAM_MEM_START_EFI + MIB;
+-        let (gm, ram) = ram_memory(start, 6 * MIB);
++        let half_block = RECLAIM_BLOCK_SIZE / 2;
++        let start = DRAM_MEM_START_EFI + half_block;
++        let (gm, ram) = ram_memory(start, 6 * half_block);
+         map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+         touch(&gm, ram, 1);
+ 
+-        let entries: Vec<_> = [start, start + MIB, start + 3 * MIB, start + 5 * MIB]
++        let entries: Vec<_> = [start, start + half_block, start + 3 * half_block, start + 5 * half_block]
+             .into_iter()
+             .map(|addr| {
+                 let entry = vm_map::entry(host_addr(&gm, addr));
+@@ -995,10 +996,10 @@
+         assert_eq!(
+             entries,
+             [
+-                (host_addr(&gm, start), MIB),
+-                (host_addr(&gm, start + MIB), 2 * MIB),
+-                (host_addr(&gm, start + 3 * MIB), 2 * MIB),
+-                (host_addr(&gm, start + 5 * MIB), MIB),
++                (host_addr(&gm, start), half_block),
++                (host_addr(&gm, start + half_block), 2 * half_block),
++                (host_addr(&gm, start + 3 * half_block), 2 * half_block),
++                (host_addr(&gm, start + 5 * half_block), half_block),
+             ]
+         );
+     }
+@@ -1078,10 +1079,10 @@
+         // one, and a run that ends in the middle of one.
+         for (addr, len) in [
+             (ram.start + 2 * MIB, 0),
+-            (ram.start + 2 * MIB, MIB),
++            (ram.start + 2 * MIB, RECLAIM_BLOCK_SIZE / 2),
+             (ram.start + 2 * MIB, RECLAIM_BLOCK_SIZE - page_size()),
+-            (ram.start + 3 * MIB, RECLAIM_BLOCK_SIZE),
+-            (ram.start + 2 * MIB, 3 * MIB),
++            (ram.start + page_size(), RECLAIM_BLOCK_SIZE),
++            (ram.start + 2 * MIB, 3 * RECLAIM_BLOCK_SIZE / 2),
+             (ram.start + 2 * MIB, 6 * MIB + page_size()),
+         ] {
+             assert!(

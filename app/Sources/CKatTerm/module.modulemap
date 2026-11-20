@@ -1,0 +1,5 @@
+module CKatTerm [system] {
+    header "../../../crates/kat-term/include/kat_term.h"
+    link "kat_term"
+    export *
+}

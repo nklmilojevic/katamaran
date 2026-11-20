@@ -1,0 +1,164 @@
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index c49790e..0665ad3 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -70,6 +70,9 @@ pub(super) struct InodeData {
+     // check the identity of what they get, since the name may have moved to another file since.
+     pub(super) anchor: Mutex<Option<(Inode, CString)>>,
+     open_handles: AtomicU32,
++    // One more than the host mtime (ns) at the last open, zero before the first: an open of an
++    // unchanged file keeps the guest's pages.
++    open_mtime: AtomicU64,
+ }
+ 
+ impl InodeData {
+@@ -85,6 +88,7 @@ impl InodeData {
+             pin: Arc::default(),
+             anchor: Mutex::new(None),
+             open_handles: AtomicU32::new(0),
++            open_mtime: AtomicU64::new(0),
+         }
+     }
+ 
+@@ -1224,6 +1228,7 @@ impl PassthroughFs {
+     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+         let flags = self.parse_open_flags(flags as i32);
+ 
++        syncopen::clear_mtime();
+         let file = self.open_file(inode, flags, directory)?;
+ 
+         // If O_TRUNC and kill_priv (OPEN_KILL_SUIDGID), clear security.capability and suid/sgid
+@@ -1250,20 +1255,46 @@ impl PassthroughFs {
+             }
+         }
+ 
+-        let handle = self
+-            .handles
+-            .insert(Arc::new(HandleData::new(self.node(inode)?, file)));
+-
+         let opts = match self.cfg.cache_policy {
+             CachePolicy::Never if !directory => OpenOptions::DIRECT_IO,
+             CachePolicy::Always if directory => OpenOptions::CACHE_DIR,
+             CachePolicy::Always => OpenOptions::KEEP_CACHE,
++            CachePolicy::Auto if !directory => self.keep_cache_if_unchanged(inode, &file),
+             _ => OpenOptions::empty(),
+         };
+ 
++        let handle = self
++            .handles
++            .insert(Arc::new(HandleData::new(self.node(inode)?, file)));
++
+         Ok((Some(handle), opts))
+     }
+ 
++    /// KEEP_CACHE when the file's mtime is the one its previous open saw: nothing has written it
++    /// since, so the pages the guest read then are still current.
++    fn keep_cache_if_unchanged(&self, inode: Inode, file: &RwLock<File>) -> OpenOptions {
++        let fd = file.read().unwrap().as_raw_fd();
++        let mtime = match syncopen::take_mtime(fd) {
++            Some(mtime) => mtime,
++            None => {
++                let mut st = MaybeUninit::<libc::stat>::uninit();
++                if unsafe { libc::fstat(fd, st.as_mut_ptr()) } < 0 {
++                    return OpenOptions::empty();
++                }
++                syncopen::mtime_ns(unsafe { st.assume_init_ref() })
++            }
++        }
++        .wrapping_add(1);
++        let Ok(data) = self.node(inode) else {
++            return OpenOptions::empty();
++        };
++        if data.open_mtime.swap(mtime, Ordering::Relaxed) == mtime {
++            OpenOptions::KEEP_CACHE
++        } else {
++            OpenOptions::empty()
++        }
++    }
++
+     fn open_file(
+         &self,
+         inode: Inode,
+@@ -3348,6 +3379,20 @@ mod tests {
+         assert_ne!(share.fd(first), share.fd(second));
+     }
+ 
++    #[test]
++    fn auto_policy_keeps_cache_of_unchanged_files() {
++        let name = "auto";
++        let share = Share::with_file_and_policy(name, CachePolicy::Auto);
++        let inode = share.inode(name);
++        let open = || share.fs.open(CTX, inode, false, libc::O_RDONLY as u32).unwrap().1;
++        assert_eq!(open(), OpenOptions::empty(), "first open");
++        assert_eq!(open(), OpenOptions::KEEP_CACHE, "unchanged");
++        let file = fs::File::options().write(true).open(share.dir.join(name)).unwrap();
++        file.set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
++        assert_eq!(open(), OpenOptions::empty(), "modified");
++        assert_eq!(open(), OpenOptions::KEEP_CACHE, "unchanged again");
++    }
++
+     #[test]
+     fn cache_policy_applies_file_and_directory_options() {
+         for (name, policy, file_options, directory_options) in [
+diff --git a/src/devices/src/virtio/fs/macos/syncopen.rs b/src/devices/src/virtio/fs/macos/syncopen.rs
+index 382d38c..9121d28 100644
+--- a/src/devices/src/virtio/fs/macos/syncopen.rs
++++ b/src/devices/src/virtio/fs/macos/syncopen.rs
+@@ -38,6 +38,26 @@ thread_local! {
+     static TIMED_OUT: Cell<bool> = const { Cell::new(false) };
+     /// Opens this thread handed to a helper, for tests.
+     static HELPER_OPENS: Cell<u64> = const { Cell::new(0) };
++    /// The descriptor and mtime (ns) of this thread's last inline open, which already stats it.
++    static LAST_MTIME: Cell<Option<(c_int, u64)>> = const { Cell::new(None) };
++}
++
++/// The mtime in nanoseconds of `fd` if this thread's last inline open returned it; clears it.
++pub fn take_mtime(fd: c_int) -> Option<u64> {
++    LAST_MTIME
++        .with(|m| m.take())
++        .and_then(|(f, mtime)| (f == fd).then_some(mtime))
++}
++
++/// Forgets the last inline open's mtime, before an open that may not go inline.
++pub fn clear_mtime() {
++    LAST_MTIME.with(|m| m.set(None));
++}
++
++pub fn mtime_ns(st: &libc::stat) -> u64 {
++    (st.st_mtime as u64)
++        .wrapping_mul(1_000_000_000)
++        .wrapping_add(st.st_mtime_nsec as u64)
+ }
+ 
+ // <sys/resource.h>
+@@ -263,11 +283,10 @@ unsafe fn open_inline(path: *const c_char, flags: c_int, mode: c_int) -> Option<
+             unsafe { st.assume_init() }.st_mode & libc::S_IFMT,
+             libc::S_IFREG | libc::S_IFDIR
+         );
+-    let restored = flags & libc::O_NONBLOCK != 0 || {
+-        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+-        fl >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) } == 0
+-    };
+-    if plain && restored {
++    // O_NONBLOCK does nothing on a regular file or a directory, so it can stay set.
++    if plain {
++        let mtime = mtime_ns(unsafe { st.assume_init_ref() });
++        LAST_MTIME.with(|m| m.set(Some((fd, mtime))));
+         Some(fd)
+     } else {
+         unsafe { libc::close(fd) };
+@@ -345,11 +364,9 @@ mod tests {
+         let before = helper_opens();
+         let fd = unsafe { open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+         assert!(fd >= 0);
+-        // O_NONBLOCK was only for the attempt.
+-        assert_eq!(
+-            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+-            0
+-        );
++        // The inline open stats the file, so its mtime comes along.
++        assert!(take_mtime(fd).is_some());
++        assert_eq!(take_mtime(fd), None);
+         unsafe { libc::close(fd) };
+         let fd = unsafe { open(dpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0) };
+         assert!(fd >= 0);

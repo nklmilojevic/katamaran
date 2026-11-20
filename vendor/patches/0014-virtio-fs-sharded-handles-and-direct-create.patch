@@ -1,0 +1,642 @@
+Subject: virtio/fs: shard the handle table, build CREATE entries from the new fd
+
+Every CREATE, OPEN and RELEASE write-locked one table of all open handles,
+and every READ and WRITE read-locked it, so with ten parallel unzips the
+vCPUs parked on that lock for about a quarter of their file-system time
+(sample: waits in write, release and create). Split the table into 64
+shards with their own locks; handles are numbered in order, so concurrent
+streams use different shards. RELEASE under 8 parallel writers went from
+28 to 14 us of host time.
+
+CREATE opened the name through syncopen (two setiopolicy_np calls, an
+fstat and two fcntls to undo O_NONBLOCK), then looked the name up again
+for the entry: a second path resolution and stat. One open and an fstat
+of the new descriptor are enough: open with O_EXCL through the
+parent's pin (or its /.vol path), and build the entry from fstat of that
+descriptor. A file the call creates cannot be dataless or a FIFO, so the
+open needs no bounding; a name that already exists (the guest had not seen
+it and did not ask for O_EXCL) still gets the bounded open. Host time per
+CREATE went from 51 to 43 us.
+
+--- a/src/devices/src/virtio/fs/macos/mod.rs
++++ b/src/devices/src/virtio/fs/macos/mod.rs
+@@ -3,6 +3,7 @@
+ pub mod fileops;
+ pub mod fs_utils;
+ pub mod guest_cache;
++mod handles;
+ pub mod passthrough;
+ mod pins;
+ pub mod syncopen;
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/handles.rs
+@@ -0,0 +1,116 @@
++// Open file handles. Every create, open and release changes the table and every read and write
++// looks a handle up, from all vCPUs at once, so it is split into shards that lock on their own:
++// handles are numbered in order, and concurrent streams land in different shards.
++
++use std::array;
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, RwLock};
++
++const SHARDS: usize = 64;
++
++pub(super) struct HandleTable<T> {
++    shards: [RwLock<HashMap<u64, Arc<T>>>; SHARDS],
++    next: AtomicU64,
++}
++
++impl<T> HandleTable<T> {
++    pub fn new() -> Self {
++        HandleTable {
++            shards: array::from_fn(|_| RwLock::new(HashMap::new())),
++            next: AtomicU64::new(1),
++        }
++    }
++
++    fn shard(&self, handle: u64) -> &RwLock<HashMap<u64, Arc<T>>> {
++        &self.shards[handle as usize % SHARDS]
++    }
++
++    /// Adds `data` under a new handle and returns the handle.
++    pub fn insert(&self, data: Arc<T>) -> u64 {
++        let handle = self.next.fetch_add(1, Ordering::Relaxed);
++        self.shard(handle).write().unwrap().insert(handle, data);
++        handle
++    }
++
++    pub fn get(&self, handle: u64) -> Option<Arc<T>> {
++        self.shard(handle).read().unwrap().get(&handle).cloned()
++    }
++
++    /// Removes the handle if `matches` accepts its data; returns whether it did.
++    pub fn remove_if(&self, handle: u64, matches: impl FnOnce(&T) -> bool) -> bool {
++        let mut shard = self.shard(handle).write().unwrap();
++        if shard.get(&handle).is_some_and(|data| matches(data)) {
++            shard.remove(&handle);
++            return true;
++        }
++        false
++    }
++
++    pub fn clear(&self) {
++        for shard in &self.shards {
++            shard.write().unwrap().clear();
++        }
++    }
++
++    /// Every handle's data, for the rare operations that look across handles.
++    pub fn all(&self) -> Vec<Arc<T>> {
++        self.shards
++            .iter()
++            .flat_map(|shard| shard.read().unwrap().values().cloned().collect::<Vec<_>>())
++            .collect()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::thread;
++
++    #[test]
++    fn handles_are_unique_and_found_until_removed() {
++        let table = HandleTable::new();
++        let a = table.insert(Arc::new("a"));
++        let b = table.insert(Arc::new("b"));
++        assert_ne!(a, b);
++        assert_eq!(*table.get(a).unwrap(), "a");
++        assert!(!table.remove_if(a, |d| *d == "b"));
++        assert!(table.get(a).is_some());
++        assert!(table.remove_if(a, |d| *d == "a"));
++        assert!(table.get(a).is_none());
++        assert!(!table.remove_if(a, |_| true));
++        assert_eq!(table.all().len(), 1);
++        table.clear();
++        assert!(table.get(b).is_none());
++    }
++
++    #[test]
++    fn concurrent_inserts_and_removes_keep_every_handle() {
++        let table = Arc::new(HandleTable::new());
++        let threads: Vec<_> = (0..8u64)
++            .map(|t| {
++                let table = table.clone();
++                thread::spawn(move || {
++                    let mut kept = Vec::new();
++                    for i in 0..2000u64 {
++                        let h = table.insert(Arc::new((t, i)));
++                        assert_eq!(*table.get(h).unwrap(), (t, i));
++                        if i % 2 == 0 {
++                            assert!(table.remove_if(h, |d| *d == (t, i)));
++                        } else {
++                            kept.push(h);
++                        }
++                    }
++                    kept
++                })
++            })
++            .collect();
++        let kept: Vec<u64> = threads
++            .into_iter()
++            .flat_map(|t| t.join().unwrap())
++            .collect();
++        assert_eq!(kept.len(), 8 * 1000);
++        assert_eq!(table.all().len(), kept.len());
++        assert!(kept.iter().all(|&h| table.get(h).is_some()));
++    }
++}
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -2,9 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-use std::collections::BTreeMap;
+ use std::collections::HashMap;
+-use std::collections::btree_map;
+ use std::env;
+ use std::ffi::{CStr, CString};
+ use std::fs::File;
+@@ -37,6 +35,7 @@
+ use super::attrlist;
+ use super::guest_cache::InodeTable;
+ pub use super::guest_cache::{CachedNode, GuestCache, GuestCacheView};
++use super::handles::HandleTable;
+ use super::pins::{Pin, PinPool, PinSlot};
+ use super::{fileops, syncopen};
+ 
+@@ -765,8 +764,7 @@
+     inodes: Arc<InodeTable>,
+     inode_alloc: Arc<InodeAllocator>,
+ 
+-    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+-    next_handle: AtomicU64,
++    handles: HandleTable<HandleData>,
+ 
+     map_windows: Mutex<HashMap<u64, u64>>,
+ 
+@@ -804,8 +802,7 @@
+             inodes,
+             inode_alloc,
+ 
+-            handles: RwLock::new(BTreeMap::new()),
+-            next_handle: AtomicU64::new(1),
++            handles: HandleTable::new(),
+ 
+             map_windows: Mutex::new(HashMap::new()),
+ 
+@@ -1098,14 +1095,7 @@
+             return Ok(());
+         }
+ 
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
++        let data = self.handle_data(inode, handle)?;
+ 
+         let mut ds = data.dirstream.lock().unwrap();
+ 
+@@ -1260,11 +1250,10 @@
+             }
+         }
+ 
+-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+-        let data = HandleData::new(self.node(inode)?, file);
++        let handle = self
++            .handles
++            .insert(Arc::new(HandleData::new(self.node(inode)?, file)));
+ 
+-        self.handles.write().unwrap().insert(handle, Arc::new(data));
+-
+         let opts = match self.cfg.cache_policy {
+             CachePolicy::Never if !directory => OpenOptions::DIRECT_IO,
+             CachePolicy::Always if directory => OpenOptions::CACHE_DIR,
+@@ -1304,18 +1293,53 @@
+         Ok(file)
+     }
+ 
+-    fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
+-        let mut handles = self.handles.write().unwrap();
+-
+-        if let btree_map::Entry::Occupied(e) = handles.entry(handle)
+-            && e.get().inode == inode
++    /// Opens `name` in the parent for CREATE. A file the call creates itself cannot be dataless
++    /// or a FIFO, so it opens directly, through the parent's pin when it has one; a name that
++    /// exists already (the guest did not ask for O_EXCL) gets a bounded open.
++    fn create_file(
++        &self,
++        parent_data: &InodeData,
++        name: &CStr,
++        flags: i32,
++        mode: u32,
++    ) -> io::Result<File> {
++        let flags = flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
++        let excl = flags | libc::O_EXCL;
++        let mut fd = match self.parent_pin(parent_data) {
++            Some(pin) => unsafe {
++                libc::openat(pin.fd(), name.as_ptr(), excl, mode as libc::c_uint)
++            },
++            None => {
++                let c_path = self.name_to_path(parent_data.inode, name)?;
++                unsafe { libc::open(c_path.as_ptr(), excl, mode as libc::c_uint) }
++            }
++        };
++        if fd < 0
++            && flags & libc::O_EXCL == 0
++            && io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+         {
+-            // We don't need to close the file here because that will happen automatically when
+-            // the last `Arc` is dropped.
+-            e.remove();
+-            return Ok(());
++            let c_path = self.name_to_path(parent_data.inode, name)?;
++            fd = unsafe { syncopen::open(c_path.as_ptr(), flags, mode as libc::c_int) };
+         }
++        if fd < 0 {
++            return Err(linux_error(io::Error::last_os_error()));
++        }
++        // Safe because we just opened this fd.
++        Ok(unsafe { File::from_raw_fd(fd) })
++    }
+ 
++    fn handle_data(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
++        self.handles
++            .get(handle)
++            .filter(|hd| hd.inode == inode)
++            .ok_or_else(ebadf)
++    }
++
++    fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
++        // The file closes when the last `Arc` of the handle data drops.
++        if self.handles.remove_if(handle, |hd| hd.inode == inode) {
++            return Ok(());
++        }
+         Err(ebadf())
+     }
+ 
+@@ -1774,7 +1798,7 @@
+     }
+ 
+     fn destroy(&self) {
+-        self.handles.write().unwrap().clear();
++        self.handles.clear();
+         self.inodes.write().unwrap().clear();
+     }
+ 
+@@ -2000,7 +2024,7 @@
+         umask: u32,
+         extensions: Extensions,
+     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+-        let c_path = self.name_to_path(parent, name)?;
++        let parent_data = self.node(parent)?;
+ 
+         let flags = self.parse_open_flags(flags as i32);
+         let (host_mode, complete) = match self.cfg.semantics {
+@@ -2016,33 +2040,19 @@
+             | PermissionSemantics::LinuxSimplifiedFixedOwner => (mode & !(umask & 0o777), false),
+         };
+ 
+-        // Safe because this doesn't modify any memory and we check the return value. We don't
+-        // really check `flags` because if the kernel can't handle poorly specified flags then we
+-        // have much bigger problems.
+-        let fd = unsafe {
+-            syncopen::open(
+-                c_path.as_ptr(),
+-                flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+-                host_mode as libc::c_int,
+-            )
+-        };
+-        if fd < 0 {
+-            return Err(linux_error(io::Error::last_os_error()));
+-        }
++        let file = self.create_file(&parent_data, name, flags, host_mode)?;
++        let fd = file.as_raw_fd();
+         let ihandle = InodeHandle::Fd(fd);
+ 
+-        if complete
+-            && let Err(e) = set_stat(
++        if complete {
++            set_stat(
+                 &ctx,
+                 self.cfg.semantics,
+                 &ihandle,
+                 None,
+                 Some((ctx.uid, ctx.gid)),
+                 Some(libc::S_IFREG as u32 | (mode & !(umask & 0o777))),
+-            )
+-        {
+-            unsafe { libc::close(fd) };
+-            return Err(e);
++            )?;
+         }
+ 
+         // Set security context
+@@ -2057,15 +2067,15 @@
+             remove_security_capability(&ihandle);
+         }
+ 
+-        // Safe because we just opened this fd.
+-        let file = Arc::new(RwLock::new(unsafe { File::from_raw_fd(fd) }));
+-
+-        let entry = self.lookup(ctx, parent, name)?;
+-
+-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+-        let data = HandleData::new(self.node(entry.inode)?, file);
++        // The entry comes from the new descriptor: a lookup of the name would resolve the path
++        // and stat the file a second time.
++        let st = fstat(&ctx, self.cfg.ownership(), fd, false)?;
++        let entry = self.register_entry(&parent_data, name, st);
++        let file = Arc::new(RwLock::new(file));
+ 
+-        self.handles.write().unwrap().insert(handle, Arc::new(data));
++        let handle = self
++            .handles
++            .insert(Arc::new(HandleData::new(self.node(entry.inode)?, file)));
+ 
+         let mut opts = OpenOptions::empty();
+         match self.cfg.cache_policy {
+@@ -2093,14 +2103,7 @@
+         _flags: u32,
+     ) -> io::Result<usize> {
+         debug!("read: {inode:?}");
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
++        let data = self.handle_data(inode, handle)?;
+ 
+         // This is safe because write_from uses preadv64, so the underlying file descriptor
+         // offset is not affected by this operation.
+@@ -2121,14 +2124,7 @@
+         kill_priv: bool,
+         _flags: u32,
+     ) -> io::Result<usize> {
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
++        let data = self.handle_data(inode, handle)?;
+ 
+         // This is safe because read_to uses pwritev64, so the underlying file descriptor
+         // offset is not affected by this operation.
+@@ -2182,14 +2178,7 @@
+     ) -> io::Result<(bindings::stat64, Duration)> {
+         // If we have a handle then use it otherwise get a new fd from the inode.
+         let ihandle = if let Some(handle) = handle {
+-            let hd = self
+-                .handles
+-                .read()
+-                .unwrap()
+-                .get(&handle)
+-                .filter(|hd| hd.inode == inode)
+-                .cloned()
+-                .ok_or_else(ebadf)?;
++            let hd = self.handle_data(inode, handle)?;
+ 
+             let fd = hd.file.write().unwrap().as_raw_fd();
+             InodeHandle::Fd(fd)
+@@ -2584,14 +2573,7 @@
+         _datasync: bool,
+         handle: Handle,
+     ) -> io::Result<()> {
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
++        let data = self.handle_data(inode, handle)?;
+ 
+         let fd = data.file.write().unwrap().as_raw_fd();
+ 
+@@ -2928,14 +2910,7 @@
+         offset: u64,
+         length: u64,
+     ) -> io::Result<()> {
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
++        let data = self.handle_data(inode, handle)?;
+ 
+         let fd = data.file.write().unwrap().as_raw_fd();
+ 
+@@ -3022,14 +2997,7 @@
+         offset: u64,
+         whence: u32,
+     ) -> io::Result<u64> {
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
++        let data = self.handle_data(inode, handle)?;
+ 
+         // SEEK_DATA and SEEK_HOLE have slightly different semantics
+         // in Linux vs. macOS, which means we can't support them.
+@@ -3199,16 +3167,10 @@
+         if flags != 0 {
+             return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+         }
+-        let handle = |handle: Handle, inode: Inode| {
+-            self.handles
+-                .read()
+-                .unwrap()
+-                .get(&handle)
+-                .filter(|hd| hd.inode == inode)
+-                .cloned()
+-                .ok_or_else(ebadf)
+-        };
+-        let (src, dst) = (handle(handle_in, inode_in)?, handle(handle_out, inode_out)?);
++        let (src, dst) = (
++            self.handle_data(inode_in, handle_in)?,
++            self.handle_data(inode_out, handle_out)?,
++        );
+         let src_fd = src.file.read().unwrap().as_raw_fd();
+         let dst_fd = dst.file.read().unwrap().as_raw_fd();
+         match fileops::copy_file_range(src_fd, off_in, dst_fd, off_out, len).map_err(linux_error)? {
+@@ -3248,7 +3210,7 @@
+         if unlinked >= 0 {
+             unsafe { libc::close(unlinked as RawFd) };
+         }
+-        for hd in self.handles.read().unwrap().values() {
++        for hd in self.handles.all() {
+             if hd.inode == inode {
+                 *hd.file.write().unwrap() = file.try_clone()?;
+             }
+@@ -3310,7 +3272,10 @@
+         }
+ 
+         fn fd(&self, handle: Handle) -> RawFd {
+-            self.fs.handles.read().unwrap()[&handle]
++            self.fs
++                .handles
++                .get(handle)
++                .unwrap()
+                 .file
+                 .read()
+                 .unwrap()
+@@ -3420,7 +3385,7 @@
+         let first = share.open(inode, libc::O_RDONLY);
+         let second = share.open(inode, libc::O_RDONLY);
+ 
+-        let shared = Arc::downgrade(&share.fs.handles.read().unwrap()[&first].file);
++        let shared = Arc::downgrade(&share.fs.handles.get(first).unwrap().file);
+ 
+         share.fs.do_release(inode, first).unwrap();
+         assert!(shared.upgrade().is_some());
+@@ -3792,7 +3757,10 @@
+     }
+ 
+     fn read_handle(fs: &PassthroughFs, handle: Handle) -> Vec<u8> {
+-        let fd = fs.handles.read().unwrap()[&handle]
++        let fd = fs
++            .handles
++            .get(handle)
++            .unwrap()
+             .file
+             .read()
+             .unwrap()
+@@ -3873,9 +3841,118 @@
+         assert_eq!(times("f"), (1_000_000, 2_000_000));
+         assert_eq!(times("l"), (3_000_000, 4_000_000));
+         fs::remove_dir_all(&dir).unwrap();
++    }
++
++    fn create_in(
++        fs: &PassthroughFs,
++        ctx: Context,
++        name: &str,
++        flags: i32,
++    ) -> io::Result<(Entry, Handle)> {
++        let (entry, handle, _) = fs.create(
++            ctx,
++            fuse::ROOT_ID,
++            &CString::new(name).unwrap(),
++            libc::S_IFREG as u32 | 0o640,
++            false,
++            (libc::O_RDWR | flags) as u32,
++            0o022,
++            Extensions::default(),
++        )?;
++        Ok((entry, handle.unwrap()))
++    }
++
++    /// CREATE builds the entry from the new descriptor instead of looking the name up again;
++    /// the entry must still be what a lookup returns, with the root pinned or not.
++    #[test]
++    fn create_returns_the_entry_a_lookup_would() {
++        let dir = fresh_dir("create-entry");
++        for pinned in [false, true] {
++            let fs = fixed_owner_at(&dir);
++            if pinned {
++                pin_root(&fs);
++            }
++            let name = format!("new-{pinned}");
++            let (entry, handle) = create_in(&fs, CTX, &name, 0).unwrap();
++            let meta = fs::symlink_metadata(dir.join(&name)).unwrap();
++            assert_eq!(entry.attr.st_ino, meta.ino());
++            assert_eq!(entry.attr.st_size, 0);
++            assert_eq!(u32::from(entry.attr.st_mode), libc::S_IFREG as u32 | 0o640);
++            assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (0, 0));
++            assert_eq!(meta.mode() & 0o777, 0o640);
++            let looked_up = lookup_in(&fs, fuse::ROOT_ID, &name).unwrap();
++            assert_eq!(looked_up.inode, entry.inode);
++            assert_eq!(refcount(&fs, entry.inode), 2);
++            let fd = fs
++                .handles
++                .get(handle)
++                .unwrap()
++                .file
++                .read()
++                .unwrap()
++                .as_raw_fd();
++            assert_eq!(
++                unsafe { libc::pwrite(fd, b"data".as_ptr().cast(), 4, 0) },
++                4
++            );
++            assert_eq!(fs::read(dir.join(&name)).unwrap(), b"data");
++            fs.release(CTX, entry.inode, 0, handle, false, false, None)
++                .unwrap();
++        }
+     }
+ 
++    /// A CREATE for a name that exists on the host (the guest had not seen it) opens that file,
++    /// unless the guest asked for O_EXCL.
+     #[test]
++    fn create_opens_an_existing_name_unless_exclusive() {
++        let dir = fresh_dir("create-existing");
++        fs::write(dir.join("old"), b"keep").unwrap();
++        let fs = fixed_owner_at(&dir);
++        let old = lookup_in(&fs, fuse::ROOT_ID, "old").unwrap().inode;
++
++        let (entry, handle) = create_in(&fs, CTX, "old", 0).unwrap();
++        assert_eq!(entry.inode, old);
++        assert_eq!(read_handle(&fs, handle), b"keep");
++        fs.release(CTX, old, 0, handle, false, false, None).unwrap();
++
++        let err = create_in(&fs, CTX, "old", bindings::LINUX_O_EXCL).map(|_| ());
++        assert_eq!(err.unwrap_err().raw_os_error(), Some(libc::EEXIST));
++        assert_eq!(fs::read(dir.join("old")).unwrap(), b"keep");
++
++        let (entry, handle) = create_in(&fs, CTX, "old", bindings::LINUX_O_TRUNC).unwrap();
++        assert_eq!((entry.inode, entry.attr.st_size), (old, 0));
++        assert!(fs::read(dir.join("old")).unwrap().is_empty());
++        fs.release(CTX, old, 0, handle, false, false, None).unwrap();
++    }
++
++    /// With xattr semantics the entry of a new file shows the owner and mode just recorded for
++    /// the guest, not the host's.
++    #[test]
++    fn create_reports_the_recorded_owner_with_xattr_semantics() {
++        let dir = fresh_dir("create-xattr");
++        let fs = passthrough_at(&dir, true, FsOptions::empty());
++        let user = Context {
++            uid: 1000,
++            gid: 1001,
++            pid: 0,
++        };
++        let (entry, handle) = create_in(&fs, user, "owned", 0).unwrap();
++        assert_eq!((entry.attr.st_uid, entry.attr.st_gid), (1000, 1001));
++        assert_eq!(u32::from(entry.attr.st_mode), libc::S_IFREG as u32 | 0o640);
++        let looked_up = lookup_in(&fs, fuse::ROOT_ID, "owned").unwrap();
++        assert_eq!(
++            (
++                looked_up.attr.st_uid,
++                looked_up.attr.st_gid,
++                looked_up.attr.st_mode
++            ),
++            (1000, 1001, entry.attr.st_mode)
++        );
++        fs.release(user, entry.inode, 0, handle, false, false, None)
++            .unwrap();
++    }
++
++    #[test]
+     fn lookups_pin_busy_directories_within_the_budget() {
+         let dir = fresh_dir("pins");
+         for d in 0..40 {

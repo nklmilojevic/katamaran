@@ -1,0 +1,118 @@
+Subject: [PATCH] sched/idle: poll before halting, with arm64 TIF_POLLING_NRFLAG
+
+Waking a halted vCPU costs an IPI that Hypervisor.framework delivers by
+waking the host thread parked in WFI: tens of microseconds per wakeup,
+paid twice by every request/response between two tasks on different vCPUs
+(a PHP worker and its database, a pipe between two processes). Define
+TIF_POLLING_NRFLAG on arm64, so that a wakeup aimed at an idle CPU that is
+polling only sets TIF_NEED_RESCHED, and poll for an adaptive window before
+halting, as x86 guest haltpoll does. The window grows while the CPU is woken
+soon after it halted and shrinks to nothing when it stays idle, so an idle
+guest does not spin. idle_poll_ns=0 turns it off.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/arch/arm64/include/asm/thread_info.h b/arch/arm64/include/asm/thread_info.h
+--- a/arch/arm64/include/asm/thread_info.h	2026-11-18 22:09:48
++++ b/arch/arm64/include/asm/thread_info.h	2026-11-18 22:10:07
+@@ -71,6 +71,7 @@
+ #define TIF_SECCOMP		11	/* syscall secure computing */
+ #define TIF_SYSCALL_EMU		12	/* syscall emulation active */
+ #define TIF_PATCH_PENDING	13	/* pending live patching update */
++#define TIF_POLLING_NRFLAG	14	/* idle is polling for TIF_NEED_RESCHED */
+ #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
+ #define TIF_FREEZE		19
+ #define TIF_RESTORE_SIGMASK	20
+@@ -98,6 +99,7 @@
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ #define _TIF_SYSCALL_EMU	(1 << TIF_SYSCALL_EMU)
+ #define _TIF_PATCH_PENDING	(1 << TIF_PATCH_PENDING)
++#define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_UPROBE		(1 << TIF_UPROBE)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+ #define _TIF_32BIT		(1 << TIF_32BIT)
+diff -ruN a/kernel/sched/idle.c b/kernel/sched/idle.c
+--- a/kernel/sched/idle.c	2026-11-18 22:09:49
++++ b/kernel/sched/idle.c	2026-11-18 22:10:07
+@@ -76,6 +76,63 @@
+ 	return 1;
+ }
+ 
++/*
++ * Poll before halting, for guests whose halt is expensive to leave: waking a
++ * halted vCPU means an IPI the hypervisor delivers by waking a host thread,
++ * tens of microseconds per wakeup. While the idle task polls with
++ * TIF_POLLING_NRFLAG set, a wakeup only sets TIF_NEED_RESCHED and sends no
++ * IPI. The window adapts per CPU as in x86's guest haltpoll governor: it
++ * grows while wakeups arrive soon after the CPU halted and shrinks when the
++ * CPU stays idle for longer than idle_poll_ns, so an idle guest stops
++ * polling. idle_poll_ns=0 on the command line turns it off.
++ */
++static unsigned int idle_poll_max_ns = 200000;
++core_param(idle_poll_ns, idle_poll_max_ns, uint, 0644);
++
++#define IDLE_POLL_START_NS	10000
++
++static DEFINE_PER_CPU(unsigned int, idle_poll_limit_ns);
++
++/* Called with interrupts disabled; returns with them disabled. */
++static noinline bool __cpuidle idle_poll(u64 limit)
++{
++	u64 start = local_clock_noinstr();
++	bool woken;
++
++	instrumentation_begin();
++	trace_cpu_idle(0, smp_processor_id());
++	stop_critical_timings();
++	ct_cpuidle_enter();
++
++	raw_local_irq_enable();
++	while (!tif_need_resched() && local_clock_noinstr() - start < limit)
++		cpu_relax();
++	raw_local_irq_disable();
++
++	ct_cpuidle_exit();
++	start_critical_timings();
++	trace_cpu_idle(PWR_EVENT_EXIT, smp_processor_id());
++	woken = tif_need_resched();
++	instrumentation_end();
++
++	return woken;
++}
++
++/* After a halt that lasted @idle_ns, from going idle to waking up. */
++static void idle_poll_adjust(u64 idle_ns)
++{
++	unsigned int max = READ_ONCE(idle_poll_max_ns);
++	unsigned int limit = __this_cpu_read(idle_poll_limit_ns);
++
++	if (idle_ns <= max)
++		limit = limit ? min(limit * 2, max) : min(IDLE_POLL_START_NS, max);
++	else if (limit / 2 >= IDLE_POLL_START_NS)
++		limit /= 2;
++	else
++		limit = 0;
++	__this_cpu_write(idle_poll_limit_ns, limit);
++}
++
+ /* Weak implementations for optional arch specific functions */
+ void __weak arch_cpu_idle_prepare(void) { }
+ void __weak arch_cpu_idle_enter(void) { }
+@@ -347,7 +404,16 @@
+ 			tick_nohz_idle_restart_tick();
+ 			cpu_idle_poll();
+ 		} else {
+-			cpuidle_idle_call(got_tick);
++			unsigned int limit = __this_cpu_read(idle_poll_limit_ns);
++			u64 start = local_clock();
++
++			if (limit && READ_ONCE(idle_poll_max_ns) && idle_poll(limit)) {
++				local_irq_enable();
++			} else {
++				cpuidle_idle_call(got_tick);
++				if (READ_ONCE(idle_poll_max_ns))
++					idle_poll_adjust(local_clock() - start);
++			}
+ 		}
+ 		got_tick = tick_nohz_idle_got_tick();
+ 		arch_cpu_idle_exit();

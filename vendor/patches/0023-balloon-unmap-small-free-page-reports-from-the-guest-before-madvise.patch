@@ -1,0 +1,96 @@
+diff --git a/src/devices/src/virtio/balloon/macos.rs b/src/devices/src/virtio/balloon/macos.rs
+--- a/src/devices/src/virtio/balloon/macos.rs
++++ b/src/devices/src/virtio/balloon/macos.rs
+@@ -3,6 +3,9 @@ use std::os::fd::{AsRawFd, RawFd};
+ use std::thread;
+ 
+ use crossbeam_channel::{Receiver, Sender, unbounded};
++use hvf::bindings::{
++    HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE, HV_SUCCESS, hv_return_t, hv_vm_map, hv_vm_unmap,
++};
+ use utils::epoll::{EpollEvent, EventSet};
+ use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender, pollable_channel};
+ use utils::worker_message::{RECLAIM_BLOCK_SIZE, WorkerMessage};
+@@ -67,21 +70,7 @@ impl FreePageReclaim {
+         head: u16,
+         ranges: Vec<FreeRange>,
+     ) -> bool {
+-        self.release_with(mem, head, ranges, |range| {
+-            // MADV_FREE_REUSABLE takes the pages out of the process's footprint right away and
+-            // lets the system take them without writing them out; MADV_FREE only does the
+-            // latter, so the footprint keeps every page the guest ever touched. A later access
+-            // by the guest faults the page back in (zeroed if the system took it), which
+-            // counts it again.
+-            // SAFETY: the range is guest memory, whose contents the guest has given up.
+-            unsafe {
+-                libc::madvise(
+-                    range.host_addr.cast(),
+-                    range.len,
+-                    libc::MADV_FREE_REUSABLE,
+-                )
+-            };
+-        })
++        self.release_with(mem, head, ranges, release_pages)
+     }
+ 
+     /// Like [`FreePageReclaim::release`], with `discard` giving back each run of adjacent ranges
+@@ -199,6 +188,43 @@ fn reclaim(
+     }
+ }
+ 
++/// Gives the pages of a range that isn't reclaimed back to the host.
++///
++/// XNU ignores madvise() for pages that the guest faulted in while the hypervisor maps them: they
++/// stay dirty and in the footprint, and the system can't take them. So the range is unmapped from
++/// the guest first and mapped again afterwards, which the guest doesn't notice: it doesn't touch
++/// reported pages before the report is used. MADV_FREE then takes the pages out of the footprint,
++/// and a later access by the guest counts them again. MADV_FREE_REUSABLE doesn't: the pages that
++/// the guest writes to again stay out of the footprint until memory pressure makes the system
++/// account for them, so the footprint keeps growing after each pressure spike.
++///
++/// Without the hypervisor (in the tests), the pages are madvise()d with MADV_FREE_REUSABLE, which
++/// takes the pages that the VMM itself wrote to out of the footprint.
++fn release_pages(range: &FreeRange) {
++    let guest_addr = range.guest_addr.0;
++    // SAFETY: the range is guest memory, whose contents the guest has given up.
++    let unmapped = unsafe { hv_vm_unmap(guest_addr, range.len) } == HV_SUCCESS as hv_return_t;
++    let advice = if unmapped {
++        libc::MADV_FREE
++    } else {
++        libc::MADV_FREE_REUSABLE
++    };
++    // SAFETY: as above.
++    unsafe { libc::madvise(range.host_addr.cast(), range.len, advice) };
++    if !unmapped {
++        return;
++    }
++    let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
++    // SAFETY: maps the range of guest memory back where it was.
++    let ret = unsafe { hv_vm_map(range.host_addr.cast(), guest_addr, range.len, flags.into()) };
++    if ret != HV_SUCCESS as hv_return_t {
++        error!(
++            "balloon: couldn't map guest memory back: guest_addr={guest_addr:x} len={} ret={ret:x}",
++            range.len
++        );
++    }
++}
++
+ /// Smaller or unaligned reports are only madvise()d, so that the guest can't make the VMM split
+ /// the stage-2 mapping of its RAM into small pieces, and because the VMM only replaces whole
+ /// blocks. Linux reports 2 MiB blocks by default.
+diff --git a/src/devices/src/virtio/balloon/mod.rs b/src/devices/src/virtio/balloon/mod.rs
+--- a/src/devices/src/virtio/balloon/mod.rs
++++ b/src/devices/src/virtio/balloon/mod.rs
+@@ -41,9 +41,9 @@ mod defs {
+ #[repr(u32)]
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub enum FreePageReportingMode {
+-    /// madvise() the reported pages on Linux and macOS (MADV_FREE_REUSABLE there, which takes
+-    /// them out of the footprint and lets the system take them), and DiscardVirtualMemory()
+-    /// them on Windows.
++    /// madvise() the reported pages on Linux and macOS (on macOS with the pages unmapped from
++    /// the guest, without which XNU ignores the advice for pages the guest wrote to), and
++    /// DiscardVirtualMemory() them on Windows.
+     #[default]
+     Default = 0,
+     /// On macOS, have the VMM replace the reported pages with fresh memory, which releases them

@@ -1,0 +1,15 @@
+{
+  "Name": "b-slow",
+  "Ref": "8m338bwlk6t9yft083lvtkpoc",
+  "Context": "/Users/dev/src/b-slow",
+  "Dockerfile": "Dockerfile",
+  "StartedAt": "2026-11-19T10:49:11.278934179+01:00",
+  "Duration": 6060550461,
+  "Status": "running",
+  "NumCompletedSteps": 0,
+  "NumTotalSteps": 0,
+  "NumCachedSteps": 0,
+  "Config": {
+    "ImageResolveMode": "local"
+  }
+}

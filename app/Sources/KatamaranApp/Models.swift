@@ -1,0 +1,125 @@
+import Foundation
+
+/// Mirrors `crates/kat-daemon/src/api.rs`. Unknown fields are ignored and
+/// optional ones may be missing, so the app tolerates a newer daemon.
+struct DaemonStatus: Decodable, Equatable {
+    var state: String
+    var error: String?
+    var since_ms: UInt64
+    var uptime_s: Double?
+    var daemon: DaemonInfo
+    var versions: Versions
+    var config: Config
+    var vm: VmInfo?
+    var usage: Sample?
+    var docker: DockerInfo
+    var mount: MountInfo
+    var ports: [Port]
+}
+
+struct DaemonInfo: Decodable, Equatable {
+    var pid: UInt32
+    var home: String
+    var launchd_label: String?
+}
+
+struct Versions: Decodable, Equatable {
+    var katamaran: String
+    var `protocol`: UInt32
+    var kernel: String?
+}
+
+struct Config: Codable, Equatable {
+    var cpus: Int
+    var memory_mib: Int
+    var mount: Bool
+    var mount_path: String?
+    var launch_at_login: Bool
+}
+
+struct ConfigView: Decodable {
+    var config: Config
+    var restart_required: Bool
+}
+
+struct VmInfo: Decodable, Equatable {
+    var cpus: Int
+    var memory_mib: Int
+    var pid: UInt32?
+    var boot_ms: Double?
+    var docker_ready_ms: Double?
+}
+
+struct Sample: Decodable, Equatable {
+    var t_ms: UInt64
+    var guest_cpu_percent: Double
+    var guest_mem_used_mib: UInt64
+    var guest_mem_total_mib: UInt64
+    var host_cpu_percent: Double
+    var host_footprint_mib: UInt64
+}
+
+struct StatsResult: Decodable {
+    var interval_ms: UInt64
+    var samples: [Sample]
+}
+
+struct DockerInfo: Decodable, Equatable {
+    var state: String
+    var socket: String
+}
+
+struct MountInfo: Decodable, Equatable {
+    var enabled: Bool
+    var path: String?
+    var mounted: Bool
+    var error: String?
+}
+
+struct Port: Decodable, Equatable, Hashable {
+    var proto: String
+    var port: UInt16
+}
+
+struct LogChunk: Decodable {
+    var data: String
+    var offset: UInt64
+}
+
+/// What the menu-bar icon shows.
+enum Phase: Equatable {
+    case noDaemon, stopped, starting, running, stopping, error
+
+    init(_ s: DaemonStatus?) {
+        guard let s else { self = .noDaemon; return }
+        switch s.state {
+        case "running": self = s.docker.state == "failed" ? .error : .running
+        case "starting": self = .starting
+        case "stopping": self = .stopping
+        case "error": self = .error
+        default: self = .stopped
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .noDaemon: "Not running"
+        case .stopped: "Stopped"
+        case .starting: "Starting…"
+        case .running: "Running"
+        case .stopping: "Stopping…"
+        case .error: "Error"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .running: "sailboat.fill"
+        case .starting, .stopping: "sailboat.circle"
+        case .error: "exclamationmark.triangle"
+        case .stopped, .noDaemon: "sailboat"
+        }
+    }
+
+    var isUp: Bool { self == .running || self == .starting }
+}

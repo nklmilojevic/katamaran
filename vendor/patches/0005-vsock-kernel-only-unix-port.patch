@@ -1,0 +1,173 @@
+diff --git a/src/devices/src/virtio/vsock/kernel_peer.rs b/src/devices/src/virtio/vsock/kernel_peer.rs
+new file mode 100644
+index 00000000..a5458eb4
+--- /dev/null
++++ b/src/devices/src/virtio/vsock/kernel_peer.rs
+@@ -0,0 +1,93 @@
++//! Host Unix listeners that only the host kernel may connect to.
++//!
++//! Some host listeners serve a client inside the host kernel, such as the
++//! macOS NFS client mounting a socket with `proto=ticotsord`. A socket the
++//! kernel connects by itself has no owning process: macOS reports peer pid 0
++//! (`kernel_task`), and so does Linux. Any user process has a pid of its own,
++//! root's included, so a pid of 0 admits the kernel and nobody else.
++
++use std::os::unix::io::RawFd;
++use std::path::{Path, PathBuf};
++use std::sync::Mutex;
++
++static KERNEL_ONLY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
++
++/// Admit only the kernel on the listener bound at `path`.
++pub fn restrict_to_kernel(path: &Path) {
++    let mut paths = KERNEL_ONLY.lock().unwrap();
++    if !paths.iter().any(|p| p == path) {
++        paths.push(path.to_path_buf());
++    }
++}
++
++/// Whether a connection accepted on the listener at `path` may proceed.
++pub fn admits(path: &Path, fd: RawFd) -> bool {
++    let restricted = KERNEL_ONLY.lock().unwrap().iter().any(|p| p == path);
++    !restricted || peer_pid(fd) == Some(0)
++}
++
++#[cfg(target_os = "macos")]
++fn peer_pid(fd: RawFd) -> Option<libc::pid_t> {
++    let mut pid: libc::pid_t = -1;
++    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
++    // SAFETY: getsockopt writes at most `len` bytes into `pid`.
++    let rc = unsafe {
++        libc::getsockopt(
++            fd,
++            libc::SOL_LOCAL,
++            libc::LOCAL_PEERPID,
++            &mut pid as *mut libc::pid_t as *mut libc::c_void,
++            &mut len,
++        )
++    };
++    (rc == 0).then_some(pid)
++}
++
++#[cfg(target_os = "linux")]
++fn peer_pid(fd: RawFd) -> Option<libc::pid_t> {
++    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
++    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
++    // SAFETY: getsockopt writes at most `len` bytes into `cred`.
++    let rc = unsafe {
++        libc::getsockopt(
++            fd,
++            libc::SOL_SOCKET,
++            libc::SO_PEERCRED,
++            &mut cred as *mut libc::ucred as *mut libc::c_void,
++            &mut len,
++        )
++    };
++    (rc == 0).then_some(cred.pid)
++}
++
++#[cfg(not(any(target_os = "macos", target_os = "linux")))]
++fn peer_pid(_fd: RawFd) -> Option<libc::pid_t> {
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::io::AsRawFd;
++    use std::os::unix::net::{UnixListener, UnixStream};
++
++    #[test]
++    fn user_processes_are_refused_on_restricted_listeners_only() {
++        let dir = std::env::temp_dir().join(format!("krun-kpeer-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("s");
++        let _ = std::fs::remove_file(&path);
++        let listener = UnixListener::bind(&path).unwrap();
++        let _client = UnixStream::connect(&path).unwrap();
++        let (conn, _) = listener.accept().unwrap();
++        assert_eq!(
++            peer_pid(conn.as_raw_fd()),
++            Some(std::process::id() as libc::pid_t)
++        );
++        assert!(admits(&path, conn.as_raw_fd()));
++        restrict_to_kernel(&path);
++        assert!(!admits(&path, conn.as_raw_fd()));
++        assert!(admits(&dir.join("other"), conn.as_raw_fd()));
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+diff --git a/src/devices/src/virtio/vsock/mod.rs b/src/devices/src/virtio/vsock/mod.rs
+index d425cb61..136be038 100644
+--- a/src/devices/src/virtio/vsock/mod.rs
++++ b/src/devices/src/virtio/vsock/mod.rs
+@@ -7,6 +7,7 @@
+ 
+ mod device;
+ mod event_handler;
++pub mod kernel_peer;
+ mod muxer;
+ mod muxer_rxq;
+ mod muxer_thread;
+diff --git a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+index f9fe91d6..8ba465b8 100644
+--- a/src/libkrun/src/api/device_builders.rs
++++ b/src/libkrun/src/api/device_builders.rs
+@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
+ use std::os::windows::io::OwnedHandle;
+ #[cfg(target_os = "windows")]
+ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::sync::atomic::AtomicI32;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -38,6 +38,7 @@ use devices::virtio::block::{DiskFormat, SyncMode};
+ use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
++use devices::virtio::vsock::kernel_peer;
+ use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
+ #[cfg(feature = "input")]
+ use krun_input;
+@@ -1519,6 +1520,14 @@ impl VsockDevice {
+         self.unix_ipc_port_map
+             .insert(port, (PathBuf::from(path), listen));
+     }
++
++    /// Listen on a Unix socket for the host, like `add_unix_port` with
++    /// `listen`, but accept only connections the host kernel makes itself
++    /// (peer pid 0), such as the macOS NFS client's.
++    pub fn add_unix_port_kernel_only(&mut self, port: u32, path: &str) {
++        kernel_peer::restrict_to_kernel(Path::new(path));
++        self.add_unix_port(port, path, true);
++    }
+ }
+ 
+ #[cfg_attr(feature = "ffi", ffier::export)]
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/unix.rs b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+--- a/src/devices/src/virtio/vsock/unix_proxy/unix.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+@@ -14,6 +14,7 @@
+ 
+ #[cfg(target_os = "macos")]
+ use super::super::super::linux_errno::linux_errno_raw;
++use super::super::kernel_peer;
+ use super::super::muxer::{MuxerRx, push_packet};
+ use super::super::packet::{TsiConnectReq, VsockPacket};
+ use super::super::proxy::{
+@@ -553,6 +554,14 @@
+     }
+     if evset.contains(EventSet::IN) {
+         match accept(proxy.fd.as_raw_fd()) {
++            Ok(accept_fd) if !kernel_peer::admits(&proxy.path, accept_fd) => {
++                warn!(
++                    "refusing connection on {}: only the kernel may connect",
++                    proxy.path.display()
++                );
++                // Safe because we've just obtained the FD from the `accept` call above.
++                drop(unsafe { OwnedFd::from_raw_fd(accept_fd) });
++            }
+             Ok(accept_fd) => {
+                 // Safe because we've just obtained the FD from the `accept` call above.
+                 let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };

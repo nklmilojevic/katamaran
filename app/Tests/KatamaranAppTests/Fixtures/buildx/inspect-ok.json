@@ -1,0 +1,49 @@
+{
+  "Name": "b-ok",
+  "Ref": "m5hfid023iprqxkinunv1w5z8",
+  "Context": "/Users/dev/src/b-ok",
+  "Dockerfile": "Dockerfile",
+  "StartedAt": "2026-11-19T10:48:57.03807138+01:00",
+  "CompletedAt": "2026-11-19T10:49:04.866468759+01:00",
+  "Duration": 7828397379,
+  "Status": "completed",
+  "NumCompletedSteps": 9,
+  "NumTotalSteps": 9,
+  "NumCachedSteps": 0,
+  "BuildArgs": [
+    {
+      "Name": "API_TOKEN",
+      "Value": "supersecret"
+    },
+    {
+      "Name": "GREETING",
+      "Value": "hey"
+    }
+  ],
+  "Config": {
+    "ImageResolveMode": "local"
+  },
+  "Materials": [
+    {
+      "URI": "pkg:docker/alpine@3.20?platform=linux%2Farm64",
+      "Digests": [
+        "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+      ]
+    }
+  ],
+  "Attachments": [
+    {
+      "Digest": "sha256:aa9d0e714b9e45b6acd43255e81bfce87dbd339a35f4ec7d7d4ed2751dac22c4",
+      "Type": "application/vnd.oci.image.index.v1+json"
+    },
+    {
+      "Digest": "sha256:1ba6fef7720e8757c52123402d2064ccca13bed9fd2d8e214ba527f69c784d0c",
+      "Type": "https://slsa.dev/provenance/v1"
+    },
+    {
+      "Digest": "sha256:cdfead9be605aa218672a1844bd1b0b913a448e75ef5b92f32a30443bb58a79b",
+      "Platform": "linux/arm64",
+      "Type": "application/vnd.oci.image.manifest.v1+json"
+    }
+  ]
+}

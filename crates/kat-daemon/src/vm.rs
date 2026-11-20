@@ -1,0 +1,175 @@
+//! Starting a `katamaran-vm` process and completing the guest handshake.
+
+use std::fs;
+use std::io::{self, BufRead};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, bail};
+use kat_proto::{Hello, Msg, PROTOCOL_VERSION, read_msg, write_msg};
+use kat_vmm::VmConfig;
+
+pub struct RunningVm {
+    pub child: Child,
+    pub conn: UnixStream,
+    pub hello: Hello,
+    pub t_spawn: Instant,
+    /// Spawn until the guest's `Hello`.
+    pub t_hello: Duration,
+}
+
+/// Write `cfg` next to its control socket, listen, spawn the VM process and
+/// wait for the guest's `Hello`. On error the VM process is killed.
+pub fn start(cfg: &VmConfig, vm_bin: &Path, timeout: Duration) -> anyhow::Result<RunningVm> {
+    cfg.validate()?;
+    let dir = cfg
+        .control_socket
+        .parent()
+        .context("control socket has no parent directory")?;
+    let cfg_path = dir.join("vm.json");
+    fs::write(&cfg_path, serde_json::to_vec_pretty(cfg)?)?;
+
+    // Listen before the VM starts, so the guest's first dial succeeds and
+    // neither side has to poll.
+    let _ = fs::remove_file(&cfg.control_socket);
+    let listener = UnixListener::bind(&cfg.control_socket)
+        .with_context(|| format!("bind {}", cfg.control_socket.display()))?;
+    listener.set_nonblocking(true)?;
+
+    let vm_log = fs::File::create(dir.join("vm.log"))?;
+    let t_spawn = Instant::now();
+    let mut child = Command::new(vm_bin)
+        .arg(&cfg_path)
+        .stdin(Stdio::null())
+        .stdout(vm_log.try_clone()?)
+        .stderr(vm_log)
+        .spawn()
+        .with_context(|| format!("spawn {}", vm_bin.display()))?;
+
+    match handshake(&listener, &mut child, timeout) {
+        Ok((conn, hello)) => Ok(RunningVm {
+            child,
+            conn,
+            hello,
+            t_spawn,
+            t_hello: t_spawn.elapsed(),
+        }),
+        Err(e) => {
+            child.kill().ok();
+            child.wait().ok();
+            Err(e)
+        }
+    }
+}
+
+fn handshake(
+    listener: &UnixListener,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<(UnixStream, Hello)> {
+    let mut conn = accept_guest(listener, child, timeout)?;
+    conn.set_nonblocking(false)?;
+    let hello = match read_msg(&mut conn)? {
+        Some(Msg::Hello(h)) => h,
+        Some(other) => bail!("expected Hello, got {other:?}"),
+        None => bail!("guest closed the control channel before Hello"),
+    };
+    if hello.protocol != PROTOCOL_VERSION {
+        bail!(
+            "guest speaks protocol {}, host speaks {PROTOCOL_VERSION}",
+            hello.protocol
+        );
+    }
+    write_msg(
+        &mut conn,
+        &Msg::SetTime {
+            unix_ns: unix_now_ns(),
+        },
+    )?;
+    Ok((conn, hello))
+}
+
+impl RunningVm {
+    /// Ask the guest to power off and wait for the VM process to exit.
+    pub fn shutdown(&mut self, timeout: Duration) -> anyhow::Result<(ExitStatus, Duration)> {
+        let t = Instant::now();
+        write_msg(&mut self.conn, &Msg::Shutdown)?;
+        let status = wait_with_timeout(&mut self.child, timeout)?;
+        Ok((status, t.elapsed()))
+    }
+}
+
+fn accept_guest(
+    listener: &UnixListener,
+    child: &mut Child,
+    timeout: Duration,
+) -> anyhow::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((conn, _)) => return Ok(conn),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e).context("accept guest connection"),
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("katamaran-vm exited before the guest connected ({status})");
+        }
+        if Instant::now() >= deadline {
+            bail!("guest did not connect within {}s", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
+pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> anyhow::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            bail!("VM did not power off within {}s", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
+pub fn vm_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    match explicit {
+        Some(p) => Ok(p.to_path_buf()),
+        None => Ok(std::env::current_exe()?.with_file_name("katamaran-vm")),
+    }
+}
+
+pub fn unix_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+pub fn absolute(p: &Path) -> anyhow::Result<PathBuf> {
+    std::path::absolute(p).with_context(|| format!("resolve {}", p.display()))
+}
+
+pub fn ms(d: Duration) -> String {
+    format!("{:.1} ms", d.as_secs_f64() * 1e3)
+}
+
+pub fn print_tail(label: &str, path: &Path) {
+    let Ok(f) = fs::File::open(path) else { return };
+    let lines: Vec<String> = io::BufReader::new(f)
+        .lines()
+        .map_while(Result::ok)
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!("--- last lines of {label} ({}) ---", path.display());
+    for l in &lines[lines.len().saturating_sub(40)..] {
+        eprintln!("{l}");
+    }
+}

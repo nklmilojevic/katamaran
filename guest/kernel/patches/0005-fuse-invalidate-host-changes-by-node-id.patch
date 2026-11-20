@@ -1,0 +1,313 @@
+Subject: [PATCH] fuse: katamaran host changes invalidate any cached inode
+
+Patch 0003 drops the guest's caches only for inodes a guest process
+watches with inotify, so the share had to keep short entry and attribute
+timeouts. The host knows exactly which of its files the guest caches: the
+FUSE node ids it handed out that the guest has not forgotten. It now names
+those by node id on /dev/kat_fsnotify, for every host change it sees, so
+the share can cache for long.
+
+The agent first registers each virtio-fs share by index (SHARE, with an fd
+of its mount root). Then:
+
+ - INVAL_INODE drops a node's attributes, and with DATA its page cache;
+   for a directory, its attributes and listing.
+ - INVAL_ENTRY expires one name in a directory, and its listing, under
+   any ASCII case: a case-insensitive host file system treats "readme"
+   and "README" as the same file, and the guest may cache both. Negative
+   entries are expired too, so a name the host creates shows up.
+ - EXPIRE_DIR expires every cached name in a directory (after lost host
+   events).
+
+Entries are only expired (as FUSE_EXPIRE_ONLY does), never unhashed: the
+next walk through one looks it up again and keeps it when the node is
+unchanged, so a container's bind or volume mount on a share directory is
+not detached by a host change nearby.
+
+Invalidated attributes are fetched again lazily, on the next use. A read
+through sendfile/splice (busybox cat) never asked for them, so a file
+grown on the host read short until something called stat; splice reads
+now refresh i_size the way fuse_cache_read_iter() does.
+
+Also take fc->killsb around fuse_reverse_inval_inode(), which
+fuse_ilookup() expects.
+
+SPDX-License-Identifier: GPL-2.0
+---
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -156,6 +156,28 @@
+ void fuse_invalidate_entry_cache(struct dentry *entry)
+ {
+ 	fuse_dentry_settime(entry, 0);
++}
++
++/*
++ * katamaran: expire the cached children of @parent, all of them or (with
++ * @name) those named like it ignoring ASCII case, as a case-insensitive host
++ * file system treats them as the same name. The next walk through each
++ * looks it up again; nothing is unhashed, so mounts on them stay.
++ */
++void fuse_kat_expire_children(struct dentry *parent, const struct qstr *name)
++{
++	struct dentry *child;
++
++	spin_lock(&parent->d_lock);
++	hlist_for_each_entry(child, &parent->d_children, d_sib) {
++		if (child->d_flags & DCACHE_DENTRY_CURSOR)
++			continue;
++		if (name && (child->d_name.len != name->len ||
++			     strncasecmp(child->d_name.name, name->name, name->len)))
++			continue;
++		__fuse_dentry_settime(child, 0);
++	}
++	spin_unlock(&parent->d_lock);
+ }
+ 
+ /*
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1826,12 +1826,24 @@
+ 				unsigned int flags)
+ {
+ 	struct fuse_file *ff = in->private_data;
++	struct inode *inode = file_inode(in);
++	int err;
+ 
+ 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
+ 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
+ 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
+-	else
+-		return filemap_splice_read(in, ppos, pipe, len, flags);
++
++	/*
++	 * katamaran: as fuse_cache_read_iter() does, refresh invalidated
++	 * attributes before reading up to i_size, or a file the server
++	 * changed (and grew) since reads short through sendfile/splice.
++	 */
++	if (get_fuse_conn(inode)->auto_inval_data || *ppos + len > i_size_read(inode)) {
++		err = fuse_update_attributes(inode, in, STATX_SIZE);
++		if (err)
++			return err;
++	}
++	return filemap_splice_read(in, ppos, pipe, len, flags);
+ }
+ 
+ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1246,6 +1246,9 @@
+ 
+ void fuse_invalidate_entry_cache(struct dentry *entry);
+ 
++/* katamaran: expire cached children of @parent (all, or matching @name ignoring case) */
++void fuse_kat_expire_children(struct dentry *parent, const struct qstr *name);
++
+ void fuse_invalidate_atime(struct inode *inode);
+ 
+ u64 fuse_time_to_jiffies(u64 sec, u32 nsec);
+--- a/fs/fuse/kat_notify.c
++++ b/fs/fuse/kat_notify.c
+@@ -25,6 +25,7 @@
+ 
+ #include <linux/capability.h>
+ #include <linux/dcache.h>
++#include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/fsnotify.h>
+ #include <linux/hashtable.h>
+@@ -36,6 +37,8 @@
+ #include <linux/magic.h>
+ #include <linux/miscdevice.h>
+ #include <linux/mm.h>
++#include <linux/mutex.h>
++#include <linux/path.h>
+ #include <linux/nsproxy.h>
+ #include <linux/poll.h>
+ #include <linux/sched/task.h>
+@@ -77,6 +80,11 @@
+ static DECLARE_WAIT_QUEUE_HEAD(kat_wait);
+ static unsigned long kat_busy;
+ 
++/* The shares the agent registered, by index, for node-id invalidations. */
++#define KAT_MAX_SHARES	8
++static DEFINE_MUTEX(kat_share_lock);
++static struct path kat_shares[KAT_MAX_SHARES];
++
+ /*
+  * fsnotify() reports an event to a directory's watchers with a child's name
+  * (FS_EVENT_ON_CHILD) only when given a child inode. For a child the guest
+@@ -241,7 +249,11 @@
+ /* Attributes, and with @data the page cache: what FUSE_NOTIFY_INVAL_INODE drops. */
+ static void kat_inval(struct inode *inode, bool data)
+ {
+-	fuse_reverse_inval_inode(get_fuse_conn(inode), get_node_id(inode), data ? 0 : -1, 0);
++	struct fuse_conn *fc = get_fuse_conn(inode);
++
++	down_read(&fc->killsb);
++	fuse_reverse_inval_inode(fc, get_node_id(inode), data ? 0 : -1, 0);
++	up_read(&fc->killsb);
+ }
+ 
+ /* An entry was added or removed: the directory's attributes and listing. */
+@@ -395,13 +407,123 @@
+ 	if (len == 2 && name[0] == '.' && name[1] == '.')
+ 		return false;
+ 	return !memchr(name, '/', len) && !memchr(name, '\0', len);
++}
++
++static void kat_set_share(u64 index, u64 fd)
++{
++	struct file *file;
++
++	if (index >= KAT_MAX_SHARES || fd > INT_MAX)
++		return;
++	file = fget(fd);
++	if (!file)
++		return;
++	if (kat_is_share(file_inode(file)->i_sb)) {
++		mutex_lock(&kat_share_lock);
++		path_put(&kat_shares[index]);
++		kat_shares[index] = file->f_path;
++		path_get(&kat_shares[index]);
++		mutex_unlock(&kat_share_lock);
++	}
++	fput(file);
+ }
+ 
++static void kat_clear_shares(void)
++{
++	int i;
++
++	mutex_lock(&kat_share_lock);
++	for (i = 0; i < KAT_MAX_SHARES; i++) {
++		path_put(&kat_shares[i]);
++		kat_shares[i] = (struct path){};
++	}
++	mutex_unlock(&kat_share_lock);
++}
++
++/*
++ * An entry of @dir changed on the host: expire it under any case (the guest
++ * may have looked it up as "readme" and listed it as "README"), and the
++ * listing.
++ */
++static void kat_expire_entry(struct inode *dir, const struct qstr *name)
++{
++	struct dentry *parent;
++
++	kat_dir_changed(dir);
++	parent = d_find_alias(dir);
++	if (parent) {
++		fuse_kat_expire_children(parent, name);
++		dput(parent);
++	}
++}
++
++/* Apply a node-id invalidation; nothing to do for a node the guest dropped. */
++static void kat_apply_cache(const struct kat_fsn_event *ev)
++{
++	struct fuse_conn *fc;
++	struct dentry *alias;
++	struct inode *inode;
++
++	if (ev->op == KAT_FSN_SHARE) {
++		kat_set_share(ev->id, ev->ino);
++		return;
++	}
++	if (ev->cookie >= KAT_MAX_SHARES)
++		return;
++	if (ev->op == KAT_FSN_INVAL_ENTRY &&
++	    (!ev->name_len || !kat_valid_name(ev->name, ev->name_len)))
++		return;
++
++	/* held across the change, so the share stays mounted */
++	mutex_lock(&kat_share_lock);
++	if (!kat_shares[ev->cookie].dentry)
++		goto out;
++	fc = get_fuse_conn_super(kat_shares[ev->cookie].dentry->d_sb);
++	down_read(&fc->killsb);
++	inode = fuse_ilookup(fc, ev->id, NULL);
++	up_read(&fc->killsb);
++	if (!inode)
++		goto out;
++
++	switch (ev->op) {
++	case KAT_FSN_INVAL_INODE:
++		if (S_ISDIR(inode->i_mode))
++			kat_dir_changed(inode);
++		else
++			kat_inval(inode, ev->flags & KAT_FSN_DATA);
++		break;
++	case KAT_FSN_INVAL_ENTRY:
++		if (S_ISDIR(inode->i_mode)) {
++			const struct qstr name = QSTR_INIT(ev->name, ev->name_len);
++
++			kat_expire_entry(inode, &name);
++		}
++		break;
++	case KAT_FSN_EXPIRE_DIR:
++		if (S_ISDIR(inode->i_mode)) {
++			kat_dir_changed(inode);
++			alias = d_find_alias(inode);
++			if (alias) {
++				fuse_kat_expire_children(alias, NULL);
++				dput(alias);
++			}
++		}
++		break;
++	}
++	iput(inode);
++out:
++	mutex_unlock(&kat_share_lock);
++}
++
+ static void kat_apply(const struct kat_fsn_event *ev)
+ {
+ 	struct inode *inode = NULL;
+ 	struct kat_watch *w;
+ 
++	if (ev->op >= KAT_FSN_SHARE) {
++		kat_apply_cache(ev);
++		return;
++	}
+ 	if (ev->id == 0 || ev->id > INT_MAX)
+ 		return;
+ 	if (ev->name_len && !kat_valid_name(ev->name, ev->name_len))
+@@ -577,6 +699,7 @@
+ 	list_for_each_entry_safe(w, wnext, &kat_adds, pending)
+ 		list_del_init(&w->pending);
+ 	spin_unlock(&kat_lock);
++	kat_clear_shares();
+ 	clear_bit(0, &kat_busy);
+ 	return 0;
+ }
+--- a/include/linux/kat_fsnotify.h
++++ b/include/linux/kat_fsnotify.h
+@@ -24,6 +24,7 @@
+ 
+ /* report and event flags */
+ #define KAT_FSN_ISDIR		0x1
++#define KAT_FSN_DATA		0x2	/* INVAL_INODE: the page cache too */
+ 
+ struct kat_fsn_report {
+ 	__u32 len;
+@@ -45,6 +46,18 @@
+ #define KAT_FSN_MOVED_TO	6
+ 
+ /*
++ * Cache invalidation for every inode the guest holds, watched or not. The
++ * host knows which of its files the guest caches (the FUSE node ids it has
++ * handed out and not had forgotten) and names them by node id; `cookie` is
++ * the share index. Entries are only expired, never unhashed: the next walk
++ * through one looks it up again, and mounts on it stay.
++ */
++#define KAT_FSN_SHARE		16	/* id: share index, ino: fd of its mount root */
++#define KAT_FSN_INVAL_INODE	17	/* id: node: attributes (DATA: and page cache) */
++#define KAT_FSN_INVAL_ENTRY	18	/* id: directory node, name: an entry changed */
++#define KAT_FSN_EXPIRE_DIR	19	/* id: directory node: its attributes and every entry */
++
++/*
+  * A change to the child `name` of watched directory `id`, or to the watched
+  * inode itself when name_len is 0. `ino` is the host inode number of the
+  * object the change is about (the removed one for DELETE and MOVED_FROM),

@@ -1,0 +1,25 @@
+--- a/src/libkrun/src/vmm/macos/vstate.rs
++++ b/src/libkrun/src/vmm/macos/vstate.rs
+@@ -121,7 +121,9 @@
+                 (block_end - addr) as usize,
+                 libc::PROT_READ | libc::PROT_WRITE,
+                 libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+-                -1,
++                // Alternate VM tags so XNU keeps adjacent blocks in separate map entries.
++                libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8
++                    + ((addr / RECLAIM_BLOCK_SIZE) % 2) as u8) as libc::c_int,
+                 0,
+             )
+         };
+--- a/src/hvf/src/lib.rs
++++ b/src/hvf/src/lib.rs
+@@ -17,6 +17,9 @@
+ extern crate log;
+ 
+ use bindings::*;
++
++#[link(name = "Hypervisor", kind = "framework")]
++unsafe extern "C" {}
+ 
+ #[cfg(target_arch = "aarch64")]
+ use std::arch::asm;

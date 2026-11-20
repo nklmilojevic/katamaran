@@ -1,0 +1,532 @@
+diff --git a/src/devices/src/virtio/fs/augment_fs.rs b/src/devices/src/virtio/fs/augment_fs.rs
+index c444edb1..3d391b75 100644
+--- a/src/devices/src/virtio/fs/augment_fs.rs
++++ b/src/devices/src/virtio/fs/augment_fs.rs
+@@ -184,6 +184,10 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T>
+         self.inner.lookup(ctx, parent, name)
+     }
+ 
++    fn negative_timeout(&self) -> Duration {
++        self.inner.negative_timeout()
++    }
++
+     fn forget(&self, ctx: Context, inode: Inode, count: u64) {
+         if !self.is_virtual(inode) {
+             self.inner.forget(ctx, inode, count)
+diff --git a/src/devices/src/virtio/fs/device.rs b/src/devices/src/virtio/fs/device.rs
+index 42ba1f26..63c2722c 100644
+--- a/src/devices/src/virtio/fs/device.rs
++++ b/src/devices/src/virtio/fs/device.rs
+@@ -201,6 +201,32 @@ impl Fs {
+         true
+     }
+ 
++    /// How long the guest may cache entries and attributes, and failed lookups (zero: not at
++    /// all). Attributes stay uncached when ownership depends on the requester. Only for shares
++    /// whose host changes are invalidated through [`Fs::guest_cache`].
++    pub fn set_cache_timeouts(
++        &mut self,
++        entry: Duration,
++        attr: Duration,
++        negative: Duration,
++    ) -> bool {
++        let Some(cfg) = self.passthrough_cfg.as_mut() else {
++            return false;
++        };
++        cfg.entry_timeout = entry;
++        if !cfg.attr_timeout.is_zero() {
++            cfg.attr_timeout = attr;
++        }
++        cfg.negative_timeout = negative;
++        true
++    }
++
++    /// Which host files the guest holds, once the device is active.
++    #[cfg(target_os = "macos")]
++    pub fn guest_cache(&self) -> Option<passthrough::GuestCache> {
++        self.passthrough_cfg.as_ref().map(|c| c.guest_cache.clone())
++    }
++
+     pub fn set_cache_policy(&mut self, policy: CachePolicy) -> bool {
+         let Some(cfg) = self.passthrough_cfg.as_mut() else {
+             return false;
+diff --git a/src/devices/src/virtio/fs/filesystem.rs b/src/devices/src/virtio/fs/filesystem.rs
+index 9d7472c5..a49c1245 100644
+--- a/src/devices/src/virtio/fs/filesystem.rs
++++ b/src/devices/src/virtio/fs/filesystem.rs
+@@ -431,6 +431,11 @@ pub trait FileSystem {
+         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+     }
+ 
++    /// How long the client may cache a lookup that failed with `ENOENT`; zero for not at all.
++    fn negative_timeout(&self) -> Duration {
++        Duration::ZERO
++    }
++
+     /// Forget about an inode.
+     ///
+     /// Called when the kernel removes an inode from its internal caches. `count` indicates the
+diff --git a/src/devices/src/virtio/fs/macos/guest_cache.rs b/src/devices/src/virtio/fs/macos/guest_cache.rs
+new file mode 100644
+index 00000000..2163d2b7
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/guest_cache.rs
+@@ -0,0 +1,188 @@
++//! Which host files the guest holds: the inodes it has looked up and not yet forgotten. A host
++//! watcher checks changed files against this, so that the guest can cache entries and attributes
++//! for long and is told to drop only what it actually caches.
++
++use std::ffi::CString;
++use std::fmt;
++use std::sync::{Arc, Mutex, RwLock, Weak};
++
++use super::super::multikey::MultikeyBTreeMap;
++use super::passthrough::{InodeAltKey, InodeData};
++
++pub(super) type InodeTable = RwLock<MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>>;
++
++/// A handle on a share's inode table; empty until the device is active and after the file
++/// system is gone.
++#[derive(Clone, Default)]
++pub struct GuestCache(Arc<Mutex<Weak<InodeTable>>>);
++
++impl fmt::Debug for GuestCache {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("GuestCache")
++    }
++}
++
++/// An inode the guest holds.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CachedNode {
++    /// The FUSE node id the guest knows it by.
++    pub nodeid: u64,
++    pub dir: bool,
++    /// The parent node and name it was last found by.
++    pub anchor: Option<(u64, CString)>,
++}
++
++impl CachedNode {
++    fn of(data: &InodeData) -> CachedNode {
++        CachedNode {
++            nodeid: data.inode,
++            dir: u32::from(data.kind) == libc::S_IFDIR as u32,
++            anchor: data.anchor.lock().unwrap().clone(),
++        }
++    }
++}
++
++impl GuestCache {
++    pub(super) fn attach(&self, table: &Arc<InodeTable>) {
++        *self.0.lock().unwrap() = Arc::downgrade(table);
++    }
++
++    /// The table, while the file system lives. Take one per batch of lookups.
++    pub fn view(&self) -> Option<GuestCacheView> {
++        self.0.lock().unwrap().upgrade().map(GuestCacheView)
++    }
++}
++
++pub struct GuestCacheView(Arc<InodeTable>);
++
++impl GuestCacheView {
++    /// The inode with host identity (`dev`, `ino`), if the guest holds it.
++    pub fn get(&self, dev: i32, ino: u64) -> Option<CachedNode> {
++        let key = InodeAltKey { ino, dev };
++        self.0
++            .read()
++            .unwrap()
++            .get_alt(&key)
++            .map(|d| CachedNode::of(d))
++    }
++
++    /// Every inode the guest holds.
++    pub fn all(&self) -> Vec<CachedNode> {
++        self.0
++            .read()
++            .unwrap()
++            .values()
++            .map(|d| CachedNode::of(d))
++            .collect()
++    }
++
++    pub fn len(&self) -> usize {
++        self.0.read().unwrap().len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::ffi::CString;
++    use std::os::unix::fs::MetadataExt;
++    use std::time::Duration;
++
++    use super::super::super::filesystem::{Context, FileSystem, FsOptions};
++    use super::super::super::fuse::ROOT_ID;
++    use super::super::super::inode_alloc::InodeAllocator;
++    use super::super::passthrough::{Config, PassthroughFs};
++    use super::super::test_util::TempDir;
++    use super::*;
++
++    const CTX: Context = Context {
++        uid: 0,
++        gid: 0,
++        pid: 0,
++    };
++
++    fn share(dir: &TempDir, cache: &GuestCache) -> PassthroughFs {
++        let cfg = Config {
++            root_dir: dir.0.to_str().unwrap().into(),
++            guest_cache: cache.clone(),
++            negative_timeout: Duration::from_secs(60),
++            ..Default::default()
++        };
++        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
++        fs.init(FsOptions::empty()).unwrap();
++        fs
++    }
++
++    #[test]
++    fn shows_what_the_guest_holds_until_it_forgets() {
++        let dir = TempDir::new();
++        std::fs::create_dir(dir.0.join("d")).unwrap();
++        std::fs::write(dir.0.join("d/f"), "x").unwrap();
++        let cache = GuestCache::default();
++        assert!(cache.view().is_none());
++        let fs = share(&dir, &cache);
++        let view = cache.view().unwrap();
++        assert_eq!(view.len(), 1, "the root");
++
++        let d = fs
++            .lookup(CTX, ROOT_ID, &CString::new("d").unwrap())
++            .unwrap();
++        let f = fs
++            .lookup(CTX, d.inode, &CString::new("f").unwrap())
++            .unwrap();
++        let m = std::fs::symlink_metadata(dir.0.join("d/f")).unwrap();
++        let node = view.get(m.dev() as i32, m.ino()).unwrap();
++        assert_eq!(
++            node,
++            CachedNode {
++                nodeid: f.inode,
++                dir: false,
++                anchor: Some((d.inode, CString::new("f").unwrap())),
++            }
++        );
++        let dm = std::fs::symlink_metadata(dir.0.join("d")).unwrap();
++        assert!(view.get(dm.dev() as i32, dm.ino()).unwrap().dir);
++        assert_eq!(view.all().len(), 3);
++
++        fs.forget(CTX, f.inode, 1);
++        assert!(view.get(m.dev() as i32, m.ino()).is_none());
++
++        drop(view);
++        drop(fs);
++        assert!(
++            cache.view().is_none(),
++            "the table goes with the file system"
++        );
++    }
++
++    #[test]
++    fn opening_a_node_replaced_on_the_host_is_stale() {
++        let dir = TempDir::new();
++        std::fs::write(dir.0.join("f"), "old").unwrap();
++        let fs = share(&dir, &GuestCache::default());
++        let f = fs
++            .lookup(CTX, ROOT_ID, &CString::new("f").unwrap())
++            .unwrap();
++        // An editor's save on the host: a new file renamed over the old one.
++        std::fs::write(dir.0.join("f.tmp"), "new").unwrap();
++        std::fs::rename(dir.0.join("f.tmp"), dir.0.join("f")).unwrap();
++        let Err(err) = fs.open(CTX, f.inode, false, libc::O_RDONLY as u32) else {
++            panic!("opened a replaced node");
++        };
++        assert_eq!(err.raw_os_error(), Some(116), "Linux ESTALE");
++    }
++
++    #[test]
++    fn missing_names_may_be_cached() {
++        let dir = TempDir::new();
++        let fs = share(&dir, &GuestCache::default());
++        assert_eq!(fs.negative_timeout(), Duration::from_secs(60));
++        let Err(err) = fs.lookup(CTX, ROOT_ID, &CString::new("nope").unwrap()) else {
++            panic!("found a missing name");
++        };
++        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
++    }
++}
+diff --git a/src/devices/src/virtio/fs/macos/mod.rs b/src/devices/src/virtio/fs/macos/mod.rs
+index 05f7f4c9..dceba740 100644
+--- a/src/devices/src/virtio/fs/macos/mod.rs
++++ b/src/devices/src/virtio/fs/macos/mod.rs
+@@ -2,6 +2,7 @@ mod attrlist;
+ pub mod boundaries;
+ pub mod fileops;
+ pub mod fs_utils;
++pub mod guest_cache;
+ pub mod passthrough;
+ mod pins;
+ pub mod syncopen;
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index 3c287cf6..11ad0a49 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -35,6 +35,8 @@ use super::super::inode_alloc::InodeAllocator;
+ use super::super::multikey::MultikeyBTreeMap;
+ pub use super::super::{CachePolicy, PermissionSemantics};
+ use super::attrlist;
++use super::guest_cache::InodeTable;
++pub use super::guest_cache::{CachedNode, GuestCache, GuestCacheView};
+ use super::pins::{Pin, PinPool, PinSlot};
+ use super::{fileops, syncopen};
+ 
+@@ -49,13 +51,13 @@ type Inode = u64;
+ type Handle = u64;
+ 
+ #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+-struct InodeAltKey {
+-    ino: u64,
+-    dev: i32,
++pub(super) struct InodeAltKey {
++    pub(super) ino: u64,
++    pub(super) dev: i32,
+ }
+ 
+-struct InodeData {
+-    inode: Inode,
++pub(super) struct InodeData {
++    pub(super) inode: Inode,
+     ino: u64,
+     dev: i32,
+     refcount: AtomicU64,
+@@ -63,11 +65,11 @@ struct InodeData {
+     // Each guest process that maps a file keeps its own handle open, so the read-only handles of
+     // an inode share one host file instead of holding one descriptor each.
+     read_only_file: Mutex<Weak<RwLock<File>>>,
+-    kind: u16,
++    pub(super) kind: u16,
+     pin: Arc<PinSlot>,
+     // The parent and name this inode was last found by. Opens try it before the /.vol path and
+     // check the identity of what they get, since the name may have moved to another file since.
+-    anchor: Mutex<Option<(Inode, CString)>>,
++    pub(super) anchor: Mutex<Option<(Inode, CString)>>,
+     open_handles: AtomicU32,
+ }
+ 
+@@ -654,6 +656,9 @@ pub struct Config {
+     /// The default value for this option is 5 seconds.
+     pub attr_timeout: Duration,
+ 
++    /// How long the FUSE client may cache a failed lookup. Zero (the default) caches none.
++    pub negative_timeout: Duration,
++
+     /// The caching policy the file system should use. See the documentation of `CachePolicy` for
+     /// more details.
+     pub cache_policy: CachePolicy,
+@@ -707,6 +712,10 @@ pub struct Config {
+ 
+     /// Make FSYNC and FSYNCDIR no-ops (for disposable data). Off by default.
+     pub no_sync_io: bool,
++
++    /// Shows a host-side watcher which inodes the guest holds, so it can invalidate exactly the
++    /// changed ones (and the guest can cache entries and attributes for long).
++    pub guest_cache: GuestCache,
+ }
+ 
+ impl Config {
+@@ -726,6 +735,7 @@ impl Default for Config {
+         Config {
+             entry_timeout: Duration::from_secs(5),
+             attr_timeout: Duration::from_secs(5),
++            negative_timeout: Duration::ZERO,
+             cache_policy: Default::default(),
+             writeback: false,
+             root_dir: String::from("/"),
+@@ -736,6 +746,7 @@ impl Default for Config {
+             semantics: PermissionSemantics::LinuxComplete,
+             fixed_owner: None,
+             no_sync_io: false,
++            guest_cache: GuestCache::default(),
+         }
+     }
+ }
+@@ -746,7 +757,7 @@ impl Default for Config {
+ /// directory ends up as the root of the file system process. One way to accomplish this is via a
+ /// combination of mount namespaces and the pivot_root system call.
+ pub struct PassthroughFs {
+-    inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
++    inodes: Arc<InodeTable>,
+     inode_alloc: Arc<InodeAllocator>,
+ 
+     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+@@ -782,8 +793,10 @@ impl PassthroughFs {
+ 
+         unsafe { libc::close(fd) };
+ 
++        let inodes = Arc::new(RwLock::new(MultikeyBTreeMap::new()));
++        cfg.guest_cache.attach(&inodes);
+         Ok(PassthroughFs {
+-            inodes: RwLock::new(MultikeyBTreeMap::new()),
++            inodes,
+             inode_alloc,
+ 
+             handles: RwLock::new(BTreeMap::new()),
+@@ -1041,17 +1054,28 @@ impl PassthroughFs {
+                     .unwrap_or_else(|| unsafe { libc::open(c_path.as_ptr(), flags) }),
+             })
+         };
+-        let mut fd = open()?;
+-        if fd < 0 && is_fd_exhaustion(&io::Error::last_os_error()) {
+-            self.pins.relieve();
+-            fd = open()?;
+-        }
+-        if fd < 0 {
+-            return Err(linux_error(io::Error::last_os_error()));
++        let open = || -> io::Result<RawFd> {
++            let mut fd = open()?;
++            if fd < 0 && is_fd_exhaustion(&io::Error::last_os_error()) {
++                self.pins.relieve();
++                fd = open()?;
++            }
++            if fd < 0 {
++                return Err(io::Error::last_os_error());
++            }
++            Ok(fd)
++        };
++        match open() {
++            // Safe because we just opened this fd.
++            Ok(fd) => Ok(unsafe { File::from_raw_fd(fd) }),
++            // The host file behind the node is gone: removed, or replaced by a rename on the
++            // host before the guest heard of it. ESTALE makes the guest walk the path again (with
++            // LOOKUP_REVAL) and open whatever is there now.
++            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
++                Err(linux_error(io::Error::from_raw_os_error(libc::ESTALE)))
++            }
++            Err(e) => Err(linux_error(e)),
+         }
+-
+-        // Safe because we just opened this fd.
+-        Ok(unsafe { File::from_raw_fd(fd) })
+     }
+ 
+     fn do_readdir<F>(
+@@ -1786,6 +1810,10 @@ impl FileSystem for PassthroughFs {
+         Ok(self.register_entry(&parent_data, name, st))
+     }
+ 
++    fn negative_timeout(&self) -> Duration {
++        self.cfg.negative_timeout
++    }
++
+     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+         let mut inodes = self.inodes.write().unwrap();
+ 
+diff --git a/src/devices/src/virtio/fs/multikey.rs b/src/devices/src/virtio/fs/multikey.rs
+index e6d0bdaf..f7fde245 100644
+--- a/src/devices/src/virtio/fs/multikey.rs
++++ b/src/devices/src/virtio/fs/multikey.rs
+@@ -111,6 +111,19 @@ where
+         self.alt.clear();
+         self.main.clear()
+     }
++
++    /// The values, in the order of their main keys.
++    pub fn values(&self) -> impl Iterator<Item = &V> {
++        self.main.values().map(|(_, v)| v)
++    }
++
++    pub fn len(&self) -> usize {
++        self.main.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.main.is_empty()
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/devices/src/virtio/fs/server.rs b/src/devices/src/virtio/fs/server.rs
+index e364e760..d27368f0 100644
+--- a/src/devices/src/virtio/fs/server.rs
++++ b/src/devices/src/virtio/fs/server.rs
+@@ -249,6 +249,15 @@ impl<F: FileSystem + Sync> Server<F> {
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+             }
++            // A zero node id with a timeout lets the client cache the name as missing.
++            Err(e)
++                if e.raw_os_error() == Some(libc::ENOENT)
++                    && !self.fs.negative_timeout().is_zero() =>
++            {
++                let mut entry = Entry::without_attributes();
++                entry.entry_timeout = self.fs.negative_timeout();
++                reply_ok(Some(EntryOut::from(entry)), None, in_header.unique, w)
++            }
+             Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+diff --git a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+index a2725fff..cd25ee45 100644
+--- a/src/libkrun/src/api/device_builders.rs
++++ b/src/libkrun/src/api/device_builders.rs
+@@ -34,6 +34,8 @@ use devices::legacy::IrqChip;
+ use devices::virtio::balloon::FreePageReportingMode;
+ #[cfg(feature = "blk")]
+ use devices::virtio::block::{DiskFormat, SyncMode};
++#[cfg(target_os = "macos")]
++pub use devices::virtio::fs::passthrough::{CachedNode, GuestCache, GuestCacheView};
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+@@ -755,6 +757,33 @@ impl<'a> FsDevice<'a> {
+         Ok(())
+     }
+ 
++    /// How long the guest may cache entries and attributes, and failed lookups (zero: not at
++    /// all), after the permission semantics are set. Long timeouts are only safe when host changes
++    /// are invalidated in the guest through [`guest_cache`](Self::guest_cache).
++    pub fn set_cache_timeouts(
++        &mut self,
++        entry: std::time::Duration,
++        attr: std::time::Duration,
++        negative: std::time::Duration,
++    ) -> Result<(), VmmError> {
++        if !self
++            .inner
++            .lock()
++            .unwrap()
++            .set_cache_timeouts(entry, attr, negative)
++        {
++            return Err(VmmError::InvalidParam());
++        }
++        Ok(())
++    }
++
++    /// Which host files the guest holds, from when the device is active; a host watcher checks
++    /// changed files against it.
++    #[cfg(target_os = "macos")]
++    pub fn guest_cache(&self) -> Option<GuestCache> {
++        self.inner.lock().unwrap().guest_cache()
++    }
++
+     /// Offer the guest writeback caching. Only for shares that nothing else
+     /// changes while the guest runs. Off by default.
+     pub fn set_writeback(&mut self, writeback: bool) -> Result<(), VmmError> {
+diff --git a/src/libkrun/src/api/mod.rs b/src/libkrun/src/api/mod.rs
+index 9eece648..6c7784d5 100644
+--- a/src/libkrun/src/api/mod.rs
++++ b/src/libkrun/src/api/mod.rs
+@@ -53,6 +53,8 @@ pub use device_builders::{
+     AttachContext, AttachDevice, DeviceManager, DeviceRequirements, MmioDeviceManager,
+     ResolvedShmRegion, TsiFlags, VsockDevice,
+ };
++#[cfg(target_os = "macos")]
++pub use device_builders::{CachedNode, GuestCache, GuestCacheView};
+ pub use device_builders::{ConsoleBuilder, ConsoleDevice};
+ #[cfg(any(feature = "gpu", feature = "vhost-user"))]
+ pub use device_builders::{DisplayBackend, DisplayInfoBuilder};

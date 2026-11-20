@@ -1,0 +1,240 @@
+diff --git a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+index afdd07d4..242fcd3d 100644
+--- a/src/devices/src/virtio/vsock/muxer.rs
++++ b/src/devices/src/virtio/vsock/muxer.rs
+@@ -53,6 +53,11 @@ pub enum MuxerRx {
+         local_port: u32,
+         peer_port: u32,
+     },
++    Shutdown {
++        local_port: u32,
++        peer_port: u32,
++        flags: u32,
++    },
+     GetnameResponse {
+         local_port: u32,
+         peer_port: u32,
+diff --git a/src/devices/src/virtio/vsock/muxer_rxq.rs b/src/devices/src/virtio/vsock/muxer_rxq.rs
+index ef1f7d75..700d2079 100644
+--- a/src/devices/src/virtio/vsock/muxer_rxq.rs
++++ b/src/devices/src/virtio/vsock/muxer_rxq.rs
+@@ -107,6 +107,22 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+                 .set_buf_alloc(0)
+                 .set_fwd_cnt(0);
+         }
++        MuxerRx::Shutdown {
++            local_port,
++            peer_port,
++            flags,
++        } => {
++            pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
++                .set_src_cid(uapi::VSOCK_HOST_CID)
++                .set_dst_cid(cid)
++                .set_src_port(local_port)
++                .set_dst_port(peer_port)
++                .set_len(0)
++                .set_type(uapi::VSOCK_TYPE_STREAM)
++                .set_flags(flags)
++                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
++                .set_fwd_cnt(0);
++        }
+         MuxerRx::ConnResponse {
+             local_port,
+             peer_port,
+diff --git a/src/devices/src/virtio/vsock/proxy.rs b/src/devices/src/virtio/vsock/proxy.rs
+index f535f391..add36f69 100644
+--- a/src/devices/src/virtio/vsock/proxy.rs
++++ b/src/devices/src/virtio/vsock/proxy.rs
+@@ -26,6 +26,8 @@ use utils::epoll::EventSet;
+ #[derive(Debug)]
+ pub enum RecvPkt {
+     Close,
++    /// The host end will send no more data (recv returned 0).
++    Eof,
+     Error,
+     Read(usize),
+     WaitForCredit,
+diff --git a/src/devices/src/virtio/vsock/tsi_dgram/mod.rs b/src/devices/src/virtio/vsock/tsi_dgram/mod.rs
+index 60dc07cc..42983897 100644
+--- a/src/devices/src/virtio/vsock/tsi_dgram/mod.rs
++++ b/src/devices/src/virtio/vsock/tsi_dgram/mod.rs
+@@ -78,7 +78,7 @@ impl TsiDgramProxy {
+                         pkt.set_len(cnt as u32);
+                         pkt.hdr().len() + cnt
+                     }
+-                    RecvPkt::Close => {
++                    RecvPkt::Close | RecvPkt::Eof => {
+                         self.status = ProxyStatus::Closed;
+                         0
+                     }
+diff --git a/src/devices/src/virtio/vsock/tsi_stream/mod.rs b/src/devices/src/virtio/vsock/tsi_stream/mod.rs
+index cd8e0af7..297c362f 100644
+--- a/src/devices/src/virtio/vsock/tsi_stream/mod.rs
++++ b/src/devices/src/virtio/vsock/tsi_stream/mod.rs
+@@ -183,7 +183,7 @@ impl TsiStreamProxy {
+                         pkt.set_len(cnt as u32);
+                         pkt.hdr().len() + cnt
+                     }
+-                    Ok(RecvPkt::Close) => {
++                    Ok(RecvPkt::Close | RecvPkt::Eof) => {
+                         self.host_read_closed = true;
+                         self.init_data_pkt(&mut pkt);
+                         pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/mod.rs b/src/devices/src/virtio/vsock/unix_proxy/mod.rs
+index dcbf6c1b..bbbb4556 100644
+--- a/src/devices/src/virtio/vsock/unix_proxy/mod.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/mod.rs
+@@ -39,6 +39,8 @@ pub struct UnixProxy {
+     pub(crate) local_port: u32,
+     pub(crate) control_port: u32,
+     pub(crate) peer_shutdown: u32,
++    /// The host end reached EOF and the guest was sent SHUTDOWN_SEND.
++    pub(crate) local_shutdown: bool,
+     pub(crate) peer_fwd_cnt: Wrapping<u32>,
+     pub(crate) peer_buf_alloc: u32,
+     pub(crate) tx_cnt: Wrapping<u32>,
+@@ -73,6 +75,7 @@ impl UnixProxy {
+             local_port,
+             control_port,
+             peer_shutdown: 0,
++            local_shutdown: false,
+             peer_fwd_cnt: Wrapping(0),
+             peer_buf_alloc: 0,
+             tx_cnt: Wrapping(0),
+@@ -101,6 +104,7 @@ impl UnixProxy {
+             peer_port,
+             control_port: 0,
+             peer_shutdown: 0,
++            local_shutdown: false,
+             fd,
+             status: ProxyStatus::ReverseInit,
+             mem,
+@@ -130,6 +134,25 @@ impl UnixProxy {
+         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+     }
+ 
++    /// Tell the guest the host end will send no more data.
++    pub(crate) fn push_shutdown_send(&self) {
++        let rx = MuxerRx::Shutdown {
++            local_port: self.local_port,
++            peer_port: self.peer_port,
++            flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
++        };
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++    }
++
++    /// Readiness to poll the host socket for: nothing once it reached EOF.
++    pub(crate) fn read_interest(&self) -> EventSet {
++        if self.local_shutdown {
++            EventSet::empty()
++        } else {
++            EventSet::IN
++        }
++    }
++
+     pub(crate) fn peer_avail_credit(&self) -> usize {
+         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+     }
+@@ -156,6 +179,10 @@ impl UnixProxy {
+                         self.status = ProxyStatus::Closed;
+                         0
+                     }
++                    RecvPkt::Eof => {
++                        self.local_shutdown = true;
++                        0
++                    }
+                     RecvPkt::Error => 0,
+                 },
+                 Err(e) => {
+@@ -270,7 +297,10 @@ impl Proxy for UnixProxy {
+         self.peer_shutdown |= shutdown;
+         sys::do_shutdown(self, pkt);
+ 
+-        if self.peer_shutdown != SHUTDOWN_MASK {
++        // Fully done once the guest stops both directions, or stops sending
++        // after the host end already reached EOF.
++        let guest_done_sending = self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
++        if self.peer_shutdown != SHUTDOWN_MASK && !(self.local_shutdown && guest_done_sending) {
+             return ProxyUpdate::default();
+         }
+ 
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/unix.rs b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+index c8f839a3..240fe1e0 100644
+--- a/src/devices/src/virtio/vsock/unix_proxy/unix.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+@@ -120,7 +120,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
+                     debug!("recv rx_cnt={}", proxy.rx_cnt);
+                     RecvPkt::Read(cnt)
+                 } else {
+-                    RecvPkt::Close
++                    RecvPkt::Eof
+                 }
+             }
+             Err(e) => {
+@@ -276,7 +276,7 @@ pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket
+     proxy.status = ProxyStatus::Connected;
+ 
+     ProxyUpdate {
+-        polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN)),
++        polling: Some((proxy.id, proxy.fd.as_raw_fd(), proxy.read_interest())),
+         ..Default::default()
+     }
+ }
+@@ -309,7 +309,7 @@ pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacke
+     switch_to_connected(proxy);
+ 
+     ProxyUpdate {
+-        polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN)),
++        polling: Some((proxy.id, proxy.fd.as_raw_fd(), proxy.read_interest())),
+         ..Default::default()
+     }
+ }
+@@ -382,9 +382,26 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
+     if evset.intersects(EventSet::IN | EventSet::HANG_UP) {
+         debug!("process_event: IN");
+         if proxy.status == ProxyStatus::Connected {
++            let was_shut = proxy.local_shutdown;
+             let (signal_queue, wait_credit) = proxy.recv_pkt();
+             update.signal_queue = signal_queue;
+ 
++            // The host end half-closed: tell the guest it will get no more
++            // data, stop reading, and keep the guest-to-host direction open
++            // until the guest is done too.
++            if !was_shut && proxy.local_shutdown {
++                debug!("process_event: host EOF, sending shutdown: id={}", proxy.id);
++                proxy.push_shutdown_send();
++                update.signal_queue = true;
++                update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
++                if proxy.peer_shutdown & super::uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0 {
++                    proxy.push_reset();
++                    proxy.status = ProxyStatus::Closed;
++                    update.remove_proxy = ProxyRemoval::Deferred;
++                }
++                return update;
++            }
++
+             if wait_credit && proxy.status != ProxyStatus::WaitingCreditUpdate {
+                 proxy.status = ProxyStatus::WaitingCreditUpdate;
+                 let rx = MuxerRx::CreditRequest {
+@@ -421,7 +438,7 @@ pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> Pr
+             switch_to_connected(proxy);
+             push_connect_rsp(proxy, 0);
+             update.signal_queue = true;
+-            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::IN));
++            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), proxy.read_interest()));
+         } else {
+             error!("EventSet::OUT while not connecting");
+         }
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/windows.rs b/src/devices/src/virtio/vsock/unix_proxy/windows.rs
+index 039394f9..9278ae0d 100644
+--- a/src/devices/src/virtio/vsock/unix_proxy/windows.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/windows.rs
+@@ -84,7 +84,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
+         if res > 0 {
+             RecvPkt::Read(res as usize)
+         } else if res == 0 {
+-            RecvPkt::Close
++            RecvPkt::Eof
+         } else {
+             let e = unsafe { WSAGetLastError() };
+             if e == WSAEWOULDBLOCK {

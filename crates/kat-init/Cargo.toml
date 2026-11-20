@@ -1,0 +1,12 @@
+[package]
+name = "kat-init"
+description = "katamaran guest PID 1 and agent"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+kat-proto.workspace = true
+kat-nfs.workspace = true
+libc.workspace = true

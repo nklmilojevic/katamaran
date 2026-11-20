@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Thu, 19 Nov 2026 16:57:30 +0100
+Subject: [PATCH] forwarder: give the Mac side 8 MiB socket buffers
+
+macOS sizes a TCP socket's buffers automatically only up to 4 MiB, and
+at that size the forwarder's copy to and from gVisor waits on the Mac's
+loopback socket. Setting 8 MiB, the default kern.ipc.maxsockbuf, on the
+Mac side of each forwarded connection made a published-port download
+~8% and an upload to the Mac ~15% faster. Smaller fixed buffers are
+worse than the automatic ones: 512 KiB/2 MiB measured ~7% and ~14%
+slower here.
+---
+ pkg/services/forwarder/copy.go | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/pkg/services/forwarder/copy.go b/pkg/services/forwarder/copy.go
+index 72c1d51..9f42253 100644
+--- a/pkg/services/forwarder/copy.go
++++ b/pkg/services/forwarder/copy.go
+@@ -22,6 +22,15 @@ const copyBufferMin = 64 << 10
+ 
+ const hostKeepAlive = time.Minute
+ 
++// hostSocketBuffer is the send and receive buffer of the Mac side of a
++// forwarded connection, macOS's default kern.ipc.maxsockbuf. Its automatic
++// sizing stops at 4 MiB (net.inet.tcp.autosndbufmax/autorcvbufmax), which
++// leaves the copy to and from gVisor waiting on the Mac's loopback: a
++// published-port download ran ~8% and an upload to the Mac ~15% slower.
++// The sizes are limits, not allocations. If the Mac's limit is
++// lower, setting them fails and the automatic sizing stays.
++const hostSocketBuffer = 8 << 20
++
+ // halfCloser is a connection whose directions can be shut down separately,
+ // as both *net.TCPConn and gVisor's *gonet.TCPConn are.
+ type halfCloser interface {
+@@ -37,6 +46,8 @@ func proxyConns(guest, host halfCloser) {
+ 	if tcp, ok := host.(*net.TCPConn); ok {
+ 		_ = tcp.SetKeepAlive(true)
+ 		_ = tcp.SetKeepAlivePeriod(hostKeepAlive)
++		_ = tcp.SetWriteBuffer(hostSocketBuffer)
++		_ = tcp.SetReadBuffer(hostSocketBuffer)
+ 	}
+ 	done := make(chan struct{}, 2)
+ 	pump := func(dst, src halfCloser) {

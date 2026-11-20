@@ -1,0 +1,20 @@
+{
+  "Name": "b-slow",
+  "Ref": "prf9j1ybblk92lb93e3ygk9h2",
+  "Context": "/Users/dev/src/b-slow",
+  "Dockerfile": "Dockerfile",
+  "StartedAt": "2026-11-19T10:49:47.804638113+01:00",
+  "CompletedAt": "2026-11-19T10:49:51.736696073+01:00",
+  "Duration": 3932057960,
+  "Status": "canceled",
+  "Error": {
+    "Code": 1,
+    "Message": "context canceled"
+  },
+  "NumCompletedSteps": 5,
+  "NumTotalSteps": 6,
+  "NumCachedSteps": 1,
+  "Config": {
+    "ImageResolveMode": "local"
+  }
+}

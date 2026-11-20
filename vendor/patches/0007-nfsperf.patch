@@ -1,0 +1,407 @@
+diff --git a/src/devices/src/virtio/device.rs b/src/devices/src/virtio/device.rs
+index 925fc54..c783275 100644
+--- a/src/devices/src/virtio/device.rs
++++ b/src/devices/src/virtio/device.rs
+@@ -340,6 +340,14 @@ pub trait VirtioDevice: AsAny + Send {
+     /// The transport uses this to construct the queues during initialization and after reset.
+     fn queue_config(&self) -> &[QueueConfig];
+ 
++    /// Whether [`VirtioDevice::notify_inline`] can ever handle a notification.
++    /// Asked once, when the transport is created: a device that says no is
++    /// notified through its eventfd without taking its lock, so a vCPU never
++    /// waits for a worker that holds the device while it processes a queue.
++    fn handles_notify_inline(&self) -> bool {
++        false
++    }
++
+     /// Handle a queue notification synchronously on the notifying vCPU thread.
+     /// Returns false to fall back to signalling the queue's eventfd.
+     fn notify_inline(&mut self, _queue_index: u32) -> bool {
+diff --git a/src/devices/src/virtio/fs/device.rs b/src/devices/src/virtio/fs/device.rs
+index 49e40ed..42ba1f2 100644
+--- a/src/devices/src/virtio/fs/device.rs
++++ b/src/devices/src/virtio/fs/device.rs
+@@ -347,6 +347,10 @@ impl VirtioDevice for Fs {
+         self.shm_region.as_ref()
+     }
+ 
++    fn handles_notify_inline(&self) -> bool {
++        true
++    }
++
+     fn notify_inline(&mut self, queue_index: u32) -> bool {
+         if queue_index as usize != defs::REQ_INDEX {
+             return false;
+diff --git a/src/devices/src/virtio/mmio.rs b/src/devices/src/virtio/mmio.rs
+index 79ae3c4..d14e5e9 100644
+--- a/src/devices/src/virtio/mmio.rs
++++ b/src/devices/src/virtio/mmio.rs
+@@ -59,6 +59,8 @@ pub struct MmioTransport {
+     shm_region_select: u32,
+     interrupt: MmioInterrupt,
+     device_interrupt: InterruptTransport,
++    /// The device may handle queue notifications on the vCPU thread.
++    notify_inline: bool,
+ }
+ 
+ struct MmioInterruptInner {
+@@ -181,11 +183,12 @@ impl MmioTransport {
+         intc: IrqChip,
+         device: Arc<Mutex<dyn VirtioDevice>>,
+     ) -> Result<MmioTransport, CreateMmioTransportError> {
+-        let device_name = device
+-            .try_lock()
+-            .expect("Mutex of VirtioDevice should not be locked when calling MmioTransport::new")
+-            .device_name()
+-            .to_string();
++        let (device_name, notify_inline) = {
++            let d = device.try_lock().expect(
++                "Mutex of VirtioDevice should not be locked when calling MmioTransport::new",
++            );
++            (d.device_name().to_string(), d.handles_notify_inline())
++        };
+         let debug_log_target = format!("{}[{device_name}]", module_path!());
+         let state = VirtioTransportState::new(mem, device)
+             .map_err(CreateMmioTransportError::CreateInterruptEventFd)?;
+@@ -197,6 +200,7 @@ impl MmioTransport {
+             interrupt,
+             device_interrupt,
+             shm_region_select: 0,
++            notify_inline,
+         })
+     }
+ 
+@@ -361,7 +365,7 @@ impl BusDevice for MmioTransport {
+                     0x50 => {
+                         // Queue notification: let the device handle it on this vCPU thread
+                         // if it can, otherwise wake its worker through the eventfd.
+-                        if self.locked_device().notify_inline(v) {
++                        if self.notify_inline && self.locked_device().notify_inline(v) {
+                         } else if let Some(eventfd) = self.state.queue_evts().get(v as usize) {
+                             eventfd.write(1).unwrap();
+                         } else {
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/batch.rs b/src/devices/src/virtio/vsock/unix_proxy/batch.rs
+new file mode 100644
+index 0000000..77cf912
+--- /dev/null
++++ b/src/devices/src/virtio/vsock/unix_proxy/batch.rs
+@@ -0,0 +1,176 @@
++//! Host-to-guest data for a Unix proxy: one `recvmsg` fills many guest
++//! receive buffers.
++//!
++//! Linux posts receive buffers of about 3.7 KiB, so receiving into one at a
++//! time costs a system call per 3.7 KiB, and that call is most of what the
++//! muxer thread does while the host streams data in. Here a batch of
++//! buffers is popped first, the socket is read once straight into all of
++//! them (bounded by the guest's credit), and the buffers that stayed empty
++//! go back to the queue.
++
++use std::io;
++use std::num::Wrapping;
++
++use super::super::packet::VsockPacket;
++use super::{AsRawFd, ProxyStatus, RecvPkt, UnixProxy};
++
++/// Guest buffers per `recvmsg`: about 230 KiB with Linux's buffer size.
++const BATCH: usize = 64;
++
++fn recv_into(fd: libc::c_int, iov: &mut [libc::iovec]) -> RecvPkt {
++    // SAFETY: a zeroed msghdr is valid; it points at `iov`, which lives
++    // across the call, and every iovec points at writable guest memory.
++    let n = unsafe {
++        let mut msg: libc::msghdr = std::mem::zeroed();
++        msg.msg_iov = iov.as_mut_ptr();
++        msg.msg_iovlen = iov.len() as _;
++        libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT)
++    };
++    match n {
++        n if n > 0 => RecvPkt::Read(n as usize),
++        0 => RecvPkt::Eof,
++        _ => match io::Error::last_os_error().raw_os_error() {
++            Some(libc::EAGAIN) | Some(libc::EINTR) => RecvPkt::Error,
++            _ => RecvPkt::Close,
++        },
++    }
++}
++
++/// How `got` bytes spread over buffers of the given sizes, in order.
++pub(crate) fn spread(got: usize, sizes: &[usize]) -> Vec<usize> {
++    let mut left = got;
++    sizes
++        .iter()
++        .map(|&s| {
++            let n = left.min(s);
++            left -= n;
++            n
++        })
++        .take_while(|&n| n > 0)
++        .collect()
++}
++
++/// Move what the host socket has into guest receive buffers. Returns
++/// whether any buffer was used and whether the guest's credit ran out,
++/// like the one-buffer-at-a-time loop it replaces.
++pub(crate) fn recv_pkts(proxy: &mut UnixProxy) -> (bool, bool) {
++    let mut have_used = false;
++    let mut wait_credit = false;
++    let queue = proxy.queue.clone();
++    let mut queue = queue.lock().unwrap();
++    let fd = proxy.fd.as_raw_fd();
++
++    loop {
++        let credit = proxy.peer_avail_credit();
++        if credit == 0 {
++            wait_credit = true;
++            break;
++        }
++
++        let mut room = credit;
++        let mut pkts: Vec<(u16, VsockPacket)> = Vec::with_capacity(BATCH);
++        let mut iov: Vec<libc::iovec> = Vec::with_capacity(BATCH);
++        while pkts.len() < BATCH && room > 0 {
++            let Some(head) = queue.pop(&proxy.mem) else {
++                break;
++            };
++            let mut pkt = match VsockPacket::from_rx_virtq_head(&head) {
++                Ok(pkt) => pkt,
++                Err(e) => {
++                    debug!("recv_pkts: RX queue error: {e:?}");
++                    queue.undo_pop();
++                    break;
++                }
++            };
++            let Some(buf) = pkt.buf_mut().filter(|b| !b.is_empty()) else {
++                queue.undo_pop();
++                break;
++            };
++            let len = buf.len().min(room);
++            room -= len;
++            iov.push(libc::iovec {
++                iov_base: buf.as_mut_ptr().cast(),
++                iov_len: len,
++            });
++            pkts.push((head.index, pkt));
++        }
++        if pkts.is_empty() {
++            break;
++        }
++
++        let capacity = credit - room;
++        let got = match recv_into(fd, &mut iov) {
++            RecvPkt::Read(n) => n,
++            RecvPkt::Eof => {
++                proxy.local_shutdown = true;
++                0
++            }
++            RecvPkt::Close => {
++                proxy.status = ProxyStatus::Closed;
++                0
++            }
++            RecvPkt::Error | RecvPkt::WaitForCredit => 0,
++        };
++
++        let sizes: Vec<usize> = iov.iter().map(|v| v.iov_len).collect();
++        let filled = spread(got, &sizes);
++        for ((index, pkt), &cnt) in pkts.iter_mut().zip(&filled) {
++            proxy.rx_cnt += Wrapping(cnt as u32);
++            proxy.init_data_pkt(pkt);
++            pkt.set_len(cnt as u32);
++            let len = pkt.hdr().len() + cnt;
++            proxy.push_cnt += Wrapping(len as u32);
++            if let Err(e) = queue.add_used(&proxy.mem, *index, len as u32) {
++                error!("failed to add used elements to the queue: {e:?}");
++            }
++            have_used = true;
++        }
++        for _ in filled.len()..pkts.len() {
++            queue.undo_pop();
++        }
++
++        // A short read means the socket is drained, closed or failed.
++        if got < capacity {
++            break;
++        }
++    }
++
++    (have_used, wait_credit)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Write;
++    use std::os::unix::net::UnixStream;
++
++    #[test]
++    fn spread_fills_buffers_in_order() {
++        assert_eq!(spread(0, &[4, 4]), Vec::<usize>::new());
++        assert_eq!(spread(3, &[4, 4]), vec![3]);
++        assert_eq!(spread(4, &[4, 4]), vec![4]);
++        assert_eq!(spread(6, &[4, 4]), vec![4, 2]);
++        assert_eq!(spread(8, &[4, 4, 4]), vec![4, 4]);
++    }
++
++    #[test]
++    fn one_recvmsg_scatters_over_buffers() {
++        let (mut a, b) = UnixStream::pair().unwrap();
++        a.write_all(b"abcdefghij").unwrap();
++        let mut x = [0u8; 4];
++        let mut y = [0u8; 4];
++        let mut z = [0u8; 4];
++        let mut iov = [&mut x[..], &mut y[..], &mut z[..]].map(|s| libc::iovec {
++            iov_base: s.as_mut_ptr().cast(),
++            iov_len: s.len(),
++        });
++        assert!(matches!(
++            recv_into(b.as_raw_fd(), &mut iov),
++            RecvPkt::Read(10)
++        ));
++        assert_eq!((&x, &y, &z[..2]), (b"abcd", b"efgh", &b"ij"[..]));
++        assert!(matches!(recv_into(b.as_raw_fd(), &mut iov), RecvPkt::Error));
++        drop(a);
++        assert!(matches!(recv_into(b.as_raw_fd(), &mut iov), RecvPkt::Eof));
++    }
++}
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/mod.rs b/src/devices/src/virtio/vsock/unix_proxy/mod.rs
+index bbbb455..ffe1cf9 100644
+--- a/src/devices/src/virtio/vsock/unix_proxy/mod.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/mod.rs
+@@ -15,6 +15,8 @@ use super::proxy::{AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate
+ use utils::epoll::EventSet;
+ use vm_memory::GuestMemoryMmap;
+ 
++#[cfg(unix)]
++mod batch;
+ #[cfg(unix)]
+ mod unix;
+ #[cfg(unix)]
+@@ -157,6 +159,12 @@ impl UnixProxy {
+         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+     }
+ 
++    #[cfg(unix)]
++    pub fn recv_pkt(&mut self) -> (bool, bool) {
++        batch::recv_pkts(self)
++    }
++
++    #[cfg(windows)]
+     pub fn recv_pkt(&mut self) -> (bool, bool) {
+         let mut have_used = false;
+         let mut wait_credit = false;
+diff --git a/src/devices/src/virtio/vsock/unix_proxy/unix.rs b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+index 3cd4509..3e21098 100644
+--- a/src/devices/src/virtio/vsock/unix_proxy/unix.rs
++++ b/src/devices/src/virtio/vsock/unix_proxy/unix.rs
+@@ -9,7 +9,7 @@ use nix::errno::Errno;
+ use nix::fcntl::{FcntlArg, OFlag, fcntl};
+ use nix::sys::socket::{
+     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, UnixAddr, accept, bind,
+-    connect, listen, recv, send, shutdown, socket,
++    connect, listen, send, shutdown, socket,
+ };
+ 
+ #[cfg(target_os = "macos")]
+@@ -17,9 +17,7 @@ use super::super::super::linux_errno::linux_errno_raw;
+ use super::super::kernel_peer;
+ use super::super::muxer::{MuxerRx, push_packet};
+ use super::super::packet::{TsiConnectReq, VsockPacket};
+-use super::super::proxy::{
+-    NewProxyType, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+-};
++use super::super::proxy::{NewProxyType, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate};
+ use utils::epoll::EventSet;
+ 
+ pub type PlatformHandle = OwnedFd;
+@@ -94,50 +92,6 @@ fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
+     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
+ }
+ 
+-pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> RecvPkt {
+-    if let Some(buf) = pkt.buf_mut() {
+-        let peer_credit = proxy.peer_avail_credit();
+-        let max_len = std::cmp::min(buf.len(), peer_credit);
+-
+-        debug!(
+-            "recv_to_pkt: peer_avail_credit={}, buf.len={}, max_len={}",
+-            proxy.peer_avail_credit(),
+-            buf.len(),
+-            max_len
+-        );
+-
+-        if max_len == 0 {
+-            return RecvPkt::WaitForCredit;
+-        }
+-
+-        match recv(
+-            proxy.fd.as_raw_fd(),
+-            &mut buf[..max_len],
+-            MsgFlags::MSG_DONTWAIT,
+-        ) {
+-            Ok(cnt) => {
+-                debug!("recv cnt={cnt}");
+-                if cnt > 0 {
+-                    debug!("recv rx_cnt={}", proxy.rx_cnt);
+-                    RecvPkt::Read(cnt)
+-                } else {
+-                    RecvPkt::Eof
+-                }
+-            }
+-            Err(e) => {
+-                debug!("recv_pkt: recv error: {e:?}");
+-                match e {
+-                    Errno::EAGAIN | Errno::EINTR => RecvPkt::Error,
+-                    _ => RecvPkt::Close,
+-                }
+-            }
+-        }
+-    } else {
+-        debug!("recv_pkt: pkt without buf");
+-        RecvPkt::Error
+-    }
+-}
+-
+ pub(crate) fn do_connect(
+     proxy: &mut super::UnixProxy,
+     _pkt: &VsockPacket,
+@@ -565,6 +519,7 @@ pub(crate) fn process_acceptor_event(
+             Ok(accept_fd) => {
+                 // Safe because we've just obtained the FD from the `accept` call above.
+                 let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
++                set_stream_buffers(&new_fd);
+                 update.new_proxy = Some((
+                     proxy.peer_port,
+                     new_fd,
+@@ -579,6 +534,33 @@ pub(crate) fn process_acceptor_event(
+     update
+ }
+ 
++/// Socket buffers for a relayed stream. macOS gives a Unix stream socket
++/// 8 KiB, and a Unix sender may queue only its own send buffer's worth in
++/// the peer; the guest delivers up to 64 KiB per packet, so with the default
++/// every packet blocks the device thread until the peer reads.
++const STREAM_BUF_SIZE: libc::c_int = 4 << 20;
++
++fn set_stream_buffers(fd: &OwnedFd) {
++    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
++        // SAFETY: plain setsockopt with an int value on a socket we own.
++        let ret = unsafe {
++            libc::setsockopt(
++                fd.as_raw_fd(),
++                libc::SOL_SOCKET,
++                opt,
++                &STREAM_BUF_SIZE as *const _ as *const libc::c_void,
++                std::mem::size_of_val(&STREAM_BUF_SIZE) as libc::socklen_t,
++            )
++        };
++        if ret != 0 {
++            warn!(
++                "setting socket buffer option {opt} to {STREAM_BUF_SIZE}: {}",
++                std::io::Error::last_os_error()
++            );
++        }
++    }
++}
++
+ pub(crate) fn as_raw_acceptor_fd(proxy: &super::UnixAcceptorProxy) -> RawFd {
+     proxy.fd.as_raw_fd()
+ }

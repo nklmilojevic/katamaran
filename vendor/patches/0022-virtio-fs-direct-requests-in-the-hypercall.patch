@@ -1,0 +1,852 @@
+diff --git a/src/devices/src/virtio/descriptor_utils.rs b/src/devices/src/virtio/descriptor_utils.rs
+index 7c2cfbc..cda5129 100644
+--- a/src/devices/src/virtio/descriptor_utils.rs
++++ b/src/devices/src/virtio/descriptor_utils.rs
+@@ -59,6 +59,32 @@ impl std::error::Error for Error {}
+ /// allocating them cost every request a few malloc/free pairs.
+ type Buffers<'a> = SmallVec<[VolatileSlice<'a>; 4]>;
+ 
++/// Host slices for guest buffers. Each buffer must lie within a single guest memory region
++/// (`get_slice` checks the end), and their total must fit in a `usize`.
++fn guest_slices<'a>(
++    mem: &'a GuestMemoryMmap,
++    buffers: impl IntoIterator<Item = (GuestAddress, u32)>,
++) -> Result<Buffers<'a>> {
++    let mut total_len: usize = 0;
++    buffers
++        .into_iter()
++        .map(|(addr, len)| {
++            // A driver could otherwise make the device read or write more data than fits in
++            // a `usize`.
++            total_len = total_len
++                .checked_add(len as usize)
++                .ok_or(Error::DescriptorChainOverflow)?;
++
++            let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
++            let offset = addr.checked_sub(region.start_addr().raw_value()).unwrap();
++            region
++                .deref()
++                .get_slice(offset.raw_value() as usize, len as usize)
++                .map_err(Error::VolatileMemoryError)
++        })
++        .collect()
++}
++
+ #[derive(Clone)]
+ struct DescriptorChainConsumer<'a> {
+     buffers: Buffers<'a>,
+@@ -197,32 +223,24 @@ pub struct Reader<'a> {
+ impl<'a> Reader<'a> {
+     /// Construct a new Reader wrapper over `desc_chain`.
+     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
+-        let mut total_len: usize = 0;
+-        let buffers = chain
+-            .into_iter()
+-            .readable()
+-            .map(|desc| {
+-                // Verify that summing the descriptor sizes does not overflow.
+-                // This can happen if a driver tricks a device into reading more data than
+-                // fits in a `usize`.
+-                total_len = total_len
+-                    .checked_add(desc.len as usize)
+-                    .ok_or(Error::DescriptorChainOverflow)?;
+-
+-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
+-                let offset = desc
+-                    .addr
+-                    .checked_sub(region.start_addr().raw_value())
+-                    .unwrap();
+-                region
+-                    .deref()
+-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
+-                    .map_err(Error::VolatileMemoryError)
+-            })
+-            .collect::<Result<Buffers<'a>>>()?;
++        Self::from_guest_buffers(
++            mem,
++            chain
++                .into_iter()
++                .readable()
++                .map(|desc| (desc.addr, desc.len)),
++        )
++    }
++
++    /// Construct a Reader over guest memory buffers. Every buffer must lie in one guest memory
++    /// region, or this fails without touching memory.
++    pub(crate) fn from_guest_buffers(
++        mem: &'a GuestMemoryMmap,
++        buffers: impl IntoIterator<Item = (GuestAddress, u32)>,
++    ) -> Result<Reader<'a>> {
+         Ok(Reader {
+             buffer: DescriptorChainConsumer {
+-                buffers,
++                buffers: guest_slices(mem, buffers)?,
+                 bytes_consumed: 0,
+             },
+         })
+@@ -363,29 +381,9 @@ impl<'a> Writer<'a> {
+         mem: &'a GuestMemoryMmap,
+         buffers: impl IntoIterator<Item = (GuestAddress, u32)>,
+     ) -> Result<Writer<'a>> {
+-        let mut total_len: usize = 0;
+-        let buffers = buffers
+-            .into_iter()
+-            .map(|(addr, len)| {
+-                // Verify that summing the descriptor sizes does not overflow.
+-                // This can happen if a driver tricks a device into writing more data than
+-                // fits in a `usize`.
+-                total_len = total_len
+-                    .checked_add(len as usize)
+-                    .ok_or(Error::DescriptorChainOverflow)?;
+-
+-                let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
+-                let offset = addr.checked_sub(region.start_addr().raw_value()).unwrap();
+-                region
+-                    .deref()
+-                    .get_slice(offset.raw_value() as usize, len as usize)
+-                    .map_err(Error::VolatileMemoryError)
+-            })
+-            .collect::<Result<Buffers<'a>>>()?;
+-
+         Ok(Writer {
+             buffer: DescriptorChainConsumer {
+-                buffers,
++                buffers: guest_slices(mem, buffers)?,
+                 bytes_consumed: 0,
+             },
+         })
+diff --git a/src/devices/src/virtio/fs/device.rs b/src/devices/src/virtio/fs/device.rs
+index 4bad958..cc07441 100644
+--- a/src/devices/src/virtio/fs/device.rs
++++ b/src/devices/src/virtio/fs/device.rs
+@@ -92,7 +92,9 @@ impl Fs {
+         // The guest probes once at driver init, before the device is activated.
+         #[cfg(target_os = "macos")]
+         if std::env::var("KATAMARAN_FS_INLINE").as_deref() != Ok("0") {
+-            hvf::vendor_call::register(KAT_FS_PROBE, |_| KAT_FS_MAGIC);
++            hvf::vendor_call::register(KAT_FS_PROBE, |[abi, _, _]| {
++                super::sync_calls::probe(KAT_FS_MAGIC, abi)
++            });
+         }
+ 
+         let mut fs = Fs {
+@@ -683,7 +685,8 @@ mod tests {
+     }
+ }
+ 
+-/// Guest probe: returns [`KAT_FS_MAGIC`] when synchronous submission works.
++/// Guest probe: returns [`KAT_FS_MAGIC`] when synchronous submission works, with the
++/// direct-request ABI version in bits 32.. when the guest asks for one.
+ #[cfg(target_os = "macos")]
+ const KAT_FS_PROBE: u64 = 0xC600_4B00;
+ #[cfg(target_os = "macos")]
+diff --git a/src/devices/src/virtio/fs/direct.rs b/src/devices/src/virtio/fs/direct.rs
+new file mode 100644
+index 0000000..0b441b4
+--- /dev/null
++++ b/src/devices/src/virtio/fs/direct.rs
+@@ -0,0 +1,363 @@
++//! KAT_FS_DIRECT: a guest FUSE request passed in the hypercall itself.
++//!
++//! `x1` is the guest-physical address of a request table, `x2` its length in
++//! bytes and `x3` the descriptor table address of the request queue the guest
++//! would otherwise use (it names the device). The table lists the request's
++//! guest buffers, the same ones its virtqueue descriptors would carry:
++//!
++//! ```text
++//! le16 version (ABI_DIRECT)   le16 nsegs   le16 nin   le16 reserved (0)
++//! nsegs x { le64 addr, le32 len, le32 reserved (0) }
++//! ```
++//!
++//! `segs[..nin]` are read by the host and `segs[nin..]` written. The reply is
++//! the number of bytes written; values from [`STATUS`] up are statuses, and on
++//! every status the guest sends the request through the virtqueue instead.
++//!
++//! The table is copied out of guest memory once, before anything else, so the
++//! guest cannot change it while it is checked or used. Every buffer must lie
++//! within one guest memory region, which `Reader`/`Writer` check before they
++//! touch memory.
++
++use smallvec::{SmallVec, smallvec};
++use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32, Le64};
++
++use super::super::descriptor_utils::{Reader, Writer};
++
++pub const KAT_FS_DIRECT: u64 = 0xC600_4B02;
++/// The table layout above; the guest asks for it in KAT_FS_PROBE's `x1`.
++pub const ABI_DIRECT: u64 = 1;
++/// Replies below this are reply lengths.
++pub const STATUS: u64 = 1 << 32;
++/// Not run here (it may block, or the device or queue is unknown).
++pub const DECLINED: u64 = STATUS;
++/// The table or a buffer in it is invalid; no guest buffer was read or written.
++pub const INVALID: u64 = STATUS | 1;
++
++/// Header and args in each direction plus up to 128 pages (the request size limit; a 32 KiB
++/// READDIRPLUS buffer is 8 separate pages). Larger requests take the virtqueue.
++pub const MAX_SEGS: usize = 4 + 128;
++/// Bytes in either direction. Above what the sync policy runs on a vCPU
++/// (`MAX_SYNC_IO` plus headers), so it only stops nonsense early.
++pub const MAX_BYTES: u64 = 2 << 20;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++struct RawHeader {
++    version: Le16,
++    nsegs: Le16,
++    nin: Le16,
++    reserved: Le16,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default)]
++struct RawSeg {
++    addr: Le64,
++    len: Le32,
++    reserved: Le32,
++}
++
++// SAFETY: plain little-endian integers without padding; any bit pattern is valid.
++unsafe impl ByteValued for RawHeader {}
++// SAFETY: as above.
++unsafe impl ByteValued for RawSeg {}
++
++const HDR: usize = size_of::<RawHeader>();
++const SEG: usize = size_of::<RawSeg>();
++const MAX_TABLE: usize = HDR + MAX_SEGS * SEG;
++/// Segments kept inline: all but READDIR(PLUS) and multi-page I/O.
++const INLINE_SEGS: usize = 8;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Invalid {
++    /// `x2` is not the size of a header and a whole number of segments.
++    TableLength,
++    /// The table is not in guest memory.
++    TableMemory,
++    Version,
++    /// `nsegs` disagrees with `x2`, or there is no buffer to read or none to write.
++    Counts,
++    Reserved,
++    EmptySegment,
++    /// A direction's total exceeds [`MAX_BYTES`].
++    TooLarge,
++    /// A buffer is not within one guest memory region.
++    BufferMemory,
++}
++
++/// The checked buffers of one request.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Segments {
++    segs: SmallVec<[(GuestAddress, u32); INLINE_SEGS]>,
++    nin: usize,
++}
++
++impl Segments {
++    pub fn readable(&self) -> impl Iterator<Item = (GuestAddress, u32)> + '_ {
++        self.segs[..self.nin].iter().copied()
++    }
++
++    pub fn writable(&self) -> impl Iterator<Item = (GuestAddress, u32)> + '_ {
++        self.segs[self.nin..].iter().copied()
++    }
++}
++
++/// Copy the table at `addr` (`len` bytes) out of guest memory and check it.
++pub fn parse(mem: &GuestMemoryMmap, addr: u64, len: u64) -> Result<Segments, Invalid> {
++    let len = usize::try_from(len).map_err(|_| Invalid::TableLength)?;
++    if !(HDR + 2 * SEG..=MAX_TABLE).contains(&len) || (len - HDR) % SEG != 0 {
++        return Err(Invalid::TableLength);
++    }
++    let mut table: SmallVec<[u8; 256]> = smallvec![0; len];
++    mem.read_slice(&mut table[..], GuestAddress(addr))
++        .map_err(|_| Invalid::TableMemory)?;
++    parse_table(&table)
++}
++
++/// `T` from the start of `bytes`, which need not be aligned for it.
++fn copy_from<T: ByteValued + Default>(bytes: &[u8]) -> T {
++    let mut v = T::default();
++    let dst = v.as_mut_slice();
++    dst.copy_from_slice(&bytes[..dst.len()]);
++    v
++}
++
++fn parse_table(table: &[u8]) -> Result<Segments, Invalid> {
++    let header: RawHeader = copy_from(&table[..HDR]);
++    if u64::from(header.version.to_native()) != ABI_DIRECT {
++        return Err(Invalid::Version);
++    }
++    if header.reserved.to_native() != 0 {
++        return Err(Invalid::Reserved);
++    }
++    let n = header.nsegs.to_native() as usize;
++    let nin = header.nin.to_native() as usize;
++    if n * SEG != table.len() - HDR || nin == 0 || nin >= n {
++        return Err(Invalid::Counts);
++    }
++
++    let mut out = Segments {
++        segs: SmallVec::with_capacity(n),
++        nin,
++    };
++    let (mut read, mut written) = (0u64, 0u64);
++    for (i, raw) in table[HDR..].chunks_exact(SEG).enumerate() {
++        let seg: RawSeg = copy_from(raw);
++        if seg.reserved.to_native() != 0 {
++            return Err(Invalid::Reserved);
++        }
++        let len = seg.len.to_native();
++        if len == 0 {
++            return Err(Invalid::EmptySegment);
++        }
++        let total = if i < nin { &mut read } else { &mut written };
++        *total += u64::from(len);
++        if *total > MAX_BYTES {
++            return Err(Invalid::TooLarge);
++        }
++        out.segs.push((GuestAddress(seg.addr.to_native()), len));
++    }
++    Ok(out)
++}
++
++/// The request's input and reply buffers.
++pub fn buffers<'a>(
++    mem: &'a GuestMemoryMmap,
++    segs: &Segments,
++) -> Result<(Reader<'a>, Writer<'a>), Invalid> {
++    let r = Reader::from_guest_buffers(mem, segs.readable()).map_err(|_| Invalid::BufferMemory)?;
++    let w = Writer::from_guest_buffers(mem, segs.writable()).map_err(|_| Invalid::BufferMemory)?;
++    Ok((r, w))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const RAM: u64 = 0x10_0000;
++    /// A second region after a hole, to catch buffers that span regions.
++    const HIGH: u64 = 0x20_0000;
++
++    fn mem() -> GuestMemoryMmap {
++        GuestMemoryMmap::from_ranges(&[
++            (GuestAddress(0), RAM as usize),
++            (GuestAddress(HIGH), 0x1000),
++        ])
++        .unwrap()
++    }
++
++    fn table(version: u16, nin: u16, segs: &[(u64, u32)]) -> Vec<u8> {
++        let mut t = Vec::new();
++        t.extend_from_slice(&version.to_le_bytes());
++        t.extend_from_slice(&(segs.len() as u16).to_le_bytes());
++        t.extend_from_slice(&nin.to_le_bytes());
++        t.extend_from_slice(&0u16.to_le_bytes());
++        for &(addr, len) in segs {
++            t.extend_from_slice(&addr.to_le_bytes());
++            t.extend_from_slice(&len.to_le_bytes());
++            t.extend_from_slice(&0u32.to_le_bytes());
++        }
++        t
++    }
++
++    /// A GETATTR-shaped request: in header + args, out header + args.
++    fn getattr() -> Vec<u8> {
++        table(
++            1,
++            2,
++            &[(0x1000, 40), (0x1100, 16), (0x2000, 16), (0x2100, 104)],
++        )
++    }
++
++    fn put(mem: &GuestMemoryMmap, at: u64, t: &[u8]) -> u64 {
++        mem.write_slice(t, GuestAddress(at)).unwrap();
++        t.len() as u64
++    }
++
++    #[test]
++    fn accepts_a_well_formed_request() {
++        let mem = mem();
++        let len = put(&mem, 0x8000, &getattr());
++        let segs = parse(&mem, 0x8000, len).unwrap();
++        assert_eq!(
++            segs.readable().collect::<Vec<_>>(),
++            [(GuestAddress(0x1000), 40), (GuestAddress(0x1100), 16)]
++        );
++        assert_eq!(
++            segs.writable().collect::<Vec<_>>(),
++            [(GuestAddress(0x2000), 16), (GuestAddress(0x2100), 104)]
++        );
++        let (r, w) = buffers(&mem, &segs).unwrap();
++        assert_eq!(r.available_bytes(), 56);
++        assert_eq!(w.available_bytes(), 120);
++    }
++
++    #[test]
++    fn rejects_table_lengths_that_are_not_whole_segments() {
++        let mem = mem();
++        let t = getattr();
++        put(&mem, 0x8000, &t);
++        for len in [
++            0,
++            1,
++            HDR as u64,
++            (HDR + SEG) as u64,
++            t.len() as u64 - 1,
++            t.len() as u64 + 1,
++        ] {
++            assert_eq!(parse(&mem, 0x8000, len), Err(Invalid::TableLength), "{len}");
++        }
++        let too_many = table(1, 1, &[(0x1000, 8); MAX_SEGS + 1]);
++        let len = put(&mem, 0x8000, &too_many);
++        assert_eq!(parse(&mem, 0x8000, len), Err(Invalid::TableLength));
++        assert_eq!(parse(&mem, 0x8000, u64::MAX), Err(Invalid::TableLength));
++    }
++
++    #[test]
++    fn rejects_a_table_outside_guest_memory() {
++        let mem = mem();
++        let len = getattr().len() as u64;
++        assert_eq!(parse(&mem, RAM, len), Err(Invalid::TableMemory));
++        assert_eq!(parse(&mem, RAM - 8, len), Err(Invalid::TableMemory));
++        assert_eq!(parse(&mem, u64::MAX - 8, len), Err(Invalid::TableMemory));
++        assert_eq!(parse(&mem, HIGH - 0x10, len), Err(Invalid::TableMemory));
++    }
++
++    #[test]
++    fn parses_tables_at_any_alignment() {
++        let t = getattr();
++        let mut buf = vec![0u8; t.len() + 1];
++        buf[1..].copy_from_slice(&t);
++        assert_eq!(parse_table(&buf[1..]), parse_table(&t));
++        assert!(parse_table(&buf[1..]).is_ok());
++    }
++
++    #[test]
++    fn rejects_bad_headers() {
++        let segs = [(0x1000, 40), (0x2000, 16)];
++        let cases = [
++            (table(0, 1, &segs), Invalid::Version),
++            (table(2, 1, &segs), Invalid::Version),
++            (table(1, 0, &segs), Invalid::Counts),
++            (table(1, 2, &segs), Invalid::Counts),
++            (table(1, 9, &segs), Invalid::Counts),
++        ];
++        for (t, want) in cases {
++            assert_eq!(parse_table(&t), Err(want));
++        }
++        // nsegs says three, the table holds two.
++        let mut t = table(1, 1, &segs);
++        t[2] = 3;
++        assert_eq!(parse_table(&t), Err(Invalid::Counts));
++        let mut t = table(1, 1, &segs);
++        t[6] = 1;
++        assert_eq!(parse_table(&t), Err(Invalid::Reserved));
++    }
++
++    #[test]
++    fn rejects_bad_segments() {
++        let mut t = getattr();
++        t[HDR + SEG + 12] = 1;
++        assert_eq!(parse_table(&t), Err(Invalid::Reserved));
++        assert_eq!(
++            parse_table(&table(1, 1, &[(0x1000, 40), (0x2000, 0)])),
++            Err(Invalid::EmptySegment)
++        );
++        let big = MAX_BYTES as u32 / 2 + 1;
++        assert_eq!(
++            parse_table(&table(1, 2, &[(0x1000, big), (0x1000, big), (0x2000, 16)])),
++            Err(Invalid::TooLarge)
++        );
++        assert_eq!(
++            parse_table(&table(1, 1, &[(0x1000, 40), (0x2000, big), (0x2000, big)])),
++            Err(Invalid::TooLarge)
++        );
++        // Lengths near u32::MAX in every slot cannot overflow the totals.
++        assert_eq!(
++            parse_table(&table(1, 4, &[(0, u32::MAX); MAX_SEGS])),
++            Err(Invalid::TooLarge)
++        );
++    }
++
++    #[test]
++    fn rejects_buffers_outside_guest_memory() {
++        let mem = mem();
++        let cases: [&[(u64, u32)]; 6] = [
++            // Ends one byte past RAM.
++            &[(RAM - 40, 41), (0x2000, 16)],
++            // Starts in the hole between the regions.
++            &[(0x1000, 40), (RAM + 0x1000, 16)],
++            // Spans the hole from the first region into the second.
++            &[(0x1000, 40), (RAM - 8, (HIGH - RAM) as u32 + 16)],
++            // Runs off the end of the second region.
++            &[(HIGH + 0xff0, 0x20), (0x2000, 16)],
++            // Address arithmetic would wrap.
++            &[(u64::MAX - 8, 40), (0x2000, 16)],
++            &[(0x1000, 40), (u64::MAX, 16)],
++        ];
++        for segs in cases {
++            let parsed = parse_table(&table(1, 1, segs)).unwrap();
++            assert_eq!(
++                buffers(&mem, &parsed).err(),
++                Some(Invalid::BufferMemory),
++                "{segs:x?}"
++            );
++        }
++        // At the very end of each region is fine.
++        let ok = parse_table(&table(1, 1, &[(RAM - 40, 40), (HIGH + 0xff0, 16)])).unwrap();
++        assert!(buffers(&mem, &ok).is_ok());
++    }
++
++    #[test]
++    fn the_guest_cannot_change_the_table_after_it_is_read() {
++        let mem = mem();
++        let len = put(&mem, 0x8000, &getattr());
++        let segs = parse(&mem, 0x8000, len).unwrap();
++        // Rewrite the first segment to point outside memory, as another vCPU could.
++        mem.write_obj(RAM + 0x100, GuestAddress(0x8000 + HDR as u64))
++            .unwrap();
++        let (r, _) = buffers(&mem, &segs).unwrap();
++        assert_eq!(r.available_bytes(), 56);
++    }
++}
+diff --git a/src/devices/src/virtio/fs/mod.rs b/src/devices/src/virtio/fs/mod.rs
+index 18cc50d..3934706 100644
+--- a/src/devices/src/virtio/fs/mod.rs
++++ b/src/devices/src/virtio/fs/mod.rs
+@@ -1,5 +1,6 @@
+ mod augment_fs;
+ mod device;
++mod direct;
+ #[allow(dead_code)]
+ mod filesystem;
+ pub mod fuse;
+diff --git a/src/devices/src/virtio/fs/sync_calls.rs b/src/devices/src/virtio/fs/sync_calls.rs
+index cff7b7e..1bdd687 100644
+--- a/src/devices/src/virtio/fs/sync_calls.rs
++++ b/src/devices/src/virtio/fs/sync_calls.rs
+@@ -1,15 +1,19 @@
+-//! KAT_FS_DRAIN, the call a katamaran guest makes after queueing virtio-fs
+-//! requests: process the request queue on the calling vCPU without raising an
+-//! interrupt. Returns [`DRAIN_DONE`] when done, [`DRAIN_BUSY`] when the queue
+-//! is busy on another thread or unknown (the guest then notifies the queue as
+-//! usual).
++//! The calls a katamaran guest makes to have virtio-fs requests run on the
++//! calling vCPU without raising an interrupt:
+ //!
+-//! The call is global but every virtio-fs device has its own queues, so the
+-//! guest names the queue by its index (`x1`) and the guest address of its
+-//! descriptor table (`x2`), which is unique to one device.
++//! - KAT_FS_DRAIN, after queueing requests: process the request queue.
++//!   Returns [`DRAIN_DONE`] when done, [`DRAIN_BUSY`] when the queue is busy on
++//!   another thread or unknown (the guest then notifies the queue as usual).
++//! - KAT_FS_DIRECT: run one request passed in the call itself, without the
++//!   queue (see [`direct`]).
++//!
++//! The calls are global but every virtio-fs device has its own queues, so the
++//! guest names the queue by the guest address of its descriptor table, which
++//! is unique to one device.
+ 
+ use std::sync::{Arc, RwLock};
+ 
++use super::direct::{self, KAT_FS_DIRECT};
+ use super::worker::{DRAIN_BUSY, FsCore, note_sync};
+ 
+ const KAT_FS_DRAIN: u64 = 0xC600_4B01;
+@@ -21,6 +25,11 @@ pub fn register(core: Arc<FsCore>) {
+     hvf::vendor_call::register(KAT_FS_DRAIN, |[queue, desc_table, _]| {
+         drain(queue as usize, desc_table)
+     });
++    if direct_enabled() {
++        hvf::vendor_call::register(KAT_FS_DIRECT, |[table, len, desc_table]| {
++            run_direct(table, len, desc_table)
++        });
++    }
+ }
+ 
+ pub fn unregister(core: &Arc<FsCore>) {
+@@ -28,6 +37,23 @@ pub fn unregister(core: &Arc<FsCore>) {
+     cores.retain(|c| !Arc::ptr_eq(c, core));
+     if cores.is_empty() {
+         hvf::vendor_call::unregister(KAT_FS_DRAIN);
++        hvf::vendor_call::unregister(KAT_FS_DIRECT);
++    }
++}
++
++/// KATAMARAN_FS_DIRECT=0 turns the direct call off; the guest then keeps
++/// queueing and draining.
++pub fn direct_enabled() -> bool {
++    std::env::var("KATAMARAN_FS_DIRECT").as_deref() != Ok("0")
++}
++
++/// KAT_FS_PROBE: the bare magic for a guest that asks for no ABI version,
++/// otherwise the magic with the highest supported version in bits 32..48.
++pub fn probe(magic: u64, abi: u64) -> u64 {
++    if abi >= direct::ABI_DIRECT && direct_enabled() {
++        magic | direct::ABI_DIRECT << 32
++    } else {
++        magic
+     }
+ }
+ 
+@@ -42,6 +68,14 @@ fn drain(queue: usize, desc_table: u64) -> u64 {
+     }
+ }
+ 
++fn run_direct(table: u64, len: u64, desc_table: u64) -> u64 {
++    let found = find_request_queue(&CORES.read().unwrap(), desc_table);
++    match found {
++        Some((core, queue)) => core.run_direct(queue, table, len),
++        None => direct::DECLINED,
++    }
++}
++
+ /// The device that owns the queue. A guest that passes no address (an older
+ /// kernel) is only served when there is a single device.
+ pub(super) fn find(cores: &[Arc<FsCore>], queue: usize, desc_table: u64) -> Option<Arc<FsCore>> {
+@@ -53,3 +87,13 @@ pub(super) fn find(cores: &[Arc<FsCore>], queue: usize, desc_table: u64) -> Opti
+             .cloned(),
+     }
+ }
++
++/// The device and request queue whose descriptor table is at `desc_table`.
++pub(super) fn find_request_queue(
++    cores: &[Arc<FsCore>],
++    desc_table: u64,
++) -> Option<(Arc<FsCore>, usize)> {
++    cores
++        .iter()
++        .find_map(|c| c.request_queue_at(desc_table).map(|q| (c.clone(), q)))
++}
+diff --git a/src/devices/src/virtio/fs/worker.rs b/src/devices/src/virtio/fs/worker.rs
+index 3a1a4e4..763e88e 100644
+--- a/src/devices/src/virtio/fs/worker.rs
++++ b/src/devices/src/virtio/fs/worker.rs
+@@ -23,6 +23,7 @@ use super::super::{DescriptorChain, FsError, Queue};
+ use super::augment_fs::AugmentFs;
+ use super::defs::{HPQ_INDEX, REQ_INDEX};
+ use super::descriptor_utils::{Reader, Writer};
++use super::direct;
+ use super::fuse::{InHeader, Opcode, ReadIn, WriteIn};
+ use super::inode_alloc::InodeAllocator;
+ #[cfg(target_os = "macos")]
+@@ -314,6 +315,9 @@ static STAT_INLINE: AtomicU64 = AtomicU64::new(0);
+ static STAT_SYNC: AtomicU64 = AtomicU64::new(0);
+ static STAT_ASYNC: AtomicU64 = AtomicU64::new(0);
+ static STAT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
++static STAT_DIRECT: AtomicU64 = AtomicU64::new(0);
++static STAT_DIRECT_DECLINED: AtomicU64 = AtomicU64::new(0);
++static STAT_DIRECT_INVALID: AtomicU64 = AtomicU64::new(0);
+ static STATS_ON: AtomicBool = AtomicBool::new(false);
+ /// Requests and host nanoseconds per FUSE opcode (`OP_SLOTS - 1` collects the rest).
+ const OP_SLOTS: usize = 64;
+@@ -358,7 +362,7 @@ pub fn start_stats_reporter() {
+     STARTED.call_once(|| {
+         STATS_ON.store(true, Ordering::Relaxed);
+         thread::spawn(|| {
+-            let mut last = [0u64; 6];
++            let mut last = [0u64; 9];
+             let mut last_ops = [(0u64, 0u64); OP_SLOTS];
+             loop {
+                 thread::sleep(Duration::from_secs(2));
+@@ -369,17 +373,23 @@ pub fn start_stats_reporter() {
+                     STAT_SYNC.load(Ordering::Relaxed),
+                     STAT_ASYNC.load(Ordering::Relaxed),
+                     STAT_TIMEOUTS.load(Ordering::Relaxed),
++                    STAT_DIRECT.load(Ordering::Relaxed),
++                    STAT_DIRECT_DECLINED.load(Ordering::Relaxed),
++                    STAT_DIRECT_INVALID.load(Ordering::Relaxed),
+                 ];
+                 let d: Vec<u64> = now.iter().zip(last).map(|(n, l)| n - l).collect();
+                 if d[0] > 0 {
+                     log::warn!(
+-                        "fs stats: {} req/s, host {:.1} us/req, drains: {} notify-inline, {} sync; {} to pool, {} open timeouts",
++                        "fs stats: {} req/s, host {:.1} us/req, drains: {} notify-inline, {} sync; {} to pool, {} open timeouts; direct: {} done, {} declined, {} invalid",
+                         d[0] / 2,
+                         d[1] as f64 / d[0] as f64 / 1000.0,
+                         d[2],
+                         d[3],
+                         d[4],
+-                        d[5]
++                        d[5],
++                        d[6],
++                        d[7],
++                        d[8]
+                     );
+                     log::warn!("fs ops (opcode:count): {}", op_summary(&mut last_ops));
+                 }
+@@ -464,6 +474,71 @@ impl FsCore {
+         self.drain_locked(&mut queue, queue_index, true)
+     }
+ 
++    /// The request queue whose descriptor table is at `desc_table`.
++    pub fn request_queue_at(&self, desc_table: u64) -> Option<usize> {
++        self.desc_tables
++            .iter()
++            .position(|&d| d == desc_table)
++            .filter(|&q| q >= REQ_INDEX)
++    }
++
++    /// vCPU thread on KAT_FS_DIRECT: run the request whose table the guest
++    /// passed (`len` bytes at `table`), as if it came on request queue
++    /// `queue_index`, and return the reply length or a [`direct`] status. No
++    /// queue is touched, so no queue lock is taken.
++    pub fn run_direct(&self, queue_index: usize, table: u64, len: u64) -> u64 {
++        let checked =
++            direct::parse(&self.mem, table, len).and_then(|segs| direct::buffers(&self.mem, &segs));
++        let (reader, writer) = match checked {
++            Ok(rw) => rw,
++            Err(e) => {
++                if STAT_DIRECT_INVALID.fetch_add(1, Ordering::Relaxed) == 0 {
++                    log::warn!("fs: invalid direct request from the guest: {e:?}");
++                }
++                return direct::INVALID;
++            }
++        };
++        let peeked = self.peek_reader(reader.clone(), queue_index);
++        let Some(p) = &peeked else {
++            STAT_DIRECT_INVALID.fetch_add(1, Ordering::Relaxed);
++            return direct::INVALID;
++        };
++        let (opcode, nodeid) = (p.opcode, p.nodeid);
++        let route = self.route(&peeked, queue_index);
++        if route == Route::Async {
++            STAT_DIRECT_DECLINED.fetch_add(1, Ordering::Relaxed);
++            return direct::DECLINED;
++        }
++
++        #[cfg(target_os = "macos")]
++        let scope = (route == Route::BoundedOpen).then(syncopen::bounded_scope);
++        let len = self.serve(reader, writer, Some(opcode));
++        #[cfg(target_os = "macos")]
++        if let Some(scope) = scope {
++            drop(scope);
++            if syncopen::take_timed_out() {
++                // As on the queue path: the guest ignores what was written and
++                // sends the request again, and it now goes to the pool.
++                STAT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
++                self.policy.mark_async(nodeid);
++                STAT_DIRECT_DECLINED.fetch_add(1, Ordering::Relaxed);
++                return direct::DECLINED;
++            }
++        }
++        #[cfg(not(target_os = "macos"))]
++        let _ = nodeid;
++        match len {
++            Some(len) if len > 0 => {
++                STAT_DIRECT.fetch_add(1, Ordering::Relaxed);
++                len as u64
++            }
++            _ => {
++                STAT_DIRECT_INVALID.fetch_add(1, Ordering::Relaxed);
++                direct::INVALID
++            }
++        }
++    }
++
+     fn drain_locked(&self, queue: &mut Queue, queue_index: usize, sync: bool) -> u64 {
+         loop {
+             queue.disable_notification(&self.mem).unwrap();
+@@ -487,7 +562,12 @@ impl FsCore {
+         if let Some(p) = self.peek_head(head, queue_index) {
+             return Some(p);
+         }
+-        let mut r = Reader::new(&self.mem, head.clone()).ok()?;
++        let r = Reader::new(&self.mem, head.clone()).ok()?;
++        self.peek_reader(r, queue_index)
++    }
++
++    /// The parts of a request that decide where it runs, read from its input.
++    fn peek_reader(&self, mut r: Reader, queue_index: usize) -> Option<Peeked> {
+         let h: InHeader = r.read_obj().ok()?;
+         let mut p = Peeked {
+             opcode: h.opcode,
+@@ -590,6 +670,12 @@ impl FsCore {
+         let writer = Writer::new(&self.mem, head)
+             .map_err(FsError::QueueWriter)
+             .unwrap();
++        self.serve(reader, writer, opcode).unwrap_or(0)
++    }
++
++    /// Run one request through the FUSE server; the reply length, or None when the server could
++    /// not decode it. `opcode` is for the per-opcode stats.
++    fn serve(&self, reader: Reader, writer: Writer, opcode: Option<u32>) -> Option<usize> {
+         let started = STATS_ON.load(Ordering::Relaxed).then(Instant::now);
+         let len = match self.server.handle_message(
+             reader,
+@@ -600,10 +686,10 @@ impl FsCore {
+             #[cfg(target_os = "macos")]
+             &self.map_sender,
+         ) {
+-            Ok(len) => len,
++            Ok(len) => Some(len),
+             Err(e) => {
+                 error!("error handling message: {e:?}");
+-                0
++                None
+             }
+         };
+         if let Some(started) = started {
+@@ -849,4 +935,63 @@ mod tests {
+         users.stop_pool();
+         rosetta.stop_pool();
+     }
++
++    /// A KAT_FS_DIRECT table at `at` for a GETATTR of the root whose reply goes to `reply`.
++    fn direct_getattr(mem: &GuestMemoryMmap, at: u64, reply: u64, reply_len: u32) -> u64 {
++        let req = at + 0x100;
++        let in_len = (size_of::<InHeader>() + size_of::<GetattrIn>()) as u32;
++        let header = InHeader {
++            len: in_len,
++            opcode: Opcode::Getattr as u32,
++            unique: 7,
++            nodeid: super::super::fuse::ROOT_ID,
++            ..Default::default()
++        };
++        mem.write_obj(header, GuestAddress(req)).unwrap();
++        let mut t = Vec::new();
++        for v in [1u16, 2, 1, 0] {
++            t.extend_from_slice(&v.to_le_bytes());
++        }
++        for (addr, len) in [(req, in_len), (reply, reply_len)] {
++            t.extend_from_slice(&addr.to_le_bytes());
++            t.extend_from_slice(&len.to_le_bytes());
++            t.extend_from_slice(&0u32.to_le_bytes());
++        }
++        mem.write_slice(&t, GuestAddress(at)).unwrap();
++        t.len() as u64
++    }
++
++    #[test]
++    fn direct_requests_run_without_the_queue() {
++        use super::super::fuse::{AttrOut, OutHeader};
++
++        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
++        let core = core_with_queues(&mem, &[0x1000, 0x2000]);
++        let q1 = VirtQueue::new(GuestAddress(0x2000), &mem, 16);
++        let desc = q1.create_queue().desc_table.0;
++        assert_eq!(core.request_queue_at(desc), Some(REQ_INDEX));
++        let hpq = VirtQueue::new(GuestAddress(0x1000), &mem, 16);
++        assert_eq!(core.request_queue_at(hpq.create_queue().desc_table.0), None);
++        assert_eq!(core.request_queue_at(0xdead_0000), None);
++
++        let reply_len = (size_of::<OutHeader>() + size_of::<AttrOut>()) as u32;
++        let len = direct_getattr(&mem, 0x10000, 0x18000, reply_len);
++        let ret = core.run_direct(REQ_INDEX, 0x10000, len);
++        assert_eq!(ret, reply_len as u64);
++        let out: OutHeader = mem.read_obj(GuestAddress(0x18000)).unwrap();
++        assert_eq!((out.len, out.error, out.unique), (reply_len, 0, 7));
++        // Nothing went through the queue.
++        assert_eq!(q1.used.idx.get(), 0);
++
++        // A reply buffer past the end of guest memory: refused before anything is written.
++        let len = direct_getattr(&mem, 0x10000, 0x40000 - 8, reply_len);
++        assert_eq!(core.run_direct(REQ_INDEX, 0x10000, len), direct::INVALID);
++        // A truncated table, and one outside guest memory.
++        assert_eq!(
++            core.run_direct(REQ_INDEX, 0x10000, len - 1),
++            direct::INVALID
++        );
++        assert_eq!(core.run_direct(REQ_INDEX, 0x40000, len), direct::INVALID);
++        core.stop_pool();
++    }
+ }

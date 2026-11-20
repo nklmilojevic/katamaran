@@ -1,0 +1,219 @@
+//! Common utilities used by multiple tests.
+
+use std::fs::{self, create_dir};
+use std::os::fd::AsFd;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+#[cfg(feature = "dynamic-linking")]
+use krun::DeviceManager;
+
+use crate::TestSetup;
+
+fn copy_guest_agent(dir: &Path) -> anyhow::Result<()> {
+    let path = std::env::var_os("KRUN_TEST_GUEST_AGENT_PATH")
+        .context("KRUN_TEST_GUEST_AGENT_PATH env variable not set")?;
+
+    let output_path = dir.join("guest-agent");
+    fs::copy(path, output_path).context("Failed to copy executable into vm")?;
+    Ok(())
+}
+
+/// Creates the root filesystem directory and copies the guest agent into it.
+pub fn setup_rootfs(test_setup: &TestSetup) -> anyhow::Result<PathBuf> {
+    let root_dir = test_setup.tmp_dir.join("rootfs");
+    if !root_dir.exists() {
+        create_dir(&root_dir).context("Failed to create rootfs directory")?;
+    }
+    copy_guest_agent(&root_dir)?;
+    Ok(root_dir)
+}
+
+/// Build an init config for running the guest-agent with the given test case.
+pub fn build_init_config(test_case: &str, guest_env: &[&str]) -> krun_init::Config {
+    krun_init::Config::builder()
+        .args(&["/guest-agent", test_case])
+        .workdir("/")
+        .env(guest_env)
+        .build()
+}
+
+/// Sets up the root filesystem, builds a VM, and enters it.
+pub fn setup_and_run(num_cpus: u8, ram_mib: u32, test_setup: TestSetup) -> anyhow::Result<()> {
+    setup_and_run_with_env(num_cpus, ram_mib, test_setup, &[])
+}
+
+/// Initialize libkrun logging.
+pub fn init_krun() -> anyhow::Result<()> {
+    krun::init_log(
+        None,
+        krun::LogLevel::Trace,
+        krun::LogStyle::Auto,
+        krun::LogOptions::empty(),
+    )
+    .map_err(|e| anyhow::anyhow!("init_log: {e:?}"))?;
+    Ok(())
+}
+
+pub fn setup_and_run_with_env(
+    num_cpus: u8,
+    ram_mib: u32,
+    test_setup: TestSetup,
+    guest_env: &[&str],
+) -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let init_config = init_config_builder(&test_setup, guest_env).build();
+    let (devices, payload) =
+        setup_standard_devices(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
+
+    let vmm = krun::VmmBuilder::new()
+        .vcpus(num_cpus)
+        .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+        .ram_mib(ram_mib)
+        .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+        .payload(payload)
+        .devices(devices)
+        .build()
+        .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e:?}"))?;
+
+    vmm.run();
+    unreachable!()
+}
+
+/// Set up the standard test VM: rootfs + init config + console + balloon + rng.
+/// Returns a device manager and payload ready for the test to add extra devices
+/// (vsock, block, net, etc.) before passing to `build_and_run()`.
+/// Create a base init config builder for the given test case.
+pub fn init_config_builder(test_setup: &TestSetup, guest_env: &[&str]) -> krun_init::Builder {
+    krun_init::Config::builder()
+        .args(&["/guest-agent", &test_setup.test_case])
+        .workdir("/")
+        .env(guest_env)
+}
+
+pub fn setup_standard_devices<'a>(
+    test_setup: &'a TestSetup,
+    init_config: &'a krun_init::Config,
+    stdin: &'a std::io::Stdin,
+    stdout: &'a std::io::Stdout,
+    stderr: &'a std::io::Stderr,
+) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
+    setup_standard_devices_from(test_setup, init_config, stdin, stdout, stderr)
+}
+
+/// Build standard devices from a pre-configured init config builder.
+/// Caller can customize the builder (e.g. `.dhcp(true)`) before passing it.
+pub fn setup_standard_devices_from<'a>(
+    test_setup: &'a TestSetup,
+    init_config: &'a krun_init::Config,
+    stdin: &'a std::io::Stdin,
+    stdout: &'a std::io::Stdout,
+    stderr: &'a std::io::Stderr,
+) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
+    setup_standard_devices_inner(test_setup, init_config, stdin, stdout, stderr, None)
+}
+
+/// Like `setup_standard_devices`, for an init config with a control socket:
+/// the config is applied together with `vsock`, which gets the port mapping.
+/// The caller still adds `vsock` to the returned device manager.
+pub fn setup_standard_devices_with_vsock<'a>(
+    test_setup: &'a TestSetup,
+    init_config: &'a krun_init::Config,
+    stdin: &'a std::io::Stdin,
+    stdout: &'a std::io::Stdout,
+    stderr: &'a std::io::Stderr,
+    vsock: &mut krun::VsockDevice,
+) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
+    setup_standard_devices_inner(test_setup, init_config, stdin, stdout, stderr, Some(vsock))
+}
+
+fn setup_standard_devices_inner<'a>(
+    test_setup: &'a TestSetup,
+    init_config: &'a krun_init::Config,
+    stdin: &'a std::io::Stdin,
+    stdout: &'a std::io::Stdout,
+    stderr: &'a std::io::Stderr,
+    vsock: Option<&mut krun::VsockDevice>,
+) -> anyhow::Result<(krun::MmioDeviceManager<'a>, krun::Payload)> {
+    let root_dir = setup_rootfs(test_setup)?;
+
+    let mut rootfs = krun::FsDevice::new("/dev/root", root_dir.to_str().unwrap())
+        .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;
+    let mut payload =
+        krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
+    let mut overlay = krun::FsOverlay::new();
+    match vsock {
+        Some(vsock) => init_config
+            .apply_with_vsock(&mut overlay, &mut payload, vsock)
+            .map_err(|e| anyhow::anyhow!("Config::apply_with_vsock: {e}"))?,
+        None => init_config
+            .apply(&mut overlay, &mut payload)
+            .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?,
+    }
+    rootfs.set_overlay(overlay);
+
+    let mut console_builder = krun::ConsoleDevice::builder();
+    console_builder
+        .add_default_console(
+            Some(stdin.as_fd()),
+            Some(stdout.as_fd()),
+            Some(stderr.as_fd()),
+        )
+        .map_err(|e| anyhow::anyhow!("add_default_console: {e:?}"))?;
+    let console = console_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("ConsoleDevice::build: {e:?}"))?;
+
+    let mut devices = krun::MmioDeviceManager::new();
+    devices.add(rootfs);
+    devices.add(console);
+    devices.add(krun::BalloonDevice::new().map_err(|e| anyhow::anyhow!("BalloonDevice: {e:?}"))?);
+    devices.add(krun::RngDevice::new().map_err(|e| anyhow::anyhow!("RngDevice: {e:?}"))?);
+
+    Ok((devices, payload))
+}
+
+/// Build a VM with the given rootfs device and payload, add a default console,
+/// and run it. Does not return.
+pub fn build_and_run<'a>(
+    num_cpus: u8,
+    ram_mib: u32,
+    rootfs: krun::FsDevice<'a>,
+    payload: krun::Payload,
+) -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut console_builder = krun::ConsoleDevice::builder();
+    console_builder
+        .add_default_console(
+            Some(stdin.as_fd()),
+            Some(stdout.as_fd()),
+            Some(stderr.as_fd()),
+        )
+        .map_err(|e| anyhow::anyhow!("add_default_console: {e:?}"))?;
+    let console = console_builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("ConsoleDevice::build: {e:?}"))?;
+
+    let mut devices = krun::MmioDeviceManager::new();
+    devices.add(rootfs);
+    devices.add(console);
+    devices.add(krun::BalloonDevice::new().map_err(|e| anyhow::anyhow!("BalloonDevice: {e:?}"))?);
+    devices.add(krun::RngDevice::new().map_err(|e| anyhow::anyhow!("RngDevice: {e:?}"))?);
+
+    let vmm = krun::VmmBuilder::new()
+        .vcpus(num_cpus)
+        .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+        .ram_mib(ram_mib)
+        .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+        .payload(payload)
+        .devices(devices)
+        .build()
+        .map_err(|e| anyhow::anyhow!("VmmBuilder::build: {e:?}"))?;
+
+    vmm.run();
+    unreachable!()
+}

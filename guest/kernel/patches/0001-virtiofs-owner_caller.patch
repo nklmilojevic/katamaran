@@ -1,0 +1,112 @@
+Subject: [PATCH] fuse/virtio_fs: add owner_caller mount option
+
+With owner_caller, getattr reports every file as owned by the calling
+task's fsuid/fsgid, and local default_permissions checks are turned off so
+the host enforces access. The host can then return one cacheable set of
+attributes with no per-file ownership lookup, while each container still
+sees its own files as its own.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/fs/fuse/dir.c b/fs/fuse/dir.c
+--- a/fs/fuse/dir.c	2026-11-18 12:48:01
++++ b/fs/fuse/dir.c	2026-11-18 12:48:01
+@@ -1387,6 +1387,16 @@
+ 		}
+ 	}
+ 
++	/*
++	 * owner_caller: the host stores no Linux ownership, so show the file as
++	 * owned by the caller. Doing this here rather than on the host lets the
++	 * attributes stay cached for every caller.
++	 */
++	if (!err && stat && fc->owner_caller) {
++		stat->uid = current_fsuid();
++		stat->gid = current_fsgid();
++	}
++
+ 	return err;
+ }
+ 
+diff -ruN a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+--- a/fs/fuse/fuse_i.h	2026-11-18 12:48:01
++++ b/fs/fuse/fuse_i.h	2026-11-18 12:48:01
+@@ -553,6 +553,7 @@
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+ 	bool legacy_opts_show:1;
++	bool owner_caller:1;
+ 	enum fuse_dax_mode dax_mode;
+ 	unsigned int max_read;
+ 	unsigned int blksize;
+@@ -799,6 +800,9 @@
+ 
+ 	/** Check permissions based on the file mode or not? */
+ 	unsigned default_permissions:1;
++
++	/** Report every file as owned by the calling task (see getattr) */
++	unsigned owner_caller:1;
+ 
+ 	/** Allow other than the mounter user to access the filesystem ? */
+ 	unsigned allow_other:1;
+diff -ruN a/fs/fuse/inode.c b/fs/fuse/inode.c
+--- a/fs/fuse/inode.c	2026-11-18 12:48:01
++++ b/fs/fuse/inode.c	2026-11-18 12:48:01
+@@ -921,6 +921,8 @@
+ 			   from_kgid_munged(fc->user_ns, fc->group_id));
+ 		if (fc->default_permissions)
+ 			seq_puts(m, ",default_permissions");
++		if (fc->owner_caller)
++			seq_puts(m, ",owner_caller");
+ 		if (fc->allow_other)
+ 			seq_puts(m, ",allow_other");
+ 		if (fc->max_read != ~0)
+@@ -1885,6 +1887,7 @@
+ 	sb->s_flags |= SB_POSIXACL;
+ 
+ 	fc->default_permissions = ctx->default_permissions;
++	fc->owner_caller = ctx->owner_caller;
+ 	fc->allow_other = ctx->allow_other;
+ 	fc->user_id = ctx->user_id;
+ 	fc->group_id = ctx->group_id;
+diff -ruN a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+--- a/fs/fuse/virtio_fs.c	2026-11-18 12:48:01
++++ b/fs/fuse/virtio_fs.c	2026-11-18 12:48:01
+@@ -110,11 +110,13 @@
+ enum {
+ 	OPT_DAX,
+ 	OPT_DAX_ENUM,
++	OPT_OWNER_CALLER,
+ };
+ 
+ static const struct fs_parameter_spec virtio_fs_parameters[] = {
+ 	fsparam_flag("dax", OPT_DAX),
+ 	fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
++	fsparam_flag("owner_caller", OPT_OWNER_CALLER),
+ 	{}
+ };
+ 
+@@ -136,6 +138,9 @@
+ 	case OPT_DAX_ENUM:
+ 		ctx->dax_mode = result.uint_32;
+ 		break;
++	case OPT_OWNER_CALLER:
++		ctx->owner_caller = true;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1578,7 +1583,12 @@
+ static inline void virtio_fs_ctx_set_defaults(struct fuse_fs_context *ctx)
+ {
+ 	ctx->rootmode = S_IFDIR;
+-	ctx->default_permissions = 1;
++	/*
++	 * With owner_caller every file looks owned by whoever asks, so local
++	 * mode checks against the cached owner would be wrong; the host
++	 * enforces access instead.
++	 */
++	ctx->default_permissions = !ctx->owner_caller;
+ 	ctx->allow_other = 1;
+ 	ctx->max_read = UINT_MAX;
+ 	ctx->blksize = 512;

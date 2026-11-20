@@ -1,0 +1,1124 @@
+diff --git a/src/devices/src/virtio/fs/macos/attrlist.rs b/src/devices/src/virtio/fs/macos/attrlist.rs
+new file mode 100644
+index 00000000..4f890d60
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/attrlist.rs
+@@ -0,0 +1,433 @@
++// Directory listing with getattrlistbulk(2): one call returns the names and attributes of a batch
++// of entries, so READDIRPLUS does not need an lstat per entry.
++
++use std::ffi::{CStr, CString};
++use std::io;
++use std::mem::{self, MaybeUninit};
++use std::os::unix::io::RawFd;
++
++use libc::{
++    ATTR_BIT_MAP_COUNT, ATTR_CMN_ACCESSMASK, ATTR_CMN_ACCTIME, ATTR_CMN_CHGTIME, ATTR_CMN_DEVID,
++    ATTR_CMN_FILEID, ATTR_CMN_FLAGS, ATTR_CMN_GRPID, ATTR_CMN_MODTIME, ATTR_CMN_NAME,
++    ATTR_CMN_OBJTYPE, ATTR_CMN_OWNERID, ATTR_CMN_RETURNED_ATTRS, ATTR_CMNEXT_EXT_FLAGS,
++    ATTR_DIR_ALLOCSIZE, ATTR_DIR_DATALENGTH, ATTR_DIR_ENTRYCOUNT, ATTR_DIR_IOBLOCKSIZE,
++    ATTR_DIR_MOUNTSTATUS, ATTR_FILE_ALLOCSIZE, ATTR_FILE_DATALENGTH, ATTR_FILE_DEVTYPE,
++    ATTR_FILE_IOBLOCKSIZE, ATTR_FILE_LINKCOUNT, DIR_MNTSTATUS_MNTPOINT, FSOPT_ATTR_CMN_EXTENDED,
++    attrgroup_t, attrlist,
++};
++
++use super::super::super::linux_errno::linux_error;
++use super::super::bindings;
++
++// Not exported by the libc crate.
++const ATTR_CMN_ERROR: attrgroup_t = 0x2000_0000;
++const EF_NO_XATTRS: u64 = 0x2;
++const SF_FIRMLINK: u32 = 0x0080_0000;
++
++const VREG: u32 = 1;
++const VDIR: u32 = 2;
++const VBLK: u32 = 3;
++const VCHR: u32 = 4;
++const VLNK: u32 = 5;
++const VSOCK: u32 = 6;
++const VFIFO: u32 = 7;
++
++const BUF_SIZE: usize = 16384;
++
++// Each group is packed in ascending bit order; the sizes follow getattrlist(2).
++const COMMON: &[(attrgroup_t, usize)] = &[
++    (ATTR_CMN_NAME, 8),
++    (ATTR_CMN_DEVID, 4),
++    (ATTR_CMN_OBJTYPE, 4),
++    (ATTR_CMN_MODTIME, 16),
++    (ATTR_CMN_CHGTIME, 16),
++    (ATTR_CMN_ACCTIME, 16),
++    (ATTR_CMN_OWNERID, 4),
++    (ATTR_CMN_GRPID, 4),
++    (ATTR_CMN_ACCESSMASK, 4),
++    (ATTR_CMN_FLAGS, 4),
++    (ATTR_CMN_FILEID, 8),
++];
++const DIR: &[(attrgroup_t, usize)] = &[
++    (ATTR_DIR_ENTRYCOUNT, 4),
++    (ATTR_DIR_MOUNTSTATUS, 4),
++    (ATTR_DIR_ALLOCSIZE, 8),
++    (ATTR_DIR_IOBLOCKSIZE, 4),
++    (ATTR_DIR_DATALENGTH, 8),
++];
++const FILE: &[(attrgroup_t, usize)] = &[
++    (ATTR_FILE_LINKCOUNT, 4),
++    (ATTR_FILE_ALLOCSIZE, 8),
++    (ATTR_FILE_IOBLOCKSIZE, 4),
++    (ATTR_FILE_DEVTYPE, 4),
++    (ATTR_FILE_DATALENGTH, 8),
++];
++const EXT: &[(attrgroup_t, usize)] = &[(ATTR_CMNEXT_EXT_FLAGS, 8)];
++
++const STAT_COMMON: attrgroup_t = ATTR_CMN_DEVID
++    | ATTR_CMN_OBJTYPE
++    | ATTR_CMN_MODTIME
++    | ATTR_CMN_CHGTIME
++    | ATTR_CMN_ACCTIME
++    | ATTR_CMN_OWNERID
++    | ATTR_CMN_GRPID
++    | ATTR_CMN_ACCESSMASK
++    | ATTR_CMN_FLAGS
++    | ATTR_CMN_FILEID;
++const STAT_DIR: attrgroup_t = ATTR_DIR_ENTRYCOUNT
++    | ATTR_DIR_MOUNTSTATUS
++    | ATTR_DIR_ALLOCSIZE
++    | ATTR_DIR_IOBLOCKSIZE
++    | ATTR_DIR_DATALENGTH;
++const STAT_FILE: attrgroup_t =
++    ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE | ATTR_FILE_IOBLOCKSIZE | ATTR_FILE_DATALENGTH;
++
++fn mask(fields: &[(attrgroup_t, usize)]) -> attrgroup_t {
++    fields.iter().fold(0, |m, (bit, _)| m | bit)
++}
++
++pub(super) struct BulkEntry {
++    pub name: Box<[u8]>,
++    pub ino: u64,
++    pub type_: u8,
++    /// The host's `lstat` of the entry, or `None` when it has to be looked up by path instead:
++    /// mountpoints and firmlinks (whose listed attributes are those of the covered directory),
++    /// entries that failed, and devices of unknown type.
++    pub attr: Option<bindings::stat64>,
++    /// The file has no extended attributes, so it has no ownership override either.
++    pub no_xattrs: bool,
++}
++
++/// `getattrlistbulk` fills `st_nlink` of a directory from its entry count, which matches `lstat`
++/// only on APFS. Other file systems are listed with readdir.
++pub(super) fn supported(fd: RawFd) -> bool {
++    let mut sfs = MaybeUninit::<libc::statfs>::zeroed();
++    if unsafe { libc::fstatfs(fd, sfs.as_mut_ptr()) } != 0 {
++        return false;
++    }
++    let sfs = unsafe { sfs.assume_init() };
++    let name = unsafe { CStr::from_ptr(sfs.f_fstypename.as_ptr()) };
++    name.to_bytes() == b"apfs"
++}
++
++/// Appends every entry of the directory open at `fd` (read from its current offset) to `entries`.
++/// On error, the entries read so far stay in `entries`.
++pub(super) fn read_dir(fd: RawFd, entries: &mut Vec<BulkEntry>) -> io::Result<()> {
++    let mut attrs = attrlist {
++        bitmapcount: ATTR_BIT_MAP_COUNT,
++        reserved: 0,
++        commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | mask(COMMON),
++        volattr: 0,
++        dirattr: mask(DIR),
++        fileattr: mask(FILE),
++        forkattr: mask(EXT),
++    };
++    // u64 storage keeps each entry 8-byte aligned, as the kernel packs them.
++    let mut buf = vec![0u64; BUF_SIZE / mem::size_of::<u64>()];
++
++    loop {
++        let count = unsafe {
++            libc::getattrlistbulk(
++                fd,
++                (&mut attrs as *mut attrlist).cast(),
++                buf.as_mut_ptr().cast(),
++                BUF_SIZE,
++                u64::from(FSOPT_ATTR_CMN_EXTENDED),
++            )
++        };
++        if count < 0 {
++            let err = io::Error::last_os_error();
++            if err.kind() == io::ErrorKind::Interrupted {
++                continue;
++            }
++            return Err(linux_error(err));
++        }
++        if count == 0 {
++            return Ok(());
++        }
++
++        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), BUF_SIZE) };
++        let mut offset = 0;
++        for _ in 0..count {
++            let len = read_u32(bytes, offset).ok_or_else(eio)? as usize;
++            if len == 0 {
++                return Err(eio());
++            }
++            let record = bytes.get(offset..offset + len).ok_or_else(eio)?;
++            if let Some(entry) = parse(fd, record) {
++                entries.push(entry);
++            }
++            offset += len;
++        }
++    }
++}
++
++fn eio() -> io::Error {
++    linux_error(io::Error::from_raw_os_error(libc::EIO))
++}
++
++fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
++    Some(u32::from_ne_bytes(buf.get(at..at + 4)?.try_into().ok()?))
++}
++
++fn read_u64(buf: &[u8], at: usize) -> Option<u64> {
++    Some(u64::from_ne_bytes(buf.get(at..at + 8)?.try_into().ok()?))
++}
++
++/// The attribute values of one record, by bit, in the order of the group tables.
++struct Group {
++    offsets: [Option<usize>; 16],
++}
++
++impl Group {
++    fn walk(fields: &[(attrgroup_t, usize)], returned: attrgroup_t, pos: &mut usize) -> Self {
++        let mut offsets = [None; 16];
++        for (i, (bit, size)) in fields.iter().enumerate() {
++            if returned & bit != 0 {
++                offsets[i] = Some(*pos);
++                *pos += size;
++            }
++        }
++        Group { offsets }
++    }
++
++    fn at(&self, fields: &[(attrgroup_t, usize)], bit: attrgroup_t) -> Option<usize> {
++        let i = fields.iter().position(|(b, _)| *b == bit)?;
++        self.offsets[i]
++    }
++}
++
++fn parse(dirfd: RawFd, record: &[u8]) -> Option<BulkEntry> {
++    let returned = libc::attribute_set_t {
++        commonattr: read_u32(record, 4)?,
++        volattr: read_u32(record, 8)?,
++        dirattr: read_u32(record, 12)?,
++        fileattr: read_u32(record, 16)?,
++        forkattr: read_u32(record, 20)?,
++    };
++    let mut pos = 4 + mem::size_of::<libc::attribute_set_t>();
++    let mut error = 0;
++    if returned.commonattr & ATTR_CMN_ERROR != 0 {
++        error = read_u32(record, pos)?;
++        pos += 4;
++    }
++
++    let common = Group::walk(COMMON, returned.commonattr, &mut pos);
++    let dir = Group::walk(DIR, returned.dirattr, &mut pos);
++    let file = Group::walk(FILE, returned.fileattr, &mut pos);
++    let ext = Group::walk(EXT, returned.forkattr, &mut pos);
++
++    let c32 = |bit| read_u32(record, common.at(COMMON, bit)?);
++    let c64 = |bit| read_u64(record, common.at(COMMON, bit)?);
++    let time = |bit| {
++        let at = common.at(COMMON, bit)?;
++        Some((
++            read_u64(record, at)? as i64,
++            read_u64(record, at + 8)? as i64,
++        ))
++    };
++
++    let name_at = common.at(COMMON, ATTR_CMN_NAME)?;
++    let name_offset = read_u32(record, name_at)? as i32;
++    let name_len = read_u32(record, name_at + 4)? as usize;
++    let name_start = name_at.checked_add_signed(name_offset as isize)?;
++    let name = record.get(name_start..name_start + name_len)?;
++    let name = name.split(|c| *c == 0).next()?;
++    if name.is_empty() || name == b"." || name == b".." {
++        return None;
++    }
++
++    let objtype = c32(ATTR_CMN_OBJTYPE);
++    let type_ = match objtype {
++        Some(VREG) => libc::DT_REG,
++        Some(VDIR) => libc::DT_DIR,
++        Some(VBLK) => libc::DT_BLK,
++        Some(VCHR) => libc::DT_CHR,
++        Some(VLNK) => libc::DT_LNK,
++        Some(VSOCK) => libc::DT_SOCK,
++        Some(VFIFO) => libc::DT_FIFO,
++        _ => libc::DT_UNKNOWN,
++    };
++    let ino = match c64(ATTR_CMN_FILEID) {
++        Some(ino) => ino,
++        None => fstatat_ino(dirfd, name).unwrap_or(0),
++    };
++    let no_xattrs = ext
++        .at(EXT, ATTR_CMNEXT_EXT_FLAGS)
++        .and_then(|at| read_u64(record, at))
++        .is_some_and(|flags| flags & EF_NO_XATTRS != 0);
++
++    let attr = (|| {
++        if error != 0 || returned.commonattr & STAT_COMMON != STAT_COMMON {
++            return None;
++        }
++        let flags = c32(ATTR_CMN_FLAGS)?;
++        if flags & SF_FIRMLINK != 0 {
++            return None;
++        }
++
++        let mut st: bindings::stat64 = unsafe { mem::zeroed() };
++        st.st_dev = c32(ATTR_CMN_DEVID)? as i32;
++        st.st_ino = ino;
++        st.st_uid = c32(ATTR_CMN_OWNERID)?;
++        st.st_gid = c32(ATTR_CMN_GRPID)?;
++        st.st_flags = flags;
++        (st.st_mtime, st.st_mtime_nsec) = time(ATTR_CMN_MODTIME)?;
++        (st.st_ctime, st.st_ctime_nsec) = time(ATTR_CMN_CHGTIME)?;
++        (st.st_atime, st.st_atime_nsec) = time(ATTR_CMN_ACCTIME)?;
++        let perm = c32(ATTR_CMN_ACCESSMASK)? as u16 & 0o7777;
++
++        let alloc = if objtype == Some(VDIR) {
++            if returned.dirattr & STAT_DIR != STAT_DIR {
++                return None;
++            }
++            let d32 = |bit| read_u32(record, dir.at(DIR, bit)?);
++            let d64 = |bit| read_u64(record, dir.at(DIR, bit)?);
++            if d32(ATTR_DIR_MOUNTSTATUS)? & DIR_MNTSTATUS_MNTPOINT != 0 {
++                return None;
++            }
++            st.st_mode = libc::S_IFDIR | perm;
++            // APFS counts a directory's links as its entries plus "." and "..".
++            st.st_nlink = (u64::from(d32(ATTR_DIR_ENTRYCOUNT)?) + 2).min(u16::MAX.into()) as u16;
++            st.st_blksize = d32(ATTR_DIR_IOBLOCKSIZE)? as i32;
++            st.st_size = d64(ATTR_DIR_DATALENGTH)? as i64;
++            d64(ATTR_DIR_ALLOCSIZE)?
++        } else {
++            if returned.fileattr & STAT_FILE != STAT_FILE {
++                return None;
++            }
++            let f32 = |bit| read_u32(record, file.at(FILE, bit)?);
++            let f64 = |bit| read_u64(record, file.at(FILE, bit)?);
++            let fmt = match objtype? {
++                VREG => libc::S_IFREG,
++                VLNK => libc::S_IFLNK,
++                VSOCK => libc::S_IFSOCK,
++                VFIFO => libc::S_IFIFO,
++                VBLK => libc::S_IFBLK,
++                VCHR => libc::S_IFCHR,
++                _ => return None,
++            };
++            if fmt == libc::S_IFBLK || fmt == libc::S_IFCHR {
++                st.st_rdev = f32(ATTR_FILE_DEVTYPE)? as i32;
++            }
++            st.st_mode = fmt | perm;
++            st.st_nlink = f32(ATTR_FILE_LINKCOUNT)?.min(u16::MAX.into()) as u16;
++            st.st_blksize = f32(ATTR_FILE_IOBLOCKSIZE)? as i32;
++            st.st_size = f64(ATTR_FILE_DATALENGTH)? as i64;
++            f64(ATTR_FILE_ALLOCSIZE)?
++        };
++        st.st_blocks = alloc.div_ceil(512) as i64;
++        Some(st)
++    })();
++
++    Some(BulkEntry {
++        name: name.into(),
++        ino,
++        type_,
++        attr,
++        no_xattrs,
++    })
++}
++
++fn fstatat_ino(dirfd: RawFd, name: &[u8]) -> Option<u64> {
++    let name = CString::new(name).ok()?;
++    let mut st = MaybeUninit::<libc::stat>::zeroed();
++    let res = unsafe {
++        libc::fstatat(
++            dirfd,
++            name.as_ptr(),
++            st.as_mut_ptr(),
++            libc::AT_SYMLINK_NOFOLLOW,
++        )
++    };
++    (res == 0).then(|| unsafe { st.assume_init() }.st_ino)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::fs::{self, File};
++    use std::os::unix::io::AsRawFd;
++    use std::path::Path;
++
++    #[test]
++    fn a_failed_entry_keeps_its_name_without_attributes() {
++        let returned = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME;
++        let mut record = Vec::new();
++        record.extend(40u32.to_ne_bytes());
++        for group in [returned, 0, 0, 0, 0] {
++            record.extend(group.to_ne_bytes());
++        }
++        record.extend((libc::ENOENT as u32).to_ne_bytes());
++        // The name reference sits at offset 28 and points at offset 36.
++        record.extend(8i32.to_ne_bytes());
++        record.extend(5u32.to_ne_bytes());
++        record.extend(b"gone\0\0\0\0");
++
++        let dir = File::open(std::env::temp_dir()).unwrap();
++        let entry = parse(dir.as_raw_fd(), &record).unwrap();
++        assert_eq!(&*entry.name, b"gone");
++        assert_eq!(entry.type_, libc::DT_UNKNOWN);
++        assert_eq!(entry.ino, 0);
++        assert!(entry.attr.is_none());
++        assert!(!entry.no_xattrs);
++    }
++
++    fn compare_tree(dir: &Path, checked: &mut usize, fallbacks: &mut usize) {
++        let fd = File::open(dir).unwrap();
++        let mut entries = Vec::new();
++        read_dir(fd.as_raw_fd(), &mut entries).unwrap();
++        for e in entries {
++            let path = dir.join(std::ffi::OsStr::from_bytes(&e.name));
++            let host = fs::symlink_metadata(&path).unwrap();
++            let Some(st) = e.attr else {
++                *fallbacks += 1;
++                continue;
++            };
++            let got = (
++                st.st_dev as u64,
++                st.st_ino,
++                u32::from(st.st_mode),
++                u64::from(st.st_nlink),
++                st.st_uid,
++                st.st_gid,
++                st.st_size as u64,
++                st.st_blocks as u64,
++                st.st_blksize as u64,
++                (st.st_mtime, st.st_mtime_nsec),
++                (st.st_ctime, st.st_ctime_nsec),
++            );
++            let want = (
++                host.dev(),
++                host.ino(),
++                host.mode(),
++                host.nlink(),
++                host.uid(),
++                host.gid(),
++                host.size(),
++                host.blocks(),
++                host.blksize(),
++                (host.mtime(), host.mtime_nsec()),
++                (host.ctime(), host.ctime_nsec()),
++            );
++            assert_eq!(got, want, "{}", path.display());
++            *checked += 1;
++            if host.is_dir() {
++                compare_tree(&path, checked, fallbacks);
++            }
++        }
++    }
++
++    use std::os::unix::ffi::OsStrExt;
++    use std::os::unix::fs::MetadataExt;
++
++    /// KAT_BULK_TREE=<dir> cargo test -- --ignored compares every entry under <dir> with lstat.
++    #[test]
++    #[ignore]
++    fn bulk_attributes_match_lstat_over_a_tree() {
++        let root = std::env::var("KAT_BULK_TREE").expect("KAT_BULK_TREE");
++        let (mut checked, mut fallbacks) = (0, 0);
++        compare_tree(Path::new(&root), &mut checked, &mut fallbacks);
++        eprintln!("{root}: {checked} entries match lstat, {fallbacks} fall back to lookup");
++    }
++}
+diff --git a/src/devices/src/virtio/fs/macos/mod.rs b/src/devices/src/virtio/fs/macos/mod.rs
+index b8edbc7f..0305895f 100644
+--- a/src/devices/src/virtio/fs/macos/mod.rs
++++ b/src/devices/src/virtio/fs/macos/mod.rs
+@@ -1,2 +1,3 @@
++mod attrlist;
+ pub mod fs_utils;
+ pub mod passthrough;
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index b00adf73..b98c4756 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -5,6 +5,7 @@
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::collections::btree_map;
++use std::env;
+ use std::ffi::{CStr, CString};
+ use std::fs::File;
+ use std::io;
+@@ -33,6 +34,7 @@ use super::super::fuse;
+ use super::super::inode_alloc::InodeAllocator;
+ use super::super::multikey::MultikeyBTreeMap;
+ pub use super::super::{CachePolicy, PermissionSemantics};
++use super::attrlist;
+ 
+ const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+ const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
+@@ -70,6 +72,9 @@ struct CachedDirEntry {
+     ino: bindings::ino64_t,
+     name: Box<[u8]>,
+     type_: u8,
++    // Host attributes from getattrlistbulk, before the ownership policy applies.
++    attr: Option<bindings::stat64>,
++    no_xattrs: bool,
+ }
+ 
+ struct DirStream {
+@@ -85,16 +90,39 @@ impl DirStream {
+         }
+     }
+ 
+-    fn get_entry<'a>(&'a self, offset: u64) -> Option<DirEntry<'a>> {
+-        self.entries.get(offset as usize).map(|e| DirEntry {
+-            ino: e.ino,
+-            // offset points to the next entry, not the current one
+-            offset: offset + 1,
+-            type_: u32::from(e.type_),
+-            name: &e.name,
++    fn get_entry<'a>(&'a self, offset: u64) -> Option<(DirEntry<'a>, &'a CachedDirEntry)> {
++        self.entries.get(offset as usize).map(|e| {
++            let entry = DirEntry {
++                ino: e.ino,
++                // offset points to the next entry, not the current one
++                offset: offset + 1,
++                type_: u32::from(e.type_),
++                name: &e.name,
++            };
++            (entry, e)
+         })
+     }
+ 
++    // Reads the whole directory from its start. getattrlistbulk cannot seek, so the stream keeps
++    // every entry and serves offsets as indexes into them.
++    fn fill(&mut self, fd: RawFd, bulk: bool) -> io::Result<()> {
++        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
++        if !(bulk && attrlist::supported(fd)) {
++            return self.fill_from_fd(fd);
++        }
++        let mut entries = Vec::new();
++        let res = attrlist::read_dir(fd, &mut entries);
++        self.entries
++            .extend(entries.into_iter().map(|e| CachedDirEntry {
++                ino: e.ino,
++                name: e.name,
++                type_: e.type_,
++                attr: e.attr,
++                no_xattrs: e.no_xattrs,
++            }));
++        res
++    }
++
+     fn fill_from_fd(&mut self, fd: RawFd) -> io::Result<()> {
+         // fdopendir() takes ownership of the fd, so we need to obtain a new one
+         // to be donated.
+@@ -146,7 +174,13 @@ impl DirStream {
+             // exact constants (`libc::DT_*`) on macOS, Linux, and FUSE.
+             let type_ = unsafe { (*dentry).d_type };
+ 
+-            self.entries.push(CachedDirEntry { ino, name, type_ });
++            self.entries.push(CachedDirEntry {
++                ino,
++                name,
++                type_,
++                attr: None,
++                no_xattrs: false,
++            });
+         }
+ 
+         unsafe { libc::closedir(dir) };
+@@ -633,6 +667,8 @@ pub struct PassthroughFs {
+     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
+     writeback: AtomicBool,
+     announce_submounts: AtomicBool,
++    // KATAMARAN_FS_BULK=0 lists directories with readdir and one lstat per entry instead.
++    bulk_readdir: bool,
+     cfg: Config,
+ }
+ 
+@@ -665,6 +701,7 @@ impl PassthroughFs {
+ 
+             writeback: AtomicBool::new(false),
+             announce_submounts: AtomicBool::new(false),
++            bulk_readdir: env::var("KATAMARAN_FS_BULK").as_deref() != Ok("0"),
+             cfg,
+         })
+     }
+@@ -766,7 +803,7 @@ impl PassthroughFs {
+         mut add_entry: F,
+     ) -> io::Result<()>
+     where
+-        F: FnMut(DirEntry) -> io::Result<usize>,
++        F: FnMut(DirEntry, &CachedDirEntry) -> io::Result<usize>,
+     {
+         if size == 0 {
+             return Ok(());
+@@ -787,15 +824,14 @@ impl PassthroughFs {
+         // stream or a stream that has been rewound. If that's the case, make sure
+         // the cache will be refreshed.
+         if offset == 0 && ds.ready {
+-            let fd = data.file.write().unwrap().as_raw_fd();
+-            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+             ds.entries.clear();
+             ds.ready = false;
+         }
+ 
+         if !ds.ready {
+             // Fill the cache on first call
+-            if let Err(e) = ds.fill_from_fd(data.file.write().unwrap().as_raw_fd()) {
++            let fd = data.file.write().unwrap().as_raw_fd();
++            if let Err(e) = ds.fill(fd, self.bulk_readdir) {
+                 if ds.entries.is_empty() {
+                     return Err(e);
+                 }
+@@ -807,11 +843,11 @@ impl PassthroughFs {
+             ds.ready = true;
+         }
+ 
+-        while let Some(entry) = ds.get_entry(offset) {
++        while let Some((entry, cached)) = ds.get_entry(offset) {
+             offset += 1;
+ 
+             let name = entry.name;
+-            match add_entry(entry) {
++            match add_entry(entry, cached) {
+                 Ok(size) => {
+                     if size == 0 {
+                         break;
+@@ -831,6 +867,91 @@ impl PassthroughFs {
+         Ok(())
+     }
+ 
++    /// Takes a lookup reference on the inode that `st` describes, adding it to the inode table
++    /// when it is new, and returns its entry.
++    fn register_entry(&self, parent_data: &InodeData, st: bindings::stat64) -> Entry {
++        let mut attr_flags: u32 = 0;
++
++        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
++            && self.announce_submounts.load(Ordering::Relaxed)
++            && (st.st_dev != parent_data.dev)
++        {
++            attr_flags |= fuse::ATTR_SUBMOUNT;
++        }
++
++        let altkey = InodeAltKey {
++            ino: st.st_ino,
++            dev: st.st_dev,
++        };
++        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
++
++        let inode = if let Some(data) = data {
++            // Matches with the release store in `forget`.
++            data.refcount.fetch_add(1, Ordering::Acquire);
++            data.inode
++        } else {
++            // There is a possible race here where 2 threads end up adding the same file
++            // into the inode list.  However, since each of those will get a unique Inode
++            // value and unique file descriptors this shouldn't be that much of a problem.
++            let inode = self.inode_alloc.next();
++            self.inodes.write().unwrap().insert(
++                inode,
++                InodeAltKey {
++                    ino: st.st_ino,
++                    dev: st.st_dev,
++                },
++                Arc::new(InodeData {
++                    inode,
++                    ino: st.st_ino,
++                    dev: st.st_dev,
++                    refcount: AtomicU64::new(1),
++                    unlinked_fd: AtomicI64::new(-1),
++                    read_only_file: Mutex::new(Weak::new()),
++                }),
++            );
++
++            inode
++        };
++
++        Entry {
++            inode,
++            generation: 0,
++            attr: st,
++            attr_flags,
++            attr_timeout: self.cfg.attr_timeout,
++            entry_timeout: self.cfg.entry_timeout,
++        }
++    }
++
++    /// The entry for a listed name whose host attributes came from getattrlistbulk, with the same
++    /// ownership `lookup` would report.
++    fn bulk_entry(
++        &self,
++        ctx: &Context,
++        parent_data: &InodeData,
++        name: &CStr,
++        mut st: bindings::stat64,
++        no_xattrs: bool,
++    ) -> io::Result<Entry> {
++        match self.cfg.ownership() {
++            Ownership::Xattr if no_xattrs => {}
++            Ownership::Xattr => {
++                let c_path = self.name_to_path(parent_data.inode, name)?;
++                let (uid, gid, mode) = get_xattr_lstat(&c_path, st)?;
++                stat_xattr_common(&mut st, uid, gid, mode)?;
++            }
++            Ownership::Requester => {
++                st.st_uid = ctx.uid;
++                st.st_gid = ctx.gid;
++            }
++            Ownership::Fixed(uid, gid) => {
++                st.st_uid = uid;
++                st.st_gid = gid;
++            }
++        }
++        Ok(self.register_entry(parent_data, st))
++    }
++
+     fn do_open(
+         &self,
+         ctx: &Context,
+@@ -1447,57 +1568,7 @@ impl FileSystem for PassthroughFs {
+             c_path.to_str().unwrap()
+         );
+ 
+-        let mut attr_flags: u32 = 0;
+-
+-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+-            && self.announce_submounts.load(Ordering::Relaxed)
+-            && (st.st_dev != parent_data.dev)
+-        {
+-            attr_flags |= fuse::ATTR_SUBMOUNT;
+-        }
+-
+-        let altkey = InodeAltKey {
+-            ino: st.st_ino,
+-            dev: st.st_dev,
+-        };
+-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+-
+-        let inode = if let Some(data) = data {
+-            // Matches with the release store in `forget`.
+-            data.refcount.fetch_add(1, Ordering::Acquire);
+-            data.inode
+-        } else {
+-            // There is a possible race here where 2 threads end up adding the same file
+-            // into the inode list.  However, since each of those will get a unique Inode
+-            // value and unique file descriptors this shouldn't be that much of a problem.
+-            let inode = self.inode_alloc.next();
+-            self.inodes.write().unwrap().insert(
+-                inode,
+-                InodeAltKey {
+-                    ino: st.st_ino,
+-                    dev: st.st_dev,
+-                },
+-                Arc::new(InodeData {
+-                    inode,
+-                    ino: st.st_ino,
+-                    dev: st.st_dev,
+-                    refcount: AtomicU64::new(1),
+-                    unlinked_fd: AtomicI64::new(-1),
+-                    read_only_file: Mutex::new(Weak::new()),
+-                }),
+-            );
+-
+-            inode
+-        };
+-
+-        Ok(Entry {
+-            inode,
+-            generation: 0,
+-            attr: st,
+-            attr_flags,
+-            attr_timeout: self.cfg.attr_timeout,
+-            entry_timeout: self.cfg.entry_timeout,
+-        })
++        Ok(self.register_entry(&parent_data, st))
+     }
+ 
+     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+@@ -1586,12 +1657,14 @@ impl FileSystem for PassthroughFs {
+         handle: Handle,
+         size: u32,
+         offset: u64,
+-        add_entry: F,
++        mut add_entry: F,
+     ) -> io::Result<()>
+     where
+         F: FnMut(DirEntry) -> io::Result<usize>,
+     {
+-        self.do_readdir(inode, handle, size, offset, add_entry)
++        self.do_readdir(inode, handle, size, offset, |dir_entry, _| {
++            add_entry(dir_entry)
++        })
+     }
+ 
+     fn readdirplus<F>(
+@@ -1606,10 +1679,21 @@ impl FileSystem for PassthroughFs {
+     where
+         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+     {
+-        self.do_readdir(inode, handle, size, offset, |dir_entry| {
++        let parent_data = self
++            .inodes
++            .read()
++            .unwrap()
++            .get(&inode)
++            .cloned()
++            .ok_or_else(ebadf)?;
++        self.do_readdir(inode, handle, size, offset, |dir_entry, cached| {
+             // The directory stream keeps each name without a NUL, and without "." and "..".
+             let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+-            let entry = match self.lookup(ctx, inode, &name) {
++            let looked_up = match cached.attr {
++                Some(st) => self.bulk_entry(&ctx, &parent_data, &name, st, cached.no_xattrs),
++                None => self.lookup(ctx, inode, &name),
++            };
++            let entry = match looked_up {
+                 Ok(entry) => entry,
+                 // A name removed since the directory was read still lists, without attributes,
+                 // instead of ending the reply early.
+@@ -3039,4 +3123,334 @@ mod tests {
+ 
+         assert!(shared.upgrade().is_none());
+     }
++
++    struct Listed {
++        name: Vec<u8>,
++        ino: u64,
++        offset: u64,
++        type_: u32,
++        entry: Option<Entry>,
++    }
++
++    fn passthrough_at(root: &Path, bulk: bool, capable: FsOptions) -> PassthroughFs {
++        let cfg = Config {
++            root_dir: root.to_str().unwrap().to_string(),
++            ..Default::default()
++        };
++        let mut fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
++        fs.bulk_readdir = bulk;
++        fs.init(capable).unwrap();
++        fs
++    }
++
++    /// Lists the root directory, taking at most `chunk` entries per request and resuming at the
++    /// offset of the last entry taken, as the guest kernel does.
++    fn list_root(fs: &PassthroughFs, plus: bool, chunk: usize) -> Vec<Listed> {
++        let handle = fs
++            .opendir(CTX, fuse::ROOT_ID, libc::O_RDONLY as u32)
++            .unwrap()
++            .0
++            .unwrap();
++        let mut listed: Vec<Listed> = Vec::new();
++        loop {
++            let offset = listed.last().map_or(0, |l| l.offset);
++            let before = listed.len();
++            let mut take = |d: DirEntry, entry: Option<Entry>| {
++                if listed.len() - before == chunk {
++                    return Ok(0);
++                }
++                listed.push(Listed {
++                    name: d.name.to_vec(),
++                    ino: d.ino,
++                    offset: d.offset,
++                    type_: d.type_,
++                    entry,
++                });
++                Ok(1)
++            };
++            if plus {
++                fs.readdirplus(CTX, fuse::ROOT_ID, handle, 4096, offset, |d, e| {
++                    take(d, Some(e))
++                })
++                .unwrap();
++            } else {
++                fs.readdir(CTX, fuse::ROOT_ID, handle, 4096, offset, |d| take(d, None))
++                    .unwrap();
++            }
++            if listed.len() == before {
++                break;
++            }
++        }
++        fs.releasedir(CTX, fuse::ROOT_ID, 0, handle).unwrap();
++        listed.sort_by(|a, b| a.name.cmp(&b.name));
++        listed
++    }
++
++    fn refcount(fs: &PassthroughFs, inode: Inode) -> u64 {
++        fs.inodes
++            .read()
++            .unwrap()
++            .get(&inode)
++            .unwrap()
++            .refcount
++            .load(Ordering::Relaxed)
++    }
++
++    fn stat_fields(st: &bindings::stat64) -> Vec<(&'static str, i64)> {
++        vec![
++            ("dev", st.st_dev as i64),
++            ("ino", st.st_ino as i64),
++            ("mode", st.st_mode as i64),
++            ("nlink", st.st_nlink as i64),
++            ("uid", st.st_uid as i64),
++            ("gid", st.st_gid as i64),
++            ("rdev", st.st_rdev as i64),
++            ("size", st.st_size),
++            ("blocks", st.st_blocks),
++            ("blksize", st.st_blksize as i64),
++            ("flags", st.st_flags as i64),
++            ("atime", st.st_atime),
++            ("atime_nsec", st.st_atime_nsec),
++            ("mtime", st.st_mtime),
++            ("mtime_nsec", st.st_mtime_nsec),
++            ("ctime", st.st_ctime),
++            ("ctime_nsec", st.st_ctime_nsec),
++        ]
++    }
++
++    fn set_xattr(path: &Path, name: &str, value: &[u8]) {
++        let path = CString::new(path.to_str().unwrap()).unwrap();
++        let name = CString::new(name).unwrap();
++        let res = unsafe {
++            libc::setxattr(
++                path.as_ptr(),
++                name.as_ptr(),
++                value.as_ptr().cast(),
++                value.len(),
++                0,
++                libc::XATTR_NOFOLLOW,
++            )
++        };
++        assert_eq!(res, 0, "setxattr {name:?}: {}", io::Error::last_os_error());
++    }
++
++    /// A directory with one of each kind of entry the guest can meet on a share.
++    fn mixed_tree(name: &str) -> PathBuf {
++        use std::os::unix::fs::{PermissionsExt, symlink};
++
++        let dir =
++            std::env::temp_dir().join(format!("libkrun-passthrough-{}-{name}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(dir.join("sub/deeper")).unwrap();
++        fs::create_dir(dir.join("emptydir")).unwrap();
++        fs::write(dir.join("sub/inner"), b"x").unwrap();
++        fs::write(dir.join("regular"), vec![7u8; 100_000]).unwrap();
++        fs::write(dir.join("empty"), b"").unwrap();
++        fs::hard_link(dir.join("regular"), dir.join("hardlink")).unwrap();
++        symlink("regular", dir.join("link")).unwrap();
++        symlink("missing", dir.join("dangling")).unwrap();
++        let fifo = CString::new(dir.join("fifo").to_str().unwrap()).unwrap();
++        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
++        std::mem::forget(UnixListener::bind(dir.join("socket")).unwrap());
++        fs::write(dir.join("setuid"), b"#!/bin/sh\n").unwrap();
++        fs::set_permissions(dir.join("setuid"), fs::Permissions::from_mode(0o4751)).unwrap();
++        fs::write(dir.join("with-xattr"), b"x").unwrap();
++        set_xattr(&dir.join("with-xattr"), "user.test", b"value");
++        fs::write(dir.join("resource-fork"), b"data").unwrap();
++        set_xattr(
++            &dir.join("resource-fork"),
++            "com.apple.ResourceFork",
++            &[1u8; 20_000],
++        );
++        fs::write(dir.join("overridden"), b"x").unwrap();
++        set_xattr(
++            &dir.join("overridden"),
++            "user.containers.override_stat",
++            b"1000:1001:0100600",
++        );
++        fs::write(dir.join("\u{10d}\u{107}\u{17e} name with spaces"), b"x").unwrap();
++        dir
++    }
++
++    #[test]
++    fn bulk_attributes_match_lstat() {
++        let dir = mixed_tree("bulk-lstat");
++        let fd = File::open(&dir).unwrap();
++        assert!(attrlist::supported(fd.as_raw_fd()));
++        let mut entries = Vec::new();
++        attrlist::read_dir(fd.as_raw_fd(), &mut entries).unwrap();
++
++        let mut names: Vec<_> = entries.iter().map(|e| e.name.to_vec()).collect();
++        names.sort();
++        let mut expected: Vec<_> = fs::read_dir(&dir)
++            .unwrap()
++            .map(|e| e.unwrap().file_name().into_encoded_bytes())
++            .collect();
++        expected.sort();
++        assert_eq!(names, expected);
++
++        for e in &entries {
++            let path =
++                CString::new([dir.as_os_str().as_encoded_bytes(), b"/", &e.name].concat()).unwrap();
++            let host = lstat(&CTX, Ownership::Xattr, &path, true).unwrap();
++            let name = String::from_utf8_lossy(&e.name);
++            let attr = e.attr.unwrap_or_else(|| panic!("{name}: no attributes"));
++            assert_eq!(stat_fields(&attr), stat_fields(&host), "{name}");
++            assert_eq!(e.ino, host.st_ino, "{name}");
++            let dt = match host.st_mode & libc::S_IFMT {
++                libc::S_IFREG => libc::DT_REG,
++                libc::S_IFDIR => libc::DT_DIR,
++                libc::S_IFLNK => libc::DT_LNK,
++                libc::S_IFIFO => libc::DT_FIFO,
++                libc::S_IFSOCK => libc::DT_SOCK,
++                _ => unreachable!(),
++            };
++            assert_eq!(e.type_, dt, "{name}");
++            // EF_NO_XATTRS may be missing (hard links never carry it), but it is never wrong.
++            let xattrs_len =
++                unsafe { libc::listxattr(path.as_ptr(), null_mut(), 0, libc::XATTR_NOFOLLOW) };
++            if e.no_xattrs {
++                assert_eq!(xattrs_len, 0, "{name}");
++            }
++            if ["with-xattr", "resource-fork", "overridden"].contains(&&*name) {
++                assert!(!e.no_xattrs, "{name}");
++            }
++        }
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn bulk_and_legacy_listings_match() {
++        let dir = mixed_tree("bulk-legacy");
++        for plus in [false, true] {
++            let bulk_fs = passthrough_at(&dir, true, FsOptions::empty());
++            let legacy_fs = passthrough_at(&dir, false, FsOptions::empty());
++            let bulk = list_root(&bulk_fs, plus, usize::MAX);
++            let legacy = list_root(&legacy_fs, plus, usize::MAX);
++            assert_eq!(bulk.len(), legacy.len());
++            assert_eq!(bulk.len(), 14);
++
++            for (b, l) in bulk.iter().zip(&legacy) {
++                let name = String::from_utf8_lossy(&b.name);
++                assert_eq!(b.name, l.name);
++                assert_eq!((b.ino, b.type_), (l.ino, l.type_), "{name}");
++                let (Some(be), Some(le)) = (&b.entry, &l.entry) else {
++                    continue;
++                };
++                assert_ne!(be.inode, 0, "{name}");
++                assert_eq!(stat_fields(&be.attr), stat_fields(&le.attr), "{name}");
++                assert_eq!(be.attr_flags, le.attr_flags, "{name}");
++                assert_eq!(be.attr_timeout, le.attr_timeout, "{name}");
++                assert_eq!(be.entry_timeout, le.entry_timeout, "{name}");
++                if name == "overridden" {
++                    assert_eq!((be.attr.st_uid, be.attr.st_gid), (1000, 1001));
++                    assert_eq!(be.attr.st_mode, libc::S_IFREG | 0o600);
++                }
++
++                // Each listed name took one lookup reference; a lookup finds the same inode.
++                let names = bulk
++                    .iter()
++                    .filter(|o| o.entry.as_ref().unwrap().inode == be.inode)
++                    .count() as u64;
++                assert_eq!(refcount(&bulk_fs, be.inode), names, "{name}");
++                assert_eq!(refcount(&legacy_fs, le.inode), names, "{name}");
++                let c_name = CString::new(b.name.clone()).unwrap();
++                let looked_up = bulk_fs.lookup(CTX, fuse::ROOT_ID, &c_name).unwrap();
++                assert_eq!(looked_up.inode, be.inode, "{name}");
++                assert_eq!(refcount(&bulk_fs, be.inode), names + 1, "{name}");
++                bulk_fs.forget(CTX, be.inode, 1);
++            }
++
++            // Hard links share one inode.
++            let inode_of = |name: &[u8]| {
++                bulk.iter()
++                    .find(|l| l.name == name)
++                    .unwrap()
++                    .entry
++                    .as_ref()
++                    .map(|e| e.inode)
++            };
++            assert_eq!(inode_of(b"regular"), inode_of(b"hardlink"));
++        }
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn bulk_ownership_follows_the_permission_semantics() {
++        let dir = mixed_tree("bulk-owner");
++        let fixed = |bulk| {
++            let cfg = Config {
++                root_dir: dir.to_str().unwrap().to_string(),
++                semantics: PermissionSemantics::LinuxSimplifiedFixedOwner,
++                fixed_owner: Some((0, 0)),
++                ..Default::default()
++            };
++            let mut fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
++            fs.bulk_readdir = bulk;
++            fs.init(FsOptions::empty()).unwrap();
++            list_root(&fs, true, usize::MAX)
++        };
++        let (bulk, legacy) = (fixed(true), fixed(false));
++        for (b, l) in bulk.iter().zip(&legacy) {
++            let (be, le) = (b.entry.as_ref().unwrap(), l.entry.as_ref().unwrap());
++            assert_eq!((be.attr.st_uid, be.attr.st_gid), (0, 0));
++            assert_eq!(stat_fields(&be.attr), stat_fields(&le.attr));
++        }
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn bulk_listing_resumes_at_each_offset_and_refreshes_at_zero() {
++        let dir = std::env::temp_dir().join(format!(
++            "libkrun-passthrough-{}-bulk-large",
++            std::process::id()
++        ));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(&dir).unwrap();
++        // Enough entries for several 16 KiB getattrlistbulk batches.
++        for i in 0..3000 {
++            fs::write(dir.join(format!("file-with-a-long-name-{i:05}")), b"").unwrap();
++        }
++        let fs = passthrough_at(&dir, true, FsOptions::empty());
++
++        let listed = list_root(&fs, true, 7);
++        assert_eq!(listed.len(), 3000);
++        let mut offsets: Vec<_> = listed.iter().map(|l| l.offset).collect();
++        offsets.sort();
++        assert_eq!(offsets, (1..=3000).collect::<Vec<_>>());
++        assert!(listed.iter().all(|l| l.entry.as_ref().unwrap().inode != 0));
++        assert!(listed.windows(2).all(|w| w[0].name != w[1].name));
++
++        fs::write(dir.join("added"), b"").unwrap();
++        let plain = list_root(&fs, false, 100);
++        assert_eq!(plain.len(), 3001);
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn mountpoints_and_firmlinks_list_like_lookup() {
++        for root in ["/", "/System/Volumes"] {
++            let bulk_fs = passthrough_at(Path::new(root), true, FsOptions::SUBMOUNTS);
++            let legacy_fs = passthrough_at(Path::new(root), false, FsOptions::SUBMOUNTS);
++            let bulk = list_root(&bulk_fs, true, usize::MAX);
++            let legacy = list_root(&legacy_fs, true, usize::MAX);
++            assert_eq!(
++                bulk.iter().map(|l| &l.name).collect::<Vec<_>>(),
++                legacy.iter().map(|l| &l.name).collect::<Vec<_>>()
++            );
++            let mut submounts = 0;
++            for (b, l) in bulk.iter().zip(&legacy) {
++                let name = String::from_utf8_lossy(&b.name);
++                let (be, le) = (b.entry.as_ref().unwrap(), l.entry.as_ref().unwrap());
++                let id = |e: &Entry| (e.attr.st_dev, e.attr.st_ino, e.attr.st_mode, e.attr_flags);
++                assert_eq!(id(be), id(le), "{root} {name}");
++                if be.attr_flags & fuse::ATTR_SUBMOUNT != 0 {
++                    submounts += 1;
++                }
++            }
++            if root == "/System/Volumes" {
++                assert!(submounts > 0);
++            }
++        }
++    }
+ }

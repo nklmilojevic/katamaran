@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 15:18:31 +0100
+Subject: [PATCH 4/6] tap: write frames from the stack on a queue
+
+Writing each frame inline makes the TCP sender wait for the socket, so
+producing the next frame and sending this one never overlap. Queue up to
+128 frames for a writer goroutine; a full queue still pushes back.
+---
+ pkg/tap/switch.go       | 12 +++++---
+ pkg/tap/txqueue.go      | 30 +++++++++++++++++++
+ pkg/tap/txqueue_test.go | 64 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 102 insertions(+), 4 deletions(-)
+ create mode 100644 pkg/tap/txqueue.go
+ create mode 100644 pkg/tap/txqueue_test.go
+
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index 96eee3c..17133e6 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -49,17 +49,23 @@ type Switch struct {
+ 
+ 	writeLock sync.Mutex
+ 
++	// Frames from the stack, written to the VMs by txLoop.
++	txq chan *stack.PacketBuffer
++
+ 	gateway VirtualDevice
+ 
+ 	notificationSender *notification.NotificationSender
+ }
+ 
+ func NewSwitch(debug bool) *Switch {
+-	return &Switch{
++	s := &Switch{
+ 		debug: debug,
+ 		conns: make(map[int]protocolConn),
+ 		cam:   make(map[tcpip.LinkAddress]int),
++		txq:   make(chan *stack.PacketBuffer, txQueueLen),
+ 	}
++	go s.txLoop()
++	return s
+ }
+ 
+ func (e *Switch) CAM() map[string]int {
+@@ -77,9 +83,7 @@ func (e *Switch) Connect(ep VirtualDevice) {
+ }
+ 
+ func (e *Switch) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+-	if err := e.tx(pkt); err != nil {
+-		log.Error(err)
+-	}
++	e.enqueue(pkt)
+ }
+ 
+ func (e *Switch) Accept(ctx context.Context, rawConn net.Conn, protocol types.Protocol) error {
+diff --git a/pkg/tap/txqueue.go b/pkg/tap/txqueue.go
+new file mode 100644
+index 0000000..e0f6390
+--- /dev/null
++++ b/pkg/tap/txqueue.go
+@@ -0,0 +1,30 @@
++package tap
++
++import (
++	log "github.com/sirupsen/logrus"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++// txQueueLen bounds the frames queued between the stack and the socket: 128
++// frames of 64 KiB are 8 MiB, about 2 ms at full speed.
++const txQueueLen = 128
++
++// enqueue hands a frame from the stack to txLoop. Writing it inline would
++// make the goroutine that produced it (a TCP sender, or the reader of guest
++// frames answering one) wait for the socket write, so producing the next
++// frame and sending this one could never overlap. A full queue blocks, which
++// pushes back on the stack as a blocking write did.
++func (e *Switch) enqueue(pkt *stack.PacketBuffer) {
++	pkt.IncRef()
++	e.txq <- pkt
++}
++
++// txLoop writes queued frames in order.
++func (e *Switch) txLoop() {
++	for pkt := range e.txq {
++		if err := e.tx(pkt); err != nil {
++			log.Error(err)
++		}
++		pkt.DecRef()
++	}
++}
+diff --git a/pkg/tap/txqueue_test.go b/pkg/tap/txqueue_test.go
+new file mode 100644
+index 0000000..a888804
+--- /dev/null
++++ b/pkg/tap/txqueue_test.go
+@@ -0,0 +1,64 @@
++package tap
++
++import (
++	"bytes"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++var guestMAC = tcpip.LinkAddress("\x5a\x94\xef\xe4\x0c\xee")
++
++func frame(i int) []byte {
++	b := make([]byte, header.EthernetMinimumSize+3)
++	eth := header.Ethernet(b)
++	eth.Encode(&header.EthernetFields{DstAddr: guestMAC, SrcAddr: "\x5a\x94\xef\xe4\x0c\x01", Type: 0x0800})
++	b[header.EthernetMinimumSize] = byte(i)
++	b[header.EthernetMinimumSize+1] = byte(i >> 8)
++	return b
++}
++
++func TestDeliverNetworkPacketQueuesInOrder(t *testing.T) {
++	sw := NewSwitch(false)
++	vm, peer := net.Pipe()
++	defer vm.Close()
++	defer peer.Close()
++	id, _ := sw.connect(protocolConn{Conn: vm, protocolImpl: protocolImplementation(types.VfkitProtocol)})
++	sw.cam[guestMAC] = id
++
++	// net.Pipe writes block until read, so delivering does not wait for
++	// the socket only if frames are queued.
++	n := txQueueLen / 2
++	delivered := make(chan struct{})
++	go func() {
++		for i := range n {
++			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame(i))})
++			sw.DeliverNetworkPacket(0, pkt)
++			pkt.DecRef()
++		}
++		close(delivered)
++	}()
++	select {
++	case <-delivered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("DeliverNetworkPacket waited for the socket")
++	}
++
++	buf := make([]byte, 100)
++	for i := range n {
++		_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
++		k, err := peer.Read(buf)
++		if err != nil {
++			t.Fatalf("frame %d: %v", i, err)
++		}
++		if !bytes.Equal(buf[:k], frame(i)) {
++			t.Fatalf("frame %d out of order or corrupt: % x", i, buf[:k])
++		}
++	}
++}

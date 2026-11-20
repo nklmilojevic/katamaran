@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 16:50:44 +0100
+Subject: [PATCH 07/10] tap: read vfkit frames straight into gVisor buffers
+
+Reading each frame into a scratch slice and copying it into a new
+buffer kept the reading goroutine busy on a fast upload. Read a frame
+into a pooled 64 KiB gVisor view and pass that view to the stack; small
+frames are still copied out, so an ACK does not take (and zero) a fresh
+64 KiB chunk. recvmsg reports truncated datagrams, which are dropped.
+---
+ pkg/tap/rxframe.go      | 113 ++++++++++++++++++++++++++++++++++++++++
+ pkg/tap/rxframe_test.go | 103 ++++++++++++++++++++++++++++++++++++
+ pkg/tap/switch.go       |  49 +++--------------
+ 3 files changed, 224 insertions(+), 41 deletions(-)
+ create mode 100644 pkg/tap/rxframe.go
+ create mode 100644 pkg/tap/rxframe_test.go
+
+diff --git a/pkg/tap/rxframe.go b/pkg/tap/rxframe.go
+new file mode 100644
+index 0000000..1c3acbf
+--- /dev/null
++++ b/pkg/tap/rxframe.go
+@@ -0,0 +1,113 @@
++package tap
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"sync/atomic"
++	"syscall"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"github.com/google/gopacket"
++	"github.com/google/gopacket/layers"
++	log "github.com/sirupsen/logrus"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++// rxViewSize is the receive buffer for one datagram: the largest pooled
++// gVisor chunk, above the largest frame (an MTU of 65520 plus the Ethernet
++// header). Larger datagrams arrive truncated and are dropped.
++const rxViewSize = buffer.MaxChunkSize
++
++// rxCopyBelow is the frame size under which a frame is copied out of the
++// receive view, so the view is read into again. gVisor zeroes a chunk when it
++// hands one out, so taking a fresh 64 KiB view for every ACK would cost more
++// than copying it.
++const rxCopyBelow = 4096
++
++// datagramReader is a datagram socket that reports truncation, as
++// *net.UnixConn does.
++type datagramReader interface {
++	ReadMsgUnix(b, oob []byte) (n, oobn, flags int, addr *net.UnixAddr, err error)
++}
++
++// rxDatagrams reads frames from a datagram socket straight into gVisor
++// buffers: a large frame is passed on in the view it was read into, instead of
++// being read into a scratch slice and copied into a new buffer, which on a
++// fast upload kept the reading goroutine busy copying.
++func (e *Switch) rxDatagrams(ctx context.Context, id int, conn datagramReader) error {
++	view := buffer.NewViewSize(rxViewSize)
++	defer func() { view.Release() }()
++	for ctx.Err() == nil {
++		buf := view.AsSlice()
++		n, _, flags, _, err := conn.ReadMsgUnix(buf, nil)
++		if err != nil {
++			return fmt.Errorf("cannot read size from socket: %w", err)
++		}
++		if flags&syscall.MSG_TRUNC != 0 {
++			log.Warnf("dropping a frame larger than %d bytes", len(buf))
++			continue
++		}
++		frame := buf[:n]
++		if n < rxCopyBelow {
++			e.rxFrame(id, frame, buffer.MakeWithData(frame))
++			continue
++		}
++		view.CapLength(n)
++		e.rxFrame(id, frame, buffer.MakeWithView(view))
++		view = buffer.NewViewSize(rxViewSize)
++	}
++	return nil
++}
++
++// rxFrame switches one frame from a VM. data holds the frame's bytes, which
++// frame also points to, and rxFrame takes it over.
++func (e *Switch) rxFrame(id int, frame []byte, data buffer.Buffer) {
++	if len(frame) < header.EthernetMinimumSize {
++		data.Release()
++		return
++	}
++	if e.debug {
++		packet := gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
++		log.Info(packet.String())
++	}
++	size := len(frame)
++	eth := header.Ethernet(frame)
++	src, dst, typ := eth.SourceAddress(), eth.DestinationAddress(), eth.Type()
++
++	e.camLock.Lock()
++	_, exists := e.cam[src]
++	e.cam[src] = id
++	e.camLock.Unlock()
++
++	if !exists && e.notificationSender != nil {
++		e.notificationSender.Send(types.NotificationMessage{
++			NotificationType: types.ConnectionEstablished,
++			MacAddress:       src.String(),
++		})
++	}
++
++	gateway := e.gateway.LinkAddress()
++	toGateway := dst == gateway || dst == header.EthernetBroadcastAddress
++	if dst != gateway {
++		payload := data
++		if toGateway {
++			payload = data.Clone()
++		}
++		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: payload})
++		if err := e.tx(pkt); err != nil {
++			log.Error(err)
++		}
++		pkt.DecRef()
++	}
++	if toGateway {
++		data.TrimFront(header.EthernetMinimumSize)
++		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: data})
++		e.gateway.DeliverNetworkPacket(typ, pkt)
++		pkt.DecRef()
++	}
++
++	atomic.AddUint64(&e.Received, uint64(size))
++}
+diff --git a/pkg/tap/rxframe_test.go b/pkg/tap/rxframe_test.go
+new file mode 100644
+index 0000000..824b4eb
+--- /dev/null
++++ b/pkg/tap/rxframe_test.go
+@@ -0,0 +1,103 @@
++//go:build !windows
++
++package tap
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"os"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++// rxGatewayMAC is the stack's MAC in these tests.
++var rxGatewayMAC = tcpip.LinkAddress("\x5a\x94\xef\xe4\x0c\x01")
++
++// chanDispatcher passes what the link endpoint delivers to the stack on.
++type chanDispatcher chan []byte
++
++func (d chanDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
++	d <- bytes.Clone(pkt.ToView().AsSlice())
++}
++
++func (d chanDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
++
++func unixgramPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
++	t.Helper()
++	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	conns := make([]*net.UnixConn, 2)
++	for i, fd := range fds {
++		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 1<<17)
++		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1<<20)
++		f := os.NewFile(uintptr(fd), "unixgram")
++		c, err := net.FileConn(f)
++		f.Close()
++		if err != nil {
++			t.Fatal(err)
++		}
++		conns[i] = c.(*net.UnixConn)
++	}
++	t.Cleanup(func() {
++		conns[0].Close()
++		conns[1].Close()
++	})
++	return conns[0], conns[1]
++}
++
++func TestRxDatagramsDeliversFramesAndDropsOversizedOnes(t *testing.T) {
++	le, err := NewLinkEndpoint(false, 65520, rxGatewayMAC.String(), "192.168.127.1", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	stackIn := make(chanDispatcher, 8)
++	le.Attach(stackIn)
++	sw := NewSwitch(false)
++	le.Connect(sw)
++	sw.Connect(le)
++
++	vm, peer := unixgramPair(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan error, 1)
++	go func() {
++		done <- sw.Accept(ctx, vm, types.VfkitProtocol)
++	}()
++
++	toStack := func(size int, fill byte) []byte {
++		b := bytes.Repeat([]byte{fill}, size)
++		header.Ethernet(b).Encode(&header.EthernetFields{SrcAddr: guestMAC, DstAddr: rxGatewayMAC, Type: header.IPv4ProtocolNumber})
++		return b
++	}
++	small := toStack(100, 1)
++	large := toStack(rxCopyBelow+1000, 2)
++	oversized := toStack(buffer.MaxChunkSize+100, 3)
++	last := toStack(60000, 4)
++	for _, f := range [][]byte{small, large, oversized, last} {
++		if _, err := peer.Write(f); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for _, want := range [][]byte{small, large, last} {
++		select {
++		case got := <-stackIn:
++			if !bytes.Equal(got, want[header.EthernetMinimumSize:]) {
++				t.Fatalf("stack got %d bytes starting % x, want %d", len(got), got[:4], len(want)-header.EthernetMinimumSize)
++			}
++		case err := <-done:
++			t.Fatalf("reader stopped: %v", err)
++		case <-time.After(5 * time.Second):
++			t.Fatal("frame not delivered")
++		}
++	}
++}
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index 17133e6..665e9ef 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -13,8 +13,6 @@ import (
+ 
+ 	"github.com/containers/gvisor-tap-vsock/pkg/notification"
+ 	"github.com/containers/gvisor-tap-vsock/pkg/types"
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
+ 	log "github.com/sirupsen/logrus"
+ 	"gvisor.dev/gvisor/pkg/buffer"
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+@@ -239,6 +237,13 @@ func (e *Switch) rx(ctx context.Context, id int, conn protocolConn) error {
+ }
+ 
+ func (e *Switch) rxNonStream(ctx context.Context, id int, conn net.Conn) error {
++	raw := conn
++	if pc, ok := conn.(protocolConn); ok {
++		raw = pc.Conn
++	}
++	if dc, ok := raw.(datagramReader); ok {
++		return e.rxDatagrams(ctx, id, dc)
++	}
+ 	buf := make([]byte, maxStreamPacketSize)
+ loop:
+ 	for {
+@@ -295,45 +300,7 @@ loop:
+ }
+ 
+ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
+-	if e.debug {
+-		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
+-		log.Info(packet.String())
+-	}
+-
+-	eth := header.Ethernet(buf)
+-
+-	e.camLock.Lock()
+-	_, exists := e.cam[eth.SourceAddress()]
+-	e.cam[eth.SourceAddress()] = id
+-	e.camLock.Unlock()
+-
+-	if !exists && e.notificationSender != nil {
+-		e.notificationSender.Send(types.NotificationMessage{
+-			NotificationType: types.ConnectionEstablished,
+-			MacAddress:       eth.SourceAddress().String(),
+-		})
+-	}
+-
+-	if eth.DestinationAddress() != e.gateway.LinkAddress() {
+-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+-			Payload: buffer.MakeWithData(buf),
+-		})
+-		if err := e.tx(pkt); err != nil {
+-			log.Error(err)
+-		}
+-		pkt.DecRef()
+-	}
+-	if eth.DestinationAddress() == e.gateway.LinkAddress() || eth.DestinationAddress() == header.EthernetBroadcastAddress {
+-		data := buffer.MakeWithData(buf)
+-		data.TrimFront(header.EthernetMinimumSize)
+-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+-			Payload: data,
+-		})
+-		e.gateway.DeliverNetworkPacket(eth.Type(), pkt)
+-		pkt.DecRef()
+-	}
+-
+-	atomic.AddUint64(&e.Received, uint64(len(buf)))
++	e.rxFrame(id, buf, buffer.MakeWithData(buf))
+ }
+ 
+ func protocolImplementation(protocol types.Protocol) protocol {

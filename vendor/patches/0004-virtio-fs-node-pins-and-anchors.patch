@@ -1,0 +1,1314 @@
+diff --git a/src/devices/src/virtio/fs/macos/mod.rs b/src/devices/src/virtio/fs/macos/mod.rs
+index 0305895f..fdb1357e 100644
+--- a/src/devices/src/virtio/fs/macos/mod.rs
++++ b/src/devices/src/virtio/fs/macos/mod.rs
+@@ -1,3 +1,4 @@
+ mod attrlist;
+ pub mod fs_utils;
+ pub mod passthrough;
++mod pins;
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index b98c4756..0e1eb25f 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -14,7 +14,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+ use std::os::unix::net::UnixListener;
+ use std::path::Path;
+ use std::ptr::null_mut;
+-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, RwLock, Weak};
+ use std::time::Duration;
+ 
+@@ -35,6 +35,7 @@ use super::super::inode_alloc::InodeAllocator;
+ use super::super::multikey::MultikeyBTreeMap;
+ pub use super::super::{CachePolicy, PermissionSemantics};
+ use super::attrlist;
++use super::pins::{Pin, PinPool, PinSlot};
+ 
+ const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+ const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
+@@ -61,6 +62,39 @@ struct InodeData {
+     // Each guest process that maps a file keeps its own handle open, so the read-only handles of
+     // an inode share one host file instead of holding one descriptor each.
+     read_only_file: Mutex<Weak<RwLock<File>>>,
++    kind: u16,
++    pin: Arc<PinSlot>,
++    // The parent and name this inode was last found by. Opens try it before the /.vol path and
++    // check the identity of what they get, since the name may have moved to another file since.
++    anchor: Mutex<Option<(Inode, CString)>>,
++    open_handles: AtomicU32,
++}
++
++impl InodeData {
++    fn new(inode: Inode, st: &bindings::stat64, refcount: u64) -> Self {
++        InodeData {
++            inode,
++            ino: st.st_ino,
++            dev: st.st_dev,
++            refcount: AtomicU64::new(refcount),
++            unlinked_fd: AtomicI64::new(-1),
++            read_only_file: Mutex::new(Weak::new()),
++            kind: st.st_mode & libc::S_IFMT,
++            pin: Arc::default(),
++            anchor: Mutex::new(None),
++            open_handles: AtomicU32::new(0),
++        }
++    }
++
++    fn set_anchor(&self, parent: Inode, name: &CStr) {
++        let mut anchor = self.anchor.lock().unwrap();
++        if anchor
++            .as_ref()
++            .is_none_or(|(p, n)| *p != parent || n.as_c_str() != name)
++        {
++            *anchor = Some((parent, name.to_owned()));
++        }
++    }
+ }
+ 
+ enum InodeHandle {
+@@ -190,10 +224,29 @@ impl DirStream {
+ 
+ struct HandleData {
+     inode: Inode,
++    node: Arc<InodeData>,
+     file: Arc<RwLock<File>>,
+     dirstream: Mutex<DirStream>,
+ }
+ 
++impl HandleData {
++    fn new(node: Arc<InodeData>, file: Arc<RwLock<File>>) -> Self {
++        node.open_handles.fetch_add(1, Ordering::AcqRel);
++        HandleData {
++            inode: node.inode,
++            node,
++            file,
++            dirstream: Mutex::new(DirStream::new()),
++        }
++    }
++}
++
++impl Drop for HandleData {
++    fn drop(&mut self) {
++        self.node.open_handles.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
+ fn ebadf() -> io::Error {
+     linux_error(io::Error::from_raw_os_error(libc::EBADF))
+ }
+@@ -538,6 +591,39 @@ fn lstat(
+     }
+ }
+ 
++fn set_owner(ctx: &Context, ownership: Ownership, st: &mut bindings::stat64) {
++    match ownership {
++        Ownership::Xattr => {}
++        Ownership::Requester => {
++            st.st_uid = ctx.uid;
++            st.st_gid = ctx.gid;
++        }
++        Ownership::Fixed(uid, gid) => {
++            st.st_uid = uid;
++            st.st_gid = gid;
++        }
++    }
++}
++
++/// A directory descriptor to resolve names in: the directory's pin, or one opened for the call.
++enum DirFd {
++    Pinned(Arc<Pin>),
++    Opened(File),
++}
++
++impl DirFd {
++    fn fd(&self) -> RawFd {
++        match self {
++            DirFd::Pinned(pin) => pin.fd(),
++            DirFd::Opened(file) => file.as_raw_fd(),
++        }
++    }
++}
++
++fn is_fd_exhaustion(err: &io::Error) -> bool {
++    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
++}
++
+ fn istat(
+     ctx: &Context,
+     ownership: Ownership,
+@@ -669,6 +755,7 @@ pub struct PassthroughFs {
+     announce_submounts: AtomicBool,
+     // KATAMARAN_FS_BULK=0 lists directories with readdir and one lstat per entry instead.
+     bulk_readdir: bool,
++    pins: Arc<PinPool>,
+     cfg: Config,
+ }
+ 
+@@ -702,10 +789,168 @@ impl PassthroughFs {
+             writeback: AtomicBool::new(false),
+             announce_submounts: AtomicBool::new(false),
+             bulk_readdir: env::var("KATAMARAN_FS_BULK").as_deref() != Ok("0"),
++            pins: PinPool::new(),
+             cfg,
+         })
+     }
+ 
++    fn node(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
++        self.inodes
++            .read()
++            .unwrap()
++            .get(&inode)
++            .cloned()
++            .ok_or_else(ebadf)
++    }
++
++    /// The pin of a directory that names are being resolved in, once it is used often enough.
++    fn parent_pin(&self, data: &InodeData) -> Option<Arc<Pin>> {
++        if data.kind != libc::S_IFDIR || data.unlinked_fd.load(Ordering::Acquire) >= 0 {
++            return None;
++        }
++        self.pins
++            .parent_pin(&data.pin, data.inode, data.dev, data.ino)
++    }
++
++    fn dir_fd(&self, data: &InodeData) -> io::Result<DirFd> {
++        if let Some(pin) = self.parent_pin(data) {
++            return Ok(DirFd::Pinned(pin));
++        }
++        let fd = match self.inode_to_handle(data.inode, true)? {
++            InodeHandle::Path(c_path) => unsafe {
++                libc::open(c_path.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC)
++            },
++            InodeHandle::Fd(fd) => unsafe { libc::dup(fd) },
++        };
++        if fd < 0 {
++            return Err(linux_error(io::Error::last_os_error()));
++        }
++        Ok(DirFd::Opened(unsafe { File::from_raw_fd(fd) }))
++    }
++
++    fn stat_child(
++        &self,
++        ctx: &Context,
++        parent_data: &InodeData,
++        name: &CStr,
++    ) -> io::Result<bindings::stat64> {
++        let ownership = self.cfg.ownership();
++        if !matches!(ownership, Ownership::Xattr)
++            && let Some(pin) = self.parent_pin(parent_data)
++        {
++            let mut st = MaybeUninit::<bindings::stat64>::zeroed();
++            let res = unsafe {
++                libc::fstatat(
++                    pin.fd(),
++                    name.as_ptr(),
++                    st.as_mut_ptr(),
++                    libc::AT_SYMLINK_NOFOLLOW,
++                )
++            };
++            if res < 0 {
++                return Err(linux_error(io::Error::last_os_error()));
++            }
++            let mut st = unsafe { st.assume_init() };
++            set_owner(ctx, ownership, &mut st);
++            return Ok(st);
++        }
++        let c_path = self.name_to_path(parent_data.inode, name)?;
++        lstat(ctx, ownership, &c_path, false)
++    }
++
++    /// Opens the inode relative to a pinned directory instead of by its /.vol path: a directory
++    /// through its own pin, a regular file through its anchor. `None` when that is not possible
++    /// or the anchor now names another file.
++    fn open_pinned(&self, data: &InodeData, flags: i32) -> Option<RawFd> {
++        if data.kind == libc::S_IFDIR {
++            let pin = self.pins.current(&data.pin)?;
++            let fd = unsafe { libc::openat(pin.fd(), c".".as_ptr(), flags) };
++            return (fd >= 0).then_some(fd);
++        }
++        if data.kind != libc::S_IFREG || flags & (libc::O_TRUNC | libc::O_CREAT) != 0 {
++            return None;
++        }
++        let (parent, name) = data.anchor.lock().unwrap().clone()?;
++        let parent_data = self.inodes.read().unwrap().get(&parent).cloned()?;
++        let pin = self.pins.current(&parent_data.pin)?;
++        // Non-blocking, in case the name has become a FIFO since.
++        let fd = unsafe {
++            libc::openat(
++                pin.fd(),
++                name.as_ptr(),
++                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK,
++            )
++        };
++        if fd < 0 {
++            return None;
++        }
++        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
++        let same = unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0 && {
++            let st = unsafe { st.assume_init() };
++            (st.st_dev, st.st_ino) == (data.dev, data.ino)
++        };
++        if !same {
++            unsafe { libc::close(fd) };
++            let mut anchor = data.anchor.lock().unwrap();
++            if anchor
++                .as_ref()
++                .is_some_and(|(p, n)| *p == parent && *n == name)
++            {
++                *anchor = None;
++            }
++            return None;
++        }
++        if flags & libc::O_NONBLOCK == 0 {
++            unsafe {
++                let fl = libc::fcntl(fd, libc::F_GETFL);
++                libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
++            }
++        }
++        Some(fd)
++    }
++
++    /// The descriptor of the inode at `name` in `dir`, kept so the inode stays reachable after
++    /// its last name goes, if the guest has it open. Inodes without open handles are not kept:
++    /// the guest drops them with their name.
++    fn keep_if_open(&self, dir: RawFd, name: &CStr) -> Option<RawFd> {
++        let mut st = MaybeUninit::<bindings::stat64>::zeroed();
++        let res = unsafe {
++            libc::fstatat(
++                dir,
++                name.as_ptr(),
++                st.as_mut_ptr(),
++                libc::AT_SYMLINK_NOFOLLOW,
++            )
++        };
++        if res < 0 {
++            return None;
++        }
++        let st = unsafe { st.assume_init() };
++        let altkey = InodeAltKey {
++            ino: st.st_ino,
++            dev: st.st_dev,
++        };
++        let open = self
++            .inodes
++            .read()
++            .unwrap()
++            .get_alt(&altkey)
++            .is_some_and(|data| data.open_handles.load(Ordering::Acquire) > 0);
++        if !open {
++            return None;
++        }
++        match self.grab_unlinked_fd(dir, name) {
++            Ok(fd) => Some(fd),
++            Err(err) => {
++                warn!(
++                    "Couldn't grab a file descriptor for file \"{}\": {err}",
++                    name.to_string_lossy()
++                );
++                None
++            }
++        }
++    }
++
+     fn inode_to_handle(&self, inode: Inode, supports_fd: bool) -> io::Result<InodeHandle> {
+         debug!("inode_to_handle: inode={inode}");
+         let data = self
+@@ -775,17 +1020,22 @@ impl PassthroughFs {
+             flags &= !libc::O_APPEND;
+         }
+ 
+-        let ihandle = self.inode_to_handle(inode, true)?;
+-        let fd = match ihandle {
+-            InodeHandle::Path(c_path) => unsafe {
+-                libc::open(
+-                    c_path.as_ptr(),
+-                    (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW) & (!libc::O_EXLOCK),
+-                )
+-            },
+-            // Check if we have recently unlinked the inode and kept open a file descriptor to it.
+-            InodeHandle::Fd(fd) => unsafe { libc::dup(fd) },
++        let flags = (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW) & (!libc::O_EXLOCK);
++        let data = self.node(inode)?;
++        let open = || -> io::Result<RawFd> {
++            Ok(match self.inode_to_handle(inode, true)? {
++                // Check if we have recently unlinked the inode and kept open a file descriptor to it.
++                InodeHandle::Fd(fd) => unsafe { libc::dup(fd) },
++                InodeHandle::Path(c_path) => self
++                    .open_pinned(&data, flags)
++                    .unwrap_or_else(|| unsafe { libc::open(c_path.as_ptr(), flags) }),
++            })
+         };
++        let mut fd = open()?;
++        if fd < 0 && is_fd_exhaustion(&io::Error::last_os_error()) {
++            self.pins.relieve();
++            fd = open()?;
++        }
+         if fd < 0 {
+             return Err(linux_error(io::Error::last_os_error()));
+         }
+@@ -869,7 +1119,7 @@ impl PassthroughFs {
+ 
+     /// Takes a lookup reference on the inode that `st` describes, adding it to the inode table
+     /// when it is new, and returns its entry.
+-    fn register_entry(&self, parent_data: &InodeData, st: bindings::stat64) -> Entry {
++    fn register_entry(&self, parent_data: &InodeData, name: &CStr, st: bindings::stat64) -> Entry {
+         let mut attr_flags: u32 = 0;
+ 
+         if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+@@ -883,38 +1133,28 @@ impl PassthroughFs {
+             ino: st.st_ino,
+             dev: st.st_dev,
+         };
+-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+-
+-        let inode = if let Some(data) = data {
++        // The reference is taken under the table lock, so a concurrent `forget` cannot remove
++        // the inode in between, and a new inode is added only after a second check under the
++        // write lock, so two lookups of one file cannot each add (and evict) an inode.
++        let take = |data: &Arc<InodeData>| {
+             // Matches with the release store in `forget`.
+             data.refcount.fetch_add(1, Ordering::Acquire);
+-            data.inode
+-        } else {
+-            // There is a possible race here where 2 threads end up adding the same file
+-            // into the inode list.  However, since each of those will get a unique Inode
+-            // value and unique file descriptors this shouldn't be that much of a problem.
+-            let inode = self.inode_alloc.next();
+-            self.inodes.write().unwrap().insert(
+-                inode,
+-                InodeAltKey {
+-                    ino: st.st_ino,
+-                    dev: st.st_dev,
+-                },
+-                Arc::new(InodeData {
+-                    inode,
+-                    ino: st.st_ino,
+-                    dev: st.st_dev,
+-                    refcount: AtomicU64::new(1),
+-                    unlinked_fd: AtomicI64::new(-1),
+-                    read_only_file: Mutex::new(Weak::new()),
+-                }),
+-            );
+-
+-            inode
++            data.clone()
+         };
++        let found = self.inodes.read().unwrap().get_alt(&altkey).map(take);
++        let data = found.unwrap_or_else(|| {
++            let mut inodes = self.inodes.write().unwrap();
++            if let Some(data) = inodes.get_alt(&altkey) {
++                return take(data);
++            }
++            let data = Arc::new(InodeData::new(self.inode_alloc.next(), &st, 1));
++            inodes.insert(data.inode, altkey, data.clone());
++            data
++        });
++        data.set_anchor(parent_data.inode, name);
+ 
+         Entry {
+-            inode,
++            inode: data.inode,
+             generation: 0,
+             attr: st,
+             attr_flags,
+@@ -940,16 +1180,9 @@ impl PassthroughFs {
+                 let (uid, gid, mode) = get_xattr_lstat(&c_path, st)?;
+                 stat_xattr_common(&mut st, uid, gid, mode)?;
+             }
+-            Ownership::Requester => {
+-                st.st_uid = ctx.uid;
+-                st.st_gid = ctx.gid;
+-            }
+-            Ownership::Fixed(uid, gid) => {
+-                st.st_uid = uid;
+-                st.st_gid = gid;
+-            }
++            ownership => set_owner(ctx, ownership, &mut st),
+         }
+-        Ok(self.register_entry(parent_data, st))
++        Ok(self.register_entry(parent_data, name, st))
+     }
+ 
+     fn do_open(
+@@ -989,11 +1222,7 @@ impl PassthroughFs {
+         }
+ 
+         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+-        let data = HandleData {
+-            inode,
+-            file,
+-            dirstream: Mutex::new(DirStream::new()),
+-        };
++        let data = HandleData::new(self.node(inode)?, file);
+ 
+         self.handles.write().unwrap().insert(handle, Arc::new(data));
+ 
+@@ -1052,6 +1281,14 @@ impl PassthroughFs {
+     }
+ 
+     fn do_getattr(&self, ctx: &Context, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
++        let data = self.node(inode)?;
++        if !matches!(self.cfg.ownership(), Ownership::Xattr)
++            && data.unlinked_fd.load(Ordering::Acquire) < 0
++            && let Some(pin) = self.pins.current(&data.pin)
++        {
++            let st = fstat(ctx, self.cfg.ownership(), pin.fd(), false)?;
++            return Ok((st, self.cfg.attr_timeout));
++        }
+         let ihandle = self.inode_to_handle(inode, true)?;
+         let st = match ihandle {
+             InodeHandle::Path(c_path) => lstat(ctx, self.cfg.ownership(), &c_path, false)?,
+@@ -1109,42 +1346,18 @@ impl PassthroughFs {
+         name: &CStr,
+         flags: libc::c_int,
+     ) -> io::Result<()> {
+-        let ihandle = self.inode_to_handle(parent, true)?;
+-
+-        let (fd, close_fd) = match ihandle {
+-            InodeHandle::Path(c_path) => unsafe {
+-                (
+-                    libc::open(c_path.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC),
+-                    true,
+-                )
+-            },
+-            InodeHandle::Fd(fd) => (fd, false),
+-        };
+-        if fd < 0 {
+-            return Err(io::Error::last_os_error());
+-        }
++        let dir = self.dir_fd(&*self.node(parent)?)?;
++        let fd = dir.fd();
+ 
+         // After unlinking this inode, we can't keep relying on getting a "/.vol/..." path
+         // to operate on it. Before unlinking the inode, grab a file descriptor so we can
+         // still operate on it. This one will be closed on "forget_one".
+-        let unlinked_fd = match self.grab_unlinked_fd(fd, name) {
+-            Ok(fd) => Some(fd),
+-            Err(err) => {
+-                warn!(
+-                    "Couldn't grab a file descriptor for file \"{}\": {err}",
+-                    name.to_string_lossy()
+-                );
+-                None
+-            }
+-        };
++        let unlinked_fd = self.keep_if_open(fd, name);
+ 
+         // Safe because this doesn't modify any memory and we check the return value.
+         let res = unsafe { libc::unlinkat(fd, name.as_ptr(), flags) };
+         let err = io::Error::last_os_error();
+-
+-        if close_fd {
+-            unsafe { libc::close(fd) };
+-        }
++        drop(dir);
+ 
+         if res == 0 {
+             if let Some(unlinked_fd) = unlinked_fd {
+@@ -1496,14 +1709,7 @@ impl FileSystem for PassthroughFs {
+                 ino: st.st_ino,
+                 dev: st.st_dev,
+             },
+-            Arc::new(InodeData {
+-                inode: fuse::ROOT_ID,
+-                ino: st.st_ino,
+-                dev: st.st_dev,
+-                refcount: AtomicU64::new(2),
+-                unlinked_fd: AtomicI64::new(-1),
+-                read_only_file: Mutex::new(Weak::new()),
+-            }),
++            Arc::new(InodeData::new(fuse::ROOT_ID, &st, 2)),
+         );
+ 
+         let mut opts = FsOptions::empty();
+@@ -1559,16 +1765,15 @@ impl FileSystem for PassthroughFs {
+             .cloned()
+             .ok_or_else(ebadf)?;
+ 
+-        let c_path = self.name_to_path(parent, name)?;
+-        let st = lstat(&ctx, self.cfg.ownership(), &c_path, false)?;
++        let st = self.stat_child(&ctx, &parent_data, name)?;
+ 
+         debug!(
+-            "lookup: inode={} path={}",
+-            st.st_ino,
+-            c_path.to_str().unwrap()
++            "lookup: parent={parent} name={} ino={}",
++            name.to_string_lossy(),
++            st.st_ino
+         );
+ 
+-        Ok(self.register_entry(&parent_data, st))
++        Ok(self.register_entry(&parent_data, name, st))
+     }
+ 
+     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
+@@ -1815,11 +2020,7 @@ impl FileSystem for PassthroughFs {
+         let entry = self.lookup(ctx, parent, name)?;
+ 
+         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+-        let data = HandleData {
+-            inode: entry.inode,
+-            file,
+-            dirstream: Mutex::new(DirStream::new()),
+-        };
++        let data = HandleData::new(self.node(entry.inode)?, file);
+ 
+         self.handles.write().unwrap().insert(handle, Arc::new(data));
+ 
+@@ -2139,22 +2340,10 @@ impl FileSystem for PassthroughFs {
+             & (bindings::LINUX_RENAME_EXCHANGE | bindings::LINUX_RENAME_NOREPLACE)
+             == 0
+         {
+-            match self.inode_to_handle(newdir, true) {
+-                Ok(InodeHandle::Path(newdir_cpath)) => {
+-                    let newdir_fd = unsafe {
+-                        libc::open(newdir_cpath.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC)
+-                    };
+-                    if newdir_fd < 0 {
+-                        None
+-                    } else {
+-                        let grabbed = self.grab_unlinked_fd(newdir_fd, newname).ok();
+-                        unsafe { libc::close(newdir_fd) };
+-                        grabbed
+-                    }
+-                }
+-                Ok(InodeHandle::Fd(newdir_fd)) => self.grab_unlinked_fd(newdir_fd, newname).ok(),
+-                Err(_) => None,
+-            }
++            self.node(newdir)
++                .and_then(|data| self.dir_fd(&data))
++                .ok()
++                .and_then(|dir| self.keep_if_open(dir.fd(), newname))
+         } else {
+             None
+         };
+@@ -2331,34 +2520,14 @@ impl FileSystem for PassthroughFs {
+     fn flush(
+         &self,
+         _ctx: Context,
+-        inode: Inode,
+-        handle: Handle,
++        _inode: Inode,
++        _handle: Handle,
+         _lock_owner: u64,
+     ) -> io::Result<()> {
+-        let data = self
+-            .handles
+-            .read()
+-            .unwrap()
+-            .get(&handle)
+-            .filter(|hd| hd.inode == inode)
+-            .cloned()
+-            .ok_or_else(ebadf)?;
+-
+-        // Since this method is called whenever an fd is closed in the client, we can emulate that
+-        // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
+-        // because this doesn't modify any memory and we check the return values.
+-        unsafe {
+-            let newfd = libc::dup(data.file.write().unwrap().as_raw_fd());
+-            if newfd < 0 {
+-                return Err(linux_error(io::Error::last_os_error()));
+-            }
+-
+-            if libc::close(newfd) < 0 {
+-                Err(linux_error(io::Error::last_os_error()))
+-            } else {
+-                Ok(())
+-            }
+-        }
++        // Locks stay in the guest and closing a duplicate of the host file reports nothing, so a
++        // FLUSH would only cost every close() a round trip. ENOSYS makes the guest stop sending
++        // them; it still writes back dirty pages before it would have.
++        Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)))
+     }
+ 
+     fn fsync(
+@@ -2957,6 +3126,7 @@ impl FileSystem for PassthroughFs {
+ mod tests {
+     use super::*;
+     use std::fs;
++    use std::os::unix::fs::MetadataExt;
+     use std::path::PathBuf;
+ 
+     const CTX: Context = Context {
+@@ -3453,4 +3623,418 @@ mod tests {
+             }
+         }
+     }
++
++    /// A share with katamaran's ownership policy, under which lookups resolve through pins.
++    fn fixed_owner_at(root: &Path) -> PassthroughFs {
++        let cfg = Config {
++            root_dir: root.to_str().unwrap().to_string(),
++            semantics: PermissionSemantics::LinuxSimplifiedFixedOwner,
++            fixed_owner: Some((0, 0)),
++            ..Default::default()
++        };
++        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
++        fs.init(FsOptions::empty()).unwrap();
++        fs
++    }
++
++    fn fresh_dir(name: &str) -> PathBuf {
++        let dir =
++            std::env::temp_dir().join(format!("libkrun-passthrough-{}-{name}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn lookup_in(fs: &PassthroughFs, parent: Inode, name: &str) -> io::Result<Entry> {
++        fs.lookup(CTX, parent, &CString::new(name).unwrap())
++    }
++
++    fn open_handle(fs: &PassthroughFs, inode: Inode) -> io::Result<Handle> {
++        Ok(fs
++            .open(CTX, inode, false, libc::O_RDONLY as u32)?
++            .0
++            .unwrap())
++    }
++
++    fn read_handle(fs: &PassthroughFs, handle: Handle) -> Vec<u8> {
++        let fd = fs.handles.read().unwrap()[&handle]
++            .file
++            .read()
++            .unwrap()
++            .as_raw_fd();
++        let mut buf = vec![0u8; 64];
++        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
++        assert!(n >= 0);
++        buf.truncate(n as usize);
++        buf
++    }
++
++    fn read_inode(fs: &PassthroughFs, inode: Inode) -> io::Result<Vec<u8>> {
++        let handle = open_handle(fs, inode)?;
++        let data = read_handle(fs, handle);
++        fs.release(CTX, inode, 0, handle, false, false, None)?;
++        Ok(data)
++    }
++
++    fn pin_root(fs: &PassthroughFs) {
++        let root = fs.node(fuse::ROOT_ID).unwrap();
++        while fs.parent_pin(&root).is_none() {}
++    }
++
++    #[test]
++    fn lookups_pin_busy_directories_within_the_budget() {
++        let dir = fresh_dir("pins");
++        for d in 0..40 {
++            fs::create_dir(dir.join(format!("d{d}"))).unwrap();
++            for f in 0..6 {
++                fs::write(dir.join(format!("d{d}/f{f}")), b"x").unwrap();
++            }
++        }
++        let fs = fixed_owner_at(&dir);
++        fs.pins.set_budget(10);
++
++        let mut subdirs = Vec::new();
++        for d in 0..40 {
++            let sub = lookup_in(&fs, fuse::ROOT_ID, &format!("d{d}"))
++                .unwrap()
++                .inode;
++            for f in 0..6 {
++                let entry = lookup_in(&fs, sub, &format!("f{f}")).unwrap();
++                let host = fs::symlink_metadata(dir.join(format!("d{d}/f{f}"))).unwrap();
++                assert_eq!(entry.attr.st_ino, host.ino());
++                assert!(fs.pins.count() <= 10);
++            }
++            subdirs.push(sub);
++        }
++        assert_eq!(fs.pins.count(), 10);
++
++        let pinned = *subdirs
++            .iter()
++            .find(|i| fs.node(**i).unwrap().pin.is_pinned())
++            .unwrap();
++        let (st, _) = fs.do_getattr(&CTX, pinned).unwrap();
++        let host = fs::symlink_metadata(dir.join(format!(
++            "d{}",
++            subdirs.iter().position(|i| *i == pinned).unwrap()
++        )))
++        .unwrap();
++        assert_eq!((st.st_ino, st.st_nlink as u64), (host.ino(), host.nlink()));
++
++        fs.pins.demote(0);
++        assert_eq!(fs.pins.count(), 0);
++        assert!(lookup_in(&fs, subdirs[0], "f0").is_ok());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn concurrent_lookups_and_forgets_keep_one_inode() {
++        let dir = fresh_dir("refcount");
++        fs::write(dir.join("x"), b"x").unwrap();
++        let fs = fixed_owner_at(&dir);
++
++        let inodes: Vec<Inode> = std::thread::scope(|s| {
++            let workers: Vec<_> = (0..8)
++                .map(|_| {
++                    s.spawn(|| {
++                        (0..500)
++                            .map(|_| lookup_in(&fs, fuse::ROOT_ID, "x").unwrap().inode)
++                            .collect::<Vec<_>>()
++                    })
++                })
++                .collect();
++            workers
++                .into_iter()
++                .flat_map(|w| w.join().unwrap())
++                .collect()
++        });
++        assert!(inodes.iter().all(|i| *i == inodes[0]));
++        assert_eq!(refcount(&fs, inodes[0]), 4000);
++
++        std::thread::scope(|s| {
++            for _ in 0..8 {
++                s.spawn(|| {
++                    for _ in 0..500 {
++                        let inode = lookup_in(&fs, fuse::ROOT_ID, "x").unwrap().inode;
++                        // The inode the lookup returned is still in the table.
++                        assert!(fs.node(inode).is_ok());
++                        fs.forget(CTX, inode, 1);
++                        fs.forget(CTX, inode, 1);
++                    }
++                });
++            }
++        });
++        assert!(fs.node(inodes[0]).is_err());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_name_replaced_on_the_host_gets_a_new_inode() {
++        let dir = fresh_dir("rename-over-host");
++        fs::write(dir.join("a"), b"old").unwrap();
++        let fs = fixed_owner_at(&dir);
++        pin_root(&fs);
++
++        let a = lookup_in(&fs, fuse::ROOT_ID, "a").unwrap().inode;
++        let handle = open_handle(&fs, a).unwrap();
++        assert_eq!(read_inode(&fs, a).unwrap(), b"old");
++
++        fs::write(dir.join("a.tmp"), b"new").unwrap();
++        fs::rename(dir.join("a.tmp"), dir.join("a")).unwrap();
++
++        // The open handle stays on the replaced file, and the old inode never opens the new one.
++        assert_eq!(read_handle(&fs, handle), b"old");
++        assert_eq!(read_inode(&fs, a).unwrap(), b"old");
++        fs.release(CTX, a, 0, handle, false, false, None).unwrap();
++        // Without a shared open file, the anchor now names another file: the open must not
++        // return it, and the stale anchor goes.
++        assert_ne!(read_inode(&fs, a).ok(), Some(b"new".to_vec()));
++        assert!(fs.node(a).unwrap().anchor.lock().unwrap().is_none());
++
++        let b = lookup_in(&fs, fuse::ROOT_ID, "a").unwrap();
++        assert_ne!(b.inode, a);
++        assert_eq!(b.attr.st_ino, fs::metadata(dir.join("a")).unwrap().ino());
++        assert_eq!(read_inode(&fs, b.inode).unwrap(), b"new");
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_rename_over_an_open_file_keeps_it_reachable() {
++        let dir = fresh_dir("rename-over-guest");
++        fs::write(dir.join("a"), b"old").unwrap();
++        fs::write(dir.join("b"), b"new").unwrap();
++        fs::write(dir.join("c"), b"unopened").unwrap();
++        fs::write(dir.join("d"), b"d").unwrap();
++        let fs = fixed_owner_at(&dir);
++        pin_root(&fs);
++
++        let a = lookup_in(&fs, fuse::ROOT_ID, "a").unwrap();
++        let handle = open_handle(&fs, a.inode).unwrap();
++        let c = lookup_in(&fs, fuse::ROOT_ID, "c").unwrap().inode;
++        let name = |n: &str| CString::new(n).unwrap();
++        fs.rename(CTX, fuse::ROOT_ID, &name("b"), fuse::ROOT_ID, &name("a"), 0)
++            .unwrap();
++        fs.rename(CTX, fuse::ROOT_ID, &name("d"), fuse::ROOT_ID, &name("c"), 0)
++            .unwrap();
++
++        let (st, _) = fs.do_getattr(&CTX, a.inode).unwrap();
++        assert_eq!(st.st_ino, a.attr.st_ino);
++        assert_eq!(read_handle(&fs, handle), b"old");
++        assert_eq!(read_inode(&fs, a.inode).unwrap(), b"old");
++        // Nothing had the overwritten "c" open, so no descriptor was kept for it.
++        assert_eq!(fs.node(c).unwrap().unlinked_fd.load(Ordering::Acquire), -1);
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn a_file_deleted_while_open_stays_usable() {
++        let dir = fresh_dir("delete-open");
++        fs::write(dir.join("f"), b"data").unwrap();
++        fs::write(dir.join("g"), b"data").unwrap();
++        let fs = fixed_owner_at(&dir);
++
++        let f = lookup_in(&fs, fuse::ROOT_ID, "f").unwrap().inode;
++        let handle = open_handle(&fs, f).unwrap();
++        fs.unlink(CTX, fuse::ROOT_ID, &CString::new("f").unwrap())
++            .unwrap();
++        let (st, _) = fs.do_getattr(&CTX, f).unwrap();
++        assert_eq!(st.st_nlink, 0);
++        assert_eq!(read_handle(&fs, handle), b"data");
++        assert_eq!(read_inode(&fs, f).unwrap(), b"data");
++
++        let g = lookup_in(&fs, fuse::ROOT_ID, "g").unwrap().inode;
++        fs.unlink(CTX, fuse::ROOT_ID, &CString::new("g").unwrap())
++            .unwrap();
++        assert_eq!(fs.node(g).unwrap().unlinked_fd.load(Ordering::Acquire), -1);
++        assert_eq!(
++            fs.do_getattr(&CTX, g).unwrap_err().raw_os_error(),
++            Some(libc::ENOENT)
++        );
++
++        fs.release(CTX, f, 0, handle, false, false, None).unwrap();
++        fs.forget(CTX, f, 1);
++        assert!(fs.node(f).is_err());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn git_checkout_swaps_inodes_behind_names() {
++        let dir = fresh_dir("git-checkout");
++        let git = |args: &[&str]| {
++            let out = std::process::Command::new("git")
++                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c"])
++                .arg("init.defaultBranch=one")
++                .args(args)
++                .current_dir(&dir)
++                .output();
++            match out {
++                Ok(out) => assert!(out.status.success(), "git {args:?}: {out:?}"),
++                Err(e) => panic!("git: {e}"),
++            }
++        };
++        git(&["init", "-q"]);
++        fs::write(dir.join("a"), b"v1").unwrap();
++        fs::write(dir.join("b"), b"b").unwrap();
++        git(&["add", "."]);
++        git(&["commit", "-qm", "one"]);
++        git(&["checkout", "-qb", "two"]);
++        fs::write(dir.join("a"), b"v2").unwrap();
++        fs::remove_file(dir.join("b")).unwrap();
++        fs::write(dir.join("c"), b"c").unwrap();
++        git(&["add", "-A"]);
++        git(&["commit", "-qm", "two"]);
++        git(&["checkout", "-q", "one"]);
++
++        let fs = fixed_owner_at(&dir);
++        pin_root(&fs);
++        let a = lookup_in(&fs, fuse::ROOT_ID, "a").unwrap();
++        let handle = open_handle(&fs, a.inode).unwrap();
++        assert_eq!(read_inode(&fs, a.inode).unwrap(), b"v1");
++
++        git(&["checkout", "-q", "two"]);
++
++        let a2 = lookup_in(&fs, fuse::ROOT_ID, "a").unwrap();
++        assert_eq!(a2.attr.st_ino, fs::metadata(dir.join("a")).unwrap().ino());
++        assert_eq!(read_inode(&fs, a2.inode).unwrap(), b"v2");
++        assert_eq!(read_handle(&fs, handle), b"v1");
++        if a2.attr.st_ino != a.attr.st_ino {
++            assert_ne!(a2.inode, a.inode);
++            assert_ne!(read_inode(&fs, a.inode).ok(), Some(b"v2".to_vec()));
++        }
++        assert_eq!(
++            lookup_in(&fs, fuse::ROOT_ID, "b")
++                .err()
++                .and_then(|e| e.raw_os_error()),
++            Some(libc::ENOENT)
++        );
++        assert!(lookup_in(&fs, fuse::ROOT_ID, "c").is_ok());
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn survives_a_low_descriptor_limit() {
++        let out = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "virtio::fs::macos::passthrough::tests::low_descriptor_limit_child",
++                "--exact",
++                "--ignored",
++                "--nocapture",
++            ])
++            .env("KAT_LOW_NOFILE_CHILD", "1")
++            .output()
++            .unwrap();
++        assert!(
++            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
++            "{}\n{}",
++            String::from_utf8_lossy(&out.stdout),
++            String::from_utf8_lossy(&out.stderr)
++        );
++    }
++
++    /// Runs in its own process (see `survives_a_low_descriptor_limit`) with RLIMIT_NOFILE 256.
++    #[test]
++    #[ignore]
++    fn low_descriptor_limit_child() {
++        if std::env::var("KAT_LOW_NOFILE_CHILD").is_err() {
++            return;
++        }
++        let lim = libc::rlimit {
++            rlim_cur: 256,
++            rlim_max: 256,
++        };
++        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
++
++        let dir = fresh_dir("low-nofile");
++        for d in 0..300 {
++            fs::create_dir(dir.join(format!("d{d}"))).unwrap();
++            for f in 0..5 {
++                fs::write(dir.join(format!("d{d}/f{f}")), b"x").unwrap();
++            }
++        }
++        let fs = fixed_owner_at(&dir);
++
++        let mut held = Vec::new();
++        for d in 0..300 {
++            let sub = lookup_in(&fs, fuse::ROOT_ID, &format!("d{d}"))
++                .unwrap()
++                .inode;
++            let listed = list_dir(&fs, sub);
++            assert_eq!(listed, 5);
++            for f in 0..5 {
++                let file = lookup_in(&fs, sub, &format!("f{f}")).unwrap().inode;
++                if f == 0 && held.len() < 150 {
++                    held.push((file, open_handle(&fs, file).unwrap()));
++                } else {
++                    assert_eq!(read_inode(&fs, file).unwrap(), b"x");
++                }
++            }
++            assert!(fs.pins.count() <= 128);
++        }
++        assert_eq!(held.len(), 150);
++        for (inode, handle) in held {
++            fs.release(CTX, inode, 0, handle, false, false, None)
++                .unwrap();
++        }
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    fn list_dir(fs: &PassthroughFs, inode: Inode) -> usize {
++        let handle = fs
++            .opendir(CTX, inode, libc::O_RDONLY as u32)
++            .unwrap()
++            .0
++            .unwrap();
++        let mut n = 0;
++        fs.readdirplus(CTX, inode, handle, 4096, 0, |_, e| {
++            n += 1;
++            fs.forget(CTX, e.inode, 1);
++            Ok(1)
++        })
++        .unwrap();
++        fs.releasedir(CTX, inode, 0, handle).unwrap();
++        n
++    }
++
++    /// KAT_BENCH_TREE=<dir> KAT_BENCH_PINS=0|1: time a lookup of every entry under <dir> and an
++    /// open and release of every regular file, through the server as the guest drives it.
++    #[test]
++    #[ignore]
++    fn lookup_and_open_timing() {
++        let root = PathBuf::from(std::env::var("KAT_BENCH_TREE").expect("KAT_BENCH_TREE"));
++        let fs = fixed_owner_at(&root);
++        if std::env::var("KAT_BENCH_PINS").as_deref() == Ok("0") {
++            fs.pins.set_budget(0);
++        }
++        let mut files = Vec::new();
++        let start = std::time::Instant::now();
++        let mut lookups = 0;
++        let mut stack = vec![(fuse::ROOT_ID, root.clone())];
++        while let Some((inode, dir)) = stack.pop() {
++            for e in fs::read_dir(&dir).unwrap() {
++                let e = e.unwrap();
++                let name = CString::new(e.file_name().into_encoded_bytes()).unwrap();
++                let entry = fs.lookup(CTX, inode, &name).unwrap();
++                lookups += 1;
++                match entry.attr.st_mode & libc::S_IFMT {
++                    libc::S_IFDIR => stack.push((entry.inode, e.path())),
++                    libc::S_IFREG => files.push(entry.inode),
++                    _ => {}
++                }
++            }
++        }
++        let walk = start.elapsed();
++        let start = std::time::Instant::now();
++        for inode in &files {
++            let handle = open_handle(&fs, *inode).unwrap();
++            fs.release(CTX, *inode, 0, handle, false, false, None)
++                .unwrap();
++        }
++        let opens = start.elapsed();
++        eprintln!(
++            "pins={} walk incl. readdir: {} ns/lookup over {lookups}; open+release {} ns over {}",
++            fs.pins.count(),
++            walk.as_nanos() / lookups as u128,
++            opens.as_nanos() / files.len() as u128,
++            files.len()
++        );
++    }
+ }
+diff --git a/src/devices/src/virtio/fs/macos/pins.rs b/src/devices/src/virtio/fs/macos/pins.rs
+new file mode 100644
+index 00000000..e7b2b0c5
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/pins.rs
+@@ -0,0 +1,253 @@
++// Pinned directory descriptors. A directory that keeps being used as a parent holds an O_EVTONLY
++// descriptor, so names in it resolve with *at() calls on that descriptor instead of a volfs path
++// lookup of the directory each time. The descriptors come from a budget; the least recently used
++// ones are closed by a background thread, and the node falls back to its /.vol path.
++
++use std::collections::HashMap;
++use std::env;
++use std::ffi::{CStr, CString};
++use std::io;
++use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
++use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, Weak};
++use std::thread;
++use std::time::{Duration, Instant};
++
++/// Child lookups in a directory before it is worth an open of its own.
++const PIN_AFTER: u32 = 4;
++const TRIM_INTERVAL: Duration = Duration::from_secs(1);
++
++pub(super) struct Pin {
++    fd: OwnedFd,
++    inode: u64,
++    pool: Arc<PinPool>,
++}
++
++impl Pin {
++    pub fn fd(&self) -> RawFd {
++        self.fd.as_raw_fd()
++    }
++}
++
++impl Drop for Pin {
++    fn drop(&mut self) {
++        self.pool.count.fetch_sub(1, Ordering::AcqRel);
++        let mut slots = self.pool.slots.lock().unwrap();
++        // The slot may already hold a newer pin of the same inode.
++        if slots
++            .get(&self.inode)
++            .and_then(Weak::upgrade)
++            .is_none_or(|slot| slot.pin.lock().unwrap().is_none())
++        {
++            slots.remove(&self.inode);
++        }
++    }
++}
++
++/// The pin state of one node.
++#[derive(Default)]
++pub(super) struct PinSlot {
++    pin: Mutex<Option<Arc<Pin>>>,
++    last_used: AtomicU64,
++    uses: AtomicU32,
++}
++
++impl PinSlot {
++    fn current(&self, pool: &PinPool) -> Option<Arc<Pin>> {
++        let pin = self.pin.lock().unwrap().clone()?;
++        self.last_used.store(pool.now(), Ordering::Relaxed);
++        Some(pin)
++    }
++
++    #[cfg(test)]
++    pub fn is_pinned(&self) -> bool {
++        self.pin.lock().unwrap().is_some()
++    }
++}
++
++pub(super) struct PinPool {
++    budget: AtomicUsize,
++    count: AtomicUsize,
++    slots: Mutex<HashMap<u64, Weak<PinSlot>>>,
++    epoch: Instant,
++}
++
++impl PinPool {
++    /// Raises the soft RLIMIT_NOFILE to the hard limit and allows pins half of it.
++    /// KATAMARAN_FS_PINS=0 turns pinning off.
++    pub fn new() -> Arc<Self> {
++        let budget = match env::var("KATAMARAN_FS_PINS").as_deref() {
++            Ok("0") => 0,
++            _ => raise_nofile_limit() / 2,
++        };
++        let pool = Arc::new(PinPool {
++            budget: AtomicUsize::new(budget),
++            count: AtomicUsize::new(0),
++            slots: Mutex::new(HashMap::new()),
++            epoch: Instant::now(),
++        });
++        let weak = Arc::downgrade(&pool);
++        let spawned = thread::Builder::new()
++            .name("fs node trim".into())
++            .spawn(move || {
++                loop {
++                    thread::sleep(TRIM_INTERVAL);
++                    let Some(pool) = weak.upgrade() else {
++                        return;
++                    };
++                    pool.trim();
++                }
++            });
++        if let Err(e) = spawned {
++            warn!("virtio-fs: no node trim thread: {e}");
++        }
++        pool
++    }
++
++    fn now(&self) -> u64 {
++        self.epoch.elapsed().as_millis() as u64
++    }
++
++    pub fn count(&self) -> usize {
++        self.count.load(Ordering::Acquire)
++    }
++
++    #[cfg(test)]
++    pub fn set_budget(&self, budget: usize) {
++        self.budget.store(budget, Ordering::Release);
++    }
++
++    /// The pin of a directory node, taking one once the directory has been used as a parent
++    /// often enough. `path` opens the directory itself.
++    pub fn parent_pin(
++        self: &Arc<Self>,
++        slot: &Arc<PinSlot>,
++        inode: u64,
++        dev: i32,
++        ino: u64,
++    ) -> Option<Arc<Pin>> {
++        if let Some(pin) = slot.current(self) {
++            return Some(pin);
++        }
++        if slot.uses.fetch_add(1, Ordering::Relaxed) + 1 < PIN_AFTER {
++            return None;
++        }
++        let path = CString::new(format!("/.vol/{dev}/{ino}")).ok()?;
++        self.pin(slot, inode, &path)
++    }
++
++    /// Pins the node now if the budget allows.
++    pub fn pin(self: &Arc<Self>, slot: &Arc<PinSlot>, inode: u64, path: &CStr) -> Option<Arc<Pin>> {
++        let mut current = slot.pin.lock().unwrap();
++        if let Some(pin) = current.as_ref() {
++            return Some(pin.clone());
++        }
++        if self.count.fetch_add(1, Ordering::AcqRel) >= self.budget.load(Ordering::Acquire) {
++            self.count.fetch_sub(1, Ordering::AcqRel);
++            return None;
++        }
++        let fd = unsafe {
++            libc::open(
++                path.as_ptr(),
++                libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC,
++            )
++        };
++        if fd < 0 {
++            self.count.fetch_sub(1, Ordering::AcqRel);
++            debug!(
++                "virtio-fs: pin open failed, using path anchor: {}",
++                io::Error::last_os_error()
++            );
++            return None;
++        }
++        let pin = Arc::new(Pin {
++            fd: unsafe { OwnedFd::from_raw_fd(fd) },
++            inode,
++            pool: self.clone(),
++        });
++        *current = Some(pin.clone());
++        drop(current);
++        slot.last_used.store(self.now(), Ordering::Relaxed);
++        self.slots
++            .lock()
++            .unwrap()
++            .insert(inode, Arc::downgrade(slot));
++        Some(pin)
++    }
++
++    pub fn current(&self, slot: &PinSlot) -> Option<Arc<Pin>> {
++        slot.current(self)
++    }
++
++    /// Unpins least recently used nodes until at most `keep` pins remain (descriptors still in
++    /// use by a request close when it finishes).
++    pub fn demote(&self, keep: usize) {
++        let mut pinned: Vec<(u64, Arc<PinSlot>)> = self
++            .slots
++            .lock()
++            .unwrap()
++            .values()
++            .filter_map(Weak::upgrade)
++            .map(|slot| (slot.last_used.load(Ordering::Relaxed), slot))
++            .collect();
++        let excess = pinned.len().saturating_sub(keep);
++        if excess == 0 {
++            return;
++        }
++        pinned.sort_unstable_by_key(|(used, _)| *used);
++        for (_, slot) in pinned.into_iter().take(excess) {
++            let pin = slot.pin.lock().unwrap().take();
++            slot.uses.store(0, Ordering::Relaxed);
++            drop(pin);
++        }
++        debug!("virtio-fs: evicted pinned fds to path anchors, {excess} closed");
++    }
++
++    fn trim(&self) {
++        let budget = self.budget.load(Ordering::Acquire);
++        if self.count() > budget * 9 / 10 {
++            self.demote(budget * 7 / 10);
++        }
++    }
++
++    /// The process ran out of descriptors: give back half of the pins.
++    pub fn relieve(&self) {
++        self.demote(self.count() / 2);
++    }
++}
++
++fn raise_nofile_limit() -> usize {
++    let mut lim = libc::rlimit {
++        rlim_cur: 0,
++        rlim_max: 0,
++    };
++    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
++        return 256;
++    }
++    let mut per_proc: libc::c_int = 0;
++    let mut len = std::mem::size_of::<libc::c_int>();
++    let name = c"kern.maxfilesperproc";
++    let have_max = unsafe {
++        libc::sysctlbyname(
++            name.as_ptr(),
++            (&mut per_proc as *mut libc::c_int).cast(),
++            &mut len,
++            std::ptr::null_mut(),
++            0,
++        )
++    } == 0;
++    let mut want = lim.rlim_max;
++    if have_max && per_proc > 0 {
++        want = want.min(per_proc as libc::rlim_t);
++    }
++    if want > lim.rlim_cur {
++        let raised = libc::rlimit {
++            rlim_cur: want,
++            rlim_max: lim.rlim_max,
++        };
++        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
++            lim.rlim_cur = want;
++        }
++    }
++    lim.rlim_cur.min(1 << 20) as usize
++}

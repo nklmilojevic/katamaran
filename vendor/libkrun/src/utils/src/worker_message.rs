@@ -1,0 +1,33 @@
+/// The granularity of [`WorkerMessage::ReclaimMemory`] in guest physical addresses: the VMM
+/// replaces whole blocks only, and the balloon only asks for ranges of whole blocks.
+#[cfg(target_os = "macos")]
+pub const RECLAIM_BLOCK_SIZE: u64 = 64 << 10;
+
+#[derive(Debug)]
+pub struct MemoryProperties {
+    pub gpa: u64,
+    pub size: u64,
+    pub private: bool,
+}
+
+#[derive(Debug)]
+pub enum WorkerMessage {
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    GsiRoute(
+        crossbeam_channel::Sender<bool>,
+        Vec<kvm_bindings::kvm_irq_routing_entry>,
+    ),
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    IrqLine(crossbeam_channel::Sender<bool>, u32, bool),
+    #[cfg(target_os = "macos")]
+    GpuAddMapping(crossbeam_channel::Sender<bool>, u64, u64, u64),
+    #[cfg(target_os = "macos")]
+    GpuRemoveMapping(crossbeam_channel::Sender<bool>, u64, u64),
+    /// Gives the host pages backing a range of guest RAM back to the system; the range reads
+    /// as zeroes afterwards. Replies whether they were given back. The range is made of whole
+    /// blocks of [`RECLAIM_BLOCK_SIZE`], or the VMM leaves it as it is.
+    #[cfg(target_os = "macos")]
+    ReclaimMemory(crossbeam_channel::Sender<bool>, u64, u64),
+    #[cfg(not(target_os = "windows"))]
+    ConvertMemory(crossbeam_channel::Sender<bool>, MemoryProperties),
+}

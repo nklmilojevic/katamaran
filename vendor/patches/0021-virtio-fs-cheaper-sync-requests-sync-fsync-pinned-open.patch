@@ -1,0 +1,552 @@
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index 66cadbd..7d16948 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -31,6 +31,7 @@ libc = ">=0.2.39"
+ libloading = "0.8"
+ log = "0.4.0"
+ rand = "0.10.2"
++smallvec = "1.15"
+ thiserror = { version = "2.0", optional = true }
+ vhost = { version = "0.17", optional = true, features = ["vhost-user-frontend"] }
+ vmm-sys-util = { version = "0.15", optional = true }
+diff --git a/src/devices/src/virtio/descriptor_utils.rs b/src/devices/src/virtio/descriptor_utils.rs
+index 22c0eb0..7c2cfbc 100644
+--- a/src/devices/src/virtio/descriptor_utils.rs
++++ b/src/devices/src/virtio/descriptor_utils.rs
+@@ -3,7 +3,6 @@
+ // found in the LICENSE file.
+ 
+ use std::cmp;
+-use std::collections::VecDeque;
+ use std::fmt::{self, Display};
+ use std::io::{self, Read, Write};
+ use std::mem::{MaybeUninit, size_of};
+@@ -11,6 +10,8 @@ use std::ops::Deref;
+ use std::ptr::copy_nonoverlapping;
+ use std::result;
+ 
++use smallvec::SmallVec;
++
+ use crate::virtio::queue::DescriptorChain;
+ use vm_memory::{
+     Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
+@@ -54,9 +55,13 @@ pub type Result<T> = result::Result<T, Error>;
+ 
+ impl std::error::Error for Error {}
+ 
++/// A request's guest buffers. Most requests have a header and one or two more, kept inline:
++/// allocating them cost every request a few malloc/free pairs.
++type Buffers<'a> = SmallVec<[VolatileSlice<'a>; 4]>;
++
+ #[derive(Clone)]
+ struct DescriptorChainConsumer<'a> {
+-    buffers: VecDeque<VolatileSlice<'a>>,
++    buffers: Buffers<'a>,
+     bytes_consumed: usize,
+ }
+ 
+@@ -87,28 +92,24 @@ impl<'a> DescriptorChainConsumer<'a> {
+     where
+         F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
+     {
++        // Every request consumes a few times (header, arguments, payload): the slices are passed
++        // in place rather than copied into a new Vec each time.
++        let all = &self.buffers[..];
+         let mut buflen = 0;
+-        let mut bufs = Vec::with_capacity(self.buffers.len());
+-        for &vs in &self.buffers {
++        let mut n = 0;
++        for vs in all.iter() {
+             if buflen >= count {
+                 break;
+             }
+-
+-            bufs.push(vs);
+-
+-            let rem = count - buflen;
+-            if rem < vs.len() {
+-                buflen += rem;
+-            } else {
+-                buflen += vs.len();
+-            }
++            n += 1;
++            buflen += cmp::min(count - buflen, vs.len());
+         }
+ 
+-        if bufs.is_empty() {
++        if n == 0 {
+             return Ok(0);
+         }
+ 
+-        let bytes_consumed = f(&bufs)?;
++        let bytes_consumed = f(&all[..n])?;
+ 
+         // This can happen if a driver tricks a device into reading/writing more data than
+         // fits in a `usize`.
+@@ -120,17 +121,22 @@ impl<'a> DescriptorChainConsumer<'a> {
+                 })?;
+ 
+         let mut rem = bytes_consumed;
+-        while let Some(vs) = self.buffers.pop_front() {
++        let mut done = 0;
++        while let Some(vs) = self.buffers.get(done) {
+             if rem < vs.len() {
+-                // Split the slice and push the remainder back into the buffer list. Safe because we
+-                // know that `rem` is not out of bounds due to the check and we checked the bounds
+-                // on `vs` when we added it to the buffer list.
+-                self.buffers.push_front(vs.offset(rem).unwrap());
+                 break;
+             }
+-
+             // No need for checked math because we know that `vs.size() <= rem`.
+             rem -= vs.len();
++            done += 1;
++        }
++        self.buffers.drain(..done);
++        if rem > 0
++            && let Some(front) = self.buffers.first_mut()
++        {
++            // Safe because `rem` is less than the slice's length, which was checked when it was
++            // added to the buffer list.
++            *front = front.offset(rem).unwrap();
+         }
+ 
+         self.bytes_consumed = total_bytes_consumed;
+@@ -150,15 +156,15 @@ impl<'a> DescriptorChainConsumer<'a> {
+         });
+ 
+         if let Some(at) = pos {
+-            let mut other = self.buffers.split_off(at);
++            let mut other: Buffers<'a> = self.buffers.drain(at..).collect();
+ 
+             if rem > 0 {
+                 // There must be at least one element in `other` because we checked
+                 // its `size` value in the call to `position` above.
+-                let front = other.pop_front().expect("empty VecDeque after split");
++                let front = other[0];
+                 self.buffers
+-                    .push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
+-                other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
++                    .push(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
++                other[0] = front.offset(rem).map_err(Error::VolatileMemoryError)?;
+             }
+ 
+             Ok(DescriptorChainConsumer {
+@@ -167,7 +173,7 @@ impl<'a> DescriptorChainConsumer<'a> {
+             })
+         } else if rem == 0 {
+             Ok(DescriptorChainConsumer {
+-                buffers: VecDeque::new(),
++                buffers: Buffers::new(),
+                 bytes_consumed: 0,
+             })
+         } else {
+@@ -213,7 +219,7 @@ impl<'a> Reader<'a> {
+                     .get_slice(offset.raw_value() as usize, desc.len as usize)
+                     .map_err(Error::VolatileMemoryError)
+             })
+-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
++            .collect::<Result<Buffers<'a>>>()?;
+         Ok(Reader {
+             buffer: DescriptorChainConsumer {
+                 buffers,
+@@ -375,7 +381,7 @@ impl<'a> Writer<'a> {
+                     .get_slice(offset.raw_value() as usize, len as usize)
+                     .map_err(Error::VolatileMemoryError)
+             })
+-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
++            .collect::<Result<Buffers<'a>>>()?;
+ 
+         Ok(Writer {
+             buffer: DescriptorChainConsumer {
+diff --git a/src/devices/src/virtio/file_traits.rs b/src/devices/src/virtio/file_traits.rs
+index b1639a3..c57f234 100644
+--- a/src/devices/src/virtio/file_traits.rs
++++ b/src/devices/src/virtio/file_traits.rs
+@@ -340,6 +340,10 @@ macro_rules! volatile_impl {
+                 bufs: &[VolatileSlice],
+                 offset: u64,
+             ) -> Result<usize> {
++                // A small READ lands in one guest buffer: no iovec array to build.
++                if let [one] = bufs {
++                    return self.read_at_volatile(*one, offset);
++                }
+                 let iovecs: Vec<libc::iovec> = bufs
+                     .iter()
+                     .map(|s| libc::iovec {
+@@ -393,6 +397,9 @@ macro_rules! volatile_impl {
+                 bufs: &[VolatileSlice],
+                 offset: u64,
+             ) -> Result<usize> {
++                if let [one] = bufs {
++                    return self.write_at_volatile(*one, offset);
++                }
+                 let iovecs: Vec<libc::iovec> = bufs
+                     .iter()
+                     .map(|s| libc::iovec {
+diff --git a/src/devices/src/virtio/fs/macos/handles.rs b/src/devices/src/virtio/fs/macos/handles.rs
+index cc5472c..c7a857d 100644
+--- a/src/devices/src/virtio/fs/macos/handles.rs
++++ b/src/devices/src/virtio/fs/macos/handles.rs
+@@ -4,25 +4,47 @@
+ 
+ use std::array;
+ use std::collections::HashMap;
++use std::hash::{BuildHasherDefault, Hasher};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, RwLock};
+ 
+ const SHARDS: usize = 64;
+ 
++/// Handles are sequence numbers the guest cannot choose, so one multiply spreads them well
++/// enough: SipHash cost every READ and WRITE more than the rest of the lookup.
++#[derive(Default)]
++struct HandleHasher(u64);
++
++impl Hasher for HandleHasher {
++    fn finish(&self) -> u64 {
++        self.0
++    }
++    fn write(&mut self, bytes: &[u8]) {
++        for &b in bytes {
++            self.0 = (self.0 << 8) | u64::from(b);
++        }
++    }
++    fn write_u64(&mut self, n: u64) {
++        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
++    }
++}
++
++type Shard<T> = HashMap<u64, Arc<T>, BuildHasherDefault<HandleHasher>>;
++
+ pub(super) struct HandleTable<T> {
+-    shards: [RwLock<HashMap<u64, Arc<T>>>; SHARDS],
++    shards: [RwLock<Shard<T>>; SHARDS],
+     next: AtomicU64,
+ }
+ 
+ impl<T> HandleTable<T> {
+     pub fn new() -> Self {
+         HandleTable {
+-            shards: array::from_fn(|_| RwLock::new(HashMap::new())),
++            shards: array::from_fn(|_| RwLock::new(Shard::default())),
+             next: AtomicU64::new(1),
+         }
+     }
+ 
+-    fn shard(&self, handle: u64) -> &RwLock<HashMap<u64, Arc<T>>> {
++    fn shard(&self, handle: u64) -> &RwLock<Shard<T>> {
+         &self.shards[handle as usize % SHARDS]
+     }
+ 
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index 3407e09..5f90868 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -885,6 +885,31 @@ impl PassthroughFs {
+     /// Opens the inode relative to a pinned directory instead of by its /.vol path: a directory
+     /// through its own pin, a regular file through its anchor. `None` when that is not possible
+     /// or the anchor now names another file.
++    /// A bounded open through the parent's pin (a directory's own), when there is one: what
++    /// `syncopen::open` does with the `/.vol` path, a microsecond and a half faster. None when
++    /// there is no pin or the name no longer leads to this node; the caller then opens the path.
++    fn open_pinned_inline(&self, data: &InodeData, flags: i32) -> Option<RawFd> {
++        if flags & (libc::O_TRUNC | libc::O_CREAT) != 0 {
++            return None;
++        }
++        let (pin, name) = match data.kind {
++            libc::S_IFDIR => (self.pins.current(&data.pin)?, c".".to_owned()),
++            libc::S_IFREG => {
++                let (parent, name) = data.anchor.lock().unwrap().clone()?;
++                let parent_data = self.inodes.read().unwrap().get(&parent).cloned()?;
++                (self.pins.current(&parent_data.pin)?, name)
++            }
++            _ => return None,
++        };
++        let (fd, st) = unsafe { syncopen::open_inline_at(pin.fd(), name.as_ptr(), flags) }?;
++        if (st.st_dev as i64, st.st_ino) != (data.dev as i64, data.ino) {
++            syncopen::clear_mtime();
++            unsafe { libc::close(fd) };
++            return None;
++        }
++        Some(fd)
++    }
++
+     fn open_pinned(&self, data: &InodeData, flags: i32) -> Option<RawFd> {
+         if data.kind == libc::S_IFDIR {
+             let pin = self.pins.current(&data.pin)?;
+@@ -1052,9 +1077,9 @@ impl PassthroughFs {
+                 InodeHandle::Fd(fd) => unsafe { libc::dup(fd) },
+                 // On the synchronous path every open must be bounded, and an openat through a
+                 // pin can block like any other open (a dataless iCloud file), so skip the pins.
+-                InodeHandle::Path(c_path) if syncopen::in_bounded_scope() => unsafe {
+-                    syncopen::open(c_path.as_ptr(), flags, 0)
+-                },
++                InodeHandle::Path(c_path) if syncopen::in_bounded_scope() => self
++                    .open_pinned_inline(&data, flags)
++                    .unwrap_or_else(|| unsafe { syncopen::open(c_path.as_ptr(), flags, 0) }),
+                 InodeHandle::Path(c_path) => self
+                     .open_pinned(&data, flags)
+                     .unwrap_or_else(|| unsafe { libc::open(c_path.as_ptr(), flags) }),
+diff --git a/src/devices/src/virtio/fs/macos/syncopen.rs b/src/devices/src/virtio/fs/macos/syncopen.rs
+index 9121d28..74c4d7d 100644
+--- a/src/devices/src/virtio/fs/macos/syncopen.rs
++++ b/src/devices/src/virtio/fs/macos/syncopen.rs
+@@ -262,6 +262,32 @@ pub unsafe fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+ /// # Safety
+ /// `path` must point to a NUL-terminated string.
+ unsafe fn open_inline(path: *const c_char, flags: c_int, mode: c_int) -> Option<c_int> {
++    unsafe { open_inline_with(|| libc::open(path, flags | libc::O_NONBLOCK, mode)) }.map(|(fd, _)| fd)
++}
++
++/// [`open_inline`] of `name` in the directory `dirfd` (a pinned parent): resolving one name
++/// in a held directory costs less than resolving `/.vol/<dev>/<ino>`. Returns the descriptor
++/// and its stat, for the caller to check that it is still the file it meant.
++///
++/// # Safety
++/// `name` must point to a NUL-terminated string.
++pub unsafe fn open_inline_at(
++    dirfd: c_int,
++    name: *const c_char,
++    flags: c_int,
++) -> Option<(c_int, libc::stat)> {
++    unsafe {
++        open_inline_with(|| {
++            libc::openat(
++                dirfd,
++                name,
++                flags | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
++            )
++        })
++    }
++}
++
++unsafe fn open_inline_with(open: impl FnOnce() -> c_int) -> Option<(c_int, libc::stat)> {
+     let policy = |p| unsafe {
+         setiopolicy_np(
+             IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+@@ -272,7 +298,7 @@ unsafe fn open_inline(path: *const c_char, flags: c_int, mode: c_int) -> Option<
+     if policy(IOPOL_MATERIALIZE_DATALESS_FILES_OFF) != 0 {
+         return None;
+     }
+-    let fd = unsafe { libc::open(path, flags | libc::O_NONBLOCK, mode) };
++    let fd = open();
+     policy(IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT);
+     if fd < 0 {
+         return None;
+@@ -285,9 +311,9 @@ unsafe fn open_inline(path: *const c_char, flags: c_int, mode: c_int) -> Option<
+         );
+     // O_NONBLOCK does nothing on a regular file or a directory, so it can stay set.
+     if plain {
+-        let mtime = mtime_ns(unsafe { st.assume_init_ref() });
+-        LAST_MTIME.with(|m| m.set(Some((fd, mtime))));
+-        Some(fd)
++        let st = unsafe { st.assume_init() };
++        LAST_MTIME.with(|m| m.set(Some((fd, mtime_ns(&st)))));
++        Some((fd, st))
+     } else {
+         unsafe { libc::close(fd) };
+         None
+diff --git a/src/devices/src/virtio/fs/sync_policy.rs b/src/devices/src/virtio/fs/sync_policy.rs
+index 4446727..d552373 100644
+--- a/src/devices/src/virtio/fs/sync_policy.rs
++++ b/src/devices/src/virtio/fs/sync_policy.rs
+@@ -75,13 +75,18 @@ pub fn classify(opcode: u32, io_size: u32) -> Route {
+             // Every server answers at once (unsupported, or a table update);
+             // the guest sends one for each isatty() on a shared file.
+             Ioctl,
++            // F_BARRIERFSYNC on local APFS takes a fraction of a millisecond, less than
++            // the pool's wakeup and completion interrupt add to it, so it runs on
++            // the vCPU. Nodes on volumes that can block still go to the pool.
++            Fsync,
++            Fsyncdir,
+         ]
+         .into_iter()
+         .any(|o| op(o) == x) =>
+         {
+             Route::Sync
+         }
+-        // Fsync, Fsyncdir, Fallocate, Setxattr, Removexattr, CopyFileRange,
++        // Fallocate, Setxattr, Removexattr, CopyFileRange,
+         // Setlk(w), Getlk, Poll, Bmap, mappings and unknown opcodes.
+         _ => Route::Async,
+     }
+@@ -287,6 +292,8 @@ mod tests {
+             Getxattr,
+             Flush,
+             Ioctl,
++            Fsync,
++            Fsyncdir,
+         ] {
+             assert_eq!(classify(o as u32, 0), Route::Sync, "{o:?}");
+         }
+@@ -294,8 +301,6 @@ mod tests {
+             assert_eq!(classify(o as u32, 0), Route::BoundedOpen, "{o:?}");
+         }
+         for o in [
+-            Fsync,
+-            Fsyncdir,
+             Fallocate,
+             Setxattr,
+             Removexattr,
+@@ -378,6 +383,7 @@ mod tests {
+         assert_eq!(p.route(&peek(Opcode::Open, 31)), Route::Async);
+         assert_eq!(p.route(&peek(Opcode::Getattr, 31)), Route::Async);
+         // Opcodes that always block stay async on any node.
+-        assert_eq!(p.route(&peek(Opcode::Fsync, 1)), Route::Async);
++        assert_eq!(p.route(&peek(Opcode::Setxattr, 1)), Route::Async);
++        assert_eq!(p.route(&peek(Opcode::Fsync, 31)), Route::Async);
+     }
+ }
+diff --git a/src/devices/src/virtio/fs/worker.rs b/src/devices/src/virtio/fs/worker.rs
+index 01a9698..3a1a4e4 100644
+--- a/src/devices/src/virtio/fs/worker.rs
++++ b/src/devices/src/virtio/fs/worker.rs
+@@ -16,8 +16,9 @@ use utils::windows::AsRawFd;
+ use crossbeam_channel::{Receiver, unbounded};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+ use utils::eventfd::EventFd;
+-use vm_memory::{GuestAddress, GuestMemoryMmap};
++use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryMmap};
+ 
++use super::super::queue::read_small;
+ use super::super::{DescriptorChain, FsError, Queue};
+ use super::augment_fs::AugmentFs;
+ use super::defs::{HPQ_INDEX, REQ_INDEX};
+@@ -483,6 +484,9 @@ impl FsCore {
+     }
+ 
+     fn peek(&self, head: &DescriptorChain, queue_index: usize) -> Option<Peeked> {
++        if let Some(p) = self.peek_head(head, queue_index) {
++            return Some(p);
++        }
+         let mut r = Reader::new(&self.mem, head.clone()).ok()?;
+         let h: InHeader = r.read_obj().ok()?;
+         let mut p = Peeked {
+@@ -510,6 +514,51 @@ impl FsCore {
+         Some(p)
+     }
+ 
++    /// The header and READ/WRITE size straight from the first descriptor, where the guest puts
++    /// them, without walking the chain. None when they are not all there or a name is needed.
++    fn peek_head(&self, head: &DescriptorChain, queue_index: usize) -> Option<Peeked> {
++        const HDR: usize = size_of::<InHeader>();
++        if !head.is_read_only() || (head.len as usize) < HDR {
++            return None;
++        }
++        let h: InHeader = read_small(&self.mem, head.addr)?;
++        let mut p = Peeked {
++            opcode: h.opcode,
++            nodeid: h.nodeid,
++            io_size: 0,
++            name: None,
++        };
++        if queue_index == HPQ_INDEX {
++            return Some(p);
++        }
++        if h.opcode == Opcode::Read as u32 {
++            p.io_size = self.peek_args::<ReadIn>(head)?.size;
++        } else if h.opcode == Opcode::Write as u32 {
++            p.io_size = self.peek_args::<WriteIn>(head)?.size;
++        } else if h.opcode == Opcode::Lookup as u32 && self.policy.wants_name(h.nodeid) {
++            return None;
++        }
++        Some(p)
++    }
++
++    /// The arguments after the header: in the same descriptor, or (as Linux sends them) at the
++    /// start of the next one.
++    fn peek_args<T: ByteValued>(&self, head: &DescriptorChain) -> Option<T> {
++        const HDR: usize = size_of::<InHeader>();
++        let need = size_of::<T>();
++        if head.len as usize >= HDR + need {
++            return read_small(&self.mem, head.addr.checked_add(HDR as u64)?);
++        }
++        if head.len as usize != HDR {
++            return None;
++        }
++        let next = head.next_descriptor()?;
++        if !next.is_read_only() || (next.len as usize) < need {
++            return None;
++        }
++        read_small(&self.mem, next.addr)
++    }
++
+     fn route(&self, peeked: &Option<Peeked>, queue_index: usize) -> Route {
+         let Some(p) = peeked else {
+             // Malformed: the server answers with an error right away.
+@@ -541,7 +590,7 @@ impl FsCore {
+         let writer = Writer::new(&self.mem, head)
+             .map_err(FsError::QueueWriter)
+             .unwrap();
+-        let started = Instant::now();
++        let started = STATS_ON.load(Ordering::Relaxed).then(Instant::now);
+         let len = match self.server.handle_message(
+             reader,
+             writer,
+@@ -557,11 +606,13 @@ impl FsCore {
+                 0
+             }
+         };
+-        let ns = started.elapsed().as_nanos() as u64;
+-        STAT_REQS.fetch_add(1, Ordering::Relaxed);
+-        STAT_NS.fetch_add(ns, Ordering::Relaxed);
+-        if let Some(op) = opcode {
+-            note_op(op, ns);
++        if let Some(started) = started {
++            let ns = started.elapsed().as_nanos() as u64;
++            STAT_REQS.fetch_add(1, Ordering::Relaxed);
++            STAT_NS.fetch_add(ns, Ordering::Relaxed);
++            if let Some(op) = opcode {
++                note_op(op, ns);
++            }
+         }
+         len
+     }
+diff --git a/src/devices/src/virtio/queue.rs b/src/devices/src/virtio/queue.rs
+index 8f65f49..d814b81 100644
+--- a/src/devices/src/virtio/queue.rs
++++ b/src/devices/src/virtio/queue.rs
+@@ -223,6 +223,16 @@ pub struct DescriptorChain<'a> {
+     pub next: u16,
+ }
+ 
++/// A small object from guest memory through its region's mapping. `read_obj` copies through
++/// a generic iterator over regions, which cost every request more than the request's own
++/// decoding; it remains the fallback for an object that crosses regions.
++pub(crate) fn read_small<T: ByteValued>(mem: &GuestMemoryMmap, addr: GuestAddress) -> Option<T> {
++    match mem.get_slice(addr, size_of::<T>()) {
++        Ok(slice) => slice.read_obj(0).ok(),
++        Err(_) => mem.read_obj(addr).ok(),
++    }
++}
++
+ impl<'a> DescriptorChain<'a> {
+     pub fn checked_new(
+         mem: &GuestMemoryMmap,
+@@ -238,9 +248,9 @@ impl<'a> DescriptorChain<'a> {
+         mem.checked_offset(desc_head, 16)?;
+ 
+         // These reads can't fail unless Guest memory is hopelessly broken.
+-        let desc = match mem.read_obj::<Descriptor>(desc_head) {
+-            Ok(ret) => ret,
+-            Err(_) => {
++        let desc = match read_small::<Descriptor>(mem, desc_head) {
++            Some(ret) => ret,
++            None => {
+                 // TODO log address
+                 error!("Failed to read from memory");
+                 return None;
+@@ -527,9 +537,8 @@ impl Queue {
+         // `self.is_valid()` already performed all the bound checks on the descriptor table
+         // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
+         // offsets.
+-        let desc_index: u16 = mem
+-            .read_obj(self.avail_ring.unchecked_add(u64::from(index_offset)))
+-            .unwrap();
++        let desc_index: u16 =
++            read_small(mem, self.avail_ring.unchecked_add(u64::from(index_offset))).unwrap();
+ 
+         DescriptorChain::checked_new(mem, self.desc_table, self.actual_size(), desc_index)
+             .inspect(|_| self.next_avail += Wrapping(1))

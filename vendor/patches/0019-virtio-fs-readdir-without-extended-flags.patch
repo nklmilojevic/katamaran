@@ -1,0 +1,91 @@
+diff --git a/src/devices/src/virtio/fs/macos/attrlist.rs b/src/devices/src/virtio/fs/macos/attrlist.rs
+index 4f890d6..dcade4b 100644
+--- a/src/devices/src/virtio/fs/macos/attrlist.rs
++++ b/src/devices/src/virtio/fs/macos/attrlist.rs
+@@ -111,8 +111,13 @@ pub(super) fn supported(fd: RawFd) -> bool {
+ }
+ 
+ /// Appends every entry of the directory open at `fd` (read from its current offset) to `entries`.
+-/// On error, the entries read so far stay in `entries`.
+-pub(super) fn read_dir(fd: RawFd, entries: &mut Vec<BulkEntry>) -> io::Result<()> {
++/// On error, the entries read so far stay in `entries`. `xattr_flags` also asks which entries have
++/// no extended attributes ([`BulkEntry::no_xattrs`]); it makes the listing about 40% slower.
++pub(super) fn read_dir(
++    fd: RawFd,
++    xattr_flags: bool,
++    entries: &mut Vec<BulkEntry>,
++) -> io::Result<()> {
+     let mut attrs = attrlist {
+         bitmapcount: ATTR_BIT_MAP_COUNT,
+         reserved: 0,
+@@ -120,7 +125,12 @@ pub(super) fn read_dir(fd: RawFd, entries: &mut Vec<BulkEntry>) -> io::Result<()
+         volattr: 0,
+         dirattr: mask(DIR),
+         fileattr: mask(FILE),
+-        forkattr: mask(EXT),
++        forkattr: if xattr_flags { mask(EXT) } else { 0 },
++    };
++    let options = if xattr_flags {
++        FSOPT_ATTR_CMN_EXTENDED
++    } else {
++        0
+     };
+     // u64 storage keeps each entry 8-byte aligned, as the kernel packs them.
+     let mut buf = vec![0u64; BUF_SIZE / mem::size_of::<u64>()];
+@@ -132,7 +142,7 @@ pub(super) fn read_dir(fd: RawFd, entries: &mut Vec<BulkEntry>) -> io::Result<()
+                 (&mut attrs as *mut attrlist).cast(),
+                 buf.as_mut_ptr().cast(),
+                 BUF_SIZE,
+-                u64::from(FSOPT_ATTR_CMN_EXTENDED),
++                u64::from(options),
+             )
+         };
+         if count < 0 {
+@@ -376,7 +386,7 @@ mod tests {
+     fn compare_tree(dir: &Path, checked: &mut usize, fallbacks: &mut usize) {
+         let fd = File::open(dir).unwrap();
+         let mut entries = Vec::new();
+-        read_dir(fd.as_raw_fd(), &mut entries).unwrap();
++        read_dir(fd.as_raw_fd(), true, &mut entries).unwrap();
+         for e in entries {
+             let path = dir.join(std::ffi::OsStr::from_bytes(&e.name));
+             let host = fs::symlink_metadata(&path).unwrap();
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index 0665ad3..3407e09 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -145,13 +145,13 @@ impl DirStream {
+ 
+     // Reads the whole directory from its start. getattrlistbulk cannot seek, so the stream keeps
+     // every entry and serves offsets as indexes into them.
+-    fn fill(&mut self, fd: RawFd, bulk: bool) -> io::Result<()> {
++    fn fill(&mut self, fd: RawFd, bulk: bool, xattr_flags: bool) -> io::Result<()> {
+         unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+         if !(bulk && attrlist::supported(fd)) {
+             return self.fill_from_fd(fd);
+         }
+         let mut entries = Vec::new();
+-        let res = attrlist::read_dir(fd, &mut entries);
++        let res = attrlist::read_dir(fd, xattr_flags, &mut entries);
+         self.entries
+             .extend(entries.into_iter().map(|e| CachedDirEntry {
+                 ino: e.ino,
+@@ -1114,7 +1114,8 @@ impl PassthroughFs {
+         if !ds.ready {
+             // Fill the cache on first call
+             let fd = data.file.write().unwrap().as_raw_fd();
+-            if let Err(e) = ds.fill(fd, self.bulk_readdir) {
++            let xattr_flags = matches!(self.cfg.ownership(), Ownership::Xattr);
++            if let Err(e) = ds.fill(fd, self.bulk_readdir, xattr_flags) {
+                 if ds.entries.is_empty() {
+                     return Err(e);
+                 }
+@@ -3593,7 +3594,7 @@ mod tests {
+         let fd = File::open(&dir).unwrap();
+         assert!(attrlist::supported(fd.as_raw_fd()));
+         let mut entries = Vec::new();
+-        attrlist::read_dir(fd.as_raw_fd(), &mut entries).unwrap();
++        attrlist::read_dir(fd.as_raw_fd(), true, &mut entries).unwrap();
+ 
+         let mut names: Vec<_> = entries.iter().map(|e| e.name.to_vec()).collect();
+         names.sort();

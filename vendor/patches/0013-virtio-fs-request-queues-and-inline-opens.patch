@@ -1,0 +1,723 @@
+Subject: virtio/fs: a request queue per vCPU, inline opens and ioctls
+
+Every request queue shared one mutex, and the device offered one request
+queue, so file requests from all vCPUs were processed one at a time: ten
+parallel unzips onto a share ran one request at a time, with one thread
+busy and the vCPUs waiting. Offer up to 16 request queues
+(set_request_queues, usually one per vCPU; the guest maps CPUs to queues),
+each with its own lock, and drain the queue the guest names in KAT_FS_DRAIN.
+
+A bounded open handed every open to a helper thread, usually parked, so an
+open cost a thread wakeup on top of the syscall (24 us of host time per
+OPEN, most of PHP's per-request file cost without opcache). Try the open on
+the calling thread first, with materializing of dataless files turned off
+for that thread and O_NONBLOCK so a FIFO cannot block; only what fails or
+is not a regular file or directory goes to a helper as before.
+
+FUSE_IOCTL ran on the worker pool although every server answers it at once;
+the guest sends one for each isatty() on a shared file (perl, Python).
+
+SETATTR of times by path opened the file to futimens it; utimensat with
+AT_SYMLINK_NOFOLLOW does the same in one call.
+
+KATAMARAN_FS_STATS=1 also logs request counts and host time per opcode.
+
+--- a/src/devices/src/virtio/fs/mod.rs	2026-11-18 23:10:42
++++ b/src/devices/src/virtio/fs/mod.rs	2026-11-18 23:10:42
+@@ -97,12 +97,14 @@
+     use super::super::QueueConfig;
+ 
+     pub const FS_DEV_ID: &str = "virtio_fs";
+-    pub const NUM_QUEUES: usize = 2;
++    /// Request queues a device may offer; the guest maps each CPU to one.
++    pub const MAX_REQUEST_QUEUES: usize = 16;
++    pub const NUM_QUEUES: usize = 1 + MAX_REQUEST_QUEUES;
+     pub const QUEUE_SIZE: u16 = 1024;
+     pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
+     // High priority queue.
+     pub const HPQ_INDEX: usize = 0;
+-    // Request queue.
++    // The first request queue.
+     pub const REQ_INDEX: usize = 1;
+ 
+     pub mod uapi {
+--- a/src/devices/src/virtio/fs/device.rs	2026-11-18 23:10:42
++++ b/src/devices/src/virtio/fs/device.rs	2026-11-18 23:10:42
+@@ -119,6 +119,17 @@
+         defs::FS_DEV_ID
+     }
+ 
++    /// Offer `n` request queues (at most [`defs::MAX_REQUEST_QUEUES`]) before activation. The
++    /// guest gives each CPU its own queue where it can, so requests from different vCPUs are
++    /// processed in parallel instead of one after another on one queue.
++    pub fn set_request_queues(&mut self, n: u32) -> bool {
++        if self.device_state.is_activated() || n == 0 || n as usize > defs::MAX_REQUEST_QUEUES {
++            return false;
++        }
++        self.config.num_request_queues = n;
++        true
++    }
++
+     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
+         self.shm_region = Some(shm_region);
+     }
+@@ -304,7 +315,8 @@
+     }
+ 
+     fn queue_config(&self) -> &[QueueConfig] {
+-        &defs::QUEUE_CONFIG
++        let n = self.config.num_request_queues;
++        &defs::QUEUE_CONFIG[..defs::REQ_INDEX + n as usize]
+     }
+ 
+     fn config_len(&self) -> Option<u32> {
+@@ -396,13 +408,13 @@
+     }
+ 
+     fn notify_inline(&mut self, queue_index: u32) -> bool {
+-        if queue_index as usize != defs::REQ_INDEX {
++        if (queue_index as usize) < defs::REQ_INDEX {
+             return false;
+         }
+         let Some(core) = &self.inline_core else {
+             return false;
+         };
+-        let drained = core.try_drain_notified(defs::REQ_INDEX);
++        let drained = core.try_drain_notified(queue_index as usize);
+         if drained {
+             super::worker::note_inline(1);
+         }
+@@ -438,6 +450,20 @@
+             Vec::new(),
+         )
+         .unwrap()
++    }
++
++    #[test]
++    fn request_queues_size_the_queues_and_the_config_space() {
++        let mut fs = filesystem(None);
++        assert_eq!(fs.queue_config().len(), 2);
++        assert!(fs.set_request_queues(14));
++        assert_eq!(fs.queue_config().len(), 15);
++        let mut n = [0u8; 4];
++        fs.read_config(36, &mut n);
++        assert_eq!(u32::from_le_bytes(n), 14);
++        assert!(!fs.set_request_queues(0));
++        assert!(!fs.set_request_queues(defs::MAX_REQUEST_QUEUES as u32 + 1));
++        assert_eq!(fs.queue_config().len(), 15);
+     }
+ 
+     #[test]
+@@ -645,8 +671,8 @@
+ 
+ #[cfg(target_os = "macos")]
+ fn register_sync_calls(core: Arc<FsCore>) {
+-    hvf::vendor_call::register(KAT_FS_DRAIN, move |_| {
++    hvf::vendor_call::register(KAT_FS_DRAIN, move |[queue, ..]| {
+         super::worker::note_sync(1);
+-        core.drain_sync(defs::REQ_INDEX)
++        core.drain_sync(queue as usize)
+     });
+ }
+--- a/src/devices/src/virtio/fs/worker.rs	2026-11-18 23:10:42
++++ b/src/devices/src/virtio/fs/worker.rs	2026-11-18 23:10:42
+@@ -6,7 +6,7 @@
+ use std::io;
+ #[cfg(unix)]
+ use std::os::fd::AsRawFd;
+-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, Weak};
+ use std::thread;
+ use std::time::{Duration, Instant};
+@@ -104,7 +104,9 @@
+ /// locked only to pop and complete requests and to run requests that cannot
+ /// block for long.
+ pub struct FsCore {
+-    queues: Mutex<Vec<Queue>>,
++    /// One lock per queue, so vCPUs that submit on different request queues
++    /// do not wait for each other.
++    queues: Vec<Mutex<Queue>>,
+     interrupt: InterruptTransport,
+     mem: GuestMemoryMmap,
+     allow_idmap: bool,
+@@ -195,7 +197,7 @@
+             )),
+         };
+         let core = Arc::new(FsCore {
+-            queues: Mutex::new(queues),
++            queues: queues.into_iter().map(Mutex::new).collect(),
+             interrupt,
+             mem,
+             allow_idmap,
+@@ -228,22 +230,18 @@
+ 
+     fn work(self) {
+         set_interactive_qos();
+-        let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
+-        let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
+         let stop_ev_fd = self.stop_fd.as_raw_fd();
+ 
+         let mut epoll = Epoll::new().unwrap();
+ 
+-        let _ = epoll.ctl(
+-            ControlOperation::Add,
+-            virtq_hpq_ev_fd,
+-            &EpollEvent::new(EventSet::IN, virtq_hpq_ev_fd as u64),
+-        );
+-        let _ = epoll.ctl(
+-            ControlOperation::Add,
+-            virtq_req_ev_fd,
+-            &EpollEvent::new(EventSet::IN, virtq_req_ev_fd as u64),
+-        );
++        for evt in &self.queue_evts {
++            let fd = evt.as_raw_fd();
++            let _ = epoll.ctl(
++                ControlOperation::Add,
++                fd,
++                &EpollEvent::new(EventSet::IN, fd as u64),
++            );
++        }
+         let _ = epoll.ctl(
+             ControlOperation::Add,
+             stop_ev_fd,
+@@ -257,13 +255,14 @@
+                     for event in &epoll_events[0..ev_cnt] {
+                         let source = event.fd();
+                         let event_set = event.event_set();
++                        let queue = self
++                            .queue_evts
++                            .iter()
++                            .position(|evt| evt.as_raw_fd() == source);
+                         match event_set {
+-                            EventSet::IN if source == virtq_hpq_ev_fd => {
+-                                self.handle_event(HPQ_INDEX);
++                            EventSet::IN if queue.is_some() => {
++                                self.handle_event(queue.unwrap());
+                             }
+-                            EventSet::IN if source == virtq_req_ev_fd => {
+-                                self.handle_event(REQ_INDEX);
+-                            }
+                             EventSet::IN if source == stop_ev_fd => {
+                                 debug!("stopping worker thread");
+                                 let _ = self.stop_fd.read();
+@@ -308,7 +307,40 @@
+ static STAT_SYNC: AtomicU64 = AtomicU64::new(0);
+ static STAT_ASYNC: AtomicU64 = AtomicU64::new(0);
+ static STAT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
++static STATS_ON: AtomicBool = AtomicBool::new(false);
++/// Requests and host nanoseconds per FUSE opcode (`OP_SLOTS - 1` collects the rest).
++const OP_SLOTS: usize = 64;
++static OP_REQS: [AtomicU64; OP_SLOTS] = [const { AtomicU64::new(0) }; OP_SLOTS];
++static OP_NS: [AtomicU64; OP_SLOTS] = [const { AtomicU64::new(0) }; OP_SLOTS];
+ 
++fn note_op(opcode: u32, ns: u64) {
++    let slot = (opcode as usize).min(OP_SLOTS - 1);
++    OP_REQS[slot].fetch_add(1, Ordering::Relaxed);
++    OP_NS[slot].fetch_add(ns, Ordering::Relaxed);
++}
++
++/// `"getattr 120 (3.1 us)"` for the busiest opcodes since `last`, which is updated.
++fn op_summary(last: &mut [(u64, u64); OP_SLOTS]) -> String {
++    let mut rows: Vec<(usize, u64, u64)> = (0..OP_SLOTS)
++        .map(|i| {
++            let (n, ns) = (
++                OP_REQS[i].load(Ordering::Relaxed),
++                OP_NS[i].load(Ordering::Relaxed),
++            );
++            let row = (i, n - last[i].0, ns - last[i].1);
++            last[i] = (n, ns);
++            row
++        })
++        .filter(|&(_, n, _)| n > 0)
++        .collect();
++    rows.sort_by_key(|&(_, n, _)| std::cmp::Reverse(n));
++    rows.iter()
++        .take(12)
++        .map(|&(op, n, ns)| format!("{op}:{n} ({:.1} us)", ns as f64 / n as f64 / 1000.0))
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
+ /// KATAMARAN_FS_STATS=1: every 2 s, log how many requests the server handled
+ /// and the mean host time per request.
+ pub fn start_stats_reporter() {
+@@ -317,8 +349,10 @@
+         return;
+     }
+     STARTED.call_once(|| {
++        STATS_ON.store(true, Ordering::Relaxed);
+         thread::spawn(|| {
+             let mut last = [0u64; 6];
++            let mut last_ops = [(0u64, 0u64); OP_SLOTS];
+             loop {
+                 thread::sleep(Duration::from_secs(2));
+                 let now = [
+@@ -340,6 +374,7 @@
+                         d[4],
+                         d[5]
+                     );
++                    log::warn!("fs ops (opcode:count): {}", op_summary(&mut last_ops));
+                 }
+                 last = now;
+             }
+@@ -388,17 +423,17 @@
+ 
+     /// Worker thread: process everything, blocking requests on the pool.
+     pub fn drain(&self, queue_index: usize) {
+-        let mut queues = self.queues.lock().unwrap();
+-        self.drain_locked(&mut queues[queue_index], queue_index, false);
++        let mut queue = self.queues[queue_index].lock().unwrap();
++        self.drain_locked(&mut queue, queue_index, false);
+     }
+ 
+     /// vCPU thread after an MMIO queue notify. Returns false when another
+     /// thread holds the queues; the caller then wakes the worker thread.
+     pub fn try_drain_notified(&self, queue_index: usize) -> bool {
+-        let Ok(mut queues) = self.queues.try_lock() else {
++        let Some(Ok(mut queue)) = self.queues.get(queue_index).map(Mutex::try_lock) else {
+             return false;
+         };
+-        self.drain_locked(&mut queues[queue_index], queue_index, false);
++        self.drain_locked(&mut queue, queue_index, false);
+         true
+     }
+ 
+@@ -406,10 +441,14 @@
+     /// interrupt, the guest collects the replies itself on return. Stops at
+     /// the first request that may block and returns [`DRAIN_BUSY`].
+     pub fn drain_sync(&self, queue_index: usize) -> u64 {
+-        let Ok(mut queues) = self.queues.try_lock() else {
++        // A queue the guest does not use for requests: let it notify instead.
++        if queue_index < REQ_INDEX {
+             return DRAIN_BUSY;
++        }
++        let Some(Ok(mut queue)) = self.queues.get(queue_index).map(Mutex::try_lock) else {
++            return DRAIN_BUSY;
+         };
+-        self.drain_locked(&mut queues[queue_index], queue_index, true)
++        self.drain_locked(&mut queue, queue_index, true)
+     }
+ 
+     fn drain_locked(&self, queue: &mut Queue, queue_index: usize, sync: bool) -> u64 {
+@@ -476,6 +515,14 @@
+     }
+ 
+     fn handle(&self, head: DescriptorChain) -> usize {
++        let opcode = if STATS_ON.load(Ordering::Relaxed) {
++            Reader::new(&self.mem, head.clone())
++                .ok()
++                .and_then(|mut r| r.read_obj::<InHeader>().ok())
++                .map(|h| h.opcode)
++        } else {
++            None
++        };
+         let reader = Reader::new(&self.mem, head.clone())
+             .map_err(FsError::QueueReader)
+             .unwrap();
+@@ -498,8 +545,12 @@
+                 0
+             }
+         };
++        let ns = started.elapsed().as_nanos() as u64;
+         STAT_REQS.fetch_add(1, Ordering::Relaxed);
+-        STAT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
++        STAT_NS.fetch_add(ns, Ordering::Relaxed);
++        if let Some(op) = opcode {
++            note_op(op, ns);
++        }
+         len
+     }
+ 
+@@ -541,8 +592,8 @@
+             return;
+         };
+         let len = self.handle(head);
+-        let mut queues = self.queues.lock().unwrap();
+-        self.add_used(&mut queues[job.queue_index], job.head, len, true);
++        let mut queue = self.queues[job.queue_index].lock().unwrap();
++        self.add_used(&mut queue, job.head, len, true);
+     }
+ 
+     /// Returns true when the sync drain must stop and report busy.
+@@ -586,3 +637,91 @@
+         false
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::legacy::DummyIrqChip;
++    use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
++    use crate::virtio::queue::tests::VirtQueue;
++    use std::mem::size_of;
++    use utils::eventfd::EFD_NONBLOCK;
++    use vm_memory::Bytes;
++
++    use super::super::fuse::GetattrIn;
++
++    /// A request queue at `base` holding one GETATTR of the root.
++    fn queue_with_getattr(mem: &GuestMemoryMmap, base: u64) -> VirtQueue<'_> {
++        let vq = VirtQueue::new(GuestAddress(base), mem, 16);
++        let req = GuestAddress(base + 0x8000);
++        let len = (size_of::<InHeader>() + size_of::<GetattrIn>()) as u32;
++        create_descriptor_chain(
++            mem,
++            GuestAddress(base),
++            req,
++            vec![
++                (DescriptorType::Readable, len),
++                (DescriptorType::Writable, 0x200),
++            ],
++            0,
++        )
++        .unwrap();
++        let header = InHeader {
++            len,
++            opcode: Opcode::Getattr as u32,
++            unique: 1,
++            nodeid: super::super::fuse::ROOT_ID,
++            ..Default::default()
++        };
++        mem.write_obj(header, req).unwrap();
++        vq.avail.ring[0].set(0);
++        vq.avail.idx.set(1);
++        vq
++    }
++
++    #[test]
++    fn request_queues_are_drained_independently() {
++        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
++        let hpq = VirtQueue::new(GuestAddress(0), &mem, 16);
++        let q1 = queue_with_getattr(&mem, 0x10000);
++        let q2 = queue_with_getattr(&mem, 0x20000);
++        let worker = FsWorker::new(
++            vec![hpq.create_queue(), q1.create_queue(), q2.create_queue()],
++            (0..3)
++                .map(|_| Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()))
++                .collect(),
++            InterruptTransport::new(DummyIrqChip::new().into(), "fs test".into()).unwrap(),
++            mem.clone(),
++            false,
++            None,
++            Some(passthrough::Config {
++                root_dir: "/".into(),
++                ..Default::default()
++            }),
++            false,
++            Vec::new(),
++            EventFd::new(EFD_NONBLOCK).unwrap(),
++            Arc::new(AtomicI32::new(0)),
++            #[cfg(target_os = "macos")]
++            None,
++        )
++        .unwrap();
++        let core = worker.core();
++
++        // Another vCPU is processing the first request queue.
++        let busy = core.queues[REQ_INDEX].lock().unwrap();
++        assert_eq!(core.drain_sync(REQ_INDEX), DRAIN_BUSY);
++        assert_eq!(core.drain_sync(REQ_INDEX + 1), DRAIN_DONE);
++        assert_eq!(q2.used.idx.get(), 1);
++        assert_eq!(q1.used.idx.get(), 0);
++        drop(busy);
++        assert_eq!(core.drain_sync(REQ_INDEX), DRAIN_DONE);
++        assert_eq!(q1.used.idx.get(), 1);
++
++        // Not request queues: the guest notifies instead.
++        assert_eq!(core.drain_sync(HPQ_INDEX), DRAIN_BUSY);
++        assert_eq!(core.drain_sync(REQ_INDEX + 2), DRAIN_BUSY);
++        assert!(!core.try_drain_notified(REQ_INDEX + 2));
++        core.stop_pool();
++    }
++}
+--- a/src/devices/src/virtio/fs/sync_policy.rs	2026-11-18 23:10:42
++++ b/src/devices/src/virtio/fs/sync_policy.rs	2026-11-18 23:10:42
+@@ -70,6 +70,9 @@
+             Interrupt,
+             Destroy,
+             Lseek,
++            // Every server answers at once (unsupported, or a table update);
++            // the guest sends one for each isatty() on a shared file.
++            Ioctl,
+         ]
+         .into_iter()
+         .any(|o| op(o) == x) =>
+@@ -77,7 +80,7 @@
+             Route::Sync
+         }
+         // Fsync, Fsyncdir, Fallocate, Setxattr, Removexattr, CopyFileRange,
+-        // Ioctl, Setlk(w), Getlk, Poll, Bmap, mappings and unknown opcodes.
++        // Setlk(w), Getlk, Poll, Bmap, mappings and unknown opcodes.
+         _ => Route::Async,
+     }
+ }
+@@ -281,6 +284,7 @@
+             Rename,
+             Getxattr,
+             Flush,
++            Ioctl,
+         ] {
+             assert_eq!(classify(o as u32, 0), Route::Sync, "{o:?}");
+         }
+@@ -294,7 +298,6 @@
+             Setxattr,
+             Removexattr,
+             CopyFileRange,
+-            Ioctl,
+             Setlkw,
+         ] {
+             assert_eq!(classify(o as u32, 0), Route::Async, "{o:?}");
+--- a/src/devices/src/virtio/fs/macos/syncopen.rs	2026-11-18 23:10:42
++++ b/src/devices/src/virtio/fs/macos/syncopen.rs	2026-11-18 23:10:42
+@@ -6,6 +6,11 @@
+ //! thread and the caller waits at most [`DEADLINE`]. On timeout the open is
+ //! abandoned (the helper closes the descriptor when it finally returns), the
+ //! request is retried on the worker pool and the node becomes async-only.
++//!
++//! Most opens cannot block, and handing them to a helper costs more than the
++//! open itself. So the calling thread first tries the open with materializing
++//! of dataless files turned off for itself and without waiting for a FIFO's
++//! peer; only what that attempt cannot open goes to a helper.
+ 
+ use std::cell::Cell;
+ use std::ffi::{CStr, CString};
+@@ -31,8 +36,20 @@
+ thread_local! {
+     static BOUNDED: Cell<bool> = const { Cell::new(false) };
+     static TIMED_OUT: Cell<bool> = const { Cell::new(false) };
++    /// Opens this thread handed to a helper, for tests.
++    static HELPER_OPENS: Cell<u64> = const { Cell::new(0) };
+ }
+ 
++// <sys/resource.h>
++const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
++const IOPOL_SCOPE_THREAD: c_int = 1;
++const IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT: c_int = 0;
++const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
++
++unsafe extern "C" {
++    fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
++}
++
+ /// While alive, opens on this thread go through [`run_bounded`].
+ pub struct BoundedScope(());
+ 
+@@ -203,6 +220,10 @@
+     if !BOUNDED.with(|b| b.get()) {
+         return unsafe { libc::open(path, flags, mode) };
+     }
++    if let Some(fd) = unsafe { open_inline(path, flags, mode) } {
++        return fd;
++    }
++    HELPER_OPENS.with(|n| n.set(n.get() + 1));
+     let owned = unsafe { CStr::from_ptr(path) }.to_owned();
+     match open_with_deadline(owned, flags, mode, DEADLINE) {
+         Ok(fd) => fd,
+@@ -210,7 +231,48 @@
+             Errno::set_raw(errno);
+             -1
+         }
++    }
++}
++
++/// Open on this thread if that cannot block: a dataless file fails instead of
++/// downloading, a FIFO opens without waiting for its peer and is closed again.
++/// `None` when the open failed or found something other than a regular file or
++/// a directory; the caller then opens it on a helper, as it would block.
++///
++/// # Safety
++/// `path` must point to a NUL-terminated string.
++unsafe fn open_inline(path: *const c_char, flags: c_int, mode: c_int) -> Option<c_int> {
++    let policy = |p| unsafe {
++        setiopolicy_np(
++            IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
++            IOPOL_SCOPE_THREAD,
++            p,
++        )
++    };
++    if policy(IOPOL_MATERIALIZE_DATALESS_FILES_OFF) != 0 {
++        return None;
+     }
++    let fd = unsafe { libc::open(path, flags | libc::O_NONBLOCK, mode) };
++    policy(IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT);
++    if fd < 0 {
++        return None;
++    }
++    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
++    let plain = unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0
++        && matches!(
++            unsafe { st.assume_init() }.st_mode & libc::S_IFMT,
++            libc::S_IFREG | libc::S_IFDIR
++        );
++    let restored = flags & libc::O_NONBLOCK != 0 || {
++        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++        fl >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) } == 0
++    };
++    if plain && restored {
++        Some(fd)
++    } else {
++        unsafe { libc::close(fd) };
++        None
++    }
+ }
+ 
+ fn open_with_deadline(
+@@ -270,7 +332,76 @@
+         unsafe { libc::close(fd) };
+     }
+ 
++    fn helper_opens() -> u64 {
++        HELPER_OPENS.with(|n| n.get())
++    }
++
+     #[test]
++    fn regular_files_and_directories_open_without_a_helper() {
++        let dir = TempDir::new();
++        let path = CString::new(dir.0.join("f").to_str().unwrap()).unwrap();
++        let dpath = CString::new(dir.0.to_str().unwrap()).unwrap();
++        let _scope = bounded_scope();
++        let before = helper_opens();
++        let fd = unsafe { open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
++        assert!(fd >= 0);
++        // O_NONBLOCK was only for the attempt.
++        assert_eq!(
++            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
++            0
++        );
++        unsafe { libc::close(fd) };
++        let fd = unsafe { open(dpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY, 0) };
++        assert!(fd >= 0);
++        unsafe { libc::close(fd) };
++        assert_eq!(helper_opens(), before);
++        // Asked for, it stays.
++        let fd = unsafe { open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK, 0) };
++        assert_ne!(
++            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
++            0
++        );
++        unsafe { libc::close(fd) };
++    }
++
++    #[test]
++    fn the_materialization_policy_is_restored() {
++        let dir = TempDir::new();
++        let path = CString::new(dir.0.join("f").to_str().unwrap()).unwrap();
++        let _scope = bounded_scope();
++        let fd = unsafe { open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
++        assert!(fd >= 0);
++        unsafe { libc::close(fd) };
++        unsafe extern "C" {
++            fn getiopolicy_np(iotype: c_int, scope: c_int) -> c_int;
++        }
++        let p = unsafe {
++            getiopolicy_np(
++                IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
++                IOPOL_SCOPE_THREAD,
++            )
++        };
++        assert_eq!(p, IOPOL_MATERIALIZE_DATALESS_FILES_DEFAULT);
++    }
++
++    #[test]
++    fn a_fifo_goes_to_a_helper_and_times_out() {
++        let (_dir, path) = fifo();
++        let _scope = bounded_scope();
++        let before = helper_opens();
++        let started = Instant::now();
++        let fd = unsafe { open(path.as_ptr(), libc::O_RDONLY, 0) };
++        assert_eq!(fd, -1);
++        assert_eq!(Errno::last_raw(), libc::EAGAIN);
++        assert!(take_timed_out());
++        assert!(started.elapsed() >= DEADLINE);
++        assert_eq!(helper_opens(), before + 1);
++        let w = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
++        assert!(w >= 0);
++        unsafe { libc::close(w) };
++    }
++
++    #[test]
+     fn errors_pass_through() {
+         let _scope = bounded_scope();
+         let fd = unsafe { open(c"/nonexistent/x".as_ptr(), libc::O_RDONLY, 0) };
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs	2026-11-18 23:10:42
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs	2026-11-18 23:10:42
+@@ -2325,11 +2325,15 @@
+             // Safe because this doesn't modify any memory and we check the return value.
+             let res = match ihandle {
+                 InodeHandle::Fd(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
++                // One call instead of open, futimens and close; the times of a
++                // symlink itself, as with O_SYMLINK.
+                 InodeHandle::Path(c_path) => unsafe {
+-                    let fd = libc::open(c_path.as_ptr(), libc::O_SYMLINK | libc::O_CLOEXEC);
+-                    let res = libc::futimens(fd, tvs.as_ptr());
+-                    libc::close(fd);
+-                    res
++                    libc::utimensat(
++                        libc::AT_FDCWD,
++                        c_path.as_ptr(),
++                        tvs.as_ptr(),
++                        libc::AT_SYMLINK_NOFOLLOW,
++                    )
+                 },
+             };
+             if res < 0 {
+@@ -3836,6 +3840,38 @@
+         assert_eq!(check(false), [true, false, true]);
+         fs::set_permissions(dir.join("cache"), fs::Permissions::from_mode(0o555)).unwrap();
+         assert_eq!(check(true), [true, false, true]);
++        fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn setattr_sets_times_without_following_symlinks() {
++        use std::os::unix::fs::MetadataExt;
++        let dir = fresh_dir("utimes");
++        fs::write(dir.join("f"), "x").unwrap();
++        std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
++        let fs = fixed_owner_at(&dir);
++        let set = |name: &str, atime: i64, mtime: i64| {
++            let mut attr: bindings::stat64 = unsafe { std::mem::zeroed() };
++            attr.st_atime = atime;
++            attr.st_mtime = mtime;
++            let inode = lookup_in(&fs, fuse::ROOT_ID, name).unwrap().inode;
++            fs.setattr(
++                CTX,
++                inode,
++                attr,
++                None,
++                SetattrValid::ATIME | SetattrValid::MTIME,
++            )
++            .unwrap();
++        };
++        let times = |name: &str| {
++            let md = fs::symlink_metadata(dir.join(name)).unwrap();
++            (md.atime(), md.mtime())
++        };
++        set("f", 1_000_000, 2_000_000);
++        set("l", 3_000_000, 4_000_000);
++        assert_eq!(times("f"), (1_000_000, 2_000_000));
++        assert_eq!(times("l"), (3_000_000, 4_000_000));
+         fs::remove_dir_all(&dir).unwrap();
+     }
+ 
+--- a/src/libkrun/src/api/device_builders.rs	2026-11-18 23:10:42
++++ b/src/libkrun/src/api/device_builders.rs	2026-11-18 23:10:42
+@@ -761,6 +761,16 @@
+ 
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ impl<'a> FsDevice<'a> {
++    /// Offer the guest `n` request queues (1 to 16; one by default). A guest kernel with
++    /// multi-queue virtio-fs maps CPUs to queues, and requests on different queues are
++    /// processed in parallel. Usually the number of vCPUs.
++    pub fn set_request_queues(&mut self, n: u32) -> Result<(), VmmError> {
++        if !self.inner.lock().unwrap().set_request_queues(n) {
++            return Err(VmmError::InvalidParam());
++        }
++        Ok(())
++    }
++
+     /// Make fsync a no-op on this share (for disposable data). Off by default.
+     pub fn set_no_sync_io(&mut self, no_sync_io: bool) -> Result<(), VmmError> {
+         if !self.inner.lock().unwrap().set_no_sync_io(no_sync_io) {

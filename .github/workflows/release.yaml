@@ -1,0 +1,230 @@
+name: Release
+
+# Builds Apple silicon Katamaran.app, Katamaran-<version>.dmg, and Sparkle update archive
+# Katamaran-<version>.zip, signs with Developer ID (hardened runtime + secure timestamp),
+# notarizes with Apple via an App Store Connect API key, signs the Sparkle archive with EdDSA,
+# uploads all assets to the GitHub release, and triggers pages.yml to regenerate appcast.xml.
+#
+# One-time setup: scripts/release/setup-github.sh
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build, sign, and notarize without uploading to a GitHub release
+        type: boolean
+        default: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guest:
+    name: Guest images (arm64)
+    if: github.event_name != 'release' || !github.event.release.prerelease
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+      - name: Build guest kernel, rootfs, and data disk
+        run: |
+          set -euo pipefail
+          bash guest/kernel/build.sh
+          bash guest/rootfs/build.sh
+          bash guest/disk/build.sh
+      - name: Archive guest images (preserving sparse data.img)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/guest"
+          tar --sparse -czf "$RUNNER_TEMP/guest/guest-out.tar.gz" -C guest/out \
+            Image rootfs.erofs data.img
+          ls -lh "$RUNNER_TEMP/guest/guest-out.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: guest-images
+          path: ${{ runner.temp }}/guest/guest-out.tar.gz
+          retention-days: 3
+
+  build:
+    name: Build, sign, and notarize (macOS arm64)
+    needs: [guest]
+    runs-on: macos-26
+    # Apple's notary service can take over 30 minutes per submission (app and DMG).
+    timeout-minutes: 180
+    concurrency:
+      group: release-build-${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write # trigger pages.yml to publish updated appcast.xml
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      KATAMARAN_SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          fetch-depth: 0 # build number is the commit count
+
+      - name: Version, feed URL, and tag check
+        id: meta
+        env:
+          SPARKLE_FEED_URL: ${{ vars.SPARKLE_FEED_URL }}
+        run: |
+          set -euo pipefail
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          FEED="${SPARKLE_FEED_URL:-https://$OWNER.github.io/${GITHUB_REPOSITORY#*/}/appcast.xml}"
+          echo "KATAMARAN_FEED_URL=$FEED" >> "$GITHUB_ENV"
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          [[ -n "$VERSION" ]] || { echo "::error::No workspace version in Cargo.toml"; exit 1; }
+          if [[ "${{ github.event_name }}" == release ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            if [[ "$TAG" != "v$VERSION" ]]; then
+              echo "::error::Tag $TAG does not match workspace version $VERSION in Cargo.toml."
+              exit 1
+            fi
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "build_number=$(git rev-list --count HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check signing configuration
+        env:
+          HAVE_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+          HAVE_NOTARY_KEY: ${{ secrets.NOTARY_API_KEY_P8 != '' }}
+          HAVE_NOTARY_ID: ${{ secrets.NOTARY_API_KEY_ID != '' }}
+          HAVE_NOTARY_ISSUER: ${{ secrets.NOTARY_API_KEY_ISSUER_ID != '' }}
+          HAVE_SPARKLE: ${{ secrets.SPARKLE_PRIVATE_KEY != '' }}
+        run: |
+          missing=()
+          [[ "$HAVE_CERT" == true ]] || missing+=(secret:MACOS_CERTIFICATE_P12)
+          [[ "$HAVE_NOTARY_KEY" == true ]] || missing+=(secret:NOTARY_API_KEY_P8)
+          [[ "$HAVE_NOTARY_ID" == true ]] || missing+=(secret:NOTARY_API_KEY_ID)
+          [[ "$HAVE_NOTARY_ISSUER" == true ]] || missing+=(secret:NOTARY_API_KEY_ISSUER_ID)
+          [[ "$HAVE_SPARKLE" == true ]] || missing+=(secret:SPARKLE_PRIVATE_KEY)
+          [[ -n "$KATAMARAN_SPARKLE_PUBLIC_KEY" ]] || missing+=(variable:SPARKLE_PUBLIC_KEY)
+          if (( ${#missing[@]} )); then
+            echo "::error::Release signing is not configured: ${missing[*]} (see scripts/release/setup-github.sh)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: release-macos
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.x'
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          go version
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: guest-images
+          path: ${{ runner.temp }}/guest
+
+      - name: Unpack guest images
+        run: |
+          set -euo pipefail
+          mkdir -p guest/out
+          tar -xzf "$RUNNER_TEMP/guest/guest-out.tar.gz" -C guest/out
+          ls -lh guest/out/
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY_OVERRIDE: ${{ vars.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(scripts/release/ci-keychain.sh create "$RUNNER_TEMP/katamaran-signing.keychain-db")"
+          IDENTITY="${IDENTITY_OVERRIDE:-$IDENTITY}"
+          [[ -n "$IDENTITY" ]] || { echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE_P12"; exit 1; }
+          echo "Signing as: $IDENTITY"
+          echo "KATAMARAN_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Write notarization and Sparkle keys
+        env:
+          NOTARY_API_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$NOTARY_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle-ed25519"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "SPARKLE_KEY_FILE=$RUNNER_TEMP/sparkle-ed25519" >> "$GITHUB_ENV"
+
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          NOTES="$RUNNER_TEMP/notes.md"
+          if [[ "${{ steps.meta.outputs.publish }}" == true ]]; then
+            gh release view "${{ steps.meta.outputs.tag }}" --repo "$REPO" --json body -q .body > "$NOTES"
+          else
+            printf 'Dry run build of `%s`.\n' "$(git rev-parse --short=7 HEAD)" > "$NOTES"
+          fi
+          echo "KATAMARAN_NOTES_FILE=$NOTES" >> "$GITHUB_ENV"
+
+      - name: Build, sign, and notarize
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_API_KEY_ISSUER_ID }}
+          KATAMARAN_VERSION: ${{ steps.meta.outputs.version }}
+          KATAMARAN_BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          KATAMARAN_DOWNLOAD_BASE: https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}
+        run: scripts/release/build-release.sh
+
+      - name: Upload release assets
+        if: steps.meta.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          cd target/dist
+          gh release upload "$TAG" --repo "$REPO" --clobber \
+            Katamaran-*.dmg Katamaran-*.dmg.sha256 Katamaran.dmg Katamaran-*.zip
+          # sparkle.json last: pages.yml only lists a release once it carries one.
+          gh release upload "$TAG" --repo "$REPO" --clobber sparkle.json
+
+      - name: Update docs and Sparkle appcast
+        if: steps.meta.outputs.publish == 'true'
+        run: gh workflow run pages.yml --repo "$REPO" --ref main
+
+      - name: Upload dry-run artifact
+        if: steps.meta.outputs.publish != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: Katamaran-${{ steps.meta.outputs.version }}-release
+          path: |
+            target/dist/Katamaran-*.dmg
+            target/dist/Katamaran-*.dmg.sha256
+            target/dist/Katamaran-*.zip
+            target/dist/sparkle.json
+          retention-days: 3
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          scripts/release/ci-keychain.sh delete "$RUNNER_TEMP/katamaran-signing.keychain-db"
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/sparkle-ed25519"

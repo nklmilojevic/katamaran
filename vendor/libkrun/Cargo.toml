@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "src/libkrun",
+    "init/init-blob",
+    "init/common",
+    "src/input",
+    "src/display",
+    "src/utils",
+    "src/arch_gen",
+    "src/cpuid",
+    "src/smbios",
+    "src/polly",
+    "src/kernel",
+    "src/arch",
+    "src/hvf",
+    "src/devices",
+    "src/aws_nitro",
+    "src/whp",
+]
+exclude = [
+    # Binding clients pick a linking mode per consuming application, so they
+    # have no single valid configuration for a workspace-wide build.
+    "bindings/init-blob-via-cdylib",
+    "bindings/libkrun-via-libc",
+    "examples/gtk_display",
+    "init/init-binary",
+    "init/aws-nitro",
+]
+resolver = "2"
+#panic = "abort"
+
+[workspace.dependencies]
+ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
+ffier-builtins = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
+ffier-gen-rust-client = { git = "https://github.com/mtjhrc/ffier.git", tag = "v0.3.0" }
+
+[profile.release]
+#panic = "abort"
+lto = true

@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 18:04:52 +0100
+Subject: [PATCH 10/10] forwarder: grow copy buffers to 1 MiB for bulk
+ transfers
+
+A guest uploading to the Mac is limited by the receive window gVisor
+advertises, which depends on how fast the forwarder drains it into the
+host socket. Reads and writes of up to 1 MiB instead of 256 KiB raised
+uploads from about 4.1 to 5 GiB/s. Buffers start at 64 KiB and double
+only when a read fills them, so idle connections stay small.
+---
+ pkg/services/forwarder/copy.go      | 54 ++++++++++++++++++++++------
+ pkg/services/forwarder/copy_test.go | 55 +++++++++++++++++++++++++++++
+ 2 files changed, 98 insertions(+), 11 deletions(-)
+
+diff --git a/pkg/services/forwarder/copy.go b/pkg/services/forwarder/copy.go
+index f14d605..72c1d51 100644
+--- a/pkg/services/forwarder/copy.go
++++ b/pkg/services/forwarder/copy.go
+@@ -6,11 +6,19 @@ import (
+ 	"time"
+ )
+ 
+-// copyBufferSize is the size of each read from one side of a forwarded
+-// connection and so of each write to the other. io.Copy would use 32 KiB on
+-// macOS (no splice), and gVisor then sends segments of at most that size even
+-// when the MTU allows 64 KiB, doubling the per-frame cost on the guest link.
+-const copyBufferSize = 256 << 10
++// copyBufferSize is the largest read from one side of a forwarded
++// connection and so the largest write to the other. io.Copy would use 32 KiB
++// on macOS (no splice), and gVisor then sends segments of at most that size
++// even when the MTU allows 64 KiB, doubling the per-frame cost on the guest
++// link. On the way to the Mac, a write of 1 MiB instead of 256 KiB keeps
++// gVisor's receive buffer drained: the guest's sender is limited by the
++// window it advertises, so this raised uploads from ~4.1 to ~5 GiB/s.
++const copyBufferSize = 1 << 20
++
++// copyBufferMin is where each direction's buffer starts; it grows to
++// copyBufferSize only once reads fill it, so idle and request/response
++// connections, the many, hold 64 KiB per direction rather than 1 MiB.
++const copyBufferMin = 64 << 10
+ 
+ const hostKeepAlive = time.Minute
+ 
+@@ -22,11 +30,6 @@ type halfCloser interface {
+ 	CloseWrite() error
+ }
+ 
+-// The wrappers hide ReadFrom and WriteTo, so io.CopyBuffer uses our buffer
+-// instead of falling back to its own 32 KiB one.
+-type readerOnly struct{ io.Reader }
+-type writerOnly struct{ io.Writer }
+-
+ // proxyConns copies both ways between a guest connection and a host one until
+ // both directions are done, passing each EOF on as a half-close, like
+ // tcpproxy.DialProxy.HandleConn which it replaces.
+@@ -37,7 +40,7 @@ func proxyConns(guest, host halfCloser) {
+ 	}
+ 	done := make(chan struct{}, 2)
+ 	pump := func(dst, src halfCloser) {
+-		_, _ = io.CopyBuffer(writerOnly{dst}, readerOnly{src}, make([]byte, copyBufferSize))
++		_, _ = copyGrowing(dst, src)
+ 		_ = src.CloseRead()
+ 		_ = dst.CloseWrite()
+ 		done <- struct{}{}
+@@ -49,3 +52,32 @@ func proxyConns(guest, host halfCloser) {
+ 	_ = guest.Close()
+ 	_ = host.Close()
+ }
++
++// copyGrowing copies src to dst until EOF like io.Copy, but reads into a
++// buffer that doubles, up to copyBufferSize, each time a read fills it.
++func copyGrowing(dst io.Writer, src io.Reader) (int64, error) {
++	buf := make([]byte, copyBufferMin)
++	var written int64
++	for {
++		n, rerr := src.Read(buf)
++		if n > 0 {
++			w, werr := dst.Write(buf[:n])
++			written += int64(w)
++			if werr != nil {
++				return written, werr
++			}
++			if w != n {
++				return written, io.ErrShortWrite
++			}
++			if n == len(buf) && len(buf) < copyBufferSize {
++				buf = make([]byte, min(2*len(buf), copyBufferSize))
++			}
++		}
++		if rerr == io.EOF {
++			return written, nil
++		}
++		if rerr != nil {
++			return written, rerr
++		}
++	}
++}
+diff --git a/pkg/services/forwarder/copy_test.go b/pkg/services/forwarder/copy_test.go
+index 5802091..9438563 100644
+--- a/pkg/services/forwarder/copy_test.go
++++ b/pkg/services/forwarder/copy_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"crypto/rand"
+ 	"io"
+ 	"net"
++	"slices"
+ 	"testing"
+ 	"time"
+ )
+@@ -132,3 +133,57 @@ func TestProxyConnsWritesLargeChunks(t *testing.T) {
+ 		t.Fatalf("largest write was %d bytes; the 32 KiB io.Copy buffer is still in use", largest)
+ 	}
+ }
++
++// sizedReader returns at most chunk bytes per read.
++type sizedReader struct {
++	data  []byte
++	chunk int
++}
++
++func (r *sizedReader) Read(p []byte) (int, error) {
++	if len(r.data) == 0 {
++		return 0, io.EOF
++	}
++	n := copy(p[:min(len(p), r.chunk)], r.data)
++	r.data = r.data[n:]
++	return n, nil
++}
++
++type sizeRecorder struct {
++	bytes.Buffer
++	sizes []int
++}
++
++func (w *sizeRecorder) Write(p []byte) (int, error) {
++	w.sizes = append(w.sizes, len(p))
++	return w.Buffer.Write(p)
++}
++
++func TestCopyGrowingStaysSmallForSmallReads(t *testing.T) {
++	payload := randomBytes(t, 3*copyBufferSize)
++	var out sizeRecorder
++	n, err := copyGrowing(&out, &sizedReader{data: payload, chunk: 1000})
++	if err != nil || n != int64(len(payload)) || !bytes.Equal(out.Bytes(), payload) {
++		t.Fatalf("copied %d bytes, err %v", n, err)
++	}
++	for _, s := range out.sizes {
++		if s > 1000 {
++			t.Fatalf("a %d-byte write from 1000-byte reads", s)
++		}
++	}
++}
++
++func TestCopyGrowingGrowsForBulkReads(t *testing.T) {
++	payload := randomBytes(t, 4*copyBufferSize+5)
++	var out sizeRecorder
++	n, err := copyGrowing(&out, &sizedReader{data: payload, chunk: len(payload)})
++	if err != nil || n != int64(len(payload)) || !bytes.Equal(out.Bytes(), payload) {
++		t.Fatalf("copied %d bytes, err %v", n, err)
++	}
++	if out.sizes[0] != copyBufferMin {
++		t.Fatalf("first write %d bytes, want %d", out.sizes[0], copyBufferMin)
++	}
++	if largest := slices.Max(out.sizes); largest != copyBufferSize {
++		t.Fatalf("largest write %d bytes, want %d", largest, copyBufferSize)
++	}
++}

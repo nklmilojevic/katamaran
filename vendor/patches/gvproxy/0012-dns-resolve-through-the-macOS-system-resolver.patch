@@ -1,0 +1,467 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 22:10:53 +0100
+Subject: [PATCH 12/12] dns: resolve through the macOS system resolver
+
+On macOS, A, CNAME, MX, NS, SRV and TXT went through net.Resolver
+(res_search: a fresh query to the network every time, about 8 ms even
+for a name just asked), and everything else, AAAA included, was
+forwarded to the first nameserver in /etc/resolv.conf, which ignores
+the scoped resolvers that VPNs and /etc/resolver add.
+
+Ask mDNSResponder instead, for every record type, with
+DNSServiceQueryRecord on one shared connection read by one goroutine.
+It applies split DNS, answers from its cache in well under a
+millisecond, and reports real TTLs. Names are queried as given, without
+search domains. Intermediate results bring the CNAMEs on the way (the
+answer is complete once records of the asked type follow) and negative
+answers with their TTL; mDNSResponder does not say whether a negative
+answer is NXDOMAIN or NODATA, which the resolver's address probe
+settles. A failed connection fails what was pending on it and the next
+query reconnects; if mDNSResponder cannot be reached at all, questions
+go the old way. The cache in front empties when the DNS configuration
+changes (the com.apple.system.SystemConfiguration.dns_configuration
+notification), as mDNSResponder's own does.
+
+Needs cgo; without it, or on other systems, nothing changes.
+---
+ pkg/services/dns/dns.go               |   7 +-
+ pkg/services/dns/dnssd_darwin.go      | 272 ++++++++++++++++++++++++++
+ pkg/services/dns/dnssd_darwin_test.go | 113 +++++++++++
+ pkg/services/dns/dnssd_other.go       |  10 +
+ 4 files changed, 401 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/services/dns/dnssd_darwin.go
+ create mode 100644 pkg/services/dns/dnssd_darwin_test.go
+ create mode 100644 pkg/services/dns/dnssd_other.go
+
+diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
+index 2e2ae9a..ee2fb57 100644
+--- a/pkg/services/dns/dns.go
++++ b/pkg/services/dns/dns.go
+@@ -352,7 +352,12 @@ func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone) (*Serve
+ 	upstream := &net.Resolver{
+ 		PreferGo: false,
+ 	}
+-	return NewWithUpstreamResolver(udpConn, tcpLn, zones, upstream)
++	server, err := NewWithUpstreamResolver(udpConn, tcpLn, zones, upstream)
++	if err != nil {
++		return nil, err
++	}
++	server.handler.resolver = newSystemResolver()
++	return server, nil
+ }
+ 
+ func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver) (*Server, error) {
+diff --git a/pkg/services/dns/dnssd_darwin.go b/pkg/services/dns/dnssd_darwin.go
+new file mode 100644
+index 0000000..f5d4b15
+--- /dev/null
++++ b/pkg/services/dns/dnssd_darwin.go
+@@ -0,0 +1,272 @@
++//go:build darwin && cgo
++
++package dns
++
++/*
++#include <dns_sd.h>
++#include <errno.h>
++#include <notify.h>
++#include <poll.h>
++#include <stdint.h>
++#include <stdlib.h>
++
++extern void gvproxyDNSSDReply(uint32_t flags, int32_t err, char *fullname, uint16_t rrtype, uint16_t rrclass, uint16_t rdlen, void *rdata, uint32_t ttl, uintptr_t id);
++
++static inline void gvproxy_dnssd_reply(DNSServiceRef ref, DNSServiceFlags flags, uint32_t ifindex,
++		DNSServiceErrorType err, const char *fullname, uint16_t rrtype, uint16_t rrclass,
++		uint16_t rdlen, const void *rdata, uint32_t ttl, void *context) {
++	gvproxyDNSSDReply(flags, err, (char *)fullname, rrtype, rrclass, rdlen, (void *)rdata, ttl, (uintptr_t)context);
++}
++
++// Starts a query on the shared connection *ref is a copy of. Intermediate
++// results make mDNSResponder report CNAMEs on the way and negative answers,
++// which it otherwise keeps to itself.
++static inline DNSServiceErrorType gvproxy_dnssd_query(DNSServiceRef *ref, const char *name,
++		uint16_t rrtype, uint16_t rrclass, uintptr_t id) {
++	return DNSServiceQueryRecord(ref, kDNSServiceFlagsShareConnection | kDNSServiceFlagsReturnIntermediates,
++		kDNSServiceInterfaceIndexAny, name, rrtype, rrclass, gvproxy_dnssd_reply, (void *)id);
++}
++
++// Blocks until fd is readable or closed; -1 on a poll error other than EINTR.
++static inline int gvproxy_dnssd_wait(int fd) {
++	struct pollfd p = { fd, POLLIN, 0 };
++	for (;;) {
++		int n = poll(&p, 1, -1);
++		if (n >= 0 || errno != EINTR) {
++			return n;
++		}
++	}
++}
++*/
++import "C"
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"unsafe"
++
++	"github.com/miekg/dns"
++)
++
++// The host's DNS configuration (resolvers, search domains, VPN scopes)
++// changed; see dns_configuration_notify_key in configd's dnsinfo.
++const dnsConfigurationNotifyKey = "com.apple.system.SystemConfiguration.dns_configuration"
++
++// mdnsCacheFlush is the top bit of the class of multicast DNS records
++// (RFC 6762 section 10.2), not part of the class itself.
++const mdnsCacheFlush = 0x8000
++
++// newSystemResolver resolves through the macOS system resolver
++// (mDNSResponder, via dns_sd), which applies scoped and split DNS from VPNs
++// and /etc/resolver, answers from its cache, and reports real TTLs. The
++// cache in front of it is emptied when the DNS configuration changes.
++func newSystemResolver() *cachingResolver {
++	return newCachingResolver(systemDNS.query, defaultCacheConfig, dnsConfigurationWatch())
++}
++
++// dnsConfigurationWatch returns a function that reports whether the host's
++// DNS configuration changed since it was last called, or nil if that
++// cannot be watched.
++func dnsConfigurationWatch() func() bool {
++	key := C.CString(dnsConfigurationNotifyKey)
++	defer C.free(unsafe.Pointer(key))
++	var token C.int
++	if C.notify_register_check(key, &token) != C.NOTIFY_STATUS_OK {
++		return nil
++	}
++	changed := func() bool {
++		var check C.int
++		return C.notify_check(token, &check) == C.NOTIFY_STATUS_OK && check != 0
++	}
++	changed() // the first check always reports a change
++	return changed
++}
++
++// dnssdClient runs queries on one connection to mDNSResponder, shared by
++// every query and read by one goroutine. mu serialises all dns_sd calls on
++// it, which the library requires of a shared connection; replies are
++// delivered from DNSServiceProcessResult, so with mu held.
++type dnssdClient struct {
++	mu      sync.Mutex
++	main    C.DNSServiceRef
++	gen     uint64 // connection generation; 0 while disconnected
++	lastGen uint64
++	nextID  uintptr
++	pending map[uintptr]*dnssdQuery
++	// ready holds pending queries with a complete result, finished once a
++	// reply arrives without MoreComing (which, on a shared connection,
++	// refers to the whole connection, not one query).
++	ready []*dnssdQuery
++}
++
++type dnssdQuery struct {
++	qtype    uint16
++	ref      C.DNSServiceRef
++	gen      uint64
++	answer   []dns.RR
++	complete bool
++	negative bool
++	negTTL   uint32
++	err      error
++	finished bool
++	done     chan struct{}
++}
++
++var systemDNS = &dnssdClient{pending: make(map[uintptr]*dnssdQuery)}
++
++type dnssdError C.DNSServiceErrorType
++
++func (e dnssdError) Error() string {
++	switch e {
++	case C.kDNSServiceErr_ServiceNotRunning:
++		return "mDNSResponder is not running"
++	case C.kDNSServiceErr_Timeout:
++		return "dns_sd: timed out"
++	default:
++		return fmt.Sprintf("dns_sd error %d", int32(e))
++	}
++}
++
++func (c *dnssdClient) query(ctx context.Context, q dns.Question) (*lookupResult, error) {
++	name := C.CString(dns.Fqdn(q.Name))
++	defer C.free(unsafe.Pointer(name))
++	query := &dnssdQuery{qtype: q.Qtype, done: make(chan struct{})}
++
++	c.mu.Lock()
++	if c.gen == 0 {
++		if err := c.connectLocked(); err != nil {
++			c.mu.Unlock()
++			return nil, err
++		}
++	}
++	c.nextID++
++	id := c.nextID
++	ref := c.main
++	if e := C.gvproxy_dnssd_query(&ref, name, C.uint16_t(q.Qtype), C.uint16_t(q.Qclass), C.uintptr_t(id)); e != C.kDNSServiceErr_NoError {
++		c.mu.Unlock()
++		return nil, dnssdError(e)
++	}
++	query.ref, query.gen = ref, c.gen
++	c.pending[id] = query
++	c.mu.Unlock()
++
++	select {
++	case <-query.done:
++	case <-ctx.Done():
++	}
++
++	c.mu.Lock()
++	delete(c.pending, id)
++	// A reset already freed the operations of its connection.
++	if query.gen == c.gen {
++		C.DNSServiceRefDeallocate(query.ref)
++	}
++	finished, err := query.finished, query.err
++	c.mu.Unlock()
++
++	switch {
++	case !finished:
++		return nil, ctx.Err()
++	case err != nil:
++		return nil, err
++	case query.negative:
++		return &lookupResult{Rcode: dns.RcodeNameError, Answer: query.answer, NegativeTTL: query.negTTL, ambiguous: true}, nil
++	default:
++		return &lookupResult{Rcode: dns.RcodeSuccess, Answer: query.answer}, nil
++	}
++}
++
++func (c *dnssdClient) connectLocked() error {
++	var main C.DNSServiceRef
++	if e := C.DNSServiceCreateConnection(&main); e != C.kDNSServiceErr_NoError {
++		return fmt.Errorf("%w: %w", errResolverUnavailable, dnssdError(e))
++	}
++	c.lastGen++
++	c.main, c.gen = main, c.lastGen
++	go c.read(main, c.gen, C.DNSServiceRefSockFD(main))
++	return nil
++}
++
++// read processes replies on one connection until it fails, then fails
++// whatever was pending on it; the next query reconnects.
++func (c *dnssdClient) read(main C.DNSServiceRef, gen uint64, fd C.dnssd_sock_t) {
++	for {
++		waited := C.gvproxy_dnssd_wait(C.int(fd))
++		c.mu.Lock()
++		e := C.DNSServiceErrorType(C.kDNSServiceErr_ServiceNotRunning)
++		if waited >= 0 {
++			e = C.DNSServiceProcessResult(main)
++		}
++		if e != C.kDNSServiceErr_NoError {
++			for _, q := range c.pending {
++				if q.gen == gen && !q.finished {
++					q.err = dnssdError(e)
++					q.finish()
++				}
++			}
++			c.ready = nil
++			C.DNSServiceRefDeallocate(main)
++			c.main, c.gen = nil, 0
++			c.mu.Unlock()
++			return
++		}
++		c.mu.Unlock()
++	}
++}
++
++func (q *dnssdQuery) markComplete(c *dnssdClient) {
++	if !q.complete {
++		q.complete = true
++		c.ready = append(c.ready, q)
++	}
++}
++
++func (q *dnssdQuery) finish() {
++	q.finished = true
++	close(q.done)
++}
++
++//export gvproxyDNSSDReply
++func gvproxyDNSSDReply(flags C.uint32_t, code C.int32_t, fullname *C.char, rrtype, rrclass, rdlen C.uint16_t, rdata unsafe.Pointer, ttl C.uint32_t, id C.uintptr_t) {
++	c := systemDNS // c.mu is held: this runs inside DNSServiceProcessResult
++	q := c.pending[uintptr(id)]
++	if q != nil && !q.finished {
++		switch {
++		case q.negative || q.err != nil:
++		case code == C.kDNSServiceErr_NoSuchRecord || (code == C.kDNSServiceErr_NoError && rdlen == 0):
++			q.negative, q.negTTL = true, uint32(ttl)
++			q.markComplete(c)
++		case code != C.kDNSServiceErr_NoError:
++			q.err = dnssdError(code)
++			q.markComplete(c)
++		case flags&C.kDNSServiceFlagsAdd != 0:
++			hdr := dns.RR_Header{
++				Name:     dns.Fqdn(C.GoString(fullname)),
++				Rrtype:   uint16(rrtype),
++				Class:    uint16(rrclass) &^ mdnsCacheFlush,
++				Ttl:      uint32(ttl),
++				Rdlength: uint16(rdlen),
++			}
++			rr, _, err := dns.UnpackRRWithHeader(hdr, C.GoBytes(rdata, C.int(rdlen)), 0)
++			if err != nil {
++				q.err = fmt.Errorf("dns_sd: %s record for %s: %w", dns.TypeToString[hdr.Rrtype], hdr.Name, err)
++				q.markComplete(c)
++				break
++			}
++			q.answer = append(q.answer, rr)
++			// A CNAME on the way is followed by the records it leads to.
++			if hdr.Rrtype == q.qtype || q.qtype == dns.TypeANY {
++				q.markComplete(c)
++			}
++		}
++	}
++	if flags&C.kDNSServiceFlagsMoreComing == 0 {
++		for _, r := range c.ready {
++			if !r.finished {
++				r.finish()
++			}
++		}
++		c.ready = c.ready[:0]
++	}
++}
+diff --git a/pkg/services/dns/dnssd_darwin_test.go b/pkg/services/dns/dnssd_darwin_test.go
+new file mode 100644
+index 0000000..78c63ce
+--- /dev/null
++++ b/pkg/services/dns/dnssd_darwin_test.go
+@@ -0,0 +1,113 @@
++//go:build darwin && cgo
++
++package dns
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++// mDNSResponder answers these names itself, so they need no network.
++
++func TestSystemResolverAnswersLocalNames(t *testing.T) {
++	r := newSystemResolver()
++	resolve := func(name string, qtype uint16) *lookupResult {
++		t.Helper()
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		res, err := r.resolve(ctx, question(name, qtype))
++		require.NoError(t, err, "%s %s", name, dns.TypeToString[qtype])
++		return res
++	}
++
++	res := resolve("localhost.", dns.TypeA)
++	require.Equal(t, dns.RcodeSuccess, res.Rcode)
++	require.Len(t, res.Answer, 1)
++	require.Equal(t, "127.0.0.1", res.Answer[0].(*dns.A).A.String())
++	require.Equal(t, "localhost.", res.Answer[0].Header().Name)
++
++	res = resolve("localhost.", dns.TypeAAAA)
++	require.Equal(t, dns.RcodeSuccess, res.Rcode)
++	require.Len(t, res.Answer, 1)
++	require.Equal(t, "::1", res.Answer[0].(*dns.AAAA).AAAA.String())
++
++	res = resolve("1.0.0.127.in-addr.arpa.", dns.TypePTR)
++	require.Equal(t, dns.RcodeSuccess, res.Rcode)
++	require.Len(t, res.Answer, 1)
++	require.Equal(t, "localhost.", res.Answer[0].(*dns.PTR).Ptr)
++
++	res = resolve("localhost.", dns.TypeMX)
++	require.Equal(t, dns.RcodeSuccess, res.Rcode, "localhost has addresses, so no MX is NODATA")
++	require.Empty(t, res.Answer)
++}
++
++func TestSystemResolverReportsNXDOMAIN(t *testing.T) {
++	// .invalid never exists (RFC 6761), but asking needs a network.
++	name := fmt.Sprintf("gvproxy-%d-%d.invalid.", os.Getpid(), time.Now().UnixNano())
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	res, err := newSystemResolver().resolve(ctx, question(name, dns.TypeAAAA))
++	if err != nil {
++		t.Skipf("no answer from the system resolver (offline?): %v", err)
++	}
++	require.Equal(t, dns.RcodeNameError, res.Rcode)
++	require.Empty(t, res.Answer)
++}
++
++func TestSystemDNSRunsConcurrentQueries(t *testing.T) {
++	var wg sync.WaitGroup
++	errs := make(chan error, 64)
++	for i := range 64 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			qtype := dns.TypeA
++			if i%2 == 1 {
++				qtype = dns.TypeAAAA
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			res, err := systemDNS.query(ctx, question("localhost.", qtype))
++			if err == nil && (res.Rcode != dns.RcodeSuccess || len(res.Answer) != 1 || res.Answer[0].Header().Rrtype != qtype) {
++				err = fmt.Errorf("unexpected answer to %s: %+v", dns.TypeToString[qtype], res)
++			}
++			errs <- err
++		}()
++	}
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		require.NoError(t, err)
++	}
++}
++
++func TestSystemDNSGivesUpWithItsContext(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, err := systemDNS.query(ctx, question("localhost.", dns.TypeA))
++	require.ErrorIs(t, err, context.Canceled)
++
++	systemDNS.mu.Lock()
++	pending := len(systemDNS.pending)
++	systemDNS.mu.Unlock()
++	require.Zero(t, pending, "an abandoned query is cancelled")
++
++	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	res, err := systemDNS.query(ctx, question("localhost.", dns.TypeA))
++	require.NoError(t, err)
++	require.Len(t, res.Answer, 1)
++}
++
++func TestDNSConfigurationWatch(t *testing.T) {
++	changed := dnsConfigurationWatch()
++	require.NotNil(t, changed)
++	require.False(t, changed(), "no change right after registering")
++}
+diff --git a/pkg/services/dns/dnssd_other.go b/pkg/services/dns/dnssd_other.go
+new file mode 100644
+index 0000000..63d5019
+--- /dev/null
++++ b/pkg/services/dns/dnssd_other.go
+@@ -0,0 +1,10 @@
++//go:build !darwin || !cgo
++
++package dns
++
++// newSystemResolver returns nil where there is no system resolver to ask
++// for arbitrary records: questions then go to net.Resolver and the
++// nameservers in /etc/resolv.conf.
++func newSystemResolver() *cachingResolver {
++	return nil
++}

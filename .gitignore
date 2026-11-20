@@ -1,0 +1,47 @@
+# Rust / Cargo
+/target
+/vendor/libkrun/target
+/vendor/libkrun/examples/snp-example-data-disk.img
+
+# Guest build outputs
+/guest/out
+/guest/kernel/build
+
+# macOS Swift app (SwiftPM / Xcode)
+/app/.build
+/app/.swiftpm
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# Docs (Astro / Starlight / Bun)
+/docs/node_modules
+/docs/dist
+/docs/.astro
+
+# Benchmarks and Python
+/bench/work
+/bench/vs
+/bench/.venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Signing material and local secrets (never commit)
+*.p12
+*.p8
+*.keychain-db
+.env
+.env.local
+
+# Local agent / editor / OS junk
+.pi/
+.claude/
+.DS_Store
+*.swp
+*.swo
+*~
+*.orig
+*.rej

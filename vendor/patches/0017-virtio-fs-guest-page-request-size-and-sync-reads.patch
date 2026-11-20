@@ -1,0 +1,62 @@
+diff --git a/src/devices/src/virtio/fs/server.rs b/src/devices/src/virtio/fs/server.rs
+index d27368f..5bff205 100644
+--- a/src/devices/src/virtio/fs/server.rs
++++ b/src/devices/src/virtio/fs/server.rs
+@@ -30,8 +30,6 @@ use super::sync_policy::SyncPolicy;
+ use super::{FsError as Error, Result};
+ use crate::virtio::VirtioShmRegion;
+ 
+-#[cfg(windows)]
+-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+ 
+ const MAX_BUFFER_SIZE: u32 = 1 << 20;
+ const BUFFER_HEADER_SIZE: u32 = 0x1000;
+@@ -93,6 +91,9 @@ const OFFERED: FsOptions = FsOptions::ATOMIC_O_TRUNC
+ 
+ /// Largest request payload the guest may send: 128 pages.
+ const MAX_PAGES_OFFERED: u32 = 128;
++/// FUSE counts `max_pages` in the guest's pages, not the host's 16 KiB ones. The guest kernels
++/// this serves use 4 KiB pages.
++const GUEST_PAGE_SIZE: u32 = 4096;
+ 
+ impl<F: FileSystem + Sync> Server<F> {
+     pub fn with_policy(fs: F, policy: Arc<SyncPolicy>) -> Server<F> {
+@@ -957,19 +958,8 @@ impl<F: FileSystem + Sync> Server<F> {
+         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
+         let capable = FsOptions::from_bits_truncate(flags_64);
+ 
+-        let page_size: u32 = {
+-            #[cfg(unix)]
+-            unsafe {
+-                libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+-            }
+-            #[cfg(windows)]
+-            unsafe {
+-                let mut info: SYSTEM_INFO = std::mem::zeroed();
+-                GetSystemInfo(&mut info);
+-                info.dwPageSize
+-            }
+-        };
+-        let max_pages = (((MAX_BUFFER_SIZE - 1) / page_size) + 1).min(MAX_PAGES_OFFERED);
++        let page_size = GUEST_PAGE_SIZE;
++        let max_pages = MAX_PAGES_OFFERED.min(MAX_BUFFER_SIZE / page_size);
+ 
+         match self.fs.init(capable) {
+             Ok(want) => {
+diff --git a/src/devices/src/virtio/fs/sync_policy.rs b/src/devices/src/virtio/fs/sync_policy.rs
+index 8cb12d6..4446727 100644
+--- a/src/devices/src/virtio/fs/sync_policy.rs
++++ b/src/devices/src/virtio/fs/sync_policy.rs
+@@ -14,8 +14,10 @@ use std::sync::{Arc, RwLock};
+ 
+ use super::fuse::Opcode;
+ 
+-/// Largest READ or WRITE payload handled synchronously.
+-pub const MAX_SYNC_IO: u32 = 128 * 1024;
++/// Largest READ or WRITE payload handled synchronously: 128 guest pages, the most one
++/// request carries. A sequential read comes in 256 KiB requests, and sending those to the worker
++/// pool (a wakeup and an interrupt each) cost a quarter of the throughput.
++pub const MAX_SYNC_IO: u32 = 512 * 1024;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Route {

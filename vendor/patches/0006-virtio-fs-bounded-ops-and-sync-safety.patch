@@ -1,0 +1,2633 @@
+diff --git a/src/devices/src/virtio/fs/device.rs b/src/devices/src/virtio/fs/device.rs
+index 5832f82b..49e40ed0 100644
+--- a/src/devices/src/virtio/fs/device.rs
++++ b/src/devices/src/virtio/fs/device.rs
+@@ -3,7 +3,7 @@ use crossbeam_channel::Sender;
+ use std::cmp;
+ use std::io::Write;
+ use std::mem::size_of;
+-use std::sync::{Arc, Mutex};
++use std::sync::Arc;
+ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+ use std::thread::JoinHandle;
+ use std::time::Duration;
+@@ -57,7 +57,7 @@ pub struct Fs {
+     worker_stopfd: EventFd,
+     /// Set when request-queue notifications are processed on the notifying
+     /// vCPU thread instead of waking the worker (KATAMARAN_FS_INLINE != 0).
+-    inline_core: Option<Arc<Mutex<FsCore>>>,
++    inline_core: Option<Arc<FsCore>>,
+     exit_code: Arc<AtomicI32>,
+     #[cfg(target_os = "macos")]
+     map_sender: Option<Sender<WorkerMessage>>,
+@@ -180,6 +180,27 @@ impl Fs {
+         false
+     }
+ 
++    /// Make FSYNC and FSYNCDIR no-ops for this share (for disposable data).
++    pub fn set_no_sync_io(&mut self, no_sync_io: bool) -> bool {
++        #[cfg(target_os = "macos")]
++        if let Some(cfg) = self.passthrough_cfg.as_mut() {
++            cfg.no_sync_io = no_sync_io;
++            return true;
++        }
++        let _ = no_sync_io;
++        false
++    }
++
++    /// Offer FUSE_WRITEBACK_CACHE to the guest. Only for shares nothing else
++    /// writes to while the guest runs.
++    pub fn set_writeback(&mut self, writeback: bool) -> bool {
++        let Some(cfg) = self.passthrough_cfg.as_mut() else {
++            return false;
++        };
++        cfg.writeback = writeback;
++        true
++    }
++
+     pub fn set_cache_policy(&mut self, policy: CachePolicy) -> bool {
+         let Some(cfg) = self.passthrough_cfg.as_mut() else {
+             return false;
+@@ -333,14 +354,11 @@ impl VirtioDevice for Fs {
+         let Some(core) = &self.inline_core else {
+             return false;
+         };
+-        match core.try_lock() {
+-            Ok(mut core) => {
+-                core.drain(defs::REQ_INDEX);
+-                super::worker::note_inline(1);
+-                true
+-            }
+-            Err(_) => false,
++        let drained = core.try_drain_notified(defs::REQ_INDEX);
++        if drained {
++            super::worker::note_inline(1);
+         }
++        drained
+     }
+ 
+     fn reset(&mut self) -> bool {
+@@ -578,13 +596,9 @@ const KAT_FS_DRAIN: u64 = 0xC600_4B01;
+ const KAT_FS_MAGIC: u64 = 0x4B41_544D;
+ 
+ #[cfg(target_os = "macos")]
+-fn register_sync_calls(core: Arc<Mutex<FsCore>>) {
+-    hvf::vendor_call::register(KAT_FS_DRAIN, move |_| match core.try_lock() {
+-        Ok(mut core) => {
+-            core.drain_with(defs::REQ_INDEX, false);
+-            super::worker::note_sync(1);
+-            0
+-        }
+-        Err(_) => 1,
++fn register_sync_calls(core: Arc<FsCore>) {
++    hvf::vendor_call::register(KAT_FS_DRAIN, move |_| {
++        super::worker::note_sync(1);
++        core.drain_sync(defs::REQ_INDEX)
+     });
+ }
+diff --git a/src/devices/src/virtio/fs/macos/boundaries.rs b/src/devices/src/virtio/fs/macos/boundaries.rs
+new file mode 100644
+index 00000000..5d1ef203
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/boundaries.rs
+@@ -0,0 +1,315 @@
++//! Mount boundaries: which volumes are safe to touch on a vCPU thread.
++//!
++//! Only local APFS and HFS volumes are safe. Network filesystems, FUSE
++//! (macFUSE, fuse-t), autofs and other exotic volumes can block for as long
++//! as their server takes, so nodes on them are async-only, and lookups of
++//! their mountpoints are too. The table comes from `getfsstat` and is rebuilt
++//! whenever the kernel reports a mount change (kqueue `EVFILT_FS`), or when a
++//! lookup meets a device that is not in it.
++
++use std::collections::HashMap;
++use std::ffi::CStr;
++use std::io;
++use std::mem::MaybeUninit;
++use std::os::unix::ffi::OsStrExt;
++use std::path::Path;
++use std::sync::{Arc, Mutex, OnceLock, RwLock};
++use std::thread;
++use std::time::{Duration, Instant};
++
++use super::super::sync_policy::Boundaries;
++
++/// One mounted volume.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Mount {
++    /// `f_fsid.val[0]`, which is the `st_dev` of files on the volume.
++    pub dev: u64,
++    pub fstype: String,
++    pub path: Vec<u8>,
++    pub local: bool,
++}
++
++impl Mount {
++    pub fn is_safe(&self) -> bool {
++        self.local && matches!(self.fstype.as_str(), "apfs" | "hfs")
++    }
++}
++
++/// Safe devices plus, for each directory that holds unsafe mountpoints, the
++/// names of those mountpoints.
++#[derive(Debug, Default)]
++pub struct MountTable {
++    safe: HashMap<u64, bool>,
++    parents: HashMap<(u64, u64), Vec<Vec<u8>>>,
++}
++
++impl MountTable {
++    /// `stat_dir` returns (dev, ino) of a directory path.
++    pub fn build(mounts: &[Mount], stat_dir: impl Fn(&[u8]) -> Option<(u64, u64)>) -> Self {
++        let mut t = MountTable::default();
++        for m in mounts {
++            // A device mounted twice is only safe if every instance is.
++            let safe = t.safe.entry(m.dev).or_insert(true);
++            *safe &= m.is_safe();
++        }
++        for m in mounts.iter().filter(|m| !m.is_safe()) {
++            let path = Path::new(std::ffi::OsStr::from_bytes(&m.path));
++            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
++                continue;
++            };
++            if let Some(key) = stat_dir(parent.as_os_str().as_bytes()) {
++                t.parents
++                    .entry(key)
++                    .or_default()
++                    .push(name.as_bytes().to_vec());
++            }
++        }
++        t
++    }
++
++    /// `None` when the device is not in the table.
++    pub fn dev_safe(&self, dev: u64) -> Option<bool> {
++        self.safe.get(&dev).copied()
++    }
++
++    pub fn is_boundary_parent(&self, dev: u64, ino: u64) -> bool {
++        self.parents.contains_key(&(dev, ino))
++    }
++
++    pub fn is_unsafe_mountpoint(&self, dev: u64, ino: u64, name: &[u8]) -> bool {
++        self.parents
++            .get(&(dev, ino))
++            .is_some_and(|names| names.iter().any(|n| n == name))
++    }
++}
++
++fn cstr_field(buf: &[libc::c_char]) -> &[u8] {
++    // SAFETY: getfsstat NUL-terminates these fixed-size fields.
++    unsafe { CStr::from_ptr(buf.as_ptr()) }.to_bytes()
++}
++
++/// `f_fsid.val[0]`; libc keeps the field private.
++fn fsid_dev(fsid: &libc::fsid_t) -> u64 {
++    // SAFETY: fsid_t is two int32_t on macOS.
++    let val: [i32; 2] = unsafe { std::mem::transmute_copy(fsid) };
++    val[0] as u32 as u64
++}
++
++/// The current mounts, without waiting for unresponsive volumes.
++pub fn enumerate() -> io::Result<Vec<Mount>> {
++    loop {
++        let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
++        if n < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        let cap = n as usize + 4;
++        let mut buf: Vec<libc::statfs> = Vec::with_capacity(cap);
++        let size = (cap * std::mem::size_of::<libc::statfs>()) as libc::c_int;
++        let got = unsafe { libc::getfsstat(buf.as_mut_ptr(), size, libc::MNT_NOWAIT) };
++        if got < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        if got as usize == cap {
++            continue;
++        }
++        unsafe { buf.set_len(got as usize) };
++        return Ok(buf
++            .iter()
++            .map(|s| Mount {
++                dev: fsid_dev(&s.f_fsid),
++                fstype: String::from_utf8_lossy(cstr_field(&s.f_fstypename)).into_owned(),
++                path: cstr_field(&s.f_mntonname).to_vec(),
++                local: s.f_flags & libc::MNT_LOCAL as u32 != 0,
++            })
++            .collect());
++    }
++}
++
++fn lstat_dir(path: &[u8]) -> Option<(u64, u64)> {
++    let c = std::ffi::CString::new(path).ok()?;
++    let mut st = MaybeUninit::<libc::stat>::zeroed();
++    if unsafe { libc::lstat(c.as_ptr(), st.as_mut_ptr()) } != 0 {
++        return None;
++    }
++    let st = unsafe { st.assume_init() };
++    Some((st.st_dev as u32 as u64, st.st_ino))
++}
++
++/// The host's mount boundaries, kept current by a watcher thread.
++pub struct MountBoundaries {
++    table: RwLock<Arc<MountTable>>,
++    last_rebuild: Mutex<Instant>,
++}
++
++/// Unknown devices trigger at most one rebuild per this interval.
++const REBUILD_INTERVAL: Duration = Duration::from_secs(1);
++
++impl MountBoundaries {
++    /// The process-wide instance; the first call builds the table and starts
++    /// the watcher.
++    pub fn shared() -> Arc<MountBoundaries> {
++        static B: OnceLock<Arc<MountBoundaries>> = OnceLock::new();
++        B.get_or_init(|| {
++            let b = Arc::new(MountBoundaries {
++                table: RwLock::new(Arc::new(MountTable::default())),
++                last_rebuild: Mutex::new(Instant::now()),
++            });
++            b.rebuild();
++            let w = b.clone();
++            let _ = thread::Builder::new()
++                .name("fs mounts".into())
++                .spawn(move || w.watch());
++            b
++        })
++        .clone()
++    }
++
++    fn rebuild(&self) {
++        match enumerate() {
++            Ok(mounts) => {
++                let t = MountTable::build(&mounts, lstat_dir);
++                debug!(
++                    "rebuilt unsafe mount boundaries: {} volumes, {} boundary dirs",
++                    t.safe.len(),
++                    t.parents.len()
++                );
++                *self.table.write().unwrap() = Arc::new(t);
++            }
++            Err(e) => warn!("failed to enumerate mounts: {e}"),
++        }
++        *self.last_rebuild.lock().unwrap() = Instant::now();
++    }
++
++    fn table(&self) -> Arc<MountTable> {
++        self.table.read().unwrap().clone()
++    }
++
++    fn watch(&self) {
++        let kq = unsafe { libc::kqueue() };
++        if kq < 0 {
++            warn!("mount watcher: kqueue: {}", io::Error::last_os_error());
++            return;
++        }
++        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
++        ev.filter = libc::EVFILT_FS;
++        ev.flags = libc::EV_ADD | libc::EV_CLEAR;
++        if unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
++            warn!("mount watcher: EVFILT_FS: {}", io::Error::last_os_error());
++            return;
++        }
++        loop {
++            let mut out: libc::kevent = unsafe { std::mem::zeroed() };
++            let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null()) };
++            if n > 0 {
++                // Mounts often come in bursts (a disk image with several volumes).
++                thread::sleep(Duration::from_millis(50));
++                self.rebuild();
++            }
++        }
++    }
++}
++
++impl Boundaries for MountBoundaries {
++    fn is_safe_dev(&self, dev: u64) -> bool {
++        if let Some(safe) = self.table().dev_safe(dev) {
++            return safe;
++        }
++        if self.last_rebuild.lock().unwrap().elapsed() >= REBUILD_INTERVAL {
++            self.rebuild();
++        }
++        self.table().dev_safe(dev).unwrap_or(false)
++    }
++
++    fn is_boundary_parent(&self, dev: u64, ino: u64) -> bool {
++        self.table().is_boundary_parent(dev, ino)
++    }
++
++    fn is_unsafe_mountpoint(&self, dev: u64, ino: u64, name: &[u8]) -> bool {
++        self.table().is_unsafe_mountpoint(dev, ino, name)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn m(dev: u64, fstype: &str, path: &str, local: bool) -> Mount {
++        Mount {
++            dev,
++            fstype: fstype.into(),
++            path: path.as_bytes().to_vec(),
++            local,
++        }
++    }
++
++    #[test]
++    fn safe_volumes() {
++        assert!(m(1, "apfs", "/", true).is_safe());
++        assert!(m(2, "hfs", "/Volumes/Old", true).is_safe());
++        assert!(!m(3, "nfs", "/Users/me/vmshare", false).is_safe());
++        assert!(!m(4, "smbfs", "/Volumes/share", false).is_safe());
++        assert!(!m(5, "macfuse", "/Volumes/sshfs", true).is_safe());
++        assert!(!m(6, "autofs", "/System/Volumes/Data/home", true).is_safe());
++        assert!(!m(7, "apfs", "/Volumes/remote", false).is_safe());
++    }
++
++    #[test]
++    fn boundary_decisions() {
++        let mounts = vec![
++            m(10, "apfs", "/", true),
++            m(11, "apfs", "/System/Volumes/Data", true),
++            m(12, "nfs", "/Users/me/vmshare", false),
++            m(13, "smbfs", "/Users/me/mnt/nas", false),
++            m(14, "macfuse", "/Users/me/mnt/sshfs", true),
++            m(15, "devfs", "/dev", true),
++        ];
++        let dirs: HashMap<&[u8], (u64, u64)> = [
++            (&b"/Users/me"[..], (11, 100)),
++            (&b"/Users/me/mnt"[..], (11, 200)),
++        ]
++        .into();
++        let t = MountTable::build(&mounts, |p| dirs.get(p).copied());
++        assert_eq!(t.dev_safe(10), Some(true));
++        assert_eq!(t.dev_safe(11), Some(true));
++        assert_eq!(t.dev_safe(12), Some(false));
++        assert_eq!(t.dev_safe(14), Some(false));
++        assert_eq!(t.dev_safe(15), Some(false));
++        assert_eq!(t.dev_safe(99), None);
++
++        assert!(t.is_boundary_parent(11, 100));
++        assert!(t.is_boundary_parent(11, 200));
++        assert!(!t.is_boundary_parent(11, 300));
++        assert!(t.is_unsafe_mountpoint(11, 100, b"vmshare"));
++        assert!(!t.is_unsafe_mountpoint(11, 100, b"dev"));
++        assert!(t.is_unsafe_mountpoint(11, 200, b"nas"));
++        assert!(t.is_unsafe_mountpoint(11, 200, b"sshfs"));
++        // devfs at /dev: the parent "/" was not resolvable in this fake.
++        assert!(!t.is_boundary_parent(10, 2));
++    }
++
++    #[test]
++    fn same_device_mounted_twice_is_unsafe_if_any_is() {
++        let t = MountTable::build(
++            &[m(20, "apfs", "/a", true), m(20, "nullfs", "/b", true)],
++            |_| None,
++        );
++        assert_eq!(t.dev_safe(20), Some(false));
++    }
++
++    #[test]
++    fn host_mount_table_matches_stat() {
++        let mounts = enumerate().unwrap();
++        let data = mounts
++            .iter()
++            .find(|m| m.path == b"/System/Volumes/Data")
++            .expect("data volume");
++        assert!(data.is_safe(), "{data:?}");
++        // st_dev of a file equals the fsid of its volume.
++        let tmp = std::env::temp_dir();
++        let (tdev, _) = lstat_dir(tmp.as_os_str().as_bytes()).unwrap();
++        assert_eq!(tdev, data.dev);
++        let b = MountBoundaries::shared();
++        assert!(b.is_safe_dev(tdev));
++        assert!(!b.is_safe_dev(0xdead_beef));
++    }
++}
+diff --git a/src/devices/src/virtio/fs/macos/fileops.rs b/src/devices/src/virtio/fs/macos/fileops.rs
+new file mode 100644
+index 00000000..f828e2b9
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/fileops.rs
+@@ -0,0 +1,473 @@
++//! File data operations with macOS-specific implementations: barrier fsync
++//! and copy_file_range backed by APFS clones.
++
++use std::ffi::{CStr, CString};
++use std::fs::File;
++use std::io;
++use std::mem::MaybeUninit;
++use std::os::fd::{AsRawFd, FromRawFd, RawFd};
++use std::os::unix::ffi::OsStrExt;
++use std::path::Path;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++const CLONE_NOOWNERCOPY: u32 = 0x0002;
++/// One COPY_FILE_RANGE request copies at most this much; the guest loops.
++const MAX_COPY: u64 = 128 << 20;
++const COPY_CHUNK: usize = 1 << 20;
++
++/// FSYNC: `F_BARRIERFSYNC` orders the writes on the device without the full
++/// cache flush of `F_FULLFSYNC`, which is far slower on Apple SSDs. Falls back
++/// to `fsync` where the volume does not support barriers. With `no_sync` the
++/// call is a no-op (the share's data is disposable).
++pub fn fsync(fd: RawFd, no_sync: bool) -> io::Result<()> {
++    if no_sync {
++        return Ok(());
++    }
++    if unsafe { libc::fcntl(fd, libc::F_BARRIERFSYNC) } == 0 {
++        return Ok(());
++    }
++    if unsafe { libc::fsync(fd) } == 0 {
++        Ok(())
++    } else {
++        Err(io::Error::last_os_error())
++    }
++}
++
++fn fstat(fd: RawFd) -> io::Result<libc::stat> {
++    let mut st = MaybeUninit::<libc::stat>::zeroed();
++    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(unsafe { st.assume_init() })
++}
++
++fn fd_path(fd: RawFd) -> io::Result<CString> {
++    let mut buf = vec![0u8; libc::PATH_MAX as usize];
++    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
++    buf.truncate(len);
++    CString::new(buf).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
++}
++
++fn xattr_names(fd: RawFd) -> io::Result<Vec<CString>> {
++    let opts = 0;
++    let size = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0, opts) };
++    if size < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let mut buf = vec![0u8; size as usize];
++    let size = unsafe { libc::flistxattr(fd, buf.as_mut_ptr().cast(), buf.len(), opts) };
++    if size < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    buf.truncate(size as usize);
++    Ok(buf
++        .split(|&b| b == 0)
++        .filter(|n| !n.is_empty())
++        .map(|n| CString::new(n).unwrap())
++        .collect())
++}
++
++/// Give `to` exactly the extended attributes of `from`.
++fn replace_xattrs(from: RawFd, to: RawFd) -> io::Result<()> {
++    for name in xattr_names(to)? {
++        unsafe { libc::fremovexattr(to, name.as_ptr(), 0) };
++    }
++    for name in xattr_names(from)? {
++        let n = unsafe { libc::fgetxattr(from, name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
++        if n < 0 {
++            continue;
++        }
++        let mut val = vec![0u8; n as usize];
++        let n = unsafe {
++            libc::fgetxattr(
++                from,
++                name.as_ptr(),
++                val.as_mut_ptr().cast(),
++                val.len(),
++                0,
++                0,
++            )
++        };
++        if n < 0 {
++            continue;
++        }
++        let res =
++            unsafe { libc::fsetxattr(to, name.as_ptr(), val.as_ptr().cast(), n as usize, 0, 0) };
++        // macOS manages some com.apple.* attributes itself (provenance).
++        if res != 0 && !name.to_bytes().starts_with(b"com.apple.") {
++            return Err(io::Error::last_os_error());
++        }
++    }
++    Ok(())
++}
++
++/// Replace the empty file open as `dst` with an APFS clone of `src`, keeping
++/// the path, mode and extended attributes of `dst`. The new file has a
++/// different inode, so the caller must point its node and handles at the
++/// returned file (opened with `dst`'s access mode).
++///
++/// Returns `None` when a clone does not apply (not a whole-file copy into an
++/// empty file on the same volume); the caller then copies the bytes.
++pub fn clone_whole_file(
++    src: RawFd,
++    off_in: u64,
++    dst: RawFd,
++    off_out: u64,
++    len: u64,
++) -> io::Result<Option<(File, u64)>> {
++    let (s, d) = (fstat(src)?, fstat(dst)?);
++    let regular = |st: &libc::stat| st.st_mode & libc::S_IFMT == libc::S_IFREG;
++    if off_in != 0
++        || off_out != 0
++        || !regular(&s)
++        || !regular(&d)
++        || s.st_size <= 0
++        || (len as i64) < s.st_size
++        || d.st_size != 0
++        || d.st_nlink != 1
++        || s.st_dev != d.st_dev
++    {
++        debug!("clone: not a whole-file copy into an empty file");
++        return Ok(None);
++    }
++
++    let dst_path = fd_path(dst)?;
++    let path = Path::new(std::ffi::OsStr::from_bytes(dst_path.as_bytes()));
++    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
++        return Ok(None);
++    };
++    static N: AtomicU64 = AtomicU64::new(0);
++    let mut tmp_name = b".kat-clone-".to_vec();
++    tmp_name.extend_from_slice(name.as_bytes());
++    tmp_name.extend_from_slice(
++        format!(
++            ".{}.{}",
++            std::process::id(),
++            N.fetch_add(1, Ordering::Relaxed)
++        )
++        .as_bytes(),
++    );
++    let tmp_path = CString::new(
++        dir.join(std::ffi::OsStr::from_bytes(&tmp_name))
++            .as_os_str()
++            .as_bytes(),
++    )
++    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
++
++    if unsafe { libc::fclonefileat(src, libc::AT_FDCWD, tmp_path.as_ptr(), CLONE_NOOWNERCOPY) } != 0
++    {
++        let e = io::Error::last_os_error();
++        debug!("fclonefileat failed, copying instead: {e}");
++        return Ok(None);
++    }
++    let unlink_tmp = || unsafe { libc::unlink(tmp_path.as_ptr()) };
++
++    let accmode = unsafe { libc::fcntl(dst, libc::F_GETFL) } & (libc::O_ACCMODE | libc::O_APPEND);
++    let fd = unsafe {
++        libc::open(
++            tmp_path.as_ptr(),
++            accmode | libc::O_CLOEXEC | libc::O_NOFOLLOW,
++        )
++    };
++    if fd < 0 {
++        let e = io::Error::last_os_error();
++        unlink_tmp();
++        return Err(e);
++    }
++    let file = unsafe { File::from_raw_fd(fd) };
++    let finish = || -> io::Result<()> {
++        replace_xattrs(dst, file.as_raw_fd())?;
++        if unsafe { libc::fchmod(file.as_raw_fd(), d.st_mode & 0o7777) } != 0 {
++            return Err(io::Error::last_os_error());
++        }
++        // A copy is a new write: give it a fresh mtime like a byte copy would.
++        if unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) } != 0 {
++            return Err(io::Error::last_os_error());
++        }
++        // Only replace the path if it still names the file the guest created.
++        let cur = lstat(&dst_path)?;
++        if cur.st_ino != d.st_ino || cur.st_dev != d.st_dev {
++            return Err(io::Error::from_raw_os_error(libc::ESTALE));
++        }
++        if unsafe { libc::rename(tmp_path.as_ptr(), dst_path.as_ptr()) } != 0 {
++            return Err(io::Error::last_os_error());
++        }
++        Ok(())
++    };
++    if let Err(e) = finish() {
++        unlink_tmp();
++        debug!("clone of {:?} abandoned, copying instead: {e}", dst_path);
++        return Ok(None);
++    }
++    Ok(Some((file, s.st_size as u64)))
++}
++
++fn lstat(path: &CStr) -> io::Result<libc::stat> {
++    let mut st = MaybeUninit::<libc::stat>::zeroed();
++    if unsafe { libc::lstat(path.as_ptr(), st.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(unsafe { st.assume_init() })
++}
++
++/// Copy up to `len` bytes from `src` at `off_in` to `dst` at `off_out` with
++/// positioned reads and writes, stopping at the end of `src`.
++pub fn copy_bytes(src: RawFd, off_in: u64, dst: RawFd, off_out: u64, len: u64) -> io::Result<u64> {
++    let len = len.min(MAX_COPY);
++    let mut buf = vec![0u8; COPY_CHUNK.min(len as usize).max(1)];
++    let mut done = 0u64;
++    while done < len {
++        let want = ((len - done) as usize).min(buf.len());
++        let n = unsafe {
++            libc::pread(
++                src,
++                buf.as_mut_ptr().cast(),
++                want,
++                (off_in + done) as libc::off_t,
++            )
++        };
++        if n < 0 {
++            let e = io::Error::last_os_error();
++            if e.kind() == io::ErrorKind::Interrupted {
++                continue;
++            }
++            return if done > 0 { Ok(done) } else { Err(e) };
++        }
++        if n == 0 {
++            break;
++        }
++        let mut written = 0usize;
++        while written < n as usize {
++            let w = unsafe {
++                libc::pwrite(
++                    dst,
++                    buf[written..].as_ptr().cast(),
++                    n as usize - written,
++                    (off_out + done + written as u64) as libc::off_t,
++                )
++            };
++            if w < 0 {
++                let e = io::Error::last_os_error();
++                if e.kind() == io::ErrorKind::Interrupted {
++                    continue;
++                }
++                return if done + written as u64 > 0 {
++                    Ok(done + written as u64)
++                } else {
++                    Err(e)
++                };
++            }
++            written += w as usize;
++        }
++        done += n as u64;
++    }
++    Ok(done)
++}
++
++/// How a COPY_FILE_RANGE was carried out.
++pub enum Copied {
++    /// `dst` was replaced by a clone of the whole of `src`, now open as this file.
++    Cloned(File, u64),
++    Bytes(u64),
++}
++
++pub fn copy_file_range(
++    src: RawFd,
++    off_in: u64,
++    dst: RawFd,
++    off_out: u64,
++    len: u64,
++) -> io::Result<Copied> {
++    if let Some((file, n)) = clone_whole_file(src, off_in, dst, off_out, len)? {
++        return Ok(Copied::Cloned(file, n));
++    }
++    copy_bytes(src, off_in, dst, off_out, len).map(Copied::Bytes)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::virtio::fs::macos::test_util::TempDir;
++    use std::fs::OpenOptions;
++    use std::io::{Read, Write};
++    use std::os::unix::fs::MetadataExt;
++
++    fn data(n: usize) -> Vec<u8> {
++        (0..n).map(|i| (i * 7 + i / 4096) as u8).collect()
++    }
++
++    fn clone_id(path: &Path) -> u64 {
++        // getattrlist(ATTR_CMNEXT_CLONEID)
++        #[repr(C)]
++        struct AttrList {
++            bitmapcount: u16,
++            reserved: u16,
++            commonattr: u32,
++            volattr: u32,
++            dirattr: u32,
++            fileattr: u32,
++            forkattr: u32,
++        }
++        #[repr(C, packed)]
++        struct Out {
++            len: u32,
++            id: u64,
++        }
++        const ATTR_BIT_MAP_COUNT: u16 = 5;
++        const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100;
++        const FSOPT_ATTR_CMN_EXTENDED: u32 = 0x0000_0020;
++        let al = AttrList {
++            bitmapcount: ATTR_BIT_MAP_COUNT,
++            reserved: 0,
++            commonattr: 0,
++            volattr: 0,
++            dirattr: 0,
++            fileattr: 0,
++            forkattr: ATTR_CMNEXT_CLONEID,
++        };
++        let mut out = Out { len: 0, id: 0 };
++        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
++        let r = unsafe {
++            libc::getattrlist(
++                c.as_ptr(),
++                (&al as *const AttrList).cast_mut().cast(),
++                (&mut out as *mut Out).cast(),
++                std::mem::size_of::<Out>(),
++                FSOPT_ATTR_CMN_EXTENDED,
++            )
++        };
++        assert_eq!(r, 0, "{}", io::Error::last_os_error());
++        out.id
++    }
++
++    #[test]
++    fn whole_file_copy_into_new_file_is_a_clone() {
++        let dir = TempDir::new();
++        let (sp, dp) = (dir.0.join("src"), dir.0.join("dst"));
++        let content = data(3 << 20);
++        std::fs::write(&sp, &content).unwrap();
++        let src = File::open(&sp).unwrap();
++        let dst = OpenOptions::new()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&dp)
++            .unwrap();
++        std::fs::set_permissions(&dp, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
++        let k = CString::new("user.containers.override_stat").unwrap();
++        let v = b"0:0:0100644";
++        assert_eq!(
++            unsafe {
++                libc::fsetxattr(
++                    dst.as_raw_fd(),
++                    k.as_ptr(),
++                    v.as_ptr().cast(),
++                    v.len(),
++                    0,
++                    0,
++                )
++            },
++            0
++        );
++        let old_ino = dst.metadata().unwrap().ino();
++
++        let res = copy_file_range(src.as_raw_fd(), 0, dst.as_raw_fd(), 0, u64::MAX >> 1).unwrap();
++        let Copied::Cloned(mut new, n) = res else {
++            panic!("expected a clone")
++        };
++        assert_eq!(n, content.len() as u64);
++        assert_ne!(new.metadata().unwrap().ino(), old_ino);
++        assert_eq!(
++            std::fs::metadata(&dp).unwrap().ino(),
++            new.metadata().unwrap().ino()
++        );
++        assert_eq!(std::fs::read(&dp).unwrap(), content);
++        assert_eq!(clone_id(&sp), clone_id(&dp), "data blocks are shared");
++        assert_eq!(std::fs::metadata(&dp).unwrap().mode() & 0o7777, 0o640);
++        let mut buf = [0u8; 32];
++        let n = unsafe {
++            libc::getxattr(
++                CString::new(dp.as_os_str().as_bytes()).unwrap().as_ptr(),
++                k.as_ptr(),
++                buf.as_mut_ptr().cast(),
++                buf.len(),
++                0,
++                0,
++            )
++        };
++        assert_eq!(&buf[..n as usize], v);
++        // The returned file is writable like the handle it replaces.
++        new.write_all(b"x").unwrap();
++        // No temporary files are left behind.
++        let names: Vec<_> = std::fs::read_dir(&dir.0)
++            .unwrap()
++            .map(|e| e.unwrap().file_name())
++            .collect();
++        assert_eq!(names.len(), 2, "{names:?}");
++        // The source is unchanged.
++        let mut s = Vec::new();
++        File::open(&sp).unwrap().read_to_end(&mut s).unwrap();
++        assert_eq!(s, content);
++    }
++
++    #[test]
++    fn partial_and_offset_copies_fall_back_to_bytes() {
++        let dir = TempDir::new();
++        let (sp, dp) = (dir.0.join("src"), dir.0.join("dst"));
++        let content = data(200_000);
++        std::fs::write(&sp, &content).unwrap();
++        let src = File::open(&sp).unwrap();
++
++        // Into a non-empty file at an offset.
++        std::fs::write(&dp, b"0123456789").unwrap();
++        let dst = OpenOptions::new().write(true).open(&dp).unwrap();
++        let ino = dst.metadata().unwrap().ino();
++        let Copied::Bytes(n) =
++            copy_file_range(src.as_raw_fd(), 100, dst.as_raw_fd(), 5, 1000).unwrap()
++        else {
++            panic!("expected a byte copy")
++        };
++        assert_eq!(n, 1000);
++        let got = std::fs::read(&dp).unwrap();
++        assert_eq!(&got[..5], b"01234");
++        assert_eq!(&got[5..], &content[100..1100]);
++        assert_eq!(std::fs::metadata(&dp).unwrap().ino(), ino);
++
++        // A partial range of the source into an empty file.
++        let ep = dir.0.join("empty");
++        let e = OpenOptions::new()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&ep)
++            .unwrap();
++        let Copied::Bytes(n) = copy_file_range(src.as_raw_fd(), 0, e.as_raw_fd(), 0, 4096).unwrap()
++        else {
++            panic!("expected a byte copy")
++        };
++        assert_eq!(n, 4096);
++        assert_eq!(std::fs::read(&ep).unwrap(), &content[..4096]);
++
++        // Reading past the end copies what is there.
++        let Copied::Bytes(n) =
++            copy_file_range(src.as_raw_fd(), 199_990, e.as_raw_fd(), 4096, 100).unwrap()
++        else {
++            panic!("expected a byte copy")
++        };
++        assert_eq!(n, 10);
++    }
++
++    #[test]
++    fn barrier_fsync_and_no_sync() {
++        let dir = TempDir::new();
++        let mut f = File::create(dir.0.join("f")).unwrap();
++        f.write_all(b"data").unwrap();
++        fsync(f.as_raw_fd(), false).unwrap();
++        fsync(f.as_raw_fd(), true).unwrap();
++        assert!(fsync(-1, false).is_err());
++        assert!(fsync(-1, true).is_ok());
++    }
++}
+diff --git a/src/devices/src/virtio/fs/macos/mod.rs b/src/devices/src/virtio/fs/macos/mod.rs
+index fdb1357e..05f7f4c9 100644
+--- a/src/devices/src/virtio/fs/macos/mod.rs
++++ b/src/devices/src/virtio/fs/macos/mod.rs
+@@ -1,4 +1,9 @@
+ mod attrlist;
++pub mod boundaries;
++pub mod fileops;
+ pub mod fs_utils;
+ pub mod passthrough;
+ mod pins;
++pub mod syncopen;
++#[cfg(test)]
++mod test_util;
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index 0e1eb25f..3c287cf6 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -36,6 +36,7 @@ use super::super::multikey::MultikeyBTreeMap;
+ pub use super::super::{CachePolicy, PermissionSemantics};
+ use super::attrlist;
+ use super::pins::{Pin, PinPool, PinSlot};
++use super::{fileops, syncopen};
+ 
+ const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+ const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
+@@ -703,6 +704,9 @@ pub struct Config {
+ 
+     /// The owner that `PermissionSemantics::LinuxSimplifiedFixedOwner` reports for every file.
+     pub fixed_owner: Option<(u32, u32)>,
++
++    /// Make FSYNC and FSYNCDIR no-ops (for disposable data). Off by default.
++    pub no_sync_io: bool,
+ }
+ 
+ impl Config {
+@@ -731,6 +735,7 @@ impl Default for Config {
+             export_table: None,
+             semantics: PermissionSemantics::LinuxComplete,
+             fixed_owner: None,
++            no_sync_io: false,
+         }
+     }
+ }
+@@ -1026,6 +1031,11 @@ impl PassthroughFs {
+             Ok(match self.inode_to_handle(inode, true)? {
+                 // Check if we have recently unlinked the inode and kept open a file descriptor to it.
+                 InodeHandle::Fd(fd) => unsafe { libc::dup(fd) },
++                // On the synchronous path every open must be bounded, and an openat through a
++                // pin can block like any other open (a dataless iCloud file), so skip the pins.
++                InodeHandle::Path(c_path) if syncopen::in_bounded_scope() => unsafe {
++                    syncopen::open(c_path.as_ptr(), flags, 0)
++                },
+                 InodeHandle::Path(c_path) => self
+                     .open_pinned(&data, flags)
+                     .unwrap_or_else(|| unsafe { libc::open(c_path.as_ptr(), flags) }),
+@@ -1977,10 +1987,10 @@ impl FileSystem for PassthroughFs {
+         // really check `flags` because if the kernel can't handle poorly specified flags then we
+         // have much bigger problems.
+         let fd = unsafe {
+-            libc::open(
++            syncopen::open(
+                 c_path.as_ptr(),
+                 flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+-                host_mode,
++                host_mode as libc::c_int,
+             )
+         };
+         if fd < 0 {
+@@ -2548,14 +2558,7 @@ impl FileSystem for PassthroughFs {
+ 
+         let fd = data.file.write().unwrap().as_raw_fd();
+ 
+-        // Safe because this doesn't modify any memory and we check the return value.
+-        let res = unsafe { libc::fsync(fd) };
+-
+-        if res == 0 {
+-            Ok(())
+-        } else {
+-            Err(linux_error(io::Error::last_os_error()))
+-        }
++        fileops::fsync(fd, self.cfg.no_sync_io).map_err(linux_error)
+     }
+ 
+     fn fsyncdir(
+@@ -2855,6 +2858,26 @@ impl FileSystem for PassthroughFs {
+         }
+     }
+ 
++    fn copyfilerange(
++        &self,
++        _ctx: Context,
++        inode_in: Inode,
++        handle_in: Handle,
++        offset_in: u64,
++        inode_out: Inode,
++        handle_out: Handle,
++        offset_out: u64,
++        len: u64,
++        flags: u64,
++    ) -> io::Result<usize> {
++        self.copy_range(
++            (inode_in, handle_in, offset_in),
++            (inode_out, handle_out, offset_out),
++            len,
++            flags,
++        )
++    }
++
+     fn fallocate(
+         &self,
+         ctx: Context,
+@@ -3122,6 +3145,77 @@ impl FileSystem for PassthroughFs {
+     }
+ }
+ 
++// copy_file_range backed by APFS clones (see fileops.rs). A clone replaces the
++// destination file, so its node and open handles are pointed at the clone.
++impl PassthroughFs {
++    fn copy_range(
++        &self,
++        (inode_in, handle_in, off_in): (Inode, Handle, u64),
++        (inode_out, handle_out, off_out): (Inode, Handle, u64),
++        len: u64,
++        flags: u64,
++    ) -> io::Result<usize> {
++        if flags != 0 {
++            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
++        }
++        let handle = |handle: Handle, inode: Inode| {
++            self.handles
++                .read()
++                .unwrap()
++                .get(&handle)
++                .filter(|hd| hd.inode == inode)
++                .cloned()
++                .ok_or_else(ebadf)
++        };
++        let (src, dst) = (handle(handle_in, inode_in)?, handle(handle_out, inode_out)?);
++        let src_fd = src.file.read().unwrap().as_raw_fd();
++        let dst_fd = dst.file.read().unwrap().as_raw_fd();
++        match fileops::copy_file_range(src_fd, off_in, dst_fd, off_out, len).map_err(linux_error)? {
++            fileops::Copied::Bytes(n) => Ok(n as usize),
++            fileops::Copied::Cloned(file, n) => {
++                self.retarget_inode(inode_out, file)?;
++                Ok(n as usize)
++            }
++        }
++    }
++
++    fn retarget_inode(&self, inode: Inode, file: File) -> io::Result<()> {
++        let ctx = Context {
++            uid: 0,
++            gid: 0,
++            pid: 0,
++        };
++        let st = fstat(&ctx, self.cfg.ownership(), file.as_raw_fd(), true)?;
++        let old = {
++            let mut inodes = self.inodes.write().unwrap();
++            let old = inodes.remove(&inode).ok_or_else(ebadf)?;
++            let data = InodeData::new(inode, &st, old.refcount.load(Ordering::Acquire));
++            data.open_handles
++                .store(old.open_handles.load(Ordering::Acquire), Ordering::Release);
++            *data.anchor.lock().unwrap() = old.anchor.lock().unwrap().clone();
++            inodes.insert(
++                inode,
++                InodeAltKey {
++                    ino: st.st_ino,
++                    dev: st.st_dev,
++                },
++                Arc::new(data),
++            );
++            old
++        };
++        let unlinked = old.unlinked_fd.swap(-1, Ordering::AcqRel);
++        if unlinked >= 0 {
++            unsafe { libc::close(unlinked as RawFd) };
++        }
++        for hd in self.handles.read().unwrap().values() {
++            if hd.inode == inode {
++                *hd.file.write().unwrap() = file.try_clone()?;
++            }
++        }
++        Ok(())
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/devices/src/virtio/fs/macos/syncopen.rs b/src/devices/src/virtio/fs/macos/syncopen.rs
+new file mode 100644
+index 00000000..4e5900a1
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/syncopen.rs
+@@ -0,0 +1,339 @@
++//! Bounded opens for requests processed on a vCPU thread.
++//!
++//! An open can block for seconds: a dataless iCloud file is downloaded first,
++//! a FIFO waits for a writer, a stalled network volume waits for the server.
++//! While a request is processed in a bounded scope, opens run on a helper
++//! thread and the caller waits at most [`DEADLINE`]. On timeout the open is
++//! abandoned (the helper closes the descriptor when it finally returns), the
++//! request is retried on the worker pool and the node becomes async-only.
++
++use std::cell::Cell;
++use std::ffi::{CStr, CString};
++use std::os::raw::{c_char, c_int};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++use std::thread::{self, Thread};
++use std::time::{Duration, Instant};
++
++use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
++use nix::errno::Errno;
++
++pub const DEADLINE: Duration = Duration::from_millis(20);
++/// Spin instead of parking while this little time is left, or for this long
++/// after starting: most opens finish in a few microseconds, and a park costs
++/// a wakeup.
++const SPIN: Duration = Duration::from_micros(50);
++/// A helper polls for the next job this long before blocking.
++const HELPER_SPIN: Duration = Duration::from_micros(250);
++/// Helpers stuck in abandoned opens are not reused; stop adding more past this.
++const MAX_HELPERS: usize = 64;
++
++thread_local! {
++    static BOUNDED: Cell<bool> = const { Cell::new(false) };
++    static TIMED_OUT: Cell<bool> = const { Cell::new(false) };
++}
++
++/// While alive, opens on this thread go through [`run_bounded`].
++pub struct BoundedScope(());
++
++impl Drop for BoundedScope {
++    fn drop(&mut self) {
++        BOUNDED.with(|b| b.set(false));
++    }
++}
++
++/// Whether this thread is serving the synchronous path, where opens are bounded.
++pub fn in_bounded_scope() -> bool {
++    BOUNDED.with(|b| b.get())
++}
++
++pub fn bounded_scope() -> BoundedScope {
++    BOUNDED.with(|b| b.set(true));
++    TIMED_OUT.with(|t| t.set(false));
++    BoundedScope(())
++}
++
++/// Whether an open in the current scope timed out; clears the flag.
++pub fn take_timed_out() -> bool {
++    TIMED_OUT.with(|t| t.replace(false))
++}
++
++enum State<T> {
++    Pending,
++    Done(T),
++    Abandoned,
++}
++
++struct Slot<T> {
++    state: Mutex<State<T>>,
++    waiter: Thread,
++}
++
++type Job = Box<dyn FnOnce() + Send>;
++
++struct Helpers {
++    tx: Sender<Job>,
++    rx: Receiver<Job>,
++    idle: AtomicUsize,
++    total: AtomicUsize,
++}
++
++fn helpers() -> &'static Helpers {
++    static H: OnceLock<Helpers> = OnceLock::new();
++    H.get_or_init(|| {
++        let (tx, rx) = unbounded();
++        Helpers {
++            tx,
++            rx,
++            idle: AtomicUsize::new(0),
++            total: AtomicUsize::new(0),
++        }
++    })
++}
++
++fn helper_loop(h: &'static Helpers) {
++    super::super::worker::set_interactive_qos();
++    loop {
++        let spin_until = Instant::now() + HELPER_SPIN;
++        let job = loop {
++            match h.rx.try_recv() {
++                Ok(job) => break Some(job),
++                Err(TryRecvError::Disconnected) => return,
++                Err(TryRecvError::Empty) if Instant::now() < spin_until => std::hint::spin_loop(),
++                Err(TryRecvError::Empty) => break None,
++            }
++        };
++        let job = match job {
++            Some(job) => job,
++            None => match h.rx.recv() {
++                Ok(job) => job,
++                Err(_) => return,
++            },
++        };
++        h.idle.fetch_sub(1, Ordering::AcqRel);
++        job();
++        h.idle.fetch_add(1, Ordering::AcqRel);
++    }
++}
++
++/// Make sure a helper will pick up the next job. Returns false when too many
++/// helpers are stuck in abandoned work.
++fn reserve_helper(h: &'static Helpers) -> bool {
++    if h.idle.load(Ordering::Acquire) > h.rx.len() {
++        return true;
++    }
++    if h.total.fetch_add(1, Ordering::AcqRel) >= MAX_HELPERS {
++        h.total.fetch_sub(1, Ordering::AcqRel);
++        return false;
++    }
++    h.idle.fetch_add(1, Ordering::AcqRel);
++    thread::Builder::new()
++        .name("fs open".into())
++        .spawn(move || helper_loop(h))
++        .is_ok()
++}
++
++/// Run `work` on a helper thread and wait for it until `deadline`. On
++/// timeout returns `None`; `abandon` then receives the result whenever
++/// `work` finishes.
++pub fn run_bounded<T: Send + 'static>(
++    deadline: Duration,
++    work: impl FnOnce() -> T + Send + 'static,
++    abandon: impl FnOnce(T) + Send + 'static,
++) -> Option<T> {
++    let h = helpers();
++    if !reserve_helper(h) {
++        return None;
++    }
++    let started = Instant::now();
++    let end = started + deadline;
++    let slot = Arc::new(Slot {
++        state: Mutex::new(State::Pending),
++        waiter: thread::current(),
++    });
++    let theirs = slot.clone();
++    let job: Job = Box::new(move || {
++        let out = work();
++        let mut state = theirs.state.lock().unwrap();
++        match *state {
++            State::Abandoned => {
++                drop(state);
++                abandon(out);
++            }
++            _ => {
++                *state = State::Done(out);
++                drop(state);
++                theirs.waiter.unpark();
++            }
++        }
++    });
++    if h.tx.send(job).is_err() {
++        return None;
++    }
++    loop {
++        {
++            let mut state = slot.state.lock().unwrap();
++            if let State::Done(_) = *state {
++                let State::Done(out) = std::mem::replace(&mut *state, State::Abandoned) else {
++                    unreachable!()
++                };
++                return Some(out);
++            }
++            let now = Instant::now();
++            if now >= end {
++                *state = State::Abandoned;
++                return None;
++            }
++        }
++        let now = Instant::now();
++        let left = end - now;
++        if now - started < SPIN || left <= SPIN {
++            std::hint::spin_loop();
++        } else {
++            thread::park_timeout(left - SPIN);
++        }
++    }
++}
++
++/// `open(2)`, bounded by [`DEADLINE`] inside a [`bounded_scope`].
++///
++/// # Safety
++/// `path` must point to a NUL-terminated string.
++pub unsafe fn open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
++    if !BOUNDED.with(|b| b.get()) {
++        return unsafe { libc::open(path, flags, mode) };
++    }
++    let owned = unsafe { CStr::from_ptr(path) }.to_owned();
++    match open_with_deadline(owned, flags, mode, DEADLINE) {
++        Ok(fd) => fd,
++        Err(errno) => {
++            Errno::set_raw(errno);
++            -1
++        }
++    }
++}
++
++fn open_with_deadline(
++    path: CString,
++    flags: c_int,
++    mode: c_int,
++    deadline: Duration,
++) -> Result<c_int, c_int> {
++    let res = run_bounded(
++        deadline,
++        move || {
++            let fd = unsafe { libc::open(path.as_ptr(), flags, mode) };
++            if fd < 0 {
++                Err(Errno::last_raw())
++            } else {
++                Ok(fd)
++            }
++        },
++        |res| {
++            if let Ok(fd) = res {
++                unsafe { libc::close(fd) };
++                debug!("abandoned sync open completed");
++            }
++        },
++    );
++    match res {
++        Some(r) => r,
++        None => {
++            debug!("sync open timed out: require async");
++            TIMED_OUT.with(|t| t.set(true));
++            Err(libc::EAGAIN)
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::virtio::fs::macos::test_util::TempDir;
++    use std::sync::atomic::AtomicBool;
++
++    fn fifo() -> (TempDir, CString) {
++        let dir = TempDir::new();
++        let path = CString::new(dir.0.join("fifo").to_str().unwrap()).unwrap();
++        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
++        (dir, path)
++    }
++
++    #[test]
++    fn fast_open_completes_inline() {
++        let dir = TempDir::new();
++        let path = CString::new(dir.0.join("f").to_str().unwrap()).unwrap();
++        let _scope = bounded_scope();
++        let fd = unsafe { open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
++        assert!(fd >= 0);
++        assert!(!take_timed_out());
++        unsafe { libc::close(fd) };
++    }
++
++    #[test]
++    fn errors_pass_through() {
++        let _scope = bounded_scope();
++        let fd = unsafe { open(c"/nonexistent/x".as_ptr(), libc::O_RDONLY, 0) };
++        assert_eq!(fd, -1);
++        assert_eq!(Errno::last_raw(), libc::ENOENT);
++        assert!(!take_timed_out());
++    }
++
++    #[test]
++    fn stalled_open_times_out_and_is_closed_later() {
++        let (_dir, path) = fifo();
++        let started = Instant::now();
++        // A FIFO opened for reading blocks until a writer appears.
++        let res = open_with_deadline(path.clone(), libc::O_RDONLY, 0, DEADLINE);
++        let waited = started.elapsed();
++        assert_eq!(res, Err(libc::EAGAIN));
++        assert!(TIMED_OUT.with(|t| t.replace(false)));
++        assert!(waited >= DEADLINE, "{waited:?}");
++        assert!(waited < DEADLINE * 10, "{waited:?}");
++
++        // A writer releases the helper, which closes the abandoned descriptor.
++        let w = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
++        assert!(w >= 0);
++        unsafe { libc::close(w) };
++    }
++
++    #[test]
++    fn unbounded_scope_opens_directly() {
++        let (_dir, path) = fifo();
++        let fd = unsafe { open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK, 0) };
++        assert!(fd >= 0);
++        unsafe { libc::close(fd) };
++    }
++
++    #[test]
++    fn abandon_receives_the_late_result() {
++        let done = Arc::new(AtomicBool::new(false));
++        let d = done.clone();
++        let res = run_bounded(
++            Duration::from_millis(5),
++            || {
++                thread::sleep(Duration::from_millis(30));
++                7
++            },
++            move |v| {
++                assert_eq!(v, 7);
++                d.store(true, Ordering::SeqCst);
++            },
++        );
++        assert_eq!(res, None);
++        for _ in 0..100 {
++            if done.load(Ordering::SeqCst) {
++                return;
++            }
++            thread::sleep(Duration::from_millis(5));
++        }
++        panic!("abandon callback never ran");
++    }
++
++    #[test]
++    fn quick_work_returns_its_result() {
++        for i in 0..200 {
++            assert_eq!(run_bounded(DEADLINE, move || i * 2, |_| {}), Some(i * 2));
++        }
++    }
++}
+diff --git a/src/devices/src/virtio/fs/macos/test_util.rs b/src/devices/src/virtio/fs/macos/test_util.rs
+new file mode 100644
+index 00000000..8dc9b424
+--- /dev/null
++++ b/src/devices/src/virtio/fs/macos/test_util.rs
+@@ -0,0 +1,24 @@
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++/// A directory under the system temp dir, removed on drop.
++pub struct TempDir(pub PathBuf);
++
++impl TempDir {
++    pub fn new() -> Self {
++        static N: AtomicU64 = AtomicU64::new(0);
++        let path = std::env::temp_dir().join(format!(
++            "krun-fs-test-{}-{}",
++            std::process::id(),
++            N.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir_all(&path).unwrap();
++        TempDir(path)
++    }
++}
++
++impl Drop for TempDir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
+diff --git a/src/devices/src/virtio/fs/mod.rs b/src/devices/src/virtio/fs/mod.rs
+index d4a74379..5c97a7c6 100644
+--- a/src/devices/src/virtio/fs/mod.rs
++++ b/src/devices/src/virtio/fs/mod.rs
+@@ -9,6 +9,7 @@ mod multikey;
+ mod null_fs;
+ mod read_only;
+ mod server;
++mod sync_policy;
+ pub mod virtual_entry;
+ mod worker;
+ 
+diff --git a/src/devices/src/virtio/fs/server.rs b/src/devices/src/virtio/fs/server.rs
+index d4d77b6c..e364e760 100644
+--- a/src/devices/src/virtio/fs/server.rs
++++ b/src/devices/src/virtio/fs/server.rs
+@@ -26,6 +26,7 @@ use super::filesystem::{
+ };
+ use super::fs_utils::einval;
+ use super::fuse::*;
++use super::sync_policy::SyncPolicy;
+ use super::{FsError as Error, Result};
+ use crate::virtio::VirtioShmRegion;
+ 
+@@ -71,16 +72,56 @@ impl io::Write for ZCWriter<'_> {
+ pub struct Server<F: FileSystem + Sync> {
+     fs: F,
+     options: AtomicU64,
++    policy: Arc<SyncPolicy>,
+ }
+ 
++/// INIT flags offered to the guest. Not offered:
++/// ASYNC_READ and ASYNC_DIO (keeping reads foreground lets them take the
++/// synchronous path), READDIRPLUS_AUTO (READDIRPLUS is always used),
++/// SUBMOUNTS, SECURITY_CTX, HANDLE_KILLPRIV_V2, locks, DAX and splice.
++/// WRITEBACK_CACHE is added only when the share enables it.
++const OFFERED: FsOptions = FsOptions::ATOMIC_O_TRUNC
++    .union(FsOptions::BIG_WRITES)
++    .union(FsOptions::HAS_IOCTL_DIR)
++    .union(FsOptions::AUTO_INVAL_DATA)
++    .union(FsOptions::DO_READDIRPLUS)
++    .union(FsOptions::PARALLEL_DIROPS)
++    .union(FsOptions::HANDLE_KILLPRIV)
++    .union(FsOptions::MAX_PAGES)
++    .union(FsOptions::INIT_EXT)
++    .union(FsOptions::ALLOW_IDMAP);
++
++/// Largest request payload the guest may send: 128 pages.
++const MAX_PAGES_OFFERED: u32 = 128;
++
+ impl<F: FileSystem + Sync> Server<F> {
+-    pub fn new(fs: F) -> Server<F> {
++    pub fn with_policy(fs: F, policy: Arc<SyncPolicy>) -> Server<F> {
+         Server {
+             fs,
+             options: AtomicU64::new(FsOptions::empty().bits()),
++            policy,
+         }
+     }
+ 
++    /// Decide where later requests on a node returned to the guest run.
++    fn note(&self, parent: u64, name: &[u8], entry: &Entry) {
++        if entry.inode == 0 {
++            return;
++        }
++        let name = name
++            .iter()
++            .position(|&b| b == 0)
++            .map_or(name, |nul| &name[..nul]);
++        let st = &entry.attr;
++        let dir = st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
++        #[cfg(target_os = "macos")]
++        let dev = st.st_dev as u32 as u64;
++        #[cfg(not(target_os = "macos"))]
++        let dev = st.st_dev as u64;
++        self.policy
++            .note_entry(parent, name, entry.inode, dev, st.st_ino, dir);
++    }
++
+     #[allow(clippy::cognitive_complexity)]
+     pub fn handle_message(
+         &self,
+@@ -203,6 +244,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             .lookup(Context::from(in_header), in_header.nodeid.into(), name)
+         {
+             Ok(entry) => {
++                self.note(in_header.nodeid, &buf, &entry);
+                 let out = EntryOut::from(entry);
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+@@ -320,6 +362,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             extensions,
+         ) {
+             Ok(entry) => {
++                self.note(in_header.nodeid, name, &entry);
+                 let out = EntryOut::from(entry);
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+@@ -357,6 +400,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             extensions,
+         ) {
+             Ok(entry) => {
++                self.note(in_header.nodeid, name, &entry);
+                 let out = EntryOut::from(entry);
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+@@ -391,6 +435,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             extensions,
+         ) {
+             Ok(entry) => {
++                self.note(in_header.nodeid, name, &entry);
+                 let out = EntryOut::from(entry);
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+@@ -507,6 +552,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             bytes_to_cstr(&name)?,
+         ) {
+             Ok(entry) => {
++                self.note(in_header.nodeid, &name, &entry);
+                 let out = EntryOut::from(entry);
+ 
+                 reply_ok(Some(out), None, in_header.unique, w)
+@@ -894,25 +940,9 @@ impl<F: FileSystem + Sync> Server<F> {
+             );
+         }
+ 
+-        // These fuse features are supported by this server by default.
+-        let mut supported = FsOptions::ASYNC_READ
+-            | FsOptions::PARALLEL_DIROPS
+-            | FsOptions::BIG_WRITES
+-            | FsOptions::AUTO_INVAL_DATA
+-            | FsOptions::ASYNC_DIO
+-            | FsOptions::HAS_IOCTL_DIR
+-            | FsOptions::ATOMIC_O_TRUNC
+-            | FsOptions::MAX_PAGES
+-            | FsOptions::SUBMOUNTS
+-            | FsOptions::HANDLE_KILLPRIV_V2
+-            | FsOptions::INIT_EXT;
+-
+-        if allow_idmap {
+-            supported |= FsOptions::ALLOW_IDMAP;
+-        }
+-
+-        if cfg!(target_os = "macos") {
+-            supported |= FsOptions::SECURITY_CTX;
++        let mut supported = OFFERED;
++        if !allow_idmap {
++            supported.remove(FsOptions::ALLOW_IDMAP);
+         }
+ 
+         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
+@@ -930,10 +960,13 @@ impl<F: FileSystem + Sync> Server<F> {
+                 info.dwPageSize
+             }
+         };
+-        let max_pages = ((MAX_BUFFER_SIZE - 1) / page_size) + 1;
++        let max_pages = (((MAX_BUFFER_SIZE - 1) / page_size) + 1).min(MAX_PAGES_OFFERED);
+ 
+         match self.fs.init(capable) {
+             Ok(want) => {
++                // The filesystem may only add WRITEBACK_CACHE (when the share
++                // enables it) to the offer.
++                let want = want & FsOptions::WRITEBACK_CACHE;
+                 let enabled = (capable & (want | supported)).bits();
+                 self.options.store(enabled, Ordering::Relaxed);
+ 
+@@ -944,7 +977,7 @@ impl<F: FileSystem + Sync> Server<F> {
+                     flags: enabled as u32,
+                     max_background: u16::MAX,
+                     congestion_threshold: (u16::MAX / 4) * 3,
+-                    max_write: MAX_BUFFER_SIZE,
++                    max_write: max_pages * page_size,
+                     time_gran: 1, // nanoseconds
+                     max_pages: max_pages.try_into().unwrap(),
+                     map_alignment: 0,
+@@ -1016,7 +1049,10 @@ impl<F: FileSystem + Sync> Server<F> {
+                 fh.into(),
+                 size,
+                 offset,
+-                |d, e| add_dirent(&mut cursor, size, d, Some(e)),
++                |d, e| {
++                    self.note(in_header.nodeid, d.name, &e);
++                    add_dirent(&mut cursor, size, d, Some(e))
++                },
+             )
+         } else {
+             self.fs.readdir(
+@@ -1157,6 +1193,7 @@ impl<F: FileSystem + Sync> Server<F> {
+             extensions,
+         ) {
+             Ok((entry, handle, opts)) => {
++                self.note(in_header.nodeid, name, &entry);
+                 let entry_out = EntryOut {
+                     nodeid: entry.inode,
+                     generation: entry.generation,
+diff --git a/src/devices/src/virtio/fs/sync_policy.rs b/src/devices/src/virtio/fs/sync_policy.rs
+new file mode 100644
+index 00000000..68d199f8
+--- /dev/null
++++ b/src/devices/src/virtio/fs/sync_policy.rs
+@@ -0,0 +1,378 @@
++//! Which FUSE requests may run synchronously on the vCPU that submitted them.
++//!
++//! The guest's synchronous submission path (KAT_FS_DRAIN) processes requests
++//! on the calling vCPU. Anything that can block for long (an fsync, a large
++//! copy, an open that must download a file from iCloud, a request on a
++//! network volume) must instead go to the worker pool, which completes it
++//! with an interrupt. Decisions are made per request from its opcode and the
++//! flags of the node it targets; node flags are decided once, when the node
++//! is looked up.
++
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, RwLock};
++
++use super::fuse::Opcode;
++
++/// Largest READ or WRITE payload handled synchronously.
++pub const MAX_SYNC_IO: u32 = 128 * 1024;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Route {
++    /// Bounded by nature: run on the calling thread.
++    Sync,
++    /// An open: run with a deadline, retried on the worker pool on timeout.
++    BoundedOpen,
++    /// May block: always run on the worker pool.
++    Async,
++}
++
++/// Route by opcode alone. `io_size` is the payload size of a READ or WRITE.
++pub fn classify(opcode: u32, io_size: u32) -> Route {
++    use Opcode::*;
++    const fn op(o: Opcode) -> u32 {
++        o as u32
++    }
++    match opcode {
++        x if x == op(Read) || x == op(Write) => {
++            if io_size <= MAX_SYNC_IO {
++                Route::Sync
++            } else {
++                Route::Async
++            }
++        }
++        x if x == op(Open) || x == op(Opendir) || x == op(Create) => Route::BoundedOpen,
++        x if [
++            Lookup,
++            Forget,
++            BatchForget,
++            Getattr,
++            Setattr,
++            Readlink,
++            Symlink,
++            Mknod,
++            Mkdir,
++            Unlink,
++            Rmdir,
++            Rename,
++            Rename2,
++            Link,
++            Statfs,
++            Release,
++            Releasedir,
++            Getxattr,
++            Listxattr,
++            Flush,
++            Init,
++            Readdir,
++            Readdirplus,
++            Access,
++            Interrupt,
++            Destroy,
++            Lseek,
++        ]
++        .into_iter()
++        .any(|o| op(o) == x) =>
++        {
++            Route::Sync
++        }
++        // Fsync, Fsyncdir, Fallocate, Setxattr, Removexattr, CopyFileRange,
++        // Ioctl, Setlk(w), Getlk, Poll, Bmap, mappings and unknown opcodes.
++        _ => Route::Async,
++    }
++}
++
++/// Where a node sits relative to places that can block.
++pub trait Boundaries: Send + Sync {
++    /// The volume with this device id is local APFS/HFS and safe to touch
++    /// synchronously.
++    fn is_safe_dev(&self, dev: u64) -> bool;
++    /// The directory (dev, ino) contains mountpoints of unsafe volumes.
++    fn is_boundary_parent(&self, dev: u64, ino: u64) -> bool;
++    /// `name` in the directory (dev, ino) is the mountpoint of an unsafe volume.
++    fn is_unsafe_mountpoint(&self, dev: u64, ino: u64, name: &[u8]) -> bool;
++}
++
++/// Every volume is safe; used on hosts without a mount table and in tests.
++pub struct NoBoundaries;
++
++impl Boundaries for NoBoundaries {
++    fn is_safe_dev(&self, _dev: u64) -> bool {
++        true
++    }
++    fn is_boundary_parent(&self, _dev: u64, _ino: u64) -> bool {
++        false
++    }
++    fn is_unsafe_mountpoint(&self, _dev: u64, _ino: u64, _name: &[u8]) -> bool {
++        false
++    }
++}
++
++/// Everything under the node goes to the worker pool.
++const ASYNC_TREE: u8 = 1;
++/// A directory holding unsafe mountpoints: lookups of those names and
++/// READDIRPLUS (which stats every entry) go to the worker pool.
++const BOUNDARY: u8 = 2;
++/// A directory named `Library`, whose iCloud and File Provider children are
++/// async-only.
++const LIBRARY: u8 = 4;
++
++/// Children of `~/Library` that can download or call into File Provider.
++const LIBRARY_ASYNC_NAMES: [&[u8]; 3] = [b"Mobile Documents", b"Group Containers", b"CloudStorage"];
++
++#[derive(Clone, Copy)]
++struct NodeInfo {
++    flags: u8,
++    dev: u64,
++    ino: u64,
++}
++
++/// Node flags for one filesystem. Only flagged nodes have an entry, so the
++/// common case is a single read of an empty map.
++pub struct SyncPolicy {
++    boundaries: Arc<dyn Boundaries>,
++    nodes: RwLock<HashMap<u64, NodeInfo>>,
++    any: AtomicBool,
++}
++
++/// What `route` needs to know about a request before running it.
++pub struct Peek<'a> {
++    pub opcode: u32,
++    pub nodeid: u64,
++    pub io_size: u32,
++    /// The name of a LOOKUP, when the caller read it.
++    pub name: Option<&'a [u8]>,
++}
++
++impl SyncPolicy {
++    pub fn new(boundaries: Arc<dyn Boundaries>) -> Self {
++        Self {
++            boundaries,
++            nodes: RwLock::new(HashMap::new()),
++            any: AtomicBool::new(false),
++        }
++    }
++
++    fn get(&self, nodeid: u64) -> Option<NodeInfo> {
++        if !self.any.load(Ordering::Relaxed) {
++            return None;
++        }
++        self.nodes.read().unwrap().get(&nodeid).copied()
++    }
++
++    fn set(&self, nodeid: u64, info: NodeInfo) {
++        let mut nodes = self.nodes.write().unwrap();
++        let e = nodes.entry(nodeid).or_insert(NodeInfo { flags: 0, ..info });
++        e.flags |= info.flags;
++        e.dev = info.dev;
++        e.ino = info.ino;
++        self.any.store(true, Ordering::Relaxed);
++    }
++
++    /// The node is async-only from now on (a bounded open on it timed out).
++    pub fn mark_async(&self, nodeid: u64) {
++        let info = self.get(nodeid).unwrap_or(NodeInfo {
++            flags: 0,
++            dev: 0,
++            ino: 0,
++        });
++        self.set(
++            nodeid,
++            NodeInfo {
++                flags: ASYNC_TREE,
++                ..info
++            },
++        );
++    }
++
++    /// Whether `route` needs the LOOKUP name for this node.
++    pub fn wants_name(&self, nodeid: u64) -> bool {
++        self.get(nodeid).is_some_and(|i| i.flags & BOUNDARY != 0)
++    }
++
++    pub fn route(&self, req: &Peek) -> Route {
++        let base = classify(req.opcode, req.io_size);
++        if base == Route::Async {
++            return base;
++        }
++        let Some(info) = self.get(req.nodeid) else {
++            return base;
++        };
++        if info.flags & ASYNC_TREE != 0 {
++            return Route::Async;
++        }
++        if info.flags & BOUNDARY != 0 {
++            if req.opcode == Opcode::Readdirplus as u32 {
++                return Route::Async;
++            }
++            if req.opcode == Opcode::Lookup as u32 {
++                let unsafe_name = match req.name {
++                    Some(name) => self
++                        .boundaries
++                        .is_unsafe_mountpoint(info.dev, info.ino, name),
++                    None => true,
++                };
++                if unsafe_name {
++                    return Route::Async;
++                }
++            }
++        }
++        base
++    }
++
++    /// Decide the flags of the shared root (FUSE node 1).
++    pub fn note_root(&self, nodeid: u64, dev: u64, ino: u64) {
++        self.note(None, nodeid, b"", dev, ino, true);
++    }
++
++    /// Decide the flags of a node returned by LOOKUP, READDIRPLUS, CREATE,
++    /// MKDIR, MKNOD, SYMLINK or LINK under `parent`.
++    pub fn note_entry(&self, parent: u64, name: &[u8], nodeid: u64, dev: u64, ino: u64, dir: bool) {
++        self.note(Some(parent), nodeid, name, dev, ino, dir);
++    }
++
++    fn note(&self, parent: Option<u64>, nodeid: u64, name: &[u8], dev: u64, ino: u64, dir: bool) {
++        let pflags = parent.and_then(|p| self.get(p)).map_or(0, |i| i.flags);
++        let mut flags = 0;
++        if pflags & ASYNC_TREE != 0
++            || !self.boundaries.is_safe_dev(dev)
++            || (pflags & LIBRARY != 0 && LIBRARY_ASYNC_NAMES.contains(&name))
++        {
++            flags |= ASYNC_TREE;
++        } else if dir {
++            if self.boundaries.is_boundary_parent(dev, ino) {
++                flags |= BOUNDARY;
++            }
++            if name == b"Library" {
++                flags |= LIBRARY;
++            }
++        }
++        if flags != 0 {
++            self.set(nodeid, NodeInfo { flags, dev, ino });
++        }
++    }
++}
++
++impl Default for SyncPolicy {
++    fn default() -> Self {
++        Self::new(Arc::new(NoBoundaries))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn classification_table() {
++        use Opcode::*;
++        for o in [
++            Lookup,
++            Getattr,
++            Readdir,
++            Readdirplus,
++            Forget,
++            BatchForget,
++            Release,
++            Releasedir,
++            Statfs,
++            Mkdir,
++            Unlink,
++            Rename,
++            Getxattr,
++            Flush,
++        ] {
++            assert_eq!(classify(o as u32, 0), Route::Sync, "{o:?}");
++        }
++        for o in [Open, Opendir, Create] {
++            assert_eq!(classify(o as u32, 0), Route::BoundedOpen, "{o:?}");
++        }
++        for o in [
++            Fsync,
++            Fsyncdir,
++            Fallocate,
++            Setxattr,
++            Removexattr,
++            CopyFileRange,
++            Ioctl,
++            Setlkw,
++        ] {
++            assert_eq!(classify(o as u32, 0), Route::Async, "{o:?}");
++        }
++        assert_eq!(classify(Read as u32, MAX_SYNC_IO), Route::Sync);
++        assert_eq!(classify(Write as u32, 4096), Route::Sync);
++        assert_eq!(classify(Read as u32, MAX_SYNC_IO + 1), Route::Async);
++        assert_eq!(classify(Write as u32, 1 << 20), Route::Async);
++        assert_eq!(classify(9999, 0), Route::Async);
++    }
++
++    struct Fake;
++    impl Boundaries for Fake {
++        fn is_safe_dev(&self, dev: u64) -> bool {
++            dev != 66
++        }
++        fn is_boundary_parent(&self, dev: u64, ino: u64) -> bool {
++            (dev, ino) == (1, 500)
++        }
++        fn is_unsafe_mountpoint(&self, dev: u64, ino: u64, name: &[u8]) -> bool {
++            (dev, ino) == (1, 500) && name == b"nas"
++        }
++    }
++
++    fn peek(opcode: Opcode, nodeid: u64) -> Peek<'static> {
++        Peek {
++            opcode: opcode as u32,
++            nodeid,
++            io_size: 0,
++            name: None,
++        }
++    }
++
++    #[test]
++    fn node_flags_route_requests() {
++        let p = SyncPolicy::new(Arc::new(Fake));
++        p.note_root(1, 1, 2);
++        assert_eq!(p.route(&peek(Opcode::Getattr, 1)), Route::Sync);
++
++        // A volume that is not local APFS: the node and everything below it.
++        p.note_entry(1, b"net", 10, 66, 3, true);
++        assert_eq!(p.route(&peek(Opcode::Getattr, 10)), Route::Async);
++        p.note_entry(10, b"file", 11, 66, 4, false);
++        assert_eq!(p.route(&peek(Opcode::Read, 11)), Route::Async);
++
++        // iCloud Drive and File Provider below ~/Library.
++        p.note_entry(1, b"Library", 20, 1, 21, true);
++        assert_eq!(p.route(&peek(Opcode::Lookup, 20)), Route::Sync);
++        p.note_entry(20, b"Mobile Documents", 22, 1, 23, true);
++        p.note_entry(22, b"doc.pages", 24, 1, 25, false);
++        p.note_entry(20, b"Preferences", 26, 1, 27, true);
++        assert_eq!(p.route(&peek(Opcode::Open, 24)), Route::Async);
++        assert_eq!(p.route(&peek(Opcode::Open, 26)), Route::BoundedOpen);
++        p.note_entry(1, b"Mobile Documents", 28, 1, 29, true);
++        assert_eq!(p.route(&peek(Opcode::Open, 28)), Route::BoundedOpen);
++
++        // A directory holding a network mountpoint.
++        p.note_entry(1, b"home", 30, 1, 500, true);
++        let lookup = |name: &'static [u8]| Peek {
++            opcode: Opcode::Lookup as u32,
++            nodeid: 30,
++            io_size: 0,
++            name: Some(name),
++        };
++        assert!(p.wants_name(30));
++        assert_eq!(p.route(&lookup(b"nas")), Route::Async);
++        assert_eq!(p.route(&lookup(b"src")), Route::Sync);
++        assert_eq!(p.route(&peek(Opcode::Readdirplus, 30)), Route::Async);
++        assert_eq!(p.route(&peek(Opcode::Readdir, 30)), Route::Sync);
++        p.note_entry(30, b"src", 31, 1, 501, true);
++        assert_eq!(p.route(&peek(Opcode::Lookup, 31)), Route::Sync);
++
++        // A timed-out open makes the node async-only.
++        assert_eq!(p.route(&peek(Opcode::Open, 31)), Route::BoundedOpen);
++        p.mark_async(31);
++        assert_eq!(p.route(&peek(Opcode::Open, 31)), Route::Async);
++        assert_eq!(p.route(&peek(Opcode::Getattr, 31)), Route::Async);
++        // Opcodes that always block stay async on any node.
++        assert_eq!(p.route(&peek(Opcode::Fsync, 1)), Route::Async);
++    }
++}
+diff --git a/src/devices/src/virtio/fs/worker.rs b/src/devices/src/virtio/fs/worker.rs
+index a9dacdd8..63cda978 100644
+--- a/src/devices/src/virtio/fs/worker.rs
++++ b/src/devices/src/virtio/fs/worker.rs
+@@ -6,26 +6,31 @@ use utils::worker_message::WorkerMessage;
+ use std::io;
+ #[cfg(unix)]
+ use std::os::fd::AsRawFd;
+-use std::sync::{Arc, Mutex};
+ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+-use std::time::{Duration, Instant};
++use std::sync::{Arc, Mutex, Weak};
+ use std::thread;
++use std::time::{Duration, Instant};
+ #[cfg(windows)]
+ use utils::windows::AsRawFd;
+ 
++use crossbeam_channel::{Receiver, unbounded};
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+ use utils::eventfd::EventFd;
+-use vm_memory::GuestMemoryMmap;
++use vm_memory::{GuestAddress, GuestMemoryMmap};
+ 
+-use super::super::{FsError, Queue};
++use super::super::{DescriptorChain, FsError, Queue};
+ use super::augment_fs::AugmentFs;
+ use super::defs::{HPQ_INDEX, REQ_INDEX};
+ use super::descriptor_utils::{Reader, Writer};
++use super::fuse::{InHeader, Opcode, ReadIn, WriteIn};
+ use super::inode_alloc::InodeAllocator;
++#[cfg(target_os = "macos")]
++use super::macos::syncopen;
+ use super::null_fs::NullFs;
+ use super::passthrough::{self, PassthroughFs};
+ use super::read_only::PassthroughFsRo;
+ use super::server::Server;
++use super::sync_policy::{Peek, Route, SyncPolicy};
+ use super::virtual_entry::VirtualDirEntry;
+ use crate::virtio::{InterruptTransport, VirtioShmRegion};
+ 
+@@ -77,26 +82,80 @@ impl FsServer {
+     }
+ }
+ 
+-/// Queue processing state, shared between the worker thread and vCPU threads
+-/// that drain the request queue inline when they notify it.
++/// Returned to the guest's KAT_FS_DRAIN when every request was answered.
++pub const DRAIN_DONE: u64 = 0;
++/// Returned when a request must run on the worker pool: the guest then
++/// notifies the queue and waits for the interrupt.
++pub const DRAIN_BUSY: u64 = 1;
++
++/// Worker pool threads for requests that may block (KATAMARAN_FS_WORKERS).
++const DEFAULT_POOL: usize = 4;
++
++/// A request popped from a queue and handed to the worker pool.
++struct Job {
++    queue_index: usize,
++    head: u16,
++    desc_table: GuestAddress,
++    queue_size: u16,
++}
++
++/// Request processing state, shared by the worker thread, the worker pool
++/// and vCPU threads that process requests synchronously. The queues are
++/// locked only to pop and complete requests and to run requests that cannot
++/// block for long.
+ pub struct FsCore {
+-    queues: Vec<Queue>,
++    queues: Mutex<Vec<Queue>>,
+     interrupt: InterruptTransport,
+     mem: GuestMemoryMmap,
+     allow_idmap: bool,
+     shm_region: Option<VirtioShmRegion>,
+     server: FsServer,
++    policy: Arc<SyncPolicy>,
++    pool: Mutex<Option<crossbeam_channel::Sender<Job>>>,
+     exit_code: Arc<AtomicI32>,
+     #[cfg(target_os = "macos")]
+     map_sender: Option<Sender<WorkerMessage>>,
+ }
+ 
+ pub struct FsWorker {
+-    core: Arc<Mutex<FsCore>>,
++    core: Arc<FsCore>,
+     queue_evts: Vec<Arc<EventFd>>,
+     stop_fd: EventFd,
+ }
+ 
++/// Run the calling thread at QOS_CLASS_USER_INTERACTIVE, as the
++/// virtio-fs workers do: guest file requests are on someone's critical path.
++pub fn set_interactive_qos() {
++    #[cfg(target_os = "macos")]
++    {
++        unsafe extern "C" {
++            fn pthread_set_qos_class_self_np(qos: u32, relpri: i32) -> i32;
++        }
++        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
++        unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn new_policy(cfg: Option<&passthrough::Config>) -> Arc<SyncPolicy> {
++    use super::macos::boundaries::MountBoundaries;
++    use std::os::unix::fs::MetadataExt;
++
++    let Some(cfg) = cfg else {
++        return Arc::new(SyncPolicy::default());
++    };
++    let policy = SyncPolicy::new(MountBoundaries::shared());
++    if let Ok(md) = std::fs::symlink_metadata(&cfg.root_dir) {
++        policy.note_root(super::fuse::ROOT_ID, md.dev() as u32 as u64, md.ino());
++    }
++    Arc::new(policy)
++}
++
++#[cfg(not(target_os = "macos"))]
++fn new_policy(_cfg: Option<&passthrough::Config>) -> Arc<SyncPolicy> {
++    Arc::new(SyncPolicy::default())
++}
++
+ impl FsWorker {
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+@@ -114,47 +173,49 @@ impl FsWorker {
+         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+     ) -> Result<Self, io::Error> {
+         let inode_alloc = Arc::new(InodeAllocator::new());
++        let policy = new_policy(passthrough_cfg.as_ref());
+         let server = match passthrough_cfg {
+             Some(cfg) if read_only => {
+                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
+-                FsServer::ReadOnly(Server::new(AugmentFs::new(
+-                    inner,
+-                    &inode_alloc,
+-                    virtual_entries,
+-                )))
++                FsServer::ReadOnly(Server::with_policy(
++                    AugmentFs::new(inner, &inode_alloc, virtual_entries),
++                    policy.clone(),
++                ))
+             }
+             Some(cfg) => {
+                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+-                FsServer::ReadWrite(Server::new(AugmentFs::new(
+-                    inner,
+-                    &inode_alloc,
+-                    virtual_entries,
+-                )))
++                FsServer::ReadWrite(Server::with_policy(
++                    AugmentFs::new(inner, &inode_alloc, virtual_entries),
++                    policy.clone(),
++                ))
+             }
+-            None => FsServer::Null(Server::new(AugmentFs::new(
+-                NullFs,
+-                &inode_alloc,
+-                virtual_entries,
+-            ))),
++            None => FsServer::Null(Server::with_policy(
++                AugmentFs::new(NullFs, &inode_alloc, virtual_entries),
++                policy.clone(),
++            )),
+         };
++        let core = Arc::new(FsCore {
++            queues: Mutex::new(queues),
++            interrupt,
++            mem,
++            allow_idmap,
++            shm_region,
++            server,
++            policy,
++            pool: Mutex::new(None),
++            exit_code,
++            #[cfg(target_os = "macos")]
++            map_sender,
++        });
++        core.start_pool(pool_size());
+         Ok(Self {
+-            core: Arc::new(Mutex::new(FsCore {
+-                queues,
+-                interrupt,
+-                mem,
+-                allow_idmap,
+-                shm_region,
+-                server,
+-                exit_code,
+-                #[cfg(target_os = "macos")]
+-                map_sender,
+-            })),
++            core,
+             queue_evts,
+             stop_fd,
+         })
+     }
+ 
+-    pub fn core(&self) -> Arc<Mutex<FsCore>> {
++    pub fn core(&self) -> Arc<FsCore> {
+         self.core.clone()
+     }
+ 
+@@ -165,7 +226,8 @@ impl FsWorker {
+             .unwrap()
+     }
+ 
+-    fn work(mut self) {
++    fn work(self) {
++        set_interactive_qos();
+         let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
+         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
+         let stop_ev_fd = self.stop_fd.as_raw_fd();
+@@ -205,6 +267,7 @@ impl FsWorker {
+                             EventSet::IN if source == stop_ev_fd => {
+                                 debug!("stopping worker thread");
+                                 let _ = self.stop_fd.read();
++                                self.core.stop_pool();
+                                 return;
+                             }
+                             _ => {
+@@ -222,19 +285,29 @@ impl FsWorker {
+         }
+     }
+ 
+-    fn handle_event(&mut self, queue_index: usize) {
++    fn handle_event(&self, queue_index: usize) {
+         debug!("Fs: queue event: {queue_index}");
+         if let Err(e) = self.queue_evts[queue_index].read() {
+             error!("Failed to get queue event: {e:?}");
+         }
+-        self.core.lock().unwrap().drain(queue_index);
++        self.core.drain(queue_index);
+     }
+ }
+ 
++fn pool_size() -> usize {
++    std::env::var("KATAMARAN_FS_WORKERS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .filter(|&n| n > 0)
++        .unwrap_or(DEFAULT_POOL)
++}
++
+ static STAT_REQS: AtomicU64 = AtomicU64::new(0);
+ static STAT_NS: AtomicU64 = AtomicU64::new(0);
+ static STAT_INLINE: AtomicU64 = AtomicU64::new(0);
+ static STAT_SYNC: AtomicU64 = AtomicU64::new(0);
++static STAT_ASYNC: AtomicU64 = AtomicU64::new(0);
++static STAT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+ 
+ /// KATAMARAN_FS_STATS=1: every 2 s, log how many requests the server handled
+ /// and the mean host time per request.
+@@ -245,26 +318,30 @@ pub fn start_stats_reporter() {
+     }
+     STARTED.call_once(|| {
+         thread::spawn(|| {
+-            let (mut last_n, mut last_ns, mut last_inline, mut last_sync) = (0, 0, 0, 0);
++            let mut last = [0u64; 6];
+             loop {
+                 thread::sleep(Duration::from_secs(2));
+-                let (n, ns, inl, sync) = (
++                let now = [
+                     STAT_REQS.load(Ordering::Relaxed),
+                     STAT_NS.load(Ordering::Relaxed),
+                     STAT_INLINE.load(Ordering::Relaxed),
+                     STAT_SYNC.load(Ordering::Relaxed),
+-                );
+-                let dn = n - last_n;
+-                if dn > 0 {
++                    STAT_ASYNC.load(Ordering::Relaxed),
++                    STAT_TIMEOUTS.load(Ordering::Relaxed),
++                ];
++                let d: Vec<u64> = now.iter().zip(last).map(|(n, l)| n - l).collect();
++                if d[0] > 0 {
+                     log::warn!(
+-                        "fs stats: {} req/s, host {:.1} us/req, drains: {} notify-inline, {} sync",
+-                        dn / 2,
+-                        (ns - last_ns) as f64 / dn as f64 / 1000.0,
+-                        inl - last_inline,
+-                        sync - last_sync
++                        "fs stats: {} req/s, host {:.1} us/req, drains: {} notify-inline, {} sync; {} to pool, {} open timeouts",
++                        d[0] / 2,
++                        d[1] as f64 / d[0] as f64 / 1000.0,
++                        d[2],
++                        d[3],
++                        d[4],
++                        d[5]
+                     );
+                 }
+-                (last_n, last_ns, last_inline, last_sync) = (n, ns, inl, sync);
++                last = now;
+             }
+         });
+     });
+@@ -278,66 +355,234 @@ pub fn note_inline(n: u64) {
+     STAT_INLINE.fetch_add(n, Ordering::Relaxed);
+ }
+ 
++/// The parts of a request that decide where it runs.
++struct Peeked {
++    opcode: u32,
++    nodeid: u64,
++    io_size: u32,
++    name: Option<Vec<u8>>,
++}
++
+ impl FsCore {
+-    pub fn drain(&mut self, queue_index: usize) {
+-        self.drain_with(queue_index, true);
++    fn start_pool(self: &Arc<Self>, n: usize) {
++        let (tx, rx) = unbounded::<Job>();
++        for i in 0..n {
++            let rx: Receiver<Job> = rx.clone();
++            let core: Weak<FsCore> = Arc::downgrade(self);
++            let _ = thread::Builder::new()
++                .name(format!("fs pool {i}"))
++                .spawn(move || {
++                    set_interactive_qos();
++                    while let Ok(job) = rx.recv() {
++                        let Some(core) = core.upgrade() else { break };
++                        core.run_job(job);
++                    }
++                });
++        }
++        *self.pool.lock().unwrap() = Some(tx);
++    }
++
++    fn stop_pool(&self) {
++        self.pool.lock().unwrap().take();
++    }
++
++    /// Worker thread: process everything, blocking requests on the pool.
++    pub fn drain(&self, queue_index: usize) {
++        let mut queues = self.queues.lock().unwrap();
++        self.drain_locked(&mut queues[queue_index], queue_index, false);
++    }
++
++    /// vCPU thread after an MMIO queue notify. Returns false when another
++    /// thread holds the queues; the caller then wakes the worker thread.
++    pub fn try_drain_notified(&self, queue_index: usize) -> bool {
++        let Ok(mut queues) = self.queues.try_lock() else {
++            return false;
++        };
++        self.drain_locked(&mut queues[queue_index], queue_index, false);
++        true
+     }
+ 
+-    /// Process the queue. With `signal` false no interrupt is raised: the
+-    /// guest asked by hypercall and collects the replies itself on return.
+-    pub fn drain_with(&mut self, queue_index: usize, signal: bool) {
++    /// vCPU thread on KATAMARAN's KAT_FS_DRAIN: process without raising an
++    /// interrupt, the guest collects the replies itself on return. Stops at
++    /// the first request that may block and returns [`DRAIN_BUSY`].
++    pub fn drain_sync(&self, queue_index: usize) -> u64 {
++        let Ok(mut queues) = self.queues.try_lock() else {
++            return DRAIN_BUSY;
++        };
++        self.drain_locked(&mut queues[queue_index], queue_index, true)
++    }
++
++    fn drain_locked(&self, queue: &mut Queue, queue_index: usize, sync: bool) -> u64 {
+         loop {
+-            self.queues[queue_index]
+-                .disable_notification(&self.mem)
+-                .unwrap();
++            queue.disable_notification(&self.mem).unwrap();
++            let busy = self.process_queue(queue, queue_index, sync);
++            let more = queue.enable_notification(&self.mem).unwrap();
++            if busy {
++                // The guest waits for an interrupt now, also for requests this
++                // drain already answered without one.
++                if queue.needs_notification(&self.mem).unwrap() {
++                    self.interrupt.signal_used_queue();
++                }
++                return DRAIN_BUSY;
++            }
++            if !more {
++                return DRAIN_DONE;
++            }
++        }
++    }
+ 
+-            self.process_queue(queue_index, signal);
++    fn peek(&self, head: &DescriptorChain, queue_index: usize) -> Option<Peeked> {
++        let mut r = Reader::new(&self.mem, head.clone()).ok()?;
++        let h: InHeader = r.read_obj().ok()?;
++        let mut p = Peeked {
++            opcode: h.opcode,
++            nodeid: h.nodeid,
++            io_size: 0,
++            name: None,
++        };
++        if queue_index == HPQ_INDEX {
++            return Some(p);
++        }
++        if h.opcode == Opcode::Read as u32 {
++            p.io_size = r.read_obj::<ReadIn>().ok()?.size;
++        } else if h.opcode == Opcode::Write as u32 {
++            p.io_size = r.read_obj::<WriteIn>().ok()?.size;
++        } else if h.opcode == Opcode::Lookup as u32 && self.policy.wants_name(h.nodeid) {
++            let len = (h.len as usize).checked_sub(size_of::<InHeader>())?;
++            let mut name = vec![0u8; len];
++            io::Read::read_exact(&mut r, &mut name).ok()?;
++            if let Some(nul) = name.iter().position(|&b| b == 0) {
++                name.truncate(nul);
++            }
++            p.name = Some(name);
++        }
++        Some(p)
++    }
++
++    fn route(&self, peeked: &Option<Peeked>, queue_index: usize) -> Route {
++        let Some(p) = peeked else {
++            // Malformed: the server answers with an error right away.
++            return Route::Sync;
++        };
++        if queue_index == HPQ_INDEX {
++            return Route::Sync;
++        }
++        self.policy.route(&Peek {
++            opcode: p.opcode,
++            nodeid: p.nodeid,
++            io_size: p.io_size,
++            name: p.name.as_deref(),
++        })
++    }
+ 
+-            if !self.queues[queue_index]
+-                .enable_notification(&self.mem)
+-                .unwrap()
+-            {
+-                break;
++    fn handle(&self, head: DescriptorChain) -> usize {
++        let reader = Reader::new(&self.mem, head.clone())
++            .map_err(FsError::QueueReader)
++            .unwrap();
++        let writer = Writer::new(&self.mem, head)
++            .map_err(FsError::QueueWriter)
++            .unwrap();
++        let started = Instant::now();
++        let len = match self.server.handle_message(
++            reader,
++            writer,
++            self.allow_idmap,
++            &self.shm_region,
++            &self.exit_code,
++            #[cfg(target_os = "macos")]
++            &self.map_sender,
++        ) {
++            Ok(len) => len,
++            Err(e) => {
++                error!("error handling message: {e:?}");
++                0
+             }
++        };
++        STAT_REQS.fetch_add(1, Ordering::Relaxed);
++        STAT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
++        len
++    }
++
++    /// Hand a popped request to the worker pool. Without a pool (stopping)
++    /// the request is processed here.
++    fn dispatch(&self, queue: &mut Queue, queue_index: usize, head: DescriptorChain) {
++        STAT_ASYNC.fetch_add(1, Ordering::Relaxed);
++        let job = Job {
++            queue_index,
++            head: head.index,
++            desc_table: queue.desc_table,
++            queue_size: queue.actual_size(),
++        };
++        let sent = match &*self.pool.lock().unwrap() {
++            Some(tx) => tx.send(job).is_ok(),
++            None => false,
++        };
++        if !sent {
++            let index = head.index;
++            let len = self.handle(head);
++            self.add_used(queue, index, len, true);
++        }
++    }
++
++    fn add_used(&self, queue: &mut Queue, index: u16, len: usize, signal: bool) {
++        if let Err(e) = queue.add_used(&self.mem, index, len as u32) {
++            error!("failed to add used elements to the queue: {e:?}");
++        }
++        if signal && queue.needs_notification(&self.mem).unwrap() {
++            self.interrupt.signal_used_queue();
+         }
+     }
+ 
+-    fn process_queue(&mut self, queue_index: usize, signal: bool) {
+-        let queue = &mut self.queues[queue_index];
++    fn run_job(&self, job: Job) {
++        let Some(head) =
++            DescriptorChain::checked_new(&self.mem, job.desc_table, job.queue_size, job.head)
++        else {
++            error!("fs pool: invalid descriptor {}", job.head);
++            return;
++        };
++        let len = self.handle(head);
++        let mut queues = self.queues.lock().unwrap();
++        self.add_used(&mut queues[job.queue_index], job.head, len, true);
++    }
++
++    /// Returns true when the sync drain must stop and report busy.
++    fn process_queue(&self, queue: &mut Queue, queue_index: usize, sync: bool) -> bool {
+         while let Some(head) = queue.pop(&self.mem) {
+-            let reader = Reader::new(&self.mem, head.clone())
+-                .map_err(FsError::QueueReader)
+-                .unwrap();
+-            let writer = Writer::new(&self.mem, head.clone())
+-                .map_err(FsError::QueueWriter)
+-                .unwrap();
+-
+-            let started = Instant::now();
+-            let len = match self.server.handle_message(
+-                reader,
+-                writer,
+-                self.allow_idmap,
+-                &self.shm_region,
+-                &self.exit_code,
+-                #[cfg(target_os = "macos")]
+-                &self.map_sender,
+-            ) {
+-                Ok(len) => len,
+-                Err(e) => {
+-                    error!("error handling message: {e:?}");
+-                    0
++            let peeked = self.peek(&head, queue_index);
++            let route = self.route(&peeked, queue_index);
++            if route == Route::Async {
++                if sync {
++                    queue.undo_pop();
++                    return true;
+                 }
+-            };
+-
+-            STAT_REQS.fetch_add(1, Ordering::Relaxed);
+-            STAT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+-            if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
+-                error!("failed to add used elements to the queue: {e:?}");
++                self.dispatch(queue, queue_index, head);
++                continue;
+             }
+ 
+-            if signal && queue.needs_notification(&self.mem).unwrap() {
+-                self.interrupt.signal_used_queue();
++            #[cfg(target_os = "macos")]
++            let scope = (route == Route::BoundedOpen).then(syncopen::bounded_scope);
++            let index = head.index;
++            let len = self.handle(head.clone());
++            #[cfg(target_os = "macos")]
++            if let Some(scope) = scope {
++                drop(scope);
++                if syncopen::take_timed_out() {
++                    // The reply written so far is discarded: the guest never
++                    // sees a descriptor until it is in the used ring, and the
++                    // request's input is read again from guest memory.
++                    STAT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
++                    if let Some(p) = &peeked {
++                        self.policy.mark_async(p.nodeid);
++                    }
++                    self.dispatch(queue, queue_index, head);
++                    if sync {
++                        return true;
++                    }
++                    continue;
++                }
+             }
++            self.add_used(queue, index, len, !sync);
+         }
++        false
+     }
+ }
+diff --git a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+index 8ba465b8..a2725fff 100644
+--- a/src/libkrun/src/api/device_builders.rs
++++ b/src/libkrun/src/api/device_builders.rs
+@@ -747,6 +747,23 @@ impl<'a> FsDevice<'a> {
+ 
+ #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+ impl<'a> FsDevice<'a> {
++    /// Make fsync a no-op on this share (for disposable data). Off by default.
++    pub fn set_no_sync_io(&mut self, no_sync_io: bool) -> Result<(), VmmError> {
++        if !self.inner.lock().unwrap().set_no_sync_io(no_sync_io) {
++            return Err(VmmError::InvalidParam());
++        }
++        Ok(())
++    }
++
++    /// Offer the guest writeback caching. Only for shares that nothing else
++    /// changes while the guest runs. Off by default.
++    pub fn set_writeback(&mut self, writeback: bool) -> Result<(), VmmError> {
++        if !self.inner.lock().unwrap().set_writeback(writeback) {
++            return Err(VmmError::InvalidParam());
++        }
++        Ok(())
++    }
++
+     fn new_inner(tag: &str, host_path: Option<String>, read_only: bool) -> Result<Self, VmmError> {
+         let exit_code = Arc::new(AtomicI32::new(i32::MAX));
+         let fs = devices::virtio::Fs::new(

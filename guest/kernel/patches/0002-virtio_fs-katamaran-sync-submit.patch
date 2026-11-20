@@ -1,0 +1,91 @@
+Subject: [PATCH] virtio_fs: synchronous submission through a katamaran hypercall
+
+When the host advertises it (KAT_FS_PROBE), foreground requests no longer
+notify the queue and sleep until the completion interrupt. The guest asks
+the host by SMC to process the request queue on the calling vCPU, then
+collects the replies from the used ring in the submitting context: no
+interrupt, no completion work item, no sleep. If the host reports the queue
+busy, the request takes the normal notify path. Background requests are
+excluded because they are submitted under fc->bg_lock.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+--- a/fs/fuse/virtio_fs.c	2026-11-18 13:00:09
++++ b/fs/fuse/virtio_fs.c	2026-11-18 13:00:24
+@@ -21,6 +21,7 @@
+ #include <linux/uio.h>
+ #include "fuse_i.h"
+ #include "fuse_dev_i.h"
++#include <linux/arm-smccc.h>
+ 
+ /* Used to help calculate the FUSE connection's max_pages limit for a request's
+  * size. Parts of the struct fuse_req are sliced into scattergather lists in
+@@ -1422,6 +1423,38 @@
+ }
+ 
+ /* Add a request to a virtqueue and kick the device */
++/*
++ * katamaran synchronous submission. Instead of notifying the queue and
++ * waiting for the completion interrupt, ask the host by SMC to process the
++ * queue on this vCPU; on success the replies are already in the used ring and
++ * are collected right here, with no interrupt, worker or sleep. The host
++ * returns non-zero when the queue is busy on another thread, and the request
++ * then takes the normal notify path.
++ */
++#define KAT_FS_PROBE	0xC6004B00UL
++#define KAT_FS_DRAIN	0xC6004B01UL
++#define KAT_FS_MAGIC	0x4B41544DUL
++
++static bool virtio_fs_kat_sync;
++
++static bool virtio_fs_kat_drain(struct virtqueue *vq)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(KAT_FS_DRAIN, vq->index, 0, 0, 0, 0, 0, 0, &res);
++	return res.a0 == 0;
++}
++
++static void virtio_fs_kat_probe(void)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(KAT_FS_PROBE, 0, 0, 0, 0, 0, 0, 0, &res);
++	virtio_fs_kat_sync = res.a0 == KAT_FS_MAGIC;
++	if (virtio_fs_kat_sync)
++		pr_info("virtio-fs: katamaran synchronous submission enabled\n");
++}
++
+ static int virtio_fs_enqueue_req(struct virtio_fs_vq *fsvq,
+ 				 struct fuse_req *req, bool in_flight,
+ 				 gfp_t gfp)
+@@ -1511,8 +1544,17 @@
+ 
+ 	spin_unlock(&fsvq->lock);
+ 
+-	if (notify)
+-		virtqueue_notify(vq);
++	if (notify) {
++		/*
++		 * Background requests are sent under fc->bg_lock, which completing
++		 * a request takes, so only foreground requests finish inline.
++		 */
++		if (virtio_fs_kat_sync && !test_bit(FR_BACKGROUND, &req->flags) &&
++		    virtio_fs_kat_drain(vq))
++			virtio_fs_requests_done_work(&fsvq->done_work);
++		else
++			virtqueue_notify(vq);
++	}
+ 
+ out:
+ 	if (ret < 0 && req->argbuf) {
+@@ -1853,6 +1895,8 @@
+ static int __init virtio_fs_init(void)
+ {
+ 	int ret;
++
++	virtio_fs_kat_probe();
+ 
+ 	ret = virtio_fs_sysfs_init();
+ 	if (ret < 0)

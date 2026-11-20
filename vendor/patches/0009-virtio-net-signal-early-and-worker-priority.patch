@@ -1,0 +1,284 @@
+diff --git a/src/devices/src/virtio/net/worker/unix.rs b/src/devices/src/virtio/net/worker/unix.rs
+index 6091f60d..2165ecd2 100644
+--- a/src/devices/src/virtio/net/worker/unix.rs
++++ b/src/devices/src/virtio/net/worker/unix.rs
+@@ -93,7 +93,10 @@ impl NetWorker {
+     pub fn run(self) {
+         thread::Builder::new()
+             .name("virtio-net worker".into())
+-            .spawn(|| self.work())
++            .spawn(|| {
++                set_interactive_qos();
++                self.work()
++            })
+             .unwrap();
+     }
+ 
+@@ -242,6 +245,27 @@ impl NetWorker {
+     }
+ 
+     fn process_rx(&mut self) -> result::Result<(), RxError> {
++        loop {
++            let result = self.process_rx_once();
++            if !self.rx_has_deferred_frame {
++                return result;
++            }
++            // Out of guest buffers. The guest kicks for new ones only if
++            // avail_event points past what we consumed; arming it before
++            // consuming (as the socket path does) leaves it stale, and with
++            // the socket full nothing else would wake us.
++            match self.rx_q.queue.enable_notification(&self.mem) {
++                Ok(true) => continue,
++                Ok(false) => return result,
++                Err(e) => {
++                    error!("error enabling queue notifications: {e:?}");
++                    return result;
++                }
++            }
++        }
++    }
++
++    fn process_rx_once(&mut self) -> result::Result<(), RxError> {
+         // if we have a deferred frame we try to process it first,
+         // if that is not possible, we don't continue processing other frames
+         if self.rx_has_deferred_frame {
+@@ -260,6 +284,10 @@ impl NetWorker {
+                 Ok(()) => {
+                     if self.write_frame_to_guest() {
+                         signal_queue = true;
++                        if self.rx_q.queue.event_idx_enabled() {
++                            signal_queue = false;
++                            self.signal_rx_if_needed()?;
++                        }
+                     } else {
+                         self.rx_has_deferred_frame = true;
+                         break Ok(());
+@@ -272,6 +300,7 @@ impl NetWorker {
+ 
+         // At this point we processed as many Rx frames as possible.
+         // We have to wake the guest if at least one descriptor chain has been used.
++        // With EVENT_IDX the guest was already woken frame by frame as it asked.
+         if signal_queue {
+             self.interrupt
+                 .try_signal_used_queue()
+@@ -281,6 +310,24 @@ impl NetWorker {
+         result
+     }
+ 
++    /// Interrupt the guest if it asked to be woken at this point of the used
++    /// ring (EVENT_IDX). Done per frame rather than once per burst, so the
++    /// guest starts draining the ring while it is still being filled instead
++    /// of only after it ran out of buffers.
++    fn signal_rx_if_needed(&mut self) -> result::Result<(), RxError> {
++        let needed = self
++            .rx_q
++            .queue
++            .needs_notification(&self.mem)
++            .unwrap_or(true);
++        if needed {
++            self.interrupt
++                .try_signal_used_queue()
++                .map_err(RxError::DeviceError)?;
++        }
++        Ok(())
++    }
++
+     fn process_tx_loop(&mut self) {
+         loop {
+             self.tx_q.queue.disable_notification(&self.mem).unwrap();
+@@ -478,3 +525,20 @@ impl NetWorker {
+         Ok(())
+     }
+ }
++
++/// Keep the worker off the efficiency cores: every frame between the guest
++/// and the network proxy passes through this one thread.
++fn set_interactive_qos() {
++    #[cfg(target_os = "macos")]
++    {
++        unsafe extern "C" {
++            fn pthread_set_qos_class_self_np(qos: u32, relpri: i32) -> i32;
++        }
++        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
++        unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
++    }
++}
++
++#[cfg(test)]
++#[path = "unix_tests.rs"]
++mod tests;
+diff --git a/src/devices/src/virtio/net/worker/unix_tests.rs b/src/devices/src/virtio/net/worker/unix_tests.rs
+new file mode 100644
+index 00000000..2b2d6c6d
+--- /dev/null
++++ b/src/devices/src/virtio/net/worker/unix_tests.rs
+@@ -0,0 +1,154 @@
++use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
++use std::sync::{Arc, Mutex};
++
++use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, send, socketpair};
++use utils::eventfd::{EFD_NONBLOCK, EventFd};
++use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
++
++use super::NetWorker;
++use crate::virtio::device::{InterruptHandler, InterruptType};
++use crate::virtio::net::VNET_HDR_LEN;
++use crate::virtio::net::device::VirtioNetBackend;
++use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
++use crate::virtio::queue::tests::VirtQueue;
++use crate::virtio::{DeviceQueue, InterruptTransport};
++
++const RX_BUFFERS: u64 = 0x10000;
++const BUF_LEN: u32 = 0x1000;
++
++/// Records the used index of the rx ring each time the guest is interrupted.
++struct Recorder {
++    mem: GuestMemoryMmap,
++    used_idx: GuestAddress,
++    seen: Mutex<Vec<u16>>,
++}
++
++impl InterruptHandler for Recorder {
++    fn try_signal(&self, _: InterruptType) -> Result<(), crate::Error> {
++        let idx: u16 = self.mem.read_obj(self.used_idx).unwrap();
++        self.seen.lock().unwrap().push(idx);
++        Ok(())
++    }
++}
++
++struct Harness<'a> {
++    rxq: VirtQueue<'a>,
++    worker: NetWorker,
++    peer: OwnedFd,
++    irqs: Arc<Recorder>,
++}
++
++/// A worker on a datagram socketpair whose rx ring has `posted` writable
++/// buffers out of `size` slots, with EVENT_IDX negotiated.
++fn harness(mem: &GuestMemoryMmap, size: u16, posted: u16) -> Harness<'_> {
++    let rxq = VirtQueue::new(GuestAddress(0), mem, size);
++    let txq = VirtQueue::new(GuestAddress(0x8000), mem, size);
++    for i in 0..posted {
++        post(&rxq, i);
++    }
++    rxq.avail.idx.set(posted);
++
++    let mut rx = rxq.create_queue();
++    rx.set_event_idx(true);
++    let mut tx = txq.create_queue();
++    tx.set_event_idx(true);
++    let irqs = Arc::new(Recorder {
++        mem: mem.clone(),
++        used_idx: rxq.used.idx.location,
++        seen: Mutex::new(Vec::new()),
++    });
++    let (ours, peer) = socketpair(
++        AddressFamily::Unix,
++        SockType::Datagram,
++        None,
++        SockFlag::empty(),
++    )
++    .unwrap();
++    let worker = NetWorker::new(
++        DeviceQueue::new(rx, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())),
++        DeviceQueue::new(tx, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())),
++        InterruptTransport::from_handler(irqs.clone()),
++        mem.clone(),
++        0,
++        VirtioNetBackend::UnixgramFd(ours.into_raw_fd()),
++    )
++    .unwrap();
++    Harness {
++        rxq,
++        worker,
++        peer,
++        irqs,
++    }
++}
++
++/// Post rx buffer `i` in descriptor `i` and avail slot `i`.
++fn post(rxq: &VirtQueue, i: u16) {
++    let addr = RX_BUFFERS + u64::from(i) * u64::from(BUF_LEN);
++    rxq.dtable[i as usize].set(addr, BUF_LEN, VIRTQ_DESC_F_WRITE, 0);
++    rxq.avail.ring[i as usize].set(i);
++}
++
++fn send_frames(peer: &OwnedFd, n: usize) {
++    for i in 0..n {
++        let frame = [i as u8; 100];
++        send(peer.as_raw_fd(), &frame, MsgFlags::empty()).unwrap();
++    }
++}
++
++fn memory() -> GuestMemoryMmap {
++    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap()
++}
++
++#[test]
++fn rx_rearms_guest_kick_after_running_out_of_buffers() {
++    let mem = memory();
++    let mut h = harness(&mem, 8, 2);
++    send_frames(&h.peer, 3);
++
++    h.worker.process_backend_socket_readable();
++
++    assert_eq!(h.rxq.used.idx.get(), 2);
++    assert!(h.worker.rx_has_deferred_frame);
++    // The guest must kick when it posts the next buffer (avail index 2).
++    // Armed before the two buffers were consumed, avail_event would still
++    // be 0 and the guest would never kick: with the socket drained into a
++    // deferred frame, nothing would wake the worker again.
++    assert_eq!(h.rxq.used.event.get(), 2);
++
++    post(&h.rxq, 2);
++    h.rxq.avail.idx.set(3);
++    h.worker.rx_q.event.write(1).unwrap();
++    h.worker.process_rx_queue_event();
++    assert_eq!(h.rxq.used.idx.get(), 3);
++    assert!(!h.worker.rx_has_deferred_frame);
++    let third = mem.read_obj::<u8>(GuestAddress(
++        RX_BUFFERS + 2 * u64::from(BUF_LEN) + VNET_HDR_LEN as u64,
++    ));
++    assert_eq!(third.unwrap(), 2);
++}
++
++#[test]
++fn rx_interrupts_as_soon_as_the_guest_asks() {
++    let mem = memory();
++    let h = &mut harness(&mem, 8, 4);
++    // used_event 0: interrupt once the first buffer is used.
++    h.rxq.avail.event.set(0);
++    send_frames(&h.peer, 4);
++    h.worker.process_backend_socket_readable();
++    assert_eq!(h.rxq.used.idx.get(), 4);
++    // Woken after the first frame, not after the whole burst, so the guest
++    // drains the ring while it is being filled.
++    assert_eq!(*h.irqs.seen.lock().unwrap(), [1]);
++}
++
++#[test]
++fn rx_does_not_interrupt_a_guest_that_is_polling() {
++    let mem = memory();
++    let h = &mut harness(&mem, 8, 4);
++    // The guest is in NAPI and asked to be woken only past index 6.
++    h.rxq.avail.event.set(6);
++    send_frames(&h.peer, 3);
++    h.worker.process_backend_socket_readable();
++    assert_eq!(h.rxq.used.idx.get(), 3);
++    assert!(h.irqs.seen.lock().unwrap().is_empty());
++}
+diff --git a/src/devices/src/virtio/queue.rs b/src/devices/src/virtio/queue.rs
+index 690a456e..8f65f495 100644
+--- a/src/devices/src/virtio/queue.rs
++++ b/src/devices/src/virtio/queue.rs
+@@ -628,6 +628,10 @@ impl Queue {
+         self.event_idx_enabled = enabled;
+     }
+ 
++    pub fn event_idx_enabled(&self) -> bool {
++        self.event_idx_enabled
++    }
++
+     // Set the value of the `flags` field of the used ring, applying the specified ordering.
+     fn set_used_flags(
+         &mut self,

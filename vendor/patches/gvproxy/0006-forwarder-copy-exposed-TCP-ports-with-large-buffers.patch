@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 15:39:40 +0100
+Subject: [PATCH 6/6] forwarder: copy exposed TCP ports with large buffers
+
+Ports exposed on the host went through tcpproxy.DialProxy and so through
+io.Copy's 32 KiB buffers. Dial the guest the same way (source binding,
+10 s timeout) from a tcpproxy.Target and copy with proxyConns.
+---
+ pkg/services/forwarder/expose.go      | 46 ++++++++++++++++++++
+ pkg/services/forwarder/expose_test.go | 61 +++++++++++++++++++++++++++
+ pkg/services/forwarder/ports.go       |  8 ++--
+ 3 files changed, 111 insertions(+), 4 deletions(-)
+ create mode 100644 pkg/services/forwarder/expose.go
+ create mode 100644 pkg/services/forwarder/expose_test.go
+
+diff --git a/pkg/services/forwarder/expose.go b/pkg/services/forwarder/expose.go
+new file mode 100644
+index 0000000..89739d0
+--- /dev/null
++++ b/pkg/services/forwarder/expose.go
+@@ -0,0 +1,46 @@
++package forwarder
++
++import (
++	"context"
++	"net"
++	"time"
++
++	"github.com/inetaf/tcpproxy"
++	log "github.com/sirupsen/logrus"
++)
++
++// exposeDialTimeout is tcpproxy.DialProxy's default.
++const exposeDialTimeout = 10 * time.Second
++
++// guestTarget is a tcpproxy.Target for a port exposed on the host: it dials
++// the guest as tcpproxy.DialProxy would, then copies with proxyConns, whose
++// buffers are 8 times io.Copy's.
++type guestTarget struct {
++	addr string
++	dial func(ctx context.Context, src net.Addr) (halfCloser, error)
++}
++
++func (t guestTarget) HandleConn(c net.Conn) {
++	host, ok := tcpproxy.UnderlyingConn(c).(halfCloser)
++	if !ok {
++		log.Errorf("forwarder: %T from %v cannot be half-closed", c, c.RemoteAddr())
++		_ = c.Close()
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), exposeDialTimeout)
++	guest, err := t.dial(ctx, c.RemoteAddr())
++	cancel()
++	if err != nil {
++		log.Warnf("forwarder: for incoming conn %v, error dialing %q: %v", c.RemoteAddr(), t.addr, err)
++		_ = c.Close()
++		return
++	}
++	if wc, ok := c.(*tcpproxy.Conn); ok && len(wc.Peeked) > 0 {
++		if _, err := guest.Write(wc.Peeked); err != nil {
++			_ = guest.Close()
++			_ = c.Close()
++			return
++		}
++	}
++	proxyConns(guest, host)
++}
+diff --git a/pkg/services/forwarder/expose_test.go b/pkg/services/forwarder/expose_test.go
+new file mode 100644
+index 0000000..a5ec590
+--- /dev/null
++++ b/pkg/services/forwarder/expose_test.go
+@@ -0,0 +1,61 @@
++package forwarder
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/inetaf/tcpproxy"
++)
++
++func TestGuestTargetForwardsBothWays(t *testing.T) {
++	client, hostSide := tcpPair(t)
++	guestSide, guestApp := tcpPair(t)
++	var dialedFrom net.Addr
++	target := guestTarget{addr: "guest:80", dial: func(_ context.Context, src net.Addr) (halfCloser, error) {
++		dialedFrom = src
++		return guestSide, nil
++	}}
++	done := make(chan struct{})
++	go func() {
++		// As tcpproxy passes it after peeking at the first bytes.
++		target.HandleConn(&tcpproxy.Conn{Peeked: []byte("GET "), Conn: hostSide})
++		close(done)
++	}()
++
++	if _, err := client.Write([]byte("/ HTTP/1.0\r\n\r\n")); err != nil {
++		t.Fatal(err)
++	}
++	_ = client.CloseWrite()
++	got, err := io.ReadAll(guestApp)
++	if err != nil || string(got) != "GET / HTTP/1.0\r\n\r\n" {
++		t.Fatalf("guest read %q, %v", got, err)
++	}
++	reply := randomBytes(t, 2*copyBufferSize+1)
++	_, _ = guestApp.Write(reply)
++	_ = guestApp.CloseWrite()
++	got, err = io.ReadAll(client)
++	if err != nil || !bytes.Equal(got, reply) {
++		t.Fatalf("client read %d bytes, %v", len(got), err)
++	}
++	<-done
++	if dialedFrom.String() != client.LocalAddr().String() {
++		t.Fatalf("dialed with source %v, want the client's %v", dialedFrom, client.LocalAddr())
++	}
++}
++
++func TestGuestTargetClosesWhenTheGuestRefuses(t *testing.T) {
++	client, hostSide := tcpPair(t)
++	target := guestTarget{addr: "guest:80", dial: func(context.Context, net.Addr) (halfCloser, error) {
++		return nil, errors.New("connection refused")
++	}}
++	target.HandleConn(hostSide)
++	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
++	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
++		t.Fatalf("client read %d bytes, err %v; want the connection closed", n, err)
++	}
++}
+diff --git a/pkg/services/forwarder/ports.go b/pkg/services/forwarder/ports.go
+index 1fb8f4f..c236cf6 100644
+--- a/pkg/services/forwarder/ports.go
++++ b/pkg/services/forwarder/ports.go
+@@ -238,11 +238,11 @@ func (f *PortsForwarder) Expose(protocol types.TransportProtocol, local, remote
+ 		}
+ 
+ 		var p tcpproxy.Proxy
+-		p.AddRoute(local, &tcpproxy.DialProxy{
+-			Addr: remote,
+-			DialContext: func(ctx context.Context, _, _ string) (conn net.Conn, e error) {
++		p.AddRoute(local, guestTarget{
++			addr: remote,
++			dial: func(ctx context.Context, src net.Addr) (halfCloser, error) {
+ 				var bindAddr tcpip.FullAddress
+-				if a, ok := ctx.Value(tcpproxy.SourceAddrContextKey).(*net.TCPAddr); ok {
++				if a, ok := src.(*net.TCPAddr); ok {
+ 					if b := sourceBindAddr(a.IP, a.Port); b != nil {
+ 						bindAddr = *b
+ 					}

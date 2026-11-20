@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/kat-proto", "crates/kat-vmm", "crates/kat-init", "crates/kat-daemon", "crates/kat-nfs", "crates/kat-term", "xtask"]
+default-members = ["crates/kat-proto", "crates/kat-vmm", "crates/kat-daemon", "crates/kat-nfs", "crates/kat-term", "xtask"]
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+kat-proto = { path = "crates/kat-proto" }
+kat-vmm = { path = "crates/kat-vmm" }
+kat-nfs = { path = "crates/kat-nfs" }
+# libghostty-vt (Ghostty's terminal engine), prebuilt: no Zig needed.
+ghostty-vt-rs-sys = "0.3.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.init]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+strip = true

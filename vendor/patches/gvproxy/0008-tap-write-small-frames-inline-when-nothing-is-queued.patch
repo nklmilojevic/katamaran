@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 16:56:14 +0100
+Subject: [PATCH 08/10] tap: write small frames inline when nothing is queued
+
+Patch 0004's queue makes every frame from the stack wake txLoop, a
+goroutine hand-off of several microseconds on each request and reply.
+Write frames of up to 4 KiB on the goroutine that produced them when
+nothing is queued or being written; bulk frames keep the queue's
+overlap, and a small frame never overtakes a queued one.
+---
+ pkg/tap/switch.go       |  2 +
+ pkg/tap/txqueue.go      | 17 ++++++++
+ pkg/tap/txqueue_test.go | 95 ++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 98 insertions(+), 16 deletions(-)
+
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index 665e9ef..128d651 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -49,6 +49,8 @@ type Switch struct {
+ 
+ 	// Frames from the stack, written to the VMs by txLoop.
+ 	txq chan *stack.PacketBuffer
++	// Frames handed to txLoop and not yet written.
++	txPending atomic.Int64
+ 
+ 	gateway VirtualDevice
+ 
+diff --git a/pkg/tap/txqueue.go b/pkg/tap/txqueue.go
+index e0f6390..7e51417 100644
+--- a/pkg/tap/txqueue.go
++++ b/pkg/tap/txqueue.go
+@@ -9,12 +9,28 @@ import (
+ // frames of 64 KiB are 8 MiB, about 2 ms at full speed.
+ const txQueueLen = 128
+ 
++// txInlineMax is the largest frame written by the goroutine that produced
++// it when nothing is queued. Small frames (ACKs, requests and replies) gain
++// nothing from the queue's overlap and would pay a wakeup of txLoop, a
++// goroutine hand-off of several microseconds, on every round trip.
++const txInlineMax = 4096
++
+ // enqueue hands a frame from the stack to txLoop. Writing it inline would
+ // make the goroutine that produced it (a TCP sender, or the reader of guest
+ // frames answering one) wait for the socket write, so producing the next
+ // frame and sending this one could never overlap. A full queue blocks, which
+ // pushes back on the stack as a blocking write did.
++//
++// A small frame is written inline if no frame is queued or being written:
++// those were produced earlier, so writing it now cannot overtake them.
+ func (e *Switch) enqueue(pkt *stack.PacketBuffer) {
++	if pkt.Size() <= txInlineMax && e.txPending.Load() == 0 {
++		if err := e.tx(pkt); err != nil {
++			log.Error(err)
++		}
++		return
++	}
++	e.txPending.Add(1)
+ 	pkt.IncRef()
+ 	e.txq <- pkt
+ }
+@@ -25,6 +41,7 @@ func (e *Switch) txLoop() {
+ 		if err := e.tx(pkt); err != nil {
+ 			log.Error(err)
+ 		}
++		e.txPending.Add(-1)
+ 		pkt.DecRef()
+ 	}
+ }
+diff --git a/pkg/tap/txqueue_test.go b/pkg/tap/txqueue_test.go
+index a888804..b844a2d 100644
+--- a/pkg/tap/txqueue_test.go
++++ b/pkg/tap/txqueue_test.go
+@@ -16,7 +16,11 @@ import (
+ var guestMAC = tcpip.LinkAddress("\x5a\x94\xef\xe4\x0c\xee")
+ 
+ func frame(i int) []byte {
+-	b := make([]byte, header.EthernetMinimumSize+3)
++	return sizedFrame(i, header.EthernetMinimumSize+3)
++}
++
++func sizedFrame(i, size int) []byte {
++	b := make([]byte, size)
+ 	eth := header.Ethernet(b)
+ 	eth.Encode(&header.EthernetFields{DstAddr: guestMAC, SrcAddr: "\x5a\x94\xef\xe4\x0c\x01", Type: 0x0800})
+ 	b[header.EthernetMinimumSize] = byte(i)
+@@ -24,13 +28,46 @@ func frame(i int) []byte {
+ 	return b
+ }
+ 
+-func TestDeliverNetworkPacketQueuesInOrder(t *testing.T) {
++func pipeSwitch(t *testing.T) (*Switch, net.Conn) {
++	t.Helper()
+ 	sw := NewSwitch(false)
+ 	vm, peer := net.Pipe()
+-	defer vm.Close()
+-	defer peer.Close()
++	t.Cleanup(func() {
++		vm.Close()
++		peer.Close()
++	})
+ 	id, _ := sw.connect(protocolConn{Conn: vm, protocolImpl: protocolImplementation(types.VfkitProtocol)})
+ 	sw.cam[guestMAC] = id
++	return sw, peer
++}
++
++func deliver(sw *Switch, b []byte) {
++	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(b)})
++	sw.DeliverNetworkPacket(0, pkt)
++	pkt.DecRef()
++}
++
++func readFrame(t *testing.T, peer net.Conn, want []byte) {
++	t.Helper()
++	buf := make([]byte, len(want)+1)
++	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
++	got := 0
++	for got < len(want) {
++		k, err := peer.Read(buf[got:])
++		if err != nil {
++			t.Fatalf("read: %v", err)
++		}
++		got += k
++	}
++	if !bytes.Equal(buf[:got], want) {
++		t.Fatalf("got frame % x..., want % x...", buf[:min(got, 20)], want[:min(len(want), 20)])
++	}
++}
++
++const bulk = txInlineMax + 1
++
++func TestDeliverNetworkPacketQueuesInOrder(t *testing.T) {
++	sw, peer := pipeSwitch(t)
+ 
+ 	// net.Pipe writes block until read, so delivering does not wait for
+ 	// the socket only if frames are queued.
+@@ -38,9 +75,7 @@ func TestDeliverNetworkPacketQueuesInOrder(t *testing.T) {
+ 	delivered := make(chan struct{})
+ 	go func() {
+ 		for i := range n {
+-			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame(i))})
+-			sw.DeliverNetworkPacket(0, pkt)
+-			pkt.DecRef()
++			deliver(sw, sizedFrame(i, bulk))
+ 		}
+ 		close(delivered)
+ 	}()
+@@ -50,15 +85,43 @@ func TestDeliverNetworkPacketQueuesInOrder(t *testing.T) {
+ 		t.Fatal("DeliverNetworkPacket waited for the socket")
+ 	}
+ 
+-	buf := make([]byte, 100)
+ 	for i := range n {
+-		_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+-		k, err := peer.Read(buf)
+-		if err != nil {
+-			t.Fatalf("frame %d: %v", i, err)
+-		}
+-		if !bytes.Equal(buf[:k], frame(i)) {
+-			t.Fatalf("frame %d out of order or corrupt: % x", i, buf[:k])
+-		}
++		readFrame(t, peer, sizedFrame(i, bulk))
++	}
++}
++
++func TestSmallFramesAreWrittenInlineWhenIdle(t *testing.T) {
++	sw, peer := pipeSwitch(t)
++	delivered := make(chan struct{})
++	go func() {
++		deliver(sw, frame(1))
++		close(delivered)
++	}()
++	// net.Pipe blocks the write until it is read, so an inline write keeps
++	// DeliverNetworkPacket from returning.
++	select {
++	case <-delivered:
++		t.Fatal("a small frame went through the queue")
++	case <-time.After(100 * time.Millisecond):
++	}
++	readFrame(t, peer, frame(1))
++	<-delivered
++	if sw.txPending.Load() != 0 {
++		t.Fatalf("%d frames pending", sw.txPending.Load())
+ 	}
+ }
++
++func TestSmallFramesDoNotOvertakeQueuedOnes(t *testing.T) {
++	sw, peer := pipeSwitch(t)
++	done := make(chan struct{})
++	go func() {
++		deliver(sw, sizedFrame(0, bulk))
++		deliver(sw, sizedFrame(1, bulk))
++		deliver(sw, frame(2))
++		close(done)
++	}()
++	readFrame(t, peer, sizedFrame(0, bulk))
++	readFrame(t, peer, sizedFrame(1, bulk))
++	readFrame(t, peer, frame(2))
++	<-done
++}

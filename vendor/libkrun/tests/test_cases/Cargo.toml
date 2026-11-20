@@ -1,0 +1,34 @@
+[package]
+name = "test_cases"
+edition = "2024"
+
+[features]
+host = ["libloading", "serde", "serde_json"]
+static-linking = ["host", "krun", "krun/blk", "krun/net", "krun-init-blob"]
+# The generated client only exposes feature-gated API when the matching crate
+# feature is enabled, so mirror the libkrun features the tests use.
+dynamic-linking = [
+    "host",
+    "krun-cdylib",
+    "krun-cdylib/blk",
+    "krun-cdylib/net",
+    "krun-cdylib/ffier-dynlookup",
+    "krun-init-cdylib",
+    "krun-init-cdylib/ffier-strong",
+]
+guest = []
+
+[lib]
+name = "test_cases"
+
+[dependencies]
+krun = { path = "../../src/libkrun", package = "libkrun", optional = true }
+krun-cdylib = { path = "../../bindings/libkrun-via-libc", package = "libkrun-via-libc", optional = true }
+krun-init-blob = { path = "../../init/init-blob", package = "krun-init-blob", optional = true }
+krun-init-cdylib = { path = "../../bindings/init-blob-via-cdylib", package = "krun-init-blob-via-cdylib", optional = true }
+libloading = { version = "0.8", optional = true }
+macros = { path = "../macros" }
+nix = { version = "0.29.0", features = ["fs", "socket", "ioctl", "user", "signal", "process", "resource"] }
+anyhow = "1.0.95"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }

@@ -1,0 +1,791 @@
+Subject: [PATCH] fuse, inotify: katamaran host file changes as fsnotify events
+
+The host shares its files with the guest over virtio-fs. A file changed on
+the host stays cached in the guest for the attribute and entry timeouts,
+and inotify watchers in the guest (file watchers in containers) never hear
+of the change.
+
+inotify_add_watch on a virtio-fs inode now registers the inode (counted per
+mark) and reports it on /dev/kat_fsnotify, so the guest agent can ask the
+host to watch the same files. The agent writes back the changes the host
+saw, by watch id and child name. Each raises the fsnotify events the local
+change would (IN_CREATE, IN_DELETE, IN_MOVED_FROM/TO, IN_MODIFY plus
+IN_CLOSE_WRITE, IN_ATTRIB, IN_DELETE_SELF, IN_MOVE_SELF) and drops what the
+guest cached for it: attributes and page cache (as FUSE_NOTIFY_INVAL_INODE),
+the directory's attributes and listing, and stale dentries (as
+FUSE_NOTIFY_INVAL_ENTRY / FUSE_NOTIFY_DELETE). Nothing is looked up: a name
+the guest never touched has nothing cached and is reported to its
+directory's watchers by name only. Events carry the host inode number, so
+an entry already refreshed by the guest (for example the guest's own
+change, echoed back by the host) is not dropped.
+
+The idea of an agent feeding host changes into fsnotify follows kiri's
+/proc/kiri-fsnotify patch (GPL-2.0); the interface and code are separate.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/fs/fuse/Makefile b/fs/fuse/Makefile
+--- a/fs/fuse/Makefile	2026-11-18 13:24:06
++++ b/fs/fuse/Makefile	2026-11-18 13:24:16
+@@ -19,3 +19,8 @@
+ fuse-$(CONFIG_FUSE_IO_URING) += dev_uring.o
+ 
+ virtiofs-y := virtio_fs.o
++
++# katamaran: host file changes as fsnotify events (needs inotify built in)
++ifeq ($(CONFIG_FUSE_FS)$(CONFIG_VIRTIO_FS),yy)
++fuse-y += kat_notify.o
++endif
+diff -ruN a/fs/fuse/kat_notify.c b/fs/fuse/kat_notify.c
+--- a/fs/fuse/kat_notify.c	1970-01-01 01:00:00
++++ b/fs/fuse/kat_notify.c	2026-11-18 13:57:29
+@@ -0,0 +1,605 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * katamaran: file changes made on the host, raised as fsnotify events in the
++ * guest, with the cache invalidation FUSE_NOTIFY_INVAL_INODE/_ENTRY would do.
++ *
++ * The host shares its files over virtio-fs. A file the host changes stays
++ * cached in the guest for the attribute and entry timeouts, and inotify
++ * watchers in the guest hear nothing. Here:
++ *
++ *  - inotify_add_watch on a virtio-fs inode registers it (one entry per
++ *    inode, counted per mark) and queues a WATCH report with the inode's path
++ *    below the mount root; the last mark going away queues UNWATCH. The guest
++ *    agent reads these from /dev/kat_fsnotify and asks the host to watch the
++ *    same files.
++ *  - The agent writes back what changed on the host, naming a watched inode
++ *    by id and, for a change inside a watched directory, the child by name.
++ *    No path is walked and no FUSE request is sent: a child the guest never
++ *    looked up has nothing cached and is reported to the directory's
++ *    watchers by name only.
++ *
++ * The idea of an agent feeding host changes to a kernel interface follows
++ * kiri's /proc/kiri-fsnotify patch (0006-fsnotify-events-from-the-host,
++ * GPL-2.0); this implementation is separate.
++ */
++
++#include <linux/capability.h>
++#include <linux/dcache.h>
++#include <linux/fs.h>
++#include <linux/fsnotify.h>
++#include <linux/hashtable.h>
++#include <linux/idr.h>
++#include <linux/init.h>
++#include <linux/iversion.h>
++#include <linux/kat_fsnotify.h>
++#include <linux/kdev_t.h>
++#include <linux/magic.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <linux/nsproxy.h>
++#include <linux/poll.h>
++#include <linux/sched/task.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include "fuse_i.h"
++
++/* UNWATCH reports queued at most; past it the reader gets a RESET. */
++#define KAT_MAX_GONE	65536
++#define KAT_MAX_WRITE	(1 << 20)
++#define KAT_READ_CHUNK	(64 << 10)
++
++struct kat_watch {
++	struct hlist_node node;		/* kat_by_inode */
++	struct list_head pending;	/* on kat_adds while its WATCH is unread */
++	struct inode *inode;		/* held while registered */
++	u32 id;
++	unsigned int refs;		/* inotify marks on the inode */
++	u64 dev;
++	u16 flags;
++	u32 path_len;
++	char path[];
++};
++
++struct kat_gone {
++	struct list_head list;
++	u32 id;
++};
++
++static DEFINE_SPINLOCK(kat_lock);
++static DEFINE_HASHTABLE(kat_by_inode, 10);
++static DEFINE_IDR(kat_ids);
++static LIST_HEAD(kat_adds);
++static LIST_HEAD(kat_gones);
++static unsigned int kat_ngone;
++static bool kat_attached;
++static bool kat_reset;
++static DECLARE_WAIT_QUEUE_HEAD(kat_wait);
++static unsigned long kat_busy;
++
++/*
++ * fsnotify() reports an event to a directory's watchers with a child's name
++ * (FS_EVENT_ON_CHILD) only when given a child inode. For a child the guest
++ * never looked up this mark-less inode stands in: the event reaches the
++ * directory's marks and no others.
++ */
++static struct inode kat_nochild;
++
++static bool kat_is_share(struct super_block *sb)
++{
++	return sb->s_magic == FUSE_SUPER_MAGIC && !strcmp(sb->s_type->name, "virtiofs");
++}
++
++static struct kat_watch *kat_find(struct inode *inode)
++{
++	struct kat_watch *w;
++
++	hash_for_each_possible(kat_by_inode, w, node, (unsigned long)inode)
++		if (w->inode == inode)
++			return w;
++	return NULL;
++}
++
++static bool kat_has_reports(void)
++{
++	return READ_ONCE(kat_reset) || !list_empty(&kat_adds) || !list_empty(&kat_gones);
++}
++
++/* Drop queued reports and queue a RESET plus a WATCH for every entry. */
++static void kat_reset_locked(void)
++{
++	struct kat_gone *g, *next;
++	struct kat_watch *w;
++	int bkt;
++
++	list_for_each_entry_safe(g, next, &kat_gones, list) {
++		list_del(&g->list);
++		kfree(g);
++	}
++	kat_ngone = 0;
++	kat_reset = true;
++	hash_for_each(kat_by_inode, bkt, w, node)
++		if (list_empty(&w->pending))
++			list_add_tail(&w->pending, &kat_adds);
++}
++
++bool kat_fsnotify_watch(struct inode *inode)
++{
++	struct kat_watch *w, *old;
++	struct dentry *alias;
++	bool wake = false;
++	char *buf, *path;
++	size_t len;
++	int id;
++
++	if (!kat_is_share(inode->i_sb))
++		return false;
++
++	spin_lock(&kat_lock);
++	old = kat_find(inode);
++	if (old)
++		old->refs++;
++	spin_unlock(&kat_lock);
++	if (old)
++		return true;
++
++	alias = d_find_alias(inode);
++	if (!alias)
++		return false;
++	buf = kmalloc(PATH_MAX, GFP_KERNEL);
++	if (!buf) {
++		dput(alias);
++		return false;
++	}
++	path = dentry_path_raw(alias, buf, PATH_MAX);
++	dput(alias);
++	if (IS_ERR(path)) {
++		kfree(buf);
++		return false;
++	}
++	len = strlen(path);
++	w = kzalloc(struct_size(w, path, len), GFP_KERNEL);
++	if (!w) {
++		kfree(buf);
++		return false;
++	}
++	memcpy(w->path, path, len);
++	kfree(buf);
++	w->path_len = len;
++	w->inode = inode;
++	w->refs = 1;
++	w->dev = huge_encode_dev(inode->i_sb->s_dev);
++	w->flags = S_ISDIR(inode->i_mode) ? KAT_FSN_ISDIR : 0;
++	INIT_LIST_HEAD(&w->pending);
++
++	idr_preload(GFP_KERNEL);
++	spin_lock(&kat_lock);
++	old = kat_find(inode);
++	if (old) {
++		old->refs++;
++		id = 0;
++	} else {
++		id = idr_alloc_cyclic(&kat_ids, w, 1, INT_MAX, GFP_NOWAIT);
++	}
++	if (id > 0) {
++		w->id = id;
++		ihold(inode);
++		hash_add(kat_by_inode, &w->node, (unsigned long)inode);
++		if (kat_attached) {
++			list_add_tail(&w->pending, &kat_adds);
++			wake = true;
++		}
++	}
++	spin_unlock(&kat_lock);
++	idr_preload_end();
++
++	if (id <= 0)
++		kfree(w);
++	if (wake)
++		wake_up_interruptible(&kat_wait);
++	return id >= 0;
++}
++
++void kat_fsnotify_unwatch(struct inode *inode)
++{
++	struct kat_gone *g = kmalloc(sizeof(*g), GFP_NOFS);
++	struct kat_watch *w;
++	bool wake = false;
++
++	spin_lock(&kat_lock);
++	w = kat_find(inode);
++	if (!w || --w->refs) {
++		spin_unlock(&kat_lock);
++		kfree(g);
++		return;
++	}
++	hash_del(&w->node);
++	idr_remove(&kat_ids, w->id);
++	if (!list_empty(&w->pending)) {
++		/* the host never heard of it */
++		list_del_init(&w->pending);
++	} else if (kat_attached && !kat_reset) {
++		if (g && kat_ngone < KAT_MAX_GONE) {
++			g->id = w->id;
++			list_add_tail(&g->list, &kat_gones);
++			kat_ngone++;
++			g = NULL;
++		} else {
++			kat_reset_locked();
++		}
++		wake = true;
++	}
++	spin_unlock(&kat_lock);
++
++	kfree(g);
++	if (wake)
++		wake_up_interruptible(&kat_wait);
++	iput(w->inode);
++	kfree(w);
++}
++
++/* Attributes, and with @data the page cache: what FUSE_NOTIFY_INVAL_INODE drops. */
++static void kat_inval(struct inode *inode, bool data)
++{
++	fuse_reverse_inval_inode(get_fuse_conn(inode), get_node_id(inode), data ? 0 : -1, 0);
++}
++
++/* An entry was added or removed: the directory's attributes and listing. */
++static void kat_dir_changed(struct inode *dir)
++{
++	kat_inval(dir, true);
++	inode_maybe_inc_iversion(dir, false);
++}
++
++/* Report @mask on child @name to the watchers of @dir only. */
++static void kat_on_child(struct inode *dir, const struct qstr *name, u32 mask)
++{
++	if (fsnotify_sb_has_watchers(dir->i_sb))
++		fsnotify(mask | FS_EVENT_ON_CHILD, dir, FSNOTIFY_EVENT_INODE, dir, name,
++			 &kat_nochild, 0);
++}
++
++/*
++ * The object at @child was removed on the host: the local unlink's effect
++ * (unhashed, nlink 0, DELETE_SELF and IN_IGNORED once its dentry goes).
++ */
++static int kat_unlink(struct inode *dir, struct inode *inode, struct qstr *name)
++{
++	return fuse_reverse_inval_entry(get_fuse_conn(dir), get_node_id(dir),
++					get_node_id(inode), name, 0);
++}
++
++static void kat_child(struct inode *dir, const struct kat_fsn_event *ev, struct qstr *name)
++{
++	u32 isdir = ev->flags & KAT_FSN_ISDIR ? FS_ISDIR : 0;
++	struct dentry *parent, *child = NULL;
++	struct inode *cinode = NULL;
++	bool same;
++
++	parent = d_find_alias(dir);
++	if (parent) {
++		name->hash = full_name_hash(parent, name->name, name->len);
++		child = d_lookup(parent, name);
++		dput(parent);
++	}
++	if (child && d_really_is_positive(child))
++		cinode = d_inode(child);
++	/* the cached object is the one the event is about */
++	same = cinode && (!ev->ino || cinode->i_ino == ev->ino);
++
++	switch (ev->op) {
++	case KAT_FSN_CREATE:
++	case KAT_FSN_MOVED_TO:
++		kat_dir_changed(dir);
++		if (child && !same)
++			d_invalidate(child);
++		if (cinode)
++			kat_inval(cinode, same);
++		fsnotify_name((ev->op == KAT_FSN_CREATE ? FS_CREATE : FS_MOVED_TO) | isdir,
++			      dir, FSNOTIFY_EVENT_INODE, dir, name, ev->cookie);
++		break;
++	case KAT_FSN_DELETE:
++		kat_dir_changed(dir);
++		fsnotify_name(FS_DELETE | isdir, dir, FSNOTIFY_EVENT_INODE, dir, name, 0);
++		if (same && kat_unlink(dir, cinode, name))
++			d_invalidate(child);
++		break;
++	case KAT_FSN_MOVED_FROM:
++		kat_dir_changed(dir);
++		fsnotify_name(FS_MOVED_FROM | isdir, dir, FSNOTIFY_EVENT_INODE, dir, name,
++			      ev->cookie);
++		if (same) {
++			fsnotify_inode(cinode, FS_MOVE_SELF);
++			d_invalidate(child);
++			kat_inval(cinode, false);
++		}
++		break;
++	case KAT_FSN_MODIFY:
++	case KAT_FSN_ATTRIB:
++		if (cinode && !same)
++			d_invalidate(child);
++		else if (same)
++			kat_inval(cinode, ev->op == KAT_FSN_MODIFY);
++		kat_on_child(dir, name, (ev->op == KAT_FSN_MODIFY ? FS_MODIFY : FS_ATTRIB) | isdir);
++		if (ev->op == KAT_FSN_MODIFY && !isdir)
++			kat_on_child(dir, name, FS_CLOSE_WRITE);
++		break;
++	}
++	dput(child);
++}
++
++/* The watched inode itself is gone from the host. */
++static void kat_self_gone(struct inode *inode)
++{
++	struct dentry *alias = d_find_alias(inode);
++	int err = -ENOENT;
++
++	if (alias && !IS_ROOT(alias)) {
++		struct dentry *parent = dget_parent(alias);
++		struct name_snapshot snap;
++		struct qstr name;
++
++		take_dentry_name_snapshot(&snap, alias);
++		name = snap.name;
++		err = kat_unlink(d_inode(parent), inode, &name);
++		release_dentry_name_snapshot(&snap);
++		dput(parent);
++	}
++	dput(alias);
++	if (err) {
++		kat_inval(inode, false);
++		fsnotify_inoderemove(inode);
++	}
++}
++
++static void kat_self(struct inode *inode, const struct kat_fsn_event *ev)
++{
++	struct dentry *alias;
++
++	if (ev->ino && inode->i_ino != ev->ino)
++		return;
++
++	switch (ev->op) {
++	case KAT_FSN_MODIFY:
++		kat_inval(inode, true);
++		fsnotify_inode(inode, FS_MODIFY);
++		if (S_ISREG(inode->i_mode))
++			fsnotify_inode(inode, FS_CLOSE_WRITE);
++		break;
++	case KAT_FSN_ATTRIB:
++		kat_inval(inode, false);
++		fsnotify_inode(inode, FS_ATTRIB);
++		break;
++	case KAT_FSN_DELETE:
++		kat_self_gone(inode);
++		break;
++	case KAT_FSN_MOVED_FROM:
++		kat_inval(inode, false);
++		fsnotify_inode(inode, FS_MOVE_SELF);
++		alias = d_find_alias(inode);
++		if (alias && !IS_ROOT(alias))
++			d_invalidate(alias);
++		dput(alias);
++		break;
++	case KAT_FSN_CREATE:
++	case KAT_FSN_MOVED_TO:
++		kat_inval(inode, true);
++		break;
++	}
++}
++
++static bool kat_valid_name(const char *name, unsigned int len)
++{
++	if (len == 1 && name[0] == '.')
++		return false;
++	if (len == 2 && name[0] == '.' && name[1] == '.')
++		return false;
++	return !memchr(name, '/', len) && !memchr(name, '\0', len);
++}
++
++static void kat_apply(const struct kat_fsn_event *ev)
++{
++	struct inode *inode = NULL;
++	struct kat_watch *w;
++
++	if (ev->id == 0 || ev->id > INT_MAX)
++		return;
++	if (ev->name_len && !kat_valid_name(ev->name, ev->name_len))
++		return;
++
++	spin_lock(&kat_lock);
++	w = idr_find(&kat_ids, ev->id);
++	if (w) {
++		inode = w->inode;
++		ihold(inode);
++	}
++	spin_unlock(&kat_lock);
++	if (!inode)
++		return;
++
++	if (ev->name_len) {
++		struct qstr name = QSTR_INIT(ev->name, ev->name_len);
++
++		if (S_ISDIR(inode->i_mode))
++			kat_child(inode, ev, &name);
++	} else {
++		kat_self(inode, ev);
++	}
++	iput(inode);
++}
++
++static size_t kat_put_report(char *buf, size_t room, u16 type, u16 flags, u64 id, u64 dev,
++			     const char *path, u32 path_len)
++{
++	struct kat_fsn_report *r = (struct kat_fsn_report *)buf;
++	size_t len = ALIGN(sizeof(*r) + path_len, 8);
++
++	if (len > room)
++		return 0;
++	memset(r, 0, len);
++	r->len = len;
++	r->type = type;
++	r->flags = flags;
++	r->id = id;
++	r->dev = dev;
++	r->path_len = path_len;
++	if (path_len)
++		memcpy(r->path, path, path_len);
++	return len;
++}
++
++static ssize_t kat_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
++{
++	size_t room = min_t(size_t, count, KAT_READ_CHUNK), n = 0, len;
++	struct kat_watch *w;
++	struct kat_gone *g;
++	char *buf;
++
++	if (count < sizeof(struct kat_fsn_report))
++		return -EINVAL;
++	buf = kvmalloc(room, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	for (;;) {
++		spin_lock(&kat_lock);
++		if (kat_has_reports())
++			break;
++		spin_unlock(&kat_lock);
++		if (file->f_flags & O_NONBLOCK) {
++			kvfree(buf);
++			return -EAGAIN;
++		}
++		if (wait_event_interruptible(kat_wait, kat_has_reports())) {
++			kvfree(buf);
++			return -ERESTARTSYS;
++		}
++	}
++
++	if (kat_reset) {
++		n += kat_put_report(buf, room, KAT_FSN_RESET, 0, 0, 0, NULL, 0);
++		kat_reset = false;
++	}
++	while ((g = list_first_entry_or_null(&kat_gones, struct kat_gone, list))) {
++		len = kat_put_report(buf + n, room - n, KAT_FSN_UNWATCH, 0, g->id, 0, NULL, 0);
++		if (!len)
++			break;
++		n += len;
++		list_del(&g->list);
++		kat_ngone--;
++		kfree(g);
++	}
++	while ((w = list_first_entry_or_null(&kat_adds, struct kat_watch, pending))) {
++		len = kat_put_report(buf + n, room - n, KAT_FSN_WATCH, w->flags, w->id, w->dev,
++				     w->path, w->path_len);
++		if (!len)
++			break;
++		n += len;
++		list_del_init(&w->pending);
++	}
++	spin_unlock(&kat_lock);
++
++	if (!n) {
++		kvfree(buf);
++		return -EINVAL;
++	}
++	if (copy_to_user(ubuf, buf, n)) {
++		spin_lock(&kat_lock);
++		kat_reset_locked();
++		spin_unlock(&kat_lock);
++		n = -EFAULT;
++	}
++	kvfree(buf);
++	return n;
++}
++
++static ssize_t kat_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
++{
++	const struct kat_fsn_event *ev;
++	size_t off = 0, len;
++	char *buf;
++
++	if (count > KAT_MAX_WRITE || count % 8)
++		return -EINVAL;
++	buf = kvmalloc(count, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	if (copy_from_user(buf, ubuf, count)) {
++		kvfree(buf);
++		return -EFAULT;
++	}
++	while (off + sizeof(*ev) <= count) {
++		ev = (const struct kat_fsn_event *)(buf + off);
++		len = ALIGN(sizeof(*ev) + ev->name_len, 8);
++		if (off + len > count)
++			break;
++		kat_apply(ev);
++		off += len;
++		cond_resched();
++	}
++	kvfree(buf);
++	return off == count ? count : -EINVAL;
++}
++
++static __poll_t kat_poll(struct file *file, poll_table *pt)
++{
++	poll_wait(file, &kat_wait, pt);
++	return (kat_has_reports() ? EPOLLIN | EPOLLRDNORM : 0) | EPOLLOUT | EPOLLWRNORM;
++}
++
++/* Only the guest agent: root in the VM's first mount namespace, not a container. */
++static int kat_open(struct inode *inode, struct file *file)
++{
++	if (!capable(CAP_SYS_ADMIN) || current->nsproxy->mnt_ns != init_task.nsproxy->mnt_ns)
++		return -EPERM;
++	if (test_and_set_bit(0, &kat_busy))
++		return -EBUSY;
++	spin_lock(&kat_lock);
++	kat_attached = true;
++	kat_reset_locked();
++	spin_unlock(&kat_lock);
++	return 0;
++}
++
++static int kat_release(struct inode *inode, struct file *file)
++{
++	struct kat_watch *w, *wnext;
++	struct kat_gone *g, *gnext;
++
++	spin_lock(&kat_lock);
++	kat_attached = false;
++	kat_reset = false;
++	list_for_each_entry_safe(g, gnext, &kat_gones, list) {
++		list_del(&g->list);
++		kfree(g);
++	}
++	kat_ngone = 0;
++	list_for_each_entry_safe(w, wnext, &kat_adds, pending)
++		list_del_init(&w->pending);
++	spin_unlock(&kat_lock);
++	clear_bit(0, &kat_busy);
++	return 0;
++}
++
++static const struct file_operations kat_fops = {
++	.owner		= THIS_MODULE,
++	.open		= kat_open,
++	.release	= kat_release,
++	.read		= kat_read,
++	.write		= kat_write,
++	.poll		= kat_poll,
++	.llseek		= noop_llseek,
++};
++
++static struct miscdevice kat_dev = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= "kat_fsnotify",
++	.fops	= &kat_fops,
++	.mode	= 0600,
++};
++
++static int __init kat_fsnotify_init(void)
++{
++	return misc_register(&kat_dev);
++}
++device_initcall(kat_fsnotify_init);
+diff -ruN a/fs/notify/inotify/inotify.h b/fs/notify/inotify/inotify.h
+--- a/fs/notify/inotify/inotify.h	2026-11-18 13:24:06
++++ b/fs/notify/inotify/inotify.h	2026-11-18 13:24:16
+@@ -15,6 +15,8 @@
+ struct inotify_inode_mark {
+ 	struct fsnotify_mark fsn_mark;
+ 	int wd;
++	/* katamaran: the watched virtio-fs inode, reported to the host */
++	struct inode *kat_inode;
+ };
+ 
+ static inline struct inotify_event_info *INOTIFY_E(struct fsnotify_event *fse)
+diff -ruN a/fs/notify/inotify/inotify_fsnotify.c b/fs/notify/inotify/inotify_fsnotify.c
+--- a/fs/notify/inotify/inotify_fsnotify.c	2026-11-18 13:24:06
++++ b/fs/notify/inotify/inotify_fsnotify.c	2026-11-18 13:24:16
+@@ -17,6 +17,7 @@
+ #include <linux/fs.h> /* struct inode */
+ #include <linux/fsnotify_backend.h>
+ #include <linux/inotify.h>
++#include <linux/kat_fsnotify.h>
+ #include <linux/path.h> /* struct path */
+ #include <linux/slab.h> /* kmem_* */
+ #include <linux/types.h>
+@@ -137,6 +138,13 @@
+ 
+ static void inotify_freeing_mark(struct fsnotify_mark *fsn_mark, struct fsnotify_group *group)
+ {
++	struct inotify_inode_mark *i_mark =
++		container_of(fsn_mark, struct inotify_inode_mark, fsn_mark);
++
++	if (i_mark->kat_inode) {
++		kat_fsnotify_unwatch(i_mark->kat_inode);
++		i_mark->kat_inode = NULL;
++	}
+ 	inotify_ignored_and_remove_idr(fsn_mark, group);
+ }
+ 
+diff -ruN a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+--- a/fs/notify/inotify/inotify_user.c	2026-11-18 13:24:06
++++ b/fs/notify/inotify/inotify_user.c	2026-11-18 13:24:16
+@@ -19,6 +19,7 @@
+ #include <linux/idr.h>
+ #include <linux/init.h> /* fs_initcall */
+ #include <linux/inotify.h>
++#include <linux/kat_fsnotify.h>
+ #include <linux/kernel.h> /* roundup() */
+ #include <linux/namei.h> /* LOOKUP_FOLLOW */
+ #include <linux/sched/signal.h>
+@@ -591,6 +592,7 @@
+ 	tmp_i_mark->fsn_mark.mask = inotify_arg_to_mask(inode, arg);
+ 	tmp_i_mark->fsn_mark.flags = inotify_arg_to_flags(arg);
+ 	tmp_i_mark->wd = -1;
++	tmp_i_mark->kat_inode = NULL;
+ 
+ 	ret = inotify_add_to_idr(idr, idr_lock, tmp_i_mark);
+ 	if (ret)
+@@ -612,6 +614,9 @@
+ 		goto out_err;
+ 	}
+ 
++	/* katamaran: tell the host to watch this virtio-fs inode */
++	if (kat_fsnotify_watch(inode))
++		tmp_i_mark->kat_inode = inode;
+ 
+ 	/* return the watch descriptor for this new mark */
+ 	ret = tmp_i_mark->wd;
+diff -ruN a/include/linux/kat_fsnotify.h b/include/linux/kat_fsnotify.h
+--- a/include/linux/kat_fsnotify.h	1970-01-01 01:00:00
++++ b/include/linux/kat_fsnotify.h	2026-11-18 13:24:28
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * katamaran: file changes made on the host, raised in the guest.
++ *
++ * /dev/kat_fsnotify is opened by the guest agent only. Reading it yields
++ * struct kat_fsn_report records: the virtio-fs inodes guest processes watch
++ * with inotify, so the host watches the same files. Writing it takes
++ * struct kat_fsn_event records: changes the host saw, which raise the
++ * fsnotify events a local change would and drop the guest's cached
++ * attributes, data and dentries for the changed files.
++ *
++ * Both record kinds are padded to a multiple of 8 bytes; `len` (reports) or
++ * the header plus `name_len` rounded up (events) gives the stride.
++ */
++#ifndef _LINUX_KAT_FSNOTIFY_H
++#define _LINUX_KAT_FSNOTIFY_H
++
++#include <linux/types.h>
++
++/* report types */
++#define KAT_FSN_WATCH		1	/* id, dev, path: a new watched inode */
++#define KAT_FSN_UNWATCH		2	/* id: no longer watched */
++#define KAT_FSN_RESET		3	/* forget every id; WATCH records follow */
++
++/* report and event flags */
++#define KAT_FSN_ISDIR		0x1
++
++struct kat_fsn_report {
++	__u32 len;
++	__u16 type;
++	__u16 flags;
++	__u64 id;
++	__u64 dev;		/* st_dev of the virtio-fs mount */
++	__u32 path_len;
++	__u32 reserved;
++	char path[];		/* below the mount's root, starts with '/' */
++};
++
++/* event ops */
++#define KAT_FSN_CREATE		1
++#define KAT_FSN_DELETE		2
++#define KAT_FSN_MODIFY		3
++#define KAT_FSN_ATTRIB		4
++#define KAT_FSN_MOVED_FROM	5
++#define KAT_FSN_MOVED_TO	6
++
++/*
++ * A change to the child `name` of watched directory `id`, or to the watched
++ * inode itself when name_len is 0. `ino` is the host inode number of the
++ * object the change is about (the removed one for DELETE and MOVED_FROM),
++ * 0 if unknown; a cached entry for a different object is left alone.
++ */
++struct kat_fsn_event {
++	__u64 id;
++	__u64 ino;
++	__u32 cookie;
++	__u16 op;
++	__u8 flags;
++	__u8 name_len;
++	char name[];
++};
++
++#ifdef __KERNEL__
++struct inode;
++#if IS_BUILTIN(CONFIG_FUSE_FS) && IS_BUILTIN(CONFIG_VIRTIO_FS)
++bool kat_fsnotify_watch(struct inode *inode);
++void kat_fsnotify_unwatch(struct inode *inode);
++#else
++static inline bool kat_fsnotify_watch(struct inode *inode) { return false; }
++static inline void kat_fsnotify_unwatch(struct inode *inode) { }
++#endif
++#endif /* __KERNEL__ */
++
++#endif /* _LINUX_KAT_FSNOTIFY_H */

@@ -1,0 +1,37 @@
+Subject: [PATCH] virtio_vsock: 16 KiB receive buffers
+
+The guest posts its vsock receive buffers in one size, sized so each skb
+fits in a 4 KiB page: about 3.7 KiB of data per packet. katamaran relays
+the Mac's NFS client to the guest over vsock, and a 1 MiB WRITE arrives as
+about 280 packets, each a host system call, an interrupt-driven receive
+and an skb to free and replace. 16 KiB buffers (an order-2 linear skb,
+below PAGE_ALLOC_COSTLY_ORDER) carry the same data in a quarter of the
+packets, for 4 MiB of receive buffers instead of 1 MiB.
+
+Upstream sizes the skb to one page so the RX queue holds no higher-order
+pages. Here the queue holds 256 order-2 pages, which a guest that only runs
+containers can spare. Small packets still share a buffer:
+virtio_transport_recv_enqueue() copies packets of up to GOOD_COPY_LEN into
+the tail room of the last queued skb.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/include/linux/virtio_vsock.h b/include/linux/virtio_vsock.h
+--- a/include/linux/virtio_vsock.h
++++ b/include/linux/virtio_vsock.h
+@@ -131,11 +131,11 @@
+ }
+ 
+ /* Dimension the RX SKB so that the entire thing fits exactly into
+- * a single 4KiB page. This avoids wasting memory due to alloc_skb()
+- * rounding up to the next page order and also means that we
+- * don't leave higher-order pages sitting around in the RX queue.
++ * a 16KiB order-2 allocation, below PAGE_ALLOC_COSTLY_ORDER. katamaran
++ * streams bulk data from the host (the Mac's NFS writes), and 4KiB
++ * buffers cost a packet, a host system call and an skb per 3.7KiB.
+  */
+-#define VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE	SKB_WITH_OVERHEAD(1024 * 4)
++#define VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE	SKB_WITH_OVERHEAD(1024 * 16)
+ #define VIRTIO_VSOCK_MAX_BUF_SIZE		0xFFFFFFFFUL
+ #define VIRTIO_VSOCK_MAX_PKT_BUF_SIZE		(1024 * 64)
+ 

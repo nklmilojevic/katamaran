@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 15:16:59 +0100
+Subject: [PATCH 2/6] virtualnetwork: tune gVisor TCP for the local guest link
+
+Enable SACK and receive buffer moderation, raise buffers to 4 MiB
+(16 MiB max) and use classic loss detection instead of RACK-TLP, whose
+probe timeout (2 x SRTT, no floor) fires spuriously on a ~100 us link.
+---
+ pkg/virtualnetwork/tuning.go         | 37 ++++++++++++++++++++++++++++
+ pkg/virtualnetwork/tuning_test.go    | 36 +++++++++++++++++++++++++++
+ pkg/virtualnetwork/virtualnetwork.go |  4 +++
+ 3 files changed, 77 insertions(+)
+ create mode 100644 pkg/virtualnetwork/tuning.go
+ create mode 100644 pkg/virtualnetwork/tuning_test.go
+
+diff --git a/pkg/virtualnetwork/tuning.go b/pkg/virtualnetwork/tuning.go
+new file mode 100644
+index 0000000..3f334e9
+--- /dev/null
++++ b/pkg/virtualnetwork/tuning.go
+@@ -0,0 +1,37 @@
++package virtualnetwork
++
++import (
++	"fmt"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++)
++
++// Buffer sizes for TCP connections between the guest and the stack. The
++// link is a local socket with a round trip of about 100 us that carries up
++// to 4 GB/s, so the 1 MiB default caps a single connection.
++const (
++	tcpBufferDefault = 4 << 20
++	tcpBufferMax     = 16 << 20
++)
++
++// tuneTCP adapts gVisor's TCP to a lossless, low-latency virtual link:
++//   - SACK, so a rare loss does not stall a 16 MiB window;
++//   - classic loss detection instead of RACK-TLP: TLP's probe timeout is
++//     twice the smoothed RTT with no floor, so any scheduling hiccup over
++//     ~200 us on the host fires spurious retransmits and recoveries;
++//   - larger send and receive buffers, with receive buffer moderation.
++func tuneTCP(s *stack.Stack) error {
++	sack := tcpip.TCPSACKEnabled(true)
++	recovery := tcpip.TCPRecovery(0)
++	moderate := tcpip.TCPModerateReceiveBufferOption(true)
++	send := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcpBufferDefault, Max: tcpBufferMax}
++	receive := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcpBufferDefault, Max: tcpBufferMax}
++	for _, opt := range []tcpip.SettableTransportProtocolOption{&sack, &recovery, &moderate, &send, &receive} {
++		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
++			return fmt.Errorf("set TCP option %T: %s", opt, err)
++		}
++	}
++	return nil
++}
+diff --git a/pkg/virtualnetwork/tuning_test.go b/pkg/virtualnetwork/tuning_test.go
+new file mode 100644
+index 0000000..5d438d0
+--- /dev/null
++++ b/pkg/virtualnetwork/tuning_test.go
+@@ -0,0 +1,36 @@
++package virtualnetwork
++
++import (
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++)
++
++func TestTuneTCP(t *testing.T) {
++	s := stack.New(stack.Options{
++		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
++		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
++	})
++	if err := tuneTCP(s); err != nil {
++		t.Fatal(err)
++	}
++	var sack tcpip.TCPSACKEnabled
++	var recovery tcpip.TCPRecovery
++	var moderate tcpip.TCPModerateReceiveBufferOption
++	var send tcpip.TCPSendBufferSizeRangeOption
++	var receive tcpip.TCPReceiveBufferSizeRangeOption
++	for _, opt := range []tcpip.GettableTransportProtocolOption{&sack, &recovery, &moderate, &send, &receive} {
++		if err := s.TransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
++			t.Fatalf("get %T: %s", opt, err)
++		}
++	}
++	if !bool(sack) || recovery != 0 || !bool(moderate) {
++		t.Fatalf("sack=%v recovery=%v moderate=%v", sack, recovery, moderate)
++	}
++	if send.Default != tcpBufferDefault || send.Max != tcpBufferMax || receive.Max != tcpBufferMax {
++		t.Fatalf("send=%+v receive=%+v", send, receive)
++	}
++}
+diff --git a/pkg/virtualnetwork/virtualnetwork.go b/pkg/virtualnetwork/virtualnetwork.go
+index b2b4461..88803a3 100644
+--- a/pkg/virtualnetwork/virtualnetwork.go
++++ b/pkg/virtualnetwork/virtualnetwork.go
+@@ -137,6 +137,10 @@ func createStack(configuration *types.Configuration, endpoint stack.LinkEndpoint
+ 		},
+ 	})
+ 
++	if err := tuneTCP(s); err != nil {
++		return nil, err
++	}
++
+ 	if err := s.CreateNIC(1, endpoint); err != nil {
+ 		return nil, errors.New(err.String())
+ 	}

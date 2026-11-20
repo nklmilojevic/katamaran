@@ -1,0 +1,752 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Wed, 18 Nov 2026 18:04:52 +0100
+Subject: [PATCH 09/10] tap: connect an in-process VM by function call
+
+Built with -buildmode=c-shared, gvproxy can run inside the VMM process.
+kat_gvproxy_start takes gvproxy's command line and the VMM's receive
+function; kat_gvproxy_tx takes a frame from the guest. Frames then pass
+by call both ways, without a socket or the thread hand-offs on each
+side of it. Frames for the VM are written on the goroutine that made
+them, as slices with a virtio-net header, and the link offloads TCP and
+UDP checksums to the guest (NEEDS_CSUM with the pseudo-header sum).
+---
+ cmd/gvproxy/inproc.go          | 165 +++++++++++++++++++++++++++++++++
+ cmd/gvproxy/inproc_hook.go     |   7 ++
+ cmd/gvproxy/inproc_test.go     |  80 ++++++++++++++++
+ cmd/gvproxy/main.go            |   4 +
+ pkg/tap/callback.go            |  82 ++++++++++++++++
+ pkg/tap/callback_test.go       | 138 +++++++++++++++++++++++++++
+ pkg/tap/link.go                |  10 +-
+ pkg/tap/switch.go              |  28 +++++-
+ pkg/tap/txqueue.go             |   2 +-
+ pkg/tap/vnethdr.go             |  66 +++++++++++++
+ pkg/virtualnetwork/callback.go |   9 ++
+ 11 files changed, 585 insertions(+), 6 deletions(-)
+ create mode 100644 cmd/gvproxy/inproc.go
+ create mode 100644 cmd/gvproxy/inproc_hook.go
+ create mode 100644 cmd/gvproxy/inproc_test.go
+ create mode 100644 pkg/tap/callback.go
+ create mode 100644 pkg/tap/callback_test.go
+ create mode 100644 pkg/tap/vnethdr.go
+ create mode 100644 pkg/virtualnetwork/callback.go
+
+diff --git a/cmd/gvproxy/inproc.go b/cmd/gvproxy/inproc.go
+new file mode 100644
+index 0000000..aacba37
+--- /dev/null
++++ b/cmd/gvproxy/inproc.go
+@@ -0,0 +1,165 @@
++//go:build cgo && (darwin || linux)
++
++package main
++
++// In-process mode: a VMM loads this command built with -buildmode=c-shared
++// (main does not run) and calls kat_gvproxy_start with gvproxy's command line,
++// without -listen-vfkit. Frames then pass by function call both ways, with
++// no socket and no thread hand-off: kat_gvproxy_tx takes a frame from the
++// guest on the VMM's thread, and the stack writes frames for the guest
++// through the VMM's rx function on the goroutine that produced them.
++
++/*
++#include <sys/uio.h>
++
++// Writes one frame (virtio-net header, then the frame) to the guest. Returns
++// 0, or an errno; EAGAIN means the guest had no room and the frame is dropped.
++typedef int (*kat_rx_fn)(void *ctx, const struct iovec *iov, int iovcnt);
++
++static int kat_call_rx(kat_rx_fn fn, void *ctx, const struct iovec *iov, int iovcnt) {
++	return fn(ctx, iov, iovcnt);
++}
++*/
++import "C"
++
++import (
++	"context"
++	"errors"
++	"flag"
++	"runtime"
++	"sync/atomic"
++	"syscall"
++	"unsafe"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/tap"
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
++	log "github.com/sirupsen/logrus"
++	"golang.org/x/sync/errgroup"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++)
++
++var inprocLink atomic.Pointer[tap.CallbackLink]
++
++//export kat_gvproxy_start
++func kat_gvproxy_start(argc C.int, argv **C.char, rx C.kat_rx_fn, rxCtx unsafe.Pointer) C.int {
++	if rx == nil {
++		return C.int(syscall.EINVAL)
++	}
++	args := make([]string, int(argc))
++	for i, a := range unsafe.Slice(argv, int(argc)) {
++		args[i] = C.GoString(a)
++	}
++	err := startInproc(args, &guestWriter{rx: rx, ctx: rxCtx})
++	if err != nil {
++		log.Errorf("gvproxy: %v", err)
++		var errno syscall.Errno
++		if errors.As(err, &errno) {
++			return C.int(errno)
++		}
++		return C.int(syscall.EINVAL)
++	}
++	return 0
++}
++
++// startInproc starts gvproxy as its command line would, with w in place of
++// a vfkit socket, and returns once the VM is connected.
++func startInproc(argv []string, w tap.PacketWriter) error {
++	if inprocAttach != nil {
++		return syscall.EBUSY
++	}
++	var args GvproxyArgs
++	var config GvproxyConfig
++	if _, err := GvproxyArgParse(flag.NewFlagSet("gvproxy", flag.ContinueOnError), &args, argv); err != nil {
++		return err
++	}
++	if args.vfkitSocket != "" || args.qemuSocket != "" || args.bessSocket != "" || args.vpnkitSocket != "" || args.stdioSocket != "" {
++		return errors.New("in-process mode takes no VM socket")
++	}
++	cfg, err := GvproxyConfigure(&config, &args, types.NewVersion("gvproxy").String())
++	if err != nil {
++		return err
++	}
++	log.Info(GvproxyVersion())
++
++	attached := make(chan struct{})
++	inprocAttach = func(vn *virtualnetwork.VirtualNetwork) {
++		inprocLink.Store(vn.ConnectCallback(w))
++		close(attached)
++	}
++	g, ctx := errgroup.WithContext(context.Background())
++	g.Go(func() error {
++		return run(ctx, g, cfg)
++	})
++	failed := make(chan error, 1)
++	go func() {
++		err := g.Wait()
++		log.Errorf("gvproxy stopped: %v", err)
++		failed <- err
++	}()
++	select {
++	case <-attached:
++		return nil
++	case err := <-failed:
++		return err
++	}
++}
++
++//export kat_gvproxy_tx
++func kat_gvproxy_tx(iov *C.struct_iovec, iovcnt C.int) C.int {
++	link := inprocLink.Load()
++	if link == nil {
++		return C.int(syscall.ENOTCONN)
++	}
++	return C.int(injectFrame(link, unsafe.Slice(iov, int(iovcnt))))
++}
++
++// injectFrame copies the frame in vecs (guest memory) into a buffer for the
++// stack and switches it.
++func injectFrame(link *tap.CallbackLink, vecs []C.struct_iovec) syscall.Errno {
++	total := 0
++	for _, v := range vecs {
++		total += int(v.iov_len)
++	}
++	if total < header.EthernetMinimumSize {
++		return syscall.EINVAL
++	}
++	view := buffer.NewViewSize(total)
++	frame := view.AsSlice()
++	n := 0
++	for _, v := range vecs {
++		n += copy(frame[n:], unsafe.Slice((*byte)(v.iov_base), int(v.iov_len)))
++	}
++	link.Inject(frame, buffer.MakeWithView(view))
++	return 0
++}
++
++// guestWriter writes frames for the guest through the VMM's rx function.
++type guestWriter struct {
++	rx  C.kat_rx_fn
++	ctx unsafe.Pointer
++}
++
++func (w *guestWriter) WritePacket(hdr []byte, frame [][]byte) error {
++	// The iovecs point into Go memory the call only reads; pinning keeps
++	// cgo's pointer rules.
++	var pinner runtime.Pinner
++	defer pinner.Unpin()
++	iov := make([]C.struct_iovec, 0, len(frame)+1)
++	for _, b := range append([][]byte{hdr}, frame...) {
++		if len(b) == 0 {
++			continue
++		}
++		pinner.Pin(&b[0])
++		iov = append(iov, C.struct_iovec{iov_base: unsafe.Pointer(&b[0]), iov_len: C.size_t(len(b))})
++	}
++	switch r := syscall.Errno(C.kat_call_rx(w.rx, w.ctx, &iov[0], C.int(len(iov)))); r {
++	case 0, syscall.EAGAIN:
++		// A full guest queue drops the frame, as a full NIC ring does;
++		// TCP recovers it. Reporting it would disconnect the VM.
++		return nil
++	default:
++		return r
++	}
++}
+diff --git a/cmd/gvproxy/inproc_hook.go b/cmd/gvproxy/inproc_hook.go
+new file mode 100644
+index 0000000..0c583e8
+--- /dev/null
++++ b/cmd/gvproxy/inproc_hook.go
+@@ -0,0 +1,7 @@
++package main
++
++import "github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
++
++// inprocAttach, when set (in-process mode, inproc.go), connects the VM to the
++// network run creates.
++var inprocAttach func(vn *virtualnetwork.VirtualNetwork)
+diff --git a/cmd/gvproxy/inproc_test.go b/cmd/gvproxy/inproc_test.go
+new file mode 100644
+index 0000000..972db5f
+--- /dev/null
++++ b/cmd/gvproxy/inproc_test.go
+@@ -0,0 +1,80 @@
++//go:build cgo && (darwin || linux)
++
++package main
++
++import (
++	"bytes"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++)
++
++type chanWriter chan []byte
++
++func (c chanWriter) WritePacket(_ []byte, frame [][]byte) error {
++	c <- bytes.Join(frame, nil)
++	return nil
++}
++
++// The guest asks for the gateway's MAC and gets gVisor's answer back through
++// the writer: flags, run, the switch and the link all work in-process.
++func TestInprocAnswersTheGuest(t *testing.T) {
++	dir, err := os.MkdirTemp("", "gvinproc")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(dir)
++	frames := make(chanWriter, 16)
++	err = startInproc([]string{
++		"-services", "unix://" + filepath.Join(dir, "api.sock"),
++		"-ssh-port", "-1",
++		"-mtu", "65520",
++		"-subnet", "192.168.127.0/24",
++		"-gatewayIP", "192.168.127.1",
++		"-deviceIP", "192.168.127.2",
++		"-log-file", filepath.Join(dir, "gvproxy.log"),
++	}, frames)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(dir, "api.sock")); err != nil {
++		t.Fatalf("services API: %v", err)
++	}
++	if err := startInproc(nil, frames); err == nil {
++		t.Fatal("a second start succeeded")
++	}
++
++	guestMAC := net.HardwareAddr{0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee}
++	req := make([]byte, header.EthernetMinimumSize+header.ARPSize)
++	eth := header.Ethernet(req)
++	eth.Encode(&header.EthernetFields{SrcAddr: "\x5a\x94\xef\xe4\x0c\xee", DstAddr: header.EthernetBroadcastAddress, Type: header.ARPProtocolNumber})
++	arp := header.ARP(req[header.EthernetMinimumSize:])
++	arp.SetIPv4OverEthernet()
++	arp.SetOp(header.ARPRequest)
++	copy(arp.HardwareAddressSender(), guestMAC)
++	copy(arp.ProtocolAddressSender(), net.IPv4(192, 168, 127, 2).To4())
++	copy(arp.ProtocolAddressTarget(), net.IPv4(192, 168, 127, 1).To4())
++	inprocLink.Load().Inject(req, buffer.MakeWithData(req))
++
++	deadline := time.After(5 * time.Second)
++	for {
++		select {
++		case f := <-frames:
++			if header.Ethernet(f).Type() != header.ARPProtocolNumber {
++				continue
++			}
++			reply := header.ARP(f[header.EthernetMinimumSize:])
++			if reply.Op() != header.ARPReply || !bytes.Equal(reply.ProtocolAddressSender(), net.IPv4(192, 168, 127, 1).To4()) {
++				t.Fatalf("unexpected ARP % x", f)
++			}
++			return
++		case <-deadline:
++			t.Fatal("no ARP reply from the gateway")
++		}
++	}
++}
+diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
+index 21ab61e..05d2fb7 100644
+--- a/cmd/gvproxy/main.go
++++ b/cmd/gvproxy/main.go
+@@ -274,6 +274,10 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+ 		})
+ 	}
+ 
++	if inprocAttach != nil {
++		inprocAttach(vn)
++	}
++
+ 	if config.Interfaces.Vfkit != "" {
+ 		conn, err := transport.ListenUnixgram(config.Interfaces.Vfkit)
+ 		if err != nil {
+diff --git a/pkg/tap/callback.go b/pkg/tap/callback.go
+new file mode 100644
+index 0000000..601ccee
+--- /dev/null
++++ b/pkg/tap/callback.go
+@@ -0,0 +1,82 @@
++package tap
++
++import (
++	"errors"
++	"net"
++	"time"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++// PacketWriter receives the frames for a VM that runs in this process, such
++// as one whose VMM loads gvproxy as a library: no socket and no goroutine sit
++// between the stack and the VM's receive queue.
++type PacketWriter interface {
++	// WritePacket writes one frame: hdr, a virtio-net header, followed by
++	// the frame in slices. It must not block and may only read the slices
++	// during the call.
++	WritePacket(hdr []byte, frame [][]byte) error
++}
++
++// CallbackLink connects an in-process VM to the switch.
++type CallbackLink struct {
++	sw *Switch
++	id int
++}
++
++// ConnectCallback adds a VM whose frames go to w. Frames to it are written
++// on the goroutine that produced them, and the stack leaves TCP and UDP
++// checksums to the VM (virtio-net's NEEDS_CSUM), since nothing between them
++// can corrupt a frame.
++func (e *Switch) ConnectCallback(w PacketWriter) *CallbackLink {
++	id, _ := e.connect(protocolConn{
++		Conn:         &callbackConn{w: w},
++		protocolImpl: protocolImplementation(types.VfkitProtocol),
++	})
++	if le, ok := e.gateway.(*LinkEndpoint); ok {
++		le.txChecksumOffload.Store(true)
++	}
++	e.txInline.Store(true)
++	return &CallbackLink{sw: e, id: id}
++}
++
++// Inject hands a frame from the VM to the switch. frame holds its bytes and
++// data a buffer with the same bytes, which Inject takes over.
++func (l *CallbackLink) Inject(frame []byte, data buffer.Buffer) {
++	l.sw.rxFrame(l.id, frame, data)
++}
++
++// callbackConn stands in for a VM's socket in the switch's connection table.
++type callbackConn struct {
++	w PacketWriter
++}
++
++var errCallbackConn = errors.New("in-process VM link has no socket")
++
++func (c *callbackConn) writePacket(pkt *stack.PacketBuffer) error {
++	hdr := guestNetHeader(pkt)
++	return c.w.WritePacket(hdr[:], pkt.AsSlices())
++}
++
++func (c *callbackConn) Write(b []byte) (int, error) {
++	var hdr [virtioNetHdrLen]byte
++	if err := c.w.WritePacket(hdr[:], [][]byte{b}); err != nil {
++		return 0, err
++	}
++	return len(b), nil
++}
++
++func (c *callbackConn) Read([]byte) (int, error)         { return 0, errCallbackConn }
++func (c *callbackConn) Close() error                     { return nil }
++func (c *callbackConn) LocalAddr() net.Addr              { return callbackAddr{} }
++func (c *callbackConn) RemoteAddr() net.Addr             { return callbackAddr{} }
++func (c *callbackConn) SetDeadline(time.Time) error      { return nil }
++func (c *callbackConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *callbackConn) SetWriteDeadline(time.Time) error { return nil }
++
++type callbackAddr struct{}
++
++func (callbackAddr) Network() string { return "callback" }
++func (callbackAddr) String() string  { return "in-process VM" }
+diff --git a/pkg/tap/callback_test.go b/pkg/tap/callback_test.go
+new file mode 100644
+index 0000000..e8901ec
+--- /dev/null
++++ b/pkg/tap/callback_test.go
+@@ -0,0 +1,138 @@
++package tap
++
++import (
++	"bytes"
++	"encoding/binary"
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/buffer"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/checksum"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++var (
++	stackMAC = tcpip.LinkAddress("\x5a\x94\xef\xe4\x0c\x01")
++	stackIP  = tcpip.AddrFrom4([4]byte{192, 168, 127, 1})
++	guestIP  = tcpip.AddrFrom4([4]byte{192, 168, 127, 2})
++)
++
++// outboundTCP builds a frame as the stack sends it to the guest with
++// checksum offload: Ethernet, IPv4 and TCP headers pushed, no TCP checksum.
++func outboundTCP(t *testing.T, payload []byte) *stack.PacketBuffer {
++	t.Helper()
++	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
++		ReserveHeaderBytes: header.EthernetMinimumSize + header.IPv4MinimumSize + header.TCPMinimumSize,
++		Payload:            buffer.MakeWithData(payload),
++	})
++	tcp := header.TCP(pkt.TransportHeader().Push(header.TCPMinimumSize))
++	tcp.Encode(&header.TCPFields{SrcPort: 80, DstPort: 40000, SeqNum: 1, AckNum: 2,
++		DataOffset: header.TCPMinimumSize, Flags: header.TCPFlagAck, WindowSize: 1000})
++	pkt.TransportProtocolNumber = header.TCPProtocolNumber
++	ip := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
++	ip.Encode(&header.IPv4Fields{TotalLength: uint16(header.IPv4MinimumSize + header.TCPMinimumSize + len(payload)),
++		TTL: 64, Protocol: uint8(header.TCPProtocolNumber), SrcAddr: stackIP, DstAddr: guestIP})
++	ip.SetChecksum(^ip.CalculateChecksum())
++	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
++	eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
++	eth.Encode(&header.EthernetFields{SrcAddr: stackMAC, DstAddr: guestMAC, Type: header.IPv4ProtocolNumber})
++	return pkt
++}
++
++func TestGuestNetHeaderLeavesAPartialChecksumTheGuestCompletes(t *testing.T) {
++	payload := bytes.Repeat([]byte("katamaran"), 1000)
++	pkt := outboundTCP(t, payload)
++	defer pkt.DecRef()
++
++	hdr := guestNetHeader(pkt)
++	if hdr[0] != virtioNetHdrFNeedsCsum {
++		t.Fatalf("flags %#x, want NEEDS_CSUM", hdr[0])
++	}
++	start := int(binary.LittleEndian.Uint16(hdr[6:]))
++	offset := int(binary.LittleEndian.Uint16(hdr[8:]))
++	if start != header.EthernetMinimumSize+header.IPv4MinimumSize || offset != header.TCPChecksumOffset {
++		t.Fatalf("csum_start %d csum_offset %d", start, offset)
++	}
++
++	// Complete it as the guest would: sum from csum_start to the end, with
++	// the field holding the pseudo-header sum, and store the complement.
++	frame := pkt.ToView().AsSlice()
++	sum := checksum.Checksum(frame[start:], 0)
++	binary.BigEndian.PutUint16(frame[start+offset:], ^sum)
++
++	tcp := header.TCP(frame[start:])
++	if !tcp.IsChecksumValid(stackIP, guestIP, checksum.Checksum(payload, 0), uint16(len(payload))) {
++		t.Fatal("the completed checksum is wrong")
++	}
++}
++
++func TestGuestNetHeaderLeavesOtherFramesAlone(t *testing.T) {
++	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame(1))})
++	defer pkt.DecRef()
++	if hdr := guestNetHeader(pkt); hdr != [virtioNetHdrLen]byte{} {
++		t.Fatalf("header % x for a frame without a transport header", hdr)
++	}
++}
++
++type recordedFrame struct {
++	hdr   []byte
++	frame []byte
++}
++
++type frameRecorder struct{ frames []recordedFrame }
++
++func (r *frameRecorder) WritePacket(hdr []byte, frame [][]byte) error {
++	r.frames = append(r.frames, recordedFrame{bytes.Clone(hdr), bytes.Join(frame, nil)})
++	return nil
++}
++
++// fakeDispatcher records what the link endpoint delivers to the stack.
++type fakeDispatcher struct{ delivered [][]byte }
++
++func (d *fakeDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
++	d.delivered = append(d.delivered, bytes.Clone(pkt.ToView().AsSlice()))
++}
++
++func (d *fakeDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {}
++
++func TestCallbackLinkCarriesFramesBothWays(t *testing.T) {
++	le, err := NewLinkEndpoint(false, 1500, stackMAC.String(), stackIP.String(), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	gw := &fakeDispatcher{}
++	le.Attach(gw)
++	sw := NewSwitch(false)
++	le.Connect(sw)
++	sw.Connect(le)
++	var rec frameRecorder
++	link := sw.ConnectCallback(&rec)
++
++	if le.Capabilities()&stack.CapabilityTXChecksumOffload == 0 {
++		t.Fatal("the stack still computes checksums for an in-process VM")
++	}
++
++	// From the guest: the stack gets the frame without its Ethernet header,
++	// and the switch learns the guest's MAC.
++	in := frame(7)
++	in[0], in[1], in[2], in[3], in[4], in[5] = stackMAC[0], stackMAC[1], stackMAC[2], stackMAC[3], stackMAC[4], stackMAC[5]
++	copy(in[6:12], guestMAC)
++	link.Inject(in, buffer.MakeWithData(in))
++	if len(gw.delivered) != 1 || !bytes.Equal(gw.delivered[0], in[header.EthernetMinimumSize:]) {
++		t.Fatalf("stack got %x", gw.delivered)
++	}
++
++	// To the guest: written at once, whatever its size, with the header.
++	payload := bytes.Repeat([]byte{9}, 3*txInlineMax)
++	pkt := outboundTCP(t, payload)
++	sw.DeliverNetworkPacket(header.IPv4ProtocolNumber, pkt)
++	want := pkt.ToView().AsSlice()
++	pkt.DecRef()
++	if len(rec.frames) != 1 {
++		t.Fatalf("%d frames written, want 1 without queueing", len(rec.frames))
++	}
++	if !bytes.Equal(rec.frames[0].frame, want) || rec.frames[0].hdr[0] != virtioNetHdrFNeedsCsum {
++		t.Fatalf("wrote header % x and a %d-byte frame", rec.frames[0].hdr, len(rec.frames[0].frame))
++	}
++}
+diff --git a/pkg/tap/link.go b/pkg/tap/link.go
+index 3735945..5a4b11c 100644
+--- a/pkg/tap/link.go
++++ b/pkg/tap/link.go
+@@ -2,6 +2,7 @@ package tap
+ 
+ import (
+ 	"net"
++	"sync/atomic"
+ 
+ 	"github.com/google/gopacket"
+ 	"github.com/google/gopacket/layers"
+@@ -20,6 +21,9 @@ type LinkEndpoint struct {
+ 
+ 	dispatcher    stack.NetworkDispatcher
+ 	networkSwitch NetworkSwitch
++
++	// Leave TCP and UDP checksums to the VM, set when it is in-process.
++	txChecksumOffload atomic.Bool
+ }
+ 
+ func NewLinkEndpoint(debug bool, mtu uint32, macAddress string, ip string, virtualIPs []string) (*LinkEndpoint, error) {
+@@ -66,7 +70,11 @@ func (e *LinkEndpoint) AddHeader(_ *stack.PacketBuffer) {
+ func (e *LinkEndpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+ 
+ func (e *LinkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+-	return stack.CapabilityResolutionRequired | stack.CapabilityRXChecksumOffload
++	caps := stack.CapabilityResolutionRequired | stack.CapabilityRXChecksumOffload
++	if e.txChecksumOffload.Load() {
++		caps |= stack.CapabilityTXChecksumOffload
++	}
++	return caps
+ }
+ 
+ func (e *LinkEndpoint) LinkAddress() tcpip.LinkAddress {
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index 128d651..a50f59c 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -51,6 +51,9 @@ type Switch struct {
+ 	txq chan *stack.PacketBuffer
+ 	// Frames handed to txLoop and not yet written.
+ 	txPending atomic.Int64
++	// Write every frame on the goroutine that produced it: the only VM is
++	// in this process and its writer never blocks.
++	txInline atomic.Bool
+ 
+ 	gateway VirtualDevice
+ 
+@@ -126,8 +129,18 @@ type connTarget struct {
+ }
+ 
+ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
+-	buf := pkt.ToView().AsSlice()
+-	eth := header.Ethernet(buf)
++	// Flattened only for a socket: an in-process VM takes the slices.
++	var flat []byte
++	frame := func() []byte {
++		if flat == nil {
++			flat = pkt.ToView().AsSlice()
++		}
++		return flat
++	}
++	eth := header.Ethernet(pkt.LinkHeader().Slice())
++	if len(eth) < header.EthernetMinimumSize {
++		eth = frame()
++	}
+ 	dst := eth.DestinationAddress()
+ 	src := eth.SourceAddress()
+ 
+@@ -153,7 +166,7 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
+ 		e.connLock.Unlock()
+ 
+ 		for _, t := range targets {
+-			err := e.txBuf(t.conn, buf)
++			err := e.txConn(t.conn, pkt, frame)
+ 			if err != nil {
+ 				e.disconnect(t.id, t.conn)
+ 				return err
+@@ -176,7 +189,7 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
+ 			return nil
+ 		}
+ 
+-		err := e.txBuf(conn, buf)
++		err := e.txConn(conn, pkt, frame)
+ 		if err != nil {
+ 			e.disconnect(id, conn)
+ 			return err
+@@ -186,6 +199,13 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
+ 	return nil
+ }
+ 
++func (e *Switch) txConn(conn protocolConn, pkt *stack.PacketBuffer, frame func() []byte) error {
++	if cb, ok := conn.Conn.(*callbackConn); ok {
++		return cb.writePacket(pkt)
++	}
++	return e.txBuf(conn, frame())
++}
++
+ func (e *Switch) txBuf(conn protocolConn, buf []byte) error {
+ 	e.writeLock.Lock()
+ 	defer e.writeLock.Unlock()
+diff --git a/pkg/tap/txqueue.go b/pkg/tap/txqueue.go
+index 7e51417..079d7e5 100644
+--- a/pkg/tap/txqueue.go
++++ b/pkg/tap/txqueue.go
+@@ -24,7 +24,7 @@ const txInlineMax = 4096
+ // A small frame is written inline if no frame is queued or being written:
+ // those were produced earlier, so writing it now cannot overtake them.
+ func (e *Switch) enqueue(pkt *stack.PacketBuffer) {
+-	if pkt.Size() <= txInlineMax && e.txPending.Load() == 0 {
++	if e.txInline.Load() || (pkt.Size() <= txInlineMax && e.txPending.Load() == 0) {
+ 		if err := e.tx(pkt); err != nil {
+ 			log.Error(err)
+ 		}
+diff --git a/pkg/tap/vnethdr.go b/pkg/tap/vnethdr.go
+new file mode 100644
+index 0000000..bd8ad62
+--- /dev/null
++++ b/pkg/tap/vnethdr.go
+@@ -0,0 +1,66 @@
++package tap
++
++import (
++	"encoding/binary"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++)
++
++// virtioNetHdrLen is the size of struct virtio_net_hdr_v1.
++const virtioNetHdrLen = 12
++
++const virtioNetHdrFNeedsCsum = 1
++
++// udpChecksumOffset is the checksum field's offset in a UDP header; gVisor's
++// header package keeps its constant unexported.
++const udpChecksumOffset = 6
++
++// guestNetHeader returns the virtio-net header for a frame to the VM. A TCP
++// or UDP frame from the stack carries no checksum (the link offloads it), so
++// the header asks the guest to treat it as CHECKSUM_PARTIAL: csum_start and
++// csum_offset locate the field, which is set here to the pseudo-header sum
++// as Linux expects. The guest then trusts it on local delivery and fills it
++// in only if it forwards the frame to a device that needs it.
++func guestNetHeader(pkt *stack.PacketBuffer) (h [virtioNetHdrLen]byte) {
++	var off int
++	switch pkt.TransportProtocolNumber {
++	case header.TCPProtocolNumber:
++		off = header.TCPChecksumOffset
++	case header.UDPProtocolNumber:
++		off = udpChecksumOffset
++	default:
++		return h
++	}
++	nh := pkt.NetworkHeader().Slice()
++	th := pkt.TransportHeader().Slice()
++	if len(th) < off+2 {
++		return h
++	}
++	var src, dst tcpip.Address
++	switch pkt.NetworkProtocolNumber {
++	case header.IPv4ProtocolNumber:
++		if len(nh) < header.IPv4MinimumSize {
++			return h
++		}
++		ip := header.IPv4(nh)
++		src, dst = ip.SourceAddress(), ip.DestinationAddress()
++	case header.IPv6ProtocolNumber:
++		if len(nh) < header.IPv6MinimumSize {
++			return h
++		}
++		ip := header.IPv6(nh)
++		src, dst = ip.SourceAddress(), ip.DestinationAddress()
++	default:
++		return h
++	}
++	length := len(th) + pkt.Data().Size()
++	sum := header.PseudoHeaderChecksum(pkt.TransportProtocolNumber, src, dst, uint16(length))
++	binary.BigEndian.PutUint16(th[off:], sum)
++
++	h[0] = virtioNetHdrFNeedsCsum
++	binary.LittleEndian.PutUint16(h[6:], uint16(header.EthernetMinimumSize+len(nh)))
++	binary.LittleEndian.PutUint16(h[8:], uint16(off))
++	return h
++}
+diff --git a/pkg/virtualnetwork/callback.go b/pkg/virtualnetwork/callback.go
+new file mode 100644
+index 0000000..1c55c16
+--- /dev/null
++++ b/pkg/virtualnetwork/callback.go
+@@ -0,0 +1,9 @@
++package virtualnetwork
++
++import "github.com/containers/gvisor-tap-vsock/pkg/tap"
++
++// ConnectCallback connects a VM that runs in this process; see
++// tap.Switch.ConnectCallback.
++func (n *VirtualNetwork) ConnectCallback(w tap.PacketWriter) *tap.CallbackLink {
++	return n.networkSwitch.ConnectCallback(w)
++}

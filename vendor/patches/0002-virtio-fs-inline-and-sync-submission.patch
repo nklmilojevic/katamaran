@@ -1,0 +1,432 @@
+diff --git a/src/devices/src/virtio/device.rs b/src/devices/src/virtio/device.rs
+index 96a76b75..925fc54a 100644
+--- a/src/devices/src/virtio/device.rs
++++ b/src/devices/src/virtio/device.rs
+@@ -340,6 +340,12 @@ pub trait VirtioDevice: AsAny + Send {
+     /// The transport uses this to construct the queues during initialization and after reset.
+     fn queue_config(&self) -> &[QueueConfig];
+ 
++    /// Handle a queue notification synchronously on the notifying vCPU thread.
++    /// Returns false to fall back to signalling the queue's eventfd.
++    fn notify_inline(&mut self, _queue_index: u32) -> bool {
++        false
++    }
++
+     /// Returns the length of the device-specific configuration space when known.
+     /// Transports that expose device config through a capability require a length.
+     fn config_len(&self) -> Option<u32> {
+diff --git a/src/devices/src/virtio/fs/device.rs b/src/devices/src/virtio/fs/device.rs
+index 2ad76395..5832f82b 100644
+--- a/src/devices/src/virtio/fs/device.rs
++++ b/src/devices/src/virtio/fs/device.rs
+@@ -3,7 +3,7 @@ use crossbeam_channel::Sender;
+ use std::cmp;
+ use std::io::Write;
+ use std::mem::size_of;
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+ use std::thread::JoinHandle;
+ use std::time::Duration;
+@@ -21,7 +21,7 @@ use super::super::{
+ use super::ExportTable;
+ use super::passthrough;
+ use super::virtual_entry::VirtualDirEntry;
+-use super::worker::FsWorker;
++use super::worker::{FsCore, FsWorker};
+ use super::{CachePolicy, PermissionSemantics, defs, defs::uapi};
+ use crate::virtio::InterruptTransport;
+ 
+@@ -55,6 +55,9 @@ pub struct Fs {
+     virtual_entries: Vec<VirtualDirEntry<'static>>,
+     worker_thread: Option<JoinHandle<()>>,
+     worker_stopfd: EventFd,
++    /// Set when request-queue notifications are processed on the notifying
++    /// vCPU thread instead of waking the worker (KATAMARAN_FS_INLINE != 0).
++    inline_core: Option<Arc<Mutex<FsCore>>>,
+     exit_code: Arc<AtomicI32>,
+     #[cfg(target_os = "macos")]
+     map_sender: Option<Sender<WorkerMessage>>,
+@@ -83,6 +86,12 @@ impl Fs {
+ 
+         let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
+ 
++        // The guest probes once at driver init, before the device is activated.
++        #[cfg(target_os = "macos")]
++        if std::env::var("KATAMARAN_FS_INLINE").as_deref() != Ok("0") {
++            hvf::vendor_call::register(KAT_FS_PROBE, |_| KAT_FS_MAGIC);
++        }
++
+         let mut fs = Fs {
+             avail_features,
+             acked_features: 0,
+@@ -95,6 +104,7 @@ impl Fs {
+             virtual_entries,
+             worker_thread: None,
+             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
++            inline_core: None,
+             exit_code,
+             #[cfg(target_os = "macos")]
+             map_sender: None,
+@@ -296,6 +306,12 @@ impl VirtioDevice for Fs {
+             error!("virtio_fs: failed to create worker: {}", e);
+             ActivateError::BadActivate
+         })?;
++        if std::env::var("KATAMARAN_FS_INLINE").as_deref() != Ok("0") {
++            self.inline_core = Some(worker.core());
++            #[cfg(target_os = "macos")]
++            register_sync_calls(worker.core());
++        }
++        super::worker::start_stats_reporter();
+         self.worker_thread = Some(worker.run());
+ 
+         self.device_state = DeviceState::Activated(mem, interrupt);
+@@ -310,7 +326,27 @@ impl VirtioDevice for Fs {
+         self.shm_region.as_ref()
+     }
+ 
++    fn notify_inline(&mut self, queue_index: u32) -> bool {
++        if queue_index as usize != defs::REQ_INDEX {
++            return false;
++        }
++        let Some(core) = &self.inline_core else {
++            return false;
++        };
++        match core.try_lock() {
++            Ok(mut core) => {
++                core.drain(defs::REQ_INDEX);
++                super::worker::note_inline(1);
++                true
++            }
++            Err(_) => false,
++        }
++    }
++
+     fn reset(&mut self) -> bool {
++        self.inline_core = None;
++        #[cfg(target_os = "macos")]
++        hvf::vendor_call::unregister(KAT_FS_DRAIN);
+         if let Some(worker) = self.worker_thread.take() {
+             let _ = self.worker_stopfd.write(1);
+             if let Err(e) = worker.join() {
+@@ -529,3 +565,26 @@ mod tests {
+         ));
+     }
+ }
++
++/// Guest probe: returns [`KAT_FS_MAGIC`] when synchronous submission works.
++#[cfg(target_os = "macos")]
++const KAT_FS_PROBE: u64 = 0xC600_4B00;
++/// Guest call after queueing requests: process the request queue on this
++/// vCPU without raising an interrupt. Returns 0 when done, 1 when the queue is
++/// busy on another thread (the guest then notifies the queue as usual).
++#[cfg(target_os = "macos")]
++const KAT_FS_DRAIN: u64 = 0xC600_4B01;
++#[cfg(target_os = "macos")]
++const KAT_FS_MAGIC: u64 = 0x4B41_544D;
++
++#[cfg(target_os = "macos")]
++fn register_sync_calls(core: Arc<Mutex<FsCore>>) {
++    hvf::vendor_call::register(KAT_FS_DRAIN, move |_| match core.try_lock() {
++        Ok(mut core) => {
++            core.drain_with(defs::REQ_INDEX, false);
++            super::worker::note_sync(1);
++            0
++        }
++        Err(_) => 1,
++    });
++}
+diff --git a/src/devices/src/virtio/fs/worker.rs b/src/devices/src/virtio/fs/worker.rs
+index efdb4648..a9dacdd8 100644
+--- a/src/devices/src/virtio/fs/worker.rs
++++ b/src/devices/src/virtio/fs/worker.rs
+@@ -6,8 +6,9 @@ use utils::worker_message::WorkerMessage;
+ use std::io;
+ #[cfg(unix)]
+ use std::os::fd::AsRawFd;
+-use std::sync::Arc;
+-use std::sync::atomic::AtomicI32;
++use std::sync::{Arc, Mutex};
++use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
++use std::time::{Duration, Instant};
+ use std::thread;
+ #[cfg(windows)]
+ use utils::windows::AsRawFd;
+@@ -76,20 +77,26 @@ impl FsServer {
+     }
+ }
+ 
+-pub struct FsWorker {
++/// Queue processing state, shared between the worker thread and vCPU threads
++/// that drain the request queue inline when they notify it.
++pub struct FsCore {
+     queues: Vec<Queue>,
+-    queue_evts: Vec<Arc<EventFd>>,
+     interrupt: InterruptTransport,
+     mem: GuestMemoryMmap,
+     allow_idmap: bool,
+     shm_region: Option<VirtioShmRegion>,
+     server: FsServer,
+-    stop_fd: EventFd,
+     exit_code: Arc<AtomicI32>,
+     #[cfg(target_os = "macos")]
+     map_sender: Option<Sender<WorkerMessage>>,
+ }
+ 
++pub struct FsWorker {
++    core: Arc<Mutex<FsCore>>,
++    queue_evts: Vec<Arc<EventFd>>,
++    stop_fd: EventFd,
++}
++
+ impl FsWorker {
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+@@ -131,20 +138,26 @@ impl FsWorker {
+             ))),
+         };
+         Ok(Self {
+-            queues,
++            core: Arc::new(Mutex::new(FsCore {
++                queues,
++                interrupt,
++                mem,
++                allow_idmap,
++                shm_region,
++                server,
++                exit_code,
++                #[cfg(target_os = "macos")]
++                map_sender,
++            })),
+             queue_evts,
+-            interrupt,
+-            mem,
+-            allow_idmap,
+-            shm_region,
+-            server,
+             stop_fd,
+-            exit_code,
+-            #[cfg(target_os = "macos")]
+-            map_sender,
+         })
+     }
+ 
++    pub fn core(&self) -> Arc<Mutex<FsCore>> {
++        self.core.clone()
++    }
++
+     pub fn run(self) -> thread::JoinHandle<()> {
+         thread::Builder::new()
+             .name("fs worker".into())
+@@ -214,13 +227,71 @@ impl FsWorker {
+         if let Err(e) = self.queue_evts[queue_index].read() {
+             error!("Failed to get queue event: {e:?}");
+         }
++        self.core.lock().unwrap().drain(queue_index);
++    }
++}
++
++static STAT_REQS: AtomicU64 = AtomicU64::new(0);
++static STAT_NS: AtomicU64 = AtomicU64::new(0);
++static STAT_INLINE: AtomicU64 = AtomicU64::new(0);
++static STAT_SYNC: AtomicU64 = AtomicU64::new(0);
++
++/// KATAMARAN_FS_STATS=1: every 2 s, log how many requests the server handled
++/// and the mean host time per request.
++pub fn start_stats_reporter() {
++    static STARTED: std::sync::Once = std::sync::Once::new();
++    if std::env::var("KATAMARAN_FS_STATS").as_deref() != Ok("1") {
++        return;
++    }
++    STARTED.call_once(|| {
++        thread::spawn(|| {
++            let (mut last_n, mut last_ns, mut last_inline, mut last_sync) = (0, 0, 0, 0);
++            loop {
++                thread::sleep(Duration::from_secs(2));
++                let (n, ns, inl, sync) = (
++                    STAT_REQS.load(Ordering::Relaxed),
++                    STAT_NS.load(Ordering::Relaxed),
++                    STAT_INLINE.load(Ordering::Relaxed),
++                    STAT_SYNC.load(Ordering::Relaxed),
++                );
++                let dn = n - last_n;
++                if dn > 0 {
++                    log::warn!(
++                        "fs stats: {} req/s, host {:.1} us/req, drains: {} notify-inline, {} sync",
++                        dn / 2,
++                        (ns - last_ns) as f64 / dn as f64 / 1000.0,
++                        inl - last_inline,
++                        sync - last_sync
++                    );
++                }
++                (last_n, last_ns, last_inline, last_sync) = (n, ns, inl, sync);
++            }
++        });
++    });
++}
++
++pub fn note_sync(n: u64) {
++    STAT_SYNC.fetch_add(n, Ordering::Relaxed);
++}
++
++pub fn note_inline(n: u64) {
++    STAT_INLINE.fetch_add(n, Ordering::Relaxed);
++}
++
++impl FsCore {
++    pub fn drain(&mut self, queue_index: usize) {
++        self.drain_with(queue_index, true);
++    }
+ 
++    /// Process the queue. With `signal` false no interrupt is raised: the
++    /// guest asked by hypercall and collects the replies itself on return.
++    pub fn drain_with(&mut self, queue_index: usize, signal: bool) {
+         loop {
+             self.queues[queue_index]
+                 .disable_notification(&self.mem)
+                 .unwrap();
+ 
+-            self.process_queue(queue_index);
++            self.process_queue(queue_index, signal);
+ 
+             if !self.queues[queue_index]
+                 .enable_notification(&self.mem)
+@@ -231,7 +302,7 @@ impl FsWorker {
+         }
+     }
+ 
+-    fn process_queue(&mut self, queue_index: usize) {
++    fn process_queue(&mut self, queue_index: usize, signal: bool) {
+         let queue = &mut self.queues[queue_index];
+         while let Some(head) = queue.pop(&self.mem) {
+             let reader = Reader::new(&self.mem, head.clone())
+@@ -241,6 +312,7 @@ impl FsWorker {
+                 .map_err(FsError::QueueWriter)
+                 .unwrap();
+ 
++            let started = Instant::now();
+             let len = match self.server.handle_message(
+                 reader,
+                 writer,
+@@ -257,11 +329,13 @@ impl FsWorker {
+                 }
+             };
+ 
++            STAT_REQS.fetch_add(1, Ordering::Relaxed);
++            STAT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+             if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
+                 error!("failed to add used elements to the queue: {e:?}");
+             }
+ 
+-            if queue.needs_notification(&self.mem).unwrap() {
++            if signal && queue.needs_notification(&self.mem).unwrap() {
+                 self.interrupt.signal_used_queue();
+             }
+         }
+diff --git a/src/devices/src/virtio/mmio.rs b/src/devices/src/virtio/mmio.rs
+index 73357e09..79ae3c4d 100644
+--- a/src/devices/src/virtio/mmio.rs
++++ b/src/devices/src/virtio/mmio.rs
+@@ -359,8 +359,10 @@ impl BusDevice for MmioTransport {
+                     0x38 => self.update_queue_field(|q| q.size = v as u16),
+                     0x44 => self.update_queue_field(|q| q.ready = v == 1),
+                     0x50 => {
+-                        // Queue notification - write to the eventfd for the specified queue.
+-                        if let Some(eventfd) = self.state.queue_evts().get(v as usize) {
++                        // Queue notification: let the device handle it on this vCPU thread
++                        // if it can, otherwise wake its worker through the eventfd.
++                        if self.locked_device().notify_inline(v) {
++                        } else if let Some(eventfd) = self.state.queue_evts().get(v as usize) {
+                             eventfd.write(1).unwrap();
+                         } else {
+                             warn!("invalid queue index for notification: {v}");
+diff --git a/src/hvf/src/lib.rs b/src/hvf/src/lib.rs
+index 37daa951..ce92f4c3 100644
+--- a/src/hvf/src/lib.rs
++++ b/src/hvf/src/lib.rs
+@@ -10,6 +10,7 @@
+ #[allow(non_upper_case_globals)]
+ #[allow(deref_nullptr)]
+ pub mod bindings;
++pub mod vendor_call;
+ 
+ #[macro_use]
+ extern crate log;
+@@ -654,7 +655,19 @@ impl HvfVcpu<'_> {
+                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
+                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
+             }
+-            val => panic!("Unexpected val={val}")
++            val => {
++                let args = [
++                    self.read_reg(hv_reg_t_HV_REG_X1)?,
++                    self.read_reg(hv_reg_t_HV_REG_X2)?,
++                    self.read_reg(hv_reg_t_HV_REG_X3)?,
++                ];
++                let ret = vendor_call::dispatch(val, args).unwrap_or_else(|| {
++                    debug!("unsupported SMCCC call 0x{val:x}");
++                    vendor_call::NOT_SUPPORTED
++                });
++                self.write_reg(hv_reg_t_HV_REG_X0, ret)?;
++                Ok(VcpuExit::PsciHandled)
++            }
+         }
+     }
+ 
+diff --git a/src/hvf/src/vendor_call.rs b/src/hvf/src/vendor_call.rs
+new file mode 100644
+index 00000000..1cc059bb
+--- /dev/null
++++ b/src/hvf/src/vendor_call.rs
+@@ -0,0 +1,51 @@
++//! Vendor-specific hypervisor calls (SMCCC fast calls, owner 6), dispatched on
++//! the calling vCPU thread to handlers that devices register.
++
++use std::sync::{Arc, RwLock};
++
++/// SMCCC return value for an unknown function ID.
++pub const NOT_SUPPORTED: u64 = u64::MAX;
++
++type Handler = Arc<dyn Fn([u64; 3]) -> u64 + Send + Sync>;
++
++static HANDLERS: RwLock<Vec<(u64, Handler)>> = RwLock::new(Vec::new());
++
++/// Register `handler` for `function_id`, replacing any previous handler.
++pub fn register(function_id: u64, handler: impl Fn([u64; 3]) -> u64 + Send + Sync + 'static) {
++    let mut handlers = HANDLERS.write().unwrap();
++    handlers.retain(|(id, _)| *id != function_id);
++    handlers.push((function_id, Arc::new(handler)));
++}
++
++pub fn unregister(function_id: u64) {
++    HANDLERS
++        .write()
++        .unwrap()
++        .retain(|(id, _)| *id != function_id);
++}
++
++/// Run the handler for `function_id` with the call's x1..x3 arguments.
++pub fn dispatch(function_id: u64, args: [u64; 3]) -> Option<u64> {
++    let handler = HANDLERS
++        .read()
++        .unwrap()
++        .iter()
++        .find(|(id, _)| *id == function_id)
++        .map(|(_, h)| h.clone())?;
++    Some(handler(args))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn dispatches_registered_handlers_only() {
++        register(0xC600_4BF0, |a| a[0] + a[1]);
++        assert_eq!(dispatch(0xC600_4BF0, [2, 3, 0]), Some(5));
++        register(0xC600_4BF0, |_| 7);
++        assert_eq!(dispatch(0xC600_4BF0, [2, 3, 0]), Some(7));
++        unregister(0xC600_4BF0);
++        assert_eq!(dispatch(0xC600_4BF0, [0; 3]), None);
++    }
++}

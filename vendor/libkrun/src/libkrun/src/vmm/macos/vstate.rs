@@ -1,0 +1,1232 @@
+// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the THIRD-PARTY file.
+
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::io;
+use std::ops::Range;
+use std::result;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+
+use arch::ArchMemoryInfo;
+use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
+use devices::legacy::VcpuList;
+use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use utils::eventfd::EventFd;
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
+use vm_memory::{
+    Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+};
+
+/// Run this thread at QOS_CLASS_USER_INTERACTIVE so active vCPUs are scheduled
+/// on P-cores with low wakeup latency under host background load.
+fn set_interactive_qos() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos: u32, relpri: i32) -> i32;
+    }
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+
+/// Errors associated with the wrappers over KVM ioctls.
+#[derive(Debug)]
+#[allow(unused)]
+pub enum Error {
+    /// Invalid guest memory configuration.
+    GuestMemoryMmap(GuestMemoryError),
+    /// The number of configured slots is bigger than the maximum reported by KVM.
+    NotEnoughMemorySlots,
+    /// Error configuring the general purpose aarch64 registers.
+    REGSConfiguration(arch::aarch64::regs::Error),
+    /// Cannot set the memory regions.
+    SetUserMemoryRegion(hvf::Error),
+    /// The vCPU event channel was closed (the vCPU thread has exited).
+    VcpuChannelClosed,
+    /// Failed to signal Vcpu.
+    SignalVcpu(utils::errno::Error),
+    /// Error doing Vcpu Init on Arm.
+    VcpuArmInit,
+    /// Error getting the Vcpu preferred target on Arm.
+    VcpuArmPreferredTarget,
+    /// vCPU count is not initialized.
+    VcpuCountNotInitialized,
+    /// Cannot run the VCPUs.
+    VcpuRun,
+    /// Cannot spawn a new vCPU thread.
+    VcpuSpawn(io::Error),
+    /// Cannot cleanly initialize vcpu TLS.
+    VcpuTlsInit,
+    /// Vcpu not present in TLS.
+    VcpuTlsNotPresent,
+    /// Unexpected KVM_RUN exit reason
+    VcpuUnhandledKvmExit,
+    /// Cannot configure the microvm.
+    VmSetup(hvf::Error),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        use self::Error::*;
+
+        match self {
+            GuestMemoryMmap(e) => write!(f, "Guest memory error: {e:?}"),
+            VcpuCountNotInitialized => write!(f, "vCPU count is not initialized"),
+            VmSetup(e) => write!(f, "Cannot configure the microvm: {e:?}"),
+            VcpuRun => write!(f, "Cannot run the VCPUs"),
+            NotEnoughMemorySlots => write!(
+                f,
+                "The number of configured slots is bigger than the maximum reported by KVM"
+            ),
+            SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e:?}"),
+            SignalVcpu(e) => write!(f, "Failed to signal Vcpu: {e}"),
+            REGSConfiguration(e) => write!(
+                f,
+                "Error configuring the general purpose aarch64 registers: {e:?}"
+            ),
+            VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
+            VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
+            VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
+            VcpuUnhandledKvmExit => write!(f, "Unexpected KVM_RUN exit reason"),
+            VcpuArmPreferredTarget => write!(f, "Error getting the Vcpu preferred target on Arm"),
+            VcpuArmInit => write!(f, "Error doing Vcpu Init on Arm"),
+            VcpuChannelClosed => write!(f, "vCPU event channel closed"),
+        }
+    }
+}
+
+pub type Result<T> = result::Result<T, Error>;
+
+/// Maps fresh anonymous memory over the `len` bytes of guest memory at `guest_addr`, whose host
+/// address is `host_addr`, with one mmap() for each block of `RECLAIM_BLOCK_SIZE` guest physical
+/// addresses (the part of it that is in the range). XNU keeps these mappings apart, as the tests
+/// check, so each block is a VM object of its own, which is freed with all of its pages when the
+/// block is replaced.
+///
+/// A block that can't be replaced keeps its pages, because XNU puts them back when a MAP_FIXED
+/// mmap() fails. The other blocks are replaced anyway, and the first error is returned.
+///
+/// # Safety
+///
+/// The range must be within one region of guest memory, whose contents the caller gives up.
+unsafe fn map_fresh_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io::Result<()> {
+    let end = guest_addr + len;
+    let mut first_err = None;
+    let mut addr = guest_addr;
+    while addr < end {
+        let block_end = (addr + 1).next_multiple_of(RECLAIM_BLOCK_SIZE).min(end);
+        // SAFETY: the block is within the range, which the caller vouches for.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr.add((addr - guest_addr) as usize).cast(),
+                (block_end - addr) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                // Alternate VM tags so XNU keeps adjacent blocks in separate map entries.
+                libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8
+                    + ((addr / RECLAIM_BLOCK_SIZE) % 2) as u8) as libc::c_int,
+                0,
+            )
+        };
+        if ret == libc::MAP_FAILED && first_err.is_none() {
+            first_err = Some(io::Error::last_os_error());
+        }
+        addr = block_end;
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Maps an untouched guest RAM range into separate `RECLAIM_BLOCK_SIZE` entries with half as
+/// many `mmap()` syscalls as [`map_fresh_blocks`]: one mapping covers the whole range with Tag 1,
+/// and only the odd blocks are overwritten with Tag 2 so XNU splits the untouched Tag 1 mapping
+/// around them. Because no pages are resident yet, each resulting entry gets its own VM object
+/// on first fault.
+///
+/// # Safety
+///
+/// The range must be within one untouched region of guest memory whose contents the caller gives up.
+unsafe fn map_initial_blocks(host_addr: *mut u8, guest_addr: u64, len: u64) -> io::Result<()> {
+    let tag1 =
+        unsafe { libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8) } as libc::c_int;
+    let tag2 = unsafe { libc::VM_MAKE_TAG(libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u8 + 1) }
+        as libc::c_int;
+    let ret = unsafe {
+        libc::mmap(
+            host_addr.cast(),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+            tag1,
+            0,
+        )
+    };
+    if ret == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let end = guest_addr + len;
+    let mut first_err = None;
+    let mut addr = guest_addr;
+    while addr < end {
+        let block_end = (addr + 1).next_multiple_of(RECLAIM_BLOCK_SIZE).min(end);
+        if (addr / RECLAIM_BLOCK_SIZE) % 2 == 1 {
+            // SAFETY: the block is within the range, which the caller vouches for.
+            let ret = unsafe {
+                libc::mmap(
+                    host_addr.add((addr - guest_addr) as usize).cast(),
+                    (block_end - addr) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                    tag2,
+                    0,
+                )
+            };
+            if ret == libc::MAP_FAILED && first_err.is_none() {
+                first_err = Some(io::Error::last_os_error());
+            }
+        }
+        addr = block_end;
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Maps the guest memory in `ram` in blocks of `RECLAIM_BLOCK_SIZE`, so that [`Vm::reclaim_memory`]
+/// can free each block on its own. Other regions, like the firmware and SHM ones, stay as they
+/// are.
+///
+/// This throws away the contents of `ram`, so call it before anything is written there and before
+/// the hypervisor maps it.
+pub fn map_guest_ram_in_blocks(guest_mem: &GuestMemoryMmap, ram: Range<u64>) -> io::Result<()> {
+    for region in guest_mem.iter() {
+        let start = region.start_addr().raw_value().max(ram.start);
+        let end = (region.start_addr().raw_value() + region.len()).min(ram.end);
+        if start >= end {
+            continue;
+        }
+        let host_addr = guest_mem
+            .get_host_address(GuestAddress(start))
+            .map_err(io::Error::other)?;
+        // SAFETY: the range is within one region of guest memory, which holds nothing yet.
+        unsafe { map_initial_blocks(host_addr, start, end - start)? };
+    }
+    Ok(())
+}
+
+/// A wrapper around creating and using a VM.
+pub struct Vm {
+    hvf_vm: HvfVm,
+}
+
+impl Vm {
+    /// Constructs a new `Vm` using the given `Kvm` instance.
+    pub fn new(arch_mem_info: &mut ArchMemoryInfo, nested_enabled: bool) -> Result<Self> {
+        let hvf_vm = HvfVm::new(arch_mem_info, nested_enabled).map_err(Error::VmSetup)?;
+
+        Ok(Vm { hvf_vm })
+    }
+
+    /// Initializes the guest memory.
+    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
+        for region in guest_mem.iter() {
+            // It's safe to unwrap because the guest address is valid.
+            let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
+            debug!(
+                "Guest memory host_addr={:x?} guest_addr={:x?} len={:x?}",
+                host_addr,
+                region.start_addr().raw_value(),
+                region.len()
+            );
+            self.hvf_vm
+                .map_memory(
+                    host_addr as u64,
+                    region.start_addr().raw_value(),
+                    region.len(),
+                )
+                .map_err(Error::SetUserMemoryRegion)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn add_mapping(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+    ) {
+        debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
+            error!("Error removing memory map: {e:?}");
+        }
+
+        if let Err(e) = self.hvf_vm.map_memory(host_addr, guest_addr, len) {
+            error!("Error adding memory map: {e:?}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
+
+    pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+        if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
+            error!("Error removing memory map: {e:?}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
+
+    /// Replaces the host pages backing a range of guest RAM with fresh anonymous memory, which
+    /// gives them back to the system and leaves the range reading as zeroes. madvise() can't do
+    /// this: it doesn't release the pages that the guest has written to.
+    ///
+    /// The range is replaced one block of `RECLAIM_BLOCK_SIZE` at a time, and has to be made of
+    /// whole blocks: replacing part of a larger VM object leaves the pages of that part in
+    /// memory, owned by no process. The hypervisor still unmaps and maps the range as a whole.
+    ///
+    /// Returns whether the pages were replaced. If they weren't, the range is mapped as before.
+    /// An error means that it couldn't be mapped into the guest again.
+    pub fn reclaim_memory(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        guest_addr: u64,
+        len: u64,
+    ) -> Result<bool> {
+        if len == 0
+            || !guest_addr.is_multiple_of(RECLAIM_BLOCK_SIZE)
+            || !len.is_multiple_of(RECLAIM_BLOCK_SIZE)
+        {
+            warn!(
+                "Not reclaiming memory that isn't made of whole blocks: guest_addr={guest_addr:x}, len={len}"
+            );
+            return Ok(false);
+        }
+        // A range that isn't within a single region of guest memory would make mmap() replace
+        // whatever else the VMM has mapped after the region.
+        let Ok(slice) = guest_mem.get_slice(GuestAddress(guest_addr), len as usize) else {
+            warn!(
+                "Not reclaiming memory outside of a single guest memory region: guest_addr={guest_addr:x}, len={len}"
+            );
+            return Ok(false);
+        };
+        let host_addr = slice.ptr_guard_mut().as_ptr();
+        if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
+            error!("Error removing memory map: {e:?}");
+            return Ok(false);
+        }
+
+        // SAFETY: the range is within one region of guest memory, so only guest memory is
+        // replaced, and it stays mapped for the VMM's accesses.
+        let reclaimed = match unsafe { map_fresh_blocks(host_addr, guest_addr, len) } {
+            Ok(()) => true,
+            Err(e) => {
+                error!("Error replacing guest memory: {e}");
+                false
+            }
+        };
+
+        self.hvf_vm
+            .map_memory(host_addr as u64, guest_addr, len)
+            .map_err(Error::SetUserMemoryRegion)?;
+        Ok(reclaimed)
+    }
+}
+
+/// Encapsulates configuration parameters for the guest vCPUS.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VcpuConfig {
+    /// Number of guest VCPUs.
+    pub vcpu_count: u8,
+    /// Enable hyperthreading in the CPUID configuration.
+    pub ht_enabled: bool,
+    /// CPUID template to use.
+    pub cpu_template: Option<CpuFeaturesTemplate>,
+}
+
+// Using this for easier explicit type-casting to help IDEs interpret the code.
+type VcpuCell = Cell<Option<*const Vcpu>>;
+
+/// A wrapper around creating and using a kvm-based VCPU.
+pub struct Vcpu {
+    id: u8,
+    ipa_size: u32,
+    boot_entry_addr: u64,
+    boot_receiver: Option<Receiver<u64>>,
+    boot_senders: Option<HashMap<u64, Sender<u64>>>,
+    fdt_addr: u64,
+    mmio_bus: Option<devices::Bus>,
+    #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
+    exit_evt: EventFd,
+
+    #[cfg(target_arch = "aarch64")]
+    mpidr: u64,
+
+    event_receiver: Receiver<VcpuEvent>,
+    // The transmitting end of the events channel which will be given to the handler.
+    event_sender: Option<Sender<VcpuEvent>>,
+    // The receiving end of the responses channel which will be given to the handler.
+    response_receiver: Option<Receiver<VcpuResponse>>,
+    // The transmitting end of the responses channel owned by the vcpu side.
+    response_sender: Sender<VcpuResponse>,
+
+    vcpu_list: Arc<VcpuList>,
+    nested_enabled: bool,
+}
+
+impl Vcpu {
+    thread_local!(static TLS_VCPU_PTR: VcpuCell = const { Cell::new(None) });
+
+    /// Associates `self` with the current thread.
+    ///
+    /// It is a prerequisite to successfully run `init_thread_local_data()` before using
+    /// `run_on_thread_local()` on the current thread.
+    /// This function will return an error if there already is a `Vcpu` present in the TLS.
+    fn init_thread_local_data(&mut self) -> Result<()> {
+        Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
+            if cell.get().is_some() {
+                return Err(Error::VcpuTlsInit);
+            }
+            cell.set(Some(self as *const Vcpu));
+            Ok(())
+        })
+    }
+
+    /// Deassociates `self` from the current thread.
+    ///
+    /// Should be called if the current `self` had called `init_thread_local_data()` and
+    /// now needs to move to a different thread.
+    ///
+    /// Fails if `self` was not previously associated with the current thread.
+    fn reset_thread_local_data(&mut self) -> Result<()> {
+        // Best-effort to clean up TLS. If the `Vcpu` was moved to another thread
+        // _before_ running this, then there is nothing we can do.
+        Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
+            if let Some(vcpu_ptr) = cell.get()
+                && std::ptr::eq(vcpu_ptr, self)
+            {
+                Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| cell.take());
+                return Ok(());
+            }
+            Err(Error::VcpuTlsNotPresent)
+        })
+    }
+
+    /// Registers a signal handler which makes use of TLS and kvm immediate exit to
+    /// kick the vcpu running on the current thread, if there is one.
+    pub fn register_kick_signal_handler() {
+        /*
+        extern "C" fn handle_signal(_: c_int, _: *mut siginfo_t, _: *mut c_void) {
+            // This is safe because it's temporarily aliasing the `Vcpu` object, but we are
+            // only reading `vcpu.fd` which does not change for the lifetime of the `Vcpu`.
+            unsafe {
+                let _ = Vcpu::run_on_thread_local(|_vcpu| {
+                    vcpu.fd.set_kvm_immediate_exit(1);
+                    fence(Ordering::Release);
+                });
+            }
+        }
+        */
+
+        //register_signal_handler(sigrtmin() + VCPU_RTSIG_OFFSET, handle_signal)
+        //    .expect("Failed to register vcpu signal handler");
+    }
+
+    /// Constructs a new VCPU for `vm`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Represents the CPU number between [0, max vcpus).
+    /// * `vm_fd` - The kvm `VmFd` for the virtual machine this vcpu will get attached to.
+    /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
+    pub fn new_aarch64(
+        id: u8,
+        ipa_size: u32,
+        boot_entry_addr: GuestAddress,
+        boot_receiver: Option<Receiver<u64>>,
+        exit_evt: EventFd,
+        vcpu_list: Arc<VcpuList>,
+        nested_enabled: bool,
+    ) -> Result<Self> {
+        let (event_sender, event_receiver) = unbounded();
+        let (response_sender, response_receiver) = unbounded();
+
+        Ok(Vcpu {
+            id,
+            ipa_size,
+            boot_entry_addr: boot_entry_addr.raw_value(),
+            boot_receiver,
+            boot_senders: None,
+            fdt_addr: 0,
+            mmio_bus: None,
+            exit_evt,
+            mpidr: id as u64,
+            event_receiver,
+            event_sender: Some(event_sender),
+            response_receiver: Some(response_receiver),
+            response_sender,
+            vcpu_list,
+            nested_enabled,
+        })
+    }
+
+    /// Returns the cpu index as seen by the guest OS.
+    pub fn cpu_index(&self) -> u8 {
+        self.id
+    }
+
+    /// Gets the MPIDR register value.
+    pub fn get_mpidr(&self) -> u64 {
+        self.mpidr
+    }
+
+    /// Sets a MMIO bus for this vcpu.
+    pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
+        self.mmio_bus = Some(mmio_bus);
+    }
+
+    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
+        self.boot_senders = Some(boot_senders);
+    }
+
+    /// Configures an aarch64 specific vcpu.
+    ///
+    /// # Arguments
+    ///
+    /// * `guest_mem` - The guest memory used by this microvm.
+    pub fn configure_aarch64(&mut self, mem_info: &ArchMemoryInfo) -> Result<()> {
+        self.fdt_addr = mem_info.fdt_addr;
+
+        Ok(())
+    }
+
+    /// Moves the vcpu to its own thread and constructs a VcpuHandle.
+    /// The handle can be used to control the remote vcpu.
+    pub fn start_threaded(mut self) -> Result<VcpuHandle> {
+        let event_sender = self.event_sender.take().unwrap();
+        let response_receiver = self.response_receiver.take().unwrap();
+        let (init_tls_sender, init_tls_receiver) = unbounded();
+
+        let vcpu_thread = thread::Builder::new()
+            .name(format!("fc_vcpu {}", self.cpu_index()))
+            .spawn(move || {
+                set_interactive_qos();
+                self.init_thread_local_data()
+                    .expect("Cannot cleanly initialize vcpu TLS.");
+
+                self.run(init_tls_sender);
+            })
+            .map_err(Error::VcpuSpawn)?;
+
+        let hvf_id = init_tls_receiver
+            .recv()
+            .expect("Error waiting for TLS initialization.");
+
+        Ok(VcpuHandle::new(
+            event_sender,
+            response_receiver,
+            hvf_id,
+            vcpu_thread,
+        ))
+    }
+
+    /// Returns error or enum specifying whether emulation was handled or interrupted.
+    fn run_emulation(&mut self, hvf_vcpu: &mut HvfVcpu) -> Result<VcpuEmulation> {
+        let vcpuid = hvf_vcpu.id();
+
+        match hvf_vcpu.run(self.vcpu_list.clone()) {
+            Ok(exit) => match exit {
+                VcpuExit::Breakpoint => {
+                    debug!("vCPU {vcpuid} breakpoint");
+                    Ok(VcpuEmulation::Interrupted)
+                }
+                VcpuExit::Canceled => {
+                    debug!("vCPU {vcpuid} canceled");
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::CpuOn(mpidr, entry, context_id) => {
+                    debug!("CpuOn: mpidr=0x{mpidr:x} entry=0x{entry:x} context_id={context_id}");
+                    if let Some(boot_senders) = &self.boot_senders {
+                        if let Some(sender) = boot_senders.get(&mpidr) {
+                            sender.send(entry).unwrap()
+                        }
+                    } else {
+                        error!("CpuOn request coming from an unexpected vCPU={}", self.id);
+                    }
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::HypervisorCall => {
+                    debug!("vCPU {vcpuid} HVC");
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::MmioRead(addr, data) => {
+                    if let Some(ref mmio_bus) = self.mmio_bus {
+                        debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
+                        mmio_bus.read(vcpuid, addr, data);
+                    }
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::MmioWrite(addr, data) => {
+                    if let Some(ref mmio_bus) = self.mmio_bus {
+                        mmio_bus.write(vcpuid, addr, data);
+                    }
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::PsciHandled => {
+                    debug!("vCPU {vcpuid} PSCI");
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::SecureMonitorCall => {
+                    debug!("vCPU {vcpuid} SMC");
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::Reset => {
+                    info!("vCPU {vcpuid} received reset signal");
+                    Ok(VcpuEmulation::Reset)
+                }
+                VcpuExit::Shutdown => {
+                    info!("vCPU {vcpuid} received shutdown signal");
+                    Ok(VcpuEmulation::Stopped)
+                }
+                VcpuExit::SystemRegister => {
+                    debug!("vCPU {vcpuid} accessed a system register");
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::VtimerActivated => {
+                    debug!("vCPU {vcpuid} VtimerActivated");
+                    self.vcpu_list.set_vtimer_irq(vcpuid);
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::WaitForEvent => {
+                    debug!("vCPU {vcpuid} WaitForEvent");
+                    Ok(VcpuEmulation::WaitForEvent)
+                }
+                VcpuExit::WaitForEventExpired => {
+                    debug!("vCPU {vcpuid} WaitForEventExpired");
+                    Ok(VcpuEmulation::WaitForEventExpired)
+                }
+                VcpuExit::WaitForEventTimeout(duration) => {
+                    debug!("vCPU {vcpuid} WaitForEventTimeout timeout={duration:?}");
+                    Ok(VcpuEmulation::WaitForEventTimeout(duration))
+                }
+            },
+            Err(e) => panic!("Error running HVF vCPU: {e:?}"),
+        }
+    }
+
+    /// Main loop of the vCPU thread.
+    pub fn run(&mut self, init_tls_sender: Sender<u64>) {
+        let mut hvf_vcpu =
+            HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
+        let hvf_vcpuid = hvf_vcpu.id();
+
+        // Report the HVF-assigned vCPU id (creation order is not deterministic)
+        // so the coordinator can break this vCPU out of HVF to pause it.
+        init_tls_sender
+            .send(hvf_vcpuid)
+            .expect("Cannot notify vcpu TLS initialization.");
+
+        let (wfe_sender, wfe_receiver) = unbounded();
+        self.vcpu_list.register(hvf_vcpuid, wfe_sender);
+
+        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
+            boot_receiver.recv().unwrap()
+        } else {
+            self.boot_entry_addr
+        };
+
+        hvf_vcpu
+            .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
+            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+
+        loop {
+            // An out-of-band pause request breaks the vCPU out of HVF via
+            // `vcpu_request_exit` (-> Canceled), so we observe it here between
+            // guest runs and freeze on this thread, where the HvfVcpu lives.
+            if let Ok(VcpuEvent::Pause) = self.event_receiver.try_recv() {
+                self.pause_and_park(&hvf_vcpu);
+            }
+            match self.run_emulation(&mut hvf_vcpu) {
+                // Emulation ran successfully, continue.
+                Ok(VcpuEmulation::Handled) => (),
+                // Emulation was interrupted by a breakpoint.
+                Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
+                // Wait for an external event.
+                Ok(VcpuEmulation::WaitForEvent) => {
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
+                }
+                Ok(VcpuEmulation::WaitForEventExpired) => (),
+                Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
+                }
+                Ok(VcpuEmulation::Reset) => {
+                    self.exit(VcpuResponse::Reset);
+                    break;
+                }
+                // The guest was halted.
+                Ok(VcpuEmulation::Stopped) => {
+                    self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
+                    break;
+                }
+                // Emulation errors lead to vCPU exit.
+                Err(_) => {
+                    self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Park until woken by a device IRQ (`receiver`), the optional vtimer
+    /// `timeout`, or an out-of-band [`VcpuEvent::Pause`]. Watching the pause
+    /// channel here too is load-bearing: an idle vCPU blocks in this recv (not
+    /// in HVF), so `vcpu_request_exit` can't break it out — without this arm a
+    /// pause request would hang forever.
+    fn wait_for_event(
+        &mut self,
+        hvf_vcpuid: u64,
+        receiver: &Receiver<u32>,
+        timeout: Option<Duration>,
+        hvf_vcpu: &HvfVcpu,
+    ) {
+        if !self.vcpu_list.should_wait(hvf_vcpuid) {
+            return;
+        }
+        let paused = if let Some(timeout) = timeout {
+            select! {
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
+                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
+                recv(after(timeout)) -> _ => false,
+            }
+        } else {
+            select! {
+                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
+                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
+            }
+        };
+        if paused {
+            self.pause_and_park(hvf_vcpu);
+        }
+    }
+
+    fn wait_for_resume(&mut self) {}
+
+    /// Freeze this vCPU in response to a `Pause` event and block until `Resume`,
+    /// which carries the paused tick count. Advancing the vtimer offset by it
+    /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
+    /// to catch up the gap. The coordinator computes the tick count once for the
+    /// whole VM, so multi-vCPU offsets stay in lockstep.
+    fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
+        self.response_sender
+            .send(VcpuResponse::Paused)
+            .expect("failed to send Paused status");
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume(paused_ticks)) => {
+                    hvf_vcpu
+                        .advance_vtimer_offset(paused_ticks)
+                        .unwrap_or_else(|e| {
+                            panic!("vCPU {} vtimer advance failed: {e:?}", self.id)
+                        });
+                    self.response_sender
+                        .send(VcpuResponse::Resumed)
+                        .expect("failed to send Resumed status");
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn exit(&mut self, response: VcpuResponse) {
+        self.response_sender
+            .send(response)
+            .expect("failed to send exit status");
+
+        if let Err(e) = self.exit_evt.write(1) {
+            error!("Failed signaling vcpu exit event: {e}");
+        }
+    }
+}
+
+impl Drop for Vcpu {
+    fn drop(&mut self) {
+        let _ = self.reset_thread_local_data();
+    }
+}
+
+#[derive(Debug)]
+/// List of events that the Vcpu can receive.
+pub enum VcpuEvent {
+    /// Pause the Vcpu.
+    Pause,
+    /// Resume the Vcpu, advancing its vtimer offset by this many host ticks
+    /// (the wall-clock time the VM spent paused). The coordinator sends the
+    /// same value to every vCPU so their counters stay synchronized.
+    Resume(u64),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+/// List of responses that the Vcpu reports.
+pub enum VcpuResponse {
+    /// Vcpu is paused.
+    Paused,
+    /// Vcpu is resumed.
+    Resumed,
+    /// Vcpu is stopped.
+    Exited(u8),
+    /// The guest asked for a reset.
+    Reset,
+}
+
+/// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
+pub struct VcpuHandle {
+    event_sender: Sender<VcpuEvent>,
+    response_receiver: Receiver<VcpuResponse>,
+    hvf_id: u64,
+}
+
+impl VcpuHandle {
+    pub fn new(
+        event_sender: Sender<VcpuEvent>,
+        response_receiver: Receiver<VcpuResponse>,
+        hvf_id: u64,
+        _vcpu_thread: thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            event_sender,
+            response_receiver,
+            hvf_id,
+        }
+    }
+
+    /// HVF-assigned vCPU id, reported by the thread at boot. Used to break the
+    /// vCPU out of HVF (`vcpu_request_exit`) when pausing.
+    pub fn hvf_id(&self) -> u64 {
+        self.hvf_id
+    }
+
+    pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
+        self.event_sender
+            .send(event)
+            .map_err(|_| Error::VcpuChannelClosed)
+    }
+
+    pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
+        &self.response_receiver
+    }
+}
+
+enum VcpuEmulation {
+    Handled,
+    Interrupted,
+    Reset,
+    Stopped,
+    WaitForEvent,
+    WaitForEventExpired,
+    WaitForEventTimeout(Duration),
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use crossbeam_channel::RecvTimeoutError;
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+    #[cfg(target_arch = "x86_64")]
+    use std::time::Duration;
+
+    use super::*;
+    use crate::vmm::macos::vm_map;
+    use arch::aarch64::layout::DRAM_MEM_START_EFI;
+    use devices::legacy::VcpuList;
+    use std::collections::HashSet;
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    /// The tests don't run the vCPUs, so any IPA size that HVF supports will do.
+    const TEST_IPA_SIZE: u32 = 36;
+
+    // Auxiliary function being used throughout the tests.
+    // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
+    // work without one, keeping tests free from the one-VM-per-process limit.
+    fn setup_vcpu(mem_size: usize) -> (Vcpu, GuestMemoryMmap) {
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
+        let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let vcpu_list = Arc::new(VcpuList::new(1));
+        let vcpu = Vcpu::new_aarch64(
+            1,
+            TEST_IPA_SIZE,
+            GuestAddress(0),
+            None,
+            exit_evt,
+            vcpu_list,
+            false,
+        )
+        .unwrap();
+        (vcpu, gm)
+    }
+
+    #[test]
+    fn test_set_mmio_bus() {
+        let (mut vcpu, _) = setup_vcpu(0x1000);
+        assert!(vcpu.mmio_bus.is_none());
+        vcpu.set_mmio_bus(devices::Bus::new());
+        assert!(vcpu.mmio_bus.is_some());
+    }
+
+    /// HVF has one VM per process, and Vm doesn't destroy it, so the tests that need one share it.
+    fn test_vm() -> MutexGuard<'static, Vm> {
+        static VM: LazyLock<Mutex<Vm>> = LazyLock::new(|| {
+            Mutex::new(
+                Vm::new(&mut arch::ArchMemoryInfo::default(), false).expect("Cannot create new vm"),
+            )
+        });
+        VM.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_vm_memory_init() {
+        let mut vm = test_vm();
+
+        // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
+        let gm = GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(DRAM_MEM_START_EFI),
+            0x20_0000, // 2 MB
+        )])
+        .unwrap();
+        vm.memory_init(&gm).expect("memory_init failed");
+    }
+
+    #[test]
+    fn test_configure_vcpu() {
+        // configure_aarch64 only sets fdt_addr — no HVF VM needed.
+        let mem_info = arch::ArchMemoryInfo::default();
+
+        // Try it for when vcpu id is 0.
+        let vcpu_list = Arc::new(VcpuList::new(1));
+        let mut vcpu = Vcpu::new_aarch64(
+            0,
+            TEST_IPA_SIZE,
+            GuestAddress(0),
+            None,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            vcpu_list,
+            false,
+        )
+        .unwrap();
+        assert!(vcpu.configure_aarch64(&mem_info).is_ok());
+
+        // Try it for when vcpu id is NOT 0.
+        let vcpu_list = Arc::new(VcpuList::new(2));
+        let mut vcpu = Vcpu::new_aarch64(
+            1,
+            TEST_IPA_SIZE,
+            GuestAddress(0),
+            None,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            vcpu_list,
+            false,
+        )
+        .unwrap();
+        assert!(vcpu.configure_aarch64(&mem_info).is_ok());
+    }
+
+    #[test]
+    fn test_vcpu_tls() {
+        let (mut vcpu, _) = setup_vcpu(0x1000);
+
+        // Reset should fail before TLS is initialized.
+        assert!(vcpu.reset_thread_local_data().is_err());
+
+        // Initialize vcpu TLS.
+        vcpu.init_thread_local_data().unwrap();
+
+        // Reset vcpu TLS.
+        assert!(vcpu.reset_thread_local_data().is_ok());
+
+        // Second reset should return error.
+        assert!(vcpu.reset_thread_local_data().is_err());
+    }
+
+    #[test]
+    fn test_invalid_tls() {
+        let (mut vcpu, _) = setup_vcpu(0x1000);
+        // Initialize vcpu TLS.
+        vcpu.init_thread_local_data().unwrap();
+        // Trying to initialize non-empty TLS should error.
+        vcpu.init_thread_local_data().unwrap_err();
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn page_size() -> u64 {
+        // SAFETY: sysconf() has no preconditions.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+
+    fn ram_memory(start: u64, len: u64) -> (GuestMemoryMmap, Range<u64>) {
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(start), len as usize)]).unwrap();
+        (gm, start..start + len)
+    }
+
+    fn host_addr(gm: &GuestMemoryMmap, guest_addr: u64) -> u64 {
+        gm.get_host_address(GuestAddress(guest_addr)).unwrap() as u64
+    }
+
+    /// Writes `byte` to the first byte of each page in `range`.
+    fn touch(gm: &GuestMemoryMmap, range: Range<u64>, byte: u8) {
+        for addr in range.step_by(page_size() as usize) {
+            gm.write_obj(byte, GuestAddress(addr)).unwrap();
+        }
+    }
+
+    /// Whether the first byte of each page in `range` is `byte`.
+    fn reads(gm: &GuestMemoryMmap, range: Range<u64>, byte: u8) -> bool {
+        range
+            .step_by(page_size() as usize)
+            .all(|addr| gm.read_obj::<u8>(GuestAddress(addr)).unwrap() == byte)
+    }
+
+    /// Checks that the blocks in `range` are map entries of their own that have no pages, neither
+    /// mapped nor in their VM object. An object is judged by its pages and not by its id, because
+    /// XNU may give the id of an object that it has just freed to the next new one.
+    fn assert_blocks_are_empty(gm: &GuestMemoryMmap, range: Range<u64>) {
+        for block in range.step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(gm, block));
+            assert_eq!(entry.start, host_addr(gm, block), "block {block:#x}");
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "block {block:#x}");
+            assert_eq!(entry.resident, 0, "block {block:#x}");
+            assert_eq!(entry.object_resident, 0, "block {block:#x}");
+        }
+    }
+
+    #[test]
+    fn test_map_fresh_blocks_gives_each_block_an_object() {
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+        touch(&gm, ram.clone(), 1);
+
+        let mut objects = HashSet::new();
+        for block in ram.clone().step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(&gm, block));
+            assert_eq!(entry.start, host_addr(&gm, block), "block {block:#x}");
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "block {block:#x}");
+            assert_eq!(entry.offset, 0, "block {block:#x}");
+            assert!(objects.insert(entry.object_id), "block {block:#x}");
+        }
+        assert!(reads(&gm, ram, 1));
+    }
+
+    #[test]
+    fn test_map_guest_ram_in_blocks_leaves_other_regions_alone() {
+        let ram = DRAM_MEM_START_EFI..DRAM_MEM_START_EFI + 8 * MIB;
+        let gm = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 4 * MIB as usize),
+            (GuestAddress(ram.start), (ram.end - ram.start) as usize),
+        ])
+        .unwrap();
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+
+        assert_eq!(vm_map::entry(host_addr(&gm, 0)).size, 4 * MIB);
+        for block in ram.step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(&gm, block));
+            assert_eq!(entry.size, RECLAIM_BLOCK_SIZE, "block {block:#x}");
+        }
+    }
+
+    #[test]
+    fn test_map_fresh_blocks_follows_guest_physical_blocks() {
+        // RAM that starts and ends in the middle of a block has a shorter first and last block.
+        let half_block = RECLAIM_BLOCK_SIZE / 2;
+        let start = DRAM_MEM_START_EFI + half_block;
+        let (gm, ram) = ram_memory(start, 6 * half_block);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+        touch(&gm, ram, 1);
+
+        let entries: Vec<_> = [start, start + half_block, start + 3 * half_block, start + 5 * half_block]
+            .into_iter()
+            .map(|addr| {
+                let entry = vm_map::entry(host_addr(&gm, addr));
+                (entry.start, entry.size)
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (host_addr(&gm, start), half_block),
+                (host_addr(&gm, start + half_block), 2 * half_block),
+                (host_addr(&gm, start + 3 * half_block), 2 * half_block),
+                (host_addr(&gm, start + 5 * half_block), half_block),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_map_fresh_blocks_frees_the_pages_of_whole_blocks() {
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+        touch(&gm, ram.clone(), 1);
+        let run = ram.start + 2 * MIB..ram.start + 8 * MIB;
+
+        // SAFETY: the run is within the memory, and its contents aren't needed.
+        unsafe {
+            map_fresh_blocks(
+                host_addr(&gm, run.start) as *mut u8,
+                run.start,
+                run.end - run.start,
+            )
+        }
+        .unwrap();
+
+        assert_blocks_are_empty(&gm, run.clone());
+        assert!(reads(&gm, run.clone(), 0));
+        assert!(reads(&gm, ram.start..run.start, 1));
+        assert!(reads(&gm, run.end..ram.end, 1));
+        // The blocks around the run still have their pages, and all of them are mapped.
+        for block in ram.step_by(RECLAIM_BLOCK_SIZE as usize) {
+            let entry = vm_map::entry(host_addr(&gm, block));
+            assert!(entry.object_resident <= entry.resident, "block {block:#x}");
+        }
+    }
+
+    #[test]
+    fn test_reclaim_memory_replaces_whole_blocks_and_maps_them_back() {
+        let mut vm = test_vm();
+        // Where no other test maps memory into the same VM.
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI + (1 << 30), 16 * MIB);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+        vm.memory_init(&gm).unwrap();
+        touch(&gm, ram.clone(), 1);
+        let run = ram.start + 2 * MIB..ram.start + 8 * MIB;
+
+        assert!(
+            vm.reclaim_memory(&gm, run.start, run.end - run.start)
+                .unwrap()
+        );
+
+        assert_blocks_are_empty(&gm, run.clone());
+        assert!(reads(&gm, run.clone(), 0));
+        assert!(reads(&gm, ram.start..run.start, 1));
+        assert!(reads(&gm, run.end..ram.end, 1));
+        // The run is mapped into the guest again, so unmapping it works.
+        vm.hvf_vm
+            .unmap_memory(run.start, run.end - run.start)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_reclaim_memory_refuses_what_is_not_whole_blocks() {
+        let mut vm = test_vm();
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI + (2 << 30), 16 * MIB);
+        map_guest_ram_in_blocks(&gm, ram.clone()).unwrap();
+        vm.memory_init(&gm).unwrap();
+        touch(&gm, ram.clone(), 1);
+        let objects = || -> Vec<_> {
+            ram.clone()
+                .step_by(RECLAIM_BLOCK_SIZE as usize)
+                .map(|block| {
+                    let entry = vm_map::entry(host_addr(&gm, block));
+                    (entry.start, entry.size, entry.object_id, entry.resident)
+                })
+                .collect()
+        };
+        let before = objects();
+
+        // Nothing, less than a block, a part of a block, a block that starts in the middle of
+        // one, and a run that ends in the middle of one.
+        for (addr, len) in [
+            (ram.start + 2 * MIB, 0),
+            (ram.start + 2 * MIB, RECLAIM_BLOCK_SIZE / 2),
+            (ram.start + 2 * MIB, RECLAIM_BLOCK_SIZE - page_size()),
+            (ram.start + page_size(), RECLAIM_BLOCK_SIZE),
+            (ram.start + 2 * MIB, 3 * RECLAIM_BLOCK_SIZE / 2),
+            (ram.start + 2 * MIB, 6 * MIB + page_size()),
+        ] {
+            assert!(
+                !vm.reclaim_memory(&gm, addr, len).unwrap(),
+                "guest {addr:#x}, len {len:#x}"
+            );
+        }
+
+        // Nothing was replaced, and the hypervisor mapping wasn't touched either.
+        assert_eq!(objects(), before);
+        assert!(reads(&gm, ram.clone(), 1));
+        vm.hvf_vm
+            .unmap_memory(ram.start, ram.end - ram.start)
+            .unwrap();
+    }
+
+    /// The reason why the memory that the balloon replaces has to be mapped in blocks: XNU keeps
+    /// the pages of the part of a VM object that is replaced while the rest of the object is
+    /// still mapped. If this test fails, XNU has changed and the blocks may not be needed.
+    #[test]
+    fn test_xnu_keeps_the_pages_of_a_partly_replaced_mapping() {
+        let (gm, ram) = ram_memory(DRAM_MEM_START_EFI, 16 * MIB);
+        let replaced = ram.end - 4 * MIB..ram.end;
+        touch(&gm, replaced.clone(), 1);
+
+        // Replace the range with fresh memory in one mmap(), as for a free page report.
+        // SAFETY: the range is within the mapping of the memory, whose contents aren't needed.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr(&gm, replaced.start) as *mut libc::c_void,
+                (replaced.end - replaced.start) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ret, libc::MAP_FAILED);
+
+        let kept = vm_map::entry(host_addr(&gm, ram.start));
+        assert_eq!(kept.start, host_addr(&gm, ram.start));
+        assert_eq!(kept.size, 12 * MIB);
+        assert_eq!(kept.offset, 0);
+        assert_ne!(kept.object_id, 0);
+        assert_eq!(kept.resident, 0);
+        let orphans = u64::from(kept.object_resident) * page_size();
+        assert!(
+            orphans >= 2 * MIB,
+            "only {orphans} bytes of the replaced range are still in the object"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    // Sends an event to a vcpu and expects a particular response.
+    fn queue_event_expect_response(handle: &VcpuHandle, event: VcpuEvent, response: VcpuResponse) {
+        handle
+            .send_event(event)
+            .expect("failed to send event to vcpu");
+        assert_eq!(
+            handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(100))
+                .expect("did not receive event response from vcpu"),
+            response
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    // Sends an event to a vcpu and expects no response.
+    fn queue_event_expect_timeout(handle: &VcpuHandle, event: VcpuEvent) {
+        handle
+            .send_event(event)
+            .expect("failed to send event to vcpu");
+        assert_eq!(
+            handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+}

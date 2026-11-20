@@ -1,0 +1,145 @@
+Subject: virtio/fs: let the caller own files in access checks
+
+A guest mounting a LinuxSimplifiedFixedOwner share with an option that
+shows every file as owned by the caller turns off local permission checks
+and sends access(2) to the host, which compared the caller against the
+fixed owner. A non-root caller then got only the "other" bits of a file
+it appears to own: PHP is_writable() on a 0755 directory returned false
+while writes succeeded. set_caller_owns(true) checks the owner bits for
+every caller instead.
+
+--- a/src/devices/src/virtio/fs/device.rs	2026-11-18 21:20:35
++++ b/src/devices/src/virtio/fs/device.rs	2026-11-18 21:20:35
+@@ -147,6 +147,7 @@
+         #[cfg(target_os = "macos")]
+         {
+             cfg.fixed_owner = None;
++            cfg.caller_owns = false;
+         }
+         self.allow_idmap = complete;
+         true
+@@ -165,6 +166,23 @@
+             return true;
+         }
+         let _ = (uid, gid);
++        false
++    }
++
++    /// Answer permission checks as if the caller owned every file, matching a guest that
++    /// mounts the share with `owner_caller`; fails outside `LinuxSimplifiedFixedOwner` mode.
++    pub fn set_caller_owns(&mut self, caller_owns: bool) -> bool {
++        #[cfg(target_os = "macos")]
++        if let Some(cfg) = self.passthrough_cfg.as_mut()
++            && matches!(
++                cfg.semantics,
++                PermissionSemantics::LinuxSimplifiedFixedOwner
++            )
++        {
++            cfg.caller_owns = caller_owns;
++            return true;
++        }
++        let _ = caller_owns;
+         false
+     }
+ 
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs	2026-11-18 21:20:35
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs	2026-11-18 21:20:35
+@@ -710,6 +710,10 @@
+     /// The owner that `PermissionSemantics::LinuxSimplifiedFixedOwner` reports for every file.
+     pub fixed_owner: Option<(u32, u32)>,
+ 
++    /// The guest shows every file as owned by the caller (its `owner_caller` mount option) and
++    /// sends permission checks here, so `access(2)` checks the owner bits for every caller.
++    pub caller_owns: bool,
++
+     /// Make FSYNC and FSYNCDIR no-ops (for disposable data). Off by default.
+     pub no_sync_io: bool,
+ 
+@@ -745,6 +749,7 @@
+             export_table: None,
+             semantics: PermissionSemantics::LinuxComplete,
+             fixed_owner: None,
++            caller_owns: false,
+             no_sync_io: false,
+             guest_cache: GuestCache::default(),
+         }
+@@ -2600,10 +2605,14 @@
+     }
+ 
+     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+-        let st = match self.inode_to_handle(inode, true)? {
++        let mut st = match self.inode_to_handle(inode, true)? {
+             InodeHandle::Path(c_path) => lstat(&ctx, self.cfg.ownership(), &c_path, false)?,
+             InodeHandle::Fd(fd) => fstat(&ctx, self.cfg.ownership(), fd, false)?,
+         };
++        if self.cfg.caller_owns {
++            st.st_uid = ctx.uid;
++            st.st_gid = ctx.gid;
++        }
+ 
+         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
+ 
+@@ -3248,7 +3257,7 @@
+ mod tests {
+     use super::*;
+     use std::fs;
+-    use std::os::unix::fs::MetadataExt;
++    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+     use std::path::PathBuf;
+ 
+     const CTX: Context = Context {
+@@ -3801,6 +3810,33 @@
+     fn pin_root(fs: &PassthroughFs) {
+         let root = fs.node(fuse::ROOT_ID).unwrap();
+         while fs.parent_pin(&root).is_none() {}
++    }
++
++    /// With `owner_caller` the guest shows every file as owned by the caller and
++    /// leaves permission checks to the host, so `access(2)` must agree with that
++    /// owner: PHP's `is_writable()` on a 0755 directory, as a non-root user.
++    #[test]
++    fn access_treats_the_caller_as_owner_when_the_caller_owns_files() {
++        let dir = fresh_dir("access-caller");
++        fs::create_dir(dir.join("cache")).unwrap();
++        fs::set_permissions(dir.join("cache"), fs::Permissions::from_mode(0o755)).unwrap();
++        let user = Context {
++            uid: 24128,
++            gid: 24128,
++            pid: 0,
++        };
++        let check = |caller_owns| {
++            let mut fs = fixed_owner_at(&dir);
++            fs.cfg.caller_owns = caller_owns;
++            let inode = lookup_in(&fs, fuse::ROOT_ID, "cache").unwrap().inode;
++            [libc::R_OK, libc::W_OK, libc::X_OK]
++                .map(|m| fs.access(user, inode, m as u32).is_ok())
++        };
++        assert_eq!(check(true), [true, true, true]);
++        assert_eq!(check(false), [true, false, true]);
++        fs::set_permissions(dir.join("cache"), fs::Permissions::from_mode(0o555)).unwrap();
++        assert_eq!(check(true), [true, false, true]);
++        fs::remove_dir_all(&dir).unwrap();
+     }
+ 
+     #[test]
+--- a/src/libkrun/src/api/device_builders.rs	2026-11-18 21:20:35
++++ b/src/libkrun/src/api/device_builders.rs	2026-11-18 21:20:35
+@@ -727,6 +727,18 @@
+     /// Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`.
+     pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) -> Result<(), VmmError> {
+         if !self.inner.lock().unwrap().set_fixed_owner(uid, gid) {
++            return Err(VmmError::InvalidParam());
++        }
++        Ok(())
++    }
++
++    /// Answer permission checks (`access(2)`) as if the caller owned every file, for a guest
++    /// that mounts the share with an option showing the caller as the owner. Without it a
++    /// non-root caller gets only the "other" bits of a file it appears to own.
++    ///
++    /// Returns `InvalidParam` unless the permission semantics are `LinuxSimplifiedFixedOwner`.
++    pub fn set_caller_owns(&mut self, caller_owns: bool) -> Result<(), VmmError> {
++        if !self.inner.lock().unwrap().set_caller_owns(caller_owns) {
+             return Err(VmmError::InvalidParam());
+         }
+         Ok(())

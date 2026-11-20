@@ -1,0 +1,45 @@
+Subject: vsock: queue a burst of connections on host Unix sockets
+
+macOS refuses a Unix connection outright once the listen queue is full,
+and the muxer accepts one connection per wakeup. With a backlog of 5,
+`docker compose up` opening a connection per service got ECONNREFUSED.
+Listen with SOMAXCONN.
+
+--- a/src/devices/src/virtio/vsock/unix_proxy/unix.rs	2026-11-18 21:07:35
++++ b/src/devices/src/virtio/vsock/unix_proxy/unix.rs	2026-11-18 21:07:35
+@@ -435,12 +435,8 @@
+         path: path.to_path_buf(),
+         identity: (metadata.dev(), metadata.ino()),
+     };
+-    listen(
+-        &proxy.fd,
+-        Backlog::new(5)
+-            .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?,
+-    )
+-    .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
++    listen(&proxy.fd, Backlog::MAXCONN)
++        .map_err(|e| ProxyError::CreatingSocket(std::io::Error::from_raw_os_error(e as i32)))?;
+     Ok(proxy)
+ }
+ 
+@@ -590,6 +586,20 @@
+         assert!(UnixStream::connect(&path).is_ok());
+         drop(proxy);
+         assert!(!path.exists());
++    }
++
++    /// Clients such as `docker compose` open dozens of connections at once,
++    /// faster than the muxer accepts them. macOS refuses a connection
++    /// outright once the listen queue is full, so it must be deep.
++    #[test]
++    fn acceptor_queues_a_burst_of_connections() {
++        let path = socket_path("burst");
++        let proxy = new_acceptor_proxy(1, &path, 1234).unwrap();
++        let clients: Vec<_> = (0..64)
++            .map(|i| UnixStream::connect(&path).unwrap_or_else(|e| panic!("client {i}: {e}")))
++            .collect();
++        drop(clients);
++        drop(proxy);
+     }
+ 
+     #[test]

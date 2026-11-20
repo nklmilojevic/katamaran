@@ -1,0 +1,454 @@
+diff --git a/cmd/gvproxy/inproc.go b/cmd/gvproxy/inproc.go
+index aacba37..46cdceb 100644
+--- a/cmd/gvproxy/inproc.go
++++ b/cmd/gvproxy/inproc.go
+@@ -19,6 +19,11 @@ typedef int (*kat_rx_fn)(void *ctx, const struct iovec *iov, int iovcnt);
+ static int kat_call_rx(kat_rx_fn fn, void *ctx, const struct iovec *iov, int iovcnt) {
+ 	return fn(ctx, iov, iovcnt);
+ }
++
++static int kat_call_rx_flat(kat_rx_fn fn, void *ctx, const void *buf, size_t len) {
++	struct iovec iov = { (void *)buf, len };
++	return fn(ctx, &iov, 1);
++}
+ */
+ import "C"
+ 
+@@ -141,6 +146,18 @@ type guestWriter struct {
+ 	ctx unsafe.Pointer
+ }
+ 
++func (w *guestWriter) WriteFlat(frame []byte) error {
++	if len(frame) == 0 {
++		return nil
++	}
++	switch r := syscall.Errno(C.kat_call_rx_flat(w.rx, w.ctx, unsafe.Pointer(&frame[0]), C.size_t(len(frame)))); r {
++	case 0, syscall.EAGAIN:
++		return nil
++	default:
++		return r
++	}
++}
++
+ func (w *guestWriter) WritePacket(hdr []byte, frame [][]byte) error {
+ 	// The iovecs point into Go memory the call only reads; pinning keeps
+ 	// cgo's pointer rules.
+diff --git a/pkg/services/forwarder/copy.go b/pkg/services/forwarder/copy.go
+index c2c0d0e..cf7c6ae 100644
+--- a/pkg/services/forwarder/copy.go
++++ b/pkg/services/forwarder/copy.go
+@@ -1,9 +1,14 @@
+ package forwarder
+ 
+ import (
++	"bytes"
++	"errors"
+ 	"io"
+ 	"net"
+ 	"time"
++
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/waiter"
+ )
+ 
+ // copyBufferSize is the largest read from one side of a forwarded
+@@ -64,6 +69,125 @@ func proxyConns(guest, host halfCloser) {
+ 	_ = host.Close()
+ }
+ 
++// proxyEndpoint copies both ways between a gVisor TCP endpoint and a host
++// TCP connection using persistent waiter entries so small request/response
++// traffic avoids allocating a waiter channel and registering/unregistering on
++// every read.
++func proxyEndpoint(ep tcpip.Endpoint, wq *waiter.Queue, host *net.TCPConn) {
++	_ = host.SetKeepAlive(true)
++	_ = host.SetKeepAlivePeriod(hostKeepAlive)
++	_ = host.SetWriteBuffer(hostSocketBuffer)
++	_ = host.SetReadBuffer(hostSocketBuffer)
++	done := make(chan struct{}, 1)
++	go func() {
++		_, _ = copyToEndpoint(ep, wq, host)
++		_ = host.CloseRead()
++		_ = ep.Shutdown(tcpip.ShutdownWrite)
++		done <- struct{}{}
++	}()
++	_, _ = copyFromEndpoint(host, ep, wq)
++	_ = ep.Shutdown(tcpip.ShutdownRead)
++	_ = host.CloseWrite()
++	<-done
++	ep.Close()
++	_ = host.Close()
++}
++
++// copyFromEndpoint drains ep into dst with one persistent waiter entry and
++// batched receive-buffer moderation for small request/response traffic.
++func copyFromEndpoint(dst io.Writer, ep tcpip.Endpoint, wq *waiter.Queue) (int64, error) {
++	buf := make([]byte, copyBufferMin)
++	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.ReadableEvents)
++	wq.EventRegister(&waitEntry)
++	defer wq.EventUnregister(&waitEntry)
++
++	var written int64
++	var moderated int
++	for {
++		w := tcpip.SliceWriter(buf)
++		res, terr := ep.Read(&w, tcpip.ReadOptions{})
++		if _, ok := terr.(*tcpip.ErrWouldBlock); ok {
++			<-notifyCh
++			continue
++		}
++		if res.Count > 0 {
++			n := res.Count
++			moderated += n
++			if n >= 4096 || moderated >= 32768 {
++				ep.ModerateRecvBuf(moderated)
++				moderated = 0
++			}
++			nw, werr := dst.Write(buf[:n])
++			written += int64(nw)
++			if werr != nil {
++				return written, werr
++			}
++			if nw != n {
++				return written, io.ErrShortWrite
++			}
++			if n == len(buf) && len(buf) < copyBufferSize {
++				buf = make([]byte, min(2*len(buf), copyBufferSize))
++			}
++		}
++		if terr != nil {
++			if _, ok := terr.(*tcpip.ErrClosedForReceive); ok {
++				return written, nil
++			}
++			return written, errors.New(terr.String())
++		}
++	}
++}
++
++// copyToEndpoint reads from src into ep directly, registering a writable
++// waiter only if the send buffer actually fills.
++func copyToEndpoint(ep tcpip.Endpoint, wq *waiter.Queue, src io.Reader) (int64, error) {
++	buf := make([]byte, copyBufferMin)
++	var (
++		r       bytes.Reader
++		written int64
++		entry   waiter.Entry
++		ch      <-chan struct{}
++	)
++	defer func() {
++		if ch != nil {
++			wq.EventUnregister(&entry)
++		}
++	}()
++	for {
++		n, rerr := src.Read(buf)
++		if n > 0 {
++			off := 0
++			for off < n {
++				r.Reset(buf[off:n])
++				nw, terr := ep.Write(&r, tcpip.WriteOptions{})
++				off += int(nw)
++				written += nw
++				switch terr.(type) {
++				case nil:
++				case *tcpip.ErrWouldBlock:
++					if ch == nil {
++						entry, ch = waiter.NewChannelEntry(waiter.WritableEvents)
++						wq.EventRegister(&entry)
++						continue
++					}
++					<-ch
++				default:
++					return written, errors.New(terr.String())
++				}
++			}
++			if n == len(buf) && len(buf) < copyBufferSize {
++				buf = make([]byte, min(2*len(buf), copyBufferSize))
++			}
++		}
++		if rerr == io.EOF {
++			return written, nil
++		}
++		if rerr != nil {
++			return written, rerr
++		}
++	}
++}
++
+ // copyGrowing copies src to dst until EOF like io.Copy, but reads into a
+ // buffer that doubles, up to copyBufferSize, each time a read fills it.
+ func copyGrowing(dst io.Writer, src io.Reader) (int64, error) {
+diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
+index 5ba9461..8c25da7 100644
+--- a/pkg/services/forwarder/tcp.go
++++ b/pkg/services/forwarder/tcp.go
+@@ -8,7 +8,6 @@ import (
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+ 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+ 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+ 	"gvisor.dev/gvisor/pkg/waiter"
+@@ -61,7 +60,7 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			return
+ 		}
+ 
+-		proxyConns(gonet.NewTCPConn(&wq, ep), outbound.(*net.TCPConn))
++		proxyEndpoint(ep, &wq, outbound.(*net.TCPConn))
+ 	})
+ }
+ 
+diff --git a/pkg/tap/callback.go b/pkg/tap/callback.go
+index 601ccee..49fe4d9 100644
+--- a/pkg/tap/callback.go
++++ b/pkg/tap/callback.go
+@@ -20,6 +20,16 @@ type PacketWriter interface {
+ 	WritePacket(hdr []byte, frame [][]byte) error
+ }
+ 
++// flatPacketMax is the largest frame payload copied into a stack buffer for
++// FlatPacketWriter so small frames avoid pkt.AsSlices() and cgo pinning.
++const flatPacketMax = 2048
++
++// FlatPacketWriter is an optional fast path for PacketWriter that accepts a
++// single contiguous buffer (virtio-net header followed by the frame).
++type FlatPacketWriter interface {
++	WriteFlat(frame []byte) error
++}
++
+ // CallbackLink connects an in-process VM to the switch.
+ type CallbackLink struct {
+ 	sw *Switch
+@@ -31,10 +41,13 @@ type CallbackLink struct {
+ // checksums to the VM (virtio-net's NEEDS_CSUM), since nothing between them
+ // can corrupt a frame.
+ func (e *Switch) ConnectCallback(w PacketWriter) *CallbackLink {
++	flat, _ := w.(FlatPacketWriter)
++	cb := &callbackConn{w: w, flat: flat}
+ 	id, _ := e.connect(protocolConn{
+-		Conn:         &callbackConn{w: w},
++		Conn:         cb,
+ 		protocolImpl: protocolImplementation(types.VfkitProtocol),
+ 	})
++	e.inprocConn.Store(cb)
+ 	if le, ok := e.gateway.(*LinkEndpoint); ok {
+ 		le.txChecksumOffload.Store(true)
+ 	}
+@@ -50,13 +63,32 @@ func (l *CallbackLink) Inject(frame []byte, data buffer.Buffer) {
+ 
+ // callbackConn stands in for a VM's socket in the switch's connection table.
+ type callbackConn struct {
+-	w PacketWriter
++	w    PacketWriter
++	flat FlatPacketWriter
+ }
+ 
+ var errCallbackConn = errors.New("in-process VM link has no socket")
+ 
+ func (c *callbackConn) writePacket(pkt *stack.PacketBuffer) error {
+ 	hdr := guestNetHeader(pkt)
++	if c.flat != nil && pkt.Size() <= flatPacketMax {
++		var buf [virtioNetHdrLen + flatPacketMax]byte
++		n := copy(buf[:], hdr[:])
++		vl, off := pkt.AsViewList()
++		for v := vl.Front(); v != nil; v = v.Next() {
++			s := v.AsSlice()
++			if off >= len(s) {
++				off -= len(s)
++				continue
++			}
++			if off > 0 {
++				s = s[off:]
++				off = 0
++			}
++			n += copy(buf[n:], s)
++		}
++		return c.flat.WriteFlat(buf[:n])
++	}
+ 	return c.w.WritePacket(hdr[:], pkt.AsSlices())
+ }
+ 
+diff --git a/pkg/tap/callback_test.go b/pkg/tap/callback_test.go
+index e8901ec..1308003 100644
+--- a/pkg/tap/callback_test.go
++++ b/pkg/tap/callback_test.go
+@@ -136,3 +136,58 @@ func TestCallbackLinkCarriesFramesBothWays(t *testing.T) {
+ 		t.Fatalf("wrote header % x and a %d-byte frame", rec.frames[0].hdr, len(rec.frames[0].frame))
+ 	}
+ }
++
++type flatFrameRecorder struct {
++	flat   [][]byte
++	normal []recordedFrame
++}
++
++func (r *flatFrameRecorder) WritePacket(hdr []byte, frame [][]byte) error {
++	r.normal = append(r.normal, recordedFrame{bytes.Clone(hdr), bytes.Join(frame, nil)})
++	return nil
++}
++
++func (r *flatFrameRecorder) WriteFlat(frame []byte) error {
++	r.flat = append(r.flat, bytes.Clone(frame))
++	return nil
++}
++
++func TestCallbackFlatWriterForSmallFrames(t *testing.T) {
++	le, err := NewLinkEndpoint(false, 65520, stackMAC.String(), stackIP.String(), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	le.Attach(&fakeDispatcher{})
++	sw := NewSwitch(false)
++	le.Connect(sw)
++	sw.Connect(le)
++	var rec flatFrameRecorder
++	link := sw.ConnectCallback(&rec)
++
++	in := frame(1)
++	copy(in[0:6], stackMAC)
++	copy(in[6:12], guestMAC)
++	link.Inject(in, buffer.MakeWithData(in))
++
++	small := outboundTCP(t, []byte("ok"))
++	sw.DeliverNetworkPacket(header.IPv4ProtocolNumber, small)
++	wantSmall := small.ToView().AsSlice()
++	small.DecRef()
++	if len(rec.flat) != 1 || len(rec.normal) != 0 {
++		t.Fatalf("small frame: flat=%d normal=%d", len(rec.flat), len(rec.normal))
++	}
++	if !bytes.Equal(rec.flat[0][virtioNetHdrLen:], wantSmall) || rec.flat[0][0] != virtioNetHdrFNeedsCsum {
++		t.Fatalf("flat frame mismatch: hdr=%x len=%d", rec.flat[0][:virtioNetHdrLen], len(rec.flat[0]))
++	}
++
++	large := outboundTCP(t, bytes.Repeat([]byte{5}, flatPacketMax+100))
++	sw.DeliverNetworkPacket(header.IPv4ProtocolNumber, large)
++	wantLarge := large.ToView().AsSlice()
++	large.DecRef()
++	if len(rec.flat) != 1 || len(rec.normal) != 1 {
++		t.Fatalf("large frame: flat=%d normal=%d", len(rec.flat), len(rec.normal))
++	}
++	if !bytes.Equal(rec.normal[0].frame, wantLarge) {
++		t.Fatal("large frame content mismatch")
++	}
++}
+diff --git a/pkg/tap/link.go b/pkg/tap/link.go
+index 5a4b11c..49870cd 100644
+--- a/pkg/tap/link.go
++++ b/pkg/tap/link.go
+@@ -125,14 +125,16 @@ func (e *LinkEndpoint) writePacket(r stack.RouteInfo, protocol tcpip.NetworkProt
+ 		DstAddr: r.RemoteLinkAddress,
+ 	})
+ 
+-	h := header.ARP(pkt.NetworkHeader().Slice())
+-	if h.IsValid() &&
+-		h.Op() == header.ARPReply {
+-		ip := tcpip.AddrFromSlice(h.ProtocolAddressSender()).String()
+-		_, ok := e.virtualIPs[ip]
+-		if ip != e.IP() && !ok {
+-			log.Debugf("dropping spoofing packets from the gateway about IP %s", ip)
+-			return nil
++	if protocol == header.ARPProtocolNumber {
++		h := header.ARP(pkt.NetworkHeader().Slice())
++		if h.IsValid() &&
++			h.Op() == header.ARPReply {
++			ip := tcpip.AddrFromSlice(h.ProtocolAddressSender()).String()
++			_, ok := e.virtualIPs[ip]
++			if ip != e.IP() && !ok {
++				log.Debugf("dropping spoofing packets from the gateway about IP %s", ip)
++				return nil
++			}
+ 		}
+ 	}
+ 
+diff --git a/pkg/tap/rxframe.go b/pkg/tap/rxframe.go
+index 1c3acbf..72d3f4e 100644
+--- a/pkg/tap/rxframe.go
++++ b/pkg/tap/rxframe.go
+@@ -77,16 +77,24 @@ func (e *Switch) rxFrame(id int, frame []byte, data buffer.Buffer) {
+ 	eth := header.Ethernet(frame)
+ 	src, dst, typ := eth.SourceAddress(), eth.DestinationAddress(), eth.Type()
+ 
+-	e.camLock.Lock()
+-	_, exists := e.cam[src]
+-	e.cam[src] = id
+-	e.camLock.Unlock()
++	if peer := e.inprocPeer.Load(); peer != nil && peer.id == id && peer.mac == src {
++		// Fast path: MAC already learned for the in-process VM.
++	} else {
++		e.camLock.Lock()
++		_, exists := e.cam[src]
++		e.cam[src] = id
++		e.camLock.Unlock()
+ 
+-	if !exists && e.notificationSender != nil {
+-		e.notificationSender.Send(types.NotificationMessage{
+-			NotificationType: types.ConnectionEstablished,
+-			MacAddress:       src.String(),
+-		})
++		if cb := e.inprocConn.Load(); cb != nil && e.txInline.Load() {
++			e.inprocPeer.Store(&inprocPeer{mac: src, id: id, conn: cb})
++		}
++
++		if !exists && e.notificationSender != nil {
++			e.notificationSender.Send(types.NotificationMessage{
++				NotificationType: types.ConnectionEstablished,
++				MacAddress:       src.String(),
++			})
++		}
+ 	}
+ 
+ 	gateway := e.gateway.LinkAddress()
+diff --git a/pkg/tap/switch.go b/pkg/tap/switch.go
+index a50f59c..e440d28 100644
+--- a/pkg/tap/switch.go
++++ b/pkg/tap/switch.go
+@@ -54,6 +54,9 @@ type Switch struct {
+ 	// Write every frame on the goroutine that produced it: the only VM is
+ 	// in this process and its writer never blocks.
+ 	txInline atomic.Bool
++	// Lock-free fast path for the single in-process VM once its MAC is learned.
++	inprocConn atomic.Pointer[callbackConn]
++	inprocPeer atomic.Pointer[inprocPeer]
+ 
+ 	gateway VirtualDevice
+ 
+@@ -128,6 +131,12 @@ type connTarget struct {
+ 	conn protocolConn
+ }
+ 
++type inprocPeer struct {
++	mac  tcpip.LinkAddress
++	id   int
++	conn *callbackConn
++}
++
+ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
+ 	// Flattened only for a socket: an in-process VM takes the slices.
+ 	var flat []byte
+@@ -148,6 +157,15 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
+ 	if size < 0 {
+ 		return fmt.Errorf("packet size out of range")
+ 	}
++	if peer := e.inprocPeer.Load(); peer != nil && dst == peer.mac {
++		if err := peer.conn.writePacket(pkt); err != nil {
++			e.inprocPeer.Store(nil)
++			e.disconnect(peer.id, peer.conn)
++			return err
++		}
++		atomic.AddUint64(&e.Sent, uint64(size))
++		return nil
++	}
+ 	if dst == header.EthernetBroadcastAddress {
+ 		e.camLock.RLock()
+ 		srcID, ok := e.cam[src]
+@@ -230,6 +248,9 @@ func (e *Switch) txBuf(conn protocolConn, buf []byte) error {
+ }
+ 
+ func (e *Switch) disconnect(id int, conn net.Conn) {
++	if peer := e.inprocPeer.Load(); peer != nil && peer.id == id {
++		e.inprocPeer.Store(nil)
++	}
+ 	e.connLock.Lock()
+ 	defer e.connLock.Unlock()
+ 

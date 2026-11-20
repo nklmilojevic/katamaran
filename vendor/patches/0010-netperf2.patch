@@ -1,0 +1,1435 @@
+virtio-net: send from guest memory, on the vCPU, or to an in-process stack
+
+- The unixgram backend sends each frame with sendmsg from the guest's
+  buffers instead of copying it into a staging buffer first.
+- A vCPU that kicks the transmit queue sends frames of up to 4 KiB itself
+  (VirtioDevice::notify_inline), sparing a wakeup of the net worker on
+  every request; larger frames stay with the worker, which keeps the
+  guest producing while it sends. The transmit queue is shared under a
+  mutex the vCPU only try-locks.
+- A new backend, InProcess (net/inproc.rs), passes frames by function
+  call to a network stack loaded into the VMM process: the guest's frames
+  go to the stack's transmit function, and the stack writes frames for
+  the guest into the receive queue on its own threads, with a bounded
+  backlog for when the guest has no buffers. NetDevice::new_in_process
+  creates it.
+
+diff --git a/src/devices/src/virtio/net/backend.rs b/src/devices/src/virtio/net/backend.rs
+index 4a17713..c3d6358 100644
+--- a/src/devices/src/virtio/net/backend.rs
++++ b/src/devices/src/virtio/net/backend.rs
+@@ -71,6 +71,20 @@ pub trait NetBackend {
+     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
+     fn raw_socket_fd(&self) -> RawFd;
+ 
++    /// Write one frame gathered from `iov` (host addresses of guest memory)
++    /// without staging it in a buffer. `None` if the backend can't, as a
++    /// stream backend that may write part of a frame can't.
++    fn write_frame_iov(&mut self, _iov: &[libc::iovec]) -> Option<Result<(), WriteError>> {
++        None
++    }
++
++    /// A duplicate of the socket for vCPU threads to send small frames on
++    /// with [`write_frame_iov`](Self::write_frame_iov)'s semantics, if the
++    /// backend allows sending from two threads.
++    fn inline_tx_socket(&self) -> Option<std::os::fd::OwnedFd> {
++        None
++    }
++
+     /// Delay in microseconds before retrying after NothingWritten.
+     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where
+     /// EAGAIN + EPOLLET handles retries via writable events).
+diff --git a/src/devices/src/virtio/net/device.rs b/src/devices/src/virtio/net/device.rs
+index 9605ccf..3f8edc6 100644
+--- a/src/devices/src/virtio/net/device.rs
++++ b/src/devices/src/virtio/net/device.rs
+@@ -14,7 +14,13 @@ use crate::virtio::{
+ };
+ 
+ use super::backend::{ReadError, WriteError};
++#[cfg(unix)]
++use super::inproc::InprocNet;
+ use super::worker::NetWorker;
++#[cfg(unix)]
++use super::worker::{InlineTx, InprocWorker};
++#[cfg(unix)]
++use std::sync::Arc;
+ 
+ #[cfg(windows)]
+ use super::unixstream::Unixstream;
+@@ -31,6 +37,8 @@ use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+ use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
+ 
+ const VIRTIO_F_VERSION_1: u32 = 32;
++#[cfg(unix)]
++const TX_INDEX: u32 = 1;
+ 
+ #[derive(Debug)]
+ pub enum FrontendError {
+@@ -78,6 +86,9 @@ pub enum VirtioNetBackend {
+     UnixgramPath(PathBuf, bool),
+     #[cfg(target_os = "linux")]
+     Tap(String),
++    /// A network stack in this process; see [`InprocNet`].
++    #[cfg(unix)]
++    InProcess(Arc<InprocNet>),
+ }
+ 
+ pub struct Net {
+@@ -91,6 +102,9 @@ pub struct Net {
+ 
+     config: VirtioNetConfig,
+ 
++    #[cfg(unix)]
++    inline_tx: Option<InlineTx>,
++
+     #[cfg(windows)]
+     worker_socket: Option<OwnedSocket>,
+     #[cfg(windows)]
+@@ -125,6 +139,8 @@ impl Net {
+ 
+             device_state: DeviceState::Inactive,
+             config,
++            #[cfg(unix)]
++            inline_tx: None,
+             #[cfg(windows)]
+             worker_socket: None,
+             #[cfg(windows)]
+@@ -240,6 +256,15 @@ impl VirtioDevice for Net {
+             Ok(())
+         }
+ 
++        #[cfg(unix)]
++        if let VirtioNetBackend::InProcess(net) = &self.cfg_backend {
++            let worker = InprocWorker::new(rx_q, tx_q, interrupt.clone(), mem.clone(), net.clone());
++            self.inline_tx = Some(worker.inline_tx());
++            worker.run();
++            self.device_state = DeviceState::Activated(mem, interrupt);
++            return Ok(());
++        }
++
+         #[cfg(not(windows))]
+         {
+             match NetWorker::new(
+@@ -251,6 +276,7 @@ impl VirtioDevice for Net {
+                 self.cfg_backend.clone(),
+             ) {
+                 Ok(worker) => {
++                    self.inline_tx = worker.inline_tx();
+                     worker.run();
+                     self.device_state = DeviceState::Activated(mem, interrupt);
+                     Ok(())
+@@ -266,6 +292,21 @@ impl VirtioDevice for Net {
+         }
+     }
+ 
++    #[cfg(unix)]
++    fn handles_notify_inline(&self) -> bool {
++        matches!(
++            self.cfg_backend,
++            VirtioNetBackend::UnixgramFd(_)
++                | VirtioNetBackend::UnixgramPath(..)
++                | VirtioNetBackend::InProcess(_)
++        )
++    }
++
++    #[cfg(unix)]
++    fn notify_inline(&mut self, queue_index: u32) -> bool {
++        queue_index == TX_INDEX && self.inline_tx.as_ref().is_some_and(InlineTx::kick)
++    }
++
+     fn is_activated(&self) -> bool {
+         self.device_state.is_activated()
+     }
+diff --git a/src/devices/src/virtio/net/inproc.rs b/src/devices/src/virtio/net/inproc.rs
+new file mode 100644
+index 0000000..653b08c
+--- /dev/null
++++ b/src/devices/src/virtio/net/inproc.rs
+@@ -0,0 +1,251 @@
++//! A virtio-net backend for a network stack loaded into the VMM process, as
++//! katamaran loads gvproxy. Frames pass by function call both ways, so no
++//! socket and no thread hand-off sit between the guest and the stack:
++//! - the guest's frames go to the stack's transmit function, from the
++//!   vCPU that kicked the queue for small frames and from the net worker for
++//!   the rest ([`InprocNet::send`]);
++//! - the stack writes frames for the guest into the receive queue itself,
++//!   on its own threads, through [`inproc_net_rx`].
++//!
++//! When the receive queue is full, frames wait in a bounded backlog that the
++//! worker flushes when the guest adds buffers, as a socket's buffer did;
++//! beyond it they are dropped, as a full NIC ring drops them.
++
++use std::collections::VecDeque;
++use std::ffi::{c_int, c_void};
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use vm_memory::{Address, Bytes, GuestMemoryMmap};
++
++use super::backend::WriteError;
++use crate::virtio::InterruptTransport;
++use crate::virtio::queue::Queue;
++
++/// The stack's transmit function: one frame from the guest, without its
++/// virtio-net header. Returns 0 or an errno.
++pub type TxFn = unsafe extern "C" fn(iov: *const libc::iovec, iovcnt: c_int) -> c_int;
++
++/// Frames kept while the guest has no receive buffers; about 2 ms at full
++/// speed, as much as the datagram socket used to hold.
++const BACKLOG_MAX_BYTES: usize = 8 << 20;
++
++pub struct InprocNet {
++    tx: TxFn,
++    rx: Mutex<Option<RxRing>>,
++    rx_dropped: AtomicU64,
++}
++
++struct RxRing {
++    queue: Queue,
++    mem: GuestMemoryMmap,
++    interrupt: InterruptTransport,
++    backlog: VecDeque<Vec<u8>>,
++    backlog_bytes: usize,
++}
++
++impl InprocNet {
++    pub fn new(tx: TxFn) -> Self {
++        InprocNet {
++            tx,
++            rx: Mutex::new(None),
++            rx_dropped: AtomicU64::new(0),
++        }
++    }
++
++    /// Frames for the guest dropped because its receive queue and the
++    /// backlog were full.
++    pub fn rx_dropped(&self) -> u64 {
++        self.rx_dropped.load(Ordering::Relaxed)
++    }
++
++    /// Send a frame, without its virtio-net header, to the stack. Returns
++    /// the stack's 0 or errno.
++    pub fn transmit(&self, iov: &[libc::iovec]) -> c_int {
++        // SAFETY: the iovecs point to readable memory that stays valid for
++        // the call; the stack copies what it keeps.
++        unsafe { (self.tx)(iov.as_ptr(), iov.len() as c_int) }
++    }
++
++    pub(crate) fn send(&self, iov: &[libc::iovec]) -> Result<(), WriteError> {
++        match self.transmit(iov) {
++            0 => Ok(()),
++            e => Err(WriteError::Internal(nix::Error::from_raw(e))),
++        }
++    }
++
++    pub(crate) fn attach_rx(
++        &self,
++        queue: Queue,
++        mem: GuestMemoryMmap,
++        interrupt: InterruptTransport,
++    ) {
++        *self.rx.lock().unwrap() = Some(RxRing {
++            queue,
++            mem,
++            interrupt,
++            backlog: VecDeque::new(),
++            backlog_bytes: 0,
++        });
++    }
++
++    /// Write a frame from the stack (virtio-net header, then the frame) to
++    /// the guest. Returns 0, or EAGAIN if it was dropped.
++    pub fn deliver(&self, iov: &[libc::iovec]) -> c_int {
++        let mut guard = self.rx.lock().unwrap();
++        let Some(ring) = guard.as_mut() else {
++            self.rx_dropped.fetch_add(1, Ordering::Relaxed);
++            return libc::EAGAIN;
++        };
++        ring.flush();
++        if ring.backlog.is_empty() && ring.write(iov) {
++            ring.signal();
++            return 0;
++        }
++        let len: usize = iov.iter().map(|v| v.iov_len).sum();
++        if ring.backlog_bytes + len > BACKLOG_MAX_BYTES {
++            self.rx_dropped.fetch_add(1, Ordering::Relaxed);
++            return libc::EAGAIN;
++        }
++        let mut frame = Vec::with_capacity(len);
++        for v in iov {
++            // SAFETY: the stack passes readable memory for the call.
++            frame.extend_from_slice(unsafe {
++                std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len)
++            });
++        }
++        ring.backlog_bytes += len;
++        ring.backlog.push_back(frame);
++        ring.arm();
++        0
++    }
++
++    /// The guest added receive buffers: move waiting frames into them.
++    pub(crate) fn refill(&self) {
++        if let Some(ring) = self.rx.lock().unwrap().as_mut() {
++            ring.flush();
++            if !ring.backlog.is_empty() {
++                ring.arm();
++            }
++        }
++    }
++}
++
++impl RxRing {
++    /// Copy one frame into the next receive buffer. False if there is none.
++    fn write(&mut self, iov: &[libc::iovec]) -> bool {
++        let Some(head) = self.queue.pop(&self.mem) else {
++            return false;
++        };
++        let index = head.index;
++        let mut written = 0usize;
++        let mut ok = true;
++        let mut src = iov.iter().map(|v| {
++            // SAFETY: the stack passes readable memory for the call.
++            unsafe { std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len) }
++        });
++        let mut chunk: &[u8] = src.next().unwrap_or_default();
++        let mut desc = Some(head);
++        'chain: while let Some(d) = desc {
++            if !d.is_write_only() {
++                ok = false;
++                break;
++            }
++            let mut off = 0usize;
++            while off < d.len as usize {
++                while chunk.is_empty() {
++                    match src.next() {
++                        Some(c) => chunk = c,
++                        None => break 'chain,
++                    }
++                }
++                let n = chunk.len().min(d.len as usize - off);
++                if self
++                    .mem
++                    .write_slice(&chunk[..n], d.addr.unchecked_add(off as u64))
++                    .is_err()
++                {
++                    ok = false;
++                    break 'chain;
++                }
++                chunk = &chunk[n..];
++                off += n;
++                written += n;
++            }
++            desc = d.next_descriptor();
++        }
++        if ok && (!chunk.is_empty() || src.any(|c| !c.is_empty())) {
++            log::warn!("Receiving buffer is too small to hold the frame");
++            ok = false;
++        }
++        let used = if ok { written as u32 } else { 0 };
++        if let Err(e) = self.queue.add_used(&self.mem, index, used) {
++            log::error!("net: failed to add used buffer: {e:?}");
++        }
++        true
++    }
++
++    fn flush(&mut self) {
++        let mut wrote = false;
++        while let Some(frame) = self.backlog.pop_front() {
++            let iov = [libc::iovec {
++                iov_base: frame.as_ptr() as *mut c_void,
++                iov_len: frame.len(),
++            }];
++            if !self.write(&iov) {
++                self.backlog.push_front(frame);
++                break;
++            }
++            self.backlog_bytes -= frame.len();
++            wrote = true;
++        }
++        if wrote {
++            self.signal();
++        }
++    }
++
++    /// Ask the guest to kick the queue when it adds buffers.
++    fn arm(&mut self) {
++        while let Ok(true) = self.queue.enable_notification(&self.mem) {
++            // Buffers arrived while arming.
++            let before = self.backlog.len();
++            self.flush();
++            if self.backlog.is_empty() || self.backlog.len() == before {
++                return;
++            }
++        }
++    }
++
++    fn signal(&mut self) {
++        if self.queue.needs_notification(&self.mem).unwrap_or(true)
++            && let Err(e) = self.interrupt.try_signal_used_queue()
++        {
++            log::error!("net: failed to signal the guest: {e:?}");
++        }
++    }
++}
++
++/// The receive function for the stack: `ctx` is the [`InprocNet`], which
++/// must outlive the stack.
++///
++/// # Safety
++/// `ctx` must point to a live `InprocNet` and `iov` to `iovcnt` iovecs of
++/// readable memory.
++pub unsafe extern "C" fn inproc_net_rx(
++    ctx: *mut c_void,
++    iov: *const libc::iovec,
++    iovcnt: c_int,
++) -> c_int {
++    // SAFETY: guaranteed by the caller.
++    let (net, iov) = unsafe {
++        (
++            &*(ctx as *const InprocNet),
++            std::slice::from_raw_parts(iov, iovcnt.max(0) as usize),
++        )
++    };
++    net.deliver(iov)
++}
++
++#[cfg(test)]
++#[path = "inproc_tests.rs"]
++mod tests;
+diff --git a/src/devices/src/virtio/net/inproc_tests.rs b/src/devices/src/virtio/net/inproc_tests.rs
+new file mode 100644
+index 0000000..917ed99
+--- /dev/null
++++ b/src/devices/src/virtio/net/inproc_tests.rs
+@@ -0,0 +1,186 @@
++use std::cell::RefCell;
++use std::sync::atomic::AtomicUsize;
++
++use utils::eventfd::{EFD_NONBLOCK, EventFd};
++use vm_memory::GuestAddress;
++
++use super::*;
++use crate::virtio::device::{InterruptHandler, InterruptType};
++use crate::virtio::net::VNET_HDR_LEN;
++use crate::virtio::net::worker::InprocWorker;
++use crate::virtio::queue::tests::VirtQueue;
++use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
++use crate::virtio::{DeviceQueue, InterruptTransport};
++use std::sync::Arc;
++
++const BUFFERS: u64 = 0x10000;
++const BUF_LEN: u32 = 0x1000;
++
++thread_local! {
++    static SENT: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
++}
++
++/// The stack's transmit function: records each frame.
++unsafe extern "C" fn record_tx(iov: *const libc::iovec, iovcnt: c_int) -> c_int {
++    let iov = unsafe { std::slice::from_raw_parts(iov, iovcnt as usize) };
++    let mut frame = Vec::new();
++    for v in iov {
++        frame.extend_from_slice(unsafe {
++            std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len)
++        });
++    }
++    SENT.with(|s| s.borrow_mut().push(frame));
++    0
++}
++
++#[derive(Default)]
++struct Irqs(AtomicUsize);
++
++impl InterruptHandler for Irqs {
++    fn try_signal(&self, _: InterruptType) -> Result<(), crate::Error> {
++        self.0.fetch_add(1, Ordering::SeqCst);
++        Ok(())
++    }
++}
++
++fn memory() -> GuestMemoryMmap {
++    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x80000)]).unwrap()
++}
++
++/// Post receive buffer `i` in descriptor `i` and avail slot `i`.
++fn post(rxq: &VirtQueue, i: u16) {
++    let addr = BUFFERS + u64::from(i) * u64::from(BUF_LEN);
++    rxq.dtable[i as usize].set(addr, BUF_LEN, VIRTQ_DESC_F_WRITE, 0);
++    rxq.avail.ring[i as usize].set(i);
++    rxq.avail.idx.set(i + 1);
++}
++
++fn iov(parts: &[&[u8]]) -> Vec<libc::iovec> {
++    parts
++        .iter()
++        .map(|p| libc::iovec {
++            iov_base: p.as_ptr() as *mut c_void,
++            iov_len: p.len(),
++        })
++        .collect()
++}
++
++fn received(mem: &GuestMemoryMmap, rxq: &VirtQueue, n: u16) -> Vec<u8> {
++    let used = rxq.used.ring[n as usize].get();
++    let mut buf = vec![0u8; used.len as usize];
++    mem.read_slice(
++        &mut buf,
++        GuestAddress(BUFFERS + u64::from(used.id) * u64::from(BUF_LEN)),
++    )
++    .unwrap();
++    buf
++}
++
++fn attached<'a>(mem: &'a GuestMemoryMmap, posted: u16) -> (InprocNet, VirtQueue<'a>, Arc<Irqs>) {
++    let rxq = VirtQueue::new(GuestAddress(0), mem, 16);
++    for i in 0..posted {
++        post(&rxq, i);
++    }
++    let irqs = Arc::new(Irqs::default());
++    let net = InprocNet::new(record_tx);
++    let mut queue = rxq.create_queue();
++    queue.set_event_idx(true);
++    net.attach_rx(
++        queue,
++        mem.clone(),
++        InterruptTransport::from_handler(irqs.clone()),
++    );
++    (net, rxq, irqs)
++}
++
++#[test]
++fn frames_before_activation_are_dropped() {
++    let net = InprocNet::new(record_tx);
++    assert_eq!(net.deliver(&iov(&[&[0; 12], &[1; 60]])), libc::EAGAIN);
++    assert_eq!(net.rx_dropped(), 1);
++}
++
++#[test]
++fn a_frame_lands_in_the_next_buffer_and_interrupts() {
++    let mem = memory();
++    let (net, rxq, irqs) = attached(&mem, 2);
++    let hdr = [7u8; VNET_HDR_LEN];
++    let frame: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();
++    assert_eq!(net.deliver(&iov(&[&hdr, &frame[..100], &frame[100..]])), 0);
++    assert_eq!(rxq.used.idx.get(), 1);
++    assert_eq!(received(&mem, &rxq, 0), [&hdr[..], &frame].concat());
++    assert_eq!(irqs.0.load(Ordering::SeqCst), 1);
++}
++
++#[test]
++fn a_full_queue_backlogs_frames_until_the_guest_refills_it() {
++    let mem = memory();
++    let (net, rxq, _) = attached(&mem, 1);
++    for i in 1..=3u8 {
++        assert_eq!(net.deliver(&iov(&[&[i; 80]])), 0);
++    }
++    assert_eq!(rxq.used.idx.get(), 1);
++    // Armed: the guest kicks once it posts past what was consumed.
++    assert_eq!(rxq.used.event.get(), 1);
++
++    post(&rxq, 1);
++    post(&rxq, 2);
++    net.refill();
++    assert_eq!(rxq.used.idx.get(), 3);
++    for (n, i) in (1..=2u16).zip(2..=3u8) {
++        assert_eq!(received(&mem, &rxq, n), [i; 80]);
++    }
++    assert_eq!(net.rx_dropped(), 0);
++}
++
++#[test]
++fn the_backlog_is_bounded() {
++    let mem = memory();
++    let (net, _, _) = attached(&mem, 0);
++    let frame = vec![0u8; 64 << 10];
++    let fits = BACKLOG_MAX_BYTES / frame.len();
++    for _ in 0..fits {
++        assert_eq!(net.deliver(&iov(&[&frame])), 0);
++    }
++    assert_eq!(net.deliver(&iov(&[&frame])), libc::EAGAIN);
++    assert_eq!(net.rx_dropped(), 1);
++}
++
++#[test]
++fn the_worker_sends_scattered_frames_without_their_header() {
++    let mem = memory();
++    let rxq = VirtQueue::new(GuestAddress(0), &mem, 16);
++    let txq = VirtQueue::new(GuestAddress(0x8000), &mem, 16);
++    // Header and frame over three descriptors, the header split in two.
++    let mut bytes = vec![0u8; VNET_HDR_LEN];
++    let frame: Vec<u8> = (0..3000u32).map(|i| (i * 7) as u8).collect();
++    bytes.extend_from_slice(&frame);
++    let parts = [&bytes[..5], &bytes[5..1000], &bytes[1000..]];
++    for (d, part) in parts.iter().enumerate() {
++        let addr = 0x40000 + d as u64 * 0x2000;
++        mem.write_slice(part, GuestAddress(addr)).unwrap();
++        let flags = if d + 1 < parts.len() {
++            VIRTQ_DESC_F_NEXT
++        } else {
++            0
++        };
++        txq.dtable[d].set(addr, part.len() as u32, flags, d as u16 + 1);
++    }
++    txq.avail.ring[0].set(0);
++    txq.avail.idx.set(1);
++
++    let net = Arc::new(InprocNet::new(record_tx));
++    let irqs = Arc::new(Irqs::default());
++    let event = || Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
++    let mut worker = InprocWorker::new(
++        DeviceQueue::new(rxq.create_queue(), event()),
++        DeviceQueue::new(txq.create_queue(), event()),
++        InterruptTransport::from_handler(irqs),
++        mem.clone(),
++        net,
++    );
++    SENT.with(|s| s.borrow_mut().clear());
++    worker.process_tx();
++    assert_eq!(SENT.with(|s| s.borrow().clone()), [frame]);
++    assert_eq!(txq.used.idx.get(), 1);
++}
+diff --git a/src/devices/src/virtio/net/mod.rs b/src/devices/src/virtio/net/mod.rs
+index 15b919d..173f306 100644
+--- a/src/devices/src/virtio/net/mod.rs
++++ b/src/devices/src/virtio/net/mod.rs
+@@ -13,6 +13,8 @@ pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZ
+ 
+ mod backend;
+ pub mod device;
++#[cfg(unix)]
++pub mod inproc;
+ #[cfg(target_os = "linux")]
+ mod tap;
+ #[cfg(unix)]
+diff --git a/src/devices/src/virtio/net/unixgram.rs b/src/devices/src/virtio/net/unixgram.rs
+index b984e1e..48cb364 100644
+--- a/src/devices/src/virtio/net/unixgram.rs
++++ b/src/devices/src/virtio/net/unixgram.rs
+@@ -125,6 +125,27 @@ impl Unixgram {
+     }
+ }
+ 
++/// Send one frame gathered from `iov`.
++pub(crate) fn send_iov(fd: RawFd, iov: &[libc::iovec]) -> Result<(), WriteError> {
++    // SAFETY: msghdr is plain data; all-zero is a valid empty header.
++    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
++    msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
++    msg.msg_iovlen = iov.len() as _;
++    // SAFETY: the caller guarantees each iovec points to readable memory
++    // that stays mapped for the duration of the call.
++    if unsafe { libc::sendmsg(fd, &msg, 0) } >= 0 {
++        return Ok(());
++    }
++    match nix::Error::last() {
++        // macOS returns ENOBUFS; Linux returns EAGAIN when the socket buffer is full.
++        #[allow(unreachable_patterns)]
++        nix::Error::EAGAIN | nix::Error::EWOULDBLOCK | nix::Error::ENOBUFS => {
++            Err(WriteError::NothingWritten)
++        }
++        e => Err(WriteError::Internal(e)),
++    }
++}
++
+ impl NetBackend for Unixgram {
+     /// Try to read a frame the proxy. If no bytes are available reports ReadError::NothingRead
+     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+@@ -169,6 +190,20 @@ impl NetBackend for Unixgram {
+         Ok(())
+     }
+ 
++    fn write_frame_iov(&mut self, iov: &[libc::iovec]) -> Option<Result<(), WriteError>> {
++        let result = send_iov(self.fd.as_raw_fd(), iov);
++        match result {
++            Ok(()) => self.retries = 0,
++            Err(WriteError::NothingWritten) => self.retries += 1,
++            Err(_) => {}
++        }
++        Some(result)
++    }
++
++    fn inline_tx_socket(&self) -> Option<OwnedFd> {
++        self.fd.try_clone().ok()
++    }
++
+     fn has_unfinished_write(&self) -> bool {
+         false
+     }
+diff --git a/src/devices/src/virtio/net/worker/inline_tx.rs b/src/devices/src/virtio/net/worker/inline_tx.rs
+new file mode 100644
+index 0000000..ddafb49
+--- /dev/null
++++ b/src/devices/src/virtio/net/worker/inline_tx.rs
+@@ -0,0 +1,194 @@
++//! Transmit state shared between the net worker and the vCPU threads, so a
++//! vCPU that kicks the transmit queue can send small frames itself instead of
++//! waking the worker, which on macOS costs about 7 us per kick: most of what
++//! a request/response round trip spends in the device.
++
++use std::os::fd::{AsRawFd, OwnedFd};
++use std::sync::{Arc, Mutex};
++
++use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
++
++use crate::virtio::net::VNET_HDR_LEN;
++use crate::virtio::net::backend::WriteError;
++use crate::virtio::net::inproc::InprocNet;
++use crate::virtio::net::unixgram::send_iov;
++use crate::virtio::queue::DescriptorChain;
++use crate::virtio::{DeviceQueue, InterruptTransport};
++
++/// Largest frame a vCPU sends inline. Bigger ones are left to the worker, so
++/// a bulk transfer keeps the guest producing frames while the worker sends.
++pub const INLINE_TX_MAX: usize = 4096;
++
++pub struct TxShared {
++    pub q: DeviceQueue,
++    /// Guest buffers of the frame being sent.
++    pub chain: Vec<(GuestAddress, usize)>,
++    pub host_iov: HostIovecs,
++}
++
++impl TxShared {
++    pub fn new(q: DeviceQueue, capacity: usize) -> Self {
++        TxShared {
++            q,
++            chain: Vec::with_capacity(capacity),
++            host_iov: HostIovecs(Vec::with_capacity(capacity)),
++        }
++    }
++}
++
++/// Host addresses of the frame being sent, valid only while it is sent.
++pub struct HostIovecs(pub Vec<libc::iovec>);
++
++// SAFETY: the pointers are only used under the TxShared lock, into guest
++// memory that both the worker and the device keep mapped.
++unsafe impl Send for HostIovecs {}
++
++/// The readable buffers of the chain at `head`; empty if it has a writable
++/// one, which a transmit chain must not.
++pub fn read_chain(head: DescriptorChain, out: &mut Vec<(GuestAddress, usize)>) {
++    out.clear();
++    let mut next = Some(head);
++    while let Some(desc) = next {
++        if desc.is_write_only() {
++            out.clear();
++            return;
++        }
++        out.push((desc.addr, desc.len as usize));
++        next = desc.next_descriptor();
++    }
++}
++
++/// Fill `out` with the host addresses of the frame in `chain`, leaving out the
++/// virtio-net header in front of it. False if a buffer is not within one
++/// mapped region of guest memory.
++pub fn frame_iovecs(
++    mem: &GuestMemoryMmap,
++    chain: &[(GuestAddress, usize)],
++    out: &mut Vec<libc::iovec>,
++) -> bool {
++    out.clear();
++    let mut skip = VNET_HDR_LEN;
++    for &(addr, len) in chain {
++        if len <= skip {
++            skip -= len;
++            continue;
++        }
++        let len = len - skip;
++        let Ok(slice) = mem.get_slice(addr.unchecked_add(skip as u64), len) else {
++            return false;
++        };
++        out.push(libc::iovec {
++            iov_base: slice.ptr_guard().as_ptr() as *mut libc::c_void,
++            iov_len: len,
++        });
++        skip = 0;
++    }
++    true
++}
++
++/// Where frames from the guest go.
++pub enum TxSink {
++    /// The worker's datagram socket, duplicated.
++    Socket(OwnedFd),
++    InProcess(Arc<InprocNet>),
++}
++
++impl TxSink {
++    pub fn send(&self, iov: &[libc::iovec]) -> Result<(), WriteError> {
++        match self {
++            TxSink::Socket(fd) => send_iov(fd.as_raw_fd(), iov),
++            TxSink::InProcess(net) => net.send(iov),
++        }
++    }
++}
++
++/// Sends small frames on the vCPU thread that kicked the transmit queue.
++pub struct InlineTx {
++    shared: Arc<Mutex<TxShared>>,
++    sink: TxSink,
++    mem: GuestMemoryMmap,
++    interrupt: InterruptTransport,
++}
++
++enum Sent {
++    All,
++    /// Stopped at a frame the worker must send.
++    HandOff,
++}
++
++impl InlineTx {
++    pub fn new(
++        shared: Arc<Mutex<TxShared>>,
++        sink: TxSink,
++        mem: GuestMemoryMmap,
++        interrupt: InterruptTransport,
++    ) -> Self {
++        InlineTx {
++            shared,
++            sink,
++            mem,
++            interrupt,
++        }
++    }
++
++    /// Send what the guest queued, as the worker would. False leaves the
++    /// rest to the worker: the worker is sending, a frame is large or not in
++    /// one mapped region, or the socket is full.
++    pub fn kick(&self) -> bool {
++        let Ok(mut guard) = self.shared.try_lock() else {
++            return false;
++        };
++        let tx = &mut *guard;
++        loop {
++            if tx.q.queue.disable_notification(&self.mem).is_err() {
++                return false;
++            }
++            let sent = self.send_small(tx);
++            let more = tx.q.queue.enable_notification(&self.mem).unwrap_or(true);
++            match sent {
++                Sent::HandOff => return false,
++                Sent::All if more => continue,
++                Sent::All => return true,
++            }
++        }
++    }
++
++    fn send_small(&self, tx: &mut TxShared) -> Sent {
++        let mut used = false;
++        let sent = loop {
++            let Some(head) = tx.q.queue.pop(&self.mem) else {
++                break Sent::All;
++            };
++            let index = head.index;
++            read_chain(head, &mut tx.chain);
++            let len: usize = tx.chain.iter().map(|&(_, l)| l).sum();
++            if len > INLINE_TX_MAX + VNET_HDR_LEN
++                || !frame_iovecs(&self.mem, &tx.chain, &mut tx.host_iov.0)
++            {
++                tx.q.queue.undo_pop();
++                break Sent::HandOff;
++            }
++            let result = if tx.host_iov.0.is_empty() {
++                Err(WriteError::Internal(nix::Error::EINVAL))
++            } else {
++                self.sink.send(&tx.host_iov.0)
++            };
++            match result {
++                Ok(()) => {}
++                Err(WriteError::NothingWritten) => {
++                    tx.q.queue.undo_pop();
++                    break Sent::HandOff;
++                }
++                Err(e) => log::error!("Dropping a frame the backend refused: {e:?}"),
++            }
++            if tx.q.queue.add_used(&self.mem, index, 0).is_err() {
++                break Sent::HandOff;
++            }
++            used = true;
++        };
++        if used && tx.q.queue.needs_notification(&self.mem).unwrap_or(true) {
++            let _ = self.interrupt.try_signal_used_queue();
++        }
++        sent
++    }
++}
+diff --git a/src/devices/src/virtio/net/worker/inproc.rs b/src/devices/src/virtio/net/worker/inproc.rs
+new file mode 100644
+index 0000000..5bd8e40
+--- /dev/null
++++ b/src/devices/src/virtio/net/worker/inproc.rs
+@@ -0,0 +1,158 @@
++//! The net worker for an in-process network stack ([`InprocNet`]): it sends
++//! the frames vCPUs leave to it (large ones) and refills the receive queue
++//! from the backlog when the guest adds buffers. Frames for the guest do not
++//! pass through it.
++
++use std::os::fd::AsRawFd;
++use std::sync::{Arc, Mutex};
++use std::thread;
++
++use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
++use utils::eventfd::EventFd;
++use vm_memory::{Bytes, GuestMemoryMmap};
++
++use super::inline_tx::{InlineTx, TxShared, TxSink, frame_iovecs, read_chain};
++use crate::virtio::net::backend::WriteError;
++use crate::virtio::net::inproc::InprocNet;
++use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE, VNET_HDR_LEN};
++use crate::virtio::{DeviceQueue, InterruptTransport};
++
++pub struct InprocWorker {
++    net: Arc<InprocNet>,
++    tx: Arc<Mutex<TxShared>>,
++    tx_event: Arc<EventFd>,
++    rx_event: Arc<EventFd>,
++    mem: GuestMemoryMmap,
++    interrupt: InterruptTransport,
++    /// For a frame whose buffers are not in one mapped region.
++    copy_buf: Vec<u8>,
++}
++
++impl InprocWorker {
++    pub fn new(
++        rx_q: DeviceQueue,
++        tx_q: DeviceQueue,
++        interrupt: InterruptTransport,
++        mem: GuestMemoryMmap,
++        net: Arc<InprocNet>,
++    ) -> Self {
++        let rx_event = rx_q.event.clone();
++        net.attach_rx(rx_q.queue, mem.clone(), interrupt.clone());
++        InprocWorker {
++            net,
++            tx_event: tx_q.event.clone(),
++            tx: Arc::new(Mutex::new(TxShared::new(tx_q, QUEUE_SIZE as usize))),
++            rx_event,
++            mem,
++            interrupt,
++            copy_buf: Vec::with_capacity(MAX_BUFFER_SIZE),
++        }
++    }
++
++    pub fn inline_tx(&self) -> InlineTx {
++        InlineTx::new(
++            self.tx.clone(),
++            TxSink::InProcess(self.net.clone()),
++            self.mem.clone(),
++            self.interrupt.clone(),
++        )
++    }
++
++    pub fn run(self) {
++        thread::Builder::new()
++            .name("virtio-net worker".into())
++            .spawn(|| self.work())
++            .unwrap();
++    }
++
++    fn work(mut self) {
++        let tx_fd = self.tx_event.as_raw_fd();
++        let rx_fd = self.rx_event.as_raw_fd();
++        let mut epoll = Epoll::new().unwrap();
++        for fd in [tx_fd, rx_fd] {
++            epoll
++                .ctl(
++                    ControlOperation::Add,
++                    fd,
++                    &EpollEvent::new(EventSet::IN, fd as u64),
++                )
++                .unwrap();
++        }
++        let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 4];
++        loop {
++            let n = match epoll.wait(events.len(), -1, &mut events) {
++                Ok(n) => n,
++                Err(e) => {
++                    log::debug!("net worker: epoll wait: {e}");
++                    continue;
++                }
++            };
++            for ev in &events[..n] {
++                if ev.fd() == tx_fd {
++                    let _ = self.tx_event.read();
++                    self.process_tx();
++                } else if ev.fd() == rx_fd {
++                    let _ = self.rx_event.read();
++                    self.net.refill();
++                }
++            }
++        }
++    }
++
++    pub(crate) fn process_tx(&mut self) {
++        let shared = self.tx.clone();
++        let mut guard = shared.lock().unwrap();
++        let tx = &mut *guard;
++        loop {
++            if tx.q.queue.disable_notification(&self.mem).is_err() {
++                return;
++            }
++            let mut used = false;
++            while let Some(head) = tx.q.queue.pop(&self.mem) {
++                let index = head.index;
++                read_chain(head, &mut tx.chain);
++                let result = if frame_iovecs(&self.mem, &tx.chain, &mut tx.host_iov.0)
++                    && !tx.host_iov.0.is_empty()
++                {
++                    self.net.send(&tx.host_iov.0)
++                } else {
++                    self.send_copy(&tx.chain)
++                };
++                if let Err(e) = result {
++                    log::error!("Dropping a frame the network stack refused: {e:?}");
++                }
++                if let Err(e) = tx.q.queue.add_used(&self.mem, index, 0) {
++                    log::error!("net: failed to add used buffer: {e:?}");
++                }
++                used = true;
++            }
++            if used && tx.q.queue.needs_notification(&self.mem).unwrap_or(true) {
++                let _ = self.interrupt.try_signal_used_queue();
++            }
++            if !tx.q.queue.enable_notification(&self.mem).unwrap_or(false) {
++                return;
++            }
++        }
++    }
++
++    /// Send a frame through a copy, for buffers [`frame_iovecs`] can't map.
++    fn send_copy(&mut self, chain: &[(vm_memory::GuestAddress, usize)]) -> Result<(), WriteError> {
++        let len: usize = chain.iter().map(|&(_, l)| l).sum();
++        if len <= VNET_HDR_LEN || len > MAX_BUFFER_SIZE {
++            return Err(WriteError::Internal(nix::Error::EINVAL));
++        }
++        self.copy_buf.resize(len, 0);
++        let mut off = 0;
++        for &(addr, l) in chain {
++            self.mem
++                .read_slice(&mut self.copy_buf[off..off + l], addr)
++                .map_err(|_| WriteError::Internal(nix::Error::EFAULT))?;
++            off += l;
++        }
++        let iov = [libc::iovec {
++            iov_base: self.copy_buf[VNET_HDR_LEN..].as_mut_ptr() as *mut libc::c_void,
++            iov_len: len - VNET_HDR_LEN,
++        }];
++        self.net.send(&iov)
++    }
++}
+diff --git a/src/devices/src/virtio/net/worker/mod.rs b/src/devices/src/virtio/net/worker/mod.rs
+index a723a3a..9ed1913 100644
+--- a/src/devices/src/virtio/net/worker/mod.rs
++++ b/src/devices/src/virtio/net/worker/mod.rs
+@@ -1,6 +1,14 @@
+ #[cfg(unix)]
++mod inline_tx;
++#[cfg(unix)]
++mod inproc;
++#[cfg(unix)]
+ mod unix;
+ #[cfg(unix)]
++pub use inline_tx::InlineTx;
++#[cfg(unix)]
++pub use inproc::InprocWorker;
++#[cfg(unix)]
+ pub use unix::NetWorker;
+ 
+ #[cfg(windows)]
+diff --git a/src/devices/src/virtio/net/worker/unix.rs b/src/devices/src/virtio/net/worker/unix.rs
+index 2165ecd..f0a7208 100644
+--- a/src/devices/src/virtio/net/worker/unix.rs
++++ b/src/devices/src/virtio/net/worker/unix.rs
+@@ -1,10 +1,14 @@
+ use std::cmp;
+ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+ use std::result;
++use std::sync::{Arc, Mutex};
+ use std::thread;
+ 
+ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
++use vm_memory::{Bytes, GuestMemoryMmap};
++
++use super::inline_tx::{InlineTx, TxShared, TxSink, frame_iovecs, read_chain};
++use utils::eventfd::EventFd;
+ 
+ use crate::virtio::net::backend::ConnectError;
+ use crate::virtio::net::backend::{NetBackend, ReadError, WriteError};
+@@ -21,7 +25,8 @@ use std::os::fd::RawFd;
+ 
+ pub struct NetWorker {
+     rx_q: DeviceQueue,
+-    tx_q: DeviceQueue,
++    tx: Arc<Mutex<TxShared>>,
++    tx_event: Arc<EventFd>,
+     interrupt: InterruptTransport,
+ 
+     mem: GuestMemoryMmap,
+@@ -31,7 +36,6 @@ pub struct NetWorker {
+     rx_frame_buf_len: usize,
+     rx_has_deferred_frame: bool,
+ 
+-    tx_iovec: Vec<(GuestAddress, usize)>,
+     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
+     tx_frame_len: usize,
+     tx_has_deferred_frame: bool,
+@@ -65,6 +69,7 @@ impl NetWorker {
+             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
+                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
+             }
++            VirtioNetBackend::InProcess(_) => unreachable!("in-process backends use InprocWorker"),
+             #[cfg(target_os = "linux")]
+             VirtioNetBackend::Tap(tap_name) => {
+                 Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
+@@ -73,7 +78,8 @@ impl NetWorker {
+ 
+         Ok(Self {
+             rx_q,
+-            tx_q,
++            tx_event: tx_q.event.clone(),
++            tx: Arc::new(Mutex::new(TxShared::new(tx_q, QUEUE_SIZE as usize))),
+ 
+             mem,
+             backend,
+@@ -85,11 +91,22 @@ impl NetWorker {
+ 
+             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+             tx_frame_len: 0,
+-            tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+             tx_has_deferred_frame: false,
+         })
+     }
+ 
++    /// Lets vCPU threads send small frames on a transmit kick, if the
++    /// backend can be sent on from two threads.
++    pub fn inline_tx(&self) -> Option<InlineTx> {
++        let socket = self.backend.inline_tx_socket()?;
++        Some(InlineTx::new(
++            self.tx.clone(),
++            TxSink::Socket(socket),
++            self.mem.clone(),
++            self.interrupt.clone(),
++        ))
++    }
++
+     pub fn run(self) {
+         thread::Builder::new()
+             .name("virtio-net worker".into())
+@@ -105,7 +122,7 @@ impl NetWorker {
+         const TX_TIMER_FD: RawFd = -2;
+ 
+         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
+-        let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
++        let virtq_tx_ev_fd = self.tx_event.as_raw_fd();
+         let backend_socket = self.backend.raw_socket_fd();
+ 
+         let mut epoll = Epoll::new().unwrap();
+@@ -208,7 +225,7 @@ impl NetWorker {
+     }
+ 
+     fn process_tx_queue_event(&mut self) {
+-        match self.tx_q.event.read() {
++        match self.tx_event.read() {
+             Ok(_) => self.process_tx_loop(),
+             Err(e) => {
+                 log::error!("Failed to get tx queue event from queue: {e:?}");
+@@ -329,10 +346,12 @@ impl NetWorker {
+     }
+ 
+     fn process_tx_loop(&mut self) {
++        let shared = self.tx.clone();
++        let mut tx = shared.lock().unwrap();
+         loop {
+-            self.tx_q.queue.disable_notification(&self.mem).unwrap();
++            tx.q.queue.disable_notification(&self.mem).unwrap();
+ 
+-            self.tx_has_deferred_frame = match self.process_tx() {
++            self.tx_has_deferred_frame = match self.process_tx(&mut tx) {
+                 Err(TxError::Backend(WriteError::NothingWritten)) => true,
+                 Err(e) => {
+                     log::error!("Failed to process tx: {e:?}");
+@@ -341,15 +360,15 @@ impl NetWorker {
+                 _ => false,
+             };
+ 
+-            let has_new_entries = self.tx_q.queue.enable_notification(&self.mem).unwrap();
++            let has_new_entries = tx.q.queue.enable_notification(&self.mem).unwrap();
+             if self.tx_has_deferred_frame || !has_new_entries {
+                 break;
+             }
+         }
+     }
+ 
+-    fn process_tx(&mut self) -> result::Result<(), TxError> {
+-        let tx_queue = &mut self.tx_q.queue;
++    fn process_tx(&mut self, tx: &mut TxShared) -> result::Result<(), TxError> {
++        let tx_queue = &mut tx.q.queue;
+ 
+         if self.backend.has_unfinished_write()
+             && self
+@@ -366,21 +385,37 @@ impl NetWorker {
+ 
+         while let Some(head) = tx_queue.pop(&self.mem) {
+             let head_index = head.index;
+-            let mut next_desc = Some(head);
+-
+-            self.tx_iovec.clear();
+-            while let Some(desc) = next_desc {
+-                if desc.is_write_only() {
+-                    self.tx_iovec.clear();
+-                    break;
++            read_chain(head, &mut tx.chain);
++
++            // Send straight from guest memory when the backend can, which
++            // saves copying every frame through tx_frame_buf.
++            if frame_iovecs(&self.mem, &tx.chain, &mut tx.host_iov.0) {
++                let written = if tx.host_iov.0.is_empty() {
++                    Some(Err(WriteError::Internal(nix::Error::EINVAL)))
++                } else {
++                    self.backend.write_frame_iov(&tx.host_iov.0)
++                };
++                if let Some(written) = written {
++                    match written {
++                        Ok(()) => {}
++                        Err(WriteError::NothingWritten) => {
++                            tx_queue.undo_pop();
++                            result = Err(TxError::Backend(WriteError::NothingWritten));
++                            break;
++                        }
++                        Err(e) => log::error!("Dropping a frame the backend refused: {e:?}"),
++                    }
++                    tx_queue
++                        .add_used(&self.mem, head_index, 0)
++                        .map_err(TxError::QueueError)?;
++                    raise_irq = true;
++                    continue;
+                 }
+-                self.tx_iovec.push((desc.addr, desc.len as usize));
+-                next_desc = desc.next_descriptor();
+             }
+ 
+             // Copy buffer from across multiple descriptors.
+             let mut read_count = 0;
+-            for (desc_addr, desc_len) in self.tx_iovec.drain(..) {
++            for &(desc_addr, desc_len) in &tx.chain {
+                 let limit = cmp::min(read_count + desc_len, self.tx_frame_buf.len());
+ 
+                 let read_result = self
+diff --git a/src/devices/src/virtio/net/worker/unix_tests.rs b/src/devices/src/virtio/net/worker/unix_tests.rs
+index 2b2d6c6..5321402 100644
+--- a/src/devices/src/virtio/net/worker/unix_tests.rs
++++ b/src/devices/src/virtio/net/worker/unix_tests.rs
+@@ -1,20 +1,24 @@
+ use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+ use std::sync::{Arc, Mutex};
+ 
+-use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, send, socketpair};
++use nix::sys::socket::{
++    AddressFamily, MsgFlags, SockFlag, SockType, recv, send, setsockopt, socketpair, sockopt,
++};
+ use utils::eventfd::{EFD_NONBLOCK, EventFd};
+ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+ 
++use super::super::inline_tx::INLINE_TX_MAX;
+ use super::NetWorker;
+ use crate::virtio::device::{InterruptHandler, InterruptType};
+ use crate::virtio::net::VNET_HDR_LEN;
+ use crate::virtio::net::device::VirtioNetBackend;
+-use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+ use crate::virtio::queue::tests::VirtQueue;
++use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+ use crate::virtio::{DeviceQueue, InterruptTransport};
+ 
+ const RX_BUFFERS: u64 = 0x10000;
+ const BUF_LEN: u32 = 0x1000;
++const TX_BUFFERS: u64 = 0x20000;
+ 
+ /// Records the used index of the rx ring each time the guest is interrupted.
+ struct Recorder {
+@@ -33,6 +37,7 @@ impl InterruptHandler for Recorder {
+ 
+ struct Harness<'a> {
+     rxq: VirtQueue<'a>,
++    txq: VirtQueue<'a>,
+     worker: NetWorker,
+     peer: OwnedFd,
+     irqs: Arc<Recorder>,
+@@ -64,6 +69,9 @@ fn harness(mem: &GuestMemoryMmap, size: u16, posted: u16) -> Harness<'_> {
+         SockFlag::empty(),
+     )
+     .unwrap();
++    // As Unixgram::open does: on macOS the send buffer caps a datagram.
++    setsockopt(&ours, sockopt::SndBuf, &0x10000).unwrap();
++    setsockopt(&peer, sockopt::RcvBuf, &0x40000).unwrap();
+     let worker = NetWorker::new(
+         DeviceQueue::new(rx, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())),
+         DeviceQueue::new(tx, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())),
+@@ -75,6 +83,7 @@ fn harness(mem: &GuestMemoryMmap, size: u16, posted: u16) -> Harness<'_> {
+     .unwrap();
+     Harness {
+         rxq,
++        txq,
+         worker,
+         peer,
+         irqs,
+@@ -152,3 +161,119 @@ fn rx_does_not_interrupt_a_guest_that_is_polling() {
+     assert_eq!(h.rxq.used.idx.get(), 3);
+     assert!(h.irqs.seen.lock().unwrap().is_empty());
+ }
++
++/// Queue `frame` for transmit behind a virtio-net header, split over the
++/// descriptors `first..first + parts` (the header split too), in avail slot
++/// `slot`.
++fn queue_tx(
++    mem: &GuestMemoryMmap,
++    txq: &VirtQueue,
++    slot: u16,
++    first: u16,
++    frame: &[u8],
++    parts: u16,
++) {
++    let mut bytes = vec![0u8; VNET_HDR_LEN];
++    bytes.extend_from_slice(frame);
++    let chunk = bytes.len().div_ceil(parts as usize).max(1);
++    for (k, part) in bytes.chunks(chunk).enumerate() {
++        let d = first + k as u16;
++        let addr = TX_BUFFERS + u64::from(d) * 0x2000;
++        mem.write_slice(part, GuestAddress(addr)).unwrap();
++        let last = (k + 1) * chunk >= bytes.len();
++        let flags = if last { 0 } else { VIRTQ_DESC_F_NEXT };
++        txq.dtable[d as usize].set(addr, part.len() as u32, flags, d + 1);
++    }
++    txq.avail.ring[slot as usize].set(first);
++    txq.avail.idx.set(slot + 1);
++}
++
++fn received(peer: &OwnedFd) -> Vec<Vec<u8>> {
++    let mut out = Vec::new();
++    let mut buf = vec![0u8; 0x10000];
++    while let Ok(n) = recv(peer.as_raw_fd(), &mut buf, MsgFlags::MSG_DONTWAIT) {
++        out.push(buf[..n].to_vec());
++    }
++    out
++}
++
++fn tx_memory() -> GuestMemoryMmap {
++    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap()
++}
++
++#[test]
++fn tx_sends_a_scattered_frame_without_its_header() {
++    let mem = tx_memory();
++    let mut h = harness(&mem, 8, 0);
++    // Five parts of 220 bytes: the 12-byte header and the frame both span
++    // descriptors only at the first boundary.
++    let frame: Vec<u8> = (0..1088u32).map(|i| i as u8).collect();
++    queue_tx(&mem, &h.txq, 0, 0, &frame, 5);
++    h.worker.process_tx_loop();
++    assert_eq!(received(&h.peer), [frame]);
++    assert_eq!(h.txq.used.idx.get(), 1);
++}
++
++#[test]
++fn inline_kick_sends_small_frames_in_order() {
++    let mem = tx_memory();
++    let h = harness(&mem, 8, 0);
++    let inline = h
++        .worker
++        .inline_tx()
++        .expect("a datagram backend sends inline");
++    queue_tx(&mem, &h.txq, 0, 0, &[1u8; 60], 1);
++    queue_tx(&mem, &h.txq, 1, 1, &[2u8; 1500], 2);
++    assert!(inline.kick());
++    assert_eq!(received(&h.peer), [vec![1u8; 60], vec![2u8; 1500]]);
++    assert_eq!(h.txq.used.idx.get(), 2);
++}
++
++#[test]
++fn inline_kick_leaves_large_frames_to_the_worker() {
++    let mem = tx_memory();
++    let mut h = harness(&mem, 8, 0);
++    let inline = h.worker.inline_tx().unwrap();
++    let large = vec![3u8; INLINE_TX_MAX + 1];
++    queue_tx(&mem, &h.txq, 0, 0, &[1u8; 60], 1);
++    queue_tx(&mem, &h.txq, 1, 1, &large, 2);
++    queue_tx(&mem, &h.txq, 2, 3, &[2u8; 60], 1);
++    // The small frame ahead of the large one goes; the rest keeps its order
++    // for the worker.
++    assert!(!inline.kick());
++    assert_eq!(received(&h.peer), [vec![1u8; 60]]);
++    assert_eq!(h.txq.used.idx.get(), 1);
++    h.worker.process_tx_loop();
++    assert_eq!(received(&h.peer), [large, vec![2u8; 60]]);
++    assert_eq!(h.txq.used.idx.get(), 3);
++}
++
++#[test]
++fn inline_kick_does_not_wait_for_the_worker() {
++    let mem = tx_memory();
++    let h = harness(&mem, 8, 0);
++    let inline = h.worker.inline_tx().unwrap();
++    queue_tx(&mem, &h.txq, 0, 0, &[1u8; 60], 1);
++    let held = h.worker.tx.lock().unwrap();
++    assert!(!inline.kick());
++    drop(held);
++    assert!(received(&h.peer).is_empty());
++    assert_eq!(h.txq.used.idx.get(), 0);
++}
++
++#[test]
++fn inline_kick_hands_a_full_socket_to_the_worker() {
++    let mem = tx_memory();
++    let mut h = harness(&mem, 8, 0);
++    let inline = h.worker.inline_tx().unwrap();
++    let fd = h.worker.backend.raw_socket_fd();
++    while send(fd, &[0u8; 1000], MsgFlags::MSG_DONTWAIT).is_ok() {}
++    queue_tx(&mem, &h.txq, 0, 0, &[7u8; 60], 1);
++    assert!(!inline.kick());
++    assert_eq!(h.txq.used.idx.get(), 0);
++    let backlog = received(&h.peer);
++    assert!(backlog.iter().all(|f| f.len() == 1000));
++    h.worker.process_tx_loop();
++    assert_eq!(received(&h.peer), [vec![7u8; 60]]);
++    assert_eq!(h.txq.used.idx.get(), 1);
++}
+diff --git a/src/libkrun/src/api/device_builders.rs b/src/libkrun/src/api/device_builders.rs
+index cd25ee4..5870e7e 100644
+--- a/src/libkrun/src/api/device_builders.rs
++++ b/src/libkrun/src/api/device_builders.rs
+@@ -1884,6 +1884,19 @@ impl NetDevice {
+             inner: Arc::new(Mutex::new(net)),
+         })
+     }
++
++    /// Create a net device whose frames pass by function call to and from a
++    /// network stack in this process; see [`devices::virtio::net::inproc`].
++    #[cfg(unix)]
++    pub fn new_in_process(
++        id: &str,
++        net: Arc<devices::virtio::net::inproc::InprocNet>,
++        mac: &[u8],
++        features: u32,
++    ) -> Result<Self, VmmError> {
++        use devices::virtio::net::device::VirtioNetBackend;
++        Self::new_inner(id, VirtioNetBackend::InProcess(net), mac, features)
++    }
+ }
+ 
+ #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
+diff --git a/src/libkrun/src/api/mod.rs b/src/libkrun/src/api/mod.rs
+index 6c7784d..b7f6fb0 100644
+--- a/src/libkrun/src/api/mod.rs
++++ b/src/libkrun/src/api/mod.rs
+@@ -64,6 +64,8 @@ pub use device_builders::{GpuDevice, VirglRendererFlags};
+ pub use devices::virtio::balloon::FreePageReportingMode;
+ #[cfg(feature = "blk")]
+ pub use devices::virtio::block::{DiskFormat, SyncMode};
++#[cfg(all(feature = "net", unix))]
++pub use devices::virtio::net::inproc as net_inproc;
+ pub use error::VmmError;
+ pub use logging::{LogLevel, LogOptions, LogStyle, init_log};
+ pub use payload::{KernelFormat, Payload};
