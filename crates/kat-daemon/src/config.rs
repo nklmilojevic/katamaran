@@ -294,12 +294,12 @@ mod tests {
         let home = temp_home("roundtrip");
         let mut cfg = Config::default();
         cfg.set("cpus", "2", &HOST).unwrap();
-        cfg.set("memory", "6G", &HOST).unwrap();
+        cfg.set("memory", "2G", &HOST).unwrap();
         cfg.set("mount", "off", &HOST).unwrap();
         cfg.set("mount_path", "/tmp/kat-files", &HOST).unwrap();
         cfg.save(&home).unwrap();
         let text = fs::read_to_string(Config::path(&home)).unwrap();
-        assert!(text.contains("memory_mib = 6144"), "{text}");
+        assert!(text.contains("memory_mib = 2048"), "{text}");
         let back = Config::load(&home).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(back.get("mount_path").unwrap(), "/tmp/kat-files");
