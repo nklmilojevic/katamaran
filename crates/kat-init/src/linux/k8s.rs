@@ -342,18 +342,29 @@ impl K8s {
                         sync_stop2.store(true, Ordering::SeqCst);
                         let _ = exit_tx.send(());
                         if let Some(svc) = svc_ref {
-                            let mut st = svc.state.lock().unwrap();
-                            // Ignore stale watchers from a superseded instance.
-                            if st.generation != my_gen {
-                                return;
-                            }
-                            let was_stopping = st.phase == "stopping" || st.phase == "stopped";
-                            st.api_ready = false;
-                            if !was_stopping {
-                                let msg = format!("k3s {}", describe_status(status));
-                                st.phase = "failed".into();
-                                st.error = msg.clone();
-                                st.running = None;
+                            let crashed = {
+                                let mut st = svc.state.lock().unwrap();
+                                // Ignore stale watchers from a superseded instance.
+                                if st.generation != my_gen {
+                                    return;
+                                }
+                                let was_stopping = st.phase == "stopping" || st.phase == "stopped";
+                                let was_running = st.phase == "running";
+                                st.api_ready = false;
+                                if !was_stopping {
+                                    let msg = format!("k3s {}", describe_status(status));
+                                    st.phase = "failed".into();
+                                    st.error = msg.clone();
+                                    st.running = None;
+                                    Some((was_running, msg))
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((was_running, msg)) = crashed {
+                                if was_running {
+                                    stop_k8s_workloads(&svc.reaper);
+                                }
                                 ACTIVE.store(false, Ordering::SeqCst);
                                 FORWARDED.lock().unwrap().clear();
                                 restore_bridge_netfilter();
@@ -441,17 +452,17 @@ impl K8s {
 
     fn stop_inner(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
         let _guard = self.op_lock.lock().unwrap();
-        let running = {
+        let (running, needs_cleanup) = {
             let mut st = self.state.lock().unwrap();
-            if st.running.is_none() {
-                st.phase = "stopped".into();
+            let needs_cleanup = st.running.is_some() || st.phase != "stopped";
+            if !needs_cleanup {
                 st.api_ready = false;
                 ACTIVE.store(false, Ordering::SeqCst);
                 return Ok(());
             }
             st.phase = "stopping".into();
             st.api_ready = false;
-            st.running.take()
+            (st.running.take(), needs_cleanup)
         };
         if let Some(c) = conn {
             let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
@@ -459,7 +470,9 @@ impl K8s {
         if let Some(r) = running {
             terminate_running(&r);
         }
-        stop_k8s_workloads(&self.reaper);
+        if needs_cleanup {
+            stop_k8s_workloads(&self.reaper);
+        }
         ACTIVE.store(false, Ordering::SeqCst);
         FORWARDED.lock().unwrap().clear();
         restore_bridge_netfilter();
