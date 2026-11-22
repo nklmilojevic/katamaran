@@ -30,11 +30,27 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
     let t = Instant::now();
     // Machines halt in parallel with the containers; each has
     // `lxc::STOP_SECS` before it is killed.
-    let k8s_stop = thread::spawn(|| {
-        let t = Instant::now();
-        super::k8s::stop_for_shutdown();
-        t.elapsed()
-    });
+    let k8s_stop = match thread::Builder::new()
+        .name("shutdown-k8s".into())
+        .spawn(|| {
+            let t = Instant::now();
+            super::k8s::stop_for_shutdown();
+            t.elapsed()
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            super::log(&format!(
+                "shutdown: spawn k8s stop thread failed ({e}); stopping inline"
+            ));
+            let t = Instant::now();
+            super::k8s::stop_for_shutdown();
+            super::log(&format!(
+                "shutdown: k8s stopped in {} ms",
+                t.elapsed().as_millis()
+            ));
+            None
+        }
+    };
     let machines = thread::spawn(|| {
         let t = Instant::now();
         let n = super::machines::stop_all();
@@ -47,7 +63,9 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
         });
         nfs.stop();
     }
-    if let Ok(took) = k8s_stop.join() {
+    if let Some(h) = k8s_stop
+        && let Ok(took) = h.join()
+    {
         super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
     }
     if let Ok((n, took)) = machines.join() {
