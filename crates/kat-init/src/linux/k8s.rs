@@ -25,7 +25,9 @@ use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
 use kat_proto::{K8S_PORT, Msg};
 
 use super::machines::cmd::{pipe, run_status as run_reaped};
-use super::service::{CONTAINERD_SOCKET, DOCKER_SOCKET, Notifier, Reaper, describe_status};
+use super::service::{
+    CONTAINERD_SOCKET, DOCKER_SOCKET, DockerStack, Notifier, Reaper, describe_status,
+};
 use super::sys;
 
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -81,15 +83,26 @@ struct State {
 pub struct K8s {
     reaper: Reaper,
     notifier: Notifier,
+    docker: DockerStack,
     op_lock: Mutex<()>,
     state: Mutex<State>,
 }
 
+/// Whether the host passed `kat.k8s=1` on the kernel command line.
+pub fn enabled_in_cmdline(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|arg| arg == "kat.k8s=1")
+}
+
 /// Start listening on [`K8S_PORT`]. Does not start k3s itself.
-pub fn start_service(reaper: Reaper, notifier: Notifier) -> io::Result<Arc<K8s>> {
+pub fn start_service(
+    reaper: Reaper,
+    notifier: Notifier,
+    docker: DockerStack,
+) -> io::Result<Arc<K8s>> {
     let svc = Arc::new(K8s {
         reaper,
         notifier,
+        docker,
         op_lock: Mutex::new(()),
         state: Mutex::new(State {
             generation: 0,
@@ -126,16 +139,16 @@ pub fn stop_for_shutdown() {
     }
 }
 
-/// Ensure `/etc/containerd/config.toml` has CRI plugins enabled so `k3s` can
-/// share Katamaran's `containerd` without restarting it. Called before
-/// `containerd` starts.
-pub fn ensure_containerd_cri() {
+/// Ensure `/etc/containerd/config.toml` has CRI plugins enabled. Returns
+/// `true` if the file was modified (meaning an already-running `containerd`
+/// must be restarted to load CRI).
+pub fn ensure_containerd_cri() -> bool {
     let path = "/etc/containerd/config.toml";
     let Ok(text) = fs::read_to_string(path) else {
-        return;
+        return false;
     };
     if !text.contains("disabled_plugins") {
-        return;
+        return false;
     }
     let filtered: String = text
         .lines()
@@ -144,7 +157,9 @@ pub fn ensure_containerd_cri() {
         .collect();
     if let Err(e) = fs::write(path, filtered) {
         log(&format!("update {path}: {e}"));
+        return false;
     }
+    true
 }
 
 impl K8s {
@@ -248,6 +263,13 @@ impl K8s {
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
+        if ensure_containerd_cri() {
+            let _ = k8s::write(
+                &mut *conn,
+                &K8sMsg::Progress("enabling CRI in containerd".into()),
+            );
+            self.docker.restart_containerd();
+        }
         wait_containerd()?;
 
         let _ = k8s::write(&mut *conn, &K8sMsg::Progress("starting k3s server".into()));

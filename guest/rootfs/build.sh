@@ -132,6 +132,7 @@ cat > "$R/etc/containerd/config.toml" <<'TOML'
 version = 4
 root = "/var/lib/containerd"
 state = "/run/containerd"
+disabled_plugins = ["io.containerd.grpc.v1.cri", "io.containerd.cri.v1.images", "io.containerd.cri.v1.runtime"]
 
 [grpc]
   address = "/run/containerd/containerd.sock"

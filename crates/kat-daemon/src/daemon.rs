@@ -1345,7 +1345,11 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
         },
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
-        cmdline: String::new(),
+        cmdline: if cfg.kubernetes {
+            "kat.k8s=1".into()
+        } else {
+            String::new()
+        },
         vm_bin: None,
         no_share: false,
         permissions: "caller".into(),

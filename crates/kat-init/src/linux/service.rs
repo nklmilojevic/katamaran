@@ -227,6 +227,7 @@ fn wait_ready(
 struct Inner {
     services: Mutex<[Option<Service>; 2]>,
     stopping: AtomicBool,
+    reloading_containerd: AtomicBool,
 }
 
 /// containerd and dockerd, started in order on a background thread and
@@ -247,6 +248,18 @@ impl DockerStack {
             .spawn(move || supervise(&reaper, &notifier, &inner))
             .expect("spawn docker supervisor");
         stack
+    }
+
+    /// Restart containerd cleanly (without reporting a failure or backoff)
+    /// so config changes such as enabling CRI take effect on demand.
+    pub fn restart_containerd(&self) {
+        self.inner
+            .reloading_containerd
+            .store(true, Ordering::SeqCst);
+        let services = self.inner.services.lock().unwrap();
+        if let Some(s) = &services[CONTAINERD] {
+            s.stop(STOP_TIMEOUT[CONTAINERD]);
+        }
     }
 
     /// Stop in reverse start order: dockerd first, then containerd. No
@@ -284,6 +297,10 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
         };
         if inner.stopping.load(Ordering::SeqCst) {
             return;
+        }
+        if i == CONTAINERD && inner.reloading_containerd.swap(false, Ordering::SeqCst) {
+            to_start.push(CONTAINERD);
+            continue;
         }
         let ran_for = inner.services.lock().unwrap()[i]
             .as_ref()

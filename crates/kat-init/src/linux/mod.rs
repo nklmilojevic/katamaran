@@ -211,22 +211,23 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
 
     let docker = if system {
         let reaper = Reaper::start();
-        k8s::ensure_containerd_cri();
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        if k8s::enabled_in_cmdline(&cmdline) {
+            let _ = k8s::ensure_containerd_cri();
+        }
         relay::serve_unix_on_vsock(DOCKER_PORT, service::DOCKER_SOCKET)?;
         relay::serve_tcp_on_vsock(K8S_API_PORT, k8s::API_ADDR)?;
-        if let Err(e) = k8s::start_service(reaper.clone(), notifier.clone()) {
-            notifier.failed("k8s", e.to_string());
-        }
         let nfs = nfs::Nfsd::start(reaper.clone(), notifier.clone())?;
-        let dns = std::fs::read_to_string("/proc/cmdline")
-            .ok()
-            .and_then(|c| net::parse(&c))
-            .map(|n| n.gateway);
+        let dns = net::parse(&cmdline).map(|n| n.gateway);
         if let Err(e) = machines::start(reaper.clone(), dns) {
             notifier.failed("machines", e.to_string());
         }
         trim::start_periodic();
-        Some((DockerStack::start(reaper, notifier.clone()), nfs))
+        let stack = DockerStack::start(reaper.clone(), notifier.clone());
+        if let Err(e) = k8s::start_service(reaper, notifier.clone(), stack.clone()) {
+            notifier.failed("k8s", e.to_string());
+        }
+        Some((stack, nfs))
     } else {
         None
     };
