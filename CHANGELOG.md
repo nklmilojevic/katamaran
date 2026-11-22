@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.1 - 2026-11-22
+
+This release makes upgrades safer. The daemon now restarts after an upgrade, so the CLI and the app do not talk to an old daemon.
+
+### Fixes
+
+- The app runs `katamaran setup --default` again when the installed app version changes. Sparkle, Homebrew cask, and DMG upgrades now reload the `dev.katamaran.daemon` LaunchAgent.
+- `kat setup` keeps a running VM active when `launch_at_login = false`. The VM does not stop during an upgrade.
+- `kat restart` now restarts a daemon that has a different version. `kat status` and `kat version` show an upgrade hint when the daemon and CLI versions differ.
+
 ## v0.6.0 - 2026-11-22
 
 This release adds Kubernetes Pods and Services views to the main window. You can now see and manage your cluster without `kubectl` on the Mac.
