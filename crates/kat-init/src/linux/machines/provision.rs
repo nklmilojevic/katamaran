@@ -5,39 +5,111 @@
 //! no distro tool is needed; only sudo itself is installed after the first
 //! boot when the image lacks it.
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{PermissionsExt, lchown};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown};
+use std::path::{Component, Path, PathBuf};
 
 /// Groups that grant admin rights on some distro; the user joins the ones
 /// the image has.
 const ADMIN_GROUPS: [&str; 3] = ["sudo", "wheel", "adm"];
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Resolve `rel` strictly inside `rootfs`, interpreting absolute symlinks
+/// relative to `rootfs` (never PID 1's `/`) and clamping `..` at `rootfs`.
+pub(super) fn resolve_in_rootfs(rootfs: &Path, rel: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let mut parts: Vec<OsString> = Vec::new();
+    let mut pending: VecDeque<OsString> = VecDeque::new();
+    let mut hops = 0usize;
+
+    let push_front_path = |pending: &mut VecDeque<OsString>, p: &Path| {
+        let comps: Vec<OsString> = p
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(n) => Some(n.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect();
+        for c in comps.into_iter().rev() {
+            pending.push_front(c);
+        }
+    };
+
+    push_front_path(&mut pending, rel.as_ref());
+
+    while let Some(comp) = pending.pop_front() {
+        if comp == ".." {
+            parts.pop();
+            continue;
+        }
+        let mut candidate = rootfs.to_path_buf();
+        for p in &parts {
+            candidate.push(p);
+        }
+        candidate.push(&comp);
+        match fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(io::Error::other(format!(
+                        "too many symlinks resolving {}",
+                        rel.as_ref().display()
+                    )));
+                }
+                let target = fs::read_link(&candidate)?;
+                if target.is_absolute() {
+                    parts.clear();
+                }
+                push_front_path(&mut pending, &target);
+            }
+            Ok(_) => parts.push(comp),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => parts.push(comp),
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut out = rootfs.to_path_buf();
+    for p in parts {
+        out.push(p);
+    }
+    Ok(out)
+}
 
 pub fn add_user(rootfs: &Path, user: &str, uid: u32) -> io::Result<()> {
-    let etc = rootfs.join("etc");
     let shell = ["bin/bash", "usr/bin/bash", "bin/zsh"]
         .iter()
-        .find(|s| rootfs.join(s).exists())
+        .find(|s| {
+            resolve_in_rootfs(rootfs, s)
+                .ok()
+                .and_then(|p| fs::symlink_metadata(p).ok())
+                .is_some_and(|m| m.is_file())
+        })
         .map(|s| format!("/{s}"))
         .unwrap_or_else(|| "/bin/sh".into());
     let home = format!("/home/{user}");
-    edit(&etc.join("passwd"), |t| passwd(t, user, uid, &home, &shell))?;
-    edit(&etc.join("group"), |t| group(t, user, uid))?;
-    if etc.join("shadow").exists() {
-        edit(&etc.join("shadow"), |t| shadow(t, user))?;
+    let passwd_path = resolve_in_rootfs(rootfs, "etc/passwd")?;
+    let group_path = resolve_in_rootfs(rootfs, "etc/group")?;
+    edit(&passwd_path, |t| passwd(t, user, uid, &home, &shell))?;
+    edit(&group_path, |t| group(t, user, uid))?;
+    let shadow_path = resolve_in_rootfs(rootfs, "etc/shadow")?;
+    if fs::symlink_metadata(&shadow_path).is_ok() {
+        edit(&shadow_path, |t| shadow(t, user))?;
     }
-    let home_dir = rootfs.join(home.trim_start_matches('/'));
-    if !home_dir.exists() {
+    let home_dir = resolve_in_rootfs(rootfs, home.trim_start_matches('/'))?;
+    if fs::symlink_metadata(&home_dir).is_err() {
         fs::create_dir_all(&home_dir)?;
-        copy_tree(&etc.join("skel"), &home_dir, uid)?;
+        let skel_dir = resolve_in_rootfs(rootfs, "etc/skel")?;
+        copy_tree(&skel_dir, &home_dir, uid)?;
     }
     lchown(&home_dir, Some(uid), Some(uid))?;
     fs::set_permissions(&home_dir, fs::Permissions::from_mode(0o750))?;
 
-    let sudoers = etc.join("sudoers.d");
+    let sudoers = resolve_in_rootfs(rootfs, "etc/sudoers.d")?;
     fs::create_dir_all(&sudoers)?;
-    let file = sudoers.join("katamaran");
+    let file = resolve_in_rootfs(rootfs, "etc/sudoers.d/katamaran")?;
     fs::write(&file, format!("{user} ALL=(ALL:ALL) NOPASSWD: ALL\n"))?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o440))?;
     Ok(())
@@ -45,11 +117,14 @@ pub fn add_user(rootfs: &Path, user: &str, uid: u32) -> io::Result<()> {
 
 fn edit(path: &Path, f: impl FnOnce(&str) -> String) -> io::Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
-    let mode = fs::metadata(path)
-        .map(|m| m.permissions().mode())
-        .unwrap_or(0o644);
+    let meta = fs::symlink_metadata(path).ok();
+    let mode = meta.as_ref().map_or(0o644, |m| m.permissions().mode());
+    let owner = meta.as_ref().map(|m| (m.uid(), m.gid()));
     let tmp = path.with_extension("katamaran-tmp");
     fs::write(&tmp, f(&text))?;
+    if let Some((uid, gid)) = owner {
+        lchown(&tmp, Some(uid), Some(gid))?;
+    }
     fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     fs::rename(tmp, path)
 }
@@ -201,6 +276,30 @@ mod tests {
                 .unwrap()
                 .contains("NOPASSWD")
         );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn resolves_symlinks_strictly_inside_rootfs() {
+        let d = std::env::temp_dir().join(format!("kat-rootfs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("usr/bin")).unwrap();
+        fs::create_dir_all(d.join("etc")).unwrap();
+        fs::write(d.join("usr/bin/bash"), "").unwrap();
+        // Absolute symlink /bin -> /usr/bin stays inside rootfs.
+        std::os::unix::fs::symlink("/usr/bin", d.join("bin")).unwrap();
+        assert_eq!(
+            resolve_in_rootfs(&d, "bin/bash").unwrap(),
+            d.join("usr/bin/bash")
+        );
+        // `..` is clamped at rootfs.
+        assert_eq!(
+            resolve_in_rootfs(&d, "../../etc/passwd").unwrap(),
+            d.join("etc/passwd")
+        );
+        // Self-referencing absolute symlink fails as a loop instead of escaping.
+        std::os::unix::fs::symlink("/etc/hostname", d.join("etc/hostname")).unwrap();
+        assert!(resolve_in_rootfs(&d, "etc/hostname").is_err());
         fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -469,19 +469,43 @@ impl Msg {
 }
 
 pub fn write_msg<W: Write>(w: &mut W, msg: &Msg) -> io::Result<()> {
-    w.write_all(&msg.encode())?;
+    let frame = msg.encode();
+    let len = frame.len() - 4;
+    if len > MAX_FRAME {
+        return Err(ProtoError::FrameTooLarge(len).into());
+    }
+    w.write_all(&frame)?;
     w.flush()
+}
+
+/// Read a 4-byte little-endian frame length. Returns `Ok(None)` on a clean
+/// 0-byte EOF at a frame boundary, and `Err(UnexpectedEof)` if 1–3 bytes were
+/// read before EOF.
+pub(crate) fn read_len<R: Read>(r: &mut R) -> io::Result<Option<usize>> {
+    let mut buf = [0u8; 4];
+    let mut n = 0;
+    while n < 4 {
+        match r.read(&mut buf[n..]) {
+            Ok(0) if n == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated frame length",
+                ));
+            }
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(u32::from_le_bytes(buf) as usize))
 }
 
 /// Read one frame. Returns `Ok(None)` on a clean EOF at a frame boundary.
 pub fn read_msg<R: Read>(r: &mut R) -> io::Result<Option<Msg>> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_le_bytes(len) as usize;
+    let Some(len) = read_len(r)? else {
+        return Ok(None);
+    };
     if len < 2 {
         return Err(ProtoError::Truncated.into());
     }
@@ -738,5 +762,27 @@ mod tests {
     fn eof_inside_frame_is_an_error() {
         let f = Msg::Ping { seq: 1 }.encode();
         assert!(read_msg(&mut &f[..f.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn truncated_length_header_returns_unexpected_eof() {
+        assert_eq!(read_msg(&mut [].as_slice()).unwrap(), None);
+        for n in 1..=3 {
+            let bytes = [1u8, 2, 3];
+            let err = read_msg(&mut &bytes[..n]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "len {n}");
+        }
+    }
+
+    #[test]
+    fn write_msg_rejects_oversized_frame() {
+        let msg = Msg::ServiceFailed {
+            name: "x".into(),
+            error: "a".repeat(MAX_FRAME),
+        };
+        let mut out = Vec::new();
+        let err = write_msg(&mut out, &msg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.is_empty());
     }
 }

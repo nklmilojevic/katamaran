@@ -80,6 +80,7 @@ fn relay_watches(dev: &File, mounts: &[(u64, String)], notifier: &Notifier) -> i
     let mut first = true;
     loop {
         let n = match (&*dev).read(&mut buf) {
+            Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),

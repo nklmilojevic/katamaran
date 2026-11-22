@@ -219,9 +219,59 @@ pub fn accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
             return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
         }
         let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
+        if matches!(
+            e.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionAborted
+        ) || e.raw_os_error() == Some(libc::EPROTO)
+        {
+            continue;
         }
+        return Err(e);
+    }
+}
+
+pub fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+pub fn pidfd_send_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether the process referred to by `pidfd` has not yet exited.
+pub fn pidfd_alive(pidfd: &OwnedFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        return rc == 0;
     }
 }
 

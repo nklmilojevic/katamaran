@@ -16,7 +16,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::{Cursor, HEADER, MAX_FRAME, ProtoError, put_str, put_u32, put_u64};
+use crate::{Cursor, HEADER, MAX_FRAME, ProtoError, put_str, put_u32, put_u64, read_len};
 
 /// Payload bytes per `Data`/`Stdout`/`Stderr` frame.
 pub const CHUNK: usize = 64 << 10;
@@ -352,19 +352,20 @@ impl MachineMsg {
 }
 
 pub fn write<W: Write>(w: &mut W, msg: &MachineMsg) -> io::Result<()> {
-    w.write_all(&msg.encode())?;
+    let frame = msg.encode();
+    let len = frame.len() - 4;
+    if len > MAX_FRAME {
+        return Err(ProtoError::FrameTooLarge(len).into());
+    }
+    w.write_all(&frame)?;
     w.flush()
 }
 
 /// Read one frame. Returns `Ok(None)` on a clean EOF at a frame boundary.
 pub fn read<R: Read>(r: &mut R) -> io::Result<Option<MachineMsg>> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_le_bytes(len) as usize;
+    let Some(len) = read_len(r)? else {
+        return Ok(None);
+    };
     if len < 2 {
         return Err(ProtoError::Truncated.into());
     }
@@ -525,5 +526,19 @@ mod tests {
         }
         assert!(user_ok("nkl") && user_ok("_svc") && user_ok("a.b-c"));
         assert!(!user_ok("") && !user_ok("Root") && !user_ok("a b") && !user_ok("1x"));
+    }
+
+    #[test]
+    fn truncated_length_header_and_oversized_write() {
+        assert_eq!(read(&mut [].as_slice()).unwrap(), None);
+        for n in 1..=3 {
+            let bytes = [1u8, 2, 3];
+            let err = read(&mut &bytes[..n]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "len {n}");
+        }
+        let mut out = Vec::new();
+        let err = write(&mut out, &MachineMsg::Error("e".repeat(MAX_FRAME))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.is_empty());
     }
 }
