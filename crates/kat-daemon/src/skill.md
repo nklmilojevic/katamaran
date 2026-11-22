@@ -1,6 +1,6 @@
 # Using katamaran
 
-`kat` and `katamaran` are the same binary. Katamaran runs Docker (`containerd` and `dockerd`) and LXC Linux machines inside one lightweight Linux VM on Apple silicon Macs. It does not include Kubernetes.
+`kat` and `katamaran` are the same binary. Katamaran runs Docker (`containerd` and `dockerd`) and LXC Linux machines inside one lightweight Linux VM on Apple silicon Macs. It also includes an optional single-node Kubernetes (`k3s`) cluster (`kat k8s`) that stays off by default with zero overhead.
 
 ## VM lifecycle
 
@@ -48,9 +48,24 @@ kat machine stop dev
 kat machine delete dev
 ```
 
+## Kubernetes (optional)
+
+Manage the optional single-node `k3s` cluster inside the VM (off by default, zero overhead when stopped; merges the `katamaran` context into `~/.kube/config`):
+
+```sh
+kat k8s start                             # Enable and start k3s (downloads on first use)
+kat k8s status [--json]                   # Cluster state, API endpoint, context, DNS
+kat k8s sync-images                       # Mirror local Docker images into k3s
+kat k8s kubeconfig [--path]               # Print kubeconfig YAML or file path
+kat k8s dns status|install|uninstall      # Manage *.k8s.kat.local DNS on macOS
+kat k8s forward <ip>:<port> [--local P]   # Forward a local TCP port to a Pod/Service IP
+kat k8s stop                              # Stop k3s and disable auto-start
+kat k8s reset                             # Stop k3s and wipe cluster state and volumes
+```
+
 ## Configuration
 
-Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`).
+Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`), except `launch_at_login` and `kubernetes`, which apply immediately.
 
 ```sh
 kat config get
@@ -58,7 +73,7 @@ kat config set cpus=8 memory=12G pause_on_sleep=on
 kat restart
 ```
 
-Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`.
+Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`.
 
 ## Files in Finder
 

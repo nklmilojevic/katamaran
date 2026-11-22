@@ -38,11 +38,20 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release list --repo "$REPO" --exclude-drafts --limit 1 --json tagName > "$RUNNER_TEMP/releases.json"
-          if python3 -c 'import json,sys; sys.exit(not bool(json.load(open(sys.argv[1]))))' "$RUNNER_TEMP/releases.json"; then
+          gh api "repos/$REPO/releases?per_page=15" > "$RUNNER_TEMP/releases.json"
+          if python3 -c '
+          import json, sys
+          releases = json.load(open(sys.argv[1]))
+          stable = [r for r in releases if not r.get("draft") and not r.get("prerelease")][:10]
+          has_sparkle = any(
+              any(a.get("name") == "sparkle.json" for a in r.get("assets", []))
+              for r in stable
+          )
+          sys.exit(0 if has_sparkle else 1)
+          ' "$RUNNER_TEMP/releases.json"; then
             python3 scripts/release/appcast.py --repo "$REPO" --output docs/dist/appcast.xml
           else
-            echo 'No published releases yet. Publishing docs without appcast.xml.'
+            echo 'No published non-prerelease with sparkle.json yet. Publishing docs without appcast.xml.'
           fi
           touch docs/dist/.nojekyll
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5

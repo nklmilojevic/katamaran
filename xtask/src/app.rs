@@ -277,15 +277,36 @@ pub fn info_plist(version: &str) -> String {
     info_plist_full(version, version, None)
 }
 
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 pub fn info_plist_full(
     short_version: &str,
     build_version: &str,
     sparkle: Option<(&str, &str)>,
 ) -> String {
+    let short_version = xml_escape(short_version);
+    let build_version = xml_escape(build_version);
     let sparkle_entries = match sparkle {
-        Some((feed_url, public_key)) => format!(
-            "\t<key>SUFeedURL</key>\n\t<string>{feed_url}</string>\n\t<key>SUPublicEDKey</key>\n\t<string>{public_key}</string>\n"
-        ),
+        Some((feed_url, public_key)) => {
+            let feed_url = xml_escape(feed_url);
+            let public_key = xml_escape(public_key);
+            format!(
+                "\t<key>SUFeedURL</key>\n\t<string>{feed_url}</string>\n\t<key>SUPublicEDKey</key>\n\t<string>{public_key}</string>\n"
+            )
+        }
         None => String::new(),
     };
     format!(
@@ -460,6 +481,41 @@ mod tests {
         let text = std::fs::read_to_string(&f).unwrap();
         assert!(text.contains("<key>LSUIElement</key>\n\t<true/>"));
         assert!(text.contains("<string>1.2.3</string>"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn info_plist_escapes_xml_special_chars() {
+        let dir = std::env::temp_dir().join(format!("xtask-plist-xml-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Info.plist");
+        let plist = super::info_plist_full(
+            "1.2.3-beta<1>&\"'",
+            "42&<build>",
+            Some((
+                "https://example.com/appcast.xml?channel=beta&arch=arm64&q=\"test\"'",
+                "key+<foo>&bar",
+            )),
+        );
+        std::fs::write(&f, &plist).unwrap();
+        let out = std::process::Command::new("plutil")
+            .arg("-lint")
+            .arg(&f)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "plutil -lint failed:\nstdout: {}\nstderr: {}\nplist:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            plist,
+        );
+        assert!(plist.contains(
+            "https://example.com/appcast.xml?channel=beta&amp;arch=arm64&amp;q=&quot;test&quot;&apos;"
+        ));
+        assert!(plist.contains("key+&lt;foo&gt;&amp;bar"));
+        assert!(plist.contains("1.2.3-beta&lt;1&gt;&amp;&quot;&apos;"));
+        assert!(plist.contains("42&amp;&lt;build&gt;"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

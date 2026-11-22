@@ -249,6 +249,22 @@ echo "image store: $(du -sh $R/var/lib/containerd | cut -f1) in /var/lib/contain
 EOF
 }
 
+file_size() {
+    if [[ "$(uname -s)" == Darwin ]]; then
+        stat -f %z "$1"
+    else
+        stat -c %s "$1"
+    fi
+}
+
+file_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -c1-16
+    else
+        sha256sum "$1" | cut -c1-16
+    fi
+}
+
 cmd=${1:-build}
 case $cmd in
     build)
@@ -256,7 +272,7 @@ case $cmd in
         start=$SECONDS
         build
         echo "built guest/out/rootfs.erofs in $((SECONDS - start)) s:" \
-             "$(stat -f %z "$OUT/rootfs.erofs") bytes ($(du -h "$OUT/rootfs.erofs" | cut -f1)), sha256 $(shasum -a 256 "$OUT/rootfs.erofs" | cut -c1-16)"
+             "$(file_size "$OUT/rootfs.erofs") bytes ($(du -h "$OUT/rootfs.erofs" | cut -f1)), sha256 $(file_sha256 "$OUT/rootfs.erofs")"
         verify
         ;;
     verify) verify ;;
