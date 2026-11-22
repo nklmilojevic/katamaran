@@ -128,6 +128,37 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(!FirstRun.shouldRun(bundlePath: "/Applications/Katamaran.app", env: ["KATAMARAN_HOME": "/tmp/x"]))
 }
 
+@Test func firstRunRerunsSetupOnUpgradeAndVersionMismatch() {
+    #expect(FirstRun.bundleStamp(info: [
+        "CFBundleShortVersionString": "0.6.0",
+        "CFBundleVersion": "250",
+    ]) == "0.6.0 (250)")
+    #expect(FirstRun.bundleStamp(info: ["CFBundleShortVersionString": "0.6.0"]) == "0.6.0")
+    #expect(FirstRun.bundleStamp(info: ["CFBundleVersion": "250"]) == "250")
+    #expect(FirstRun.bundleStamp(info: ["CFBundleShortVersionString": "  "]) == nil)
+    #expect(FirstRun.bundleStamp(info: nil) == nil)
+
+    // Initial install runs setup.
+    #expect(FirstRun.launchAction(setupDone: false, lastStamp: nil, currentStamp: "0.6.0 (250)") == .setup)
+    // Upgrade from an earlier release that had no version stamp runs setup.
+    #expect(FirstRun.launchAction(setupDone: true, lastStamp: nil, currentStamp: "0.6.0 (250)") == .setup)
+    // Upgrade to a newer version or build runs setup.
+    #expect(FirstRun.launchAction(setupDone: true, lastStamp: "0.5.0 (210)", currentStamp: "0.6.0 (250)") == .setup)
+    #expect(FirstRun.launchAction(setupDone: true, lastStamp: "0.6.0 (250)", currentStamp: "0.6.0 (251)") == .setup)
+    // Same version only ensures the Docker context.
+    #expect(FirstRun.launchAction(setupDone: true, lastStamp: "0.6.0 (250)", currentStamp: "0.6.0 (250)") == .useContext)
+    // Missing bundle version falls back to setupDone.
+    #expect(FirstRun.launchAction(setupDone: true, lastStamp: nil, currentStamp: nil) == .useContext)
+
+    // Live daemon version mismatch triggers a one-shot upgrade.
+    #expect(FirstRun.shouldUpgradeDaemon(daemonVersion: "0.1.0", appVersion: "0.6.0", alreadyTried: false, setupInFlight: false))
+    #expect(!FirstRun.shouldUpgradeDaemon(daemonVersion: "0.6.0", appVersion: "0.6.0", alreadyTried: false, setupInFlight: false))
+    #expect(!FirstRun.shouldUpgradeDaemon(daemonVersion: "0.1.0", appVersion: "0.6.0", alreadyTried: true, setupInFlight: false))
+    #expect(!FirstRun.shouldUpgradeDaemon(daemonVersion: "0.1.0", appVersion: "0.6.0", alreadyTried: false, setupInFlight: true))
+    #expect(!FirstRun.shouldUpgradeDaemon(daemonVersion: nil, appVersion: "0.6.0", alreadyTried: false, setupInFlight: false))
+    #expect(!FirstRun.shouldUpgradeDaemon(daemonVersion: "0.1.0", appVersion: "", alreadyTried: false, setupInFlight: false))
+}
+
 @Test func machineShellScriptQuotesSingleQuotesAndSpecialChars() {
     let script = MachineShellCommand.script(
         name: "dev'$(id);rm -rf /",
