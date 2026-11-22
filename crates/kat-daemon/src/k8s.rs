@@ -10,18 +10,39 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
+
+const MAX_CONNS: usize = 256;
+
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn try_acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| ConnGuard(Arc::clone(active)))
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub const K3S_VERSION: &str = "v1.37.2+k3s1";
 pub const K3S_ARM64_SHA256: &str =
@@ -124,9 +145,19 @@ pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
         if n == 0 {
             break;
         }
-        k8s::write(&mut s, &K8sMsg::Data(buf[..n].to_vec()))?;
+        if let Err(e) = k8s::write(&mut s, &K8sMsg::Data(buf[..n].to_vec())) {
+            return match read_answer(&mut s, progress) {
+                Err(guest) => Err(guest),
+                Ok(_) => Err(e.into()),
+            };
+        }
     }
-    k8s::write(&mut s, &K8sMsg::DataEnd)?;
+    if let Err(e) = k8s::write(&mut s, &K8sMsg::DataEnd) {
+        return match read_answer(&mut s, progress) {
+            Err(guest) => Err(guest),
+            Ok(_) => Err(e.into()),
+        };
+    }
     match read_answer(&mut s, progress)? {
         K8sMsg::Done => Ok(()),
         other => bail!("unexpected install response {other:?}"),
@@ -138,10 +169,13 @@ fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
     if path.is_file() && verify_sha256(&path, K3S_ARM64_SHA256).is_ok() {
         return Ok(path);
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("part");
+    let parent = path
+        .parent()
+        .with_context(|| format!("missing parent for {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!("k3s-arm64.{pid}.{seq}.part"));
     let _ = fs::remove_file(&tmp);
     progress(&format!("downloading k3s {K3S_VERSION} (~74 MB)"));
     if let Err(e) = crate::machines::curl(K3S_ARM64_URL, &tmp) {
@@ -153,7 +187,14 @@ fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, &path).with_context(|| format!("save {}", path.display()))?;
+    if let Err(e) = File::open(&tmp).and_then(|f| f.sync_all()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("sync {}", tmp.display()));
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("save {}", path.display()));
+    }
     Ok(path)
 }
 
@@ -184,6 +225,7 @@ impl ApiProxy {
         let port = addr.port();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let active = Arc::new(AtomicUsize::new(0));
         let thread = thread::Builder::new()
             .name(format!("k8s-api-{port}"))
             .spawn(move || {
@@ -191,13 +233,29 @@ impl ApiProxy {
                     if flag.load(Ordering::SeqCst) {
                         return;
                     }
-                    let Ok(client) = conn else { continue };
+                    let client = match conn {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("katamaran: k8s api accept: {e}");
+                            thread::sleep(Duration::from_millis(50));
+                            continue;
+                        }
+                    };
+                    let Some(guard) = ConnGuard::try_acquire(&active, MAX_CONNS) else {
+                        eprintln!("katamaran: k8s api: connection limit ({MAX_CONNS}) reached");
+                        continue;
+                    };
                     let sock = api_socket.clone();
-                    let _ = thread::Builder::new()
-                        .name("k8s-api-conn".into())
-                        .spawn(move || {
-                            let _ = relay_tcp_to_unix(client, &sock);
-                        });
+                    if let Err(e) =
+                        thread::Builder::new()
+                            .name("k8s-api-conn".into())
+                            .spawn(move || {
+                                let _guard = guard;
+                                let _ = relay_tcp_to_unix(client, &sock);
+                            })
+                    {
+                        eprintln!("katamaran: k8s api spawn worker: {e}");
+                    }
                 }
             })?;
         Ok(ApiProxy {
@@ -227,10 +285,12 @@ fn relay_tcp_to_unix(client: TcpStream, sock: &Path) -> io::Result<()> {
     let _ = client.set_nodelay(true);
     let upstream = UnixStream::connect(sock)?;
     let (mut c_read, mut u_write) = (client.try_clone()?, upstream.try_clone()?);
-    let up = thread::spawn(move || {
-        let _ = io::copy(&mut c_read, &mut u_write);
-        let _ = u_write.shutdown(Shutdown::Write);
-    });
+    let up = thread::Builder::new()
+        .name("k8s-api-up".into())
+        .spawn(move || {
+            let _ = io::copy(&mut c_read, &mut u_write);
+            let _ = u_write.shutdown(Shutdown::Write);
+        })?;
     let (mut u_read, mut c_write) = (upstream, client);
     let _ = io::copy(&mut u_read, &mut c_write);
     let _ = c_write.shutdown(Shutdown::Write);
@@ -250,15 +310,33 @@ pub fn forward_guest_tcp(
         .with_context(|| format!("bind 127.0.0.1:{local_port}"))?;
     let bound = listener.local_addr()?.port();
     println!("Forwarding 127.0.0.1:{bound} -> {guest_addr}:{guest_port} (Ctrl-C to stop)");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
-        let Ok(client) = conn else { continue };
+        let client = match conn {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("katamaran: k8s forward accept: {e}");
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        let Some(guard) = ConnGuard::try_acquire(&active, MAX_CONNS) else {
+            eprintln!("katamaran: k8s forward: connection limit ({MAX_CONNS}) reached");
+            continue;
+        };
         let home = home.to_path_buf();
         let addr = guest_addr.clone();
-        thread::spawn(move || {
-            if let Err(e) = relay_k8s_connect(&home, client, &addr, guest_port) {
-                eprintln!("katamaran: k8s forward {addr}:{guest_port}: {e}");
-            }
-        });
+        if let Err(e) = thread::Builder::new()
+            .name("k8s-fwd-conn".into())
+            .spawn(move || {
+                let _guard = guard;
+                if let Err(e) = relay_k8s_connect(&home, client, &addr, guest_port) {
+                    eprintln!("katamaran: k8s forward {addr}:{guest_port}: {e}");
+                }
+            })
+        {
+            eprintln!("katamaran: k8s forward spawn worker: {e}");
+        }
     }
     Ok(())
 }
@@ -285,41 +363,50 @@ pub fn relay_k8s_connect(
     }
     let mut sock_write = sock.try_clone()?;
     let mut client_read = client.try_clone()?;
-    let up = thread::spawn(move || {
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            match client_read.read(&mut buf) {
-                Ok(0) => {
-                    let _ = k8s::write(&mut sock_write, &K8sMsg::DataEnd);
-                    return;
-                }
-                Ok(n) => {
-                    if k8s::write(&mut sock_write, &K8sMsg::Data(buf[..n].to_vec())).is_err() {
+    let up = thread::Builder::new()
+        .name("k8s-fwd-up".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match client_read.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = k8s::write(&mut sock_write, &K8sMsg::DataEnd);
+                        return;
+                    }
+                    Ok(n) => {
+                        if k8s::write(&mut sock_write, &K8sMsg::Data(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        let _ = k8s::write(&mut sock_write, &K8sMsg::DataEnd);
                         return;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    let _ = k8s::write(&mut sock_write, &K8sMsg::DataEnd);
-                    return;
-                }
             }
-        }
-    });
+        })
+        .context("spawn k8s forward reader")?;
     let mut client_write = client;
-    while let Ok(Some(msg)) = k8s::read(&mut sock) {
-        match msg {
-            K8sMsg::Data(d) => {
+    let mut clean_eof = false;
+    loop {
+        match k8s::read(&mut sock) {
+            Ok(Some(K8sMsg::Data(d))) => {
                 if client_write.write_all(&d).is_err() {
                     break;
                 }
             }
-            K8sMsg::DataEnd => {
-                let _ = client_write.shutdown(Shutdown::Write);
+            Ok(Some(K8sMsg::DataEnd)) => {
+                clean_eof = true;
                 break;
             }
-            _ => break,
+            Ok(Some(_)) | Ok(None) | Err(_) => break,
         }
+    }
+    if clean_eof {
+        let _ = client_write.shutdown(Shutdown::Write);
+    } else {
+        let _ = client_write.shutdown(Shutdown::Both);
     }
     let _ = up.join();
     Ok(())
@@ -389,6 +476,51 @@ fn write_private_atomic(target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
+    fs::create_dir_all(kube_dir).with_context(|| format!("create {}", kube_dir.display()))?;
+    let lock_path = kube_dir.join(".katamaran-kubeconfig.lock");
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(f);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e).with_context(|| format!("flock {}", lock_path.display()));
+        }
+    }
+}
+
+/// Resolve symlinks so atomic renames update the target file rather than
+/// clobbering dotfiles or Nix symlinks.
+fn resolve_symlink_target(path: &Path) -> anyhow::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match fs::canonicalize(path) {
+            Ok(real) => Ok(real),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let link =
+                    fs::read_link(path).with_context(|| format!("read_link {}", path.display()))?;
+                Ok(if link.is_absolute() {
+                    link
+                } else {
+                    path.parent().unwrap_or_else(|| Path::new(".")).join(link)
+                })
+            }
+            Err(e) => Err(e).with_context(|| format!("canonicalize {}", path.display())),
+        },
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
 /// Save `<home>/run/kubeconfig.yaml` and merge the context into `~/.kube/config`
 /// (without clobbering any existing contexts).
 pub fn write_and_merge_kubeconfig(
@@ -397,19 +529,42 @@ pub fn write_and_merge_kubeconfig(
     api_port: u16,
 ) -> anyhow::Result<PathBuf> {
     let ctx = context_name()?;
-    let rewritten = rewrite_kubeconfig(raw, &ctx, api_port);
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let kubectl = resolve_kubectl_bin();
+    write_and_merge_kubeconfig_in(home, user_home.as_deref(), raw, api_port, &ctx, &kubectl)
+}
+
+fn write_and_merge_kubeconfig_in(
+    home: &Path,
+    user_home: Option<&Path>,
+    raw: &str,
+    api_port: u16,
+    ctx: &str,
+    kubectl: &Path,
+) -> anyhow::Result<PathBuf> {
+    let rewritten = rewrite_kubeconfig(raw, ctx, api_port);
     let local_path = kubeconfig_path(home);
     write_private_atomic(&local_path, rewritten.as_bytes())?;
 
-    if let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(user_home) = user_home {
         let kube_dir = user_home.join(".kube");
+        let _lock = lock_kubeconfig_dir(&kube_dir)?;
         let user_cfg = kube_dir.join("config");
-        if !user_cfg.exists() {
-            write_private_atomic(&user_cfg, rewritten.as_bytes())
-                .with_context(|| format!("write {}", user_cfg.display()))?;
-        } else {
-            merge_into_user_kubeconfig(&user_cfg, &local_path, &ctx)
-                .with_context(|| format!("merge context {ctx} into {}", user_cfg.display()))?;
+        let target_cfg = resolve_symlink_target(&user_cfg)?;
+        match fs::read(&target_cfg) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                write_private_atomic(&target_cfg, rewritten.as_bytes())
+                    .with_context(|| format!("write {}", target_cfg.display()))?;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("read {}", target_cfg.display()));
+            }
+            Ok(existing) => {
+                merge_into_user_kubeconfig(&target_cfg, &existing, &local_path, ctx, kubectl)
+                    .with_context(|| {
+                        format!("merge context {ctx} into {}", target_cfg.display())
+                    })?;
+            }
         }
     }
     Ok(local_path)
@@ -432,29 +587,140 @@ fn find_kubectl() -> PathBuf {
     PathBuf::from("kubectl")
 }
 
-fn kubectl_cmd() -> Command {
-    let mut cmd = Command::new("kubectl");
+fn resolve_kubectl_bin() -> PathBuf {
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
-            if dir.join("kubectl").is_file() {
-                return cmd;
+            let candidate = dir.join("kubectl");
+            if candidate.is_file() {
+                return candidate;
             }
         }
     }
-    cmd = Command::new(find_kubectl());
-    cmd
+    find_kubectl()
 }
 
-/// Merge `local_cfg` into `user_cfg` using a private temporary copy so the
+/// Merge `local_cfg` into `target_cfg` using a private temporary copy so the
 /// live `~/.kube/config` is never mutated if `kubectl` is missing or fails.
-fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> anyhow::Result<()> {
-    let existing = fs::read(user_cfg).with_context(|| format!("read {}", user_cfg.display()))?;
-    let parent = user_cfg
+fn merge_into_user_kubeconfig(
+    target_cfg: &Path,
+    existing: &[u8],
+    local_cfg: &Path,
+    ctx: &str,
+    kubectl: &Path,
+) -> anyhow::Result<()> {
+    let parent = target_cfg
         .parent()
-        .with_context(|| format!("missing parent for {}", user_cfg.display()))?;
+        .with_context(|| format!("missing parent for {}", target_cfg.display()))?;
     let pid = std::process::id();
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let scratch = parent.join(format!(".config.katamaran.scratch.{pid}.{seq}.tmp"));
+    let _ = fs::remove_file(&scratch);
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&scratch)
+            .with_context(|| format!("create {}", scratch.display()))?;
+        f.write_all(existing)?;
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        // Strip any stale entry for `ctx` from the scratch copy only.
+        for sub in ["delete-context", "delete-cluster", "delete-user"] {
+            match Command::new(kubectl)
+                .args(["config", sub, ctx])
+                .env("KUBECONFIG", &scratch)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "katamaran: warning: kubectl not found; wrote {} without merging into {}",
+                        local_cfg.display(),
+                        target_cfg.display()
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e).context("run kubectl"),
+            }
+        }
+        let combined = format!("{}:{}", scratch.display(), local_cfg.display());
+        let out = match Command::new(kubectl)
+            .args(["config", "view", "--raw"])
+            .env("KUBECONFIG", combined)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!(
+                    "katamaran: warning: kubectl not found; wrote {} without merging into {}",
+                    local_cfg.display(),
+                    target_cfg.display()
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e).context("run kubectl config view --raw"),
+        };
+        if !out.status.success() {
+            bail!(
+                "kubectl config view --raw failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        if out.stdout.is_empty() {
+            bail!("kubectl config view --raw produced empty output");
+        }
+        write_private_atomic(target_cfg, &out.stdout)
+    })();
+
+    let _ = fs::remove_file(&scratch);
+    result
+}
+
+/// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
+pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let kubectl = resolve_kubectl_bin();
+    remove_kubeconfig_in(home, user_home.as_deref(), ctx, &kubectl)
+}
+
+fn remove_kubeconfig_in(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+    kubectl: &Path,
+) -> anyhow::Result<()> {
+    if let Err(e) = fs::remove_file(kubeconfig_path(home))
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(e).with_context(|| format!("remove {}", kubeconfig_path(home).display()));
+    }
+    let Some(user_home) = user_home else {
+        return Ok(());
+    };
+    let kube_dir = user_home.join(".kube");
+    if !kube_dir.is_dir() {
+        return Ok(());
+    }
+    let _lock = lock_kubeconfig_dir(&kube_dir)?;
+    let user_cfg = kube_dir.join("config");
+    let target_cfg = resolve_symlink_target(&user_cfg)?;
+    let existing = match fs::read(&target_cfg) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", target_cfg.display())),
+    };
+    let parent = target_cfg
+        .parent()
+        .with_context(|| format!("missing parent for {}", target_cfg.display()))?;
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let scratch = parent.join(format!(".config.katamaran.rm.{pid}.{seq}.tmp"));
     let _ = fs::remove_file(&scratch);
     {
         let mut f = OpenOptions::new()
@@ -467,59 +733,76 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
     }
 
     let result = (|| -> anyhow::Result<()> {
-        // Strip any stale entry for `ctx` from the scratch copy only.
-        for sub in ["delete-context", "delete-cluster", "delete-user"] {
-            let _ = kubectl_cmd()
-                .args(["config", sub, ctx])
-                .env("KUBECONFIG", &scratch)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .context("run kubectl (is kubectl installed on PATH?)")?;
-        }
-        let combined = format!("{}:{}", scratch.display(), local_cfg.display());
-        let out = kubectl_cmd()
-            .args(["config", "view", "--raw", "--flatten"])
-            .env("KUBECONFIG", combined)
+        let cur = match Command::new(kubectl)
+            .args(["config", "current-context"])
+            .env("KUBECONFIG", &scratch)
             .stdin(Stdio::null())
             .output()
-            .context("run kubectl config view --raw --flatten")?;
-        if !out.status.success() {
-            bail!(
-                "kubectl config view --raw --flatten failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        {
+            Ok(o) => Some(o),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!(
+                    "katamaran: warning: kubectl not found; could not remove context {ctx} from {}",
+                    target_cfg.display()
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e).context("run kubectl config current-context"),
+        };
+        if let Some(o) = cur
+            && o.status.success()
+            && String::from_utf8_lossy(&o.stdout).trim() == ctx
+        {
+            let out = Command::new(kubectl)
+                .args(["config", "unset", "current-context"])
+                .env("KUBECONFIG", &scratch)
+                .stdin(Stdio::null())
+                .output()
+                .context("run kubectl config unset current-context")?;
+            if !out.status.success() {
+                bail!(
+                    "kubectl config unset current-context failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
         }
-        if out.stdout.is_empty() {
-            bail!("kubectl config view --raw --flatten produced empty output");
+        for key in [
+            format!("contexts.{ctx}"),
+            format!("clusters.{ctx}"),
+            format!("users.{ctx}"),
+        ] {
+            let out = match Command::new(kubectl)
+                .args(["config", "unset", &key])
+                .env("KUBECONFIG", &scratch)
+                .stdin(Stdio::null())
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "katamaran: warning: kubectl not found; could not remove context {ctx} from {}",
+                        target_cfg.display()
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e).with_context(|| format!("run kubectl config unset {key}")),
+            };
+            if !out.status.success() {
+                bail!(
+                    "kubectl config unset {key} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
         }
-        write_private_atomic(user_cfg, &out.stdout)
+        let updated = fs::read(&scratch).with_context(|| format!("read {}", scratch.display()))?;
+        if updated != existing {
+            write_private_atomic(&target_cfg, &updated)?;
+        }
+        Ok(())
     })();
 
     let _ = fs::remove_file(&scratch);
     result
-}
-
-/// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
-pub fn remove_kubeconfig(home: &Path, ctx: &str) {
-    let _ = fs::remove_file(kubeconfig_path(home));
-    let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
-    };
-    let user_cfg = user_home.join(".kube/config");
-    if !user_cfg.is_file() {
-        return;
-    }
-    for sub in ["delete-context", "delete-cluster", "delete-user"] {
-        let _ = kubectl_cmd()
-            .args(["config", sub, ctx])
-            .env("KUBECONFIG", &user_cfg)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
 }
 
 /// Minimal UDP DNS responder for `k8s.kat.local` and `*.k8s.kat.local` -> `127.0.0.1`.
@@ -531,13 +814,26 @@ pub struct DnsServer {
 
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
-        let want_port = installed_dns_port().unwrap_or(DEFAULT_DNS_PORT);
-        let sock = UdpSocket::bind(("127.0.0.1", want_port)).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("bind 127.0.0.1:{want_port} for *.{DNS_DOMAIN} DNS: {e}"),
-            )
-        })?;
+        Self::start_with_installed_port(installed_dns_port())
+    }
+
+    fn start_with_installed_port(installed: Option<u16>) -> io::Result<DnsServer> {
+        let sock = match installed {
+            Some(p) => UdpSocket::bind(("127.0.0.1", p)).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("bind 127.0.0.1:{p} for *.{DNS_DOMAIN} DNS: {e}"),
+                )
+            })?,
+            None => UdpSocket::bind(("127.0.0.1", DEFAULT_DNS_PORT))
+                .or_else(|_| UdpSocket::bind(("127.0.0.1", 0)))
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("bind 127.0.0.1:{DEFAULT_DNS_PORT} for *.{DNS_DOMAIN} DNS: {e}"),
+                    )
+                })?,
+        };
         let port = sock.local_addr()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(250)))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -554,8 +850,12 @@ impl DnsServer {
                             }
                         }
                         Err(e)
-                            if e.kind() == io::ErrorKind::WouldBlock
-                                || e.kind() == io::ErrorKind::TimedOut =>
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
+                            ) =>
                         {
                             continue;
                         }
@@ -623,6 +923,10 @@ pub fn dns_resolver_content(port: u16) -> String {
 /// returns `NODATA` for `AAAA` on the same domain, and `NXDOMAIN` otherwise.
 pub fn build_dns_response(query: &[u8], ip: Ipv4Addr) -> Option<Vec<u8>> {
     if query.len() < 12 {
+        return None;
+    }
+    // Reject DNS responses (QR != 0) and non-standard opcodes (OPCODE != 0).
+    if query[2] & 0xF8 != 0 {
         return None;
     }
     let qdcount = u16::from_be_bytes([query[4], query[5]]);
@@ -751,5 +1055,184 @@ users:
         let q_other = make_query("example.com", 1);
         let resp_other = build_dns_response(&q_other, Ipv4Addr::LOCALHOST).unwrap();
         assert_eq!(resp_other[3] & 0x0F, 3); // NXDOMAIN
+    }
+
+    #[test]
+    fn dns_rejects_responses_and_non_standard_opcodes() {
+        let mut q_resp = make_query("app.k8s.kat.local", 1);
+        q_resp[2] |= 0x80; // QR=1 (response)
+        assert!(build_dns_response(&q_resp, Ipv4Addr::LOCALHOST).is_none());
+
+        let mut q_iquery = make_query("app.k8s.kat.local", 1);
+        q_iquery[2] |= 0x08; // OPCODE=1 (IQUERY)
+        assert!(build_dns_response(&q_iquery, Ipv4Addr::LOCALHOST).is_none());
+
+        let mut q_status = make_query("app.k8s.kat.local", 1);
+        q_status[2] |= 0x10; // OPCODE=2 (STATUS)
+        assert!(build_dns_response(&q_status, Ipv4Addr::LOCALHOST).is_none());
+    }
+
+    #[test]
+    fn conn_guard_caps_and_releases() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let g1 = ConnGuard::try_acquire(&active, 2).unwrap();
+        let g2 = ConnGuard::try_acquire(&active, 2).unwrap();
+        assert!(ConnGuard::try_acquire(&active, 2).is_none());
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        drop(g1);
+        let g3 = ConnGuard::try_acquire(&active, 2).unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        drop(g2);
+        drop(g3);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dns_server_falls_back_when_default_port_busy() {
+        // Hold DEFAULT_DNS_PORT if available, or verify fallback when another server binds first.
+        let holder = UdpSocket::bind(("127.0.0.1", DEFAULT_DNS_PORT)).ok();
+        let mut srv = DnsServer::start_with_installed_port(None).unwrap();
+        assert_ne!(srv.port, 0);
+        if holder.is_some() {
+            assert_ne!(srv.port, DEFAULT_DNS_PORT);
+        }
+        srv.stop();
+        drop(holder);
+    }
+
+    #[test]
+    fn relay_k8s_connect_unblocks_on_abrupt_eof() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kat-k8s-relay-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let run_dir = dir.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let sock_path = socket_path(&dir);
+        let ulistener = UnixListener::bind(&sock_path).unwrap();
+
+        // Guest mock: accept Connect, send Done, then abruptly close without DataEnd.
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = ulistener.accept().unwrap();
+            let req = k8s::read(&mut conn).unwrap().unwrap();
+            assert!(matches!(req, K8sMsg::Connect { port: 8080, .. }));
+            k8s::write(&mut conn, &K8sMsg::Done).unwrap();
+            thread::sleep(Duration::from_millis(30));
+            drop(conn);
+        });
+
+        // TCP peer that stays open and never writes (simulating an idle client).
+        let tlistener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taddr = tlistener.local_addr().unwrap();
+        let _idle_peer = TcpStream::connect(taddr).unwrap();
+        let (client, _) = tlistener.accept().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let home = dir.clone();
+        let relay = thread::spawn(move || {
+            let res = relay_k8s_connect(&home, client, "10.42.0.5", 8080);
+            let _ = done_tx.send(res);
+        });
+
+        let res = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("relay_k8s_connect hung instead of unblocking on abrupt EOF");
+        assert!(res.is_ok());
+        relay.join().unwrap();
+        guest.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kubeconfig_preserves_symlink_and_handles_missing_kubectl() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let base = std::env::temp_dir().join(format!(
+            "kat-k8s-kc-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = base.join("kat");
+        let user_home = base.join("user");
+        let dotfiles = base.join("dotfiles");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(user_home.join(".kube")).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+
+        let real_cfg = dotfiles.join("kubeconfig");
+        let link_cfg = user_home.join(".kube/config");
+        symlink(&real_cfg, &link_cfg).unwrap();
+
+        let raw = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: default\ncontexts:\n- context:\n    cluster: default\n    user: default\n  name: default\ncurrent-context: default\nkind: Config\nusers:\n- name: default\n  user: {}\n";
+        let missing_kubectl = base.join("no-such-kubectl");
+
+        // 1. Dangling symlink target does not exist yet: writes through symlink.
+        let local = write_and_merge_kubeconfig_in(
+            &home,
+            Some(&user_home),
+            raw,
+            16443,
+            "katamaran",
+            &missing_kubectl,
+        )
+        .unwrap();
+        assert!(local.is_file());
+        assert!(
+            fs::symlink_metadata(&link_cfg)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let written = fs::read_to_string(&real_cfg).unwrap();
+        assert!(written.contains("https://127.0.0.1:16443"));
+        assert!(written.contains("current-context: katamaran"));
+
+        // 2. Existing config with missing kubectl: warns and succeeds without failing.
+        write_and_merge_kubeconfig_in(
+            &home,
+            Some(&user_home),
+            raw,
+            26443,
+            "katamaran",
+            &missing_kubectl,
+        )
+        .unwrap();
+        assert!(
+            fs::read_to_string(&local)
+                .unwrap()
+                .contains("https://127.0.0.1:26443")
+        );
+
+        // 3. remove_kubeconfig with mock kubectl verifies current-context and unset keys + symlink preserved.
+        let log_file = base.join("kubectl.log");
+        let fake_kubectl = base.join("fake-kubectl.sh");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"current-context\" ]; then\n  echo katamaran\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"unset\" ]; then\n  printf 'cleaned\\n' > \"$KUBECONFIG\"\n  exit 0\nfi\nexit 0\n",
+            log_file.display()
+        );
+        fs::write(&fake_kubectl, script).unwrap();
+        fs::set_permissions(&fake_kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        remove_kubeconfig_in(&home, Some(&user_home), "katamaran", &fake_kubectl).unwrap();
+        assert!(!local.exists());
+        assert!(
+            fs::symlink_metadata(&link_cfg)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&real_cfg).unwrap(), "cleaned\n");
+        let calls = fs::read_to_string(&log_file).unwrap();
+        assert!(calls.contains("config current-context"));
+        assert!(calls.contains("config unset current-context"));
+        assert!(calls.contains("config unset contexts.katamaran"));
+        assert!(calls.contains("config unset clusters.katamaran"));
+        assert!(calls.contains("config unset users.katamaran"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

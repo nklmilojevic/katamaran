@@ -212,8 +212,10 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
     let docker = if system {
         let reaper = Reaper::start();
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        if k8s::enabled_in_cmdline(&cmdline) {
-            let _ = k8s::ensure_containerd_cri();
+        if k8s::enabled_in_cmdline(&cmdline)
+            && let Err(e) = k8s::ensure_containerd_cri()
+        {
+            log(&format!("k8s: enable containerd CRI: {e}"));
         }
         relay::serve_unix_on_vsock(DOCKER_PORT, service::DOCKER_SOCKET)?;
         relay::serve_tcp_on_vsock(K8S_API_PORT, k8s::API_ADDR)?;
