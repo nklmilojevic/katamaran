@@ -185,12 +185,12 @@ pub struct Term {
 }
 
 impl Term {
-    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
+    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Option<Self> {
         let (cols, rows) = (cols.max(1), rows.max(1));
         let mut t = Self {
-            vt: Vt::new(cols, rows, scrollback),
-            render: Render::new(),
-            enc: Encoders::new(),
+            vt: Vt::new(cols, rows, scrollback)?,
+            render: Render::new()?,
+            enc: Encoders::new()?,
             cols,
             rows,
             cell_width: 1,
@@ -204,7 +204,7 @@ impl Term {
         };
         t.vt.resize(cols, rows, 1, 1);
         t.apply_theme();
-        t
+        Some(t)
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -515,7 +515,9 @@ impl Term {
     pub fn scroll(&mut self, s: Scroll) {
         match s {
             Scroll::Lines(n) => self.vt.scroll_delta(-(n as isize)),
-            Scroll::Pages(n) => self.vt.scroll_delta(-(n as isize) * self.rows as isize),
+            Scroll::Pages(n) => self
+                .vt
+                .scroll_delta((-(n as isize)).saturating_mul(self.rows as isize)),
             Scroll::Top => self.vt.scroll_top(),
             Scroll::Bottom => self.vt.scroll_bottom(),
         }
@@ -538,14 +540,21 @@ impl Term {
             return None;
         }
         let (cw, ch) = (self.cell_width, self.cell_height);
-        let (x0, y0) = (col as u32 * cw, row as u32 * ch);
+        let (x0, y0) = (
+            (col as u32).saturating_mul(cw),
+            (row as u32).saturating_mul(ch),
+        );
         let x = match px {
-            Some((x, _)) if (x0..x0 + cw).contains(&x) => x,
-            _ => x0 + if right_half { cw * 3 / 4 } else { cw / 4 },
+            Some((x, _)) if (x0..x0.saturating_add(cw)).contains(&x) => x,
+            _ => x0.saturating_add(if right_half {
+                (u64::from(cw) * 3 / 4) as u32
+            } else {
+                cw / 4
+            }),
         };
         let py = match px {
-            Some((_, y)) if (y0..y0 + ch).contains(&y) => y,
-            _ => y0 + ch / 2,
+            Some((_, y)) if (y0..y0.saturating_add(ch)).contains(&y) => y,
+            _ => y0.saturating_add(ch / 2),
         };
         Some(vt::Pointer {
             cell: (col, y as u32),
@@ -568,7 +577,7 @@ impl Term {
                     columns: self.cols as u32,
                     cell_width: self.cell_width,
                     padding_left: 0,
-                    screen_height: self.rows as u32 * self.cell_height,
+                    screen_height: (self.rows as u32).saturating_mul(self.cell_height),
                 };
                 let words = word_boundaries();
                 if let Some(sel) = self.vt.gesture_drag(at, geometry, rect, &words) {

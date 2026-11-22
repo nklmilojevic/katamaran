@@ -35,8 +35,19 @@ security import "$WORK/certificate.p12" -P "${MACOS_CERTIFICATE_PASSWORD:-}" -T 
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$(cat "$WORK/lock")" \
     "$KEYCHAIN" >/dev/null
 # Searched first, before the login keychain.
-# shellcheck disable=SC2046
-security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+existing=()
+while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    line="${line#\"}"
+    line="${line%\"}"
+    [[ -n "$line" ]] && existing+=("$line")
+done < <(security list-keychains -d user)
+if ((${#existing[@]} > 0)); then
+    security list-keychains -d user -s "$KEYCHAIN" "${existing[@]}"
+else
+    security list-keychains -d user -s "$KEYCHAIN"
+fi
 
 security find-identity -v -p codesigning "$KEYCHAIN" \
     | grep -o '"Developer ID Application: [^"]*"' | head -n1 | tr -d '"'

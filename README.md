@@ -1,6 +1,6 @@
 # katamaran
 
-katamaran runs Docker containers and Linux machines on Apple silicon Macs inside one lightweight Linux virtual machine. It includes a native macOS app built with Swift and AppKit, and a command-line tool (`katamaran`, symlinked as `kat`). It does not include Kubernetes.
+katamaran runs Docker containers and Linux machines on Apple silicon Macs inside one lightweight Linux virtual machine. It includes a native macOS app built with Swift and AppKit, a command-line tool (`katamaran`, symlinked as `kat`), and an optional single-node Kubernetes (`k3s`) cluster that stays off by default with zero overhead.
 
 katamaran is free software licensed under the GNU Affero General Public License, version 3 or later (AGPL-3.0).
 
@@ -182,7 +182,7 @@ kat config set cpus=8 memory=12G pause_on_sleep=on
 kat restart
 ```
 
-Settings live in `~/.katamaran/config.toml` and take effect at the next VM start.
+Settings live in `~/.katamaran/config.toml` and take effect at the next VM start (except `launch_at_login` and `kubernetes`, which apply immediately).
 
 | Key | Default | Description |
 |---|---|---|
@@ -194,6 +194,7 @@ Settings live in `~/.katamaran/config.toml` and take effect at the next VM start
 | `mount_path` | `~/Katamaran` | Absolute path for the macOS NFS mount |
 | `launch_at_login` | `true` | Start the daemon and VM when you log in |
 | `pause_on_sleep` | `false` | Freeze vCPUs while the Mac sleeps |
+| `kubernetes` | `false` | Enable the optional single-node Kubernetes (`k3s`) cluster |
 
 ### Browse Linux files in Finder
 
@@ -224,6 +225,21 @@ To connect over SSH:
 1. Run `kat setup`.
 2. Add the `Include` line printed by setup to the top of `~/.ssh/config`.
 3. Run `ssh dev@katamaran` or `kat ssh dev`.
+
+### Run Kubernetes (optional)
+
+Start an optional single-node Kubernetes (`k3s`) cluster inside the same VM. On first start, katamaran downloads the pinned `k3s` binary, merges the `katamaran` context into `~/.kube/config`, and starts the cluster sharing Docker's `containerd`. When stopped, Kubernetes uses zero resources.
+
+```sh
+kat k8s start
+kat k8s status
+kat k8s sync-images
+kat k8s kubeconfig
+kat k8s dns install
+kat k8s forward 10.43.0.1:443 --local 8443
+kat k8s stop
+kat k8s reset
+```
 
 ### Inspect logs
 

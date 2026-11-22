@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use kat_proto::{Msg, NFS_PORT};
 
-use super::service::{Notifier, Reaper, describe_status};
+use super::service::{ChildTarget, Notifier, Reaper, describe_status};
 use super::sys;
 
 /// The listening socket's descriptor in the server process.
@@ -29,10 +29,11 @@ const LOG: &str = "/var/log/nfsd.log";
 
 struct NfsState {
     stopping: bool,
-    pid: i32,
+    target: Option<ChildTarget>,
 }
 
 pub struct Nfsd {
+    reaper: Reaper,
     state: Arc<Mutex<NfsState>>,
 }
 
@@ -41,9 +42,10 @@ impl Nfsd {
     pub fn start(reaper: Reaper, notifier: Notifier) -> io::Result<Nfsd> {
         let listener = sys::vsock_listen(NFS_PORT)?;
         let nfsd = Nfsd {
+            reaper: reaper.clone(),
             state: Arc::new(Mutex::new(NfsState {
                 stopping: false,
-                pid: 0,
+                target: None,
             })),
         };
         let state = nfsd.state.clone();
@@ -54,13 +56,10 @@ impl Nfsd {
     }
 
     pub fn stop(&self) {
-        let pid = {
-            let mut st = self.state.lock().unwrap();
-            st.stopping = true;
-            st.pid
-        };
-        if pid > 0 {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+        let mut st = self.state.lock().unwrap();
+        st.stopping = true;
+        if let Some(target) = &st.target {
+            self.reaper.signal_target(target, libc::SIGTERM);
         }
     }
 }
@@ -74,8 +73,8 @@ fn supervise(listener: &OwnedFd, reaper: &Reaper, notifier: &Notifier, state: &M
                 return;
             }
             match spawn(listener, reaper) {
-                Ok((child, exited)) => {
-                    st.pid = child;
+                Ok((target, exited)) => {
+                    st.target = Some(target);
                     exited
                 }
                 Err(e) => {
@@ -99,7 +98,7 @@ fn supervise(listener: &OwnedFd, reaper: &Reaper, notifier: &Notifier, state: &M
         let status = exited.recv().unwrap_or(0);
         {
             let mut st = state.lock().unwrap();
-            st.pid = 0;
+            st.target = None;
             if st.stopping {
                 return;
             }
@@ -117,7 +116,10 @@ fn supervise(listener: &OwnedFd, reaper: &Reaper, notifier: &Notifier, state: &M
     }
 }
 
-fn spawn(listener: &OwnedFd, reaper: &Reaper) -> io::Result<(i32, std::sync::mpsc::Receiver<i32>)> {
+fn spawn(
+    listener: &OwnedFd,
+    reaper: &Reaper,
+) -> io::Result<(ChildTarget, std::sync::mpsc::Receiver<i32>)> {
     sys::mkdir("/var/log")?;
     let log = File::options().create(true).append(true).open(LOG)?;
     let fd = listener.as_raw_fd();
@@ -140,7 +142,7 @@ fn spawn(listener: &OwnedFd, reaper: &Reaper) -> io::Result<(i32, std::sync::mps
             Ok(())
         });
     }
-    reaper.spawn(&mut cmd)
+    reaper.spawn_pidfd(&mut cmd)
 }
 
 /// `/init nfsd`: serve NFS on the inherited listener until killed.

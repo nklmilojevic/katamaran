@@ -111,6 +111,9 @@ extern "C" fn on_events(
     flags: *const u32,
     _ids: *const u64,
 ) {
+    if n == 0 || info.is_null() || paths.is_null() || flags.is_null() {
+        return;
+    }
     // SAFETY: FSEvents passes `n` C strings and flags, and `info` is the
     // Info this stream was made with, freed only by `release_info`.
     let (info, paths, flags) = unsafe {
@@ -121,23 +124,27 @@ extern "C" fn on_events(
         )
     };
     let mut events = Vec::with_capacity(n);
-    for (p, &f) in paths.iter().zip(flags) {
-        if f & flag::HISTORY_DONE != 0 {
+    for (&p, &f) in paths.iter().zip(flags) {
+        if f & flag::HISTORY_DONE != 0 || p.is_null() {
             continue;
         }
-        // SAFETY: a NUL-terminated path from FSEvents.
-        if let Ok(path) = unsafe { CStr::from_ptr(*p) }.to_str() {
+        // SAFETY: a non-null NUL-terminated path from FSEvents.
+        if let Ok(path) = unsafe { CStr::from_ptr(p) }.to_str() {
             events.push((path.to_owned(), f));
         }
     }
     if !events.is_empty() {
-        (info.sink)(events);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (info.sink)(events);
+        }));
     }
 }
 
 extern "C" fn release_info(info: *const c_void) {
-    // SAFETY: the Box made in Stream::start, released once by FSEvents.
-    drop(unsafe { Box::from_raw(info as *mut Info) });
+    if !info.is_null() {
+        // SAFETY: the Box made in Stream::start, released once by FSEvents.
+        drop(unsafe { Box::from_raw(info as *mut Info) });
+    }
 }
 
 fn queue() -> *mut c_void {
@@ -180,13 +187,22 @@ impl Stream {
         latency: f64,
         sink: impl Fn(Vec<Event>) + Send + Sync + 'static,
     ) -> std::io::Result<Stream> {
+        if roots.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FSEvents roots must not be empty",
+            ));
+        }
+        let paths = cf_array(roots);
+        if paths.is_null() {
+            return Err(std::io::Error::other("CFArrayCreate failed"));
+        }
         let info = Box::into_raw(Box::new(Info {
             sink: Box::new(sink),
         }));
         // SAFETY: FSEvents owns `info` from FSEventStreamCreate on and frees it
         // through `release_info`; before that it is still ours.
         unsafe {
-            let paths = cf_array(roots);
             let ctx = FSEventStreamContext {
                 version: 0,
                 info: info.cast(),
@@ -210,8 +226,10 @@ impl Stream {
             }
             if !exclusions.is_empty() {
                 let ex = cf_array(&exclusions[..exclusions.len().min(MAX_EXCLUSIONS)]);
-                FSEventStreamSetExclusionPaths(stream, ex);
-                CFRelease(ex);
+                if !ex.is_null() {
+                    FSEventStreamSetExclusionPaths(stream, ex);
+                    CFRelease(ex);
+                }
             }
             FSEventStreamSetDispatchQueue(stream, queue());
             if FSEventStreamStart(stream) == 0 {
@@ -285,5 +303,43 @@ mod tests {
         );
         drop(stream);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn start_rejects_empty_roots_and_on_events_handles_nulls_and_panics() {
+        assert!(Stream::start(&[], &[], 0.01, |_| {}).is_err());
+
+        // Null pointers / zero count are ignored without crashing.
+        on_events(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        on_events(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+
+        // Null path entries are skipped and panics in sink are caught.
+        let info = Box::new(Info {
+            sink: Box::new(|_| panic!("boom")),
+        });
+        let paths: [*const c_char; 2] = [std::ptr::null(), c"/tmp/ok".as_ptr()];
+        let flags: [u32; 2] = [flag::ITEM_CREATED, flag::ITEM_CREATED];
+        on_events(
+            std::ptr::null_mut(),
+            (&*info as *const Info).cast_mut().cast(),
+            paths.len(),
+            paths.as_ptr().cast_mut().cast(),
+            flags.as_ptr(),
+            std::ptr::null(),
+        );
     }
 }

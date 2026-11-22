@@ -159,7 +159,7 @@ pub fn run_status(
     {
         Ok(h) => h,
         Err(e) => {
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            reaper.signal_pgrp(pid, libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             return Err(e);
         }
@@ -167,7 +167,7 @@ pub fn run_status(
     let status = match exited.recv_timeout(timeout) {
         Ok(s) => s,
         Err(RecvTimeoutError::Timeout) => {
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            reaper.signal_pgrp(pid, libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             drop(wake_w);
             let _ = reader.join();
