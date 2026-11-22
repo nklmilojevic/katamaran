@@ -57,10 +57,8 @@ pub fn cache_binary_path(home: &Path) -> PathBuf {
         .join("k3s-arm64")
 }
 
-pub fn context_name() -> String {
-    crate::setup::Identity::resolve(None)
-        .map(|id| id.context())
-        .unwrap_or_else(|_| "katamaran".into())
+pub fn context_name() -> anyhow::Result<String> {
+    Ok(crate::setup::Identity::resolve(None)?.context())
 }
 
 pub fn connect(home: &Path) -> anyhow::Result<UnixStream> {
@@ -146,16 +144,9 @@ fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
     let tmp = path.with_extension("part");
     let _ = fs::remove_file(&tmp);
     progress(&format!("downloading k3s {K3S_VERSION} (~74 MB)"));
-    let status = Command::new("curl")
-        .args(["-fSsL", "--retry", "3", "-o"])
-        .arg(&tmp)
-        .arg(K3S_ARM64_URL)
-        .stdin(Stdio::null())
-        .status()
-        .context("run curl to download k3s")?;
-    if !status.success() {
+    if let Err(e) = crate::machines::curl(K3S_ARM64_URL, &tmp) {
         let _ = fs::remove_file(&tmp);
-        bail!("failed to download k3s from {K3S_ARM64_URL}");
+        return Err(e);
     }
     progress("verifying k3s checksum");
     if let Err(e) = verify_sha256(&tmp, K3S_ARM64_SHA256) {
@@ -167,16 +158,7 @@ fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
 }
 
 fn verify_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
-    let out = Command::new("/usr/bin/shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .context("run shasum")?;
-    if !out.status.success() {
-        bail!("shasum failed on {}", path.display());
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let actual = stdout.split_whitespace().next().unwrap_or("");
+    let actual = crate::machines::sha256_file(path)?;
     if actual != expected {
         bail!(
             "checksum mismatch for {}: got {actual}, want {expected}",
@@ -414,7 +396,7 @@ pub fn write_and_merge_kubeconfig(
     raw: &str,
     api_port: u16,
 ) -> anyhow::Result<PathBuf> {
-    let ctx = context_name();
+    let ctx = context_name()?;
     let rewritten = rewrite_kubeconfig(raw, &ctx, api_port);
     let local_path = kubeconfig_path(home);
     write_private_atomic(&local_path, rewritten.as_bytes())?;

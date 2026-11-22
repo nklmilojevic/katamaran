@@ -209,7 +209,7 @@ final class SettingsWindowController: NSWindowController {
         let k8sRunning = k8s?.state == "running"
         k8sSyncBtn.isEnabled = status != nil && k8sRunning && !model.busy
         k8sResetBtn.isEnabled = status != nil && !model.busy
-        if let k8s {
+        if let k8s, k8s.enabled || k8s.state != "stopped" {
             var desc = k8s.state.capitalized
             if let version = k8s.version, !version.isEmpty { desc += " (\(version))" }
             if let port = k8s.apiPort { desc += " · 127.0.0.1:\(port)" }

@@ -296,7 +296,7 @@ pub fn cache_name(i: &Image) -> String {
     format!("{}-{}-{}.tar.xz", i.distro, i.release, i.serial).replace([':', '/'], "-")
 }
 
-fn curl(url: &str, out: &Path) -> anyhow::Result<()> {
+pub(crate) fn curl(url: &str, out: &Path) -> anyhow::Result<()> {
     let status = Command::new("/usr/bin/curl")
         .args(["-fsSL", "--retry", "3", "--connect-timeout", "15", "-o"])
         .arg(out)
@@ -323,7 +323,7 @@ fn curl_text(url: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let out = Command::new("/usr/bin/shasum")
         .args(["-a", "256"])
         .arg(path)

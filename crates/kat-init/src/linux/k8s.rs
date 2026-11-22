@@ -11,13 +11,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +24,7 @@ use std::time::{Duration, Instant};
 use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
 use kat_proto::{K8S_PORT, Msg};
 
+use super::machines::cmd::{pipe, run_status as run_reaped};
 use super::service::{CONTAINERD_SOCKET, DOCKER_SOCKET, Notifier, Reaper, describe_status};
 use super::sys;
 
@@ -903,8 +903,15 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
 }
 
 fn is_docker_image_sync_event(line: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+    if line.trim().is_empty() {
         return false;
+    }
+    let v = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("malformed Docker event JSON: {e}"));
+            return false;
+        }
     };
     let action = v
         .get("Action")
@@ -1055,51 +1062,6 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
         return Err(format!("ctr import exited {imp_code}: {imp_err}"));
     }
     Ok(())
-}
-
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
-/// Run a child command through PID 1's [`Reaper`] so the reaper loop never
-/// steals its wait status from `std::process::Command::output`.
-fn run_reaped(reaper: &Reaper, cmd: &mut Command, timeout: Duration) -> io::Result<(i32, String)> {
-    let (r, w) = pipe()?;
-    cmd.env("PATH", PATH)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(w.try_clone()?))
-        .stderr(Stdio::from(w));
-    let (pid, exited) = reaper.spawn(cmd)?;
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    let reader = thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = File::from(r).take(1 << 20).read_to_end(&mut out);
-        String::from_utf8_lossy(&out).into_owned()
-    });
-    let status = match exited.recv_timeout(timeout) {
-        Ok(s) => s,
-        Err(RecvTimeoutError::Timeout) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = exited.recv();
-            let _ = reader.join();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{:?} timed out", cmd.get_program()),
-            ));
-        }
-        Err(RecvTimeoutError::Disconnected) => -1,
-    };
-    let out = reader.join().unwrap_or_default();
-    let code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        128 + libc::WTERMSIG(status)
-    };
-    Ok((code, out))
 }
 
 fn log(msg: &str) {

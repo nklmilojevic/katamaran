@@ -7,7 +7,7 @@
 //! went down start again once Docker is up, so they never delay it.
 
 mod bridge;
-mod cmd;
+pub(crate) mod cmd;
 mod exec;
 mod lxc;
 mod provision;
