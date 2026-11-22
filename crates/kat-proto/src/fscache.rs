@@ -80,19 +80,18 @@ pub fn share_record(index: u32, fd: u64) -> Vec<u8> {
 
 /// Send one chunk as a frame.
 pub fn write_frame(w: &mut impl Write, chunk: &[u8]) -> io::Result<()> {
+    if chunk.len() > FRAME_MAX {
+        return Err(crate::ProtoError::FrameTooLarge(chunk.len()).into());
+    }
     w.write_all(&(chunk.len() as u32).to_le_bytes())?;
     w.write_all(chunk)
 }
 
 /// Read one frame (the agent's side). `None` at end of stream.
 pub fn read_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<Option<()>> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_le_bytes(len) as usize;
+    let Some(len) = crate::read_len(r)? else {
+        return Ok(None);
+    };
     if len > FRAME_MAX || !len.is_multiple_of(8) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -176,5 +175,21 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, chunks.len());
+    }
+
+    #[test]
+    fn truncated_length_header_and_oversized_write() {
+        let mut buf = Vec::new();
+        assert_eq!(read_frame(&mut [].as_slice(), &mut buf).unwrap(), None);
+        for n in 1..=3 {
+            let bytes = [8u8, 0, 0];
+            let err = read_frame(&mut &bytes[..n], &mut buf).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "len {n}");
+        }
+        let mut out = Vec::new();
+        let big = vec![0u8; FRAME_MAX + 8];
+        let err = write_frame(&mut out, &big).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.is_empty());
     }
 }

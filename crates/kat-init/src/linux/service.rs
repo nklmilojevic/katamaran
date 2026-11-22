@@ -2,14 +2,15 @@
 //! included), and running containerd + dockerd with readiness and exit
 //! reporting to the host.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,30 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Clone)]
 pub struct Reaper {
     watched: Arc<Mutex<HashMap<i32, Sender<i32>>>>,
+}
+
+/// How to signal a spawned child without racing PID reuse.
+pub enum ChildTarget {
+    /// Kernel pidfd: `pidfd_send_signal` returns `ESRCH` once reaped.
+    PidFd(OwnedFd),
+    /// Fallback when `pidfd_open` is unavailable on the kernel.
+    Pid(i32),
+    /// The child had already exited and been reaped before `pidfd_open` ran.
+    Exited,
+}
+
+impl ChildTarget {
+    pub fn send_signal(&self, sig: i32) {
+        match self {
+            ChildTarget::PidFd(fd) => {
+                let _ = sys::pidfd_send_signal(fd, sig);
+            }
+            ChildTarget::Pid(pid) => {
+                unsafe { libc::kill(*pid, sig) };
+            }
+            ChildTarget::Exited => {}
+        }
+    }
 }
 
 impl Reaper {
@@ -54,6 +79,22 @@ impl Reaper {
         let (tx, rx) = mpsc::channel();
         watched.insert(pid, tx);
         Ok((pid, rx))
+    }
+
+    /// Like [`Reaper::spawn`], also opening a `pidfd` while the watch table
+    /// lock is held so callers can signal the child safely without PID reuse.
+    pub fn spawn_pidfd(&self, cmd: &mut Command) -> io::Result<(ChildTarget, Receiver<i32>)> {
+        let mut watched = self.watched.lock().unwrap();
+        let child = cmd.spawn()?;
+        let pid = child.id() as i32;
+        let target = match sys::pidfd_open(pid) {
+            Ok(fd) => ChildTarget::PidFd(fd),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => ChildTarget::Exited,
+            Err(_) => ChildTarget::Pid(pid),
+        };
+        let (tx, rx) = mpsc::channel();
+        watched.insert(pid, tx);
+        Ok((target, rx))
     }
 }
 
@@ -120,13 +161,39 @@ fn backoff() -> Backoff {
     )
 }
 
+struct ExitState {
+    status: Mutex<Option<i32>>,
+    notify: Condvar,
+}
+
+impl ExitState {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(None),
+            notify: Condvar::new(),
+        }
+    }
+
+    fn has_exited(&self) -> bool {
+        self.status.lock().unwrap().is_some()
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let guard = self.status.lock().unwrap();
+        let (guard, _) = self
+            .notify
+            .wait_timeout_while(guard, timeout, |s| s.is_none())
+            .unwrap();
+        guard.is_some()
+    }
+}
+
 /// A running service process.
 struct Service {
     name: &'static str,
     pid: i32,
     started: Instant,
-    exited: Arc<Mutex<Option<i32>>>,
-    exit_rx: Receiver<()>,
+    exit: Arc<ExitState>,
 }
 
 impl Service {
@@ -137,7 +204,7 @@ impl Service {
         index: usize,
         program: &str,
         args: &[&str],
-    ) -> io::Result<Service> {
+    ) -> io::Result<Arc<Service>> {
         let name = NAMES[index];
         sys::mkdir("/var/log")?;
         // Appended, so a restarted service keeps the log of its crash.
@@ -152,27 +219,31 @@ impl Service {
             .stdout(log.try_clone()?)
             .stderr(log);
         let (pid, status_rx) = reaper.spawn(&mut cmd)?;
-        let exited = Arc::new(Mutex::new(None));
-        let (exit_tx, exit_rx) = mpsc::channel();
-        let (exited2, exits) = (exited.clone(), exits.clone());
-        thread::spawn(move || {
-            if let Ok(status) = status_rx.recv() {
-                *exited2.lock().unwrap() = Some(status);
-                let _ = exit_tx.send(());
-                let _ = exits.send((index, status));
-            }
-        });
-        Ok(Service {
+        let exit = Arc::new(ExitState::new());
+        let (exit2, exits) = (exit.clone(), exits.clone());
+        let waiter = thread::Builder::new()
+            .name(format!("{name}-wait"))
+            .spawn(move || {
+                if let Ok(status) = status_rx.recv() {
+                    *exit2.status.lock().unwrap() = Some(status);
+                    exit2.notify.notify_all();
+                    let _ = exits.send((index, status));
+                }
+            });
+        if let Err(e) = waiter {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return Err(e);
+        }
+        Ok(Arc::new(Service {
             name,
             pid,
             started: Instant::now(),
-            exited,
-            exit_rx,
-        })
+            exit,
+        }))
     }
 
     fn has_exited(&self) -> bool {
-        self.exited.lock().unwrap().is_some()
+        self.exit.has_exited()
     }
 
     /// SIGTERM, wait up to `timeout`, then SIGKILL.
@@ -182,14 +253,14 @@ impl Service {
         }
         let t = Instant::now();
         unsafe { libc::kill(self.pid, libc::SIGTERM) };
-        if self.exit_rx.recv_timeout(timeout).is_err() {
+        if !self.exit.wait_timeout(timeout) {
             eprintln!(
                 "kat-init: {} did not stop in {}s, killing it",
                 self.name,
                 timeout.as_secs()
             );
             unsafe { libc::kill(self.pid, libc::SIGKILL) };
-            let _ = self.exit_rx.recv_timeout(Duration::from_secs(2));
+            let _ = self.exit.wait_timeout(Duration::from_secs(2));
         }
         eprintln!(
             "kat-init: shutdown: {} stopped in {} ms",
@@ -200,14 +271,10 @@ impl Service {
 }
 
 /// Poll `check` until it succeeds, the process exits or the timeout passes.
-fn wait_ready(
-    name: &str,
-    exited: &Mutex<Option<i32>>,
-    check: impl Fn() -> bool,
-) -> Result<(), String> {
+fn wait_ready(name: &str, exit: &ExitState, check: impl Fn() -> bool) -> Result<(), String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        if exited.lock().unwrap().is_some() {
+        if exit.has_exited() {
             return Err(format!("{name} exited during startup"));
         }
         if check() {
@@ -225,7 +292,7 @@ fn wait_ready(
 
 #[derive(Default)]
 struct Inner {
-    services: Mutex<[Option<Service>; 2]>,
+    services: Mutex<[Option<Arc<Service>>; 2]>,
     stopping: AtomicBool,
     reloading_containerd: AtomicBool,
 }
@@ -253,13 +320,19 @@ impl DockerStack {
     /// Restart containerd cleanly (without reporting a failure or backoff)
     /// so config changes such as enabling CRI take effect on demand.
     pub fn restart_containerd(&self) {
-        let services = self.inner.services.lock().unwrap();
-        if let Some(s) = &services[CONTAINERD]
-            && !s.has_exited()
-        {
-            self.inner
-                .reloading_containerd
-                .store(true, Ordering::SeqCst);
+        let service = {
+            let services = self.inner.services.lock().unwrap();
+            match &services[CONTAINERD] {
+                Some(s) if !s.has_exited() => {
+                    self.inner
+                        .reloading_containerd
+                        .store(true, Ordering::SeqCst);
+                    Some(s.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(s) = service {
             s.stop(STOP_TIMEOUT[CONTAINERD]);
         }
     }
@@ -268,7 +341,7 @@ impl DockerStack {
     /// restart happens after this.
     pub fn stop(&self) {
         self.inner.stopping.store(true, Ordering::SeqCst);
-        let services = self.inner.services.lock().unwrap();
+        let services = { self.inner.services.lock().unwrap().clone() };
         for i in [DOCKERD, CONTAINERD] {
             if let Some(s) = &services[i] {
                 s.stop(STOP_TIMEOUT[i]);
@@ -277,21 +350,51 @@ impl DockerStack {
     }
 }
 
+enum StartError {
+    Stopping,
+    /// `Service::spawn` failed; no process exists, so no exit event will arrive.
+    SpawnFailed(String),
+    /// The child was spawned and either exited or was killed; its exit event will arrive.
+    NotReady(String),
+}
+
 fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
     let (exits, exited) = mpsc::channel();
     let mut backoff = [backoff(), backoff()];
-    let mut to_start = vec![CONTAINERD, DOCKERD];
+    let mut to_start = VecDeque::from([CONTAINERD]);
+    let mut dockerd_pending = true;
     loop {
-        for i in std::mem::take(&mut to_start) {
+        while let Some(i) = to_start.pop_front() {
             match start_one(reaper, &exits, inner, i) {
-                Ok(()) if i == DOCKERD => notifier.send(&Msg::ServiceReady {
+                Ok(()) if i == CONTAINERD => {
+                    if dockerd_pending {
+                        dockerd_pending = false;
+                        to_start.push_back(DOCKERD);
+                    }
+                }
+                Ok(()) => notifier.send(&Msg::ServiceReady {
                     name: "docker".into(),
                     at_ns: sys::boottime_ns(),
                 }),
-                Ok(()) => {}
-                Err(None) => return,
+                Err(StartError::Stopping) => return,
+                Err(StartError::SpawnFailed(e)) => {
+                    let delay = backoff[i].next(Duration::ZERO);
+                    let name = NAMES[i];
+                    if backoff[i].failures() > MAX_RESTARTS {
+                        notifier
+                            .failed(name, format!("{e}; gave up after {MAX_RESTARTS} restarts"));
+                    } else {
+                        notifier
+                            .failed(name, format!("{e}; restarting in {} ms", delay.as_millis()));
+                        if !sleep_unless_stopping(delay, &inner.stopping) {
+                            return;
+                        }
+                        to_start.push_back(i);
+                    }
+                }
                 // The process is gone or killed; its exit restarts it below.
-                Err(Some(e)) => notifier.failed(NAMES[i], e),
+                // If containerd failed, dockerd remains pending until containerd is ready.
+                Err(StartError::NotReady(e)) => notifier.failed(NAMES[i], e),
             }
         }
         let Ok((i, status)) = exited.recv() else {
@@ -301,7 +404,7 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
             return;
         }
         if i == CONTAINERD && inner.reloading_containerd.swap(false, Ordering::SeqCst) {
-            to_start.push(CONTAINERD);
+            to_start.push_back(CONTAINERD);
             continue;
         }
         let ran_for = inner.services.lock().unwrap()[i]
@@ -330,19 +433,17 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
         if !sleep_unless_stopping(delay, &inner.stopping) {
             return;
         }
-        to_start.push(i);
+        to_start.push_back(i);
     }
 }
 
-/// Start service `i` and wait until it serves. `Err(None)` means the stack
-/// is stopping; `Err(Some)` describes a failed start, after which the
-/// process has exited or is killed.
+/// Start service `i` and wait until it serves.
 fn start_one(
     reaper: &Reaper,
     exits: &Sender<(usize, i32)>,
     inner: &Inner,
     i: usize,
-) -> Result<(), Option<String>> {
+) -> Result<(), StartError> {
     let dockerd_args = super::net::dockerd_args();
     let (program, args): (&str, Vec<&str>) = match i {
         CONTAINERD => ("/usr/bin/containerd", vec![]),
@@ -354,25 +455,25 @@ fn start_one(
     let mut services = inner.services.lock().unwrap();
     // Checked under the lock, so stop() never misses a service.
     if inner.stopping.load(Ordering::SeqCst) {
-        return Err(None);
+        return Err(StartError::Stopping);
     }
     let service = Service::spawn(reaper, exits, i, program, &args)
-        .map_err(|e| Some(format!("start {}: {e}", NAMES[i])))?;
-    let (pid, exited) = (service.pid, service.exited.clone());
+        .map_err(|e| StartError::SpawnFailed(format!("start {}: {e}", NAMES[i])))?;
+    let (pid, exit) = (service.pid, service.exit.clone());
     services[i] = Some(service);
     drop(services);
 
     let ready = match i {
-        CONTAINERD => wait_ready(NAMES[i], &exited, || {
+        CONTAINERD => wait_ready(NAMES[i], &exit, || {
             UnixStream::connect(CONTAINERD_SOCKET).is_ok()
         }),
-        _ => wait_ready(NAMES[i], &exited, docker_ping),
+        _ => wait_ready(NAMES[i], &exit, docker_ping),
     };
     ready.map_err(|e| {
-        if exited.lock().unwrap().is_none() {
+        if !exit.has_exited() {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-        Some(e)
+        StartError::NotReady(e)
     })
 }
 

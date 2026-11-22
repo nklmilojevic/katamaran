@@ -29,8 +29,8 @@ pub fn watch(notifier: Notifier, mut auto: Option<AutoForward>) {
         let mut known = BTreeSet::new();
         loop {
             let mut now = listening();
-            now.retain(|p| !super::k8s::is_internal_port(*p));
             now.extend(super::machines::forwarded_ports());
+            now.retain(|p| !super::k8s::is_internal_port(*p));
             now.extend(super::k8s::forwarded_ports());
             let (added, removed) = diff(&known, &now);
             // An auto-forward gives way before the published port is added.
@@ -73,26 +73,50 @@ struct RootDiag {
     buf: Vec<u8>,
 }
 
-static ROOT_DIAG: Mutex<Option<RootDiag>> = Mutex::new(None);
+struct RootDiagState {
+    diag: Option<RootDiag>,
+    last: Option<BTreeSet<u16>>,
+}
+
+static ROOT_DIAG: Mutex<RootDiagState> = Mutex::new(RootDiagState {
+    diag: None,
+    last: None,
+});
 
 /// Wildcard TCP listeners in the root network namespace. Call only from
 /// threads in that namespace (the socket is made by the first caller).
 pub fn listening() -> BTreeSet<u16> {
-    let mut diag = ROOT_DIAG.lock().unwrap_or_else(|e| e.into_inner());
-    if diag.is_none() {
-        *diag = autofwd::diag_socket().ok().map(|fd| RootDiag {
+    let mut state = ROOT_DIAG.lock().unwrap_or_else(|e| e.into_inner());
+    if state.diag.is_none() {
+        state.diag = autofwd::diag_socket().ok().map(|fd| RootDiag {
             fd,
             seq: 0,
             buf: vec![0; 32 << 10],
         });
     }
-    match diag.as_mut() {
-        Some(d) => autofwd::listeners(&d.fd, &mut d.seq, &mut d.buf)
-            .into_iter()
-            .filter(|l| l.addr.is_unspecified())
-            .map(|l| l.port)
-            .collect(),
-        None => listening_proc(),
+    match state.diag.as_mut() {
+        Some(d) => match autofwd::listeners(&d.fd, &mut d.seq, &mut d.buf) {
+            Ok(list) => {
+                let ports: BTreeSet<u16> = list
+                    .into_iter()
+                    .filter(|l| l.addr.is_unspecified())
+                    .map(|l| l.port)
+                    .collect();
+                state.last = Some(ports.clone());
+                ports
+            }
+            Err(_) => {
+                // Drop the broken netlink socket so the next poll recreates it,
+                // and preserve prior state instead of flapping all forwards.
+                state.diag = None;
+                state.last.clone().unwrap_or_else(listening_proc)
+            }
+        },
+        None => {
+            let ports = listening_proc();
+            state.last = Some(ports.clone());
+            ports
+        }
     }
 }
 

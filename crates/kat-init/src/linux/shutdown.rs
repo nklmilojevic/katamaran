@@ -30,16 +30,20 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
     let t = Instant::now();
     // Machines halt in parallel with the containers; each has
     // `lxc::STOP_SECS` before it is killed.
-    let k8s_stop = thread::spawn(|| {
-        let t = Instant::now();
-        super::k8s::stop_for_shutdown();
-        t.elapsed()
-    });
-    let machines = thread::spawn(|| {
-        let t = Instant::now();
-        let n = super::machines::stop_all();
-        (n, t.elapsed())
-    });
+    let k8s_stop = thread::Builder::new()
+        .name("shutdown-k8s".into())
+        .spawn(|| {
+            let t = Instant::now();
+            super::k8s::stop_for_shutdown();
+            t.elapsed()
+        });
+    let machines = thread::Builder::new()
+        .name("shutdown-machines".into())
+        .spawn(|| {
+            let t = Instant::now();
+            let n = super::machines::stop_all();
+            (n, t.elapsed())
+        });
     if let Some((_, nfs)) = docker {
         step("containers", || {
             let n = stop_containers(CONTAINERS_TIMEOUT);
@@ -47,14 +51,40 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
         });
         nfs.stop();
     }
-    if let Ok(took) = k8s_stop.join() {
-        super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
+    match k8s_stop {
+        Ok(h) => {
+            if let Ok(took) = h.join() {
+                super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
+            }
+        }
+        Err(e) => {
+            super::log(&format!("shutdown: spawn k8s stop thread: {e}"));
+            let t = Instant::now();
+            super::k8s::stop_for_shutdown();
+            super::log(&format!(
+                "shutdown: k8s stopped in {} ms",
+                t.elapsed().as_millis()
+            ));
+        }
     }
-    if let Ok((n, took)) = machines.join() {
-        super::log(&format!(
-            "shutdown: machines: {n} stopped in {} ms",
-            took.as_millis()
-        ));
+    match machines {
+        Ok(h) => {
+            if let Ok((n, took)) = h.join() {
+                super::log(&format!(
+                    "shutdown: machines: {n} stopped in {} ms",
+                    took.as_millis()
+                ));
+            }
+        }
+        Err(e) => {
+            super::log(&format!("shutdown: spawn machines stop thread: {e}"));
+            let t = Instant::now();
+            let n = super::machines::stop_all();
+            super::log(&format!(
+                "shutdown: machines: {n} stopped in {} ms",
+                t.elapsed().as_millis()
+            ));
+        }
     }
     if let Some((stack, _)) = docker {
         stack.stop();
@@ -88,13 +118,24 @@ fn stop_containers(timeout: Duration) -> usize {
     };
     let ids = container_ids(&list);
     let deadline = Instant::now() + timeout;
-    let workers: Vec<_> = ids
-        .iter()
-        .map(|id| {
-            let req = format!("POST /containers/{id}/stop?t={CONTAINER_STOP_SECS}");
-            thread::spawn(move || docker_request(&req))
-        })
-        .collect();
+    let mut workers = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let req = format!("POST /containers/{id}/stop?t={CONTAINER_STOP_SECS}");
+        match thread::Builder::new()
+            .name("shutdown-container".into())
+            .spawn(move || docker_request(&req))
+        {
+            Ok(w) => workers.push(w),
+            Err(e) => {
+                super::log(&format!("shutdown: spawn container stop thread: {e}"));
+                if Instant::now() < deadline {
+                    let _ = docker_request(&format!(
+                        "POST /containers/{id}/stop?t={CONTAINER_STOP_SECS}"
+                    ));
+                }
+            }
+        }
+    }
     for w in workers {
         while !w.is_finished() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));

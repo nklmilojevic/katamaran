@@ -10,7 +10,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use super::super::service::Reaper;
-use super::{bridge, cmd, store};
+use super::{bridge, cmd, provision, store};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// What a clean halt gets before lxc-stop kills the machine.
@@ -18,7 +18,10 @@ pub const STOP_SECS: u64 = 8;
 
 /// The signal that makes the machine's init power off cleanly.
 pub fn halt_signal(rootfs: &Path) -> &'static str {
-    let init = fs::read_link(rootfs.join("sbin/init"))
+    let init_path = provision::resolve_in_rootfs(rootfs, "sbin")
+        .map(|sbin| sbin.join("init"))
+        .unwrap_or_else(|_| rootfs.join("sbin/init"));
+    let init = fs::read_link(init_path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     if init.contains("systemd") {
@@ -63,9 +66,11 @@ lxc.log.level = WARN
 /// `/etc/hostname` and `/etc/hosts`, the two files the image's LXC
 /// templates fill in.
 pub fn write_identity(rootfs: &Path, name: &str) -> io::Result<()> {
-    fs::write(rootfs.join("etc/hostname"), format!("{name}\n"))?;
+    let hostname = provision::resolve_in_rootfs(rootfs, "etc/hostname")?;
+    let hosts = provision::resolve_in_rootfs(rootfs, "etc/hosts")?;
+    fs::write(hostname, format!("{name}\n"))?;
     fs::write(
-        rootfs.join("etc/hosts"),
+        hosts,
         format!(
             "127.0.0.1\tlocalhost\n127.0.1.1\t{name}\n::1\tlocalhost ip6-localhost ip6-loopback\n\
              ff02::1\tip6-allnodes\nff02::2\tip6-allrouters\n"
@@ -183,24 +188,33 @@ pub fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+fn is_valid_env_name(k: &str) -> bool {
+    let mut bytes = k.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// The script `su -c` runs: export the environment, change to `cwd` if it
 /// exists (else stay in the home `su -l` chose), then run `argv`, or the
 /// login shell.
 pub fn script(cwd: &str, env: &[(String, String)], argv: &[String]) -> String {
     let mut s = String::new();
     for (k, v) in env {
-        if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if is_valid_env_name(k) {
             s.push_str(&format!("export {k}={}; ", quote(v)));
         }
     }
     if !cwd.is_empty() {
-        s.push_str(&format!("cd {} 2>/dev/null; ", quote(cwd)));
+        s.push_str(&format!("cd -- {} 2>/dev/null; ", quote(cwd)));
     }
     if argv.is_empty() {
         s.push_str("exec \"$SHELL\" -l");
     } else {
         let cmd: Vec<String> = argv.iter().map(|a| quote(a)).collect();
-        s.push_str(&format!("exec {}", cmd.join(" ")));
+        s.push_str(&format!("exec -- {}", cmd.join(" ")));
     }
     s
 }
@@ -243,13 +257,19 @@ mod tests {
             "/Users/me/my app",
             &[
                 ("LANG".into(), "C.UTF-8".into()),
+                ("_OK_1".into(), "y".into()),
+                ("1BAD".into(), "z".into()),
                 ("BAD;".into(), "x".into()),
             ],
             &["echo".into(), "$HOME".into()],
         );
         assert_eq!(
             s,
-            "export LANG=C.UTF-8; cd '/Users/me/my app' 2>/dev/null; exec echo '$HOME'"
+            "export LANG=C.UTF-8; export _OK_1=y; cd -- '/Users/me/my app' 2>/dev/null; exec -- echo '$HOME'"
+        );
+        assert_eq!(
+            script("-dir", &[], &["-cmd".into()]),
+            "cd -- -dir 2>/dev/null; exec -- -cmd"
         );
         assert_eq!(script("", &[], &[]), "exec \"$SHELL\" -l");
     }

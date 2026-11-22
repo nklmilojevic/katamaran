@@ -287,10 +287,7 @@ fn control_loop(
                     log(&format!("clock not set: {e}"));
                 }
             }
-            Msg::Trim => {
-                let notifier = notifier.clone();
-                thread::spawn(move || trim::trim_and_report(&notifier));
-            }
+            Msg::Trim => trim::start_once(notifier.clone()),
             Msg::Ping { seq } => notifier.send(&Msg::Pong { seq }),
             Msg::StatsRequest => notifier.send(&Msg::Stats(stats::read())),
             Msg::FsEvents(events) => {

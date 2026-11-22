@@ -14,8 +14,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -28,9 +27,13 @@ use super::sys;
 const LISTEN_FD: i32 = 3;
 const LOG: &str = "/var/log/nfsd.log";
 
+struct NfsState {
+    stopping: bool,
+    pid: i32,
+}
+
 pub struct Nfsd {
-    stopping: Arc<AtomicBool>,
-    pid: Arc<AtomicI32>,
+    state: Arc<Mutex<NfsState>>,
 }
 
 impl Nfsd {
@@ -38,45 +41,53 @@ impl Nfsd {
     pub fn start(reaper: Reaper, notifier: Notifier) -> io::Result<Nfsd> {
         let listener = sys::vsock_listen(NFS_PORT)?;
         let nfsd = Nfsd {
-            stopping: Arc::new(AtomicBool::new(false)),
-            pid: Arc::new(AtomicI32::new(0)),
+            state: Arc::new(Mutex::new(NfsState {
+                stopping: false,
+                pid: 0,
+            })),
         };
-        let (stopping, pid) = (nfsd.stopping.clone(), nfsd.pid.clone());
+        let state = nfsd.state.clone();
         thread::Builder::new()
             .name("nfsd-supervisor".into())
-            .spawn(move || supervise(&listener, &reaper, &notifier, &stopping, &pid))?;
+            .spawn(move || supervise(&listener, &reaper, &notifier, &state))?;
         Ok(nfsd)
     }
 
     pub fn stop(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
-        let pid = self.pid.load(Ordering::SeqCst);
+        let pid = {
+            let mut st = self.state.lock().unwrap();
+            st.stopping = true;
+            st.pid
+        };
         if pid > 0 {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
 
-fn supervise(
-    listener: &OwnedFd,
-    reaper: &Reaper,
-    notifier: &Notifier,
-    stopping: &AtomicBool,
-    pid: &AtomicI32,
-) {
+fn supervise(listener: &OwnedFd, reaper: &Reaper, notifier: &Notifier, state: &Mutex<NfsState>) {
     let mut announced = false;
-    while !stopping.load(Ordering::SeqCst) {
-        let (child, exited) = match spawn(listener, reaper) {
-            Ok(c) => c,
-            Err(e) => {
-                notifier.send(&Msg::ServiceFailed {
-                    name: "nfs".into(),
-                    error: format!("start nfsd: {e}"),
-                });
+    loop {
+        let exited = {
+            let mut st = state.lock().unwrap();
+            if st.stopping {
                 return;
             }
+            match spawn(listener, reaper) {
+                Ok((child, exited)) => {
+                    st.pid = child;
+                    exited
+                }
+                Err(e) => {
+                    drop(st);
+                    notifier.send(&Msg::ServiceFailed {
+                        name: "nfs".into(),
+                        error: format!("start nfsd: {e}"),
+                    });
+                    return;
+                }
+            }
         };
-        pid.store(child, Ordering::SeqCst);
         if !announced {
             // The socket listens already; the Mac may connect right away.
             notifier.send(&Msg::ServiceReady {
@@ -86,15 +97,23 @@ fn supervise(
             announced = true;
         }
         let status = exited.recv().unwrap_or(0);
-        pid.store(0, Ordering::SeqCst);
-        if stopping.load(Ordering::SeqCst) {
-            return;
+        {
+            let mut st = state.lock().unwrap();
+            st.pid = 0;
+            if st.stopping {
+                return;
+            }
         }
         notifier.send(&Msg::ServiceFailed {
             name: "nfs".into(),
             error: format!("nfsd {}, restarting", describe_status(status)),
         });
-        thread::sleep(Duration::from_secs(1));
+        for _ in 0..50 {
+            if state.lock().unwrap().stopping {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -107,10 +126,15 @@ fn spawn(listener: &OwnedFd, reaper: &Reaper) -> io::Result<(i32, std::sync::mps
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // SAFETY: dup2 is async-signal-safe; the new descriptor has no CLOEXEC.
+    // SAFETY: dup2 and fcntl are async-signal-safe; ensure LISTEN_FD does not
+    // carry FD_CLOEXEC even when `listener` is already fd 3 (dup2(3, 3) is a no-op).
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(fd, LISTEN_FD) < 0 {
+            if fd == LISTEN_FD {
+                if libc::fcntl(LISTEN_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if libc::dup2(fd, LISTEN_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
