@@ -41,17 +41,16 @@ jobs:
           gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
           if python3 -c '
           import json, sys
-          pages = json.load(open(sys.argv[1]))
-          releases = [r for page in pages for r in page]
-          has_sparkle = any(
-              not r.get("draft")
-              and not r.get("prerelease")
-              and any(a.get("name") == "sparkle.json" for a in r.get("assets", []))
-              for r in releases
-          )
-          sys.exit(0 if has_sparkle else 1)
+          sys.path.insert(0, "scripts/release")
+          import appcast
+          with open(sys.argv[1], encoding="utf-8") as f:
+              releases = appcast.flatten_releases(json.load(f))
+          sys.exit(0 if appcast.sparkle_release_tags(releases) else 1)
           ' "$RUNNER_TEMP/releases.json"; then
-            python3 scripts/release/appcast.py --repo "$REPO" --output docs/dist/appcast.xml
+            python3 scripts/release/appcast.py \
+              --repo "$REPO" \
+              --releases-json "$RUNNER_TEMP/releases.json" \
+              --output docs/dist/appcast.xml
           else
             echo 'No published non-prerelease with sparkle.json yet. Publishing docs without appcast.xml.'
           fi
