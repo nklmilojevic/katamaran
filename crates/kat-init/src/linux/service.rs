@@ -224,10 +224,29 @@ fn wait_ready(
 }
 
 #[derive(Default)]
+struct ContainerdConfigState {
+    path: Option<String>,
+    generation: u64,
+    /// True once `containerd` has reached `Ready` with the current `path` and
+    /// `generation`. Only an unproven override is rolled back to the stock
+    /// config on startup failure; a proven-good override is retained across
+    /// later transient containerd restarts so a running k3s server never loses
+    /// CRI.
+    proven_ready: bool,
+    waiter: Option<ReloadWaiter>,
+}
+
+struct ReloadWaiter {
+    target_generation: u64,
+    tx: Sender<Result<(), String>>,
+}
+
+#[derive(Default)]
 struct Inner {
     services: Mutex<[Option<Service>; 2]>,
     stopping: AtomicBool,
     reloading_containerd: AtomicBool,
+    containerd_config: Mutex<ContainerdConfigState>,
 }
 
 /// containerd and dockerd, started in order on a background thread and
@@ -240,8 +259,13 @@ pub struct DockerStack {
 }
 
 impl DockerStack {
-    pub fn start(reaper: Reaper, notifier: Notifier) -> DockerStack {
+    pub fn start(
+        reaper: Reaper,
+        notifier: Notifier,
+        containerd_config: Option<String>,
+    ) -> DockerStack {
         let stack = DockerStack::default();
+        stack.inner.containerd_config.lock().unwrap().path = containerd_config;
         let inner = stack.inner.clone();
         thread::Builder::new()
             .name("docker-supervisor".into())
@@ -250,17 +274,89 @@ impl DockerStack {
         stack
     }
 
-    /// Restart containerd cleanly (without reporting a failure or backoff)
-    /// so config changes such as enabling CRI take effect on demand.
-    pub fn restart_containerd(&self) {
-        let services = self.inner.services.lock().unwrap();
-        if let Some(s) = &services[CONTAINERD]
-            && !s.has_exited()
+    /// The runtime config override currently configured for containerd, or
+    /// `None` when using the stock `/etc/containerd/config.toml`.
+    pub fn containerd_config(&self) -> Option<String> {
+        self.inner.containerd_config.lock().unwrap().path.clone()
+    }
+
+    /// Switch containerd to `config` (or the stock `/etc/containerd/config.toml`
+    /// when `None`), restart it cleanly without reporting a failure or backoff,
+    /// and wait until the restarted containerd instance becomes ready or fails.
+    pub fn reload_containerd_config(
+        &self,
+        config: Option<String>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if self.inner.stopping.load(Ordering::SeqCst) {
+            return Err("docker stack is stopping".into());
+        }
+        let (tx, rx) = mpsc::channel();
+        let target_generation = {
+            let mut cfg = self.inner.containerd_config.lock().unwrap();
+            cfg.generation += 1;
+            cfg.path = config;
+            cfg.proven_ready = false;
+            cfg.waiter = Some(ReloadWaiter {
+                target_generation: cfg.generation,
+                tx,
+            });
+            cfg.generation
+        };
         {
-            self.inner
-                .reloading_containerd
-                .store(true, Ordering::SeqCst);
-            s.stop(STOP_TIMEOUT[CONTAINERD]);
+            let services = self.inner.services.lock().unwrap();
+            if let Some(s) = &services[CONTAINERD]
+                && !s.has_exited()
+            {
+                self.inner
+                    .reloading_containerd
+                    .store(true, Ordering::SeqCst);
+                s.stop(STOP_TIMEOUT[CONTAINERD]);
+            }
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let rolled_back_path = {
+                    let mut cfg = self.inner.containerd_config.lock().unwrap();
+                    if cfg
+                        .waiter
+                        .as_ref()
+                        .is_some_and(|w| w.target_generation == target_generation)
+                    {
+                        cfg.waiter = None;
+                    }
+                    if cfg.generation == target_generation
+                        && cfg.path.is_some()
+                        && !cfg.proven_ready
+                    {
+                        cfg.generation += 1;
+                        cfg.proven_ready = false;
+                        cfg.path.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(override_path) = rolled_back_path {
+                    let _ = std::fs::remove_file(&override_path);
+                    let services = self.inner.services.lock().unwrap();
+                    if let Some(s) = &services[CONTAINERD]
+                        && !s.has_exited()
+                    {
+                        self.inner
+                            .reloading_containerd
+                            .store(true, Ordering::SeqCst);
+                        s.stop(STOP_TIMEOUT[CONTAINERD]);
+                    }
+                }
+                Err(format!(
+                    "timed out waiting for containerd reload after {}s",
+                    timeout.as_secs()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("docker supervisor exited during containerd reload".into())
+            }
         }
     }
 
@@ -268,6 +364,7 @@ impl DockerStack {
     /// restart happens after this.
     pub fn stop(&self) {
         self.inner.stopping.store(true, Ordering::SeqCst);
+        fail_containerd_waiter(&self.inner, "docker stack is stopping".into());
         let services = self.inner.services.lock().unwrap();
         for i in [DOCKERD, CONTAINERD] {
             if let Some(s) = &services[i] {
@@ -277,21 +374,151 @@ impl DockerStack {
     }
 }
 
+struct SuperviseExit<'a>(&'a Inner);
+
+impl Drop for SuperviseExit<'_> {
+    fn drop(&mut self) {
+        fail_containerd_waiter(self.0, "docker supervisor stopped".into());
+    }
+}
+
+fn mark_containerd_ready(inner: &Inner, generation: u64) {
+    let waiter = {
+        let mut cfg = inner.containerd_config.lock().unwrap();
+        if cfg.generation == generation {
+            cfg.proven_ready = true;
+        }
+        if cfg
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.target_generation <= generation)
+        {
+            cfg.waiter.take()
+        } else {
+            None
+        }
+    };
+    if let Some(w) = waiter {
+        let _ = w.tx.send(Ok(()));
+    }
+}
+
+fn notify_containerd_waiter(inner: &Inner, generation: u64, result: Result<(), String>) {
+    let waiter = {
+        let mut cfg = inner.containerd_config.lock().unwrap();
+        if cfg
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.target_generation <= generation)
+        {
+            cfg.waiter.take()
+        } else {
+            None
+        }
+    };
+    if let Some(w) = waiter {
+        let _ = w.tx.send(result);
+    }
+}
+
+fn fail_containerd_waiter(inner: &Inner, reason: String) {
+    let waiter = inner.containerd_config.lock().unwrap().waiter.take();
+    if let Some(w) = waiter {
+        let _ = w.tx.send(Err(reason));
+    }
+}
+
+/// Roll back a failed newly activated runtime override config to the stock
+/// `/etc/containerd/config.toml` if no newer config change has superseded
+/// `failed_generation` and this override has not already been proven ready.
+fn rollback_containerd_config(inner: &Inner, failed_generation: u64) -> Option<String> {
+    let mut cfg = inner.containerd_config.lock().unwrap();
+    if cfg.generation == failed_generation && cfg.path.is_some() && !cfg.proven_ready {
+        cfg.generation += 1;
+        cfg.proven_ready = false;
+        cfg.path.take()
+    } else {
+        None
+    }
+}
+
+fn containerd_args(config: Option<&str>) -> Vec<&str> {
+    match config {
+        Some(path) => vec!["--config", path],
+        None => Vec::new(),
+    }
+}
+
+struct ContainerdRun {
+    used_override: bool,
+    generation: u64,
+}
+
+enum StartOutcome {
+    Ready,
+    Stopping,
+    Failed { error: String, spawned: bool },
+}
+
+fn handle_containerd_failure(
+    inner: &Inner,
+    notifier: &Notifier,
+    run: ContainerdRun,
+    error: String,
+    spawned: bool,
+) {
+    let fell_back = if run.used_override {
+        if let Some(override_path) = rollback_containerd_config(inner, run.generation) {
+            let _ = std::fs::remove_file(&override_path);
+            if spawned {
+                inner.reloading_containerd.store(true, Ordering::SeqCst);
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if fell_back {
+        notifier.failed(
+            NAMES[CONTAINERD],
+            format!("{error}; falling back to default config"),
+        );
+    } else if !inner.reloading_containerd.load(Ordering::SeqCst) {
+        notifier.failed(NAMES[CONTAINERD], error.clone());
+    }
+    notify_containerd_waiter(inner, run.generation, Err(error));
+}
+
 fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
+    let _exit_guard = SuperviseExit(inner);
     let (exits, exited) = mpsc::channel();
     let mut backoff = [backoff(), backoff()];
     let mut to_start = vec![CONTAINERD, DOCKERD];
     loop {
         for i in std::mem::take(&mut to_start) {
-            match start_one(reaper, &exits, inner, i) {
-                Ok(()) if i == DOCKERD => notifier.send(&Msg::ServiceReady {
-                    name: "docker".into(),
-                    at_ns: sys::boottime_ns(),
-                }),
-                Ok(()) => {}
-                Err(None) => return,
+            let (outcome, containerd_run) = start_one(reaper, &exits, inner, i);
+            match outcome {
+                StartOutcome::Ready => {
+                    if let Some(run) = containerd_run {
+                        mark_containerd_ready(inner, run.generation);
+                    } else if i == DOCKERD {
+                        notifier.send(&Msg::ServiceReady {
+                            name: "docker".into(),
+                            at_ns: sys::boottime_ns(),
+                        });
+                    }
+                }
+                StartOutcome::Stopping => return,
                 // The process is gone or killed; its exit restarts it below.
-                Err(Some(e)) => notifier.failed(NAMES[i], e),
+                StartOutcome::Failed { error, spawned } => {
+                    if let Some(run) = containerd_run {
+                        handle_containerd_failure(inner, notifier, run, error, spawned);
+                    } else {
+                        notifier.failed(NAMES[i], error);
+                    }
+                }
             }
         }
         let Ok((i, status)) = exited.recv() else {
@@ -334,30 +561,54 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
     }
 }
 
-/// Start service `i` and wait until it serves. `Err(None)` means the stack
-/// is stopping; `Err(Some)` describes a failed start, after which the
-/// process has exited or is killed.
+/// Start service `i` and wait until it serves.
 fn start_one(
     reaper: &Reaper,
     exits: &Sender<(usize, i32)>,
     inner: &Inner,
     i: usize,
-) -> Result<(), Option<String>> {
+) -> (StartOutcome, Option<ContainerdRun>) {
     let dockerd_args = super::net::dockerd_args();
+    let mut services = inner.services.lock().unwrap();
+    // Checked under the lock, so stop() never misses a service.
+    if inner.stopping.load(Ordering::SeqCst) {
+        return (StartOutcome::Stopping, None);
+    }
+    // Read containerd_config under `services` lock so a concurrent
+    // reload_containerd_config cannot miss a spawn that picked up a stale config.
+    let (containerd_cfg_path, containerd_run) = if i == CONTAINERD {
+        let cfg = inner.containerd_config.lock().unwrap();
+        let path = cfg.path.clone();
+        let run = ContainerdRun {
+            used_override: path.is_some(),
+            generation: cfg.generation,
+        };
+        (path, Some(run))
+    } else {
+        (None, None)
+    };
     let (program, args): (&str, Vec<&str>) = match i {
-        CONTAINERD => ("/usr/bin/containerd", vec![]),
+        CONTAINERD => (
+            "/usr/bin/containerd",
+            containerd_args(containerd_cfg_path.as_deref()),
+        ),
         _ => (
             "/usr/bin/dockerd",
             dockerd_args.iter().map(String::as_str).collect(),
         ),
     };
-    let mut services = inner.services.lock().unwrap();
-    // Checked under the lock, so stop() never misses a service.
-    if inner.stopping.load(Ordering::SeqCst) {
-        return Err(None);
-    }
-    let service = Service::spawn(reaper, exits, i, program, &args)
-        .map_err(|e| Some(format!("start {}: {e}", NAMES[i])))?;
+    let service = match Service::spawn(reaper, exits, i, program, &args) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StartOutcome::Failed {
+                    error: format!("start {}: {e}", NAMES[i]),
+                    spawned: false,
+                },
+                containerd_run,
+            );
+        }
+    };
     let (pid, exited) = (service.pid, service.exited.clone());
     services[i] = Some(service);
     drop(services);
@@ -368,12 +619,19 @@ fn start_one(
         }),
         _ => wait_ready(NAMES[i], &exited, docker_ping),
     };
-    ready.map_err(|e| {
-        if exited.lock().unwrap().is_none() {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+    let outcome = match ready {
+        Ok(()) => StartOutcome::Ready,
+        Err(error) => {
+            if exited.lock().unwrap().is_none() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            StartOutcome::Failed {
+                error,
+                spawned: true,
+            }
         }
-        Some(e)
-    })
+    };
+    (outcome, containerd_run)
 }
 
 /// Sleep for `d`, waking early if `stopping` is set. Returns false if it was.
@@ -425,5 +683,89 @@ mod tests {
     fn describes_wait_status() {
         assert_eq!(describe_status(1 << 8), "exited with status 1");
         assert_eq!(describe_status(9), "killed by signal 9");
+    }
+
+    #[test]
+    fn containerd_args_include_override_only_when_set() {
+        assert!(containerd_args(None).is_empty());
+        assert_eq!(
+            containerd_args(Some("/run/katamaran/containerd-cri.toml")),
+            vec!["--config", "/run/katamaran/containerd-cri.toml"]
+        );
+    }
+
+    #[test]
+    fn rollback_clears_matching_generation_only() {
+        let inner = Inner::default();
+        {
+            let mut cfg = inner.containerd_config.lock().unwrap();
+            cfg.path = Some("/run/katamaran/containerd-cri.toml".into());
+            cfg.generation = 2;
+        }
+        // Stale generation does not roll back newer config.
+        assert_eq!(rollback_containerd_config(&inner, 1), None);
+        assert_eq!(
+            inner.containerd_config.lock().unwrap().path.as_deref(),
+            Some("/run/katamaran/containerd-cri.toml")
+        );
+
+        // Matching generation clears path and bumps generation when unproven.
+        assert_eq!(
+            rollback_containerd_config(&inner, 2).as_deref(),
+            Some("/run/katamaran/containerd-cri.toml")
+        );
+        let cfg = inner.containerd_config.lock().unwrap();
+        assert_eq!(cfg.path, None);
+        assert_eq!(cfg.generation, 3);
+    }
+
+    #[test]
+    fn proven_ready_override_is_preserved_after_transient_restart_failure() {
+        let inner = Inner::default();
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut cfg = inner.containerd_config.lock().unwrap();
+            cfg.path = Some("/run/katamaran/containerd-cri.toml".into());
+            cfg.generation = 4;
+            cfg.proven_ready = false;
+            cfg.waiter = Some(ReloadWaiter {
+                target_generation: 4,
+                tx,
+            });
+        }
+
+        // Initial activation reaches Ready: waiter succeeds and override is proven.
+        mark_containerd_ready(&inner, 4);
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
+        assert!(inner.containerd_config.lock().unwrap().proven_ready);
+
+        // A subsequent transient restart failure must NOT discard the CRI override.
+        assert_eq!(rollback_containerd_config(&inner, 4), None);
+        let cfg = inner.containerd_config.lock().unwrap();
+        assert_eq!(
+            cfg.path.as_deref(),
+            Some("/run/katamaran/containerd-cri.toml")
+        );
+        assert_eq!(cfg.generation, 4);
+        assert!(cfg.proven_ready);
+    }
+
+    #[test]
+    fn waiter_ignores_stale_generation_and_delivers_target() {
+        let inner = Inner::default();
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut cfg = inner.containerd_config.lock().unwrap();
+            cfg.generation = 5;
+            cfg.waiter = Some(ReloadWaiter {
+                target_generation: 5,
+                tx,
+            });
+        }
+        notify_containerd_waiter(&inner, 4, Err("stale".into()));
+        assert!(rx.try_recv().is_err());
+
+        notify_containerd_waiter(&inner, 5, Ok(()));
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
     }
 }

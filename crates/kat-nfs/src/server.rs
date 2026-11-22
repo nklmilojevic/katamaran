@@ -55,6 +55,7 @@ pub mod nfsstat {
     pub const STALE: u32 = 70;
     pub const BADHANDLE: u32 = 10001;
     pub const NOT_SYNC: u32 = 10002;
+    pub const BAD_COOKIE: u32 = 10003;
     pub const NOTSUPP: u32 = 10004;
     pub const TOOSMALL: u32 = 10005;
     pub const SERVERFAULT: u32 = 10006;
@@ -298,13 +299,6 @@ impl Loc {
         }
     }
 
-    fn chmod(&self, mode: u32) -> io::Result<()> {
-        match self {
-            Loc::Anchor(fd) => fsops::fchmod(&fsops::reopen_dir(fd, libc::O_RDONLY)?, mode),
-            Loc::At(d, n) => fsops::chmodat(d, n, mode),
-        }
-    }
-
     fn utimes(&self, atime: SetTime, mtime: SetTime) -> io::Result<()> {
         match self {
             Loc::Anchor(fd) => {
@@ -320,8 +314,39 @@ struct Real {
     st: Stat,
 }
 
+impl Real {
+    fn chmod(&self, mode: u32) -> R<()> {
+        if self.st.is_symlink() {
+            return Ok(());
+        }
+        if self.st.is_reg() || self.st.is_dir() {
+            match self.loc.open(libc::O_RDONLY | libc::O_NONBLOCK) {
+                Ok(fd) => {
+                    if fsops::fstat(&fd).map_err(st_err)?.ident() != self.st.ident() {
+                        return Err(STALE);
+                    }
+                    return fsops::fchmod(&fd, mode).map_err(st_err);
+                }
+                // Non-root chmodding a 0000 file/dir can fail O_RDONLY with EACCES;
+                // fall through to the no-follow fallback below.
+                Err(e) if e.raw_os_error() == Some(libc::EACCES) => {}
+                Err(e) => return Err(walk_err(e)),
+            }
+        }
+        match &self.loc {
+            Loc::Anchor(fd) => {
+                let fd = fsops::reopen_dir(fd, libc::O_RDONLY).map_err(st_err)?;
+                if fsops::fstat(&fd).map_err(st_err)?.ident() != self.st.ident() {
+                    return Err(STALE);
+                }
+                fsops::fchmod(&fd, mode).map_err(st_err)
+            }
+            Loc::At(d, n) => fsops::chmodat_nofollow(d, n, mode, self.st.ident()).map_err(walk_err),
+        }
+    }
+}
+
 struct Listing {
-    verf: u64,
     names: Vec<Vec<u8>>,
     at: Instant,
 }
@@ -332,7 +357,7 @@ const MAX_LISTINGS: usize = 64;
 pub struct Server {
     layout: Layout,
     nodes: Mutex<Nodes>,
-    listings: Mutex<HashMap<Id, Listing>>,
+    listings: Mutex<HashMap<(Id, u64), Listing>>,
     /// Container names last listed, and when that list last changed: the
     /// `containers` directory's mtime.
     containers_seen: Mutex<(Vec<String>, (i64, u32))>,
@@ -522,14 +547,20 @@ impl Server {
             }
             7 => {
                 let fh = get_fh(a)?;
-                let (off, _count, _stable) = (a.u64()?, a.u32()?, a.u32()?);
+                let (off, count, _stable) = (a.u64()?, a.u32()?, a.u32()?);
                 let data = a.opaque(MAX_IO as usize)?;
                 let id = self.node(fh);
-                match id.and_then(|id| self.write(id, off, data, cred)) {
+                let r = id.and_then(|id| {
+                    if count as usize > data.len() {
+                        return Err(INVAL);
+                    }
+                    self.write(id, off, &data[..count as usize], cred)
+                });
+                match r {
                     Ok(attr) => {
                         w.u32(OK);
                         wcc(w, Some(attr));
-                        w.u32(data.len() as u32).u32(FILE_SYNC).u64(self.verf);
+                        w.u32(count).u32(FILE_SYNC).u64(self.verf);
                     }
                     Err(s) => {
                         w.u32(s);
@@ -860,7 +891,10 @@ impl Server {
                 if let Some((_, sub)) = v.subdirs().iter().find(|(n, _)| n.as_bytes() == name) {
                     return Ok((sub.id(), self.vattr(*sub, cred)));
                 }
-                if let Some(f) = VFile::in_dir(v).iter().find(|f| f.name().as_bytes() == name) {
+                if let Some(f) = VFile::in_dir(v)
+                    .iter()
+                    .find(|f| f.name().as_bytes() == name)
+                {
                     return Ok((f.id(), self.vfile_attr(*f)));
                 }
                 let name = std::str::from_utf8(name).map_err(|_| NOENT)?;
@@ -934,10 +968,16 @@ impl Server {
             if !r.st.is_reg() {
                 return Err(INVAL);
             }
+            if size > i64::MAX as u64 {
+                return Err(FBIG);
+            }
             let fd = r
                 .loc
                 .open(libc::O_WRONLY | libc::O_NONBLOCK)
-                .map_err(st_err)?;
+                .map_err(walk_err)?;
+            if fsops::fstat(&fd).map_err(st_err)?.ident() != r.st.ident() {
+                return Err(STALE);
+            }
             fsops::ftruncate(&fd, size).map_err(st_err)?;
         }
         if s.uid.is_some() || s.gid.is_some() {
@@ -945,10 +985,8 @@ impl Server {
             let gid = s.gid.map(|g| stored(g, cred.gid));
             r.loc.chown(uid, gid).map_err(st_err)?;
         }
-        if let Some(mode) = s.mode
-            && !r.st.is_symlink()
-        {
-            r.loc.chmod(mode).map_err(st_err)?;
+        if let Some(mode) = s.mode {
+            r.chmod(mode)?;
         }
         if s.atime.is_some() || s.mtime.is_some() {
             r.loc
@@ -1090,12 +1128,19 @@ impl Server {
                     u32::from_be_bytes(verf[4..].try_into().unwrap()),
                 );
                 match fsops::openat(&d, name, excl, 0o600) {
-                    Ok(_) => {
-                        let r = self.adopt(dir, &d, name, &parent.st, &Sattr::default(), cred)?;
+                    Ok(fd) => {
+                        fsops::fchown(&fd, Some(parent.st.uid), Some(parent.st.gid))
+                            .map_err(st_err)?;
                         let (at, mt) = (SetTime::At(a as i64, 0), SetTime::At(m as i64, 0));
-                        fsops::utimensat(&d, name, at, mt).map_err(st_err)?;
-                        let st = fsops::statat(&d, name).map_err(st_err)?;
-                        Ok((r.0, fattr(&st, r.0, cred)))
+                        fsops::futimens(&fd, at, mt).map_err(st_err)?;
+                        let st = fsops::fstat(&fd).map_err(st_err)?;
+                        let id = self
+                            .nodes
+                            .lock()
+                            .unwrap()
+                            .child(dir, name, st.ident())
+                            .ok_or(STALE)?;
+                        Ok((id, fattr(&st, id, cred)))
                     }
                     Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
                         // A retransmission of a create that already worked.
@@ -1120,17 +1165,30 @@ impl Server {
                 let mode = s.mode.unwrap_or(0o644);
                 let fd = match fsops::openat(&d, name, excl, mode) {
                     Ok(fd) => {
+                        let uid = s.uid.map_or(parent.st.uid, |u| stored(u, cred.uid));
+                        let gid = s.gid.map_or(parent.st.gid, |g| stored(g, cred.gid));
+                        // Own before chmod so setuid/setgid bits are not stripped on Linux.
+                        fsops::fchown(&fd, Some(uid), Some(gid)).map_err(st_err)?;
                         fsops::fchmod(&fd, mode).map_err(st_err)?;
-                        self.adopt(dir, &d, name, &parent.st, &s, cred)?;
                         fd
                     }
                     Err(e) if e.raw_os_error() == Some(libc::EEXIST) && !guarded => {
-                        fsops::openat(&d, name, libc::O_WRONLY | libc::O_NONBLOCK, 0)
-                            .map_err(st_err)?
+                        fsops::openat(&d, name, libc::O_WRONLY | libc::O_NONBLOCK, 0).map_err(
+                            |e| {
+                                if e.raw_os_error() == Some(libc::ELOOP) {
+                                    EXIST
+                                } else {
+                                    st_err(e)
+                                }
+                            },
+                        )?
                     }
                     Err(e) => return Err(st_err(e)),
                 };
                 if let Some(size) = s.size {
+                    if size > i64::MAX as u64 {
+                        return Err(FBIG);
+                    }
                     fsops::ftruncate(&fd, size).map_err(st_err)?;
                 }
                 if s.atime.is_some() || s.mtime.is_some() {
@@ -1157,10 +1215,22 @@ impl Server {
         }
         let (parent, d) = self.real_dir(dir)?;
         let mode = s.mode.unwrap_or(0o755);
-        fsops::mkdirat(&d, name, mode).map_err(st_err)?;
-        // Exactly the mode asked for, whatever the process umask.
-        fsops::chmodat(&d, name, mode).map_err(st_err)?;
-        self.adopt(dir, &d, name, &parent.st, &s, cred)
+        fsops::mkdirat(&d, name, 0o700).map_err(st_err)?;
+        let fd = fsops::openat(&d, name, libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(st_err)?;
+        let uid = s.uid.map_or(parent.st.uid, |u| stored(u, cred.uid));
+        let gid = s.gid.map_or(parent.st.gid, |g| stored(g, cred.gid));
+        // Own before chmod so setgid bits are not stripped on Linux; exactly the
+        // mode asked for, whatever the process umask.
+        fsops::fchown(&fd, Some(uid), Some(gid)).map_err(st_err)?;
+        fsops::fchmod(&fd, mode).map_err(st_err)?;
+        let st = fsops::fstat(&fd).map_err(st_err)?;
+        let id = self
+            .nodes
+            .lock()
+            .unwrap()
+            .child(dir, name, st.ident())
+            .ok_or(STALE)?;
+        Ok((id, fattr(&st, id, cred)))
     }
 
     fn symlink(&self, dir: Id, name: &[u8], target: &[u8], s: Sattr, cred: Cred) -> R<(Id, Fattr)> {
@@ -1177,9 +1247,7 @@ impl Server {
     }
 
     fn remove(&self, dir: Id, name: &[u8], is_dir: bool) -> R<()> {
-        if name == b"." || name == b".." {
-            return Err(INVAL);
-        }
+        let name = self.new_name(name)?;
         let (_, d) = self.real_dir(dir)?;
         let st = fsops::statat(&d, name).map_err(st_err)?;
         if st.is_dir() != is_dir {
@@ -1193,9 +1261,7 @@ impl Server {
     }
 
     fn rename(&self, from: Id, fname: &[u8], to: Id, tname: &[u8]) -> R<()> {
-        if fname == b"." || fname == b".." {
-            return Err(INVAL);
-        }
+        let fname = self.new_name(fname)?;
         let tname = self.new_name(tname)?;
         let (_, fd) = self.real_dir(from)?;
         let (_, td) = self.real_dir(to)?;
@@ -1248,17 +1314,25 @@ impl Server {
     /// listing their verifier names, so a page boundary never skips or
     /// repeats an entry while the directory changes.
     fn listing(&self, dir: Id, cookie: u64, verf: u64) -> R<(u64, Vec<Vec<u8>>)> {
-        if cookie != 0
-            && let Some(l) = self.listings.lock().unwrap().get(&dir)
-            && l.verf == verf
-        {
-            return Ok((l.verf, l.names.clone()));
+        if cookie != 0 {
+            let listings = self.listings.lock().unwrap();
+            let Some(l) = listings.get(&(dir, verf)) else {
+                return Err(BAD_COOKIE);
+            };
+            if usize::try_from(cookie).is_ok_and(|c| c <= l.names.len()) {
+                return Ok((verf, l.names.clone()));
+            }
+            return Err(BAD_COOKIE);
         }
         let mut names = vec![b".".to_vec(), b"..".to_vec()];
         match self.kind(dir)? {
             Kind::Virtual(v) => {
                 names.extend(v.subdirs().iter().map(|(n, _)| n.as_bytes().to_vec()));
-                names.extend(VFile::in_dir(v).iter().map(|f| f.name().as_bytes().to_vec()));
+                names.extend(
+                    VFile::in_dir(v)
+                        .iter()
+                        .map(|f| f.name().as_bytes().to_vec()),
+                );
                 names.extend(
                     self.layout
                         .anchors(v)
@@ -1290,9 +1364,8 @@ impl Server {
             }
         }
         listings.insert(
-            dir,
+            (dir, verf),
             Listing {
-                verf,
                 names: names.clone(),
                 at: Instant::now(),
             },
@@ -1300,16 +1373,33 @@ impl Server {
         Ok((verf, names))
     }
 
-    /// One entry of a listing: its node and attributes. `None` if it went
-    /// away since the listing was read.
-    fn entry(&self, dir: Id, d: Option<&OwnedFd>, name: &[u8], cred: Cred) -> Option<(Id, Fattr)> {
+    /// One entry of a listing: its node and attributes. `Ok(None)` if it went
+    /// away since the listing was read; `Err(STALE)` if `dir` itself went stale.
+    fn entry(
+        &self,
+        dir: Id,
+        d: Option<&OwnedFd>,
+        name: &[u8],
+        cred: Cred,
+    ) -> R<Option<(Id, Fattr)>> {
         match d {
             Some(d) if name != b"." && name != b".." => {
-                let st = fsops::statat(d, name).ok()?;
-                let id = self.nodes.lock().unwrap().child(dir, name, st.ident())?;
-                Some((id, fattr(&st, id, cred)))
+                let Ok(st) = fsops::statat(d, name) else {
+                    return Ok(None);
+                };
+                let id = self
+                    .nodes
+                    .lock()
+                    .unwrap()
+                    .child(dir, name, st.ident())
+                    .ok_or(STALE)?;
+                Ok(Some((id, fattr(&st, id, cred))))
             }
-            _ => self.lookup(dir, name, cred).ok(),
+            _ => match self.lookup(dir, name, cred) {
+                Ok(v) => Ok(Some(v)),
+                Err(STALE) => Err(STALE),
+                Err(_) => Ok(None),
+            },
         }
     }
 
@@ -1324,6 +1414,7 @@ impl Server {
         cred: Cred,
         w: &mut Writer,
     ) -> R<()> {
+        let max = max.min(MAX_IO);
         let dattr = self.attr(dir, cred)?;
         if dattr.ftype != 2 {
             return Err(NOTDIR);
@@ -1343,7 +1434,13 @@ impl Server {
         let mut eof = true;
         let mut wrote = 0;
         for (i, name) in names.iter().enumerate().skip(cookie as usize) {
-            let Some((id, attr)) = self.entry(dir, d.as_ref(), name, cred) else {
+            let Some((id, attr)) = (match self.entry(dir, d.as_ref(), name, cred) {
+                Ok(e) => e,
+                Err(s) => {
+                    w.buf.truncate(mark);
+                    return Err(s);
+                }
+            }) else {
                 continue;
             };
             let size = 4

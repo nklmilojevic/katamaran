@@ -493,13 +493,11 @@ impl Daemon {
             }
             let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
         }
-        if auto_start_k8s
-            && !self
-                .k8s
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .suppress_autostart
-        {
+        let allow_autostart = {
+            let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            !k.suppress_autostart && k.state != "failed"
+        };
+        if auto_start_k8s && allow_autostart {
             let d = self.clone();
             thread::Builder::new()
                 .name("k8s-autostart".into())
@@ -1272,7 +1270,9 @@ impl Daemon {
             }
         }
         if let Some(e) = first_err {
-            return Err(failed(format!("{e:#}")));
+            let msg = format!("{e:#}");
+            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+            return Err(failed(msg));
         }
         Ok(())
     }
@@ -1337,12 +1337,14 @@ impl Daemon {
                 dlog!("k8s reset: remove kubeconfig failed: {e:#}");
             }
         }
-
         reset_res?;
         stop_res?;
 
-        self.persist_k8s_enabled(false)
-            .map_err(|e| failed(format!("{e:#}")))?;
+        if let Err(e) = self.persist_k8s_enabled(false) {
+            let msg = format!("{e:#}");
+            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+            return Err(failed(msg));
+        }
         Ok(())
     }
 

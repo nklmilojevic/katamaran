@@ -216,6 +216,9 @@ const CRI_PLUGINS: [&str; 3] = [
     "io.containerd.cri.v1.runtime",
 ];
 
+const CONTAINERD_BASE_CONFIG: &str = "/etc/containerd/config.toml";
+const CONTAINERD_CRI_CONFIG: &str = "/run/katamaran/containerd-cri.toml";
+
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = target
         .parent()
@@ -259,25 +262,109 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Ensure `/etc/containerd/config.toml` has CRI plugins enabled while leaving
-/// any other entries in `disabled_plugins` untouched. Returns `Ok(true)` if the
-/// file was modified (meaning an already-running `containerd` must be restarted
-/// to load CRI).
-pub fn ensure_containerd_cri() -> Result<bool, String> {
-    ensure_containerd_cri_at(Path::new("/etc/containerd/config.toml"))
+/// Outcome of preparing an ephemeral CRI-enabled runtime config for containerd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerdCriConfig {
+    /// Path to pass via `containerd --config`.
+    pub path: String,
+    /// True if the runtime config was created or its contents changed.
+    pub updated: bool,
 }
 
-fn ensure_containerd_cri_at(path: &Path) -> Result<bool, String> {
-    let text = match fs::read_to_string(path) {
+/// Prepare an ephemeral CRI-enabled containerd config under `/run/katamaran/`
+/// derived from `/etc/containerd/config.toml` without ever modifying the
+/// managed base config file.
+///
+/// The generated file is validated with `containerd --config <tmp> config dump`
+/// before it is committed. Returns `Ok(None)` when `/etc/containerd/config.toml`
+/// does not exist or does not disable CRI plugins.
+pub fn ensure_containerd_cri(reaper: &Reaper) -> Result<Option<ContainerdCriConfig>, String> {
+    prepare_containerd_cri_config(
+        Path::new(CONTAINERD_BASE_CONFIG),
+        Path::new(CONTAINERD_CRI_CONFIG),
+        |tmp| validate_containerd_config(reaper, tmp),
+    )
+}
+
+fn prepare_containerd_cri_config(
+    base_path: &Path,
+    out_path: &Path,
+    validate: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<Option<ContainerdCriConfig>, String> {
+    let text = match fs::read_to_string(base_path) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let _ = fs::remove_file(out_path);
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("read {}: {e}", base_path.display())),
     };
     let Some(updated) = strip_cri_from_disabled_plugins(&text) else {
-        return Ok(false);
+        let _ = fs::remove_file(out_path);
+        return Ok(None);
     };
-    write_atomic(path, updated.as_bytes())?;
-    Ok(true)
+
+    if matches!(fs::symlink_metadata(out_path), Ok(meta) if meta.file_type().is_file() && (meta.permissions().mode() & 0o777) == 0o600)
+        && fs::read_to_string(out_path).ok().as_deref() == Some(updated.as_str())
+    {
+        return Ok(Some(ContainerdCriConfig {
+            path: out_path.to_string_lossy().into_owned(),
+            updated: false,
+        }));
+    }
+
+    let parent = out_path.parent().ok_or_else(|| {
+        format!(
+            "containerd runtime config {} has no parent directory",
+            out_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".containerd-cri.{}.{seq}.tmp", std::process::id()));
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    if let Err(e) = f.write_all(updated.as_bytes()).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    drop(f);
+
+    if let Err(e) = validate(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp, out_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("commit {}: {e}", out_path.display()));
+    }
+    Ok(Some(ContainerdCriConfig {
+        path: out_path.to_string_lossy().into_owned(),
+        updated: true,
+    }))
+}
+
+fn validate_containerd_config(reaper: &Reaper, path: &Path) -> Result<(), String> {
+    let mut cmd = Command::new("/usr/bin/containerd");
+    cmd.arg("--config").arg(path).args(["config", "dump"]);
+    let (code, out) = run_reaped(reaper, &mut cmd, Duration::from_secs(10))
+        .map_err(|e| format!("validate containerd config {}: {e}", path.display()))?;
+    if code != 0 {
+        return Err(format!(
+            "containerd rejected generated config {} (exit {code}): {}",
+            path.display(),
+            out.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Split a TOML line into `(code, comment)` at the first unquoted `#`.
@@ -344,19 +431,24 @@ fn split_toml_array_items(s: &str) -> Vec<&str> {
     items
 }
 
-/// Remove only CRI plugin IDs from `disabled_plugins = [...]`, preserving all
-/// other disabled plugins, unrelated `disabled_plugins` lines, inline comments,
-/// and supporting multiline arrays. Returns `None` if no CRI plugin was disabled.
+/// Remove only CRI plugin IDs from top-level `disabled_plugins = [...]`,
+/// preserving all other disabled plugins, nested `[table]` sections, inline
+/// comments, and multiline arrays. Returns `None` if no CRI plugin was disabled.
 fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let mut any_changed = false;
+    let mut in_table = false;
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("disabled_plugins")
+        if trimmed.starts_with('[') {
+            in_table = true;
+        }
+        if !in_table
+            && let Some(rest) = trimmed.strip_prefix("disabled_plugins")
             && let Some(rhs) = rest.trim_start().strip_prefix('=')
         {
             // Strip any trailing `# ...` comment before inspecting `[` / `]`.
@@ -601,14 +693,7 @@ impl K8s {
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
-        if ensure_containerd_cri()? {
-            let _ = k8s::write(
-                &mut *conn,
-                &K8sMsg::Progress("enabling CRI in containerd".into()),
-            );
-            self.docker.restart_containerd();
-        }
-        wait_containerd()?;
+        self.activate_containerd_cri(conn)?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
@@ -881,6 +966,34 @@ impl K8s {
         Ok(self.info())
     }
 
+    fn activate_containerd_cri(&self, conn: &mut UnixStream) -> Result<(), String> {
+        match ensure_containerd_cri(&self.reaper)? {
+            Some(cfg) => {
+                let needs_reload = cfg.updated
+                    || self.docker.containerd_config().as_deref() != Some(cfg.path.as_str());
+                if needs_reload {
+                    let _ = k8s::write(
+                        &mut *conn,
+                        &K8sMsg::Progress("enabling CRI in containerd".into()),
+                    );
+                    self.docker
+                        .reload_containerd_config(Some(cfg.path), Duration::from_secs(30))?;
+                } else {
+                    wait_containerd()?;
+                }
+            }
+            None => {
+                if self.docker.containerd_config().is_some() {
+                    self.docker
+                        .reload_containerd_config(None, Duration::from_secs(30))?;
+                } else {
+                    wait_containerd()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn stop_inner(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
         let _guard = self.op_lock.lock().unwrap();
         self.stop_locked(conn)
@@ -1057,15 +1170,14 @@ fn prepare_dirs_and_sysctls(reaper: &Reaper) -> Result<(), String> {
     Ok(())
 }
 
-const BRIDGE_NF_SYSCTLS: [&str; 2] = [
+const BRIDGE_NF_SYSCTLS: [&str; 3] = [
+    "/proc/sys/net/ipv4/ip_forward",
     "/proc/sys/net/bridge/bridge-nf-call-iptables",
     "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
 ];
-static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 2]>> = Mutex::new(None);
+static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 3]>> = Mutex::new(None);
 
 fn enable_bridge_netfilter() -> Result<(), String> {
-    fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
-        .map_err(|e| format!("write /proc/sys/net/ipv4/ip_forward: {e}"))?;
     let mut saved = SAVED_BRIDGE_NF.lock().unwrap();
     let prev = match *saved {
         Some(ref p) => p.clone(),
@@ -1073,6 +1185,7 @@ fn enable_bridge_netfilter() -> Result<(), String> {
             let p = [
                 fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
                 fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[2]).ok(),
             ];
             *saved = Some(p.clone());
             p
@@ -1088,7 +1201,7 @@ fn enable_bridge_netfilter() -> Result<(), String> {
                 }
             }
             *saved = None;
-            return Err(format!("write {path}: {e}"));
+            return Err(format!("enable {path}: {e}"));
         }
     }
     Ok(())
@@ -1848,6 +1961,41 @@ fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("kat-init-k8s-{name}-{}-{seq}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn strip_cri_preserves_other_disabled_plugins_and_tables() {
+        let input = concat!(
+            "version = 4\n",
+            "disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.snapshotter.v1.zfs\"]\n",
+            "[plugins.example]\n",
+            "  disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+        );
+        let out = strip_cri_from_disabled_plugins(input).unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "version = 4\n",
+                "disabled_plugins = [\"io.containerd.snapshotter.v1.zfs\"]\n",
+                "[plugins.example]\n",
+                "  disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn strip_cri_returns_none_when_no_cri_disabled() {
+        let input = "version = 4\ndisabled_plugins = [\"io.containerd.snapshotter.v1.zfs\"]\n";
+        assert_eq!(strip_cri_from_disabled_plugins(input), None);
+    }
 
     #[test]
     fn strip_cri_handles_multiple_lines_and_preserves_non_cri() {
@@ -1938,24 +2086,17 @@ disabled_plugins = [ # note
     }
 
     #[test]
-    fn ensure_containerd_cri_at_writes_atomically_and_preserves_permissions() {
-        let dir = std::env::temp_dir().join(format!(
-            "kat-init-cri-{}",
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("config.toml");
-
-        assert!(!ensure_containerd_cri_at(&cfg).unwrap());
-        fs::write(&cfg, "disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n").unwrap();
-        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(ensure_containerd_cri_at(&cfg).unwrap());
-        assert_eq!(fs::read_to_string(&cfg).unwrap(), "");
+    fn write_atomic_preserves_existing_permissions_and_restricts_new_files() {
+        let dir = temp_dir("atomic");
+        let existing = dir.join("config.toml");
+        fs::write(&existing, "old\n").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&existing, b"new\n").unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "new\n");
         assert_eq!(
-            fs::metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!ensure_containerd_cri_at(&cfg).unwrap());
 
         let new_file = dir.join("version");
         write_atomic(&new_file, b"v1.37.2+k3s1\n").unwrap();
@@ -1963,6 +2104,108 @@ disabled_plugins = [ # note
             fs::metadata(&new_file).unwrap().permissions().mode() & 0o777,
             0o600
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_cri_config_never_modifies_base_file_or_symlink() {
+        let dir = temp_dir("symlink");
+        let real_base = dir.join("managed.toml");
+        let base_link = dir.join("config.toml");
+        let out_path = dir.join("run/containerd-cri.toml");
+
+        let original = concat!(
+            "version = 4\n",
+            "disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\", \"io.containerd.cri.v1.runtime\"]\n",
+            "[grpc]\n",
+            "  address = \"/run/containerd/containerd.sock\"\n",
+        );
+        fs::write(&real_base, original).unwrap();
+        fs::set_permissions(&real_base, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&real_base, &base_link).unwrap();
+
+        let cfg = prepare_containerd_cri_config(&base_link, &out_path, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.updated);
+        assert_eq!(cfg.path, out_path.to_string_lossy());
+
+        // Managed config symlink, target, contents, and permissions remain untouched.
+        assert!(
+            fs::symlink_metadata(&base_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&base_link).unwrap(), real_base);
+        assert_eq!(fs::read_to_string(&real_base).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&real_base).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // Runtime override is private and stripped of CRI plugins.
+        assert_eq!(
+            fs::symlink_metadata(&out_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let generated = fs::read_to_string(&out_path).unwrap();
+        assert!(!generated.contains("disabled_plugins"));
+        assert!(generated.contains("address = \"/run/containerd/containerd.sock\""));
+
+        // Second call with unchanged base is idempotent (updated = false).
+        let second = prepare_containerd_cri_config(&base_link, &out_path, |_| {
+            panic!("validator should not rerun when generated config is already up to date")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!second.updated);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_cri_config_rejects_invalid_output_without_committing() {
+        let dir = temp_dir("invalid");
+        let base = dir.join("config.toml");
+        let out_path = dir.join("run/containerd-cri.toml");
+        fs::write(
+            &base,
+            "version = 4\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+        )
+        .unwrap();
+
+        let err = prepare_containerd_cri_config(&base, &out_path, |_| {
+            Err("invalid containerd config".into())
+        })
+        .unwrap_err();
+        assert!(err.contains("invalid containerd config"));
+        assert!(!out_path.exists());
+
+        // No leftover temp files in output directory.
+        let leftover: Vec<_> = fs::read_dir(out_path.parent().unwrap()).unwrap().collect();
+        assert!(leftover.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_cri_config_removes_stale_override_when_not_needed() {
+        let dir = temp_dir("cleanup");
+        let base = dir.join("config.toml");
+        let out_path = dir.join("run/containerd-cri.toml");
+        fs::create_dir_all(out_path.parent().unwrap()).unwrap();
+        fs::write(&out_path, "stale\n").unwrap();
+        fs::write(&base, "version = 4\n").unwrap();
+
+        let res = prepare_containerd_cri_config(&base, &out_path, |_| Ok(())).unwrap();
+        assert_eq!(res, None);
+        assert!(!out_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

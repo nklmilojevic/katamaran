@@ -108,11 +108,10 @@ unsafe fn str_arg<'a>(s: *const c_char) -> &'a str {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kat_term_new(cols: u16, rows: u16, scrollback: u32) -> *mut KatTerm {
-    Box::into_raw(Box::new(KatTerm(Mutex::new(Term::new(
-        cols,
-        rows,
-        scrollback as usize,
-    )))))
+    match Term::new(cols, rows, scrollback as usize) {
+        Some(term) => Box::into_raw(Box::new(KatTerm(Mutex::new(term)))),
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// # Safety
@@ -226,10 +225,17 @@ pub unsafe extern "C" fn kat_term_snapshot(
     {
         return false;
     }
+    let prev_gen = info.generation;
     *info = current;
     let src = term.cells();
     if !cells.is_null() && cap >= src.len() {
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), cells, src.len()) };
+    } else {
+        info.generation = if prev_gen == current.generation {
+            0
+        } else {
+            prev_gen
+        };
     }
     true
 }

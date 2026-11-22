@@ -1,6 +1,6 @@
 ---
 name: katamaran
-description: Manage Docker containers, Linux machines, and the katamaran VM on Apple silicon Macs with the `kat` (`katamaran`) CLI. Use when starting or inspecting the katamaran VM, running containers or isolated test VMs, managing LXC Linux machines (`kat machine`, `kat shell`, `kat ssh`), tuning VM settings, or reading VM/daemon/guest logs.
+description: Manage Docker containers, Linux machines, optional Kubernetes (`kat k8s`), and the katamaran VM on Apple silicon Macs with the `kat` (`katamaran`) CLI. Use when starting or inspecting the katamaran VM, running containers or isolated test VMs, managing LXC Linux machines (`kat machine`, `kat shell`, `kat ssh`), managing the k3s cluster (`kat k8s`), tuning VM settings, or reading VM/daemon/guest logs.
 metadata:
   katamaran-stub: "1"
 ---

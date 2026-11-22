@@ -238,7 +238,7 @@ impl VmConfig {
                 s.host_path.display()
             );
             let valid_tag = !s.tag.is_empty() && !s.tag.contains([':', ' ']);
-            let valid_path = s.guest_path.starts_with('/') && !s.guest_path.contains(' ');
+            let valid_path = s.guest_path.starts_with('/') && !s.guest_path.contains([':', ' ']);
             anyhow::ensure!(
                 valid_tag && valid_path,
                 "share {} has an invalid tag or guest path",
@@ -260,6 +260,7 @@ impl VmConfig {
         }
         let mut ports: Vec<u32> = self.host_listeners.iter().map(|l| l.port).collect();
         ports.push(kat_proto::CONTROL_PORT);
+        ports.push(kat_proto::FSCACHE_PORT);
         ports.sort_unstable();
         anyhow::ensure!(
             ports.windows(2).all(|w| w[0] != w[1]),
@@ -619,6 +620,16 @@ mod tests {
             loopback_tcp: false,
         });
         assert!(c.validate().unwrap_err().to_string().contains("unique"));
+        c.host_listeners[0].port = kat_proto::FSCACHE_PORT;
+        assert!(c.validate().unwrap_err().to_string().contains("unique"));
+        c.host_listeners.clear();
+        c.shares.push(Share {
+            tag: "s".into(),
+            host_path: dir.clone(),
+            guest_path: "/mnt/a:b".into(),
+            permissions: Permissions::default(),
+        });
+        assert!(c.validate().unwrap_err().to_string().contains("invalid"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
