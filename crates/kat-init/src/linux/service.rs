@@ -5,11 +5,12 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,16 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Clone)]
 pub struct Reaper {
     watched: Arc<Mutex<HashMap<i32, Sender<i32>>>>,
+}
+
+/// How to signal a spawned child without racing PID reuse.
+pub enum ChildTarget {
+    /// Kernel pidfd: `pidfd_send_signal` returns `ESRCH` once reaped.
+    PidFd(OwnedFd),
+    /// Fallback when `pidfd_open` is unavailable on the kernel.
+    Pid(i32),
+    /// The child had already exited and been reaped before `pidfd_open` ran.
+    Exited,
 }
 
 impl Reaper {
@@ -55,18 +66,87 @@ impl Reaper {
         watched.insert(pid, tx);
         Ok((pid, rx))
     }
+
+    /// Like [`Reaper::spawn`], also opening a `pidfd` while the watch table
+    /// lock is held. Because `reap_loop` waits with `WNOWAIT` and only reaps
+    /// under `self.watched`, the child cannot be reaped or its PID recycled
+    /// before `pidfd_open` and registration complete.
+    pub fn spawn_pidfd(&self, cmd: &mut Command) -> io::Result<(ChildTarget, Receiver<i32>)> {
+        let mut watched = self.watched.lock().unwrap();
+        let child = cmd.spawn()?;
+        let pid = child.id() as i32;
+        let target = match sys::pidfd_open(pid) {
+            Ok(fd) => ChildTarget::PidFd(fd),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => ChildTarget::Exited,
+            Err(_) => ChildTarget::Pid(pid),
+        };
+        let (tx, rx) = mpsc::channel();
+        watched.insert(pid, tx);
+        Ok((target, rx))
+    }
+
+    /// Signal `target` without risking PID reuse. On kernels with `pidfd`,
+    /// `pidfd_send_signal` enforces process identity in the kernel; on the
+    /// fallback `ChildTarget::Pid` path, holding `self.watched` prevents
+    /// `reap_loop` from reaping and freeing the PID across the liveness check
+    /// and `kill(2)`.
+    pub fn signal_target(&self, target: &ChildTarget, sig: i32) {
+        match target {
+            ChildTarget::PidFd(fd) => {
+                let _ = sys::pidfd_send_signal(fd, sig);
+            }
+            ChildTarget::Pid(pid) => {
+                let watched = self.watched.lock().unwrap();
+                if watched.contains_key(pid) {
+                    unsafe { libc::kill(*pid, sig) };
+                }
+            }
+            ChildTarget::Exited => {}
+        }
+    }
+
+    /// Signal process group `-pid` only while `pid` is still registered in
+    /// `self.watched`. Because `reap_loop` waits with `WNOWAIT` and only reaps
+    /// under `self.watched`, holding `self.watched` prevents the leader from
+    /// being reaped and its PID/PGID from being reused before `kill(-pid, sig)`.
+    pub fn signal_pgrp(&self, pid: i32, sig: i32) {
+        let watched = self.watched.lock().unwrap();
+        if watched.contains_key(&pid) {
+            unsafe { libc::kill(-pid, sig) };
+        }
+    }
 }
 
 fn reap_loop(watched: &Mutex<HashMap<i32, Sender<i32>>>) {
     loop {
-        let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if pid < 0 {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Wait without reaping (`WNOWAIT`) so zombies stay pinned until we hold
+        // `watched`; that guarantees `spawn_pidfd` and fallback `signal_target`
+        // can never race with reaping and PID reuse.
+        let rc = unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             // ECHILD: nothing to wait for yet.
             thread::sleep(Duration::from_millis(50));
             continue;
         }
-        if let Some(tx) = watched.lock().unwrap().remove(&pid) {
+        let pid = unsafe { info.si_pid() };
+        if pid <= 0 {
+            continue;
+        }
+        let mut status = 0;
+        let tx = {
+            let mut watched = watched.lock().unwrap();
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped > 0 {
+                watched.remove(&reaped)
+            } else {
+                None
+            }
+        };
+        if let Some(tx) = tx {
             let _ = tx.send(status);
         }
     }
@@ -120,13 +200,40 @@ fn backoff() -> Backoff {
     )
 }
 
+struct ExitState {
+    status: Mutex<Option<i32>>,
+    notify: Condvar,
+}
+
+impl ExitState {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(None),
+            notify: Condvar::new(),
+        }
+    }
+
+    fn has_exited(&self) -> bool {
+        self.status.lock().unwrap().is_some()
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let guard = self.status.lock().unwrap();
+        let (guard, _) = self
+            .notify
+            .wait_timeout_while(guard, timeout, |s| s.is_none())
+            .unwrap();
+        guard.is_some()
+    }
+}
+
 /// A running service process.
 struct Service {
     name: &'static str,
-    pid: i32,
+    reaper: Reaper,
+    target: ChildTarget,
     started: Instant,
-    exited: Arc<Mutex<Option<i32>>>,
-    exit_rx: Receiver<()>,
+    exit: Arc<ExitState>,
 }
 
 impl Service {
@@ -137,7 +244,7 @@ impl Service {
         index: usize,
         program: &str,
         args: &[&str],
-    ) -> io::Result<Service> {
+    ) -> io::Result<Arc<Service>> {
         let name = NAMES[index];
         sys::mkdir("/var/log")?;
         // Appended, so a restarted service keeps the log of its crash.
@@ -151,28 +258,36 @@ impl Service {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        let (pid, status_rx) = reaper.spawn(&mut cmd)?;
-        let exited = Arc::new(Mutex::new(None));
-        let (exit_tx, exit_rx) = mpsc::channel();
-        let (exited2, exits) = (exited.clone(), exits.clone());
-        thread::spawn(move || {
-            if let Ok(status) = status_rx.recv() {
-                *exited2.lock().unwrap() = Some(status);
-                let _ = exit_tx.send(());
-                let _ = exits.send((index, status));
-            }
-        });
-        Ok(Service {
+        let (target, status_rx) = reaper.spawn_pidfd(&mut cmd)?;
+        let exit = Arc::new(ExitState::new());
+        let (exit2, exits) = (exit.clone(), exits.clone());
+        let waiter = thread::Builder::new()
+            .name(format!("{name}-wait"))
+            .spawn(move || {
+                if let Ok(status) = status_rx.recv() {
+                    *exit2.status.lock().unwrap() = Some(status);
+                    exit2.notify.notify_all();
+                    let _ = exits.send((index, status));
+                }
+            });
+        if let Err(e) = waiter {
+            // `reaper.signal_target` uses pidfd when available, or holds the
+            // reaper watch-table lock across the liveness check and kill(2) so
+            // `reap_loop` cannot reap and free the PID in between.
+            reaper.signal_target(&target, libc::SIGKILL);
+            return Err(e);
+        }
+        Ok(Arc::new(Service {
             name,
-            pid,
+            reaper: reaper.clone(),
+            target,
             started: Instant::now(),
-            exited,
-            exit_rx,
-        })
+            exit,
+        }))
     }
 
     fn has_exited(&self) -> bool {
-        self.exited.lock().unwrap().is_some()
+        self.exit.has_exited()
     }
 
     /// SIGTERM, wait up to `timeout`, then SIGKILL.
@@ -181,15 +296,17 @@ impl Service {
             return;
         }
         let t = Instant::now();
-        unsafe { libc::kill(self.pid, libc::SIGTERM) };
-        if self.exit_rx.recv_timeout(timeout).is_err() {
+        self.reaper.signal_target(&self.target, libc::SIGTERM);
+        if !self.exit.wait_timeout(timeout) {
             eprintln!(
                 "kat-init: {} did not stop in {}s, killing it",
                 self.name,
                 timeout.as_secs()
             );
-            unsafe { libc::kill(self.pid, libc::SIGKILL) };
-            let _ = self.exit_rx.recv_timeout(Duration::from_secs(2));
+            if !self.has_exited() {
+                self.reaper.signal_target(&self.target, libc::SIGKILL);
+            }
+            let _ = self.exit.wait_timeout(Duration::from_secs(2));
         }
         eprintln!(
             "kat-init: shutdown: {} stopped in {} ms",
@@ -200,14 +317,10 @@ impl Service {
 }
 
 /// Poll `check` until it succeeds, the process exits or the timeout passes.
-fn wait_ready(
-    name: &str,
-    exited: &Mutex<Option<i32>>,
-    check: impl Fn() -> bool,
-) -> Result<(), String> {
+fn wait_ready(name: &str, exit: &ExitState, check: impl Fn() -> bool) -> Result<(), String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        if exited.lock().unwrap().is_some() {
+        if exit.has_exited() {
             return Err(format!("{name} exited during startup"));
         }
         if check() {
@@ -243,7 +356,7 @@ struct ReloadWaiter {
 
 #[derive(Default)]
 struct Inner {
-    services: Mutex<[Option<Service>; 2]>,
+    services: Mutex<[Option<Arc<Service>>; 2]>,
     stopping: AtomicBool,
     reloading_containerd: AtomicBool,
     containerd_config: Mutex<ContainerdConfigState>,
@@ -280,6 +393,24 @@ impl DockerStack {
         self.inner.containerd_config.lock().unwrap().path.clone()
     }
 
+    fn stop_containerd_for_reload(&self) {
+        let service = {
+            let services = self.inner.services.lock().unwrap();
+            match &services[CONTAINERD] {
+                Some(s) if !s.has_exited() => {
+                    self.inner
+                        .reloading_containerd
+                        .store(true, Ordering::SeqCst);
+                    Some(s.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(s) = service {
+            s.stop(STOP_TIMEOUT[CONTAINERD]);
+        }
+    }
+
     /// Switch containerd to `config` (or the stock `/etc/containerd/config.toml`
     /// when `None`), restart it cleanly without reporting a failure or backoff,
     /// and wait until the restarted containerd instance becomes ready or fails.
@@ -303,17 +434,7 @@ impl DockerStack {
             });
             cfg.generation
         };
-        {
-            let services = self.inner.services.lock().unwrap();
-            if let Some(s) = &services[CONTAINERD]
-                && !s.has_exited()
-            {
-                self.inner
-                    .reloading_containerd
-                    .store(true, Ordering::SeqCst);
-                s.stop(STOP_TIMEOUT[CONTAINERD]);
-            }
-        }
+        self.stop_containerd_for_reload();
         match rx.recv_timeout(timeout) {
             Ok(res) => res,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -339,15 +460,7 @@ impl DockerStack {
                 };
                 if let Some(override_path) = rolled_back_path {
                     let _ = std::fs::remove_file(&override_path);
-                    let services = self.inner.services.lock().unwrap();
-                    if let Some(s) = &services[CONTAINERD]
-                        && !s.has_exited()
-                    {
-                        self.inner
-                            .reloading_containerd
-                            .store(true, Ordering::SeqCst);
-                        s.stop(STOP_TIMEOUT[CONTAINERD]);
-                    }
+                    self.stop_containerd_for_reload();
                 }
                 Err(format!(
                     "timed out waiting for containerd reload after {}s",
@@ -365,7 +478,7 @@ impl DockerStack {
     pub fn stop(&self) {
         self.inner.stopping.store(true, Ordering::SeqCst);
         fail_containerd_waiter(&self.inner, "docker stack is stopping".into());
-        let services = self.inner.services.lock().unwrap();
+        let services = { self.inner.services.lock().unwrap().clone() };
         for i in [DOCKERD, CONTAINERD] {
             if let Some(s) = &services[i] {
                 s.stop(STOP_TIMEOUT[i]);
@@ -460,13 +573,14 @@ enum StartOutcome {
     Failed { error: String, spawned: bool },
 }
 
+/// Returns `true` if an unproven override config was rolled back to default.
 fn handle_containerd_failure(
     inner: &Inner,
     notifier: &Notifier,
     run: ContainerdRun,
     error: String,
     spawned: bool,
-) {
+) -> bool {
     let fell_back = if run.used_override {
         if let Some(override_path) = rollback_containerd_config(inner, run.generation) {
             let _ = std::fs::remove_file(&override_path);
@@ -485,24 +599,109 @@ fn handle_containerd_failure(
             NAMES[CONTAINERD],
             format!("{error}; falling back to default config"),
         );
-    } else if !inner.reloading_containerd.load(Ordering::SeqCst) {
+    } else if spawned && !inner.reloading_containerd.load(Ordering::SeqCst) {
         notifier.failed(NAMES[CONTAINERD], error.clone());
     }
     notify_containerd_waiter(inner, run.generation, Err(error));
+    fell_back
+}
+
+/// Pick which service is due to start at `now`, in dependency order
+/// (`CONTAINERD` before `DOCKERD`). If `DOCKERD` is due while `containerd` is
+/// not alive, defer `DOCKERD` into `dockerd_pending` so it starts once
+/// `containerd` becomes ready again.
+fn pick_due_start(
+    retry_at: &mut [Option<Instant>; 2],
+    dockerd_pending: &mut bool,
+    containerd_alive: bool,
+    now: Instant,
+) -> Option<usize> {
+    if retry_at[CONTAINERD].is_some_and(|t| t <= now) {
+        retry_at[CONTAINERD] = None;
+        return Some(CONTAINERD);
+    }
+    if retry_at[DOCKERD].is_some_and(|t| t <= now) {
+        retry_at[DOCKERD] = None;
+        if containerd_alive {
+            return Some(DOCKERD);
+        }
+        *dockerd_pending = true;
+    }
+    None
 }
 
 fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
     let _exit_guard = SuperviseExit(inner);
     let (exits, exited) = mpsc::channel();
     let mut backoff = [backoff(), backoff()];
-    let mut to_start = vec![CONTAINERD, DOCKERD];
+    let mut retry_at: [Option<Instant>; 2] = [Some(Instant::now()), None];
+    let mut dockerd_pending = true;
+
+    let handle_exit =
+        |i: usize, status: i32, backoff: &mut [Backoff; 2], retry_at: &mut [Option<Instant>; 2]| {
+            if i == CONTAINERD && inner.reloading_containerd.swap(false, Ordering::SeqCst) {
+                retry_at[CONTAINERD] = Some(Instant::now());
+                return;
+            }
+            let ran_for = inner.services.lock().unwrap()[i]
+                .as_ref()
+                .map_or(Duration::ZERO, |s| s.started.elapsed());
+            let delay = backoff[i].next(ran_for);
+            let name = NAMES[i];
+            if backoff[i].failures() > MAX_RESTARTS {
+                notifier.failed(
+                    name,
+                    format!(
+                        "{name} {}; gave up after {MAX_RESTARTS} restarts",
+                        describe_status(status)
+                    ),
+                );
+                retry_at[i] = None;
+                return;
+            }
+            notifier.failed(
+                name,
+                format!(
+                    "{name} {}; restarting in {} ms",
+                    describe_status(status),
+                    delay.as_millis()
+                ),
+            );
+            retry_at[i] = Some(Instant::now() + delay);
+        };
+
     loop {
-        for i in std::mem::take(&mut to_start) {
+        if inner.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        // Drain all pending exit notifications before starting or retrying
+        // anything so containerd failures are never starved behind dockerd
+        // spawn backoff.
+        while let Ok((i, status)) = exited.try_recv() {
+            if inner.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            handle_exit(i, status, &mut backoff, &mut retry_at);
+        }
+
+        let containerd_alive = inner.services.lock().unwrap()[CONTAINERD]
+            .as_ref()
+            .is_some_and(|s| !s.has_exited());
+        if let Some(i) = pick_due_start(
+            &mut retry_at,
+            &mut dockerd_pending,
+            containerd_alive,
+            Instant::now(),
+        ) {
             let (outcome, containerd_run) = start_one(reaper, &exits, inner, i);
             match outcome {
                 StartOutcome::Ready => {
                     if let Some(run) = containerd_run {
                         mark_containerd_ready(inner, run.generation);
+                        if dockerd_pending {
+                            dockerd_pending = false;
+                            retry_at[DOCKERD] = Some(Instant::now());
+                        }
                     } else if i == DOCKERD {
                         notifier.send(&Msg::ServiceReady {
                             name: "docker".into(),
@@ -511,53 +710,57 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
                     }
                 }
                 StartOutcome::Stopping => return,
-                // The process is gone or killed; its exit restarts it below.
                 StartOutcome::Failed { error, spawned } => {
-                    if let Some(run) = containerd_run {
-                        handle_containerd_failure(inner, notifier, run, error, spawned);
+                    let fell_back = if let Some(run) = containerd_run {
+                        handle_containerd_failure(inner, notifier, run, error.clone(), spawned)
                     } else {
-                        notifier.failed(NAMES[i], error);
+                        if spawned {
+                            notifier.failed(NAMES[i], error.clone());
+                        }
+                        false
+                    };
+                    if !spawned {
+                        if fell_back {
+                            retry_at[i] = Some(Instant::now());
+                        } else {
+                            let delay = backoff[i].next(Duration::ZERO);
+                            let name = NAMES[i];
+                            if backoff[i].failures() > MAX_RESTARTS {
+                                notifier.failed(
+                                    name,
+                                    format!("{error}; gave up after {MAX_RESTARTS} restarts"),
+                                );
+                                retry_at[i] = None;
+                            } else {
+                                notifier.failed(
+                                    name,
+                                    format!("{error}; restarting in {} ms", delay.as_millis()),
+                                );
+                                retry_at[i] = Some(Instant::now() + delay);
+                            }
+                        }
                     }
                 }
             }
+            continue;
         }
-        let Ok((i, status)) = exited.recv() else {
-            return;
+
+        let wait = match retry_at.into_iter().flatten().min() {
+            Some(dl) => dl
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(20)),
+            None => Duration::from_millis(50),
         };
-        if inner.stopping.load(Ordering::SeqCst) {
-            return;
+        match exited.recv_timeout(wait) {
+            Ok((i, status)) => {
+                if inner.stopping.load(Ordering::SeqCst) {
+                    return;
+                }
+                handle_exit(i, status, &mut backoff, &mut retry_at);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
-        if i == CONTAINERD && inner.reloading_containerd.swap(false, Ordering::SeqCst) {
-            to_start.push(CONTAINERD);
-            continue;
-        }
-        let ran_for = inner.services.lock().unwrap()[i]
-            .as_ref()
-            .map_or(Duration::ZERO, |s| s.started.elapsed());
-        let delay = backoff[i].next(ran_for);
-        let name = NAMES[i];
-        if backoff[i].failures() > MAX_RESTARTS {
-            notifier.failed(
-                name,
-                format!(
-                    "{name} {}; gave up after {MAX_RESTARTS} restarts",
-                    describe_status(status)
-                ),
-            );
-            continue;
-        }
-        notifier.failed(
-            name,
-            format!(
-                "{name} {}; restarting in {} ms",
-                describe_status(status),
-                delay.as_millis()
-            ),
-        );
-        if !sleep_unless_stopping(delay, &inner.stopping) {
-            return;
-        }
-        to_start.push(i);
     }
 }
 
@@ -609,21 +812,20 @@ fn start_one(
             );
         }
     };
-    let (pid, exited) = (service.pid, service.exited.clone());
-    services[i] = Some(service);
+    services[i] = Some(service.clone());
     drop(services);
 
     let ready = match i {
-        CONTAINERD => wait_ready(NAMES[i], &exited, || {
+        CONTAINERD => wait_ready(NAMES[i], &service.exit, || {
             UnixStream::connect(CONTAINERD_SOCKET).is_ok()
         }),
-        _ => wait_ready(NAMES[i], &exited, docker_ping),
+        _ => wait_ready(NAMES[i], &service.exit, docker_ping),
     };
     let outcome = match ready {
         Ok(()) => StartOutcome::Ready,
         Err(error) => {
-            if exited.lock().unwrap().is_none() {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+            if !service.has_exited() {
+                reaper.signal_target(&service.target, libc::SIGKILL);
             }
             StartOutcome::Failed {
                 error,
@@ -632,18 +834,6 @@ fn start_one(
         }
     };
     (outcome, containerd_run)
-}
-
-/// Sleep for `d`, waking early if `stopping` is set. Returns false if it was.
-fn sleep_unless_stopping(d: Duration, stopping: &AtomicBool) -> bool {
-    let deadline = Instant::now() + d;
-    while Instant::now() < deadline {
-        if stopping.load(Ordering::SeqCst) {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(20).min(deadline - Instant::now()));
-    }
-    !stopping.load(Ordering::SeqCst)
 }
 
 /// `GET /_ping` over the Docker socket.
@@ -683,6 +873,31 @@ mod tests {
     fn describes_wait_status() {
         assert_eq!(describe_status(1 << 8), "exited with status 1");
         assert_eq!(describe_status(9), "killed by signal 9");
+    }
+
+    #[test]
+    fn due_start_prioritizes_containerd_and_defers_dockerd_when_down() {
+        let t0 = Instant::now();
+        let mut retry_at = [Some(t0), Some(t0)];
+        let mut dockerd_pending = false;
+        // Containerd is always picked first when both are due.
+        assert_eq!(
+            pick_due_start(&mut retry_at, &mut dockerd_pending, false, t0),
+            Some(CONTAINERD)
+        );
+        // Dockerd due while containerd is not alive defers into dockerd_pending.
+        assert_eq!(
+            pick_due_start(&mut retry_at, &mut dockerd_pending, false, t0),
+            None
+        );
+        assert!(dockerd_pending);
+        assert_eq!(retry_at[DOCKERD], None);
+        // Once containerd is alive, a due dockerd retry starts immediately.
+        retry_at[DOCKERD] = Some(t0);
+        assert_eq!(
+            pick_due_start(&mut retry_at, &mut dockerd_pending, true, t0),
+            Some(DOCKERD)
+        );
     }
 
     #[test]

@@ -187,14 +187,20 @@ pub enum DiagEnd {
     Error(i32),
 }
 
-/// Append the sockets in one netlink datagram of a dump to `out`.
-pub fn parse_diag(buf: &[u8], out: &mut Vec<Listener>) -> DiagEnd {
+/// Append the sockets in one netlink datagram of a dump to `out`, ignoring
+/// messages whose sequence number does not match `expected_seq`.
+pub fn parse_diag(buf: &[u8], expected_seq: u32, out: &mut Vec<Listener>) -> DiagEnd {
     let mut rest = buf;
     while rest.len() >= NLMSG_HDR {
         let len = u32::from_ne_bytes(rest[0..4].try_into().unwrap()) as usize;
         let kind = u16::from_ne_bytes(rest[4..6].try_into().unwrap());
+        let seq = u32::from_ne_bytes(rest[8..12].try_into().unwrap());
         if len < NLMSG_HDR || len > rest.len() {
             return DiagEnd::Error(EPROTO);
+        }
+        if seq != expected_seq {
+            rest = rest.get((len + 3) & !3..).unwrap_or(&[]);
+            continue;
         }
         let body = &rest[NLMSG_HDR..len];
         match kind {
@@ -412,11 +418,13 @@ mod tests {
         assert_eq!(docker_proxy_target(&bad_ip), None);
     }
 
-    fn nlmsg(kind: u16, body: &[u8]) -> Vec<u8> {
+    fn nlmsg(kind: u16, seq: u32, body: &[u8]) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(&((NLMSG_HDR + body.len()) as u32).to_ne_bytes());
         m.extend_from_slice(&kind.to_ne_bytes());
-        m.extend_from_slice(&[0; 10]);
+        m.extend_from_slice(&[0; 2]);
+        m.extend_from_slice(&seq.to_ne_bytes());
+        m.extend_from_slice(&[0; 4]);
         m.extend_from_slice(body);
         while m.len() % 4 != 0 {
             m.push(0);
@@ -447,18 +455,23 @@ mod tests {
 
     #[test]
     fn parses_diag_dumps() {
-        let mut buf = nlmsg(SOCK_DIAG_BY_FAMILY, &diag_msg(AF_INET, &[0, 0, 0, 0], 8000));
+        let mut buf = nlmsg(
+            SOCK_DIAG_BY_FAMILY,
+            7,
+            &diag_msg(AF_INET, &[0, 0, 0, 0], 8000),
+        );
         buf.extend(nlmsg(
             SOCK_DIAG_BY_FAMILY,
+            7,
             &diag_msg(AF_INET, &[172, 17, 0, 2], 443),
         ));
         let mut out = Vec::new();
-        assert_eq!(parse_diag(&buf, &mut out), DiagEnd::More);
+        assert_eq!(parse_diag(&buf, 7, &mut out), DiagEnd::More);
         let mut v6 = [0u8; 16];
         v6[15] = 1;
-        let mut buf = nlmsg(SOCK_DIAG_BY_FAMILY, &diag_msg(AF_INET6, &v6, 9000));
-        buf.extend(nlmsg(NLMSG_DONE, &[0; 4]));
-        assert_eq!(parse_diag(&buf, &mut out), DiagEnd::Done);
+        let mut buf = nlmsg(SOCK_DIAG_BY_FAMILY, 7, &diag_msg(AF_INET6, &v6, 9000));
+        buf.extend(nlmsg(NLMSG_DONE, 7, &[0; 4]));
+        assert_eq!(parse_diag(&buf, 7, &mut out), DiagEnd::Done);
         assert_eq!(
             out,
             [l("0.0.0.0", 8000), l("172.17.0.2", 443), l("::1", 9000)]
@@ -468,16 +481,40 @@ mod tests {
     #[test]
     fn diag_errors_and_garbage() {
         let mut out = Vec::new();
-        let err = nlmsg(NLMSG_ERROR, &(-2i32).to_ne_bytes());
-        assert_eq!(parse_diag(&err, &mut out), DiagEnd::Error(2));
-        assert_eq!(parse_diag(&[0; 7], &mut out), DiagEnd::More);
-        let mut bad = nlmsg(SOCK_DIAG_BY_FAMILY, &diag_msg(AF_INET, &[0; 4], 1));
+        let err = nlmsg(NLMSG_ERROR, 1, &(-2i32).to_ne_bytes());
+        assert_eq!(parse_diag(&err, 1, &mut out), DiagEnd::Error(2));
+        assert_eq!(parse_diag(&[0; 7], 1, &mut out), DiagEnd::More);
+        let mut bad = nlmsg(SOCK_DIAG_BY_FAMILY, 1, &diag_msg(AF_INET, &[0; 4], 1));
         bad[0..4].copy_from_slice(&1000u32.to_ne_bytes());
-        assert!(matches!(parse_diag(&bad, &mut out), DiagEnd::Error(_)));
+        assert!(matches!(parse_diag(&bad, 1, &mut out), DiagEnd::Error(_)));
         // Too short to be an inet_diag_msg, and port 0: skipped.
-        let mut buf = nlmsg(SOCK_DIAG_BY_FAMILY, &[0; 8]);
-        buf.extend(nlmsg(SOCK_DIAG_BY_FAMILY, &diag_msg(AF_INET, &[0; 4], 0)));
-        assert_eq!(parse_diag(&buf, &mut out), DiagEnd::More);
+        let mut buf = nlmsg(SOCK_DIAG_BY_FAMILY, 1, &[0; 8]);
+        buf.extend(nlmsg(
+            SOCK_DIAG_BY_FAMILY,
+            1,
+            &diag_msg(AF_INET, &[0; 4], 0),
+        ));
+        assert_eq!(parse_diag(&buf, 1, &mut out), DiagEnd::More);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_diag_ignores_stale_sequence_numbers() {
+        let mut buf = nlmsg(
+            SOCK_DIAG_BY_FAMILY,
+            41,
+            &diag_msg(AF_INET, &[0, 0, 0, 0], 1111),
+        );
+        buf.extend(nlmsg(NLMSG_DONE, 41, &[0; 4]));
+        buf.extend(nlmsg(NLMSG_ERROR, 41, &(-5i32).to_ne_bytes()));
+        buf.extend(nlmsg(
+            SOCK_DIAG_BY_FAMILY,
+            42,
+            &diag_msg(AF_INET, &[0, 0, 0, 0], 2222),
+        ));
+        buf.extend(nlmsg(NLMSG_DONE, 42, &[0; 4]));
+        let mut out = Vec::new();
+        assert_eq!(parse_diag(&buf, 42, &mut out), DiagEnd::Done);
+        assert_eq!(out, [l("0.0.0.0", 2222)]);
     }
 }

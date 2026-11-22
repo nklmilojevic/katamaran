@@ -13,10 +13,12 @@ mod lxc;
 mod provision;
 mod store;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,6 +33,81 @@ use super::sys;
 
 const PORT_INTERVAL: Duration = Duration::from_millis(500);
 const FIRST_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
+const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_TAR_OUTPUT: usize = 64 << 10;
+const MAX_ERROR_BYTES: usize = 64 << 10;
+
+/// Read `r` to EOF, retaining at most `max_bytes` and discarding the rest so a
+/// verbose child never blocks on a closed or full pipe.
+fn drain_capped(mut r: impl Read, max_bytes: usize) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let keep = max_bytes.saturating_sub(out.len()).min(n);
+                if keep > 0 {
+                    out.extend_from_slice(&buf[..keep]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Truncate an error message safely on a UTF-8 boundary so an encoded
+/// `MachineMsg::Error` frame can never exceed `kat_proto::MAX_FRAME`.
+pub(super) fn truncate_error(s: &str) -> String {
+    if s.len() <= MAX_ERROR_BYTES {
+        return s.to_string();
+    }
+    let suffix = "...";
+    let mut end = MAX_ERROR_BYTES.saturating_sub(suffix.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + suffix.len());
+    out.push_str(&s[..end]);
+    out.push_str(suffix);
+    out
+}
+
+#[derive(Clone)]
+struct RunningMachine {
+    pid: i32,
+    ip: Ipv4Addr,
+    pidfd: Option<Arc<OwnedFd>>,
+    netns: Arc<OwnedFd>,
+    netns_ino: u64,
+}
+
+impl RunningMachine {
+    fn is_alive(&self) -> bool {
+        if let Some(pidfd) = &self.pidfd {
+            return sys::pidfd_alive(pidfd);
+        }
+        let alive = unsafe { libc::kill(self.pid, 0) } == 0;
+        alive
+            && fs::metadata(format!("/proc/{}/ns/net", self.pid))
+                .ok()
+                .map(|m| m.ino())
+                == Some(self.netns_ino)
+    }
+}
+
+struct IpReservation<'a> {
+    alloc: &'a Mutex<HashSet<Ipv4Addr>>,
+    ip: Ipv4Addr,
+}
+
+impl Drop for IpReservation<'_> {
+    fn drop(&mut self) {
+        self.alloc.lock().unwrap().remove(&self.ip);
+    }
+}
 
 pub struct Machines {
     reaper: Reaper,
@@ -38,10 +115,11 @@ pub struct Machines {
     bridge: Mutex<Option<bridge::Bridge>>,
     /// One lifecycle operation per machine at a time.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Creates hold this while they pick an address and a name.
-    alloc: Mutex<()>,
-    /// Running machines: name → (init pid, address).
-    running: Mutex<BTreeMap<String, (i32, Ipv4Addr)>>,
+    /// Creates hold this while picking an address; tracks in-flight reserved IPs
+    /// before their metadata is saved on disk.
+    alloc: Mutex<HashSet<Ipv4Addr>>,
+    /// Running machines: name → pinned process & netns identity.
+    running: Mutex<BTreeMap<String, RunningMachine>>,
 }
 
 /// Ports the machines listen on that the host forwards (see
@@ -63,7 +141,7 @@ pub fn start(reaper: Reaper, dns: Option<Ipv4Addr>) -> io::Result<Arc<Machines>>
         dns,
         bridge: Mutex::new(None),
         locks: Mutex::new(HashMap::new()),
-        alloc: Mutex::new(()),
+        alloc: Mutex::new(HashSet::new()),
         running: Mutex::new(BTreeMap::new()),
     });
     let _ = SERVICE.set(m.clone());
@@ -77,11 +155,16 @@ pub fn start(reaper: Reaper, dns: Option<Ipv4Addr>) -> io::Result<Arc<Machines>>
                     match sys::accept(&listener) {
                         Ok(fd) => {
                             let m = m.clone();
-                            thread::spawn(move || m.serve(UnixStream::from(fd)));
+                            let spawned = thread::Builder::new()
+                                .name("machine-conn".into())
+                                .spawn(move || m.serve(UnixStream::from(fd)));
+                            if let Err(e) = spawned {
+                                log(&format!("spawn connection handler: {e}"));
+                            }
                         }
                         Err(e) => {
                             log(&format!("accept on vsock {MACHINE_PORT}: {e}"));
-                            return;
+                            thread::sleep(ACCEPT_ERR_BACKOFF);
                         }
                     }
                 }
@@ -89,11 +172,15 @@ pub fn start(reaper: Reaper, dns: Option<Ipv4Addr>) -> io::Result<Arc<Machines>>
     }
     {
         let m = m.clone();
-        thread::spawn(move || m.autostart());
+        thread::Builder::new()
+            .name("machines-autostart".into())
+            .spawn(move || m.autostart())?;
     }
     {
         let m = m.clone();
-        thread::spawn(move || m.watch_ports());
+        thread::Builder::new()
+            .name("machines-ports".into())
+            .spawn(move || m.watch_ports())?;
     }
     Ok(m)
 }
@@ -103,17 +190,25 @@ pub fn start(reaper: Reaper, dns: Option<Ipv4Addr>) -> io::Result<Arc<Machines>>
 pub fn stop_all() -> usize {
     let Some(m) = SERVICE.get() else { return 0 };
     let names: Vec<String> = m.running.lock().unwrap().keys().cloned().collect();
-    let workers: Vec<_> = names
-        .iter()
-        .map(|n| {
-            let (m, n) = (m.clone(), n.clone());
-            thread::spawn(move || {
-                if let Err(e) = lxc::stop(&m.reaper, &n, false) {
+    let mut workers = Vec::with_capacity(names.len());
+    for n in &names {
+        let (m2, n2) = (m.clone(), n.clone());
+        match thread::Builder::new()
+            .name(format!("stop-{n}"))
+            .spawn(move || {
+                if let Err(e) = lxc::stop(&m2.reaper, &n2, false) {
+                    log(&format!("stop {n2}: {e}"));
+                }
+            }) {
+            Ok(w) => workers.push(w),
+            Err(e) => {
+                log(&format!("spawn stop thread for {n}: {e}"));
+                if let Err(e) = lxc::stop(&m.reaper, n, false) {
                     log(&format!("stop {n}: {e}"));
                 }
-            })
-        })
-        .collect();
+            }
+        }
+    }
     for w in workers {
         let _ = w.join();
     }
@@ -158,14 +253,11 @@ impl Machines {
             Ok(Some(m)) => m,
             Ok(None) => return,
             Err(e) => {
-                let _ = machine::write(&mut conn, &MachineMsg::Error(e.to_string()));
+                let _ = machine::write(
+                    &mut conn,
+                    &MachineMsg::Error(truncate_error(&e.to_string())),
+                );
                 return;
-            }
-        };
-        let mut progress = conn.try_clone().ok();
-        let mut say = |s: &str| {
-            if let Some(c) = progress.as_mut() {
-                let _ = machine::write(c, &MachineMsg::Progress(s.into()));
             }
         };
         let result: Result<Option<MachineMsg>, String> = match req {
@@ -176,6 +268,12 @@ impl Machines {
                 .resolve(&name)
                 .map(|n| Some(MachineMsg::Machines(vec![self.info(&n)]))),
             MachineMsg::Create(spec) => {
+                let mut progress = conn.try_clone().ok();
+                let mut say = |s: &str| {
+                    if let Some(c) = progress.as_mut() {
+                        let _ = machine::write(c, &MachineMsg::Progress(truncate_error(s)));
+                    }
+                };
                 let r = self.create(&spec, &mut conn, &mut say);
                 r.map(|()| Some(MachineMsg::Done))
             }
@@ -207,8 +305,11 @@ impl Machines {
                         Err(format!("invalid user {user:?}"))
                     } else {
                         spec.machine = name;
-                        match exec::exec(&self.reaper, conn.try_clone().unwrap(), &spec, &user) {
-                            Ok(()) => Ok(None),
+                        match conn.try_clone() {
+                            Ok(c) => match exec::exec(&self.reaper, c, &spec, &user) {
+                                Ok(()) => Ok(None),
+                                Err(e) => Err(format!("exec: {e}")),
+                            },
                             Err(e) => Err(format!("exec: {e}")),
                         }
                     }
@@ -217,12 +318,27 @@ impl Machines {
             MachineMsg::Connect { name, port } => match self.prepare(&name) {
                 Err(e) => Err(e),
                 Ok(name) => {
-                    let target = self.running.lock().unwrap().get(&name).copied();
-                    match target {
-                        Some((pid, ip)) => {
-                            let _ = exec::connect(conn.try_clone().unwrap(), pid, ip, port);
-                            Ok(None)
+                    let target = {
+                        let mut running = self.running.lock().unwrap();
+                        match running.get(&name) {
+                            Some(entry) if entry.is_alive() => {
+                                Some((entry.netns.clone(), entry.ip))
+                            }
+                            Some(_) => {
+                                running.remove(&name);
+                                None
+                            }
+                            None => None,
                         }
+                    };
+                    match target {
+                        Some((netns, ip)) => match conn.try_clone() {
+                            Ok(c) => {
+                                let _ = exec::connect(c, netns, ip, port);
+                                Ok(None)
+                            }
+                            Err(e) => Err(format!("connect: {e}")),
+                        },
                         None => Err(format!("{name} has no address")),
                     }
                 }
@@ -232,7 +348,7 @@ impl Machines {
         let reply = match result {
             Ok(Some(m)) => m,
             Ok(None) => return,
-            Err(e) => MachineMsg::Error(e),
+            Err(e) => MachineMsg::Error(truncate_error(&e)),
         };
         let _ = machine::write(&mut conn, &reply);
     }
@@ -247,11 +363,11 @@ impl Machines {
     }
 
     fn is_running(&self, name: &str) -> bool {
-        let pid = self.running.lock().unwrap().get(name).map(|r| r.0);
-        match pid {
-            Some(pid) if unsafe { libc::kill(pid, 0) } == 0 => true,
+        let mut running = self.running.lock().unwrap();
+        match running.get(name) {
+            Some(entry) if entry.is_alive() => true,
             Some(_) => {
-                self.running.lock().unwrap().remove(name);
+                running.remove(name);
                 false
             }
             None => false,
@@ -291,12 +407,16 @@ impl Machines {
             .into_iter()
             .filter_map(|n| Some((n.clone(), store::load(&n).ok()?.ip?)))
             .collect();
-        if b.is_none() {
-            *b = Some(bridge::Bridge::up(&self.reaper, self.dns, &hosts)?);
+        if let Some(bridge) = b.as_mut() {
+            bridge.set_hosts(&hosts)?;
+            bridge.ensure_dnsmasq(&self.reaper)?;
+            Ok(bridge.mtu)
         } else {
-            b.as_ref().unwrap().set_hosts(&hosts)?;
+            let bridge = bridge::Bridge::up(&self.reaper, self.dns, &hosts)?;
+            let mtu = bridge.mtu;
+            *b = Some(bridge);
+            Ok(mtu)
         }
-        Ok(b.as_ref().unwrap().mtu)
     }
 
     fn start_machine(&self, name: &str, mark: bool) -> Result<(), String> {
@@ -315,7 +435,30 @@ impl Machines {
             lxc::start(&self.reaper, name).map_err(|e| format!("start {name}: {e}"))?;
             let (_, pid) = lxc::info(&self.reaper, name);
             let pid = pid.ok_or(format!("{name} did not stay up"))?;
-            self.running.lock().unwrap().insert(name.into(), (pid, ip));
+            let pidfd = match sys::pidfd_open(pid) {
+                Ok(fd) => Some(Arc::new(fd)),
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                    return Err(format!("{name} did not stay up"));
+                }
+                Err(_) => None,
+            };
+            let netns_file = File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|_| format!("{name} did not stay up"))?;
+            let netns_ino = netns_file
+                .metadata()
+                .map_err(|e| format!("{name}: {e}"))?
+                .ino();
+            let entry = RunningMachine {
+                pid,
+                ip,
+                pidfd,
+                netns: Arc::new(OwnedFd::from(netns_file)),
+                netns_ino,
+            };
+            if !entry.is_alive() || lxc::info(&self.reaper, name).1 != Some(pid) {
+                return Err(format!("{name} did not stay up"));
+            }
+            self.running.lock().unwrap().insert(name.into(), entry);
             log(&format!("{name} started in {} ms", t.elapsed().as_millis()));
         }
         if mark && !meta.autostart {
@@ -373,19 +516,25 @@ impl Machines {
         let t = Instant::now();
         let lock = self.lock_for(name);
         let _g = lock.lock().unwrap();
-        let ip = {
-            let _a = self.alloc.lock().unwrap();
+        let ip_reservation = {
+            let mut reserved = self.alloc.lock().unwrap();
             if store::dir(name).exists() {
                 return Err(format!("a machine named {name} already exists"));
             }
-            let used: Vec<Ipv4Addr> = store::names()
+            let mut used: Vec<Ipv4Addr> = store::names()
                 .iter()
                 .filter_map(|n| store::load(n).ok()?.ip)
                 .collect();
+            used.extend(reserved.iter().copied());
             let ip = store::free_ip(&used).ok_or("no free machine address")?;
             fs::create_dir_all(store::dir(name)).map_err(|e| e.to_string())?;
-            ip
+            reserved.insert(ip);
+            IpReservation {
+                alloc: &self.alloc,
+                ip,
+            }
         };
+        let ip = ip_reservation.ip;
         let result = self.populate(spec, ip, conn, say);
         if let Err(e) = result {
             let _ = remove(&self.reaper, name);
@@ -483,11 +632,19 @@ impl Machines {
         }
         thread::scope(|s| {
             for n in &names {
-                s.spawn(move || {
+                let spawned = thread::Builder::new()
+                    .name(format!("autostart-{n}"))
+                    .spawn_scoped(s, move || {
+                        if let Err(e) = self.start_machine(n, false) {
+                            log(&format!("autostart: {e}"));
+                        }
+                    });
+                if let Err(e) = spawned {
+                    log(&format!("spawn autostart thread for {n}: {e}"));
                     if let Err(e) = self.start_machine(n, false) {
                         log(&format!("autostart: {e}"));
                     }
-                });
+                }
             }
         });
     }
@@ -498,12 +655,12 @@ impl Machines {
     fn watch_ports(&self) {
         let mut active: BTreeMap<u16, Ipv4Addr> = BTreeMap::new();
         loop {
-            let running: Vec<(String, (i32, Ipv4Addr))> = self
+            let running: Vec<(String, RunningMachine)> = self
                 .running
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(n, r)| (n.clone(), *r))
+                .map(|(n, r)| (n.clone(), r.clone()))
                 .collect();
             if running.is_empty() && active.is_empty() {
                 thread::sleep(Duration::from_secs(5));
@@ -511,16 +668,38 @@ impl Machines {
             }
             thread::sleep(PORT_INTERVAL);
             let root = super::ports::listening();
+            let k8s_forwarded = super::k8s::forwarded_ports();
             let mut want: BTreeMap<u16, Ipv4Addr> = BTreeMap::new();
-            for (_, (pid, ip)) in &running {
+            for (name, entry) in &running {
+                if !entry.is_alive() {
+                    let mut map = self.running.lock().unwrap();
+                    if map
+                        .get(name)
+                        .is_some_and(|e| e.pid == entry.pid && e.netns_ino == entry.netns_ino)
+                    {
+                        map.remove(name);
+                    }
+                    continue;
+                }
+                let mut ports = Vec::new();
                 for t in ["tcp", "tcp6"] {
-                    let Ok(table) = fs::read_to_string(format!("/proc/{pid}/net/{t}")) else {
+                    let Ok(table) = fs::read_to_string(format!("/proc/{}/net/{t}", entry.pid))
+                    else {
                         continue;
                     };
-                    for port in super::ports::wildcard_listeners(&table) {
-                        if !root.contains(&port) {
-                            want.entry(port).or_insert(*ip);
-                        }
+                    ports.extend(super::ports::wildcard_listeners(&table));
+                }
+                // Re-verify liveness after reading /proc/{pid}/net so a recycled
+                // PID's listeners can never be forwarded for a dead machine.
+                if !entry.is_alive() {
+                    continue;
+                }
+                for port in ports {
+                    if !root.contains(&port)
+                        && !k8s_forwarded.contains(&port)
+                        && !super::k8s::is_internal_port(port)
+                    {
+                        want.entry(port).or_insert(entry.ip);
                     }
                 }
             }
@@ -583,13 +762,22 @@ fn unpack(reaper: &Reaper, rootfs: &std::path::Path, conn: &mut UnixStream) -> R
     .stdin(Stdio::from(in_r))
     .stdout(Stdio::from(out_w.try_clone().map_err(|e| e.to_string())?))
     .stderr(Stdio::from(out_w));
-    let (_pid, exited) = reaper.spawn(&mut c).map_err(|e| format!("tar: {e}"))?;
+    let (target, exited) = reaper
+        .spawn_pidfd(&mut c)
+        .map_err(|e| format!("tar: {e}"))?;
     drop(c);
-    let errors = thread::spawn(move || {
-        let mut s = String::new();
-        let _ = io::Read::read_to_string(&mut File::from(out_r), &mut s);
-        s
-    });
+    let errors = match thread::Builder::new()
+        .name("tar-stderr".into())
+        .spawn(move || drain_capped(File::from(out_r), MAX_TAR_OUTPUT))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            drop(in_w);
+            reaper.signal_target(&target, libc::SIGKILL);
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Err(format!("tar output thread: {e}"));
+        }
+    };
     let mut tar_in = Some(File::from(in_w));
     let mut bytes = 0u64;
     let stream = loop {
@@ -647,5 +835,52 @@ fn remove(reaper: &Reaper, name: &str) -> io::Result<()> {
     match fs::remove_dir_all(store::dir(name)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_long_error_utf8_safely() {
+        assert_eq!(truncate_error("short"), "short");
+        let long = "é".repeat(MAX_ERROR_BYTES);
+        let t = truncate_error(&long);
+        assert!(t.len() <= MAX_ERROR_BYTES);
+        assert!(t.ends_with("..."));
+        assert!(MachineMsg::Error(t).encode().len() - 4 <= kat_proto::MAX_FRAME);
+    }
+
+    #[test]
+    fn ip_reservation_releases_on_drop() {
+        let alloc = Mutex::new(HashSet::new());
+        let ip = Ipv4Addr::new(198, 19, 249, 2);
+        {
+            alloc.lock().unwrap().insert(ip);
+            let _guard = IpReservation { alloc: &alloc, ip };
+            assert!(alloc.lock().unwrap().contains(&ip));
+        }
+        assert!(!alloc.lock().unwrap().contains(&ip));
+    }
+
+    #[test]
+    fn drain_capped_consumes_pipe_past_limit() {
+        let (r, w) = cmd::pipe().unwrap();
+        let total = MAX_TAR_OUTPUT * 4;
+        let writer = thread::spawn(move || {
+            let mut wf = File::from(w);
+            let chunk = vec![b'x'; 8192];
+            let mut left = total;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                wf.write_all(&chunk[..n]).unwrap();
+                left -= n;
+            }
+        });
+        let captured = drain_capped(File::from(r), MAX_TAR_OUTPUT);
+        writer.join().unwrap();
+        assert_eq!(captured.len(), MAX_TAR_OUTPUT);
+        assert!(captured.bytes().all(|b| b == b'x'));
     }
 }

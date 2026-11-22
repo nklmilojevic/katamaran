@@ -15,13 +15,35 @@ use std::time::Duration;
 
 use kat_proto::machine::{self, CHUNK, ExecSpec, MachineMsg, Tty};
 
-use super::super::service::Reaper;
-use super::{cmd, lxc};
+use super::super::service::{ChildTarget, Reaper};
+use super::{cmd, lxc, truncate_error};
 
-type Writer = Arc<Mutex<UnixStream>>;
+struct ExecWriter {
+    stream: UnixStream,
+    closed: bool,
+}
+
+type Writer = Arc<Mutex<ExecWriter>>;
 
 fn send(w: &Writer, m: &MachineMsg) -> io::Result<()> {
-    machine::write(&mut *w.lock().unwrap(), m)
+    let mut guard = w.lock().unwrap();
+    if guard.closed {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "exec closed"));
+    }
+    machine::write(&mut guard.stream, m)
+}
+
+fn send_exit_and_close(w: &Writer, code: i32) -> io::Result<()> {
+    let mut guard = w.lock().unwrap();
+    guard.closed = true;
+    machine::write(&mut guard.stream, &MachineMsg::Exit { code })
+}
+
+fn signal_child(reaper: &Reaper, target: &Mutex<Option<ChildTarget>>, sig: i32) {
+    let guard = target.lock().unwrap();
+    if let Some(t) = guard.as_ref() {
+        reaper.signal_target(t, sig);
+    }
 }
 
 fn winsize(rows: u16, cols: u16) -> libc::winsize {
@@ -86,11 +108,13 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
     if let Some(t) = term {
         c.env("TERM", t);
     }
-    let w: Writer = Arc::new(Mutex::new(conn.try_clone()?));
+    let w: Writer = Arc::new(Mutex::new(ExecWriter {
+        stream: conn.try_clone()?,
+        closed: false,
+    }));
     let mut reader = conn;
 
-    let mut outputs = Vec::new();
-    let (pid, exited, stdin, master) = match &spec.tty {
+    let (target, exited, stdin, master, out_fds) = match &spec.tty {
         Some(t) => {
             let (master, slave) = openpty(t)?;
             c.stdin(Stdio::from(slave.try_clone()?))
@@ -104,16 +128,16 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
                     Ok(())
                 });
             }
-            let (pid, exited) = reaper.spawn(&mut c)?;
+            let (target, exited) = reaper.spawn_pidfd(&mut c)?;
             drop(c);
             let out = File::from(master.try_clone()?);
-            let w2 = w.clone();
-            outputs.push(thread::spawn(move || pump(out, w2, MachineMsg::Stdout)));
+            let stdin = Some(File::from(master.try_clone()?));
             (
-                pid,
+                target,
                 exited,
-                Some(File::from(master.try_clone()?)),
+                stdin,
                 Some(master),
+                vec![(out, MachineMsg::Stdout as fn(Vec<u8>) -> MachineMsg)],
             )
         }
         None => {
@@ -123,57 +147,100 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
             c.stdin(Stdio::from(in_r))
                 .stdout(Stdio::from(out_w))
                 .stderr(Stdio::from(err_w));
-            let (pid, exited) = reaper.spawn(&mut c)?;
+            let (target, exited) = reaper.spawn_pidfd(&mut c)?;
             drop(c);
-            for (fd, kind) in [
-                (out_r, MachineMsg::Stdout as fn(Vec<u8>) -> MachineMsg),
-                (err_r, MachineMsg::Stderr),
-            ] {
-                let w2 = w.clone();
-                outputs.push(thread::spawn(move || pump(File::from(fd), w2, kind)));
-            }
-            (pid, exited, Some(File::from(in_w)), None)
+            (
+                target,
+                exited,
+                Some(File::from(in_w)),
+                None,
+                vec![
+                    (
+                        File::from(out_r),
+                        MachineMsg::Stdout as fn(Vec<u8>) -> MachineMsg,
+                    ),
+                    (File::from(err_r), MachineMsg::Stderr),
+                ],
+            )
         }
     };
 
-    // Input from the host until it hangs up; the process may outlive it.
+    let target = Arc::new(Mutex::new(Some(target)));
+
+    // Input from the host until it hangs up or the child exits.
     let tty = spec.tty.is_some();
-    thread::spawn(move || {
-        let mut stdin = stdin;
-        while let Ok(Some(m)) = machine::read(&mut reader) {
-            match m {
-                MachineMsg::Data(d) => {
-                    if let Some(s) = stdin.as_mut()
-                        && s.write_all(&d).is_err()
-                    {
-                        stdin = None;
+    let target_in = target.clone();
+    let reaper_in = reaper.clone();
+    let stdin_thread = thread::Builder::new()
+        .name("exec-in".into())
+        .spawn(move || {
+            let mut stdin = stdin;
+            while let Ok(Some(m)) = machine::read(&mut reader) {
+                match m {
+                    MachineMsg::Data(d) => {
+                        if let Some(s) = stdin.as_mut()
+                            && s.write_all(&d).is_err()
+                        {
+                            stdin = None;
+                        }
                     }
-                }
-                // A pty has no EOF of its own; the line discipline's ^D
-                // is the closest.
-                MachineMsg::DataEnd if tty => {
-                    if let Some(s) = stdin.as_mut() {
-                        let _ = s.write_all(&[4]);
+                    // A pty has no EOF of its own; the line discipline's ^D
+                    // is the closest.
+                    MachineMsg::DataEnd if tty => {
+                        if let Some(s) = stdin.as_mut() {
+                            let _ = s.write_all(&[4]);
+                        }
                     }
-                }
-                MachineMsg::DataEnd => stdin = None,
-                MachineMsg::Resize { rows, cols } => {
-                    if let Some(m) = &master {
-                        let ws = winsize(rows, cols);
-                        unsafe { libc::ioctl(m.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+                    MachineMsg::DataEnd => stdin = None,
+                    MachineMsg::Resize { rows, cols } => {
+                        if let Some(m) = &master {
+                            let ws = winsize(rows, cols);
+                            unsafe { libc::ioctl(m.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+                        }
                     }
+                    MachineMsg::Signal { signal } => signal_child(&reaper_in, &target_in, signal),
+                    _ => {}
                 }
-                MachineMsg::Signal { signal } => unsafe {
-                    libc::kill(pid, signal);
-                },
-                _ => {}
+            }
+            // The client went away: hang up the session like a closed terminal,
+            // unless the child has already been reaped.
+            signal_child(&reaper_in, &target_in, libc::SIGHUP);
+        });
+    if let Err(e) = stdin_thread {
+        signal_child(reaper, &target, libc::SIGKILL);
+        *target.lock().unwrap() = None;
+        let _ = exited.recv_timeout(Duration::from_secs(2));
+        return Err(e);
+    }
+
+    let mut outputs = Vec::with_capacity(out_fds.len());
+    for (out, kind) in out_fds {
+        let w2 = w.clone();
+        match thread::Builder::new()
+            .name("exec-out".into())
+            .spawn(move || pump(out, w2, kind))
+        {
+            Ok(h) => outputs.push(h),
+            Err(e) => {
+                signal_child(reaper, &target, libc::SIGKILL);
+                *target.lock().unwrap() = None;
+                {
+                    let mut guard = w.lock().unwrap();
+                    guard.closed = true;
+                    let _ = guard.stream.shutdown(Shutdown::Read);
+                }
+                let _ = exited.recv_timeout(Duration::from_secs(2));
+                return Err(e);
             }
         }
-        // The client went away: hang up the session like a closed terminal.
-        unsafe { libc::kill(pid, libc::SIGHUP) };
-    });
+    }
 
     let status = exited.recv().unwrap_or(-1);
+    // Clear the child handle before waking the stdin reader so it never sends
+    // SIGHUP or Signal after the reaper has reaped the process.
+    *target.lock().unwrap() = None;
+    let _ = w.lock().unwrap().stream.shutdown(Shutdown::Read);
+
     // A pty's reader ends when the last slave closes, which background
     // processes in the machine can delay; don't wait for it forever.
     for o in outputs {
@@ -189,32 +256,34 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
     } else {
         128 + libc::WTERMSIG(status)
     };
-    send(&w, &MachineMsg::Exit { code })
+    send_exit_and_close(&w, code)
 }
 
-/// Dial `127.0.0.1:port` inside the network namespace of `pid` (the
-/// machine's init), so services bound to the machine's loopback are
-/// reachable too. The socket keeps the namespace it was made in; the
-/// short-lived thread that switched namespaces then exits.
-fn dial_in_netns(pid: i32, port: u16) -> io::Result<TcpStream> {
-    let ns = File::open(format!("/proc/{pid}/ns/net"))?;
-    thread::spawn(move || {
-        if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        TcpStream::connect_timeout(
-            &SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
-            Duration::from_secs(5),
-        )
-    })
-    .join()
-    .unwrap_or_else(|_| Err(io::Error::other("dial thread panicked")))
+/// Dial `127.0.0.1:port` inside the machine's pinned network namespace fd, so
+/// services bound to the machine's loopback are reachable without ever racing
+/// PID reuse. The socket keeps the namespace it was made in; the short-lived
+/// thread that switched namespaces then exits.
+fn dial_in_netns(netns: &Arc<OwnedFd>, port: u16) -> io::Result<TcpStream> {
+    let ns = netns.clone();
+    thread::Builder::new()
+        .name("machine-dial".into())
+        .spawn(move || {
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            TcpStream::connect_timeout(
+                &SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
+                Duration::from_secs(5),
+            )
+        })?
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("dial thread panicked")))
 }
 
 /// Relay a TCP connection to `port` in a machine: on its loopback, or on
 /// its address when nothing listens there.
-pub fn connect(conn: UnixStream, pid: i32, ip: Ipv4Addr, port: u16) -> io::Result<()> {
-    let tcp = match dial_in_netns(pid, port).or_else(|_| {
+pub fn connect(conn: UnixStream, netns: Arc<OwnedFd>, ip: Ipv4Addr, port: u16) -> io::Result<()> {
+    let tcp = match dial_in_netns(&netns, port).or_else(|_| {
         TcpStream::connect_timeout(&SocketAddrV4::new(ip, port).into(), Duration::from_secs(5))
     }) {
         Ok(t) => t,
@@ -222,28 +291,33 @@ pub fn connect(conn: UnixStream, pid: i32, ip: Ipv4Addr, port: u16) -> io::Resul
             let mut c = conn;
             return machine::write(
                 &mut c,
-                &MachineMsg::Error(format!("connect {ip}:{port}: {e}")),
+                &MachineMsg::Error(truncate_error(&format!("connect {ip}:{port}: {e}"))),
             );
         }
     };
-    let w: Writer = Arc::new(Mutex::new(conn.try_clone()?));
+    let w: Writer = Arc::new(Mutex::new(ExecWriter {
+        stream: conn.try_clone()?,
+        closed: false,
+    }));
     send(&w, &MachineMsg::Done)?;
     let mut tcp_w = tcp.try_clone()?;
     let mut reader = conn;
-    let up = thread::spawn(move || {
-        while let Ok(Some(m)) = machine::read(&mut reader) {
-            match m {
-                MachineMsg::Data(d) => {
-                    if tcp_w.write_all(&d).is_err() {
-                        break;
+    let up = thread::Builder::new()
+        .name("machine-connect".into())
+        .spawn(move || {
+            while let Ok(Some(m)) = machine::read(&mut reader) {
+                match m {
+                    MachineMsg::Data(d) => {
+                        if tcp_w.write_all(&d).is_err() {
+                            break;
+                        }
                     }
+                    MachineMsg::DataEnd => break,
+                    _ => {}
                 }
-                MachineMsg::DataEnd => break,
-                _ => {}
             }
-        }
-        let _ = tcp_w.shutdown(Shutdown::Write);
-    });
+            let _ = tcp_w.shutdown(Shutdown::Write);
+        })?;
     let mut tcp_r = tcp;
     let mut buf = vec![0u8; CHUNK];
     loop {

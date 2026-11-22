@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::process::Command;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use super::super::service::Reaper;
@@ -24,6 +25,8 @@ const T: Duration = Duration::from_secs(10);
 
 pub struct Bridge {
     pub mtu: u32,
+    dns: Option<Ipv4Addr>,
+    dnsmasq_exited: Receiver<i32>,
 }
 
 /// eth0's MTU, which the machines' veths copy (gvproxy's 65520 by default).
@@ -79,8 +82,8 @@ impl Bridge {
         );
         if !std::path::Path::new(&format!("/sys/class/net/{BRIDGE}")).exists() {
             sh(reaper, &["ip", "link", "add", BRIDGE, "type", "bridge"])?;
-            sh(reaper, &["ip", "addr", "add", &gw, "dev", BRIDGE])?;
         }
+        sh(reaper, &["ip", "addr", "replace", &gw, "dev", BRIDGE])?;
         sh(reaper, &["ip", "link", "set", BRIDGE, "up"])?;
         fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")?;
         ensure_rule(
@@ -109,19 +112,40 @@ impl Bridge {
         fs::create_dir_all(HOSTS_DIR)?;
         fs::write(HOSTS, dhcp_hosts(hosts))?;
         fs::write(CONF, dnsmasq_conf(dns.unwrap_or(store::gateway())))?;
-        let mut c = Command::new("dnsmasq");
-        // --conf-file takes an optional value, so only `=` attaches it.
-        c.args(["--keep-in-foreground", &format!("--conf-file={CONF}")])
-            .env("PATH", cmd::PATH)
-            .stdin(std::process::Stdio::null());
-        reaper.spawn(&mut c)?;
-        Ok(Bridge { mtu: uplink_mtu() })
+        let dnsmasq_exited = spawn_dnsmasq(reaper)?;
+        Ok(Bridge {
+            mtu: uplink_mtu(),
+            dns,
+            dnsmasq_exited,
+        })
     }
 
     /// Update the machine → address table (dnsmasq rereads it on change).
     pub fn set_hosts(&self, hosts: &[(String, Ipv4Addr)]) -> io::Result<()> {
         fs::write(HOSTS, dhcp_hosts(hosts))
     }
+
+    /// Restart dnsmasq if it has exited.
+    pub fn ensure_dnsmasq(&mut self, reaper: &Reaper) -> io::Result<()> {
+        match self.dnsmasq_exited.try_recv() {
+            Err(TryRecvError::Empty) => Ok(()),
+            Ok(_) | Err(TryRecvError::Disconnected) => {
+                fs::write(CONF, dnsmasq_conf(self.dns.unwrap_or(store::gateway())))?;
+                self.dnsmasq_exited = spawn_dnsmasq(reaper)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn spawn_dnsmasq(reaper: &Reaper) -> io::Result<Receiver<i32>> {
+    let mut c = Command::new("dnsmasq");
+    // --conf-file takes an optional value, so only `=` attaches it.
+    c.args(["--keep-in-foreground", &format!("--conf-file={CONF}")])
+        .env("PATH", cmd::PATH)
+        .stdin(std::process::Stdio::null());
+    let (_pid, exited) = reaper.spawn(&mut c)?;
+    Ok(exited)
 }
 
 pub fn dnsmasq_conf(dns: Ipv4Addr) -> String {

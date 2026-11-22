@@ -178,6 +178,11 @@ impl Policy {
             actions.push(Action::Reclaim((s.file - self.cache_budget).min(self.step)));
             st.last_reclaim = Some(now);
         }
+        // Lower the baseline as fragmentation or free memory drops, so a
+        // high-water spike cannot permanently suppress later compactions.
+        if let Some((prev_frag, prev_free)) = st.last_compact_stats {
+            st.last_compact_stats = Some((prev_frag.min(s.fragmented), prev_free.min(s.free)));
+        }
         // Avoid compacting in a loop when unmovable slabs pin scattered pages:
         // once compacted, wait until fragmented or free memory grew again.
         let compact_worthwhile = match st.last_compact_stats {
@@ -385,6 +390,32 @@ mod tests {
         );
         // More fragmented memory after the cooldown triggers compaction again.
         s.fragmented = 240 * MIB;
+        assert_eq!(
+            p.decide(&s, &mut st, t0 + Duration::from_secs(30)),
+            vec![Action::Compact]
+        );
+    }
+
+    #[test]
+    fn compaction_recovers_after_high_water_spike() {
+        let p = policy();
+        let mut st = State::default();
+        let t0 = Instant::now();
+        let mut s = sample(0);
+        // High-water spike compacts at 500 MiB fragmented, 2 GiB free.
+        s.fragmented = 500 * MIB;
+        s.free = 2 * GIB;
+        assert_eq!(p.decide(&s, &mut st, t0), vec![Action::Compact]);
+        // Fragmentation and free memory drop after compaction / workload activity.
+        s.fragmented = 20 * MIB;
+        s.free = 512 * MIB;
+        assert!(
+            p.decide(&s, &mut st, t0 + Duration::from_secs(10))
+                .is_empty()
+        );
+        // Later fragmentation grows to 100 MiB (well below the old 500 MiB spike,
+        // but above the 64 MiB threshold and +32 MiB above the lowered 20 MiB baseline).
+        s.fragmented = 100 * MIB;
         assert_eq!(
             p.decide(&s, &mut st, t0 + Duration::from_secs(30)),
             vec![Action::Compact]

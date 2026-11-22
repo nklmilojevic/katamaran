@@ -12,10 +12,12 @@ use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DIR: &str = "/var/lib/katamaran/machines";
 const META: &str = "katamaran.meta";
 const DEFAULT: &str = ".default";
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The machine bridge's network: the bridge is .1, machines get .2–.254.
 pub const SUBNET: [u8; 3] = [198, 19, 249];
@@ -41,7 +43,16 @@ pub struct Meta {
 impl Meta {
     pub fn encode(&self) -> String {
         let mut s = String::new();
-        let mut kv = |k: &str, v: &str| s.push_str(&format!("{k}={v}\n"));
+        let mut kv = |k: &str, v: &str| {
+            s.push_str(k);
+            s.push('=');
+            for c in v.chars() {
+                if c != '\r' && c != '\n' {
+                    s.push(c);
+                }
+            }
+            s.push('\n');
+        };
         kv("distro", &self.distro);
         kv("release", &self.release);
         kv("image", &self.image);
@@ -116,7 +127,12 @@ pub fn default_machine() -> Option<String> {
 pub fn set_default(name: Option<&str>) -> io::Result<()> {
     let path = PathBuf::from(DIR).join(DEFAULT);
     match name {
-        Some(n) => fs::write(path, format!("{n}\n")),
+        Some(n) => {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = PathBuf::from(DIR).join(format!("{DEFAULT}.tmp.{seq}"));
+            fs::write(&tmp, format!("{n}\n"))?;
+            fs::rename(tmp, path)
+        }
         None => match fs::remove_file(path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -156,6 +172,27 @@ mod tests {
         };
         assert_eq!(Meta::decode(&m.encode()), m);
         assert_eq!(Meta::decode("junk\nuid=x\n"), Meta::default());
+    }
+
+    #[test]
+    fn meta_strips_newlines_in_fields() {
+        let m = Meta {
+            distro: "alpine\nautostart=1".into(),
+            release: "3.24\r\nip=1.2.3.4".into(),
+            image: "img\r\n".into(),
+            user: "me".into(),
+            uid: 501,
+            ip: Some(Ipv4Addr::new(198, 19, 249, 2)),
+            created_unix: 5,
+            autostart: false,
+        };
+        let encoded = m.encode();
+        assert_eq!(encoded.lines().count(), 8);
+        let decoded = Meta::decode(&encoded);
+        assert!(!decoded.autostart);
+        assert_eq!(decoded.ip, Some(Ipv4Addr::new(198, 19, 249, 2)));
+        assert_eq!(decoded.distro, "alpineautostart=1");
+        assert_eq!(decoded.release, "3.24ip=1.2.3.4");
     }
 
     #[test]

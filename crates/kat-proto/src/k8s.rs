@@ -16,7 +16,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::{Cursor, HEADER, MAX_FRAME, ProtoError, put_str, put_u32};
+use crate::{Cursor, HEADER, MAX_FRAME, ProtoError, put_str, put_u32, read_len};
 
 /// Payload bytes per `Data` frame.
 pub const CHUNK: usize = 64 << 10;
@@ -187,23 +187,19 @@ impl K8sMsg {
 }
 
 pub fn write<W: Write>(mut w: W, msg: &K8sMsg) -> io::Result<()> {
-    w.write_all(&msg.encode())?;
+    let frame = msg.encode();
+    let len = frame.len() - 4;
+    if len > MAX_FRAME {
+        return Err(ProtoError::FrameTooLarge(len).into());
+    }
+    w.write_all(&frame)?;
     w.flush()
 }
 
 pub fn read<R: Read>(mut r: R) -> io::Result<Option<K8sMsg>> {
-    let mut len_buf = [0u8; 4];
-    let mut n = 0;
-    while n < 4 {
-        match r.read(&mut len_buf[n..]) {
-            Ok(0) if n == 0 => return Ok(None),
-            Ok(0) => return Err(ProtoError::Truncated.into()),
-            Ok(k) => n += k,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let len = u32::from_le_bytes(len_buf) as usize;
+    let Some(len) = read_len(&mut r)? else {
+        return Ok(None);
+    };
     if len < 2 {
         return Err(ProtoError::Truncated.into());
     }
@@ -290,5 +286,19 @@ mod tests {
             let k = u16::from_le_bytes([f[4], f[5]]);
             assert!((0x801..=0x81f).contains(&k), "kind {k:#x} out of range");
         }
+    }
+
+    #[test]
+    fn truncated_length_header_and_oversized_write() {
+        assert_eq!(read([].as_slice()).unwrap(), None);
+        for n in 1..=3 {
+            let bytes = [1u8, 2, 3];
+            let err = read(&bytes[..n]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "len {n}");
+        }
+        let mut out = Vec::new();
+        let err = write(&mut out, &K8sMsg::Error("e".repeat(MAX_FRAME))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.is_empty());
     }
 }

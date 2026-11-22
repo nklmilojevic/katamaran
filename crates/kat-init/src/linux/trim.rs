@@ -7,12 +7,31 @@
 
 use std::ffi::CString;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use kat_proto::Msg;
 
 use super::service::Notifier;
+
+/// Serializes on-demand and periodic `FITRIM` runs.
+static TRIMMING: AtomicBool = AtomicBool::new(false);
+
+struct TrimGuard;
+
+impl Drop for TrimGuard {
+    fn drop(&mut self) {
+        TRIMMING.store(false, Ordering::Release);
+    }
+}
+
+fn try_acquire_trim() -> Option<TrimGuard> {
+    TRIMMING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| TrimGuard)
+}
 
 /// Any mount of the data disk; FITRIM on btrfs covers the whole file system.
 const DATA_MOUNT: &str = "/var/lib/docker";
@@ -78,12 +97,40 @@ pub fn trim_and_report(notifier: &Notifier) {
     notifier.send(&msg);
 }
 
+/// Run one trim in a background thread and report to the host, rejecting
+/// overlapping requests.
+pub fn start_once(notifier: Notifier) {
+    let Some(guard) = try_acquire_trim() else {
+        notifier.send(&Msg::TrimDone {
+            bytes: 0,
+            error: "trim already in progress".into(),
+        });
+        return;
+    };
+    let n = notifier.clone();
+    let r = thread::Builder::new()
+        .name("trim-once".into())
+        .spawn(move || {
+            let _guard = guard;
+            trim_and_report(&n);
+        });
+    if let Err(e) = r {
+        super::log(&format!("trim thread not started: {e}"));
+        notifier.send(&Msg::TrimDone {
+            bytes: 0,
+            error: format!("start trim: {e}"),
+        });
+    }
+}
+
 /// Trim on a timer, for the life of the guest.
 pub fn start_periodic() {
     let r = thread::Builder::new().name("trim".into()).spawn(|| {
         thread::sleep(FIRST);
         loop {
-            if let Err(e) = trim() {
+            if let Some(_guard) = try_acquire_trim()
+                && let Err(e) = trim()
+            {
                 super::log(&format!("periodic trim failed: {e}"));
             }
             thread::sleep(EVERY);
