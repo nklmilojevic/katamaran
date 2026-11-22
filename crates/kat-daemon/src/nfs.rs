@@ -28,9 +28,9 @@ use std::ffi::CString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -374,6 +374,26 @@ pub fn mount(dir: &Path, port_file: &Path) -> anyhow::Result<Duration> {
     mount_cancellable(dir, port_file, &AtomicBool::new(false))
 }
 
+/// Monotonic mount attempt generation; prevents an abandoned background
+/// `mount(2)` thread from unmounting a newer mount attempt at the same path.
+static MOUNT_GEN: Mutex<u64> = Mutex::new(0);
+
+fn next_mount_gen() -> u64 {
+    let mut g = MOUNT_GEN.lock().unwrap_or_else(|e| e.into_inner());
+    *g += 1;
+    *g
+}
+
+/// Clean up a late-completing abandoned mount only if no newer mount attempt
+/// has started and the mounted filesystem at `dir` still belongs to us.
+fn cleanup_abandoned_mount(dir: &Path, port_file: &Path, mount_gen: u64) -> bool {
+    let g = MOUNT_GEN.lock().unwrap_or_else(|e| e.into_inner());
+    if *g != mount_gen {
+        return false;
+    }
+    unmount_force(dir, port_file).unwrap_or(false)
+}
+
 /// Like [`mount`], but aborts promptly if `cancel` becomes `true`.
 pub fn mount_cancellable(
     dir: &Path,
@@ -381,6 +401,7 @@ pub fn mount_cancellable(
     cancel: &AtomicBool,
 ) -> anyhow::Result<Duration> {
     let t = Instant::now();
+    let mount_gen = next_mount_gen();
     if cancel.load(Ordering::Acquire) {
         bail!("mount cancelled");
     }
@@ -391,7 +412,7 @@ pub fn mount_cancellable(
     if cancel.load(Ordering::Acquire) {
         bail!("mount cancelled");
     }
-    match mount_syscall(dir, port, cancel) {
+    match mount_syscall(dir, port_file, port, cancel, mount_gen) {
         Ok(()) => {}
         Err(MountSyscallErr::Os(e)) => {
             eprintln!(
@@ -418,7 +439,13 @@ enum MountSyscallErr {
 /// Mount with `mount(2)`, which, unlike `mount_nfs`, can name the source.
 /// It runs on its own thread so that a server that never answers costs
 /// [`MOUNT_TIMEOUT`], not the daemon.
-fn mount_syscall(dir: &Path, port: u16, cancel: &AtomicBool) -> Result<(), MountSyscallErr> {
+fn mount_syscall(
+    dir: &Path,
+    port_file: &Path,
+    port: u16,
+    cancel: &AtomicBool,
+    mount_gen: u64,
+) -> Result<(), MountSyscallErr> {
     let on_path = dir
         .canonicalize()
         .with_context(|| format!("resolve {}", dir.display()))
@@ -429,6 +456,7 @@ fn mount_syscall(dir: &Path, port: u16, cancel: &AtomicBool) -> Result<(), Mount
     let (tx, rx) = std::sync::mpsc::channel();
     let abandoned = Arc::new(AtomicBool::new(false));
     let abandoned_bg = abandoned.clone();
+    let port_file_bg = port_file.to_path_buf();
     std::thread::Builder::new()
         .name("nfs-mount".into())
         .spawn(move || {
@@ -442,11 +470,11 @@ fn mount_syscall(dir: &Path, port: u16, cancel: &AtomicBool) -> Result<(), Mount
             };
             if r == 0 {
                 if abandoned_bg.load(Ordering::SeqCst) {
-                    let _ = unmount_now(&on_path, true);
+                    cleanup_abandoned_mount(&on_path, &port_file_bg, mount_gen);
                     return;
                 }
                 if tx.send(Ok(())).is_err() {
-                    let _ = unmount_now(&on_path, true);
+                    cleanup_abandoned_mount(&on_path, &port_file_bg, mount_gen);
                 }
             } else {
                 let _ = tx.send(Err(std::io::Error::last_os_error()));
@@ -458,7 +486,7 @@ fn mount_syscall(dir: &Path, port: u16, cancel: &AtomicBool) -> Result<(), Mount
         if cancel.load(Ordering::Acquire) {
             abandoned.store(true, Ordering::SeqCst);
             if rx.try_recv().is_ok_and(|res| res.is_ok()) {
-                let _ = unmount_now(dir, true);
+                cleanup_abandoned_mount(dir, port_file, mount_gen);
             }
             return Err(MountSyscallErr::Cancelled);
         }
@@ -466,7 +494,7 @@ fn mount_syscall(dir: &Path, port: u16, cancel: &AtomicBool) -> Result<(), Mount
         if left.is_zero() {
             abandoned.store(true, Ordering::SeqCst);
             if rx.try_recv().is_ok_and(|res| res.is_ok()) {
-                let _ = unmount_now(dir, true);
+                cleanup_abandoned_mount(dir, port_file, mount_gen);
             }
             return Err(MountSyscallErr::TimedOut(anyhow::anyhow!(
                 "mount(2) did not finish in {}s",
@@ -773,5 +801,24 @@ mod tests {
         assert!(port_file(&d).is_err());
         std::fs::remove_dir_all(&d).unwrap();
         std::fs::remove_dir_all(&target).unwrap();
+    }
+
+    #[test]
+    fn abandoned_cleanup_ignores_stale_generation_and_foreign_mounts() {
+        let old = next_mount_gen();
+        let current = next_mount_gen();
+        assert_ne!(old, current);
+        // Stale generation skips cleanup altogether.
+        assert!(!cleanup_abandoned_mount(
+            Path::new("/"),
+            Path::new("/x/nfs.port"),
+            old
+        ));
+        // Even for the current generation, a non-Katamaran mount is never touched.
+        assert!(!cleanup_abandoned_mount(
+            Path::new("/"),
+            Path::new("/x/nfs.port"),
+            current
+        ));
     }
 }
