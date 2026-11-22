@@ -190,9 +190,16 @@ pub fn plist(
 
 /// Point an installed LaunchAgent's RunAtLoad at `value`. launchd reads it
 /// at the next login, which is exactly when it matters.
-pub fn set_run_at_load(value: bool) -> anyhow::Result<()> {
-    let id = Identity::resolve(None)?;
-    let path = plist_path(&id.label())?;
+pub fn set_run_at_load(value: bool, label: Option<&str>) -> anyhow::Result<()> {
+    let resolved;
+    let label = match label {
+        Some(l) => l,
+        None => {
+            resolved = Identity::resolve(None)?.label();
+            &resolved
+        }
+    };
+    let path = plist_path(label)?;
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(());
     };
@@ -314,6 +321,8 @@ pub fn setup(args: SetupArgs) -> anyhow::Result<()> {
     .with_context(|| format!("write {}", plist_file.display()))?;
     if is_loaded(&label) {
         launchctl(&["bootout", &service_target(&label)])?;
+        wait_gone(&sock, Duration::from_secs(70))?;
+        wait_unloaded(&label, Duration::from_secs(10))?;
     }
     launchctl(&[
         "bootstrap",
@@ -330,7 +339,7 @@ pub fn setup(args: SetupArgs) -> anyhow::Result<()> {
         Ok(msg) => println!("CLI          {msg}"),
         Err(e) => println!("CLI          {e:#}"),
     }
-    match crate::ssh::ensure_files() {
+    match crate::ssh::ensure_files_for(&id) {
         Ok(f) => {
             println!(
                 "SSH          `ssh <machine>@{}` after adding this line at the top of ~/.ssh/config:",
@@ -392,6 +401,21 @@ fn wait_gone(sock: &Path, timeout: Duration) -> anyhow::Result<()> {
             bail!("the daemon did not exit within {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// Wait until launchd finishes tearing down `label` after `bootout`.
+fn wait_unloaded(label: &str, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while is_loaded(label) {
+        if Instant::now() >= deadline {
+            bail!(
+                "{label} was still loaded in launchd after {}s",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
 }

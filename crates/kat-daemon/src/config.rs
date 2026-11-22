@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::amd64::Emulation;
 
 pub const FILE_NAME: &str = "config.toml";
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -121,13 +123,21 @@ impl Config {
     pub fn save(&self, home: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(home)?;
         let path = Config::path(home);
-        let tmp = path.with_extension("toml.tmp");
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = home.join(format!("{FILE_NAME}.tmp.{}.{n}", std::process::id()));
         let text = format!(
             "# katamaran settings; applied at the next VM start.\n{}",
             toml::to_string(self)?
         );
-        fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))?;
+        let res = fs::write(&tmp, text)
+            .with_context(|| format!("write {}", tmp.display()))
+            .and_then(|()| {
+                fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
+            });
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(())
     }
 

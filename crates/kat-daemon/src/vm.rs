@@ -65,14 +65,73 @@ pub fn start(cfg: &VmConfig, vm_bin: &Path, timeout: Duration) -> anyhow::Result
     }
 }
 
+/// Enforces a single wall-clock `deadline` across every `read`/`write` syscall
+/// during the guest handshake, so a trickling peer cannot extend the timeout.
+struct DeadlineStream<'a> {
+    conn: &'a mut UnixStream,
+    deadline: Instant,
+    timeout: Duration,
+}
+
+impl DeadlineStream<'_> {
+    fn remaining(&self) -> io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "guest handshake timed out after {}s",
+                    self.timeout.as_secs()
+                ),
+            ))
+        } else {
+            Ok(left)
+        }
+    }
+}
+
+impl io::Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.conn.set_read_timeout(Some(self.remaining()?))?;
+        self.conn.read(buf)
+    }
+}
+
+impl io::Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.conn.set_write_timeout(Some(self.remaining()?))?;
+        self.conn.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining()?;
+        self.conn.flush()
+    }
+}
+
 fn handshake(
     listener: &UnixListener,
     child: &mut Child,
     timeout: Duration,
 ) -> anyhow::Result<(UnixStream, Hello)> {
-    let mut conn = accept_guest(listener, child, timeout)?;
+    let deadline = Instant::now() + timeout;
+    let mut conn = accept_guest(listener, child, deadline, timeout)?;
+    let hello = handshake_io(&mut conn, deadline, timeout)?;
+    Ok((conn, hello))
+}
+
+fn handshake_io(
+    conn: &mut UnixStream,
+    deadline: Instant,
+    timeout: Duration,
+) -> anyhow::Result<Hello> {
     conn.set_nonblocking(false)?;
-    let hello = match read_msg(&mut conn)? {
+    let mut ds = DeadlineStream {
+        conn,
+        deadline,
+        timeout,
+    };
+    let hello = match read_msg(&mut ds)? {
         Some(Msg::Hello(h)) => h,
         Some(other) => bail!("expected Hello, got {other:?}"),
         None => bail!("guest closed the control channel before Hello"),
@@ -84,12 +143,14 @@ fn handshake(
         );
     }
     write_msg(
-        &mut conn,
+        &mut ds,
         &Msg::SetTime {
             unix_ns: unix_now_ns(),
         },
     )?;
-    Ok((conn, hello))
+    conn.set_read_timeout(None)?;
+    conn.set_write_timeout(None)?;
+    Ok(hello)
 }
 
 impl RunningVm {
@@ -102,12 +163,21 @@ impl RunningVm {
     }
 }
 
+impl Drop for RunningVm {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 fn accept_guest(
     listener: &UnixListener,
     child: &mut Child,
+    deadline: Instant,
     timeout: Duration,
 ) -> anyhow::Result<UnixStream> {
-    let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
             Ok((conn, _)) => return Ok(conn),
@@ -132,6 +202,7 @@ pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> anyhow::Result
         }
         if Instant::now() >= deadline {
             child.kill().ok();
+            child.wait().ok();
             bail!("VM did not power off within {}s", timeout.as_secs());
         }
         thread::sleep(Duration::from_micros(200));
@@ -141,7 +212,9 @@ pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> anyhow::Result
 pub fn vm_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     match explicit {
         Some(p) => Ok(p.to_path_buf()),
-        None => Ok(std::env::current_exe()?.with_file_name("katamaran-vm")),
+        None => Ok(std::env::current_exe()?
+            .canonicalize()?
+            .with_file_name("katamaran-vm")),
     }
 }
 
@@ -171,5 +244,75 @@ pub fn print_tail(label: &str, path: &Path) {
     eprintln!("--- last lines of {label} ({}) ---", path.display());
     for l in &lines[lines.len().saturating_sub(40)..] {
         eprintln!("{l}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn handshake_enforces_total_deadline_against_trickling_peer() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let trickle = thread::spawn(move || {
+            // Advertise a 100-byte frame, then trickle 1 byte every 40 ms so a
+            // per-read socket timeout would keep resetting indefinitely.
+            let header = 100u32.to_le_bytes();
+            for &b in &header {
+                if guest.write_all(&[b]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+            for _ in 0..100 {
+                if guest.write_all(&[0u8]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+
+        let timeout = Duration::from_millis(150);
+        let t = Instant::now();
+        let err = handshake_io(&mut host, t + timeout, timeout).unwrap_err();
+        let elapsed = t.elapsed();
+        drop(host);
+        let _ = trickle.join();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "trickling peer extended handshake to {elapsed:?}: {err:#}"
+        );
+    }
+
+    #[test]
+    fn handshake_clears_socket_timeouts_on_success() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let peer = thread::spawn(move || {
+            write_msg(
+                &mut guest,
+                &Msg::Hello(Hello {
+                    protocol: PROTOCOL_VERSION,
+                    kernel_release: "6.18".into(),
+                    mem_total_kib: 1024,
+                    init_start_ns: 1,
+                    ready_ns: 2,
+                }),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_msg(&mut guest).unwrap(),
+                Some(Msg::SetTime { .. })
+            ));
+        });
+
+        let timeout = Duration::from_secs(5);
+        let hello = handshake_io(&mut host, Instant::now() + timeout, timeout).unwrap();
+        assert_eq!(hello.kernel_release, "6.18");
+        assert_eq!(host.read_timeout().unwrap(), None);
+        assert_eq!(host.write_timeout().unwrap(), None);
+        peer.join().unwrap();
     }
 }

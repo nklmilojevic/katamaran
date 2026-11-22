@@ -84,7 +84,7 @@ pub fn ensure_daemon() -> anyhow::Result<Client> {
 
 /// Run `katamaran daemon` detached from this terminal.
 fn spawn_daemon() -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = std::env::current_exe()?.canonicalize()?;
     Command::new(exe)
         .arg("daemon")
         .stdin(Stdio::null())
@@ -345,7 +345,7 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
                     }
                     cfg.save(&home)?;
                     if values.contains_key("launch_at_login") {
-                        crate::setup::set_run_at_load(cfg.launch_at_login)?;
+                        crate::setup::set_run_at_load(cfg.launch_at_login, None)?;
                     }
                     false
                 }
