@@ -287,11 +287,26 @@ fn debug_on() -> bool {
 }
 
 fn serve(rx: &Receiver<Input>, overflow: &AtomicBool, shares: &[Share], roots: Vec<PathBuf>) {
+    serve_with_recheck(rx, overflow, &roots, |i| shares[i].cache.view(), RECHECK);
+}
+
+fn serve_with_recheck<N: Nodes>(
+    rx: &Receiver<Input>,
+    overflow: &AtomicBool,
+    roots: &[PathBuf],
+    view_of: impl Fn(usize) -> Option<N>,
+    recheck: Duration,
+) {
     let mut guest: Option<UnixStream> = None;
     let mut again: VecDeque<(Instant, Vec<fsevents::Event>)> = VecDeque::new();
+    let mut rescan_again: Option<Instant> = None;
     loop {
-        let first = match again.front() {
-            Some((at, _)) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+        let next_deadline = match (again.front().map(|(at, _)| *at), rescan_again) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let first = match next_deadline {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(i) => Some(i),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -303,6 +318,7 @@ fn serve(rx: &Receiver<Input>, overflow: &AtomicBool, shares: &[Share], roots: V
         };
         let mut events = Vec::new();
         let mut rescan = false;
+        let mut schedule_rescan_recheck = false;
         for input in first.into_iter().chain(rx.try_iter()) {
             match input {
                 Input::Guest(conn) => {
@@ -310,34 +326,52 @@ fn serve(rx: &Receiver<Input>, overflow: &AtomicBool, shares: &[Share], roots: V
                     // Whatever the guest cached before it connected may be stale.
                     guest = Some(conn);
                     rescan = true;
+                    schedule_rescan_recheck = true;
                 }
                 Input::Fs(e) => events.extend(e),
-                Input::Overflow => rescan = true,
+                Input::Overflow => {
+                    rescan = true;
+                    schedule_rescan_recheck = true;
+                }
             }
         }
         if overflow.swap(false, Ordering::AcqRel) {
             rescan = true;
+            schedule_rescan_recheck = true;
             again.clear();
         }
+        let now = Instant::now();
         if !rescan && !events.is_empty() {
             if again.len() >= QUEUE_BOUND {
                 again.clear();
                 rescan = true;
+                schedule_rescan_recheck = true;
             } else {
-                again.push_back((Instant::now() + RECHECK, events.clone()));
+                again.push_back((now + recheck, events.clone()));
             }
         }
-        let now = Instant::now();
+        if let Some(at) = rescan_again
+            && at <= now
+        {
+            rescan_again = None;
+            rescan = true;
+        }
+        if schedule_rescan_recheck {
+            again.clear();
+            rescan_again = Some(now + recheck);
+        }
         while let Some((_, due)) = again.pop_front_if(|(at, _)| *at <= now) {
             events.extend(due);
         }
         let Some(conn) = guest.as_mut() else {
+            again.clear();
+            rescan_again = None;
             continue;
         };
         let t = Instant::now();
         let mut invals = Vec::new();
-        for (i, (share, root)) in shares.iter().zip(&roots).enumerate() {
-            let Some(view) = share.cache.view() else {
+        for (i, root) in roots.iter().enumerate() {
+            let Some(view) = view_of(i) else {
                 continue;
             };
             if rescan {
@@ -364,6 +398,8 @@ fn serve(rx: &Receiver<Input>, overflow: &AtomicBool, shares: &[Share], roots: V
             if let Err(e) = write_frame(conn, &chunk) {
                 log::warn!("fscache: guest gone: {e}");
                 guest = None;
+                again.clear();
+                rescan_again = None;
                 break;
             }
         }
@@ -641,5 +677,82 @@ mod tests {
                 "bad value {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn overflow_rescan_rechecks_after_delay_without_more_events() {
+        let (t, nodes) = setup("overflow-recheck");
+        let (mut guest_rx, host_tx) = UnixStream::pair().unwrap();
+        guest_rx
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let root = t.0.clone();
+        let nodes_bg = Table(Arc::clone(&nodes.0));
+        let overflow_bg = Arc::clone(&overflow);
+        let h = thread::spawn(move || {
+            serve_with_recheck(
+                &rx,
+                &overflow_bg,
+                &[root],
+                |_| Some(Table(Arc::clone(&nodes_bg.0))),
+                Duration::from_millis(40),
+            );
+        });
+
+        let mut buf = Vec::new();
+        // Connect guest: receives initial full invalidation and its delayed recheck.
+        tx.send(Input::Guest(host_tx)).unwrap();
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+
+        // Trigger overflow with no subsequent FSEvents.
+        overflow.store(true, Ordering::Release);
+        tx.send(Input::Overflow).unwrap();
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+
+        // A concurrent guest lookup populates a new node right after the first invalidation.
+        fs::write(t.0.join("d/late"), "v").unwrap();
+        nodes.hold(&t.0.join("d/late"), 4, Some((2, "late")));
+
+        // Without any more events, the delayed overflow recheck invalidates everything including node 4.
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+
+        // No further frame should be sent after the delayed recheck completes.
+        guest_rx
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let err = kat_proto::fscache::read_frame(&mut guest_rx, &mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        drop(tx);
+        h.join().unwrap();
     }
 }
