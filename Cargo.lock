@@ -1098,6 +1098,7 @@ dependencies = [
  "kat-nfs",
  "kat-proto",
  "libc",
+ "serde_json",
 ]
 
 [[package]]

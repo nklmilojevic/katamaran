@@ -179,7 +179,11 @@ fn sync_images() -> anyhow::Result<()> {
 fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
     match cmd {
         DnsCmd::Status => {
-            if k8s::dns_resolver_installed() {
+            let active_port = Client::connect_default()
+                .ok()
+                .and_then(|mut c| c.status().ok())
+                .and_then(|s| s.k8s.dns_port);
+            if k8s::dns_resolver_installed(active_port) {
                 println!(
                     "*.{} resolver installed at {}",
                     k8s::DNS_DOMAIN,
@@ -195,11 +199,13 @@ fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
             Ok(())
         }
         DnsCmd::Install => {
-            let port = Client::connect_default()
-                .ok()
-                .and_then(|mut c| c.status().ok())
-                .and_then(|s| s.k8s.dns_port)
-                .unwrap_or(k8s::DEFAULT_DNS_PORT);
+            let mut c = Client::connect_default().context(
+                "start Kubernetes first (`kat k8s start`) before installing DNS resolution",
+            )?;
+            let st = c.status()?;
+            let Some(port) = st.k8s.dns_port else {
+                bail!("Kubernetes DNS responder is not running; run `kat k8s start` first");
+            };
             let content = k8s::dns_resolver_content(port);
             let script = format!(
                 "mkdir -p /etc/resolver && printf '%s' '{}' > {}",

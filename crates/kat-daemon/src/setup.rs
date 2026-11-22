@@ -370,7 +370,7 @@ pub fn uninstall(args: UninstallArgs) -> anyhow::Result<()> {
         Err(e) => println!("Docker context {} not removed: {e:#}", id.context()),
     }
     if let Ok(home) = crate::state_dir() {
-        crate::k8s::remove_kubeconfig(&home);
+        crate::k8s::remove_kubeconfig(&home, &id.context());
     }
     if let Some(p) = unlink(&id.link_name())? {
         println!("Removed {}", p.display());

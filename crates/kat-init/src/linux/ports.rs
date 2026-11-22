@@ -38,9 +38,6 @@ pub fn watch(notifier: Notifier, mut auto: Option<AutoForward>) {
             auto_changes
                 .added
                 .retain(|p| !super::k8s::is_internal_port(*p));
-            auto_changes
-                .removed
-                .retain(|p| !super::k8s::is_internal_port(*p));
             for m in autofwd::messages(&auto_changes.removed, false) {
                 notifier.send(&m);
             }

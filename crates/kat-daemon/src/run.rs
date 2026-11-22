@@ -3,6 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -250,6 +251,10 @@ fn session(
     for d in [&run_dir, &logs, &data_dir] {
         fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     }
+    // Restrict the run directory to the owning user before libkrun binds
+    // host-side vsock Unix sockets (docker.sock, machine.sock, k8s.sock, k8s-api.sock).
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
 
     let data_img = data_dir.join("data.img");
     if !data_img.exists() {

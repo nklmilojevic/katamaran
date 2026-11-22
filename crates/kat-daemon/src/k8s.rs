@@ -7,14 +7,15 @@
 //! - serves a local UDP DNS responder for `*.k8s.kat.local` -> `127.0.0.1`,
 //! - and dials arbitrary Pod/Service IPs inside the guest via `K8sMsg::Connect`.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -369,6 +370,43 @@ pub fn rewrite_kubeconfig(raw: &str, ctx: &str, api_port: u16) -> String {
     out
 }
 
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Create a private (mode 0600) temp file next to `target`, write `bytes` to
+/// it, sync, and atomically rename it over `target`. Credentials are never
+/// written to a world-readable file.
+fn write_private_atomic(target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = target
+        .parent()
+        .with_context(|| format!("missing parent for {}", target.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "kubeconfig".into());
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.katamaran.{pid}.{seq}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
+    drop(f);
+    if let Err(e) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {} -> {}", tmp.display(), target.display()));
+    }
+    Ok(())
+}
+
 /// Save `<home>/run/kubeconfig.yaml` and merge the context into `~/.kube/config`
 /// (without clobbering any existing contexts).
 pub fn write_and_merge_kubeconfig(
@@ -379,64 +417,81 @@ pub fn write_and_merge_kubeconfig(
     let ctx = context_name();
     let rewritten = rewrite_kubeconfig(raw, &ctx, api_port);
     let local_path = kubeconfig_path(home);
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = local_path.with_extension("yaml.tmp");
-    fs::write(&tmp, &rewritten)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, &local_path)?;
+    write_private_atomic(&local_path, rewritten.as_bytes())?;
 
-    // Merge into ~/.kube/config only for the real home (or always if HOME is set).
     if let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) {
         let kube_dir = user_home.join(".kube");
         let user_cfg = kube_dir.join("config");
         if !user_cfg.exists() {
-            let _ = fs::create_dir_all(&kube_dir);
-            let tmp_u = kube_dir.join("config.katamaran.tmp");
-            if fs::write(&tmp_u, &rewritten).is_ok() {
-                let _ = fs::set_permissions(&tmp_u, fs::Permissions::from_mode(0o600));
-                let _ = fs::rename(&tmp_u, &user_cfg);
-            }
+            write_private_atomic(&user_cfg, rewritten.as_bytes())
+                .with_context(|| format!("write {}", user_cfg.display()))?;
         } else {
-            let _ = merge_into_user_kubeconfig(&user_cfg, &local_path, &ctx);
+            merge_into_user_kubeconfig(&user_cfg, &local_path, &ctx)
+                .with_context(|| format!("merge context {ctx} into {}", user_cfg.display()))?;
         }
     }
     Ok(local_path)
 }
 
+/// Merge `local_cfg` into `user_cfg` using a private temporary copy so the
+/// live `~/.kube/config` is never mutated if `kubectl` is missing or fails.
 fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> anyhow::Result<()> {
-    // Strip any stale entry for `ctx` first so updated certs/ports replace it cleanly.
-    for sub in ["delete-context", "delete-cluster", "delete-user"] {
-        let _ = Command::new("kubectl")
-            .args(["config", sub, ctx])
-            .env("KUBECONFIG", user_cfg)
+    let existing = fs::read(user_cfg).with_context(|| format!("read {}", user_cfg.display()))?;
+    let parent = user_cfg
+        .parent()
+        .with_context(|| format!("missing parent for {}", user_cfg.display()))?;
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let scratch = parent.join(format!(".config.katamaran.scratch.{pid}.{seq}.tmp"));
+    let _ = fs::remove_file(&scratch);
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&scratch)
+            .with_context(|| format!("create {}", scratch.display()))?;
+        f.write_all(&existing)?;
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        // Strip any stale entry for `ctx` from the scratch copy only.
+        for sub in ["delete-context", "delete-cluster", "delete-user"] {
+            let _ = Command::new("kubectl")
+                .args(["config", sub, ctx])
+                .env("KUBECONFIG", &scratch)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("run kubectl (is kubectl installed on PATH?)")?;
+        }
+        let combined = format!("{}:{}", scratch.display(), local_cfg.display());
+        let out = Command::new("kubectl")
+            .args(["config", "view", "--flatten"])
+            .env("KUBECONFIG", combined)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let combined = format!("{}:{}", user_cfg.display(), local_cfg.display());
-    let out = Command::new("kubectl")
-        .args(["config", "view", "--flatten"])
-        .env("KUBECONFIG", combined)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return Ok(());
-    }
-    let tmp = user_cfg.with_extension("katamaran.tmp");
-    fs::write(&tmp, &out.stdout)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, user_cfg)?;
-    Ok(())
+            .output()
+            .context("run kubectl config view --flatten")?;
+        if !out.status.success() {
+            bail!(
+                "kubectl config view --flatten failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        if out.stdout.is_empty() {
+            bail!("kubectl config view --flatten produced empty output");
+        }
+        write_private_atomic(user_cfg, &out.stdout)
+    })();
+
+    let _ = fs::remove_file(&scratch);
+    result
 }
 
-/// Remove the `katamaran` context from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
-pub fn remove_kubeconfig(home: &Path) {
+/// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
+pub fn remove_kubeconfig(home: &Path, ctx: &str) {
     let _ = fs::remove_file(kubeconfig_path(home));
-    let ctx = context_name();
     let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
@@ -446,7 +501,7 @@ pub fn remove_kubeconfig(home: &Path) {
     }
     for sub in ["delete-context", "delete-cluster", "delete-user"] {
         let _ = Command::new("kubectl")
-            .args(["config", sub, &ctx])
+            .args(["config", sub, ctx])
             .env("KUBECONFIG", &user_cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -464,8 +519,13 @@ pub struct DnsServer {
 
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
-        let sock = UdpSocket::bind(("127.0.0.1", DEFAULT_DNS_PORT))
-            .or_else(|_| UdpSocket::bind(("127.0.0.1", 0)))?;
+        let want_port = installed_dns_port().unwrap_or(DEFAULT_DNS_PORT);
+        let sock = UdpSocket::bind(("127.0.0.1", want_port)).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("bind 127.0.0.1:{want_port} for *.{DNS_DOMAIN} DNS: {e}"),
+            )
+        })?;
         let port = sock.local_addr()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(250)))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -512,8 +572,34 @@ impl Drop for DnsServer {
     }
 }
 
-pub fn dns_resolver_installed() -> bool {
-    fs::read_to_string(RESOLVER_PATH).is_ok_and(|s| s.contains("nameserver 127.0.0.1"))
+/// Parse the configured port from an installed Katamaran resolver file, if present.
+pub fn installed_dns_port() -> Option<u16> {
+    let text = fs::read_to_string(RESOLVER_PATH).ok()?;
+    parse_resolver_port(&text)
+}
+
+fn parse_resolver_port(text: &str) -> Option<u16> {
+    if !text.lines().any(|l| l.trim() == "nameserver 127.0.0.1") {
+        return None;
+    }
+    text.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("port ")
+            .and_then(|p| p.trim().parse::<u16>().ok())
+            .filter(|p| *p != 0)
+    })
+}
+
+/// Whether `/etc/resolver/k8s.kat.local` is installed and matches `active_port`
+/// (when a DNS listener is running).
+pub fn dns_resolver_installed(active_port: Option<u16>) -> bool {
+    let Some(installed) = installed_dns_port() else {
+        return false;
+    };
+    match active_port {
+        Some(p) => installed == p,
+        None => true,
+    }
 }
 
 pub fn dns_resolver_content(port: u16) -> String {

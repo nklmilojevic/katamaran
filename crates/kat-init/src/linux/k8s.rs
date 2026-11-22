@@ -71,6 +71,7 @@ struct Running {
 }
 
 struct State {
+    generation: u64,
     phase: String,
     api_ready: bool,
     error: String,
@@ -91,6 +92,7 @@ pub fn start_service(reaper: Reaper, notifier: Notifier) -> io::Result<Arc<K8s>>
         notifier,
         op_lock: Mutex::new(()),
         state: Mutex::new(State {
+            generation: 0,
             phase: "stopped".into(),
             api_ready: false,
             error: String::new(),
@@ -290,8 +292,9 @@ impl K8s {
         let sync_stop = Arc::new(AtomicBool::new(false));
 
         ACTIVE.store(true, Ordering::SeqCst);
-        {
+        let my_gen = {
             let mut st = self.state.lock().unwrap();
+            st.generation += 1;
             st.phase = "starting".into();
             st.api_ready = false;
             st.error.clear();
@@ -301,7 +304,8 @@ impl K8s {
                 exited: exited.clone(),
                 sync_stop: sync_stop.clone(),
             });
-        }
+            st.generation
+        };
 
         // Watch process exit asynchronously so crashes are reported to the host.
         {
@@ -317,13 +321,19 @@ impl K8s {
                         let _ = exit_tx.send(());
                         if let Some(svc) = svc_ref {
                             let mut st = svc.state.lock().unwrap();
+                            // Ignore stale watchers from a superseded instance.
+                            if st.generation != my_gen {
+                                return;
+                            }
                             let was_stopping = st.phase == "stopping" || st.phase == "stopped";
                             st.api_ready = false;
                             if !was_stopping {
                                 let msg = format!("k3s {}", describe_status(status));
                                 st.phase = "failed".into();
                                 st.error = msg.clone();
+                                st.running = None;
                                 ACTIVE.store(false, Ordering::SeqCst);
+                                FORWARDED.lock().unwrap().clear();
                                 restore_bridge_netfilter();
                                 svc.notifier.failed("k8s", msg);
                             }
@@ -344,11 +354,15 @@ impl K8s {
                     "k3s exited during startup ({}); see {LOG_FILE}",
                     describe_status(status)
                 );
+                stop_k8s_workloads(&self.reaper);
                 let mut st = self.state.lock().unwrap();
-                st.phase = "failed".into();
-                st.error = err.clone();
-                st.running = None;
+                if st.generation == my_gen {
+                    st.phase = "failed".into();
+                    st.error = err.clone();
+                    st.running = None;
+                }
                 ACTIVE.store(false, Ordering::SeqCst);
+                FORWARDED.lock().unwrap().clear();
                 restore_bridge_netfilter();
                 return Err(err);
             }
@@ -360,12 +374,26 @@ impl K8s {
                     "Kubernetes API not ready after {}s; see {LOG_FILE}",
                     READY_TIMEOUT.as_secs()
                 );
-                let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
-                let mut st = self.state.lock().unwrap();
-                st.phase = "failed".into();
-                st.error = err.clone();
+                // Mark stopping first so the exit watcher does not race us,
+                // then reap k3s and clean up workloads before restoring sysctls.
+                let running = {
+                    let mut st = self.state.lock().unwrap();
+                    st.phase = "stopping".into();
+                    st.api_ready = false;
+                    st.running.take()
+                };
+                if let Some(r) = running {
+                    terminate_running(&r);
+                }
+                stop_k8s_workloads(&self.reaper);
                 ACTIVE.store(false, Ordering::SeqCst);
+                FORWARDED.lock().unwrap().clear();
                 restore_bridge_netfilter();
+                let mut st = self.state.lock().unwrap();
+                if st.generation == my_gen {
+                    st.phase = "failed".into();
+                    st.error = err.clone();
+                }
                 return Err(err);
             }
             thread::sleep(Duration::from_millis(250));
@@ -407,16 +435,9 @@ impl K8s {
             let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
         }
         if let Some(r) = running {
-            r.sync_stop.store(true, Ordering::SeqCst);
-            if r.exited.lock().unwrap().is_none() {
-                unsafe { libc::kill(r.pid, libc::SIGTERM) };
-                if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_err() {
-                    log("k3s did not stop in time, killing it");
-                    unsafe { libc::kill(r.pid, libc::SIGKILL) };
-                    let _ = r.exit_rx.recv_timeout(Duration::from_secs(3));
-                }
-            }
+            terminate_running(&r);
         }
+        stop_k8s_workloads(&self.reaper);
         ACTIVE.store(false, Ordering::SeqCst);
         FORWARDED.lock().unwrap().clear();
         restore_bridge_netfilter();
@@ -554,18 +575,138 @@ fn restore_bridge_netfilter() {
     }
 }
 
+fn terminate_running(r: &Running) {
+    r.sync_stop.store(true, Ordering::SeqCst);
+    if r.exited.lock().unwrap().is_none() {
+        unsafe { libc::kill(r.pid, libc::SIGTERM) };
+        if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_err() {
+            log("k3s did not stop in time, killing it");
+            unsafe { libc::kill(r.pid, libc::SIGKILL) };
+            let _ = r.exit_rx.recv_timeout(Duration::from_secs(3));
+        }
+    }
+}
+
+/// Stop and remove Kubernetes tasks/containers in the shared containerd
+/// `k8s.io` namespace and tear down CNI interfaces without touching Docker's
+/// `moby` namespace.
+fn stop_k8s_workloads(reaper: &Reaper) {
+    let mut ls = Command::new("/usr/bin/ctr");
+    ls.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io", "tasks", "ls", "-q"]);
+    if let Ok((0, out)) = run_reaped(reaper, &mut ls, Duration::from_secs(10)) {
+        let ids: Vec<&str> = out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for id in &ids {
+            let mut kill = Command::new("/usr/bin/ctr");
+            kill.args([
+                "-a",
+                CONTAINERD_SOCKET,
+                "-n",
+                "k8s.io",
+                "tasks",
+                "kill",
+                "-a",
+                "-s",
+                "SIGTERM",
+                id,
+            ]);
+            let _ = run_reaped(reaper, &mut kill, Duration::from_secs(5));
+        }
+        if !ids.is_empty() {
+            thread::sleep(Duration::from_millis(500));
+        }
+        for id in &ids {
+            let mut kill = Command::new("/usr/bin/ctr");
+            kill.args([
+                "-a",
+                CONTAINERD_SOCKET,
+                "-n",
+                "k8s.io",
+                "tasks",
+                "kill",
+                "-a",
+                "-s",
+                "SIGKILL",
+                id,
+            ]);
+            let _ = run_reaped(reaper, &mut kill, Duration::from_secs(5));
+            let mut rm = Command::new("/usr/bin/ctr");
+            rm.args([
+                "-a",
+                CONTAINERD_SOCKET,
+                "-n",
+                "k8s.io",
+                "tasks",
+                "rm",
+                "-f",
+                id,
+            ]);
+            let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
+        }
+    }
+    let mut cls = Command::new("/usr/bin/ctr");
+    cls.args([
+        "-a",
+        CONTAINERD_SOCKET,
+        "-n",
+        "k8s.io",
+        "containers",
+        "ls",
+        "-q",
+    ]);
+    if let Ok((0, out)) = run_reaped(reaper, &mut cls, Duration::from_secs(10)) {
+        for id in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+            let mut rm = Command::new("/usr/bin/ctr");
+            rm.args([
+                "-a",
+                CONTAINERD_SOCKET,
+                "-n",
+                "k8s.io",
+                "containers",
+                "rm",
+                id,
+            ]);
+            let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
+        }
+    }
+    for iface in ["cni0", "flannel.1"] {
+        let mut del = Command::new("/sbin/ip");
+        del.args(["link", "delete", iface]);
+        let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
+    }
+}
+
 fn ensure_symlink(link: &str, target: &str) -> Result<(), String> {
     let p = Path::new(link);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    if let Ok(existing) = fs::read_link(p)
-        && existing == Path::new(target)
-    {
-        return Ok(());
+    match fs::symlink_metadata(p) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if fs::read_link(p).ok().as_deref() == Some(Path::new(target)) {
+                return Ok(());
+            }
+            fs::remove_file(p).map_err(|e| format!("replace symlink {link}: {e}"))?;
+        }
+        Ok(meta) if meta.is_dir() => {
+            // Only remove an empty directory; never recursively delete unrelated files.
+            fs::remove_dir(p).map_err(|e| {
+                format!(
+                    "refusing to replace non-empty directory {link} with symlink to {target}: {e}"
+                )
+            })?;
+        }
+        Ok(_) => {
+            return Err(format!(
+                "refusing to replace existing non-symlink file {link} with symlink to {target}"
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("stat {link}: {e}")),
     }
-    let _ = fs::remove_file(p);
-    let _ = fs::remove_dir_all(p);
     symlink(target, p).map_err(|e| format!("symlink {link} -> {target}: {e}"))
 }
 
@@ -745,13 +886,10 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
             Ok(_) => {
-                if line.contains("\"tag\"")
-                    || line.contains("\"pull\"")
-                    || line.contains("\"load\"")
-                    || line.contains("\"import\"")
-                    || line.contains("\"commit\"")
+                if is_docker_image_sync_event(&line)
+                    && let Err(e) = sync_moby_images(reaper)
                 {
-                    let _ = sync_moby_images(reaper);
+                    log(&format!("background image sync: {e}"));
                 }
             }
             Err(e)
@@ -764,9 +902,22 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
     }
 }
 
+fn is_docker_image_sync_event(line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let action = v
+        .get("Action")
+        .or_else(|| v.get("status"))
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+    matches!(action, "tag" | "pull" | "load" | "import" | "commit")
+}
+
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     let moby = list_ctr_images(reaper, "moby")?;
     let k8s = list_ctr_images(reaper, "k8s.io").unwrap_or_default();
+    let mut failures = Vec::new();
     for (name, digest) in moby {
         if name.starts_with("sha256:") || name.contains("<none>") {
             continue;
@@ -776,7 +927,11 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         }
         if let Err(e) = mirror_one_image(reaper, &name) {
             log(&format!("mirror image {name}: {e}"));
+            failures.push(format!("{name}: {e}"));
         }
+    }
+    if !failures.is_empty() {
+        return Err(format!("failed to mirror images: {}", failures.join("; ")));
     }
     Ok(())
 }
@@ -805,19 +960,99 @@ fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, String>,
     Ok(map)
 }
 
+/// Stream an image from `moby` to `k8s.io` via two separate Reaper-managed
+/// `ctr` processes connected by an OS pipe, verifying both exit statuses.
 fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.args([
-        "-c",
-        "/usr/bin/ctr -a \"$1\" -n moby images export - \"$2\" | /usr/bin/ctr -a \"$1\" -n k8s.io images import --digests -",
-        "sh",
+    let timeout = Duration::from_secs(120);
+    let (pipe_r, pipe_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+    let (exp_err_r, exp_err_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+    let (imp_err_r, imp_err_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+
+    let mut exp = Command::new("/usr/bin/ctr");
+    exp.args([
+        "-a",
         CONTAINERD_SOCKET,
+        "-n",
+        "moby",
+        "images",
+        "export",
+        "-",
         name,
-    ]);
-    let (code, out) = run_reaped(reaper, &mut cmd, Duration::from_secs(120))
-        .map_err(|e| format!("mirror {name}: {e}"))?;
-    if code != 0 {
-        return Err(out.trim().to_string());
+    ])
+    .env("PATH", PATH)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(pipe_w))
+    .stderr(Stdio::from(exp_err_w));
+    let (exp_pid, exp_rx) = reaper
+        .spawn(&mut exp)
+        .map_err(|e| format!("spawn ctr export: {e}"))?;
+    exp.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut imp = Command::new("/usr/bin/ctr");
+    imp.args([
+        "-a",
+        CONTAINERD_SOCKET,
+        "-n",
+        "k8s.io",
+        "images",
+        "import",
+        "--digests",
+        "-",
+    ])
+    .env("PATH", PATH)
+    .stdin(Stdio::from(pipe_r))
+    .stdout(Stdio::null())
+    .stderr(Stdio::from(imp_err_w));
+    let (imp_pid, imp_rx) = match reaper.spawn(&mut imp) {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe { libc::kill(exp_pid, libc::SIGKILL) };
+            let _ = exp_rx.recv_timeout(Duration::from_secs(2));
+            return Err(format!("spawn ctr import: {e}"));
+        }
+    };
+    imp.stdin(Stdio::null()).stderr(Stdio::null());
+
+    let exp_err_t = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = File::from(exp_err_r).take(64 << 10).read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).trim().to_string()
+    });
+    let imp_err_t = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = File::from(imp_err_r).take(64 << 10).read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).trim().to_string()
+    });
+
+    let deadline = Instant::now() + timeout;
+    let wait_one = |pid: i32, rx: &Receiver<i32>, label: &str| -> Result<i32, String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(s) => Ok(if libc::WIFEXITED(s) {
+                libc::WEXITSTATUS(s)
+            } else {
+                128 + libc::WTERMSIG(s)
+            }),
+            Err(_) => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                Err(format!("{label} timed out"))
+            }
+        }
+    };
+
+    let exp_res = wait_one(exp_pid, &exp_rx, "ctr export");
+    let imp_res = wait_one(imp_pid, &imp_rx, "ctr import");
+    let exp_err = exp_err_t.join().unwrap_or_default();
+    let imp_err = imp_err_t.join().unwrap_or_default();
+
+    let exp_code = exp_res?;
+    let imp_code = imp_res?;
+    if exp_code != 0 {
+        return Err(format!("ctr export exited {exp_code}: {exp_err}"));
+    }
+    if imp_code != 0 {
+        return Err(format!("ctr import exited {imp_code}: {imp_err}"));
     }
     Ok(())
 }

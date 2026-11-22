@@ -469,5 +469,9 @@ mod tests {
         assert!(text.contains("/Users/me/Katamaran (mounted)"), "{text}");
         assert!(text.contains("8080/tcp"), "{text}");
         assert!(text.contains("pending"), "{text}");
+        assert!(
+            !text.contains("k8s"),
+            "default disabled k8s should be omitted: {text}"
+        );
     }
 }

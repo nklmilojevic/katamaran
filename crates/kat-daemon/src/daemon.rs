@@ -65,6 +65,8 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     for d in [&run_dir, &logs] {
         fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     }
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
     let lock = run::lock(&run_dir.join("katamaran.lock"))?;
     if !args.no_log_file {
         redirect_output(&logs.join("daemon.log"))?;
@@ -140,6 +142,9 @@ pub struct Daemon {
     home: PathBuf,
     inner: Mutex<Inner>,
     k8s: Mutex<K8sRuntime>,
+    /// Serializes Kubernetes start/stop/reset/toggle operations so rapid
+    /// preference changes cannot race or overwrite newer user choices.
+    k8s_op: Mutex<()>,
     changed: Condvar,
     started: SystemTime,
     launchd_label: Option<String>,
@@ -241,6 +246,7 @@ impl Daemon {
                 exiting: false,
             }),
             k8s: Mutex::new(K8sRuntime::default()),
+            k8s_op: Mutex::new(()),
             changed: Condvar::new(),
             started: SystemTime::now(),
             launchd_label: std::env::var("XPC_SERVICE_NAME")
@@ -474,7 +480,7 @@ impl Daemon {
             thread::Builder::new()
                 .name("k8s-autostart".into())
                 .spawn(move || {
-                    if let Err(e) = d.k8s_start(&mut |m| dlog!("k8s: {m}")) {
+                    if let Err(e) = d.k8s_start_inner(false, true, &mut |m| dlog!("k8s: {m}")) {
                         dlog!("k8s autostart failed: {e}");
                     }
                 })
@@ -641,10 +647,10 @@ impl Daemon {
                 .name("k8s-toggle".into())
                 .spawn(move || {
                     if enable {
-                        if let Err(e) = d.k8s_start(&mut |m| dlog!("k8s: {m}")) {
+                        if let Err(e) = d.k8s_start_inner(false, true, &mut |m| dlog!("k8s: {m}")) {
                             dlog!("k8s start failed: {e}");
                         }
-                    } else if let Err(e) = d.k8s_stop(false) {
+                    } else if let Err(e) = d.k8s_stop_inner(false, true) {
                         dlog!("k8s stop failed: {e}");
                     }
                 })
@@ -879,6 +885,7 @@ impl Daemon {
 
     fn k8s_status(&self, enabled: bool) -> K8sStatus {
         let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        let dns_port = k.dns.as_ref().map(|d| d.port);
         K8sStatus {
             enabled,
             state: k.state.clone(),
@@ -888,8 +895,8 @@ impl Daemon {
             context: crate::k8s::context_name(),
             kubeconfig: k.kubeconfig.clone(),
             dns_domain: crate::k8s::DNS_DOMAIN.into(),
-            dns_port: k.dns.as_ref().map(|d| d.port),
-            dns_installed: crate::k8s::dns_resolver_installed(),
+            dns_port,
+            dns_installed: crate::k8s::dns_resolver_installed(dns_port),
             error: k.error.clone(),
         }
     }
@@ -939,10 +946,28 @@ impl Daemon {
     }
 
     fn k8s_start(self: &Arc<Self>, progress: &mut dyn FnMut(&str)) -> Result<K8sStatus, RpcError> {
+        self.k8s_start_inner(true, false, progress)
+    }
+
+    fn k8s_start_inner(
+        self: &Arc<Self>,
+        persist_enabled: bool,
+        only_if_config_enabled: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<K8sStatus, RpcError> {
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
         let failed = |m: String| RpcError::new(api::FAILED, m);
-        self.persist_k8s_enabled(true);
+        if only_if_config_enabled && !Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+            return Ok(self.k8s_status(false));
+        }
+        if persist_enabled {
+            self.persist_k8s_enabled(true);
+        }
         progress("ensuring VM is running");
         self.wait_for_docker_ready()?;
+        if only_if_config_enabled && !Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+            return Ok(self.k8s_status(false));
+        }
 
         {
             let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
@@ -1008,49 +1033,75 @@ impl Daemon {
     }
 
     fn k8s_stop(&self, disable_config: bool) -> Result<(), RpcError> {
+        self.k8s_stop_inner(disable_config, false)
+    }
+
+    fn k8s_stop_inner(
+        &self,
+        disable_config: bool,
+        only_if_config_disabled: bool,
+    ) -> Result<(), RpcError> {
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
         let failed = |m: String| RpcError::new(api::FAILED, m);
-        if disable_config {
-            self.persist_k8s_enabled(false);
+        if only_if_config_disabled && Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+            return Ok(());
         }
-        {
+        let prev_state = {
             let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = k.state.clone();
             k.state = "stopping".into();
-            k.api_proxy = None;
-            k.dns = None;
-        }
-        if crate::k8s::socket_path(&self.home).exists() {
+            prev
+        };
+        // Keep API/DNS relays and saved config intact until the guest confirms
+        // k3s has actually stopped.
+        if self.lock().state.is_active() && crate::k8s::socket_path(&self.home).exists() {
             let mut noop = |_: &str| {};
             if let Err(e) =
                 crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Stop, &mut noop)
             {
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
-                k.state = "failed".into();
+                k.state = prev_state;
                 k.error = Some(format!("{e:#}"));
                 return Err(failed(format!("{e:#}")));
             }
         }
+        if disable_config {
+            self.persist_k8s_enabled(false);
+        }
+        crate::k8s::remove_kubeconfig(&self.home, &crate::k8s::context_name());
         let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        k.api_proxy = None;
+        k.dns = None;
+        k.kubeconfig = None;
         k.state = "stopped".into();
         k.error = None;
         Ok(())
     }
 
-    fn k8s_reset(&self) -> Result<(), RpcError> {
+    fn k8s_reset(self: &Arc<Self>) -> Result<(), RpcError> {
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
         let failed = |m: String| RpcError::new(api::FAILED, m);
+        let was_stopped = !self.lock().state.is_active();
+        // Disable auto-start first so booting the VM for reset does not
+        // auto-start k3s before the reset runs.
         self.persist_k8s_enabled(false);
-        {
-            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
-            k.state = "stopping".into();
-            k.api_proxy = None;
-            k.dns = None;
+        if was_stopped {
+            self.wait_for_docker_ready()?;
         }
-        if crate::k8s::socket_path(&self.home).exists() {
+        let reset_res = (|| -> Result<(), RpcError> {
             let mut noop = |_: &str| {};
             crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Reset, &mut noop)
                 .map_err(|e| failed(format!("{e:#}")))?;
+            Ok(())
+        })();
+        if was_stopped {
+            let _ = self.stop(true);
         }
-        crate::k8s::remove_kubeconfig(&self.home);
+        reset_res?;
+        crate::k8s::remove_kubeconfig(&self.home, &crate::k8s::context_name());
         let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        k.api_proxy = None;
+        k.dns = None;
         k.state = "stopped".into();
         k.kubeconfig = None;
         k.error = None;

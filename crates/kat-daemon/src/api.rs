@@ -436,7 +436,7 @@ pub struct DockerInfo {
     pub socket: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct K8sStatus {
     pub enabled: bool,
     /// `stopped`, `starting`, `running`, `stopping`, or `failed`.
@@ -458,6 +458,24 @@ pub struct K8sStatus {
     pub dns_installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl Default for K8sStatus {
+    fn default() -> Self {
+        K8sStatus {
+            enabled: false,
+            state: "stopped".into(),
+            installed: false,
+            version: String::new(),
+            api_port: None,
+            context: String::new(),
+            kubeconfig: None,
+            dns_domain: String::new(),
+            dns_port: None,
+            dns_installed: false,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
