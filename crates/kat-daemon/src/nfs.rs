@@ -379,6 +379,56 @@ pub fn mount(dir: &Path, port_file: &Path) -> anyhow::Result<Duration> {
 static IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<InFlightMount>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Records mount points whose abandoned late `mount(2)` cleanup failed so
+/// shutdown cleanup or a subsequent mount surfaces and retries it instead of
+/// silently leaking a dead NFS mount.
+static FAILED_CLEANUPS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const LATE_UNMOUNT_ATTEMPTS: usize = 5;
+const LATE_UNMOUNT_DELAY: Duration = Duration::from_millis(200);
+
+fn record_failed_cleanup(key: &str, err: String) {
+    FAILED_CLEANUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string(), err);
+}
+
+fn clear_failed_cleanup(key: &str) {
+    FAILED_CLEANUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(key);
+}
+
+fn failed_cleanup_error(key: &str) -> Option<String> {
+    FAILED_CLEANUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()
+}
+
+fn cleanup_late_mount<U>(unmount: &U, attempts: usize, delay: Duration) -> anyhow::Result<()>
+where
+    U: Fn() -> anyhow::Result<()>,
+{
+    let mut last_err = None;
+    for attempt in 0..attempts.max(1) {
+        match unmount() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < attempts && !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one unmount attempt"))
+}
+
 struct InFlightMount {
     done: Mutex<bool>,
     cv: Condvar,
@@ -594,6 +644,8 @@ fn mount_syscall(
         cancel,
         deadline,
         MOUNT_TIMEOUT,
+        LATE_UNMOUNT_ATTEMPTS,
+        LATE_UNMOUNT_DELAY,
         move || {
             let r = unsafe {
                 libc::mount(
@@ -609,23 +661,24 @@ fn mount_syscall(
                 Err(std::io::Error::last_os_error())
             }
         },
-        move || {
-            let _ = unmount_force(&on_path_cleanup, &port_file_owned);
-        },
+        move || unmount_force(&on_path_cleanup, &port_file_owned).map(|_| ()),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mount_syscall_with<M, U>(
     slot: Arc<MountSlotGuard>,
     cancel: &AtomicBool,
     deadline: Instant,
     timeout: Duration,
+    cleanup_attempts: usize,
+    cleanup_delay: Duration,
     mount_fn: M,
     unmount_fn: U,
 ) -> Result<(), MountSyscallErr>
 where
     M: FnOnce() -> std::io::Result<()> + Send + 'static,
-    U: Fn() + Send + Sync + 'static,
+    U: Fn() -> anyhow::Result<()> + Send + Sync + 'static,
 {
     let state = Arc::new((Mutex::new(MountOutcome::Pending), Condvar::new()));
     let state_bg = state.clone();
@@ -653,7 +706,17 @@ where
                 }
             };
             if was_abandoned && succeeded {
-                unmount_bg();
+                match cleanup_late_mount(&*unmount_bg, cleanup_attempts, cleanup_delay) {
+                    Ok(()) => clear_failed_cleanup(&_slot.key),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        eprintln!(
+                            "katamaran: failed to unmount abandoned NFS mount {}: {msg}",
+                            _slot.key
+                        );
+                        record_failed_cleanup(&_slot.key, msg);
+                    }
+                }
             }
         })
         .map_err(|e| MountSyscallErr::Os(e.into()))?;
@@ -665,7 +728,18 @@ where
             MountOutcome::Finished(Ok(())) => {
                 if cancel.load(Ordering::Acquire) {
                     drop(outcome);
-                    unmount();
+                    if let Err(e) = cleanup_late_mount(&*unmount, cleanup_attempts, cleanup_delay) {
+                        let msg = format!("{e:#}");
+                        eprintln!(
+                            "katamaran: failed to unmount cancelled NFS mount {}: {msg}",
+                            slot.key
+                        );
+                        record_failed_cleanup(&slot.key, msg);
+                        return Err(MountSyscallErr::Os(
+                            e.context("unmount cancelled NFS mount"),
+                        ));
+                    }
+                    clear_failed_cleanup(&slot.key);
                     return Err(MountSyscallErr::Cancelled);
                 }
                 return Ok(());
@@ -766,13 +840,67 @@ pub fn unmount_force(dir: &Path, port_file: &Path) -> anyhow::Result<bool> {
     unmount_impl(dir, port_file, true)
 }
 
+/// Wait briefly (up to `wait_timeout`) for any abandoned in-flight mount on
+/// `dir` to finish after VM shutdown, then perform a final forced unmount if
+/// an abandoned mount was in flight or its late cleanup failed.
+pub fn finish_shutdown_cleanup(
+    dir: &Path,
+    port_file: &Path,
+    wait_timeout: Duration,
+) -> anyhow::Result<bool> {
+    finish_shutdown_cleanup_with(dir, wait_timeout, || unmount_force(dir, port_file))
+}
+
+fn finish_shutdown_cleanup_with<U>(
+    dir: &Path,
+    wait_timeout: Duration,
+    final_unmount: U,
+) -> anyhow::Result<bool>
+where
+    U: FnOnce() -> anyhow::Result<bool>,
+{
+    let key = mount_slot_key(dir);
+    let existing = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    let had_in_flight = existing.is_some();
+    if let Some(prev) = existing {
+        let no_cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + wait_timeout;
+        let _ = prev.wait(&no_cancel, deadline, wait_timeout);
+    }
+    let prior_err = failed_cleanup_error(&key);
+    if !had_in_flight && prior_err.is_none() {
+        return Ok(false);
+    }
+    match final_unmount() {
+        Ok(removed) => {
+            clear_failed_cleanup(&key);
+            Ok(removed)
+        }
+        Err(e) => {
+            let msg = match prior_err {
+                Some(prev) => format!("{e:#} (after late-mount cleanup failure: {prev})"),
+                None => format!("{e:#}"),
+            };
+            record_failed_cleanup(&key, msg.clone());
+            bail!("final NFS cleanup failed for {}: {msg}", dir.display());
+        }
+    }
+}
+
 fn unmount_impl(dir: &Path, port_file: &Path, force: bool) -> anyhow::Result<bool> {
+    let key = mount_slot_key(dir);
     if !mounted_at(dir).is_some_and(|m| m.is_ours(port_file)) {
+        clear_failed_cleanup(&key);
         return Ok(false);
     }
     if force || unmount_now(dir, false).is_err() {
         unmount_now(dir, true)?;
     }
+    clear_failed_cleanup(&key);
     Ok(true)
 }
 
@@ -1002,6 +1130,8 @@ mod tests {
             &cancel,
             d1,
             t1,
+            3,
+            Duration::ZERO,
             move || {
                 let _ = entered_tx.send(());
                 let _ = release_rx.recv();
@@ -1010,6 +1140,7 @@ mod tests {
             },
             move || {
                 ev1_u.lock().unwrap().push("unmount1_done");
+                Ok(())
             },
         );
         assert!(matches!(res1, Err(MountSyscallErr::TimedOut(_))));
@@ -1030,12 +1161,15 @@ mod tests {
                 &cancel2,
                 d2,
                 t2,
+                3,
+                Duration::ZERO,
                 move || {
                     ev2_m.lock().unwrap().push("mount2_done");
                     Ok(())
                 },
                 move || {
                     ev2_u.lock().unwrap().push("unmount2_done");
+                    Ok(())
                 },
             )
             .is_ok()
@@ -1054,6 +1188,87 @@ mod tests {
             *events.lock().unwrap(),
             vec!["mount1_done", "unmount1_done", "mount2_done"]
         );
+    }
+
+    #[test]
+    fn late_mount_cleanup_retries_and_surfaces_persistent_failure() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Case 1: first forced-unmount attempt fails transiently; retry
+        // succeeds before the mount slot is released.
+        let dir1 = std::env::temp_dir().join(format!("kat-nfs-retry-{}", std::process::id()));
+        let cancel = AtomicBool::new(false);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_bg = attempts.clone();
+
+        let t = Duration::from_millis(40);
+        let d = Instant::now() + t;
+        let slot = acquire_mount_slot(&dir1, &cancel, d, t).unwrap();
+        let res = mount_syscall_with(
+            slot,
+            &cancel,
+            d,
+            t,
+            3,
+            Duration::from_millis(5),
+            move || {
+                let _ = release_rx.recv();
+                Ok(())
+            },
+            move || {
+                let n = attempts_bg.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    bail!("busy");
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(res, Err(MountSyscallErr::TimedOut(_))));
+        release_tx.send(()).unwrap();
+
+        // Waiting for the slot completes only after retry #2 succeeds.
+        let d2 = Instant::now() + Duration::from_secs(2);
+        let slot2 = acquire_mount_slot(&dir1, &cancel, d2, Duration::from_secs(2)).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(failed_cleanup_error(&mount_slot_key(&dir1)), None);
+        drop(slot2);
+
+        // Case 2: all late-cleanup retries fail -> failure is recorded and
+        // surfaced by `finish_shutdown_cleanup_with`, then cleared once a final
+        // forced unmount succeeds.
+        let dir2 = std::env::temp_dir().join(format!("kat-nfs-fail-{}", std::process::id()));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let d = Instant::now() + t;
+        let slot = acquire_mount_slot(&dir2, &cancel, d, t).unwrap();
+        let res = mount_syscall_with(
+            slot,
+            &cancel,
+            d,
+            t,
+            2,
+            Duration::from_millis(5),
+            move || {
+                let _ = release_rx.recv();
+                Ok(())
+            },
+            move || bail!("device busy"),
+        );
+        assert!(matches!(res, Err(MountSyscallErr::TimedOut(_))));
+        release_tx.send(()).unwrap();
+
+        // Shutdown cleanup waits for the abandoned worker and surfaces both
+        // the prior late-cleanup failure and final failure if still failing.
+        let err =
+            finish_shutdown_cleanup_with(&dir2, Duration::from_secs(2), || bail!("still busy"))
+                .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("still busy"), "{msg}");
+        assert!(msg.contains("device busy"), "{msg}");
+
+        // Once the final forced unmount succeeds, the recorded failure clears.
+        assert!(finish_shutdown_cleanup_with(&dir2, Duration::from_secs(2), || Ok(true)).unwrap());
+        assert_eq!(failed_cleanup_error(&mount_slot_key(&dir2)), None);
     }
 
     #[test]

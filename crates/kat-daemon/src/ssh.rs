@@ -14,7 +14,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
 use kat_proto::machine::{ExecSpec, MachineMsg, Tty};
@@ -24,7 +24,7 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
 pub struct SshFiles {
@@ -198,10 +198,14 @@ fn valid_direct_tcpip_target(host: &str, port: u32, machine: &str) -> Option<u16
 }
 
 /// Bounded per-channel host-to-guest frame queues so stalled guest reads
-/// cannot exhaust host memory, while non-blocking dispatch prevents one
-/// stalled channel from suspending the SSH handler for other channels.
+/// cannot exhaust host memory, while bounded backpressure tolerates a
+/// temporarily slower reading guest without indefinitely suspending other
+/// multiplexed channels.
 const GUEST_WRITE_QUEUE: usize = 128;
-const GUEST_CTRL_QUEUE: usize = 16;
+const GUEST_SIGNAL_QUEUE: usize = 16;
+/// Maximum time to wait for queue space when a channel's bounded queue is full
+/// before concluding the guest stopped reading and closing only that channel.
+const GUEST_WRITE_BACKPRESSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Grace period on `channel_close` to flush queued stdin/`DataEnd` to a
 /// reading guest before aborting a stalled writer.
 const CLOSE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
@@ -217,9 +221,41 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Coalescing latest-wins slot for terminal resize requests so a storm of
+/// `window_change_request` events can never fill or starve `Signal` delivery.
+#[derive(Default)]
+struct PendingResize {
+    latest: Mutex<Option<(u16, u16)>>,
+    notify: Notify,
+}
+
+impl PendingResize {
+    fn set(&self, rows: u16, cols: u16) {
+        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some((rows, cols));
+        self.notify.notify_one();
+    }
+
+    fn take(&self) -> Option<(u16, u16)> {
+        self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    async fn next(&self) -> (u16, u16) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(size) = self.take() {
+                return size;
+            }
+            notified.await;
+        }
+    }
+}
+
 struct GuestChan {
     data_tx: Option<mpsc::Sender<MachineMsg>>,
-    ctrl_tx: Option<mpsc::Sender<MachineMsg>>,
+    signal_tx: Option<mpsc::Sender<i32>>,
+    resize: Arc<PendingResize>,
     stop_read: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -230,48 +266,61 @@ impl GuestChan {
     fn spawn_task<F, Fut>(build: F) -> Self
     where
         F: FnOnce(
-            mpsc::Receiver<MachineMsg>,
+            mpsc::Receiver<i32>,
+            Arc<PendingResize>,
             mpsc::Receiver<MachineMsg>,
             oneshot::Receiver<()>,
         ) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let (data_tx, data_rx) = mpsc::channel(GUEST_WRITE_QUEUE);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(GUEST_CTRL_QUEUE);
+        let (signal_tx, signal_rx) = mpsc::channel(GUEST_SIGNAL_QUEUE);
+        let resize = Arc::new(PendingResize::default());
         let (stop_read, stop_read_rx) = oneshot::channel();
-        let task = tokio::spawn(build(ctrl_rx, data_rx, stop_read_rx));
+        let task = tokio::spawn(build(signal_rx, resize.clone(), data_rx, stop_read_rx));
         GuestChan {
             data_tx: Some(data_tx),
-            ctrl_tx: Some(ctrl_tx),
+            signal_tx: Some(signal_tx),
+            resize,
             stop_read: Some(stop_read),
             task: Some(task),
         }
     }
 
-    /// Try to enqueue a stream frame without indefinitely suspending the SSH
-    /// handler. Yields briefly on `Full` so `pump_write` gets a chance to drain
-    /// on the single-threaded runtime; returns `false` if the guest is stalled.
-    async fn try_enqueue_data(&self, mut msg: MachineMsg) -> bool {
+    /// Enqueue a stream frame with bounded backpressure. When the queue is
+    /// full because the guest is reading slower than the SSH client, waits up
+    /// to `timeout` for capacity instead of disconnecting immediately; returns
+    /// `false` only if the guest remains completely blocked for `timeout`.
+    async fn enqueue_data(&self, msg: MachineMsg, timeout: std::time::Duration) -> bool {
         let Some(tx) = self.data_tx.as_ref() else {
             return true;
         };
-        for attempt in 0..5 {
-            match tx.try_send(msg) {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return true,
-                Err(mpsc::error::TrySendError::Full(next)) => {
-                    msg = next;
-                    if attempt < 4 {
-                        tokio::task::yield_now().await;
-                    }
-                }
+        match tx.try_send(msg) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+            Err(mpsc::error::TrySendError::Full(msg)) => {
+                tokio::time::timeout(timeout, tx.send(msg)).await.is_ok()
             }
         }
-        false
     }
 
-    fn try_enqueue_ctrl(&self, msg: MachineMsg) {
-        if let Some(tx) = self.ctrl_tx.as_ref() {
-            let _ = tx.try_send(msg);
+    /// Record the latest terminal dimensions, coalescing any unconsumed resize.
+    fn set_resize(&self, rows: u16, cols: u16) {
+        self.resize.set(rows, cols);
+    }
+
+    /// Enqueue a signal on its dedicated high-priority queue (isolated from
+    /// coalesced resizes). Returns `false` if the signal queue stays full for
+    /// `timeout` so the caller can explicitly close the channel instead of
+    /// silently dropping the signal.
+    async fn enqueue_signal(&self, signal: i32, timeout: std::time::Duration) -> bool {
+        let Some(tx) = self.signal_tx.as_ref() else {
+            return true;
+        };
+        match tx.try_send(signal) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+            Err(mpsc::error::TrySendError::Full(signal)) => {
+                tokio::time::timeout(timeout, tx.send(signal)).await.is_ok()
+            }
         }
     }
 
@@ -281,7 +330,7 @@ impl GuestChan {
     fn close_graceful(mut self, grace: std::time::Duration) {
         self.stop_read.take();
         self.data_tx.take();
-        self.ctrl_tx.take();
+        self.signal_tx.take();
         if let Some(task) = self.task.take() {
             let abort = task.abort_handle();
             tokio::spawn(async move {
@@ -315,7 +364,8 @@ async fn run_pumps(
     stream: UnixStream,
     handle: russh::server::Handle,
     ch: ChannelId,
-    ctrl_rx: mpsc::Receiver<MachineMsg>,
+    signal_rx: mpsc::Receiver<i32>,
+    resize: Arc<PendingResize>,
     data_rx: mpsc::Receiver<MachineMsg>,
     stop_read: oneshot::Receiver<()>,
 ) {
@@ -328,7 +378,7 @@ async fn run_pumps(
     });
     let _abort_reader = AbortOnDrop(reader_task.abort_handle());
     tokio::pin!(reader_task);
-    let mut write_fut = std::pin::pin!(pump_write(ctrl_rx, data_rx, writer));
+    let mut write_fut = std::pin::pin!(pump_write(signal_rx, resize, data_rx, writer));
     tokio::select! {
         _ = &mut write_fut => {}
         res = &mut reader_task => {
@@ -384,34 +434,57 @@ struct Handler {
 }
 
 impl Handler {
-    /// Enqueue stream data (`Data` / `DataEnd`) without blocking other
-    /// multiplexed SSH channels. If this channel's bounded queue stays full
-    /// because its guest stopped reading, close only this stalled channel.
-    async fn send_data(&mut self, ch: ChannelId, m: MachineMsg, session: &mut Session) {
-        let ok = {
-            let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) else {
-                return;
-            };
-            g.try_enqueue_data(m).await
-        };
-        if !ok && let Some(c) = self.chans.remove(&ch) {
+    fn close_stalled(&mut self, ch: ChannelId, notice: &[u8], session: &mut Session) {
+        if let Some(c) = self.chans.remove(&ch) {
             if let Some(g) = c.guest {
                 g.abort_now();
             }
             if c.is_session {
-                let _ = session.extended_data(
-                    ch,
-                    1,
-                    b"katamaran: guest stopped reading; closing channel\r\n".to_vec(),
-                );
+                let _ = session.extended_data(ch, 1, notice.to_vec());
             }
             let _ = session.close(ch);
         }
     }
 
-    fn send_ctrl(&self, ch: ChannelId, m: MachineMsg) {
+    /// Enqueue stream data (`Data` / `DataEnd`) with bounded backpressure so a
+    /// temporarily slower reading guest paces the client while a permanently
+    /// stalled guest closes only its own channel.
+    async fn send_data(&mut self, ch: ChannelId, m: MachineMsg, session: &mut Session) {
+        let ok = {
+            let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) else {
+                return;
+            };
+            g.enqueue_data(m, GUEST_WRITE_BACKPRESSURE_TIMEOUT).await
+        };
+        if !ok {
+            self.close_stalled(
+                ch,
+                b"katamaran: guest stopped reading; closing channel\r\n",
+                session,
+            );
+        }
+    }
+
+    fn send_resize(&self, ch: ChannelId, rows: u16, cols: u16) {
         if let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) {
-            g.try_enqueue_ctrl(m);
+            g.set_resize(rows, cols);
+        }
+    }
+
+    async fn send_signal(&mut self, ch: ChannelId, signal: i32, session: &mut Session) {
+        let ok = {
+            let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) else {
+                return;
+            };
+            g.enqueue_signal(signal, GUEST_WRITE_BACKPRESSURE_TIMEOUT)
+                .await
+        };
+        if !ok {
+            self.close_stalled(
+                ch,
+                b"katamaran: guest stopped reading; could not deliver signal, closing channel\r\n",
+                session,
+            );
         }
     }
 
@@ -437,52 +510,76 @@ impl Handler {
         };
         let home = self.home.clone();
         let handle = session.handle();
-        let guest = GuestChan::spawn_task(move |ctrl_rx, data_rx, stop_read| async move {
-            let started = tokio::time::timeout(GUEST_CONNECT_TIMEOUT, async {
-                let mut s = connect_guest(&home).await?;
-                write_frame(&mut s, &MachineMsg::Exec(spec)).await?;
-                Ok::<_, anyhow::Error>(s)
-            })
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "guest exec timed out after {}s",
-                    GUEST_CONNECT_TIMEOUT.as_secs()
-                )
-            })
-            .and_then(|r| r);
-            match started {
-                Ok(s) => {
-                    let _ = handle.channel_success(ch).await;
-                    run_pumps(s, handle, ch, ctrl_rx, data_rx, stop_read).await;
+        let guest =
+            GuestChan::spawn_task(move |signal_rx, resize, data_rx, stop_read| async move {
+                let started = tokio::time::timeout(GUEST_CONNECT_TIMEOUT, async {
+                    let mut s = connect_guest(&home).await?;
+                    write_frame(&mut s, &MachineMsg::Exec(spec)).await?;
+                    Ok::<_, anyhow::Error>(s)
+                })
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "guest exec timed out after {}s",
+                        GUEST_CONNECT_TIMEOUT.as_secs()
+                    )
+                })
+                .and_then(|r| r);
+                match started {
+                    Ok(s) => {
+                        let _ = handle.channel_success(ch).await;
+                        run_pumps(s, handle, ch, signal_rx, resize, data_rx, stop_read).await;
+                    }
+                    Err(e) => {
+                        let _ = handle
+                            .extended_data(ch, 1, format!("katamaran: {e:#}\r\n").into_bytes())
+                            .await;
+                        let _ = handle.channel_failure(ch).await;
+                        let _ = handle.close(ch).await;
+                    }
                 }
-                Err(e) => {
-                    let _ = handle
-                        .extended_data(ch, 1, format!("katamaran: {e:#}\r\n").into_bytes())
-                        .await;
-                    let _ = handle.channel_failure(ch).await;
-                    let _ = handle.close(ch).await;
-                }
-            }
-        });
+            });
         self.chans.entry(ch).or_default().guest = Some(guest);
     }
 }
 
 /// Write queued host-to-guest frames asynchronously so SSH callbacks never
-/// block the runtime or deadlock against guest output. Control frames
-/// (`Signal`, `Resize`) take priority over queued stream data.
+/// block the runtime or deadlock against guest output. Signals take highest
+/// priority, followed by the latest coalesced resize, then queued stream data.
 async fn pump_write(
-    mut ctrl_rx: mpsc::Receiver<MachineMsg>,
+    mut signal_rx: mpsc::Receiver<i32>,
+    resize: Arc<PendingResize>,
     mut data_rx: mpsc::Receiver<MachineMsg>,
     mut w: OwnedWriteHalf,
 ) {
+    let mut signals_open = true;
+    let mut data_open = true;
     loop {
-        let msg = tokio::select! {
-            biased;
-            Some(m) = ctrl_rx.recv() => m,
-            Some(m) = data_rx.recv() => m,
-            else => break,
+        let msg = if let Ok(signal) = signal_rx.try_recv() {
+            MachineMsg::Signal { signal }
+        } else if let Some((rows, cols)) = resize.take() {
+            MachineMsg::Resize { rows, cols }
+        } else if !signals_open && !data_open {
+            break;
+        } else {
+            tokio::select! {
+                biased;
+                res = signal_rx.recv(), if signals_open => match res {
+                    Some(signal) => MachineMsg::Signal { signal },
+                    None => {
+                        signals_open = false;
+                        continue;
+                    }
+                },
+                (rows, cols) = resize.next() => MachineMsg::Resize { rows, cols },
+                res = data_rx.recv(), if data_open => match res {
+                    Some(m) => m,
+                    None => {
+                        data_open = false;
+                        continue;
+                    }
+                },
+            }
         };
         if write_frame(&mut w, &msg).await.is_err() {
             break;
@@ -567,16 +664,18 @@ impl russh::server::Handler for Handler {
         let h = session.handle();
         // Run the guest Connect handshake off the SSH handler loop so a stalled
         // guest cannot hold up other multiplexed channels on this connection.
-        let guest = GuestChan::spawn_task(move |ctrl_rx, data_rx, stop_read| async move {
-            let Ok(s) = connect_direct_tcpip(&home, &machine, port, GUEST_CONNECT_TIMEOUT).await
-            else {
-                // Dropping `reply` sends SSH_MSG_CHANNEL_OPEN_FAILURE.
-                drop(reply);
-                return;
-            };
-            reply.accept().await;
-            run_pumps(s, h, ch, ctrl_rx, data_rx, stop_read).await;
-        });
+        let guest =
+            GuestChan::spawn_task(move |signal_rx, resize, data_rx, stop_read| async move {
+                let Ok(s) =
+                    connect_direct_tcpip(&home, &machine, port, GUEST_CONNECT_TIMEOUT).await
+                else {
+                    // Dropping `reply` sends SSH_MSG_CHANNEL_OPEN_FAILURE.
+                    drop(reply);
+                    return;
+                };
+                reply.accept().await;
+                run_pumps(s, h, ch, signal_rx, resize, data_rx, stop_read).await;
+            });
         self.chans.insert(
             ch,
             Chan {
@@ -670,12 +769,10 @@ impl russh::server::Handler for Handler {
         _pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send_ctrl(
+        self.send_resize(
             channel,
-            MachineMsg::Resize {
-                rows: row_height.min(u16::MAX as u32) as u16,
-                cols: col_width.min(u16::MAX as u32) as u16,
-            },
+            row_height.min(u16::MAX as u32) as u16,
+            col_width.min(u16::MAX as u32) as u16,
         );
         Ok(())
     }
@@ -717,10 +814,10 @@ impl russh::server::Handler for Handler {
         &mut self,
         channel: ChannelId,
         signal: Sig,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(signal) = signal_number(&signal) {
-            self.send_ctrl(channel, MachineMsg::Signal { signal });
+            self.send_signal(channel, signal, session).await;
         }
         Ok(())
     }
@@ -855,7 +952,7 @@ mod tests {
     }
 
     fn test_guest_chan(stream: UnixStream) -> GuestChan {
-        GuestChan::spawn_task(move |ctrl_rx, data_rx, stop_read| async move {
+        GuestChan::spawn_task(move |signal_rx, resize, data_rx, stop_read| async move {
             let (mut reader, writer) = stream.into_split();
             let reader_task = tokio::spawn(async move {
                 tokio::select! {
@@ -865,7 +962,7 @@ mod tests {
             });
             let _abort_reader = AbortOnDrop(reader_task.abort_handle());
             tokio::pin!(reader_task);
-            let mut write_fut = std::pin::pin!(pump_write(ctrl_rx, data_rx, writer));
+            let mut write_fut = std::pin::pin!(pump_write(signal_rx, resize, data_rx, writer));
             tokio::select! {
                 _ = &mut write_fut => {}
                 res = &mut reader_task => {
@@ -875,6 +972,134 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn slow_reading_guest_succeeds_with_bounded_backpressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (host, mut guest) = UnixStream::pair().unwrap();
+            let ch = test_guest_chan(host);
+            let total = GUEST_WRITE_QUEUE + 48;
+            let chunk = vec![0x61u8; 16 << 10];
+
+            // Guest starts reading only after a short delay, then reads slowly
+            // so the bounded queue fills before draining.
+            let reader = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let mut count = 0usize;
+                while let Some(msg) = read_frame(&mut guest).await.unwrap() {
+                    match msg {
+                        MachineMsg::Data(d) => {
+                            assert_eq!(d.len(), 16 << 10);
+                            count += 1;
+                            if count.is_multiple_of(16) {
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            }
+                        }
+                        MachineMsg::DataEnd => break,
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+                count
+            });
+
+            for _ in 0..total {
+                assert!(
+                    ch.enqueue_data(
+                        MachineMsg::Data(chunk.clone()),
+                        GUEST_WRITE_BACKPRESSURE_TIMEOUT
+                    )
+                    .await,
+                    "slow but reading guest must not be closed as stalled"
+                );
+            }
+            assert!(
+                ch.enqueue_data(MachineMsg::DataEnd, GUEST_WRITE_BACKPRESSURE_TIMEOUT)
+                    .await
+            );
+            ch.close_graceful(GUEST_WRITE_BACKPRESSURE_TIMEOUT);
+
+            assert_eq!(reader.await.unwrap(), total);
+        });
+    }
+
+    #[test]
+    fn resizes_coalesce_and_signals_are_never_silently_dropped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (host, mut guest) = UnixStream::pair().unwrap();
+            let ch = test_guest_chan(host);
+
+            // Fill the socket buffer + data queue so `pump_write` is stalled
+            // mid-write on a large frame.
+            let chunk = vec![0x33u8; 32 << 10];
+            let short = std::time::Duration::from_millis(20);
+            for _ in 0..(GUEST_WRITE_QUEUE + 256) {
+                if !ch
+                    .enqueue_data(MachineMsg::Data(chunk.clone()), short)
+                    .await
+                {
+                    break;
+                }
+            }
+
+            // A storm of 64 resizes must coalesce into the latest dimensions
+            // and never block or fill the dedicated signal queue.
+            for i in 1u16..=64 {
+                ch.set_resize(24 + i, 80 + i);
+            }
+            assert!(
+                ch.enqueue_signal(libc::SIGINT, short).await,
+                "resizes must not fill or block signal delivery"
+            );
+
+            // Filling all remaining signal slots then sending one more while
+            // still stalled must return `false` instead of silently dropping.
+            for _ in 1..GUEST_SIGNAL_QUEUE {
+                assert!(ch.enqueue_signal(libc::SIGTERM, short).await);
+            }
+            assert!(
+                !ch.enqueue_signal(libc::SIGHUP, short).await,
+                "full signal queue must report failure rather than silently discard"
+            );
+
+            // Once the guest resumes reading, drain the in-flight data frames
+            // and verify all queued signals arrive before the single coalesced
+            // latest resize (88x144).
+            let mut got_sigint = false;
+            let mut got_resizes = Vec::new();
+            let mut sig_count = 0usize;
+            ch.close_graceful(std::time::Duration::from_secs(2));
+            while let Some(msg) = read_frame(&mut guest).await.unwrap() {
+                match msg {
+                    MachineMsg::Signal { signal } => {
+                        assert!(
+                            got_resizes.is_empty(),
+                            "signals must be prioritized ahead of coalesced resize"
+                        );
+                        if signal == libc::SIGINT {
+                            got_sigint = true;
+                        }
+                        sig_count += 1;
+                    }
+                    MachineMsg::Resize { rows, cols } => {
+                        got_resizes.push((rows, cols));
+                    }
+                    MachineMsg::Data(_) => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+            assert!(got_sigint, "SIGINT must be delivered");
+            assert_eq!(sig_count, GUEST_SIGNAL_QUEUE);
+            assert_eq!(got_resizes, vec![(24 + 64, 80 + 64)]);
+        });
     }
 
     #[test]
@@ -892,13 +1117,15 @@ mod tests {
             let (host2, mut guest2) = UnixStream::pair().unwrap();
             let healthy = test_guest_chan(host2);
 
-            // Pump frames into channel 1 until its bounded queue overflows.
-            // `try_enqueue_data` must return `false` without hanging the runtime.
+            // Pump frames into channel 1 until its bounded queue times out.
+            // `enqueue_data` must return `false` once the bounded timeout
+            // elapses without hanging the runtime indefinitely.
             let chunk = vec![0x42u8; 32 << 10];
+            let short = std::time::Duration::from_millis(20);
             let mut overflowed = false;
             for _ in 0..(GUEST_WRITE_QUEUE + 256) {
                 if !stalled
-                    .try_enqueue_data(MachineMsg::Data(chunk.clone()))
+                    .enqueue_data(MachineMsg::Data(chunk.clone()), short)
                     .await
                 {
                     overflowed = true;
@@ -912,7 +1139,7 @@ mod tests {
             let payload = b"healthy multiplexed channel".to_vec();
             assert!(
                 healthy
-                    .try_enqueue_data(MachineMsg::Data(payload.clone()))
+                    .enqueue_data(MachineMsg::Data(payload.clone()), short)
                     .await
             );
             assert_eq!(
@@ -948,14 +1175,23 @@ mod tests {
             let (host, mut guest) = UnixStream::pair().unwrap();
             let ch = test_guest_chan(host);
             assert!(
-                ch.try_enqueue_data(MachineMsg::Data(b"first".to_vec()))
-                    .await
+                ch.enqueue_data(
+                    MachineMsg::Data(b"first".to_vec()),
+                    GUEST_WRITE_BACKPRESSURE_TIMEOUT
+                )
+                .await
             );
             assert!(
-                ch.try_enqueue_data(MachineMsg::Data(b"second".to_vec()))
+                ch.enqueue_data(
+                    MachineMsg::Data(b"second".to_vec()),
+                    GUEST_WRITE_BACKPRESSURE_TIMEOUT
+                )
+                .await
+            );
+            assert!(
+                ch.enqueue_data(MachineMsg::DataEnd, GUEST_WRITE_BACKPRESSURE_TIMEOUT)
                     .await
             );
-            assert!(ch.try_enqueue_data(MachineMsg::DataEnd).await);
             ch.close_graceful(CLOSE_FLUSH_GRACE);
 
             assert_eq!(
@@ -977,8 +1213,12 @@ mod tests {
             let (host, mut guest) = UnixStream::pair().unwrap();
             let ch = test_guest_chan(host);
             let chunk = vec![0x55u8; 32 << 10];
+            let short = std::time::Duration::from_millis(20);
             for _ in 0..(GUEST_WRITE_QUEUE + 256) {
-                if !ch.try_enqueue_data(MachineMsg::Data(chunk.clone())).await {
+                if !ch
+                    .enqueue_data(MachineMsg::Data(chunk.clone()), short)
+                    .await
+                {
                     break;
                 }
             }

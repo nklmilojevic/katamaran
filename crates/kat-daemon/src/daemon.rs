@@ -1011,6 +1011,7 @@ impl Daemon {
     }
 
     fn persist_k8s_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = Config::load(&self.home)?;
         if cfg.kubernetes != enabled {
             cfg.kubernetes = enabled;

@@ -306,12 +306,21 @@ mod tests {
         sock
     }
 
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// Bind a fresh port outside macOS's ephemeral range (49152..=65535)
+    /// directly via `fwd.add`, avoiding a throwaway probe listener whose fd
+    /// could briefly be inherited by a parallel test subprocess on macOS.
+    fn add_free_port(fwd: &mut AutoForwards) -> u16 {
+        use std::sync::atomic::AtomicU16;
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let base = (std::process::id() % 8_000) as u16;
+        for _ in 0..256 {
+            let off = NEXT.fetch_add(1, Ordering::Relaxed);
+            let port = 36_000u16 + (base.wrapping_add(off) % 10_000);
+            if matches!(fwd.add(port), Ok(true)) {
+                return port;
+            }
+        }
+        panic!("could not find a free test port");
     }
 
     fn round_trip(port: u16, msg: &str) -> String {
@@ -336,10 +345,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut fwd = AutoForwards::new(&fake_guest(&dir));
-        let (a, b) = (free_port(), free_port());
-        assert!(fwd.add(a).unwrap());
+        let a = add_free_port(&mut fwd);
         assert!(!fwd.add(a).unwrap(), "added twice");
-        assert!(fwd.add(b).unwrap());
+        let b = add_free_port(&mut fwd);
         assert_eq!(round_trip(a, "hello"), format!("{a}:hello"));
         // Large enough to need many reads in both directions.
         let big = "x".repeat(4 << 20);
@@ -380,8 +388,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut fwd = AutoForwards::with_max_conns(&fake_guest(&dir), 2);
-        let port = free_port();
-        assert!(fwd.add(port).unwrap());
+        let port = add_free_port(&mut fwd);
 
         // Hold two open relayed connections (fills the cap of 2).
         let mut c1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -395,11 +402,23 @@ mod tests {
         c2.write_all(b"b").unwrap();
         c2.read_exact(&mut buf).unwrap();
 
-        // A third concurrent connection is rejected immediately (EOF / reset).
+        // A third concurrent connection is rejected immediately (EOF / reset),
+        // never silently queued until the read timeout expires.
         let mut c3 = TcpStream::connect(("127.0.0.1", port)).unwrap();
         c3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut one = [0u8; 1];
-        assert!(matches!(c3.read(&mut one), Ok(0) | Err(_)));
+        match c3.read(&mut one) {
+            Ok(0) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("expected cap rejection (EOF or reset), got {other:?}"),
+        }
         drop(c3);
 
         // Removing the forward returns promptly via the wakeup pipe even while
@@ -411,11 +430,25 @@ mod tests {
             "remove took {:?}",
             t.elapsed()
         );
-        // The listening socket is closed as soon as remove() returns (bind
-        // avoids TCP ephemeral self-connect flakiness on closed high ports).
-        let rebound = TcpListener::bind(("127.0.0.1", port));
-        assert!(rebound.is_ok(), "still listening on {port}");
-        drop(rebound);
+        // The listening socket is closed once remove() returns. Poll briefly on
+        // AddrInUse in case a parallel test subprocess briefly inherited the fd
+        // during macOS's non-atomic socket()+FIOCLEX window.
+        let bind_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(rebound) => {
+                    drop(rebound);
+                    break;
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::AddrInUse
+                        && std::time::Instant::now() < bind_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("still listening on {port}: {e:?}"),
+            }
+        }
 
         // Releasing slots restores capacity when re-added.
         drop(c1);

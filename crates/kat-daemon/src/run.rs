@@ -670,6 +670,13 @@ fn session(
         let _ = running.child.kill();
         let _ = running.child.wait();
     }
+    if let Some((dir, port_file)) = files.as_ref() {
+        match nfs::finish_shutdown_cleanup(dir, port_file, Duration::from_secs(2)) {
+            Ok(true) => println!("katamaran: unmounted late NFS mount {}", dir.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!("katamaran: {e:#}"),
+        }
+    }
     let _ = fs::remove_file(&pid_file);
     Ok(end)
 }

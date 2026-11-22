@@ -363,7 +363,7 @@ fn post(socket: &Path, path: &str, body: &str) -> Result<(), ForwardError> {
         Ok(resp)
     };
     let resp = send().map_err(|e| ForwardError::Transient(format!("gvproxy API: {e}")))?;
-    parse_response(&resp).map_err(ForwardError::Refused)
+    parse_response(&resp)
 }
 
 fn http_post(path: &str, body: &str) -> String {
@@ -374,23 +374,35 @@ fn http_post(path: &str, body: &str) -> String {
     )
 }
 
-/// `Ok` on a 200; otherwise the body, which gvproxy fills with the error.
-fn parse_response(resp: &str) -> Result<(), String> {
-    let status = resp
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse::<u16>().ok());
+/// `Ok` on a 200; `Refused` on a parsed non-200 HTTP response (whose body
+/// carries gvproxy's error); `Transient` on a truncated or malformed response.
+fn parse_response(resp: &str) -> Result<(), ForwardError> {
+    let Some((head, body)) = resp.split_once("\r\n\r\n") else {
+        return Err(ForwardError::Transient(format!(
+            "gvproxy API: malformed response {resp:?}"
+        )));
+    };
+    let status_line = head.lines().next().unwrap_or("");
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or("");
+    let status = if version.starts_with("HTTP/") {
+        parts.next().and_then(|c| c.parse::<u16>().ok())
+    } else {
+        None
+    };
     match status {
         Some(200) => Ok(()),
         Some(code) => {
-            let body = resp.split_once("\r\n\r\n").map_or("", |(_, b)| b).trim();
-            Err(if body.is_empty() {
+            let body = body.trim();
+            Err(ForwardError::Refused(if body.is_empty() {
                 format!("HTTP {code}")
             } else {
                 body.to_string()
-            })
+            }))
         }
-        None => Err(format!("malformed response {resp:?}")),
+        None => Err(ForwardError::Transient(format!(
+            "gvproxy API: malformed response {resp:?}"
+        ))),
     }
 }
 
@@ -925,13 +937,76 @@ mod tests {
             parse_response(
                 "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nlisten tcp 127.0.0.1:22: bind: permission denied\n"
             ),
-            Err("listen tcp 127.0.0.1:22: bind: permission denied".into())
+            Err(ForwardError::Refused(
+                "listen tcp 127.0.0.1:22: bind: permission denied".into()
+            ))
         );
         assert_eq!(
             parse_response("HTTP/1.1 404 Not Found\r\n\r\n"),
-            Err("HTTP 404".into())
+            Err(ForwardError::Refused("HTTP 404".into()))
         );
-        assert!(parse_response("").is_err());
+        assert!(matches!(
+            parse_response(""),
+            Err(ForwardError::Transient(_))
+        ));
+        assert!(matches!(
+            parse_response("HTTP/1.1 500"),
+            Err(ForwardError::Transient(_))
+        ));
+        assert!(matches!(
+            parse_response("garbage 500\r\n\r\n"),
+            Err(ForwardError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_gvproxy_response_is_retried_and_succeeds() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("kat-gvp-malformed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("gvproxy-api.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = thread::spawn(move || {
+            for i in 0..2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut req = [0u8; 512];
+                let _ = conn.read(&mut req);
+                let reply = if i == 0 {
+                    b"malformed truncated reply".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".as_slice()
+                };
+                let _ = conn.write_all(reply);
+            }
+        });
+
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let tx = spawn_forwarder_with(
+            GvproxyApi {
+                socket: sock,
+                guest: GUEST,
+            },
+            Duration::from_millis(10),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+        tx.send(PortChange::Add(TCP, 9200)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Transient(TCP, 9200, _)
+        ));
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, 9200)
+        );
+        drop(tx);
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
