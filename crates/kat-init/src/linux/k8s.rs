@@ -8,10 +8,10 @@
 //! `moby` namespace into `k8s.io`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -159,10 +159,33 @@ pub fn ensure_containerd_cri() -> Result<bool, String> {
     let Some(updated) = strip_cri_from_disabled_plugins(&text) else {
         return Ok(false);
     };
-    let tmp = "/etc/containerd/config.toml.tmp";
-    fs::write(tmp, updated).map_err(|e| format!("write {tmp}: {e}"))?;
-    if let Err(e) = fs::rename(tmp, path) {
-        let _ = fs::remove_file(tmp);
+    let orig_mode = fs::metadata(path)
+        .map_err(|e| format!("stat {path}: {e}"))?
+        .permissions()
+        .mode();
+    let tmp = format!(
+        "/etc/containerd/.config.toml.katamaran.{}.tmp",
+        std::process::id()
+    );
+    let _ = fs::remove_file(&tmp);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| format!("create {tmp}: {e}"))?;
+    if let Err(e) = f.write_all(updated.as_bytes()).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {tmp}: {e}"));
+    }
+    drop(f);
+    if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(orig_mode)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("chmod {tmp}: {e}"));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
         return Err(format!("replace {path}: {e}"));
     }
     Ok(true)
@@ -656,21 +679,21 @@ fn prepare_dirs_and_sysctls(reaper: &Reaper) -> Result<(), String> {
     Ok(())
 }
 
-const BRIDGE_NF_SYSCTLS: [&str; 2] = [
+const BRIDGE_NF_SYSCTLS: [&str; 3] = [
+    "/proc/sys/net/ipv4/ip_forward",
     "/proc/sys/net/bridge/bridge-nf-call-iptables",
     "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
 ];
-static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 2]>> = Mutex::new(None);
+static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 3]>> = Mutex::new(None);
 
 fn enable_bridge_netfilter() -> Result<(), String> {
-    fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
-        .map_err(|e| format!("enable /proc/sys/net/ipv4/ip_forward: {e}"))?;
     {
         let mut saved = SAVED_BRIDGE_NF.lock().unwrap();
         if saved.is_none() {
             *saved = Some([
                 fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
                 fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[2]).ok(),
             ]);
         }
     }
