@@ -30,11 +30,17 @@ protocol ResourceSource: AnyObject {
     func row(_ key: String) -> ResourceRow?
     func headerSubtitle(_ key: String) -> String
     func details(_ key: String) -> [NSView]
+    /// Changes whenever `details(key)` would produce different views.
+    func detailVersion(_ key: String) -> AnyHashable?
     /// Where the detail's open button goes (Finder, a browser), if anywhere.
     func reveal(_ key: String) -> URL?
     var revealTitle: String { get }
     var revealSymbol: String { get }
     func confirmDelete(_ key: String)
+}
+
+extension ResourceSource {
+    func detailVersion(_ key: String) -> AnyHashable? { nil }
 }
 
 /// Volumes, images and networks share one layout: a list in "In Use" and
@@ -299,6 +305,7 @@ final class ResourceDetailViewController: NSViewController {
     private let header = NSView()
     private(set) var key: String?
     private var shown: ResourceRow?
+    private var shownDetail: AnyHashable?
     /// Shown instead of the details (a pod's logs), below the header.
     private var body: NSView?
     private var bodyTop: NSLayoutYAxisAnchor?
@@ -311,6 +318,7 @@ final class ResourceDetailViewController: NSViewController {
         pane.listVC.onSelect = { [weak self] k in
             self?.key = k
             self?.shown = nil
+            self?.shownDetail = nil
             self?.onSelect(k)
             self?.reload()
         }
@@ -406,8 +414,11 @@ final class ResourceDetailViewController: NSViewController {
         reveal.title = pane.revealTitle
         reveal.image = NSImage(systemSymbolName: pane.revealSymbol, accessibilityDescription: nil)
         // Rebuilding the groups would reset the scroll position for nothing.
-        if row != shown {
+        let detail = pane.detailVersion(key)
+        let needsDetails = detail != nil ? (detail != shownDetail) : (row != shown)
+        if needsDetails {
             shown = row
+            shownDetail = detail
             content.set(pane.details(key))
         }
     }

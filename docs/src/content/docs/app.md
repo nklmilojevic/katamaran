@@ -38,7 +38,7 @@ The main window sidebar groups management views into four sections.
 - **Pods**: List pods grouped by namespace, with status, readiness, restarts, and age. Inspect a pod's containers, node, IP, owner, and labels, follow its logs (pick a container in multi-container pods), and delete it.
 - **Services**: List services with their type and ports. Inspect cluster IP, ports, selector, and the pods it selects, open LoadBalancer and NodePort services at `http://localhost:<port>`, and delete them.
 
-System namespaces (`kube-system`, `kube-public`, `kube-node-lease`) are hidden by default; turn on **Show System Namespaces** in the toolbar's **More** menu. While Kubernetes is off, both views offer a **Turn On** button. The app talks to the cluster through `~/.katamaran/run/k8s-proxy.sock`, an authenticated `kubectl proxy` in the VM, so it doesn't need `kubectl` on the Mac.
+System namespaces (`kube-system`, `kube-public`, `kube-node-lease`) are hidden by default; turn on **Show System Namespaces** in the toolbar's **More** menu. While Kubernetes is off, both views offer a **Turn On** button. The app talks to the cluster through `~/.katamaran/run/k8s-proxy.sock` by default (or `$KATAMARAN_HOME/run/k8s-proxy.sock` when `KATAMARAN_HOME` is set), relayed to an authenticated `kubectl proxy` in the VM, so it doesn't need `kubectl` on the Mac.
 
 ### Linux
 

@@ -114,6 +114,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         let errorMessage: String?
     }
     private var shownState: ShownDockerState?
+    private var shownSectionBlock: BlockedState?
     private var listWidth: CGFloat = {
         let w = UserDefaults.standard.double(forKey: MainWindowController.listWidthKey)
         return w > 0 ? w : 380
@@ -247,6 +248,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         if remember { UserDefaults.standard.set(s.rawValue, forKey: Self.sectionKey) }
         sidebar.select(s)
         shownState = nil
+        shownSectionBlock = nil
         refreshChrome()
         if window?.isVisible ?? false { panes[s]?.setActive(true) }
     }
@@ -255,7 +257,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     func select(name: String) {
         if let p = panes[section] as? ContainersPane { p.select(name: name) }
         if let p = panes[section] as? BuildsPane { p.select(name: name) }
-        if let p = panes[section] as? ResourcePane, let r = p.rows().first(where: { $0.title == name }) {
+        if let p = panes[section] as? ResourceSource, let r = p.rows().first(where: { $0.title == name }) {
             p.listVC.select(key: r.key)
         }
     }
@@ -315,13 +317,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         let blocked = (pane.needsDocker && !dockerUp) || sectionBlock != nil
 
         if let b = sectionBlock {
-            sectionState.show(symbol: b.symbol, title: b.title, message: b.message, action: b.action, busy: b.busy)
+            if b != shownSectionBlock {
+                shownSectionBlock = b
+                sectionState.show(symbol: b.symbol, title: b.title, message: b.message, action: b.action, busy: b.busy)
+            }
             sectionState.onAction = { [weak pane] in pane?.blockedAction() }
             listHost.embed(nil, overlay: sectionState)
         } else if blocked {
+            shownSectionBlock = nil
             showDockerState()
             listHost.embed(nil, overlay: dockerState)
         } else {
+            shownSectionBlock = nil
             listHost.embed(pane.list, overlay: nil)
         }
         // Docker's state stays in the list column, as a list's own empty state

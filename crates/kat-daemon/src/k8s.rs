@@ -302,7 +302,7 @@ impl ApiProxy {
 }
 
 /// Serves `<home>/run/k8s-proxy.sock`, each connection relayed to the
-/// guest's `kubectl proxy` on `127.0.0.1:PROXY_PORT`.
+/// guest's root-only `kubectl proxy` Unix socket via `K8sMsg::Proxy`.
 struct RestProxy {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -317,12 +317,15 @@ impl RestProxy {
         let path = proxy_socket_path(home);
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&path);
+            return Err(e);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let home = home.to_path_buf();
         let active = Arc::new(AtomicUsize::new(0));
-        let thread = thread::Builder::new()
+        let thread = match thread::Builder::new()
             .name("k8s-rest".into())
             .spawn(move || {
                 for conn in listener.incoming() {
@@ -347,9 +350,7 @@ impl RestProxy {
                             .name("k8s-rest-conn".into())
                             .spawn(move || {
                                 let _guard = guard;
-                                if let Err(e) =
-                                    relay_k8s_connect(&home, client, "127.0.0.1", k8s::PROXY_PORT)
-                                {
+                                if let Err(e) = relay_k8s_proxy(&home, client) {
                                     eprintln!("katamaran: k8s rest: {e:#}");
                                 }
                             })
@@ -357,7 +358,13 @@ impl RestProxy {
                         eprintln!("katamaran: k8s rest spawn worker: {e}");
                     }
                 }
-            })?;
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                return Err(e);
+            }
+        };
         Ok(RestProxy {
             path,
             stop,
@@ -474,14 +481,23 @@ pub fn relay_k8s_connect<S: Duplex>(
     addr: &str,
     port: u16,
 ) -> anyhow::Result<()> {
-    let mut sock = connect(home)?;
-    k8s::write(
-        &mut sock,
+    relay_k8s_stream(
+        home,
+        client,
         &K8sMsg::Connect {
             addr: addr.into(),
             port,
         },
-    )?;
+    )
+}
+
+pub fn relay_k8s_proxy<S: Duplex>(home: &Path, client: S) -> anyhow::Result<()> {
+    relay_k8s_stream(home, client, &K8sMsg::Proxy)
+}
+
+fn relay_k8s_stream<S: Duplex>(home: &Path, client: S, req: &K8sMsg) -> anyhow::Result<()> {
+    let mut sock = connect(home)?;
+    k8s::write(&mut sock, req)?;
     match k8s::read(&mut sock)? {
         Some(K8sMsg::Done) => {}
         Some(K8sMsg::Error(e)) => bail!("{e}"),
@@ -1245,17 +1261,11 @@ users:
         fs::create_dir_all(dir.join("run")).unwrap();
         let ulistener = UnixListener::bind(socket_path(&dir)).unwrap();
 
-        // Guest mock: expect a Connect to kubectl proxy, echo one chunk back, end.
+        // Guest mock: expect a Proxy request, echo one chunk back, end.
         let guest = thread::spawn(move || {
             let (mut conn, _) = ulistener.accept().unwrap();
             let req = k8s::read(&mut conn).unwrap().unwrap();
-            assert_eq!(
-                req,
-                K8sMsg::Connect {
-                    addr: "127.0.0.1".into(),
-                    port: k8s::PROXY_PORT
-                }
-            );
+            assert_eq!(req, K8sMsg::Proxy);
             k8s::write(&mut conn, &K8sMsg::Done).unwrap();
             let Some(K8sMsg::Data(d)) = k8s::read(&mut conn).unwrap() else {
                 panic!("expected data");

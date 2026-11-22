@@ -9,7 +9,7 @@ struct K8sList<T: Decodable>: Decodable {
     var items: [T]
 }
 
-struct K8sMeta: Decodable, Equatable {
+struct K8sMeta: Decodable, Hashable {
     var name: String
     var namespace: String?
     var uid: String?
@@ -18,30 +18,31 @@ struct K8sMeta: Decodable, Equatable {
     var labels: [String: String]?
     var ownerReferences: [OwnerRef]?
 
-    struct OwnerRef: Decodable, Equatable {
+    struct OwnerRef: Decodable, Hashable {
         var kind: String
         var name: String
+        var controller: Bool?
     }
 
     var created: Date? { creationTimestamp.flatMap(parseDockerDate) }
 }
 
-struct K8sPod: Decodable, Equatable {
+struct K8sPod: Decodable, Hashable {
     var metadata: K8sMeta
     var spec: Spec?
     var status: Status?
 
-    struct Spec: Decodable, Equatable {
+    struct Spec: Decodable, Hashable {
         var nodeName: String?
         var containers: [Container]?
     }
 
-    struct Container: Decodable, Equatable {
+    struct Container: Decodable, Hashable {
         var name: String
         var image: String?
     }
 
-    struct Status: Decodable, Equatable {
+    struct Status: Decodable, Hashable {
         var phase: String?
         var reason: String?
         var message: String?
@@ -49,7 +50,7 @@ struct K8sPod: Decodable, Equatable {
         var containerStatuses: [ContainerStatus]?
     }
 
-    struct ContainerStatus: Decodable, Equatable {
+    struct ContainerStatus: Decodable, Hashable {
         var name: String
         var ready: Bool?
         var restartCount: Int?
@@ -57,23 +58,23 @@ struct K8sPod: Decodable, Equatable {
         var state: State?
     }
 
-    struct State: Decodable, Equatable {
+    struct State: Decodable, Hashable {
         var waiting: Detail?
         var running: Running?
         var terminated: Detail?
 
-        struct Detail: Decodable, Equatable {
+        struct Detail: Decodable, Hashable {
             var reason: String?
             var exitCode: Int?
         }
 
-        struct Running: Decodable, Equatable {
+        struct Running: Decodable, Hashable {
             var startedAt: String?
         }
 
         var label: String {
-            if let w = waiting { return w.reason ?? "Waiting" }
-            if let t = terminated { return t.reason ?? "Terminated" }
+            if let w = waiting { return w.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "Waiting" }
+            if let t = terminated { return t.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "Terminated" }
             if running != nil { return "Running" }
             return "Unknown"
         }
@@ -88,19 +89,25 @@ struct K8sPod: Decodable, Equatable {
     var readyCount: Int { statuses.filter { $0.ready == true }.count }
     var containerCount: Int { max(spec?.containers?.count ?? 0, statuses.count) }
     var restarts: Int { statuses.reduce(0) { $0 + ($1.restartCount ?? 0) } }
-    var owner: K8sMeta.OwnerRef? { metadata.ownerReferences?.first }
+    var owner: K8sMeta.OwnerRef? {
+        metadata.ownerReferences?.first(where: { $0.controller == true }) ?? metadata.ownerReferences?.first
+    }
 
     /// What `kubectl get pods` puts in STATUS: a container's waiting or
     /// failure reason when there is one, otherwise the phase.
     var displayStatus: String {
         if metadata.deletionTimestamp != nil { return "Terminating" }
-        if let r = statuses.lazy.compactMap({ $0.state?.waiting?.reason }).first { return r }
+        if let r = statuses.lazy.compactMap({ $0.state?.waiting?.reason }).first(where: { !$0.isEmpty }) { return r }
         if let r = statuses.lazy.compactMap({ s -> String? in
-            guard let t = s.state?.terminated, t.exitCode != 0 else { return nil }
-            return t.reason ?? "Error"
+            guard let t = s.state?.terminated, (t.exitCode ?? 0) != 0 else { return nil }
+            return t.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "Error"
         }).first { return r }
-        if let r = status?.reason { return r }
+        if let r = status?.reason, !r.isEmpty { return r }
         return status?.phase ?? "Unknown"
+    }
+
+    private static func isFailureReason(_ s: String) -> Bool {
+        s.contains("BackOff") || s.hasPrefix("Err") || s.hasPrefix("Invalid") || s.hasSuffix("Error") || s == "OOMKilled"
     }
 
     var health: ContainerHealth {
@@ -109,30 +116,28 @@ struct K8sPod: Decodable, Equatable {
         case "Succeeded": return .stopped
         case "Failed": return .failed
         case "Running":
-            let s = displayStatus
-            if s.contains("BackOff") || s.hasPrefix("Err") || s == "Error" || s == "OOMKilled" { return .failed }
+            if Self.isFailureReason(displayStatus) { return .failed }
             return readyCount == containerCount ? .running : .transitional
         default:
-            let s = displayStatus
-            if s.contains("BackOff") || s.hasPrefix("Err") || s.hasPrefix("Invalid") { return .failed }
+            if Self.isFailureReason(displayStatus) { return .failed }
             return .transitional
         }
     }
 }
 
-struct K8sService: Decodable, Equatable {
+struct K8sService: Decodable, Hashable {
     var metadata: K8sMeta
     var spec: Spec?
     var status: Status?
 
-    struct Spec: Decodable, Equatable {
+    struct Spec: Decodable, Hashable {
         var type: String?
         var clusterIP: String?
         var ports: [ServicePort]?
         var selector: [String: String]?
     }
 
-    struct ServicePort: Decodable, Equatable {
+    struct ServicePort: Decodable, Hashable {
         var name: String?
         var port: Int
         var targetPort: IntOrString?
@@ -140,12 +145,12 @@ struct K8sService: Decodable, Equatable {
         var `protocol`: String?
     }
 
-    struct Status: Decodable, Equatable {
+    struct Status: Decodable, Hashable {
         var loadBalancer: LoadBalancer?
-        struct LoadBalancer: Decodable, Equatable {
+        struct LoadBalancer: Decodable, Hashable {
             var ingress: [Ingress]?
         }
-        struct Ingress: Decodable, Equatable {
+        struct Ingress: Decodable, Hashable {
             var ip: String?
             var hostname: String?
         }
@@ -161,8 +166,9 @@ struct K8sService: Decodable, Equatable {
     var portsLabel: String {
         ports.map { p in
             var s = "\(p.port)"
-            if let n = p.nodePort, type == "NodePort" || type == "LoadBalancer" { s += ":\(n)" }
-            return s + "/\(p.protocol ?? "TCP")"
+            if let n = p.nodePort, n > 0, type == "NodePort" || type == "LoadBalancer" { s += ":\(n)" }
+            let proto = p.protocol.flatMap { $0.isEmpty ? nil : $0 } ?? "TCP"
+            return s + "/\(proto)"
         }.joined(separator: ", ")
     }
 
@@ -170,9 +176,11 @@ struct K8sService: Decodable, Equatable {
     /// NodePorts, which the VM forwards (TCP only).
     var localPorts: [Int] {
         var out: [Int] = []
-        for p in ports where (p.protocol ?? "TCP") == "TCP" {
-            if type == "LoadBalancer" { out.append(p.port) }
-            if let n = p.nodePort, type == "NodePort" || type == "LoadBalancer" { out.append(n) }
+        for p in ports {
+            let proto = p.protocol ?? ""
+            guard proto.isEmpty || proto.caseInsensitiveCompare("TCP") == .orderedSame else { continue }
+            if type == "LoadBalancer", p.port > 0 { out.append(p.port) }
+            if let n = p.nodePort, n > 0, type == "NodePort" || type == "LoadBalancer" { out.append(n) }
         }
         var seen = Set<Int>()
         return out.filter { seen.insert($0).inserted }
@@ -180,7 +188,7 @@ struct K8sService: Decodable, Equatable {
 }
 
 /// A port as a number or a named container port.
-enum IntOrString: Decodable, Equatable, CustomStringConvertible {
+enum IntOrString: Decodable, Hashable, CustomStringConvertible {
     case int(Int), string(String)
 
     init(from decoder: Decoder) throws {
@@ -226,8 +234,7 @@ struct K8sClient: Sendable {
 
     /// The API's `Status.message`, or the status code.
     static func failure(_ code: Int, _ body: Data) -> SocketError {
-        let msg = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["message"] as? String
-        return SocketError.protocolError(msg ?? "Kubernetes answered HTTP \(code)")
+        DockerClient.failure(code, body, service: "Kubernetes")
     }
 
     func get<T: Decodable>(_ path: String, as: T.Type = T.self) throws -> T {
@@ -260,7 +267,11 @@ struct K8sClient: Sendable {
     }
 
     /// Names are DNS labels, but encode anyway: they come from the cluster.
+    private static let unreserved = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+
     static func segment(_ s: String) -> String {
-        s.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? s
+        s.addingPercentEncoding(withAllowedCharacters: unreserved) ?? s
     }
 }

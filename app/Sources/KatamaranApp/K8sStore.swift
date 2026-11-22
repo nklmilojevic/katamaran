@@ -13,14 +13,16 @@ final class K8sStore {
     private(set) var pods: [K8sPod] = []
     private(set) var services: [K8sService] = []
     private(set) var loaded: Set<Kind> = []
-    private(set) var loadError: String?
+    private(set) var loadErrors: [Kind: String] = [:]
     /// The cluster as the daemon reports it, for the panes' empty states.
     private(set) var status: K8sStatus?
+
+    func loadError(for kind: Kind) -> String? { loadErrors[kind] }
 
     /// Kinds a visible view shows.
     var interest: Set<Kind> = [] {
         didSet {
-            if !interest.subtracting(oldValue).isEmpty { refresh() }
+            if !interest.subtracting(oldValue).isEmpty { refresh(force: true) }
             schedule()
         }
     }
@@ -37,13 +39,19 @@ final class K8sStore {
     var onError: (String, String) -> Void = { _, _ in }
 
     private var observers: [(K8sStore) -> Void] = []
+    private var tickObservers: [() -> Void] = []
     private var timer: Timer?
     private var fetching = false
+    private var refreshPending = false
 
     var client: K8sClient? { socket.map(K8sClient.init) }
 
     func observe(_ f: @escaping (K8sStore) -> Void) { observers.append(f) }
+    /// Fired on each periodic poll tick so time-derived displays (pod ages) can
+    /// repaint even when Kubernetes objects are unchanged.
+    func observeTick(_ f: @escaping () -> Void) { tickObservers.append(f) }
     private func changed() { observers.forEach { $0(self) } }
+    private func tick() { tickObservers.forEach { $0() } }
 
     /// Follow the daemon: connect while the cluster runs, forget it otherwise.
     func follow(_ daemon: DaemonStatus?) {
@@ -59,18 +67,29 @@ final class K8sStore {
         socket = sock
         pods = []; services = []
         loaded = []
-        loadError = nil
+        loadErrors = [:]
         fetching = false
+        refreshPending = false
         refresh()
         schedule()
         changed()
+    }
+
+    /// Clear a failed initial load for `kind` and retry immediately.
+    func retry(_ kind: Kind) {
+        loadErrors[kind] = nil
+        changed()
+        refresh(force: true)
     }
 
     private func schedule() {
         let want = socket != nil && !interest.isEmpty
         if want, timer == nil {
             let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refresh() }
+                MainActor.assumeIsolated {
+                    self?.refresh()
+                    self?.tick()
+                }
             }
             RunLoop.main.add(t, forMode: .common)
             timer = t
@@ -80,29 +99,51 @@ final class K8sStore {
         }
     }
 
-    func refresh() {
-        guard let client, !interest.isEmpty, !fetching else { return }
+    func refresh(force: Bool = false) {
+        guard let client, !interest.isEmpty else { return }
+        if fetching {
+            if force { refreshPending = true }
+            return
+        }
         let kinds = interest
         let current = epoch
         fetching = true
+        refreshPending = false
         BlockingIO.run(on: BlockingIO.docker) {
             var p: [K8sPod]? = nil, s: [K8sService]? = nil
-            var problem: String? = nil
-            do {
-                if kinds.contains(.pods) { p = try client.pods() }
-                if kinds.contains(.services) { s = try client.services() }
-            } catch {
-                problem = error.localizedDescription
+            var podsErr: String? = nil, servicesErr: String? = nil
+            if kinds.contains(.pods) {
+                do { p = try client.pods() } catch { podsErr = error.localizedDescription }
             }
-            return (p, s, problem)
-        } completion: { [weak self] p, s, err in
+            if kinds.contains(.services) {
+                do { s = try client.services() } catch { servicesErr = error.localizedDescription }
+            }
+            return (p, podsErr, s, servicesErr)
+        } completion: { [weak self] p, podsErr, s, servicesErr in
             guard let self, self.epoch == current else { return }
             self.fetching = false
-            var dirty = self.loadError != err
-            self.loadError = err
-            if let p { dirty = dirty || p != self.pods || !self.loaded.contains(.pods); self.pods = p; self.loaded.insert(.pods) }
-            if let s { dirty = dirty || s != self.services || !self.loaded.contains(.services); self.services = s; self.loaded.insert(.services) }
+            var dirty = false
+            if kinds.contains(.pods) {
+                if self.loadErrors[.pods] != podsErr { dirty = true; self.loadErrors[.pods] = podsErr }
+                if let p {
+                    if p != self.pods || !self.loaded.contains(.pods) { dirty = true }
+                    self.pods = p
+                    self.loaded.insert(.pods)
+                }
+            }
+            if kinds.contains(.services) {
+                if self.loadErrors[.services] != servicesErr { dirty = true; self.loadErrors[.services] = servicesErr }
+                if let s {
+                    if s != self.services || !self.loaded.contains(.services) { dirty = true }
+                    self.services = s
+                    self.loaded.insert(.services)
+                }
+            }
             if dirty { self.changed() }
+            if self.refreshPending {
+                self.refreshPending = false
+                self.refresh()
+            }
         }
     }
 
@@ -130,7 +171,7 @@ final class K8sStore {
         } completion: { [weak self] err in
             guard let self, self.epoch == current else { return }
             if let err { self.onError(what, err) }
-            self.refresh()
+            self.refresh(force: true)
         }
     }
 }

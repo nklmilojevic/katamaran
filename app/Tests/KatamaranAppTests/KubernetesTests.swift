@@ -180,10 +180,14 @@ private func status(_ state: String, enabled: Bool = true, error: String? = nil)
     // Running and fetched: the list shows.
     #expect(K8sGrouping.blocked(phase: .running, busy: false, k8s: status("running"),
                                 connected: true, loaded: true, loadError: nil) == nil)
-    // Running but the proxy isn't answering yet.
+    // Running but the first fetch failed: recoverable error with Try Again.
+    let failedConnect = K8sGrouping.blocked(phase: .running, busy: false, k8s: status("running"),
+                                            connected: true, loaded: false, loadError: "connection refused")
+    #expect(failedConnect?.busy == false && failedConnect?.action == "Try Again" && failedConnect?.message == "connection refused")
+    // Running and first fetch still in flight: connecting spinner.
     let connecting = K8sGrouping.blocked(phase: .running, busy: false, k8s: status("running"),
-                                         connected: true, loaded: false, loadError: "connection refused")
-    #expect(connecting?.busy == true && connecting?.message == "connection refused")
+                                         connected: true, loaded: false, loadError: nil)
+    #expect(connecting?.busy == true && connecting?.action == nil)
     // A later failed poll keeps the last list rather than blanking it.
     #expect(K8sGrouping.blocked(phase: .running, busy: false, k8s: status("running"),
                                 connected: true, loaded: true, loadError: "timeout") == nil)
@@ -215,4 +219,255 @@ private func status(_ state: String, enabled: Bool = true, error: String? = nil)
     let body = Data(#"{"kind":"Status","status":"Failure","message":"pods \"x\" not found","code":404}"#.utf8)
     if case .protocolError(let m) = K8sClient.failure(404, body) { #expect(m == "pods \"x\" not found") } else { Issue.record("wrong error") }
     if case .protocolError(let m) = K8sClient.failure(502, Data()) { #expect(m == "Kubernetes answered HTTP 502") } else { Issue.record("wrong error") }
+}
+
+@Test func podEdgeCasesHandleNilExitCodeFailureReasonsAndControllerOwner() throws {
+    var pod = try decodePods()[0]
+    pod.metadata.ownerReferences = [
+        .init(kind: "CustomOwner", name: "first", controller: false),
+        .init(kind: "StatefulSet", name: "web", controller: true),
+    ]
+    #expect(pod.owner?.kind == "StatefulSet")
+
+    // Terminated with omitted exitCode (0) is not an error.
+    pod.status = K8sPod.Status(phase: "Succeeded", containerStatuses: [
+        K8sPod.ContainerStatus(name: "nginx", ready: false, restartCount: 0,
+                               state: K8sPod.State(terminated: .init(reason: "Completed", exitCode: nil))),
+    ])
+    #expect(pod.displayStatus == "Succeeded")
+    #expect(pod.health == .stopped)
+
+    // CreateContainerConfigError and InvalidImageName mark health failed.
+    pod.status = K8sPod.Status(phase: "Pending", containerStatuses: [
+        K8sPod.ContainerStatus(name: "nginx", ready: false, restartCount: 0,
+                               state: K8sPod.State(waiting: .init(reason: "CreateContainerConfigError"))),
+    ])
+    #expect(pod.displayStatus == "CreateContainerConfigError")
+    #expect(pod.health == .failed)
+
+    pod.status = K8sPod.Status(phase: "Running", containerStatuses: [
+        K8sPod.ContainerStatus(name: "nginx", ready: false, restartCount: 0,
+                               state: K8sPod.State(waiting: .init(reason: "InvalidImageName"))),
+    ])
+    #expect(pod.health == .failed)
+}
+
+@Test func servicesIgnoreZeroPortsAndMatchTCPCaseInsensitively() {
+    let svc = K8sService(
+        metadata: K8sMeta(name: "lb", namespace: "default"),
+        spec: .init(type: "LoadBalancer", ports: [
+            .init(port: 80, nodePort: 0, protocol: "tcp"),
+            .init(port: 0, nodePort: 30080, protocol: ""),
+        ])
+    )
+    #expect(svc.portsLabel == "80/tcp, 0:30080/TCP")
+    #expect(svc.localPorts == [80, 30080])
+}
+
+@Test func blockedFailedStateDoesNotSpinWithoutErrorOrEnabled() {
+    let noErr = K8sGrouping.blocked(phase: .running, busy: false, k8s: status("failed", enabled: true, error: nil),
+                                    connected: false, loaded: false, loadError: nil)
+    #expect(noErr?.action == "Try Again" && noErr?.busy == false)
+
+    let disabledFailed = K8sGrouping.blocked(phase: .running, busy: false, k8s: status("failed", enabled: false, error: "boom"),
+                                             connected: false, loaded: false, loadError: nil)
+    #expect(disabledFailed?.action == "Try Again" && disabledFailed?.message == "boom")
+}
+
+@Test func segmentEncodesNonASCII() {
+    #expect(K8sClient.segment("café") == "caf%C3%A9")
+}
+
+@Test @MainActor func k8sLogStreamHandlesContentLengthKeepAliveAndServiceName() async throws {
+    func serveKeepAlive(_ response: String) throws -> (String, DispatchSemaphore) {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kat-k8s-\(UUID().uuidString.prefix(8)).sock").path
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+            for (i, b) in path.utf8.enumerated() { buf[i] = b }
+        }
+        _ = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        listen(fd, 1)
+        let release = DispatchSemaphore(value: 0)
+        Thread {
+            let c = accept(fd, nil, nil)
+            var buf = [UInt8](repeating: 0, count: 4096)
+            _ = read(c, &buf, buf.count)
+            _ = response.withCString { write(c, $0, strlen($0)) }
+            _ = release.wait(timeout: .now() + 5)
+            close(c)
+            close(fd)
+            unlink(path)
+        }.start()
+        return (path, release)
+    }
+
+    // Completed pod logs returned with Content-Length on a keep-alive socket finish promptly.
+    let body = "line1\nline2"
+    let (p1, rel1) = try serveKeepAlive("HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)")
+    defer { rel1.signal() }
+    let t0 = Date()
+    let s1 = DockerStream(socketPath: p1, path: "/log", host: K8sClient.host, service: "Kubernetes")
+    var collected = Data()
+    let err1: Error? = await withCheckedContinuation { cont in
+        s1.onData = { collected.append($0) }
+        s1.onEnd = { cont.resume(returning: $0) }
+        s1.start()
+    }
+    #expect(err1 == nil)
+    #expect(String(decoding: collected, as: UTF8.self) == body)
+    #expect(Date().timeIntervalSince(t0) < 1.5)
+
+    // Non-JSON error from Kubernetes stream attributes the error to Kubernetes, not Docker.
+    let (p2, rel2) = try serveKeepAlive("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+    defer { rel2.signal() }
+    let s2 = DockerStream(socketPath: p2, path: "/log", host: K8sClient.host, service: "Kubernetes")
+    let msg2: String? = await withCheckedContinuation { cont in
+        s2.onEnd = { cont.resume(returning: $0?.localizedDescription) }
+        s2.start()
+    }
+    #expect(msg2 == "Kubernetes answered HTTP 502")
+}
+
+private func runningDaemonStatus(proxySocket: String) -> DaemonStatus {
+    DaemonStatus(
+        state: "running",
+        error: nil,
+        since_ms: 0,
+        uptime_s: 10,
+        daemon: DaemonInfo(pid: 1, home: "/tmp", launchd_label: nil),
+        versions: Versions(katamaran: "0.5.0", protocol: 1, kernel: nil),
+        config: Config(cpus: 2, memory_mib: 2048, mount: false, mount_path: nil, launch_at_login: false, kubernetes: true),
+        vm: nil,
+        usage: nil,
+        docker: DockerInfo(state: "ready", socket: "/tmp/docker.sock"),
+        k8s: K8sStatus(enabled: true, state: "running", installed: true, proxySocket: proxySocket),
+        mount: MountInfo(enabled: false, path: nil, mounted: false, error: nil),
+        ports: []
+    )
+}
+
+@Test @MainActor func storeFetchesServicesIndependentlyWhenPodsFail() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("kat-k8s-indep-\(UUID().uuidString.prefix(8)).sock").path
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+        for (i, b) in path.utf8.enumerated() { buf[i] = b }
+    }
+    _ = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    listen(fd, 8)
+
+    let stop = DispatchSemaphore(value: 0)
+    Thread {
+        for _ in 0..<2 {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = read(c, &buf, buf.count)
+            let req = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+            let resp: String
+            if req.contains("GET /api/v1/pods ") {
+                let err = #"{"message":"pods unavailable"}"#
+                resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: \(err.utf8.count)\r\nConnection: close\r\n\r\n\(err)"
+            } else {
+                resp = "HTTP/1.1 200 OK\r\nContent-Length: \(servicesJSON.utf8.count)\r\nConnection: close\r\n\r\n\(servicesJSON)"
+            }
+            _ = resp.withCString { write(c, $0, strlen($0)) }
+            close(c)
+        }
+        _ = stop.wait(timeout: .now() + 2)
+        close(fd)
+        unlink(path)
+    }.start()
+    defer { stop.signal() }
+
+    let store = K8sStore()
+    store.follow(runningDaemonStatus(proxySocket: path))
+    let loaded: Bool = await withCheckedContinuation { cont in
+        var done = false
+        store.observe { s in
+            if !done && s.loaded.contains(.services) {
+                done = true
+                cont.resume(returning: true)
+            }
+        }
+        store.interest = [.pods, .services]
+    }
+    #expect(loaded)
+    #expect(store.services.count == 3)
+    #expect(store.loadError(for: .services) == nil)
+    #expect(store.loadError(for: .pods) == "pods unavailable")
+    #expect(!store.loaded.contains(.pods))
+    store.interest = []
+}
+
+@Test @MainActor func podLogsReconnectsWhenPodUIDOrRestartCountChanges() throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("kat-k8s-uid-\(UUID().uuidString.prefix(8)).sock").path
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+        for (i, b) in path.utf8.enumerated() { buf[i] = b }
+    }
+    _ = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    listen(fd, 8)
+
+    let accepted = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    Thread {
+        var conns: [Int32] = []
+        for _ in 0..<3 {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            _ = read(c, &buf, buf.count)
+            // Keep the chunked stream open so we verify cancellation & reconnect while active.
+            let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhi\n\r\n"
+            _ = resp.withCString { write(c, $0, strlen($0)) }
+            conns.append(c)
+            accepted.signal()
+        }
+        _ = release.wait(timeout: .now() + 5)
+        for c in conns { close(c) }
+        close(fd)
+        unlink(path)
+    }.start()
+    defer { release.signal() }
+
+    let store = K8sStore()
+    store.follow(runningDaemonStatus(proxySocket: path))
+    let logs = PodLogsView(store: store)
+    var pod = try decodePods()[0]
+    logs.setActive(true)
+    logs.show(pod)
+    #expect(accepted.wait(timeout: .now() + 2) == .success)
+
+    // Same namespace/name, 0 restarts, new UID (replaced pod) -> reconnects while old stream is open.
+    pod.metadata.uid = "u1-replacement"
+    logs.show(pod)
+    #expect(accepted.wait(timeout: .now() + 2) == .success)
+
+    // Same UID, container restarted -> reconnects while old stream is open.
+    pod.status?.containerStatuses?[0].restartCount = 1
+    logs.show(pod)
+    #expect(accepted.wait(timeout: .now() + 2) == .success)
+
+    logs.setActive(false)
 }

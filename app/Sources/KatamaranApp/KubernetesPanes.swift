@@ -74,6 +74,7 @@ class KubernetesPane: SectionPane, ResourceSource {
     func row(_ key: String) -> ResourceRow? { rows().first { $0.key == key } }
     func headerSubtitle(_ key: String) -> String { "" }
     func details(_ key: String) -> [NSView] { [] }
+    func detailVersion(_ key: String) -> AnyHashable? { nil }
     func reveal(_ key: String) -> URL? { nil }
     var revealTitle: String { "Open" }
     var revealSymbol: String { "safari" }
@@ -102,13 +103,19 @@ class KubernetesPane: SectionPane, ResourceSource {
 
     var blockedState: BlockedState? {
         K8sGrouping.blocked(phase: model.phase, busy: model.busy, k8s: store.status,
-                            connected: store.socket != nil, loaded: isLoaded, loadError: store.loadError)
+                            connected: store.socket != nil, loaded: isLoaded, loadError: store.loadError(for: kind))
     }
 
     func blockedAction() {
         switch model.phase {
         case .running:
-            if store.status?.enabled == true { model.k8sStart() } else { model.saveConfig(["kubernetes": true]) }
+            if store.status?.state == "running", store.socket != nil {
+                store.retry(kind)
+            } else if store.status?.enabled == true || store.status?.state == "failed" {
+                model.k8sStart()
+            } else {
+                model.saveConfig(["kubernetes": true])
+            }
         case .error: model.restart()
         default: model.start()
         }
@@ -154,13 +161,18 @@ enum K8sGrouping {
         case "stopping":
             return BlockedState(symbol: "helm", title: "Stopping Kubernetes…", busy: true)
         case "running":
-            if !connected || (!loaded && loadError == nil) {
+            if !loaded, let loadError {
+                return BlockedState(symbol: "exclamationmark.triangle", title: "Couldn’t connect to Kubernetes",
+                                    message: loadError, action: "Try Again", busy: busy)
+            }
+            if !connected || !loaded {
                 return BlockedState(symbol: "helm", title: "Connecting to Kubernetes…", busy: true)
             }
-            if !loaded, let loadError {
-                return BlockedState(symbol: "helm", title: "Connecting to Kubernetes…", message: loadError, busy: true)
-            }
             return nil
+        case "failed":
+            let err = k8s.error.flatMap { $0.isEmpty ? nil : $0 }
+            return BlockedState(symbol: "exclamationmark.triangle", title: "Kubernetes ran into a problem",
+                                message: err, action: "Try Again", busy: busy)
         default:
             if let err = k8s.error, !err.isEmpty, k8s.enabled {
                 return BlockedState(symbol: "exclamationmark.triangle", title: "Kubernetes ran into a problem",
@@ -196,10 +208,24 @@ enum K8sGrouping {
 final class PodsPane: KubernetesPane {
     private lazy var logs = PodLogsView(store: store)
     private var tab = 0
+    private var isActive = false
 
     init(store: K8sStore, model: AppModel) {
         super.init(store: store, model: model, kind: .pods)
         detailVC.onSelect = { [weak self] _ in self?.showTab() }
+        store.observeTick { [weak self] in self?.refreshAges() }
+    }
+
+    /// Re-render visible pod rows on timer ticks so `compactAge` advances even
+    /// when the API response is unchanged. `ResourceListViewController.reload()`
+    /// diffs rows and skips work when no displayed age unit changed.
+    func refreshAges() {
+        guard isActive, !store.pods.isEmpty else { return }
+        listVC.reload()
+    }
+
+    private var selectedPod: K8sPod? {
+        detailVC.key.flatMap(store.pod).flatMap { store.visible($0.namespace) ? $0 : nil }
     }
 
     override var noun: String { "pod" }
@@ -208,8 +234,12 @@ final class PodsPane: KubernetesPane {
 
     override func reloadAll() {
         super.reloadAll()
-        logs.show(detailVC.key.flatMap(store.pod))
+        let p = selectedPod
+        logs.setActive(isActive && tab == 1 && p != nil)
+        logs.show(p)
     }
+
+    override func detailVersion(_ key: String) -> AnyHashable? { store.pod(key) }
 
     override func rows() -> [ResourceRow] {
         store.pods.filter { store.visible($0.namespace) }.map { p in
@@ -235,8 +265,8 @@ final class PodsPane: KubernetesPane {
         if let created = p.metadata.created { rows.append(InfoRow("Created", "\(absolute(created)) (\(relative(created)))")) }
         rows.append(InfoRow("Namespace", p.namespace))
         if let o = p.owner { rows.append(InfoRow("Controlled By", "\(o.kind) \(o.name)")) }
-        if let n = p.spec?.nodeName { rows.append(InfoRow("Node", n)) }
-        if let ip = p.status?.podIP { rows.append(InfoRow("Pod IP", ip, mono: true)) }
+        if let n = p.spec?.nodeName, !n.isEmpty { rows.append(InfoRow("Node", n)) }
+        if let ip = p.status?.podIP, !ip.isEmpty { rows.append(InfoRow("Pod IP", ip, mono: true)) }
         if let m = p.status?.message, !m.isEmpty { rows.append(InfoRow("Message", m)) }
         var groups: [NSView] = [FormGroup(header: "Pod", rows: rows)]
         let statuses = Dictionary(p.statuses.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
@@ -268,23 +298,25 @@ final class PodsPane: KubernetesPane {
 
     // Tabs: Info and Logs.
     override var tabs: [String] { ["Info", "Logs"] }
-    override var enabledTabs: Set<Int> { detailVC.key == nil ? [] : [0, 1] }
+    override var enabledTabs: Set<Int> { selectedPod == nil ? [] : [0, 1] }
     override var selectedTab: Int {
         get { tab }
         set { tab = newValue; showTab() }
     }
 
     private func showTab() {
-        let showLogs = tab == 1 && detailVC.key != nil
+        let p = selectedPod
+        let showLogs = tab == 1 && p != nil
         detailVC.setBody(showLogs ? logs : nil)
-        logs.setActive(showLogs)
-        logs.show(detailVC.key.flatMap(store.pod))
+        logs.setActive(isActive && showLogs)
+        logs.show(p)
         onChange()
     }
 
     override func setActive(_ active: Bool) {
+        isActive = active
         super.setActive(active)
-        logs.setActive(active && tab == 1 && detailVC.key != nil)
+        logs.setActive(active && tab == 1 && selectedPod != nil)
     }
 }
 
@@ -346,8 +378,23 @@ final class PodLogsView: NSView, NSSearchFieldDelegate {
             if let keep, names.contains(keep) { picker.selectItem(withTitle: keep) }
         }
         picker.isHidden = names.count < 2
-        // A restarted container logs again: follow the new one.
-        if let p, let old = pod, old.key == p.key, p.restarts != old.restarts, stream == nil { streaming = nil }
+        // Restart following when the pod is replaced (UID changes) or its
+        // selected container restarts, cancelling any previous stream via
+        // update(). Also retry a finished/failed stream when the container's
+        // state transitions (e.g. ContainerCreating -> Running).
+        if let p, let old = pod, old.key == p.key {
+            let selected = picker.titleOfSelectedItem
+            let oldStatus = old.statuses.first { $0.name == selected }
+            let newStatus = p.statuses.first { $0.name == selected }
+            let restarted = selected != nil
+                ? (newStatus?.restartCount ?? 0) != (oldStatus?.restartCount ?? 0)
+                : p.restarts != old.restarts
+            let stateChanged = stream == nil
+                && (p.displayStatus != old.displayStatus || newStatus?.state != oldStatus?.state)
+            if p.metadata.uid != old.metadata.uid || restarted || stateChanged {
+                streaming = nil
+            }
+        }
         pod = p
         update()
     }
@@ -359,16 +406,21 @@ final class PodLogsView: NSView, NSSearchFieldDelegate {
 
     private func update() {
         let container = picker.titleOfSelectedItem
-        let want = active ? pod.map { "\($0.key)|\(container ?? "")" } : nil
+        let socket = store.socket
+        let want: String? = if active, let pod, let socket {
+            "\(socket)|\(pod.key)|\(pod.metadata.uid ?? "")|\(container ?? "")"
+        } else {
+            nil
+        }
         guard want != streaming else { return }
         stream?.cancel()
         stream = nil
         streaming = want
         text.clear()
-        guard want != nil, let pod, let socket = store.socket else { return }
+        guard want != nil, let pod, let socket else { return }
         lines = LineSplitter()
         let path = K8sClient.logPath(namespace: pod.namespace, pod: pod.name, container: container)
-        let s = DockerStream(socketPath: socket, path: path, host: K8sClient.host)
+        let s = DockerStream(socketPath: socket, path: path, host: K8sClient.host, service: "Kubernetes")
         s.onData = { [weak self] d in self?.received(d) }
         s.onEnd = { [weak self, weak s] err in
             guard let self, self.stream === s else { return }
@@ -428,10 +480,20 @@ final class ServicesPane: KubernetesPane {
         store.service(key)?.localPorts.first.flatMap { URL(string: "http://localhost:\($0)") }
     }
 
+    private struct ServiceDetailState: Hashable {
+        var service: K8sService
+        var pods: [String]
+    }
+
+    override func detailVersion(_ key: String) -> AnyHashable? {
+        guard let s = store.service(key) else { return nil }
+        return ServiceDetailState(service: s, pods: store.pods(for: s).map(\.name).sorted())
+    }
+
     override func details(_ key: String) -> [NSView] {
         guard let s = store.service(key) else { return [] }
         var rows: [NSView] = [InfoRow("Type", s.type)]
-        if let ip = s.spec?.clusterIP { rows.append(InfoRow("Cluster IP", ip, mono: true)) }
+        if let ip = s.spec?.clusterIP, !ip.isEmpty { rows.append(InfoRow("Cluster IP", ip, mono: true)) }
         if let created = s.metadata.created { rows.append(InfoRow("Created", "\(absolute(created)) (\(relative(created)))")) }
         rows.append(InfoRow("Namespace", s.namespace))
         rows.append(InfoRow("In the Cluster", "\(s.name).\(s.namespace).svc.cluster.local", mono: true))
