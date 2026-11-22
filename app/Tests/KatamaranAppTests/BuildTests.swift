@@ -281,6 +281,19 @@ private func parse(_ log: String) -> BuildProgressParser {
         #expect(cli.process(["history", "inspect", "abc"]).arguments == ["buildx", "history", "inspect", "--builder", "default", "abc"])
     }
 
+    @Test func buildxAcceptsBuilderFlagOnHistoryLogsAndInspectWhenInstalled() throws {
+        guard let docker = BuildxCLI.find() else { return }
+        let cli = BuildxCLI(docker: docker, socket: "/nonexistent")
+        // Only run when the local Docker CLI includes the buildx plugin with `history`.
+        guard let help = try? cli.run(["history", "--help"], timeout: 10),
+              String(decoding: help, as: UTF8.self).contains("logs") else { return }
+        for sub in ["logs", "inspect"] {
+            let out = try cli.run(["history", sub, "--help"], timeout: 10)
+            let text = String(decoding: out, as: UTF8.self)
+            #expect(text.contains("--builder"), "docker buildx history \(sub) --builder default --help should document --builder")
+        }
+    }
+
     @Test func nextInfoToFetchSkipsFailedInFlightAndFetchedBuilds() throws {
         let now = Date()
         let records = [
