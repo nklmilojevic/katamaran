@@ -1001,6 +1001,12 @@ impl Daemon {
             installed: k.installed,
             version: k.version.clone(),
             api_port: k.api_proxy.as_ref().map(|p| p.port),
+            proxy_socket: k
+                .api_proxy
+                .as_ref()
+                .filter(|_| k.state == "running")
+                .and_then(|p| p.rest_socket())
+                .map(Path::to_path_buf),
             context: crate::k8s::context_name().unwrap_or_default(),
             kubeconfig: k.kubeconfig.clone(),
             dns_domain: crate::k8s::DNS_DOMAIN.into(),
@@ -1129,7 +1135,7 @@ impl Daemon {
                 other => anyhow::bail!("unexpected k8s start reply {other:?}"),
             };
             guest_started = true;
-            let proxy = crate::k8s::ApiProxy::start(crate::k8s::api_socket_path(&self.home))
+            let proxy = crate::k8s::ApiProxy::start(&self.home)
                 .context("start Kubernetes API proxy")?;
             let dns = crate::k8s::DnsServer::start()
                 .context("start Kubernetes DNS responder")?;

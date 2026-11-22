@@ -2,7 +2,7 @@ import AppKit
 
 /// The sidebar's sections, in order.
 enum MainSection: String, CaseIterable {
-    case containers, volumes, images, builds, networks, machines, activity, logs
+    case containers, volumes, images, builds, networks, pods, services, machines, activity, logs
 
     var title: String {
         switch self {
@@ -11,6 +11,8 @@ enum MainSection: String, CaseIterable {
         case .images: "Images"
         case .builds: "Builds"
         case .networks: "Networks"
+        case .pods: "Pods"
+        case .services: "Services"
         case .machines: "Machines"
         case .activity: "Activity"
         case .logs: "Logs"
@@ -24,6 +26,8 @@ enum MainSection: String, CaseIterable {
         case .images: "square.stack.3d.up"
         case .builds: "hammer"
         case .networks: "point.3.connected.trianglepath.dotted"
+        case .pods: "cube"
+        case .services: "network"
         case .machines: "server.rack"
         case .activity: "chart.xyaxis.line"
         case .logs: "text.alignleft"
@@ -33,6 +37,7 @@ enum MainSection: String, CaseIterable {
     var group: String {
         switch self {
         case .containers, .volumes, .images, .builds, .networks: "Docker"
+        case .pods, .services: "Kubernetes"
         case .machines: "Linux"
         case .activity, .logs: "General"
         }
@@ -59,9 +64,17 @@ protocol SectionPane: AnyObject {
     func setActive(_ active: Bool)
     /// The section tells the window its subtitle or tabs changed.
     var onChange: () -> Void { get set }
+    /// Shown instead of the list while the section can't work (Kubernetes off).
+    var blockedState: BlockedState? { get }
+    func blockedAction()
+    /// Extra items for the toolbar's More menu.
+    var menuItems: [NSMenuItem] { get }
 }
 
 extension SectionPane {
+    var blockedState: BlockedState? { nil }
+    func blockedAction() {}
+    var menuItems: [NSMenuItem] { [] }
     var tabs: [String] { [] }
     var enabledTabs: Set<Int> { [] }
     var selectedTab: Int { get { 0 } set {} }
@@ -85,6 +98,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     private var panes: [MainSection: SectionPane] = [:]
     private(set) var section: MainSection = .containers
     private let dockerState = EmptyStateView()
+    private let sectionState = EmptyStateView()
     private let noSelection: EmptyStateView = {
         let v = EmptyStateView()
         v.show(symbol: nil, title: "No Selection")
@@ -153,6 +167,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             .images: ImagesPane(store: store),
             .builds: BuildsPane(store: store, builds: .shared),
             .networks: NetworksPane(store: store),
+            .pods: PodsPane(store: .shared, model: model),
+            .services: ServicesPane(store: .shared, model: model),
             .machines: MachinesPane(model: model),
             .activity: ActivityPane(store: store, model: model),
             .logs: LogsPane(model: model),
@@ -295,9 +311,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     private func refreshChrome() {
         guard let pane = panes[section], let window else { return }
         let dockerUp = store.socket != nil
-        let blocked = pane.needsDocker && !dockerUp
+        let sectionBlock = pane.blockedState
+        let blocked = (pane.needsDocker && !dockerUp) || sectionBlock != nil
 
-        if blocked {
+        if let b = sectionBlock {
+            sectionState.show(symbol: b.symbol, title: b.title, message: b.message, action: b.action, busy: b.busy)
+            sectionState.onAction = { [weak pane] in pane?.blockedAction() }
+            listHost.embed(nil, overlay: sectionState)
+        } else if blocked {
             showDockerState()
             listHost.embed(nil, overlay: dockerState)
         } else {
@@ -315,7 +336,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         applyListWidth()
 
         window.title = section.title
-        window.subtitle = blocked ? model.phase.label : pane.subtitle
+        window.subtitle = sectionBlock != nil ? "" : blocked ? model.phase.label : pane.subtitle
 
         let tabs = blocked ? [] : pane.tabs
         if tabControl.segmentCount != tabs.count || (0..<tabs.count).contains(where: { (tabControl.toolTip(forSegment: $0) ?? tabControl.label(forSegment: $0)) != tabs[$0] }) {
@@ -336,7 +357,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         if !tabs.isEmpty { tabControl.selectedSegment = pane.selectedTab }
         tabItem?.isHidden = tabs.isEmpty
         searchItem?.isHidden = blocked || section == .activity || section == .logs
-        pruneItem?.isHidden = blocked || pane.pruneTitle == nil
+        pruneItem?.isHidden = blocked || (pane.pruneTitle == nil && pane.menuItems.isEmpty)
         pruneItem?.toolTip = "More"
     }
 
@@ -426,6 +447,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        for item in panes[section]?.menuItems ?? [] { menu.addItem(item) }
         guard let title = panes[section]?.pruneTitle else { return }
         let i = NSMenuItem(title: title, action: #selector(prune), keyEquivalent: "")
         i.target = self

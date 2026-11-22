@@ -21,6 +21,10 @@ use crate::{Cursor, HEADER, MAX_FRAME, ProtoError, put_str, put_u32, read_len};
 /// Payload bytes per `Data` frame.
 pub const CHUNK: usize = 64 << 10;
 
+/// Guest loopback port of `kubectl proxy`: the API server, authenticated,
+/// over plain HTTP. The host reaches it only through `K8sMsg::Connect`.
+pub const PROXY_PORT: u16 = 6445;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K8sMsg {
     Status,

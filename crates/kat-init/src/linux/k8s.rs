@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
+use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg, PROXY_PORT};
 use kat_proto::{K8S_PORT, Msg};
 
 use super::machines::cmd::{pipe, run_status as run_reaped};
@@ -50,7 +50,7 @@ const MAX_K8S_CONNS: usize = 256;
 /// Internal k3s/Kubernetes control-plane ports that must not be auto-forwarded
 /// to the Mac's `127.0.0.1` by `ports::watch` (`6443` has its own dedicated
 /// vsock relay on `K8S_API_PORT`).
-const INTERNAL_PORTS: [u16; 6] = [6443, 6444, 10250, 10256, 10257, 10259];
+const INTERNAL_PORTS: [u16; 7] = [6443, 6444, PROXY_PORT, 10250, 10256, 10257, 10259];
 
 static SERVICE: OnceLock<Arc<K8s>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -961,6 +961,7 @@ impl K8s {
 
         // Start background Docker -> k8s.io image mirror and Service port watcher.
         spawn_image_sync(self.reaper.clone(), sync_stop.clone());
+        spawn_api_proxy(self.reaper.clone(), sync_stop.clone());
         spawn_service_port_watcher(Arc::clone(self), my_gen, sync_stop);
         log("k3s is ready");
         Ok(self.info())
@@ -1598,6 +1599,64 @@ fn read_kubeconfig() -> Result<String, String> {
 /// Periodically read NodePort and LoadBalancer ports from Kubernetes services
 /// so `ports::watch` forwards them on `127.0.0.1:<port>` on macOS (kube-proxy
 /// in nftables mode and ServiceLB use DNAT rules rather than listening sockets).
+/// Keeps `kubectl proxy` running on `127.0.0.1:PROXY_PORT` until `stop`,
+/// restarting it if it exits, and stops it when `stop` is set.
+fn spawn_api_proxy(reaper: Reaper, stop: Arc<AtomicBool>) {
+    let _ = thread::Builder::new()
+        .name("k8s-proxy".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let mut cmd = Command::new(BIN);
+                cmd.args([
+                    "kubectl",
+                    "--kubeconfig",
+                    KUBECONFIG,
+                    "proxy",
+                    "--address=127.0.0.1",
+                    &format!("--port={PROXY_PORT}"),
+                ])
+                .env("PATH", PATH)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+                let (pid, status_rx) = match reaper.spawn(&mut cmd) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log(&format!("spawn kubectl proxy: {e}"));
+                        sleep_unless(&stop, Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                        if status_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                            let _ = status_rx.recv_timeout(Duration::from_secs(1));
+                        }
+                        return;
+                    }
+                    match status_rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(status) => {
+                            log(&format!("kubectl proxy {}", describe_status(status)));
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                sleep_unless(&stop, Duration::from_secs(1));
+            }
+        });
+}
+
+fn sleep_unless(stop: &AtomicBool, d: Duration) {
+    let end = Instant::now() + d;
+    while !stop.load(Ordering::Relaxed) && Instant::now() < end {
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn spawn_service_port_watcher(svc: Arc<K8s>, my_gen: u64, stop: Arc<AtomicBool>) {
     let _ = thread::Builder::new()
         .name("k8s-ports".into())

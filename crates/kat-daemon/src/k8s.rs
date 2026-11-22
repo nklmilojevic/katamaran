@@ -53,6 +53,7 @@ pub const K3S_ARM64_URL: &str =
 pub const SOCKET_NAME: &str = "k8s.sock";
 pub const API_SOCKET_NAME: &str = "k8s-api.sock";
 pub const KUBECONFIG_NAME: &str = "kubeconfig.yaml";
+pub const PROXY_SOCKET_NAME: &str = "k8s-proxy.sock";
 pub const DEFAULT_API_PORT: u16 = 6443;
 
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
@@ -65,6 +66,11 @@ pub fn socket_path(home: &Path) -> PathBuf {
 
 pub fn api_socket_path(home: &Path) -> PathBuf {
     home.join("run").join(API_SOCKET_NAME)
+}
+
+/// Plain-HTTP Kubernetes API (the guest's `kubectl proxy`) for the app.
+pub fn proxy_socket_path(home: &Path) -> PathBuf {
+    home.join("run").join(PROXY_SOCKET_NAME)
 }
 
 pub fn kubeconfig_path(home: &Path) -> PathBuf {
@@ -219,16 +225,20 @@ fn verify_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Relays `127.0.0.1:<port>` on macOS to `<home>/run/k8s-api.sock`.
+/// Relays `127.0.0.1:<port>` on macOS to `<home>/run/k8s-api.sock`, and
+/// `<home>/run/k8s-proxy.sock` to the guest's `kubectl proxy`.
 pub struct ApiProxy {
     pub port: u16,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    rest: Option<RestProxy>,
 }
 
 impl ApiProxy {
-    pub fn start(api_socket: PathBuf) -> io::Result<ApiProxy> {
+    pub fn start(home: &Path) -> io::Result<ApiProxy> {
+        let rest = RestProxy::start(home)?;
+        let api_socket = api_socket_path(home);
         let listener = TcpListener::bind(("127.0.0.1", DEFAULT_API_PORT))
             .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))?;
         let addr = listener.local_addr()?;
@@ -273,7 +283,12 @@ impl ApiProxy {
             addr,
             stop,
             thread: Some(thread),
+            rest: Some(rest),
         })
+    }
+
+    pub fn rest_socket(&self) -> Option<&Path> {
+        self.rest.as_ref().map(|r| r.path.as_path())
     }
 
     pub fn stop(&mut self) {
@@ -282,6 +297,107 @@ impl ApiProxy {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        self.rest = None;
+    }
+}
+
+/// Serves `<home>/run/k8s-proxy.sock`, each connection relayed to the
+/// guest's `kubectl proxy` on `127.0.0.1:PROXY_PORT`.
+struct RestProxy {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RestProxy {
+    fn start(home: &Path) -> io::Result<RestProxy> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let path = proxy_socket_path(home);
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let home = home.to_path_buf();
+        let active = Arc::new(AtomicUsize::new(0));
+        let thread = thread::Builder::new()
+            .name("k8s-rest".into())
+            .spawn(move || {
+                for conn in listener.incoming() {
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let client = match conn {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("katamaran: k8s rest accept: {e}");
+                            thread::sleep(Duration::from_millis(50));
+                            continue;
+                        }
+                    };
+                    let Some(guard) = ConnGuard::try_acquire(&active, MAX_CONNS) else {
+                        eprintln!("katamaran: k8s rest: connection limit ({MAX_CONNS}) reached");
+                        continue;
+                    };
+                    let home = home.clone();
+                    if let Err(e) =
+                        thread::Builder::new()
+                            .name("k8s-rest-conn".into())
+                            .spawn(move || {
+                                let _guard = guard;
+                                if let Err(e) =
+                                    relay_k8s_connect(&home, client, "127.0.0.1", k8s::PROXY_PORT)
+                                {
+                                    eprintln!("katamaran: k8s rest: {e:#}");
+                                }
+                            })
+                    {
+                        eprintln!("katamaran: k8s rest spawn worker: {e}");
+                    }
+                }
+            })?;
+        Ok(RestProxy {
+            path,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for RestProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&self.path);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A byte stream the k8s relays can split into a reader and a writer.
+pub trait Duplex: Read + Write + Send + Sized + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+impl Duplex for TcpStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+
+impl Duplex for UnixStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        UnixStream::shutdown(self, how)
     }
 }
 
@@ -340,6 +456,7 @@ pub fn forward_guest_tcp(
             .name("k8s-fwd-conn".into())
             .spawn(move || {
                 let _guard = guard;
+                let _ = client.set_nodelay(true);
                 if let Err(e) = relay_k8s_connect(&home, client, &addr, guest_port) {
                     eprintln!("katamaran: k8s forward {addr}:{guest_port}: {e}");
                 }
@@ -351,13 +468,12 @@ pub fn forward_guest_tcp(
     Ok(())
 }
 
-pub fn relay_k8s_connect(
+pub fn relay_k8s_connect<S: Duplex>(
     home: &Path,
-    client: TcpStream,
+    client: S,
     addr: &str,
     port: u16,
 ) -> anyhow::Result<()> {
-    let _ = client.set_nodelay(true);
     let mut sock = connect(home)?;
     k8s::write(
         &mut sock,
@@ -1115,6 +1231,57 @@ users:
         }
         srv.stop();
         drop(holder);
+    }
+
+    #[test]
+    fn rest_proxy_relays_to_guest_kubectl_proxy() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kat-k8s-rest-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("run")).unwrap();
+        let ulistener = UnixListener::bind(socket_path(&dir)).unwrap();
+
+        // Guest mock: expect a Connect to kubectl proxy, echo one chunk back, end.
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = ulistener.accept().unwrap();
+            let req = k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(
+                req,
+                K8sMsg::Connect {
+                    addr: "127.0.0.1".into(),
+                    port: k8s::PROXY_PORT
+                }
+            );
+            k8s::write(&mut conn, &K8sMsg::Done).unwrap();
+            let Some(K8sMsg::Data(d)) = k8s::read(&mut conn).unwrap() else {
+                panic!("expected data");
+            };
+            k8s::write(&mut conn, &K8sMsg::Data(d)).unwrap();
+            k8s::write(&mut conn, &K8sMsg::DataEnd).unwrap();
+        });
+
+        let rest = RestProxy::start(&dir).unwrap();
+        let mode = fs::metadata(&rest.path).unwrap().permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600
+        );
+        let mut c = UnixStream::connect(&rest.path).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.write_all(b"GET /api HTTP/1.1\r\n\r\n").unwrap();
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"GET /api HTTP/1.1\r\n\r\n");
+        guest.join().unwrap();
+
+        let path = rest.path.clone();
+        drop(rest);
+        assert!(!path.exists(), "socket removed on drop");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

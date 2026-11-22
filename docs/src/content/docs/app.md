@@ -1,6 +1,6 @@
 ---
 title: macOS app
-description: Manage containers, images, volumes, builds, networks, Linux machines, logs, and settings from the native macOS app.
+description: Manage containers, images, volumes, builds, networks, Kubernetes pods and services, Linux machines, logs, and settings from the native macOS app.
 ---
 
 `Katamaran.app` is a native Swift and AppKit application that lives in the macOS menu bar and opens a full management window on demand. It communicates with `katamaran daemon` and the guest Docker socket directly over Unix sockets.
@@ -19,7 +19,7 @@ Closing the main window keeps the menu-bar app and the VM running.
 
 ## Main window sections
 
-The main window sidebar groups management views into three sections.
+The main window sidebar groups management views into four sections.
 
 ### Docker
 
@@ -32,6 +32,13 @@ The main window sidebar groups management views into three sections.
 ![Containers list with live logs](../../assets/screenshots/containers.png)
 
 ![Container inspection showing ports, mounts, and environment](../../assets/screenshots/containers-info.png)
+
+### Kubernetes
+
+- **Pods**: List pods grouped by namespace, with status, readiness, restarts, and age. Inspect a pod's containers, node, IP, owner, and labels, follow its logs (pick a container in multi-container pods), and delete it.
+- **Services**: List services with their type and ports. Inspect cluster IP, ports, selector, and the pods it selects, open LoadBalancer and NodePort services at `http://localhost:<port>`, and delete them.
+
+System namespaces (`kube-system`, `kube-public`, `kube-node-lease`) are hidden by default; turn on **Show System Namespaces** in the toolbar's **More** menu. While Kubernetes is off, both views offer a **Turn On** button. The app talks to the cluster through `~/.katamaran/run/k8s-proxy.sock`, an authenticated `kubectl proxy` in the VM, so it doesn't need `kubectl` on the Mac.
 
 ### Linux
 
