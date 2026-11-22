@@ -9,10 +9,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -220,6 +220,11 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("missing parent for {}", target.display()))?;
+    let target_mode = match fs::metadata(target) {
+        Ok(meta) => meta.permissions().mode() & 0o7777,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
+        Err(e) => return Err(format!("stat {}: {e}", target.display())),
+    };
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -229,9 +234,14 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = parent.join(format!(".{name}.katamaran.{pid}.{seq}.tmp"));
     let _ = fs::remove_file(&tmp);
     let write_res = (|| -> io::Result<()> {
-        let mut f = File::create(&tmp)?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        f.set_permissions(fs::Permissions::from_mode(target_mode))?;
         Ok(())
     })();
     if let Err(e) = write_res {
@@ -637,10 +647,15 @@ impl K8s {
             let svc_ref = Arc::clone(self);
             let exited2 = exited.clone();
             let sync_stop2 = sync_stop.clone();
+            let status_rx_slot = Arc::new(Mutex::new(Some(status_rx)));
+            let status_rx_watch = Arc::clone(&status_rx_slot);
             if let Err(e) = thread::Builder::new()
                 .name("k3s-watch".into())
                 .spawn(move || {
-                    if let Ok(status) = status_rx.recv() {
+                    let rx = status_rx_watch.lock().unwrap().take();
+                    if let Some(rx) = rx
+                        && let Ok(status) = rx.recv()
+                    {
                         *exited2.lock().unwrap() = Some(status);
                         sync_stop2.store(true, Ordering::SeqCst);
                         let _ = exit_tx.send(());
@@ -673,19 +688,47 @@ impl K8s {
             {
                 let err = format!("spawn k3s-watch: {e}");
                 sync_stop.store(true, Ordering::SeqCst);
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                stop_k8s_workloads(&self.reaper);
-                ACTIVE.store(false, Ordering::SeqCst);
-                FORWARDED.lock().unwrap().clear();
-                restore_bridge_netfilter();
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                let rx = status_rx_slot.lock().unwrap().take();
+                let reaped = match rx {
+                    Some(rx) => {
+                        if rx.recv_timeout(STOP_TIMEOUT).is_ok() {
+                            true
+                        } else {
+                            log(
+                                "k3s did not stop in time after k3s-watch spawn failure, killing it",
+                            );
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                            rx.recv_timeout(Duration::from_secs(3)).is_ok()
+                        }
+                    }
+                    None => false,
+                };
+                if reaped {
+                    stop_k8s_workloads(&self.reaper);
+                    ACTIVE.store(false, Ordering::SeqCst);
+                    FORWARDED.lock().unwrap().clear();
+                    restore_bridge_netfilter();
+                } else {
+                    log(&format!(
+                        "k3s pid {pid} did not exit after SIGKILL; skipping workload teardown"
+                    ));
+                }
+                let final_err = if reaped {
+                    err
+                } else {
+                    format!("{err} (k3s pid {pid} did not exit within timeout)")
+                };
                 let mut st = self.state.lock().unwrap();
                 if st.generation == my_gen {
                     st.phase = "failed".into();
                     st.api_ready = false;
-                    st.error = err.clone();
-                    st.running = None;
+                    st.error = final_err.clone();
+                    if reaped {
+                        st.running = None;
+                    }
                 }
-                return Err(err);
+                return Err(final_err);
             }
         }
 
@@ -851,7 +894,7 @@ impl K8s {
         }
         self.stop_locked(Some(&mut *conn))?;
         let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
-        unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]);
+        unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
         if Path::new(DATA_DIR).exists() {
             // Try btrfs subvolume delete first (instant if it is a subvolume),
             // falling back to recursive removal.
@@ -1076,21 +1119,21 @@ fn is_under_prefix(path: &str, prefix: &str) -> bool {
 }
 
 /// Parse `/proc/self/mountinfo` and return all mount points matching any of
-/// `prefixes`, sorted longest path first (deepest nested mounts first).
+/// `prefixes` (retaining repeated/stacked mounts), sorted deepest nested mount
+/// first and topmost stacked mount first.
 fn mounts_under_prefixes(mountinfo: &str, prefixes: &[&str]) -> Vec<String> {
-    let mut mounts = BTreeSet::new();
-    for line in mountinfo.lines() {
+    let mut mounts: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in mountinfo.lines().enumerate() {
         let Some(raw_mp) = line.split_whitespace().nth(4) else {
             continue;
         };
         let mp = unescape_mountinfo_path(raw_mp);
         if prefixes.iter().any(|p| is_under_prefix(&mp, p)) {
-            mounts.insert(mp);
+            mounts.push((idx, mp));
         }
     }
-    let mut list: Vec<String> = mounts.into_iter().collect();
-    list.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    list
+    mounts.sort_by(|(ia, a), (ib, b)| b.len().cmp(&a.len()).then_with(|| ib.cmp(ia)));
+    mounts.into_iter().map(|(_, mp)| mp).collect()
 }
 
 fn umount_detach(target: &str) -> io::Result<()> {
@@ -1105,17 +1148,35 @@ fn umount_detach(target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn unmount_paths_under(prefixes: &[&str]) {
-    let Ok(text) = fs::read_to_string("/proc/self/mountinfo") else {
-        return;
-    };
+fn unmount_paths_under(prefixes: &[&str]) -> Result<(), String> {
+    let text = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
+    let mut failures = Vec::new();
     for mp in mounts_under_prefixes(&text, prefixes) {
         if let Err(e) = sys::umount(&mp)
             && let Err(de) = umount_detach(&mp)
         {
-            log(&format!("unmount {mp} failed ({e}); detach failed: {de}"));
+            let msg = format!("unmount {mp} failed ({e}); detach failed: {de}");
+            log(&msg);
+            failures.push(msg);
         }
     }
+    let after = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("re-read /proc/self/mountinfo: {e}"))?;
+    let remaining = mounts_under_prefixes(&after, prefixes);
+    if !remaining.is_empty() {
+        let detail = if failures.is_empty() {
+            format!("mounts still active: {}", remaining.join(", "))
+        } else {
+            format!(
+                "mounts still active ({}): {}",
+                remaining.join(", "),
+                failures.join("; ")
+            )
+        };
+        return Err(detail);
+    }
+    Ok(())
 }
 
 /// Stop and remove Kubernetes tasks/containers in the shared containerd
@@ -1222,7 +1283,9 @@ fn stop_k8s_workloads(reaper: &Reaper) {
         del.args(["delete", "table", family, "kube-proxy"]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
     }
-    unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]);
+    if let Err(e) = unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
+        log(&format!("cleanup mounts: {e}"));
+    }
 }
 
 fn ensure_symlink(link: &str, target: &str) -> Result<(), String> {
@@ -1270,6 +1333,27 @@ fn wait_containerd() -> Result<(), String> {
     Err(format!("containerd socket {CONTAINERD_SOCKET} not ready"))
 }
 
+/// Drain `r` completely to EOF so the child never blocks on a full pipe, while
+/// retaining at most `limit` bytes for diagnostics or parsing.
+fn drain_capped(mut r: impl Read, limit: usize) -> String {
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = limit.saturating_sub(captured.len());
+                if room > 0 {
+                    captured.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
 /// Run `cmd` under PID 1's reaper capturing `stdout` and `stderr` separately
 /// so warnings printed to stderr cannot corrupt stdout parsing.
 fn run_reaped_split(
@@ -1288,11 +1372,8 @@ fn run_reaped_split(
 
     let out_t = match thread::Builder::new()
         .name("k8s-cmd-out".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = File::from(out_r).take(1 << 20).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        }) {
+        .spawn(move || drain_capped(File::from(out_r), 1 << 20))
+    {
         Ok(h) => h,
         Err(e) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -1302,11 +1383,8 @@ fn run_reaped_split(
     };
     let err_t = match thread::Builder::new()
         .name("k8s-cmd-err".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = File::from(err_r).take(64 << 10).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        }) {
+        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
+    {
         Ok(h) => h,
         Err(e) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -1669,9 +1747,9 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
     let exp_err_t = match thread::Builder::new()
         .name("k8s-ctr-exp-err".into())
         .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = File::from(exp_err_r).take(64 << 10).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).trim().to_string()
+            drain_capped(File::from(exp_err_r), 64 << 10)
+                .trim()
+                .to_string()
         }) {
         Ok(h) => h,
         Err(e) => {
@@ -1682,9 +1760,9 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
     let imp_err_t = match thread::Builder::new()
         .name("k8s-ctr-imp-err".into())
         .spawn(move || {
-            let mut buf = Vec::new();
-            let _ = File::from(imp_err_r).take(64 << 10).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).trim().to_string()
+            drain_capped(File::from(imp_err_r), 64 << 10)
+                .trim()
+                .to_string()
         }) {
         Ok(h) => h,
         Err(e) => {
@@ -1812,7 +1890,7 @@ disabled_plugins = [
     }
 
     #[test]
-    fn ensure_containerd_cri_at_writes_atomically_and_handles_missing() {
+    fn ensure_containerd_cri_at_writes_atomically_and_preserves_permissions() {
         let dir = std::env::temp_dir().join(format!(
             "kat-init-cri-{}",
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -1822,20 +1900,33 @@ disabled_plugins = [
 
         assert!(!ensure_containerd_cri_at(&cfg).unwrap());
         fs::write(&cfg, "disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n").unwrap();
+        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(ensure_containerd_cri_at(&cfg).unwrap());
         assert_eq!(fs::read_to_string(&cfg).unwrap(), "");
+        assert_eq!(
+            fs::metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(!ensure_containerd_cri_at(&cfg).unwrap());
+
+        let new_file = dir.join("version");
+        write_atomic(&new_file, b"v1.37.2+k3s1\n").unwrap();
+        assert_eq!(
+            fs::metadata(&new_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn mounts_under_prefixes_sorts_deepest_first_and_unescapes() {
+    fn mounts_under_prefixes_sorts_deepest_first_retains_stacked_and_unescapes() {
         let mountinfo = "\
 10 1 0:1 / / rw - ext4 /dev/vda rw
 20 10 0:2 / /var/lib/katamaran/k3s/data rw - btrfs /dev/vdb rw
 21 20 0:3 / /var/lib/katamaran/k3s/data/agent/kubelet/pods/a/volumes/k8s.io~secret/tok rw - tmpfs tmpfs rw
 22 20 0:4 / /var/lib/katamaran/k3s/data/agent/kubelet/pods/a rw - tmpfs tmpfs rw
+25 22 0:7 / /var/lib/katamaran/k3s/data/agent/kubelet/pods/a rw - overlay overlay rw
 23 10 0:5 / /var/lib/kubelet/pods/my\\040pod/vol rw - tmpfs tmpfs rw
 24 10 0:6 / /var/lib/kubelet2/unrelated rw - tmpfs tmpfs rw
 ";
@@ -1845,10 +1936,20 @@ disabled_plugins = [
             vec![
                 "/var/lib/katamaran/k3s/data/agent/kubelet/pods/a/volumes/k8s.io~secret/tok",
                 "/var/lib/katamaran/k3s/data/agent/kubelet/pods/a",
+                "/var/lib/katamaran/k3s/data/agent/kubelet/pods/a",
                 "/var/lib/kubelet/pods/my pod/vol",
                 "/var/lib/katamaran/k3s/data",
             ]
         );
+    }
+
+    #[test]
+    fn drain_capped_reads_past_limit_to_eof() {
+        let data = vec![b'x'; 128 << 10];
+        let mut cursor = io::Cursor::new(data);
+        let out = drain_capped(&mut cursor, 64 << 10);
+        assert_eq!(out.len(), 64 << 10);
+        assert_eq!(cursor.position(), 128 << 10);
     }
 
     #[test]

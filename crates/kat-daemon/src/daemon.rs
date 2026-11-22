@@ -1093,6 +1093,24 @@ impl Daemon {
             g.state == VmState::Running && g.generation == vm_gen && k.epoch == k8s_epoch
         };
 
+        let cleanup_kubeconfig = |merged: bool| {
+            // Caller holds `self.k8s_op`, so no newer start can run concurrently;
+            // double-check state != "running" before removing the merged user context.
+            let can_remove_user =
+                merged && self.k8s.lock().unwrap_or_else(|e| e.into_inner()).state != "running";
+            if can_remove_user {
+                if let Ok(ctx) = crate::k8s::context_name() {
+                    if let Err(re) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
+                        dlog!("k8s rollback remove kubeconfig failed: {re:#}");
+                    }
+                } else {
+                    let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+                }
+            } else {
+                let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+            }
+        };
+
         let e = match res {
             Ok((info, proxy, dns, kc_path)) => {
                 let stale = {
@@ -1103,7 +1121,7 @@ impl Daemon {
                 if stale {
                     drop(proxy);
                     drop(dns);
-                    let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+                    cleanup_kubeconfig(kubeconfig_merged);
                     return Err(failed(
                         "Kubernetes start was superseded by a VM state change".into(),
                     ));
@@ -1120,7 +1138,7 @@ impl Daemon {
                         drop(g);
                         drop(proxy);
                         drop(dns);
-                        let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+                        cleanup_kubeconfig(kubeconfig_merged);
                         return Err(failed(
                             "Kubernetes start was superseded by a VM state change".into(),
                         ));
@@ -1139,11 +1157,12 @@ impl Daemon {
             }
             Err(e) => e,
         };
-        let same_vm_up = {
+        let still_same_session = {
             let g = self.lock();
-            g.generation == vm_gen && g.state.is_active()
+            let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            is_fresh(&g, &k)
         };
-        if guest_started && same_vm_up {
+        if guest_started && still_same_session {
             let mut noop = |_: &str| {};
             if let Err(se) =
                 crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Stop, &mut noop)
@@ -1151,17 +1170,7 @@ impl Daemon {
                 dlog!("k8s rollback stop failed: {se:#}");
             }
         }
-        if kubeconfig_merged {
-            if let Ok(ctx) = crate::k8s::context_name() {
-                if let Err(re) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
-                    dlog!("k8s rollback remove kubeconfig failed: {re:#}");
-                }
-            } else {
-                let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
-            }
-        } else {
-            let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
-        }
+        cleanup_kubeconfig(kubeconfig_merged);
         let msg = format!("{e:#}");
         {
             let g = self.lock();
@@ -1199,18 +1208,31 @@ impl Daemon {
         };
         let vm_state = self.lock().state;
         // Keep API/DNS relays and saved config intact until the guest confirms
-        // k3s has actually stopped.
+        // k3s has actually stopped. Only tolerate k8s.sock connect failures when
+        // the VM is still starting or k8s was already stopped; never ignore an
+        // error returned by the guest Stop RPC itself.
         if vm_state.is_active() && crate::k8s::socket_path(&self.home).exists() {
-            let mut noop = |_: &str| {};
-            if let Err(e) =
-                crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Stop, &mut noop)
-            {
-                if vm_state == VmState::Starting || prev_state == "stopped" {
+            match crate::k8s::connect(&self.home) {
+                Ok(mut stream) => {
+                    let mut noop = |_: &str| {};
+                    if let Err(e) = crate::k8s::request_stream(
+                        &mut stream,
+                        &kat_proto::k8s::K8sMsg::Stop,
+                        &mut noop,
+                    ) {
+                        let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+                        k.state = prev_state;
+                        k.error = Some(format!("{e:#}"));
+                        return Err(failed(format!("{e:#}")));
+                    }
+                }
+                Err(e) if vm_state == VmState::Starting || prev_state == "stopped" => {
                     dlog!(
-                        "k8s stop: ignoring guest stop error while vm={} k8s={prev_state}: {e:#}",
+                        "k8s stop: ignoring k8s.sock connect error while vm={} k8s={prev_state}: {e:#}",
                         vm_state.as_str()
                     );
-                } else {
+                }
+                Err(e) => {
                     let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
                     k.state = prev_state;
                     k.error = Some(format!("{e:#}"));
@@ -1307,7 +1329,9 @@ impl Daemon {
                 k.state = "stopped".into();
                 k.error = reset_res.as_ref().err().map(|e| e.message.clone());
             }
-            let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+            if let Err(e) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
+                dlog!("k8s reset: remove kubeconfig failed: {e:#}");
+            }
         }
 
         reset_res?;
@@ -1315,9 +1339,6 @@ impl Daemon {
 
         self.persist_k8s_enabled(false)
             .map_err(|e| failed(format!("{e:#}")))?;
-        if let Err(e) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
-            dlog!("k8s reset: remove kubeconfig failed: {e:#}");
-        }
         Ok(())
     }
 
@@ -1906,6 +1927,28 @@ mod tests {
         d.k8s_stop_inner(true, false).unwrap();
         assert_eq!(d.k8s.lock().unwrap().state, "stopped");
         assert!(d.k8s.lock().unwrap().epoch >= 1);
+
+        // Must NOT ignore an explicit guest Stop RPC error even when prev_state == "stopped".
+        let _ = fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Stop);
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error("still busy".into()),
+            )
+            .unwrap();
+        });
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+        }
+        let err = d.k8s_stop_inner(true, false).unwrap_err();
+        assert!(err.message.contains("still busy"), "got: {}", err.message);
+        guest.join().unwrap();
+
         fs::remove_dir_all(&home).unwrap();
     }
 }

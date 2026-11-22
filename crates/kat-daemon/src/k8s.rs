@@ -98,8 +98,16 @@ pub fn request(
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<K8sMsg> {
     let mut s = connect(home)?;
-    k8s::write(&mut s, req)?;
-    read_answer(&mut s, progress)
+    request_stream(&mut s, req, progress)
+}
+
+pub fn request_stream(
+    s: &mut UnixStream,
+    req: &K8sMsg,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<K8sMsg> {
+    k8s::write(&mut *s, req)?;
+    read_answer(s, progress)
 }
 
 fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow::Result<K8sMsg> {
@@ -498,27 +506,34 @@ fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
     }
 }
 
-/// Resolve symlinks so atomic renames update the target file rather than
-/// clobbering dotfiles or Nix symlinks.
+/// Resolve every symlink in a chain (including dangling chains) so atomic
+/// renames update the final target path rather than clobbering dotfiles or
+/// Nix symlinks. Detects cycles via a hop limit.
 fn resolve_symlink_target(path: &Path) -> anyhow::Result<PathBuf> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => match fs::canonicalize(path) {
-            Ok(real) => Ok(real),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    const MAX_SYMLINK_HOPS: usize = 40;
+    let mut cur = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
                 let link =
-                    fs::read_link(path).with_context(|| format!("read_link {}", path.display()))?;
-                Ok(if link.is_absolute() {
+                    fs::read_link(&cur).with_context(|| format!("read_link {}", cur.display()))?;
+                cur = if link.is_absolute() {
                     link
                 } else {
-                    path.parent().unwrap_or_else(|| Path::new(".")).join(link)
-                })
+                    cur.parent().unwrap_or_else(|| Path::new(".")).join(link)
+                };
             }
-            Err(e) => Err(e).with_context(|| format!("canonicalize {}", path.display())),
-        },
-        Ok(_) => Ok(path.to_path_buf()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
-        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+            Ok(_) => {
+                return Ok(fs::canonicalize(&cur).unwrap_or(cur));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(cur),
+            Err(e) => return Err(e).with_context(|| format!("stat {}", cur.display())),
+        }
     }
+    bail!(
+        "too many levels of symbolic links while resolving {}",
+        path.display()
+    )
 }
 
 /// Save `<home>/run/kubeconfig.yaml` and merge the context into `~/.kube/config`
@@ -1232,6 +1247,67 @@ users:
         assert!(calls.contains("config unset contexts.katamaran"));
         assert!(calls.contains("config unset clusters.katamaran"));
         assert!(calls.contains("config unset users.katamaran"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_symlink_target_follows_dangling_chains_and_detects_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "kat-k8s-symchain-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = base.join("kat");
+        let user_home = base.join("user");
+        let dotfiles = base.join("dotfiles");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(user_home.join(".kube")).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+
+        // Chained dangling symlinks: ~/.kube/config -> intermediate -> final_target (absent)
+        let final_target = dotfiles.join("final-kubeconfig");
+        let intermediate = dotfiles.join("intermediate-link");
+        let link_cfg = user_home.join(".kube/config");
+        symlink(&final_target, &intermediate).unwrap();
+        symlink(&intermediate, &link_cfg).unwrap();
+
+        let resolved = resolve_symlink_target(&link_cfg).unwrap();
+        assert_eq!(resolved, final_target);
+
+        let raw = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: default\ncontexts:\n- context:\n    cluster: default\n    user: default\n  name: default\ncurrent-context: default\nkind: Config\nusers:\n- name: default\n  user: {}\n";
+        let missing_kubectl = base.join("no-such-kubectl");
+        write_and_merge_kubeconfig_in(
+            &home,
+            Some(&user_home),
+            raw,
+            16443,
+            "katamaran",
+            &missing_kubectl,
+        )
+        .unwrap();
+        assert!(
+            fs::symlink_metadata(&link_cfg)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&intermediate)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::read_to_string(&final_target).unwrap().contains("16443"));
+
+        // Cycle detection: loop_a -> loop_b -> loop_a
+        let loop_a = base.join("loop_a");
+        let loop_b = base.join("loop_b");
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        assert!(resolve_symlink_target(&loop_a).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }
