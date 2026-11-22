@@ -389,7 +389,7 @@ impl K8s {
         Ok(self.info())
     }
 
-    fn stop_inner(&self, mut conn: Option<&mut UnixStream>) -> Result<(), String> {
+    fn stop_inner(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
         let _guard = self.op_lock.lock().unwrap();
         let running = {
             let mut st = self.state.lock().unwrap();
@@ -403,7 +403,7 @@ impl K8s {
             st.api_ready = false;
             st.running.take()
         };
-        if let Some(c) = conn.as_deref_mut() {
+        if let Some(c) = conn {
             let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
         }
         if let Some(r) = running {
