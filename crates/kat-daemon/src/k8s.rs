@@ -450,19 +450,19 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
         }
         let combined = format!("{}:{}", scratch.display(), local_cfg.display());
         let out = Command::new("kubectl")
-            .args(["config", "view", "--flatten"])
+            .args(["config", "view", "--raw", "--flatten"])
             .env("KUBECONFIG", combined)
             .stdin(Stdio::null())
             .output()
-            .context("run kubectl config view --flatten")?;
+            .context("run kubectl config view --raw --flatten")?;
         if !out.status.success() {
             bail!(
-                "kubectl config view --flatten failed: {}",
+                "kubectl config view --raw --flatten failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
         if out.stdout.is_empty() {
-            bail!("kubectl config view --flatten produced empty output");
+            bail!("kubectl config view --raw --flatten produced empty output");
         }
         write_private_atomic(user_cfg, &out.stdout)
     })();

@@ -342,34 +342,30 @@ impl K8s {
                         sync_stop2.store(true, Ordering::SeqCst);
                         let _ = exit_tx.send(());
                         if let Some(svc) = svc_ref {
+                            // Serialize crash cleanup with start_inner/stop_inner so a
+                            // replacement cluster cannot launch while this watcher is
+                            // tearing down workloads or restoring sysctls. Safe against
+                            // deadlock because exited2 and exit_tx were signaled above.
+                            let _op = svc.op_lock.lock().unwrap();
                             let crashed = {
                                 let mut st = svc.state.lock().unwrap();
-                                // Ignore stale watchers from a superseded instance.
-                                if st.generation != my_gen {
+                                // Ignore stale watchers or startup exits already handled
+                                // by start_inner/stop_inner.
+                                if st.generation != my_gen || st.phase != "running" {
                                     return;
                                 }
-                                let was_stopping = st.phase == "stopping" || st.phase == "stopped";
-                                let was_running = st.phase == "running";
+                                let msg = format!("k3s {}", describe_status(status));
+                                st.phase = "failed".into();
                                 st.api_ready = false;
-                                if !was_stopping {
-                                    let msg = format!("k3s {}", describe_status(status));
-                                    st.phase = "failed".into();
-                                    st.error = msg.clone();
-                                    st.running = None;
-                                    Some((was_running, msg))
-                                } else {
-                                    None
-                                }
+                                st.error = msg.clone();
+                                st.running = None;
+                                msg
                             };
-                            if let Some((was_running, msg)) = crashed {
-                                if was_running {
-                                    stop_k8s_workloads(&svc.reaper);
-                                }
-                                ACTIVE.store(false, Ordering::SeqCst);
-                                FORWARDED.lock().unwrap().clear();
-                                restore_bridge_netfilter();
-                                svc.notifier.failed("k8s", msg);
-                            }
+                            stop_k8s_workloads(&svc.reaper);
+                            ACTIVE.store(false, Ordering::SeqCst);
+                            FORWARDED.lock().unwrap().clear();
+                            restore_bridge_netfilter();
+                            svc.notifier.failed("k8s", crashed);
                         }
                     }
                 })
