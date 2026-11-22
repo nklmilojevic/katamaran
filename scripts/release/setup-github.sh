@@ -123,10 +123,10 @@ if gh api -X POST "repos/$REPO/pages" -f build_type=workflow >/dev/null 2>&1 \
     gh api -X PUT "repos/$REPO/environments/github-pages" \
         -F 'deployment_branch_policy[protected_branches]=false' \
         -F 'deployment_branch_policy[custom_branch_policies]=true' >/dev/null
-    for policy in "main branch" "v* tag"; do
-        set -- $policy
+    for spec in "main:branch" "v*:tag"; do
+        IFS=: read -r name kind <<< "$spec"
         gh api -X POST "repos/$REPO/environments/github-pages/deployment-branch-policies" \
-            -f name="$1" -f type="$2" >/dev/null 2>&1 || true
+            -f name="$name" -f type="$kind" >/dev/null 2>&1 || true
     done
     URL="$(gh api "repos/$REPO/pages" -q .html_url)"
     log "Done. Docs and appcast: ${URL}appcast.xml (published after the first Release run)"

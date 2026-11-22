@@ -16,9 +16,10 @@ launch_at_login = true
 pause_on_sleep = false
 auto_forward = true
 amd64 = "auto"
+kubernetes = false
 ```
 
-Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart`.
+Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately).
 
 ## Settings keys
 
@@ -32,6 +33,7 @@ Edit settings with `kat config set` or the **Settings** window in the app, then 
 | `pause_on_sleep` | boolean | `false` | Boolean. Freezes vCPUs and adjusts virtual timer offsets across macOS sleep. |
 | `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
+| `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
 
@@ -45,7 +47,11 @@ All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
 | `data/data.img` | Sparse btrfs disk image for Docker, containerd, and LXC machines |
 | `run/docker.sock` | Docker Engine Unix socket relayed from the guest |
 | `run/daemon.sock` | Control socket used by the CLI and macOS app |
+| `run/k8s.sock` | Kubernetes control socket relayed to the guest |
+| `run/k8s-api.sock` | Kubernetes API server socket relayed from the guest |
+| `run/kubeconfig.yaml` | Generated kubeconfig for the single-node Kubernetes cluster |
 | `run/vm.json` | Generated VM launch configuration passed to `katamaran-vm` |
+| `cache/k3s/` | Cached and SHA-256 verified `k3s-arm64` binary downloaded on first Kubernetes start |
 | `logs/` | Logs for `daemon`, `console`, `vm`, and `gvproxy` |
 | `ssh/` | Managed SSH host key, `known_hosts`, and `config` file |
 
