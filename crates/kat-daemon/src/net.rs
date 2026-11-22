@@ -471,6 +471,12 @@ const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(200);
 const TRANSIENT_RETRY_MAX: Duration = Duration::from_secs(2);
 const MAX_TRANSIENT_RETRIES: u32 = 30;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingOp {
+    Add,
+    Remove,
+}
+
 /// Apply guest port changes on a worker thread, so a slow gvproxy call never
 /// holds up the control loop. Reports each resulting [`Event`] to `on_event`.
 pub fn spawn_forwarder(
@@ -490,10 +496,11 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
         .name("port-forward".into())
         .spawn(move || {
             let mut fwd = Forwards::new(api);
-            let mut pending: BTreeMap<(PortProto, u16), (Instant, u32)> = BTreeMap::new();
+            let mut pending: BTreeMap<(PortProto, u16), (PendingOp, Instant, u32)> =
+                BTreeMap::new();
             let retry_max = TRANSIENT_RETRY_MAX.max(retry_base);
             loop {
-                let next_due = pending.values().map(|(at, _)| *at).min();
+                let next_due = pending.values().map(|(_, at, _)| *at).min();
                 let got = match next_due {
                     Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
                     None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -501,26 +508,38 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                 match got {
                     Ok(PortChange::Add(proto, port)) => {
                         let key = (proto, port);
+                        pending.remove(&key);
                         match fwd.add(proto, port) {
                             Some(e @ Event::Transient(..)) => {
-                                pending.insert(key, (Instant::now() + retry_base, 1));
+                                pending
+                                    .insert(key, (PendingOp::Add, Instant::now() + retry_base, 1));
                                 report(&e);
                                 on_event(e);
                             }
-                            other => {
-                                pending.remove(&key);
-                                if let Some(e) = other {
-                                    report(&e);
-                                    on_event(e);
-                                }
+                            Some(e) => {
+                                report(&e);
+                                on_event(e);
                             }
+                            None => {}
                         }
                     }
                     Ok(PortChange::Remove(proto, port)) => {
-                        pending.remove(&(proto, port));
-                        if let Some(e) = fwd.remove(proto, port) {
-                            report(&e);
-                            on_event(e);
+                        let key = (proto, port);
+                        pending.remove(&key);
+                        match fwd.remove(proto, port) {
+                            Some(e @ Event::RemoveFailed(..)) => {
+                                pending.insert(
+                                    key,
+                                    (PendingOp::Remove, Instant::now() + retry_base, 1),
+                                );
+                                report(&e);
+                                on_event(e);
+                            }
+                            Some(e) => {
+                                report(&e);
+                                on_event(e);
+                            }
+                            None => {}
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {}
@@ -528,31 +547,54 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                 }
 
                 let now = Instant::now();
-                let due: Vec<((PortProto, u16), u32)> = pending
+                let due: Vec<((PortProto, u16), PendingOp, u32)> = pending
                     .iter()
-                    .filter(|(_, (at, _))| *at <= now)
-                    .map(|(&k, &(_, attempts))| (k, attempts))
+                    .filter(|(_, (_, at, _))| *at <= now)
+                    .map(|(&k, &(op, _, attempts))| (k, op, attempts))
                     .collect();
-                for ((proto, port), attempts) in due {
-                    pending.remove(&(proto, port));
-                    match fwd.add(proto, port) {
-                        Some(e @ Event::Transient(..)) => {
-                            if attempts < MAX_TRANSIENT_RETRIES {
-                                let delay = retry_base
-                                    .saturating_mul(1u32 << attempts.min(4))
-                                    .min(retry_max);
-                                pending
-                                    .insert((proto, port), (Instant::now() + delay, attempts + 1));
-                            } else {
+                for ((proto, port), op, attempts) in due {
+                    let key = (proto, port);
+                    pending.remove(&key);
+                    let delay = retry_base
+                        .saturating_mul(1u32 << attempts.min(4))
+                        .min(retry_max);
+                    match op {
+                        PendingOp::Add => match fwd.add(proto, port) {
+                            Some(e @ Event::Transient(..)) => {
+                                if attempts < MAX_TRANSIENT_RETRIES {
+                                    pending.insert(
+                                        key,
+                                        (PendingOp::Add, Instant::now() + delay, attempts + 1),
+                                    );
+                                } else {
+                                    report(&e);
+                                    on_event(e);
+                                }
+                            }
+                            Some(e) => {
                                 report(&e);
                                 on_event(e);
                             }
-                        }
-                        Some(e) => {
-                            report(&e);
-                            on_event(e);
-                        }
-                        None => {}
+                            None => {}
+                        },
+                        PendingOp::Remove => match fwd.remove(proto, port) {
+                            Some(e @ Event::RemoveFailed(..)) => {
+                                if attempts < MAX_TRANSIENT_RETRIES {
+                                    pending.insert(
+                                        key,
+                                        (PendingOp::Remove, Instant::now() + delay, attempts + 1),
+                                    );
+                                } else {
+                                    report(&e);
+                                    on_event(e);
+                                }
+                            }
+                            Some(e) => {
+                                report(&e);
+                                on_event(e);
+                            }
+                            None => {}
+                        },
                     }
                 }
             }
@@ -777,6 +819,91 @@ mod tests {
         tx.send(PortChange::Remove(TCP, 8081)).unwrap();
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(tx);
+    }
+
+    #[test]
+    fn forwarder_retries_failed_unexpose_and_cancels_on_re_add() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct FlakyUnexposeApi {
+            fail_unexpose_times: Arc<AtomicUsize>,
+            unexpose_calls: Arc<AtomicUsize>,
+        }
+        impl ForwardApi for FlakyUnexposeApi {
+            fn expose(&mut self, _: PortProto, _: u16) -> Result<(), ForwardError> {
+                Ok(())
+            }
+            fn unexpose(&mut self, _: PortProto, _: u16) -> Result<(), ForwardError> {
+                let n = self.unexpose_calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.fail_unexpose_times.load(Ordering::SeqCst) {
+                    Err(ForwardError::Transient(
+                        "gvproxy API: connection reset".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        // Unexpose fails once then automatically retries and succeeds without a second Remove.
+        let unexpose_calls = Arc::new(AtomicUsize::new(0));
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let tx = spawn_forwarder_with(
+            FlakyUnexposeApi {
+                fail_unexpose_times: Arc::new(AtomicUsize::new(1)),
+                unexpose_calls: unexpose_calls.clone(),
+            },
+            Duration::from_millis(10),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+        tx.send(PortChange::Add(TCP, 9100)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, 9100)
+        );
+        tx.send(PortChange::Remove(TCP, 9100)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveFailed(TCP, 9100, _)
+        ));
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, 9100)
+        );
+        assert_eq!(unexpose_calls.load(Ordering::SeqCst), 2);
+        drop(tx);
+
+        // A new Add cancels a pending unexpose retry while the port is still active.
+        let unexpose_calls = Arc::new(AtomicUsize::new(0));
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let tx = spawn_forwarder_with(
+            FlakyUnexposeApi {
+                fail_unexpose_times: Arc::new(AtomicUsize::new(1)),
+                unexpose_calls: unexpose_calls.clone(),
+            },
+            Duration::from_millis(50),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+        tx.send(PortChange::Add(TCP, 9101)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, 9101)
+        );
+        tx.send(PortChange::Remove(TCP, 9101)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveFailed(TCP, 9101, _)
+        ));
+        tx.send(PortChange::Add(TCP, 9101)).unwrap();
+        assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        assert_eq!(unexpose_calls.load(Ordering::SeqCst), 1);
         drop(tx);
     }
 

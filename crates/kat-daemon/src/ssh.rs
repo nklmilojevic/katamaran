@@ -197,12 +197,15 @@ fn valid_direct_tcpip_target(host: &str, port: u32, machine: &str) -> Option<u16
     allowed.then_some(port)
 }
 
-/// Bounded per-channel host-to-guest frame queue so stalled guest reads
-/// apply SSH flow-control backpressure instead of growing memory unboundedly.
-const GUEST_WRITE_QUEUE: usize = 64;
+/// Bounded per-channel host-to-guest frame queues so stalled guest reads
+/// cannot exhaust host memory, while non-blocking dispatch prevents one
+/// stalled channel from suspending the SSH handler for other channels.
+const GUEST_WRITE_QUEUE: usize = 128;
+const GUEST_CTRL_QUEUE: usize = 16;
 
 struct GuestChan {
-    tx: mpsc::Sender<MachineMsg>,
+    data_tx: mpsc::Sender<MachineMsg>,
+    ctrl_tx: mpsc::Sender<MachineMsg>,
     reader: AbortHandle,
     writer: AbortHandle,
 }
@@ -210,14 +213,38 @@ struct GuestChan {
 impl GuestChan {
     fn spawn(stream: UnixStream, handle: russh::server::Handle, ch: ChannelId) -> Self {
         let (reader, writer) = stream.into_split();
-        let (tx, rx) = mpsc::channel(GUEST_WRITE_QUEUE);
-        let writer_task = tokio::spawn(pump_write(rx, writer));
+        let (data_tx, data_rx) = mpsc::channel(GUEST_WRITE_QUEUE);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(GUEST_CTRL_QUEUE);
+        let writer_task = tokio::spawn(pump_write(ctrl_rx, data_rx, writer));
         let reader_task = tokio::spawn(pump_read(handle, ch, reader));
         GuestChan {
-            tx,
+            data_tx,
+            ctrl_tx,
             reader: reader_task.abort_handle(),
             writer: writer_task.abort_handle(),
         }
+    }
+
+    /// Try to enqueue a stream frame without indefinitely suspending the SSH
+    /// handler. Yields briefly on `Full` so `pump_write` gets a chance to drain
+    /// on the single-threaded runtime; returns `false` if the guest is stalled.
+    async fn try_enqueue_data(&self, mut msg: MachineMsg) -> bool {
+        for attempt in 0..5 {
+            match self.data_tx.try_send(msg) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return true,
+                Err(mpsc::error::TrySendError::Full(next)) => {
+                    msg = next;
+                    if attempt < 4 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn try_enqueue_ctrl(&self, msg: MachineMsg) {
+        let _ = self.ctrl_tx.try_send(msg);
     }
 
     fn close(self) {
@@ -236,6 +263,7 @@ impl Drop for GuestChan {
 struct Chan {
     env: Vec<(String, String)>,
     tty: Option<Tty>,
+    is_session: bool,
     /// The guest connection once the channel runs something.
     guest: Option<GuestChan>,
 }
@@ -248,16 +276,35 @@ struct Handler {
 }
 
 impl Handler {
-    async fn send(&self, ch: ChannelId, m: MachineMsg) {
-        let Some(tx) = self
-            .chans
-            .get(&ch)
-            .and_then(|c| c.guest.as_ref())
-            .map(|g| g.tx.clone())
-        else {
-            return;
+    /// Enqueue stream data (`Data` / `DataEnd`) without blocking other
+    /// multiplexed SSH channels. If this channel's bounded queue stays full
+    /// because its guest stopped reading, close only this stalled channel.
+    async fn send_data(&mut self, ch: ChannelId, m: MachineMsg, session: &mut Session) {
+        let ok = {
+            let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) else {
+                return;
+            };
+            g.try_enqueue_data(m).await
         };
-        let _ = tx.send(m).await;
+        if !ok && let Some(c) = self.chans.remove(&ch) {
+            if let Some(g) = c.guest {
+                g.close();
+            }
+            if c.is_session {
+                let _ = session.extended_data(
+                    ch,
+                    1,
+                    b"katamaran: guest stopped reading; closing channel\r\n".to_vec(),
+                );
+            }
+            let _ = session.close(ch);
+        }
+    }
+
+    fn send_ctrl(&self, ch: ChannelId, m: MachineMsg) {
+        if let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) {
+            g.try_enqueue_ctrl(m);
+        }
     }
 
     /// Start `argv` (empty: login shell) for a session channel.
@@ -268,6 +315,7 @@ impl Handler {
         }
         let (env, tty) = {
             let c = self.chans.entry(ch).or_default();
+            c.is_session = true;
             (c.env.clone(), c.tty.clone())
         };
         let spec = ExecSpec {
@@ -300,9 +348,20 @@ impl Handler {
 }
 
 /// Write queued host-to-guest frames asynchronously so SSH callbacks never
-/// block the runtime or deadlock against guest output.
-async fn pump_write(mut rx: mpsc::Receiver<MachineMsg>, mut w: OwnedWriteHalf) {
-    while let Some(msg) = rx.recv().await {
+/// block the runtime or deadlock against guest output. Control frames
+/// (`Signal`, `Resize`) take priority over queued stream data.
+async fn pump_write(
+    mut ctrl_rx: mpsc::Receiver<MachineMsg>,
+    mut data_rx: mpsc::Receiver<MachineMsg>,
+    mut w: OwnedWriteHalf,
+) {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            Some(m) = ctrl_rx.recv() => m,
+            Some(m) = data_rx.recv() => m,
+            else => break,
+        };
         if write_frame(&mut w, &msg).await.is_err() {
             break;
         }
@@ -498,14 +557,13 @@ impl russh::server::Handler for Handler {
         _pix_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(
+        self.send_ctrl(
             channel,
             MachineMsg::Resize {
                 rows: row_height.min(u16::MAX as u32) as u16,
                 cols: col_width.min(u16::MAX as u32) as u16,
             },
-        )
-        .await;
+        );
         Ok(())
     }
 
@@ -513,18 +571,19 @@ impl russh::server::Handler for Handler {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(channel, MachineMsg::Data(data.to_vec())).await;
+        self.send_data(channel, MachineMsg::Data(data.to_vec()), session)
+            .await;
         Ok(())
     }
 
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(channel, MachineMsg::DataEnd).await;
+        self.send_data(channel, MachineMsg::DataEnd, session).await;
         Ok(())
     }
 
@@ -548,7 +607,7 @@ impl russh::server::Handler for Handler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(signal) = signal_number(&signal) {
-            self.send(channel, MachineMsg::Signal { signal }).await;
+            self.send_ctrl(channel, MachineMsg::Signal { signal });
         }
         Ok(())
     }
@@ -683,46 +742,87 @@ mod tests {
     }
 
     #[test]
-    fn aborting_writer_closes_guest_socket_even_when_stalled() {
+    fn stalled_guest_channel_does_not_block_multiplexed_channels_or_close() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let (host, mut guest) = UnixStream::pair().unwrap();
-            let (_reader, writer) = host.into_split();
-            let (tx, rx) = mpsc::channel(GUEST_WRITE_QUEUE);
-            let writer_task = tokio::spawn(pump_write(rx, writer));
-            let writer_abort = writer_task.abort_handle();
+            // Channel 1: guest never reads.
+            let (host1, mut guest1) = UnixStream::pair().unwrap();
+            let (r1, w1) = host1.into_split();
+            let (data_tx1, data_rx1) = mpsc::channel(GUEST_WRITE_QUEUE);
+            let (ctrl_tx1, ctrl_rx1) = mpsc::channel(GUEST_CTRL_QUEUE);
+            let w_task1 = tokio::spawn(pump_write(ctrl_rx1, data_rx1, w1));
+            let r_task1 = tokio::spawn(async move {
+                let mut r = r1;
+                let _ = read_frame(&mut r).await;
+            });
+            let stalled = GuestChan {
+                data_tx: data_tx1,
+                ctrl_tx: ctrl_tx1,
+                reader: r_task1.abort_handle(),
+                writer: w_task1.abort_handle(),
+            };
 
-            // Fill both the kernel Unix socket buffer and the bounded channel
-            // without reading from `guest`, simulating a stalled guest reader.
+            // Channel 2: healthy multiplexed guest reading concurrently.
+            let (host2, mut guest2) = UnixStream::pair().unwrap();
+            let (r2, w2) = host2.into_split();
+            let (data_tx2, data_rx2) = mpsc::channel(GUEST_WRITE_QUEUE);
+            let (ctrl_tx2, ctrl_rx2) = mpsc::channel(GUEST_CTRL_QUEUE);
+            let w_task2 = tokio::spawn(pump_write(ctrl_rx2, data_rx2, w2));
+            let r_task2 = tokio::spawn(async move {
+                let mut r = r2;
+                let _ = read_frame(&mut r).await;
+            });
+            let healthy = GuestChan {
+                data_tx: data_tx2,
+                ctrl_tx: ctrl_tx2,
+                reader: r_task2.abort_handle(),
+                writer: w_task2.abort_handle(),
+            };
+
+            // Pump frames into channel 1 until its bounded queue overflows.
+            // `try_enqueue_data` must return `false` without hanging the runtime.
             let chunk = vec![0x42u8; 32 << 10];
-            let mut hit_full = false;
+            let mut overflowed = false;
             for _ in 0..(GUEST_WRITE_QUEUE + 256) {
-                match tx.try_send(MachineMsg::Data(chunk.clone())) {
-                    Ok(()) => tokio::task::yield_now().await,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        hit_full = true;
-                        break;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                if !stalled
+                    .try_enqueue_data(MachineMsg::Data(chunk.clone()))
+                    .await
+                {
+                    overflowed = true;
+                    break;
                 }
             }
-            assert!(hit_full, "bounded queue must apply backpressure");
+            assert!(overflowed, "bounded queue must detect stalled guest");
 
-            // Aborting the writer releases the write half so draining the guest
-            // sees EOF instead of hanging forever.
-            writer_abort.abort();
-            let _ = writer_task.await;
-            drop(_reader);
+            // Channel 2 must still accept and deliver data immediately while
+            // channel 1 is completely stalled.
+            let payload = b"healthy multiplexed channel".to_vec();
+            assert!(
+                healthy
+                    .try_enqueue_data(MachineMsg::Data(payload.clone()))
+                    .await
+            );
+            assert_eq!(
+                read_frame(&mut guest2).await.unwrap(),
+                Some(MachineMsg::Data(payload))
+            );
+
+            // Closing the stalled channel aborts both reader & writer so
+            // draining `guest1` sees EOF instead of hanging forever.
+            stalled.close();
+            let _ = w_task1.await;
             let mut buf = vec![0u8; 64 << 10];
             loop {
-                let n = guest.read(&mut buf).await.unwrap();
+                let n = guest1.read(&mut buf).await.unwrap();
                 if n == 0 {
                     break;
                 }
             }
+
+            healthy.close();
         });
     }
 }
