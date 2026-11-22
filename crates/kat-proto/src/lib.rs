@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 
 pub mod backoff;
 pub mod fscache;
+pub mod k8s;
 pub mod machine;
 
 pub const PROTOCOL_VERSION: u32 = 3;
@@ -33,6 +34,12 @@ pub const NFS_PORT: u32 = 2049;
 /// Guest vsock port of the Linux machine service (see [`machine`]). The host
 /// side is a Unix socket libkrun listens on.
 pub const MACHINE_PORT: u32 = 1050;
+/// Guest vsock port of the Kubernetes (k3s) management service (see [`k8s`]).
+/// The host side is a Unix socket libkrun listens on.
+pub const K8S_PORT: u32 = 1051;
+/// Guest vsock port relayed to the k3s Kubernetes API server (`127.0.0.1:6443`).
+/// The host side is a Unix socket libkrun listens on.
+pub const K8S_API_PORT: u32 = 1052;
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub(crate) const HEADER: usize = 6;

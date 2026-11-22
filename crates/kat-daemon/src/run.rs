@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use kat_proto::{
-    AUTO_FORWARD_PORT, DOCKER_PORT, GuestStats, MACHINE_PORT, Msg, NFS_PORT, PortProto, read_msg,
+    AUTO_FORWARD_PORT, DOCKER_PORT, GuestStats, K8S_API_PORT, K8S_PORT, MACHINE_PORT, Msg,
+    NFS_PORT, PortProto, read_msg,
 };
 use kat_vmm::{Disk, HostListener, Permissions, Share, VmConfig};
 
@@ -326,6 +327,18 @@ fn session(
         .chain(std::iter::once(HostListener {
             port: MACHINE_PORT,
             path: crate::machines::socket_path(&state),
+            kernel_only: false,
+            loopback_tcp: false,
+        }))
+        .chain(std::iter::once(HostListener {
+            port: K8S_PORT,
+            path: crate::k8s::socket_path(&state),
+            kernel_only: false,
+            loopback_tcp: false,
+        }))
+        .chain(std::iter::once(HostListener {
+            port: K8S_API_PORT,
+            path: crate::k8s::api_socket_path(&state),
             kernel_only: false,
             loopback_tcp: false,
         }))

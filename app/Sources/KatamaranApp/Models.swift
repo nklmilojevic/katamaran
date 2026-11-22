@@ -13,6 +13,7 @@ struct DaemonStatus: Decodable, Equatable {
     var vm: VmInfo?
     var usage: Sample?
     var docker: DockerInfo
+    var k8s: K8sStatus?
     var mount: MountInfo
     var ports: [Port]
 }
@@ -35,6 +36,7 @@ struct Config: Codable, Equatable {
     var mount: Bool
     var mount_path: String?
     var launch_at_login: Bool
+    var kubernetes: Bool? = nil
 }
 
 struct ConfigView: Decodable {
@@ -67,6 +69,28 @@ struct StatsResult: Decodable {
 struct DockerInfo: Decodable, Equatable {
     var state: String
     var socket: String
+}
+
+struct K8sStatus: Decodable, Equatable {
+    var enabled: Bool
+    var state: String
+    var installed: Bool
+    var version: String?
+    var apiPort: UInt16?
+    var context: String?
+    var kubeconfig: String?
+    var dnsDomain: String?
+    var dnsPort: UInt16?
+    var dnsInstalled: Bool?
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, state, installed, version, context, kubeconfig, error
+        case apiPort = "api_port"
+        case dnsDomain = "dns_domain"
+        case dnsPort = "dns_port"
+        case dnsInstalled = "dns_installed"
+    }
 }
 
 struct MountInfo: Decodable, Equatable {

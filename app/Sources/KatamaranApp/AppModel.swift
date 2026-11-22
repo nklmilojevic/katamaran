@@ -115,6 +115,16 @@ final class AppModel {
         perform("settings", done: done) { _ = try d.call("config.set", ["values": values]) }
     }
 
+    func k8sReset() {
+        let d = daemon
+        perform("kubernetes") { _ = try d.call("k8s.reset", timeout: 60) }
+    }
+
+    func k8sSyncImages() {
+        let d = daemon
+        perform("kubernetes") { _ = try d.call("k8s.sync_images", timeout: 120) }
+    }
+
     /// The `katamaran` CLI next to this app's executable (in the bundle), or $KATAMARAN_BIN.
     nonisolated static func cliPath() -> String {
         if let p = ProcessInfo.processInfo.environment["KATAMARAN_BIN"], !p.isEmpty { return p }

@@ -197,6 +197,16 @@ pub fn summary(s: &Status) -> String {
         "docker",
         format!("{docker} · unix://{}", s.docker.socket.display()),
     );
+    if s.k8s.enabled || s.k8s.state != "stopped" {
+        let mut k = s.k8s.state.clone();
+        if let Some(p) = s.k8s.api_port {
+            k.push_str(&format!(
+                " · https://127.0.0.1:{p} (context {})",
+                s.k8s.context
+            ));
+        }
+        line("k8s", k);
+    }
     if let Some(vm) = &s.vm {
         let mut v = format!("{} CPUs · {} MiB", vm.cpus, vm.memory_mib);
         if let Some(u) = &s.usage {
@@ -440,6 +450,7 @@ mod tests {
                 state: DockerState::Ready,
                 socket: "/h/run/docker.sock".into(),
             },
+            k8s: K8sStatus::default(),
             mount: MountInfo {
                 enabled: true,
                 path: Some("/Users/me/Katamaran".into()),

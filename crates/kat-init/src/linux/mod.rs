@@ -3,6 +3,7 @@ mod autofwd;
 mod clock;
 mod fscache;
 mod fsnotify;
+mod k8s;
 mod machines;
 mod memory;
 mod net;
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use kat_proto::{CONTROL_PORT, DOCKER_PORT, Hello, Msg, PROTOCOL_VERSION, read_msg};
+use kat_proto::{CONTROL_PORT, DOCKER_PORT, Hello, K8S_API_PORT, Msg, PROTOCOL_VERSION, read_msg};
 
 use service::{DockerStack, Notifier, Reaper};
 
@@ -210,7 +211,12 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
 
     let docker = if system {
         let reaper = Reaper::start();
+        k8s::ensure_containerd_cri();
         relay::serve_unix_on_vsock(DOCKER_PORT, service::DOCKER_SOCKET)?;
+        relay::serve_tcp_on_vsock(K8S_API_PORT, k8s::API_ADDR)?;
+        if let Err(e) = k8s::start_service(reaper.clone(), notifier.clone()) {
+            notifier.failed("k8s", e.to_string());
+        }
         let nfs = nfs::Nfsd::start(reaper.clone(), notifier.clone())?;
         let dns = std::fs::read_to_string("/proc/cmdline")
             .ok()

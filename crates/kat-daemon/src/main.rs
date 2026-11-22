@@ -8,6 +8,8 @@ mod config;
 mod daemon;
 mod fsevents;
 mod fswatch;
+mod k8s;
+mod k8s_cli;
 mod lifecycle;
 mod machine_cli;
 mod machines;
@@ -65,6 +67,9 @@ enum Command {
     /// Create, list, start, stop and delete Linux machines.
     #[command(subcommand)]
     Machine(machine_cli::MachineCmd),
+    /// Manage the optional single-node Kubernetes (k3s) cluster.
+    #[command(subcommand, visible_alias = "kubernetes")]
+    K8s(k8s_cli::K8sCmd),
     /// Open a shell (or run a command) in a Linux machine.
     Shell(machine_cli::ShellArgs),
     /// SSH into a Linux machine through the katamaran SSH config.
@@ -98,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         Command::UseContext => setup::ensure_default_docker_context(),
         Command::Uninstall(args) => setup::uninstall(args),
         Command::Machine(cmd) => machine_cli::machine(cmd),
+        Command::K8s(cmd) => k8s_cli::run(cmd),
         Command::Shell(args) => machine_cli::shell(args),
         Command::Ssh(args) => machine_cli::ssh(args),
         Command::SshProxy => ssh::proxy(),

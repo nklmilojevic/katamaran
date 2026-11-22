@@ -405,7 +405,7 @@ final class VolumesPane: ResourcePane {
     override func rows() -> [ResourceRow] {
         store.volumes.map { v in
             let users = store.containers(usingVolume: v)
-            var sub = [v.size.map(bytes) ?? "—"]
+            var sub = [v.size.map(bytes) ?? "-"]
             if let p = v.project { sub.append(p) }
             if !users.isEmpty { sub.append(users.map(\.name).sorted().joined(separator: ", ")) }
             return ResourceRow(key: v.Name, title: v.Name, subtitle: sub.joined(separator: " · "),
@@ -481,7 +481,7 @@ final class ImagesPane: ResourcePane {
     override func rows() -> [ResourceRow] {
         store.images.map { i in
             let users = store.containers(usingImage: i).count
-            var sub = [i.Size.map(bytes) ?? "—", relative(i.createdDate)]
+            var sub = [i.Size.map(bytes) ?? "-", relative(i.createdDate)]
             if users > 0 { sub.append("\(users) container\(users == 1 ? "" : "s")") }
             return ResourceRow(key: i.Id, title: i.name, subtitle: sub.joined(separator: " · "),
                                symbol: ImageIcon.symbol(for: i.name), tint: ImageIcon.tint(for: i.name),
@@ -574,7 +574,7 @@ final class NetworksPane: ResourcePane {
 
     override func details(_ key: String) -> [NSView] {
         guard let n = network(key) else { return [] }
-        var rows: [NSView] = [InfoRow("Driver", n.Driver ?? "—")]
+        var rows: [NSView] = [InfoRow("Driver", n.Driver ?? "-")]
         if !n.subnets.isEmpty { rows.append(InfoRow("Subnet", n.subnets.joined(separator: "\n"), mono: true)) }
         if !n.gateways.isEmpty { rows.append(InfoRow("Gateway", n.gateways.joined(separator: "\n"), mono: true)) }
         if n.Internal == true { rows.append(InfoRow("Internal", "Yes: no access outside")) }

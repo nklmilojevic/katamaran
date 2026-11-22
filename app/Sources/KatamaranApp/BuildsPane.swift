@@ -827,7 +827,7 @@ final class RunningCard: NSBox {
             bar.value = 0
         }
         if let s = p?.current {
-            let last = s.logs.last { !$0.isEmpty }.map { " — " + $0 } ?? ""
+            let last = s.logs.last { !$0.isEmpty }.map { " - " + $0 } ?? ""
             step.stringValue = (s.isInternal ? s.name : s.parts.instruction) + last
         } else {
             step.stringValue = "Waiting for BuildKit"
@@ -1073,7 +1073,7 @@ final class StepRow: NSView {
             let bar = ProgressLine()
             bar.color = state == .failed ? .systemRed : state == .running ? .systemBlue : dim ? .tertiaryLabelColor : .systemGreen
             bar.value = duration.map { max($0 / slowest, 0.02) } ?? (state == .running ? 0.02 : 0)
-            let d = label(duration.map(buildDuration) ?? (state == .running ? "…" : "—"),
+            let d = label(duration.map(buildDuration) ?? (state == .running ? "…" : "-"),
                           font: .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular),
                           color: .secondaryLabelColor)
             d.alignment = .right
@@ -1126,7 +1126,7 @@ final class StepRow: NSView {
 
 /// "5 min. ago", for list rows where the full form doesn't fit.
 func shortRelative(_ date: Date?) -> String {
-    guard let date else { return "—" }
+    guard let date else { return "-" }
     let f = RelativeDateTimeFormatter()
     f.unitsStyle = .short
     return f.localizedString(for: date, relativeTo: Date())
