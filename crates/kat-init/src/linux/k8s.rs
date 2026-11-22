@@ -139,27 +139,72 @@ pub fn stop_for_shutdown() {
     }
 }
 
-/// Ensure `/etc/containerd/config.toml` has CRI plugins enabled. Returns
-/// `true` if the file was modified (meaning an already-running `containerd`
-/// must be restarted to load CRI).
+const CRI_PLUGINS: [&str; 3] = [
+    "io.containerd.grpc.v1.cri",
+    "io.containerd.cri.v1.images",
+    "io.containerd.cri.v1.runtime",
+];
+
+/// Ensure `/etc/containerd/config.toml` has CRI plugins enabled while leaving
+/// any other entries in `disabled_plugins` untouched. Returns `true` if the
+/// file was modified (meaning an already-running `containerd` must be restarted
+/// to load CRI).
 pub fn ensure_containerd_cri() -> bool {
     let path = "/etc/containerd/config.toml";
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    if !text.contains("disabled_plugins") {
+    let Some(updated) = strip_cri_from_disabled_plugins(&text) else {
         return false;
-    }
-    let filtered: String = text
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("disabled_plugins"))
-        .map(|l| format!("{l}\n"))
-        .collect();
-    if let Err(e) = fs::write(path, filtered) {
+    };
+    if let Err(e) = fs::write(path, updated) {
         log(&format!("update {path}: {e}"));
         return false;
     }
     true
+}
+
+/// Remove only CRI plugin IDs from `disabled_plugins = [...]`, preserving all
+/// other disabled plugins. Returns `None` if no CRI plugin was disabled.
+fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("disabled_plugins")
+            && let Some(rhs) = rest.trim_start().strip_prefix('=')
+        {
+            let rhs = rhs.trim();
+            if let Some(inner) = rhs.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                let mut kept = Vec::new();
+                for item in inner.split(',') {
+                    let raw = item.trim();
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let unquoted = raw.trim_matches(|c| c == '"' || c == '\'');
+                    if CRI_PLUGINS.contains(&unquoted) {
+                        changed = true;
+                    } else {
+                        kept.push(raw);
+                    }
+                }
+                if changed {
+                    let indent = &line[..line.len() - trimmed.len()];
+                    if !kept.is_empty() {
+                        out.push_str(&format!(
+                            "{indent}disabled_plugins = [{}]\n",
+                            kept.join(", ")
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    changed.then_some(out)
 }
 
 impl K8s {
