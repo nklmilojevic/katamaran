@@ -446,8 +446,42 @@ impl Drop for MountSlotGuard {
     }
 }
 
+/// Resolve `dir` by canonicalizing the longest existing ancestor strictly
+/// above `dir` (never stating `dir` itself, which may hold a dead NFS mount),
+/// so the key stays identical before and after missing parent directories are
+/// created.
+fn stable_mount_path(dir: &Path) -> PathBuf {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let Some(name) = abs.file_name().map(std::ffi::OsStr::to_os_string) else {
+        return abs;
+    };
+    let mut tail = vec![name];
+    let mut cur = match abs.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return abs,
+    };
+    loop {
+        if let Ok(canon) = cur.canonicalize() {
+            let mut out = canon;
+            for part in tail.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match cur.file_name() {
+            Some(n) => {
+                tail.push(n.to_os_string());
+                if !cur.pop() {
+                    return abs;
+                }
+            }
+            None => return abs,
+        }
+    }
+}
+
 fn mount_slot_key(dir: &Path) -> String {
-    table_path(dir)
+    stable_mount_path(dir)
         .to_string_lossy()
         .trim_end_matches('/')
         .to_ascii_lowercase()
@@ -1020,5 +1054,27 @@ mod tests {
             *events.lock().unwrap(),
             vec!["mount1_done", "unmount1_done", "mount2_done"]
         );
+    }
+
+    #[test]
+    fn mount_slot_key_is_stable_before_and_after_parent_creation() {
+        let base = std::env::temp_dir().join(format!("kat-nfs-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mount_via_link = link.join("missing/nested/Katamaran");
+        let mount_via_real = real.join("missing/nested/Katamaran");
+        let key_before = mount_slot_key(&mount_via_link);
+        assert_eq!(key_before, mount_slot_key(&mount_via_real));
+
+        std::fs::create_dir_all(&mount_via_link).unwrap();
+        let key_after = mount_slot_key(&mount_via_link);
+        assert_eq!(key_before, key_after);
+        assert_eq!(key_after, mount_slot_key(&mount_via_real));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

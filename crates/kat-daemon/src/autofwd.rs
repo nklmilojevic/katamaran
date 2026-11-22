@@ -411,7 +411,11 @@ mod tests {
             "remove took {:?}",
             t.elapsed()
         );
-        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+        // The listening socket is closed as soon as remove() returns (bind
+        // avoids TCP ephemeral self-connect flakiness on closed high ports).
+        let rebound = TcpListener::bind(("127.0.0.1", port));
+        assert!(rebound.is_ok(), "still listening on {port}");
+        drop(rebound);
 
         // Releasing slots restores capacity when re-added.
         drop(c1);

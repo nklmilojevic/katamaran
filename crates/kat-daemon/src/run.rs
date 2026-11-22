@@ -493,7 +493,9 @@ fn session(
                 if docker {
                     mounted = true;
                     println!("  export DOCKER_HOST=unix://{}", docker_sock.display());
-                    if let Some((dir, port_file)) = files.clone() {
+                    if mount_task.is_none()
+                        && let Some((dir, port_file)) = files.clone()
+                    {
                         let tx = tx.clone();
                         let cancel = mount_cancel.clone();
                         match thread::Builder::new().name("nfs-mount-task".into()).spawn(
