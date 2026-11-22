@@ -154,6 +154,7 @@ pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
             break;
         }
         if let Err(e) = k8s::write(&mut s, &K8sMsg::Data(buf[..n].to_vec())) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
             return match read_answer(&mut s, progress) {
                 Err(guest) => Err(guest),
                 Ok(_) => Err(e.into()),
@@ -161,6 +162,7 @@ pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
         }
     }
     if let Err(e) = k8s::write(&mut s, &K8sMsg::DataEnd) {
+        let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
         return match read_answer(&mut s, progress) {
             Err(guest) => Err(guest),
             Ok(_) => Err(e.into()),

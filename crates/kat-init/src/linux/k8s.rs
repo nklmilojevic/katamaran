@@ -310,6 +310,40 @@ fn strip_toml_comment(line: &str) -> (&str, &str) {
     (line, "")
 }
 
+/// Split comma-separated TOML array items, ignoring commas inside quoted strings.
+fn split_toml_array_items(s: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if b == b'"' {
+            in_double = true;
+        } else if b == b'\'' {
+            in_single = true;
+        } else if b == b',' {
+            items.push(&s[start..i]);
+            start = i + 1;
+        }
+    }
+    items.push(&s[start..]);
+    items
+}
+
 /// Remove only CRI plugin IDs from `disabled_plugins = [...]`, preserving all
 /// other disabled plugins, unrelated `disabled_plugins` lines, inline comments,
 /// and supporting multiline arrays. Returns `None` if no CRI plugin was disabled.
@@ -325,6 +359,7 @@ fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
         if let Some(rest) = trimmed.strip_prefix("disabled_plugins")
             && let Some(rhs) = rest.trim_start().strip_prefix('=')
         {
+            // Strip any trailing `# ...` comment before inspecting `[` / `]`.
             let (code, comment) = strip_toml_comment(rhs);
             let code_trimmed = code.trim();
             if let Some(after_open) = code_trimmed.strip_prefix('[') {
@@ -332,7 +367,7 @@ fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
                     // Single-line array.
                     let mut line_changed = false;
                     let mut kept = Vec::new();
-                    for item in inner.split(',') {
+                    for item in split_toml_array_items(inner) {
                         let raw = item.trim();
                         if raw.is_empty() {
                             continue;
@@ -362,7 +397,8 @@ fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
                         continue;
                     }
                 } else {
-                    // Multiline array: find the closing `]`.
+                    // Multiline array: `after_open` already has any `# comment`
+                    // stripped from the opening line; find the closing `]`.
                     let mut end = None;
                     for (j, l) in lines.iter().enumerate().skip(i + 1) {
                         let (lcode, _) = strip_toml_comment(l);
@@ -386,7 +422,7 @@ fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
 
                         let mut block_changed = false;
                         let mut kept = Vec::new();
-                        for item in body.split(',') {
+                        for item in split_toml_array_items(&body) {
                             let raw = item.trim();
                             if raw.is_empty() {
                                 continue;
@@ -1878,7 +1914,7 @@ disabled_plugins = [
 
         let only_cri_multiline = "\
 version = 2
-disabled_plugins = [
+disabled_plugins = [ # opening comment ]
   \"io.containerd.grpc.v1.cri\",
   \"io.containerd.cri.v1.runtime\",
 ]
@@ -1886,6 +1922,18 @@ disabled_plugins = [
         assert_eq!(
             strip_cri_from_disabled_plugins(only_cri_multiline).unwrap(),
             "version = 2\n"
+        );
+
+        let opening_comment_with_kept = "\
+version = 2
+disabled_plugins = [ # note
+  \"io.containerd.grpc.v1.cri\",
+  \"io.containerd.snapshotter.v1.zfs\",
+]
+";
+        assert_eq!(
+            strip_cri_from_disabled_plugins(opening_comment_with_kept).unwrap(),
+            "version = 2\ndisabled_plugins = [\"io.containerd.snapshotter.v1.zfs\"]\n"
         );
     }
 
