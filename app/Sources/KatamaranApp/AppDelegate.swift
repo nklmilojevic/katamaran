@@ -28,10 +28,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return m
     }()
     private var mainCreated = false
+    private var headless = false
+    private var setupInFlight = false
+    private var daemonUpgradeTried = false
     private let args = CommandLine.arguments
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let headless = args.contains("--smoke-test") || args.contains("--snapshot")
+        headless = args.contains("--smoke-test") || args.contains("--snapshot")
         if !headless {
             Updater.shared.start()
         }
@@ -42,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.observe { [weak self] in
             self?.store.follow(self?.model.status)
             K8sStore.shared.follow(self?.model.status)
+            self?.upgradeDaemonIfNeeded()
         }
         store.onError = { [weak self] what, why in self?.showError(what, why) }
         K8sStore.shared.onError = { [weak self] what, why in self?.showError(what, why) }
@@ -68,28 +72,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static let setupKey = "firstRunSetupDone"
+    private static let setupVersionKey = "setupBundleVersion"
 
-    /// The first launch of an installed app runs `katamaran setup --default` once:
-    /// the LaunchAgent that keeps the daemon running, the `katamaran` Docker context
-    /// (set as the default) and the `kat` link. Subsequent launches make sure the
-    /// `katamaran` context is active. Development builds under target/ are left alone.
+    /// The first launch of an installed app — and the first launch after an
+    /// upgrade — runs `katamaran setup --default` so the LaunchAgent reloads the
+    /// current daemon binary, keeps the `katamaran` Docker context active, and
+    /// refreshes the `kat` link. Other launches only ensure the Docker context is
+    /// active. Development builds under target/ are left alone.
     private func runFirstSetupIfNeeded() {
         guard FirstRun.shouldRun(bundlePath: Bundle.main.bundlePath,
                                  env: ProcessInfo.processInfo.environment) else { return }
-        if UserDefaults.standard.bool(forKey: Self.setupKey) {
+        let stamp = FirstRun.bundleStamp(info: Bundle.main.infoDictionary)
+        let action = FirstRun.launchAction(
+            setupDone: UserDefaults.standard.bool(forKey: Self.setupKey),
+            lastStamp: UserDefaults.standard.string(forKey: Self.setupVersionKey),
+            currentStamp: stamp
+        )
+        switch action {
+        case .useContext:
             DispatchQueue.global().async {
                 _ = try? AppModel.runCLI(["use-context"])
             }
-            return
+        case .setup:
+            runSetup(stamp: stamp)
         }
+    }
+
+    /// If the running daemon still reports a different version than this app
+    /// bundle (for example after an in-place replacement or manual daemon start),
+    /// reload it once via `katamaran setup --default`.
+    private func upgradeDaemonIfNeeded() {
+        guard !headless,
+              FirstRun.shouldRun(bundlePath: Bundle.main.bundlePath,
+                                 env: ProcessInfo.processInfo.environment)
+        else { return }
+        let appVersion = FirstRun.appShortVersion(info: Bundle.main.infoDictionary)
+        guard FirstRun.shouldUpgradeDaemon(
+            daemonVersion: model.status?.versions.katamaran,
+            appVersion: appVersion,
+            alreadyTried: daemonUpgradeTried,
+            setupInFlight: setupInFlight
+        ) else { return }
+        runSetup(stamp: FirstRun.bundleStamp(info: Bundle.main.infoDictionary))
+    }
+
+    private func runSetup(stamp: String?) {
+        setupInFlight = true
+        daemonUpgradeTried = true
         DispatchQueue.global().async { [weak self] in
-            let result = Result { try AppModel.runCLI(["setup", "--default"]) }
+            // Allow enough time for a running VM to stop cleanly during bootout.
+            let result = Result { try AppModel.runCLI(["setup", "--default"], timeout: 120) }
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.setupInFlight = false
                 switch result {
                 case .success:
                     UserDefaults.standard.set(true, forKey: Self.setupKey)
-                    self.model.refresh()
+                    if let stamp {
+                        UserDefaults.standard.set(stamp, forKey: Self.setupVersionKey)
+                    }
+                    self.model.refresh(force: true)
                 case .failure(let e):
                     self.showError("Katamaran couldn’t finish setting up", e.localizedDescription)
                 }
@@ -387,10 +429,53 @@ extension MainSection {
 }
 
 enum FirstRun {
+    enum LaunchAction: Equatable {
+        case setup
+        case useContext
+    }
+
     /// Only installed copies set up launchd and Docker; a build in a source
     /// tree (or one pointed at another home) would replace the real ones.
     static func shouldRun(bundlePath: String, env: [String: String]) -> Bool {
         if env["KATAMARAN_HOME"].map({ !$0.isEmpty }) == true { return false }
         return !bundlePath.contains("/target/") && !bundlePath.contains("/.build/")
+    }
+
+    /// Bundle version + build stamp from Info.plist, used to detect upgrades.
+    static func bundleStamp(info: [String: Any]?) -> String? {
+        let short = nonEmpty(info?["CFBundleShortVersionString"] as? String)
+        let build = nonEmpty(info?["CFBundleVersion"] as? String)
+        switch (short, build) {
+        case let (s?, b?): return "\(s) (\(b))"
+        case let (s?, nil): return s
+        case let (nil, b?): return b
+        case (nil, nil): return nil
+        }
+    }
+
+    static func appShortVersion(info: [String: Any]?) -> String? {
+        nonEmpty(info?["CFBundleShortVersionString"] as? String)
+    }
+
+    static func launchAction(setupDone: Bool, lastStamp: String?, currentStamp: String?) -> LaunchAction {
+        if !setupDone { return .setup }
+        if let currentStamp, lastStamp != currentStamp { return .setup }
+        return .useContext
+    }
+
+    static func shouldUpgradeDaemon(daemonVersion: String?, appVersion: String?,
+                                    alreadyTried: Bool, setupInFlight: Bool) -> Bool {
+        guard !alreadyTried, !setupInFlight,
+              let daemonVersion = nonEmpty(daemonVersion),
+              let appVersion = nonEmpty(appVersion)
+        else { return false }
+        return daemonVersion != appVersion
+    }
+
+    private static func nonEmpty(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
     }
 }

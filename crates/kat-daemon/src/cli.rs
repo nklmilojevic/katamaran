@@ -62,16 +62,42 @@ pub enum ConfigCmd {
 }
 
 /// Make sure a daemon answers, starting one if needed.
+/// If an idle daemon is running a different version, recycle it so the current
+/// binary takes over cleanly.
 pub fn ensure_daemon() -> anyhow::Result<Client> {
-    if let Ok(c) = Client::connect_default() {
-        return Ok(c);
+    ensure_daemon_inner(false)
+}
+
+fn ensure_daemon_inner(mut recycled_stale: bool) -> anyhow::Result<Client> {
+    let sock = client::socket_path()?;
+    if let Ok(mut c) = Client::connect(&sock) {
+        if let Ok(status) = c.status()
+            && !status.state.is_active()
+            && status.versions.katamaran != env!("CARGO_PKG_VERSION")
+        {
+            let pid = Some(status.daemon.pid);
+            let _ = c.call(&Call::Shutdown);
+            crate::setup::wait_gone(&sock, pid, Duration::from_secs(70))?;
+            recycled_stale = true;
+        } else {
+            return Ok(c);
+        }
     }
-    if !crate::setup::kickstart_if_installed()? {
+    let started_by_launchd = if recycled_stale {
+        crate::setup::restart_launchd_for_current_exe()?
+    } else {
+        crate::setup::kickstart_if_installed()?
+    };
+    if !started_by_launchd {
         spawn_daemon()?;
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if let Ok(c) = Client::connect_default() {
+        if let Ok(mut c) = Client::connect(&sock) {
+            if recycled_stale {
+                let status = c.status()?;
+                verify_restarted_version(&status.versions.katamaran, env!("CARGO_PKG_VERSION"))?;
+            }
             return Ok(c);
         }
         if Instant::now() > deadline {
@@ -80,6 +106,15 @@ pub fn ensure_daemon() -> anyhow::Result<Client> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn verify_restarted_version(actual: &str, expected: &str) -> anyhow::Result<()> {
+    if actual != expected {
+        bail!(
+            "daemon restarted as version {actual}, expected {expected}; run `kat setup` to update the LaunchAgent"
+        );
+    }
+    Ok(())
 }
 
 /// Run `katamaran daemon` detached from this terminal.
@@ -97,8 +132,12 @@ fn spawn_daemon() -> anyhow::Result<()> {
 }
 
 pub fn start(args: StartArgs) -> anyhow::Result<()> {
+    start_with(args, false)
+}
+
+fn start_with(args: StartArgs, recycled_stale: bool) -> anyhow::Result<()> {
     let t = Instant::now();
-    let mut c = ensure_daemon()?;
+    let mut c = ensure_daemon_inner(recycled_stale)?;
     let status: Status = serde_json::from_value(c.call(&Call::Start)?)?;
     if status.docker.state == DockerState::Ready {
         let _ = crate::setup::ensure_default_docker_context();
@@ -144,14 +183,28 @@ pub fn stop() -> anyhow::Result<()> {
 }
 
 pub fn restart(args: StartArgs) -> anyhow::Result<()> {
-    if let Ok(mut c) = Client::connect(&client::socket_path()?)
-        && c.status()?.state.is_active()
-    {
-        let t = Instant::now();
-        c.call(&Call::Stop { wait: true })?;
-        println!("katamaran: stopped in {:.2} s", t.elapsed().as_secs_f64());
+    let sock = client::socket_path()?;
+    let mut recycled_stale = false;
+    if let Ok(mut c) = Client::connect(&sock) {
+        let s = c.status()?;
+        if s.versions.katamaran != env!("CARGO_PKG_VERSION") {
+            let t = Instant::now();
+            println!(
+                "katamaran: restarting daemon ({} -> {})",
+                s.versions.katamaran,
+                env!("CARGO_PKG_VERSION")
+            );
+            c.call(&Call::Shutdown)?;
+            crate::setup::wait_gone(&sock, Some(s.daemon.pid), Duration::from_secs(70))?;
+            println!("katamaran: stopped in {:.2} s", t.elapsed().as_secs_f64());
+            recycled_stale = true;
+        } else if s.state.is_active() {
+            let t = Instant::now();
+            c.call(&Call::Stop { wait: true })?;
+            println!("katamaran: stopped in {:.2} s", t.elapsed().as_secs_f64());
+        }
     }
-    start(args)
+    start_with(args, recycled_stale)
 }
 
 pub fn status(args: StatusArgs) -> anyhow::Result<()> {
@@ -176,6 +229,10 @@ pub fn status(args: StatusArgs) -> anyhow::Result<()> {
 
 /// The compact human view of a status.
 pub fn summary(s: &Status) -> String {
+    summary_for(s, env!("CARGO_PKG_VERSION"))
+}
+
+fn summary_for(s: &Status, cli_version: &str) -> String {
     let mut out = String::new();
     let mut line = |k: &str, v: String| out.push_str(&format!("  {k:<10} {v}\n"));
     let head = match (s.state, s.uptime_s) {
@@ -255,6 +312,15 @@ pub fn summary(s: &Status) -> String {
         versions.push_str(&format!(" · kernel {k}"));
     }
     line("versions", versions);
+    if s.versions.katamaran != cli_version {
+        line(
+            "upgrade",
+            format!(
+                "daemon is on {}, CLI is {cli_version}; run `kat restart` to upgrade",
+                s.versions.katamaran
+            ),
+        );
+    }
     if let Some(vm) = &s.vm
         && (vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib)
     {
@@ -390,6 +456,9 @@ pub fn version() -> anyhow::Result<()> {
             Some(k) => println!(", guest kernel {k}"),
             None => println!(),
         }
+        if v.katamaran != env!("CARGO_PKG_VERSION") {
+            println!("note      daemon version differs; run `kat restart` to upgrade");
+        }
     }
     Ok(())
 }
@@ -472,6 +541,23 @@ mod tests {
         assert!(
             !text.contains("k8s"),
             "default disabled k8s should be omitted: {text}"
+        );
+
+        let same = summary_for(&s, "0.1.0");
+        assert!(
+            !same.contains("upgrade"),
+            "matching daemon version should not warn: {same}"
+        );
+        let stale = summary_for(&s, "0.6.0");
+        assert!(
+            stale.contains("daemon is on 0.1.0, CLI is 0.6.0; run `kat restart` to upgrade"),
+            "mismatched daemon version should warn: {stale}"
+        );
+        assert!(verify_restarted_version("0.6.0", "0.6.0").is_ok());
+        let err = verify_restarted_version("0.1.0", "0.6.0").unwrap_err();
+        assert!(
+            err.to_string().contains("kat setup"),
+            "unexpected error: {err}"
         );
     }
 }

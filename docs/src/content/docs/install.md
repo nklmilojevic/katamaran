@@ -37,7 +37,7 @@ Open **Katamaran** from `/Applications` after Homebrew finishes.
 2. Drag `Katamaran.app` into `/Applications`.
 3. Open **Katamaran** from `/Applications`.
 
-On first launch, **Katamaran** runs `katamaran setup --default` automatically. Setup installs:
+On first launch (and after upgrades), **Katamaran** runs `katamaran setup --default` automatically. Setup installs:
 
 - A LaunchAgent in `~/Library/LaunchAgents/` that runs the `katamaran daemon` process at login
 - A Docker context named `katamaran` pointing to `unix://$HOME/.katamaran/run/docker.sock`, set as the default Docker context whenever Katamaran launches

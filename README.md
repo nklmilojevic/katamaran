@@ -135,7 +135,7 @@ Or install from the signed release disk image:
 2. Drag `Katamaran.app` into `/Applications`.
 3. Open **Katamaran**.
 
-On first launch, **Katamaran** runs `kat setup --default` automatically. Setup installs:
+On first launch (and after upgrades), **Katamaran** runs `kat setup --default` automatically. Setup installs:
 
 - A LaunchAgent that starts the daemon and VM when you log in
 - A Docker context named `katamaran` (set as the default Docker context whenever Katamaran launches)

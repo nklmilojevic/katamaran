@@ -133,6 +133,23 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+/// Extract the first `ProgramArguments` entry from a LaunchAgent XML plist.
+fn plist_executable(text: &str) -> Option<String> {
+    let after_key = text.split_once("<key>ProgramArguments</key>")?.1;
+    let after_array = after_key.split_once("<array>")?.1;
+    let after_start = after_array.split_once("<string>")?.1;
+    let raw = after_start.split_once("</string>")?.0;
+    Some(xml_unescape(raw))
+}
+
 /// The LaunchAgent: `katamaran daemon --start`, restarted after a crash
 /// (not after a clean exit, so `uninstall` and `daemon.shutdown` stick),
 /// with time to stop the VM on SIGTERM.
@@ -265,6 +282,57 @@ pub fn kickstart_if_installed() -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Restart the installed LaunchAgent for the currently running binary, if one
+/// is loaded. If the existing plist points at a different executable, rewrite
+/// and reload it first (subject to `guard_unsuffixed`) so launchd starts this
+/// binary rather than the old one.
+pub fn restart_launchd_for_current_exe() -> anyhow::Result<bool> {
+    let id = Identity::resolve(None)?;
+    let label = id.label();
+    if !is_loaded(&label) {
+        return Ok(false);
+    }
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let plist_file = plist_path(&label)?;
+    let target = service_target(&label);
+    let points_here = fs::read_to_string(&plist_file)
+        .ok()
+        .and_then(|text| plist_executable(&text))
+        .map(|p| {
+            let p = PathBuf::from(p);
+            p.canonicalize().unwrap_or(p) == exe
+        })
+        .unwrap_or(false);
+    if points_here {
+        launchctl(&["kickstart", "-k", &target])?;
+        return Ok(true);
+    }
+
+    guard_unsuffixed(&id, &exe)?;
+    let home = crate::state_dir()?;
+    let logs = home.join("logs");
+    fs::create_dir_all(&logs)?;
+    let cfg = Config::load(&home)?;
+    fs::create_dir_all(plist_file.parent().unwrap())?;
+    let home_env = std::env::var_os("KATAMARAN_HOME").map(|_| home.as_path());
+    fs::write(
+        &plist_file,
+        plist(&label, &exe, home_env, &logs, cfg.launch_at_login),
+    )
+    .with_context(|| format!("write {}", plist_file.display()))?;
+    launchctl(&["bootout", &target])?;
+    wait_unloaded(&label, Duration::from_secs(10))?;
+    launchctl(&[
+        "bootstrap",
+        &format!("gui/{}", uid()),
+        &plist_file.to_string_lossy(),
+    ])?;
+    if !cfg.launch_at_login {
+        launchctl(&["kickstart", &target])?;
+    }
+    Ok(true)
+}
+
 /// Refuse to install the real label from a development build, unless asked
 /// to: a build under `target/` is a development copy.
 fn guard_unsuffixed(id: &Identity, exe: &Path) -> anyhow::Result<()> {
@@ -292,22 +360,26 @@ pub fn setup(args: SetupArgs) -> anyhow::Result<()> {
     let label = id.label();
     let cfg = Config::load(&home)?;
 
-    // A daemon that is not launchd's must make way, or the agent's daemon
-    // would find the home locked.
+    // Remember whether the VM was active so an upgrade brings it back even when
+    // `launch_at_login` is off (RunAtLoad = false). A daemon that is not
+    // launchd's must also make way, or the agent's daemon would find the home
+    // locked.
     let sock = crate::client::socket_path()?;
+    let mut was_up = false;
+    let mut running_pid = None;
     if let Ok(mut c) = Client::connect(&sock)
         && let Ok(status) = c.status()
-        && status.daemon.launchd_label.as_deref() != Some(label.as_str())
     {
-        println!(
-            "Handing the running daemon (pid {}) over to launchd",
-            status.daemon.pid
-        );
-        let was_up = status.state.is_active();
-        c.call(&crate::api::Call::Shutdown)?;
-        wait_gone(&sock, Duration::from_secs(70))?;
-        if was_up && !cfg.launch_at_login {
-            println!("The VM was stopped; `katamaran start` brings it back.");
+        was_up = status.state.is_active();
+        running_pid = Some(status.daemon.pid);
+        if status.daemon.launchd_label.as_deref() != Some(label.as_str()) {
+            println!(
+                "Handing the running daemon (pid {}) over to launchd",
+                status.daemon.pid
+            );
+            c.call(&crate::api::Call::Shutdown)?;
+            wait_gone(&sock, running_pid, Duration::from_secs(70))?;
+            running_pid = None;
         }
     }
 
@@ -321,7 +393,7 @@ pub fn setup(args: SetupArgs) -> anyhow::Result<()> {
     .with_context(|| format!("write {}", plist_file.display()))?;
     if is_loaded(&label) {
         launchctl(&["bootout", &service_target(&label)])?;
-        wait_gone(&sock, Duration::from_secs(70))?;
+        wait_gone(&sock, running_pid, Duration::from_secs(70))?;
         wait_unloaded(&label, Duration::from_secs(10))?;
     }
     launchctl(&[
@@ -329,6 +401,9 @@ pub fn setup(args: SetupArgs) -> anyhow::Result<()> {
         &format!("gui/{}", uid()),
         &plist_file.to_string_lossy(),
     ])?;
+    if was_up && !cfg.launch_at_login {
+        launchctl(&["kickstart", &service_target(&label)])?;
+    }
     println!("LaunchAgent  {label} ({})", plist_file.display());
 
     match docker_context(&id.context(), &home.join("run/docker.sock"), args.default) {
@@ -357,16 +432,21 @@ pub fn uninstall(args: UninstallArgs) -> anyhow::Result<()> {
     let label = id.label();
     let plist_file = plist_path(&label)?;
     let sock = crate::client::socket_path()?;
+    let running_pid = Client::connect(&sock)
+        .ok()
+        .and_then(|mut c| c.status().ok())
+        .map(|s| s.daemon.pid);
     if is_loaded(&label) {
         // launchd sends SIGTERM; the daemon stops the VM before it exits.
         launchctl(&["bootout", &service_target(&label)])?;
-        wait_gone(&sock, Duration::from_secs(70))?;
+        wait_gone(&sock, running_pid, Duration::from_secs(70))?;
         println!("Stopped and unloaded {label}");
     }
     // A daemon started by the CLI rather than launchd.
     if let Ok(mut c) = Client::connect(&sock) {
+        let pid = c.status().ok().map(|s| s.daemon.pid);
         c.call(&crate::api::Call::Shutdown)?;
-        wait_gone(&sock, Duration::from_secs(70))?;
+        wait_gone(&sock, pid, Duration::from_secs(70))?;
         println!("Stopped the daemon");
     }
     if plist_file.exists() {
@@ -393,16 +473,27 @@ pub fn uninstall(args: UninstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wait until nothing answers on the daemon socket.
-fn wait_gone(sock: &Path, timeout: Duration) -> anyhow::Result<()> {
+/// Wait until nothing answers on the daemon socket and (if known) its PID has exited.
+pub fn wait_gone(sock: &Path, pid: Option<u32>, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
-    while Client::connect(sock).is_ok() {
+    while Client::connect(sock).is_ok() || pid.is_some_and(pid_alive) {
         if Instant::now() > deadline {
             bail!("the daemon did not exit within {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // Signal 0 only checks process existence without delivering a signal.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Wait until launchd finishes tearing down `label` after `bootout`.
@@ -653,5 +744,18 @@ mod tests {
         let no_home = plist("l", Path::new("/k"), None, Path::new("/l"), false);
         assert!(!no_home.contains("EnvironmentVariables"));
         assert!(no_home.contains("<key>RunAtLoad</key>\n\t<false/>"));
+        assert_eq!(plist_executable(&p).as_deref(), Some("/opt/k&k/katamaran"));
+        assert_eq!(plist_executable(&no_home).as_deref(), Some("/k"));
+        assert_eq!(plist_executable("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn pid_alive_handles_edge_cases() {
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(u32::MAX));
+        assert!(pid_alive(std::process::id()));
+        // Non-existent socket with no PID returns immediately.
+        let sock = std::env::temp_dir().join(format!("kat-missing-{}.sock", std::process::id()));
+        wait_gone(&sock, None, Duration::from_secs(1)).unwrap();
     }
 }
