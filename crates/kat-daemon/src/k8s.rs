@@ -110,7 +110,7 @@ pub fn request_stream(
     read_answer(s, progress)
 }
 
-fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow::Result<K8sMsg> {
+pub fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow::Result<K8sMsg> {
     loop {
         match k8s::read(&mut *s)? {
             Some(K8sMsg::Progress(p)) => progress(&p),

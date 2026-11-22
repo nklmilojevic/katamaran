@@ -1295,9 +1295,13 @@ impl Daemon {
             if needs_wait_docker {
                 self.wait_for_docker_ready(was_stopped)?;
             }
+            let mut stream =
+                crate::k8s::connect(&self.home).map_err(|e| failed(format!("{e:#}")))?;
+            kat_proto::k8s::write(&mut stream, &kat_proto::k8s::K8sMsg::Reset)
+                .map_err(|e| failed(format!("{e:#}")))?;
             guest_reset_attempted = true;
             let mut noop = |_: &str| {};
-            crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Reset, &mut noop)
+            crate::k8s::read_answer(&mut stream, &mut noop)
                 .map_err(|e| failed(format!("{e:#}")))?;
             Ok(())
         })();
@@ -1947,6 +1951,72 @@ mod tests {
         }
         let err = d.k8s_stop_inner(true, false).unwrap_err();
         assert!(err.message.contains("still busy"), "got: {}", err.message);
+        guest.join().unwrap();
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_only_tears_down_host_state_after_reset_request_is_sent() {
+        let home = temp("k8s-reset");
+        let d = Daemon::new(home.clone());
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "dummy-kc").unwrap();
+
+        // 1. Connection failure before Reset is sent must NOT tear down running host state.
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+        let err = d.k8s_reset().unwrap_err();
+        assert!(
+            err.message.contains("not running"),
+            "unexpected err: {}",
+            err.message
+        );
+        {
+            let k = d.k8s.lock().unwrap();
+            assert_eq!(k.state, "running");
+            assert_eq!(k.kubeconfig.as_deref(), Some(kc.as_path()));
+            assert_eq!(k.epoch, 0);
+        }
+        assert!(kc.exists());
+
+        // 2. Once guest receives Reset and fails mid-cleanup, host state and kubeconfig ARE torn down.
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset);
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error("remove data failed".into()),
+            )
+            .unwrap();
+        });
+        let err = d.k8s_reset().unwrap_err();
+        assert!(
+            err.message.contains("remove data failed"),
+            "unexpected err: {}",
+            err.message
+        );
+        {
+            let k = d.k8s.lock().unwrap();
+            assert_eq!(k.state, "stopped");
+            assert!(k.kubeconfig.is_none());
+            assert_eq!(k.epoch, 1);
+            assert!(
+                k.error
+                    .as_deref()
+                    .is_some_and(|m| m.contains("remove data failed"))
+            );
+        }
+        assert!(!kc.exists());
         guest.join().unwrap();
 
         fs::remove_dir_all(&home).unwrap();
