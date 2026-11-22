@@ -442,8 +442,14 @@ struct ChunkedDecoder {
                 guard let nl = buffer[i...].firstIndex(of: 0x0A) else { break loop }
                 var line = String(decoding: buffer[i..<nl], as: UTF8.self)
                 if line.hasSuffix("\r") { line.removeLast() }
-                let hex = line.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
-                guard let size = Int(hex, radix: 16) else { throw SocketError.protocolError("bad chunk size") }
+                let hex = line.split(separator: ";", omittingEmptySubsequences: false).first
+                    .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+                let isASCIIHex = !hex.isEmpty && hex.utf8.allSatisfy { b in
+                    (0x30...0x39).contains(b) || (0x41...0x46).contains(b) || (0x61...0x66).contains(b)
+                }
+                guard isASCIIHex, let size = Int(hex, radix: 16), size >= 0 else {
+                    throw SocketError.protocolError("bad chunk size")
+                }
                 i = nl + 1
                 if size == 0 { finished = true } else { state = .data(size) }
             case .data(let left):
@@ -454,6 +460,9 @@ struct ChunkedDecoder {
                 state = left == n ? .crlf : .data(left - n)
             case .crlf:
                 guard buffer.count - i >= 2 else { break loop }
+                guard buffer[i] == 0x0D && buffer[i + 1] == 0x0A else {
+                    throw SocketError.protocolError("bad chunk terminator")
+                }
                 i += 2
                 state = .size
             }
@@ -470,11 +479,17 @@ struct LineSplitter {
     mutating func feed(_ data: Data) -> [Data] {
         pending.append(data)
         var lines: [Data] = []
-        while let nl = pending.firstIndex(of: 0x0A) {
-            var line = pending[pending.startIndex..<nl]
-            if line.last == 0x0D { line = line.dropLast() }
-            lines.append(Data(line))
-            pending = Data(pending[pending.index(after: nl)...])
+        var start = pending.startIndex
+        while let nl = pending[start...].firstIndex(of: 0x0A) {
+            var end = nl
+            if end > start && pending[pending.index(before: end)] == 0x0D {
+                end = pending.index(before: end)
+            }
+            lines.append(Data(pending[start..<end]))
+            start = pending.index(after: nl)
+        }
+        if start > pending.startIndex {
+            pending = start < pending.endIndex ? Data(pending[start...]) : Data()
         }
         return lines
     }
@@ -515,6 +530,14 @@ struct LogDemuxer {
 
 // MARK: - Client
 
+/// Parsed HTTP/1.1 response status line and framing headers.
+struct HTTPResponseHead: Equatable {
+    let code: Int
+    let chunked: Bool
+    let contentLength: Int?
+    let connectionClose: Bool
+}
+
 /// Just enough HTTP/1.1 for the Docker Engine API on a Unix socket. Blocking:
 /// call it off the main thread.
 struct DockerClient: Sendable {
@@ -542,27 +565,91 @@ struct DockerClient: Sendable {
         guard let sep = raw.range(of: Data("\r\n\r\n".utf8)) else {
             throw SocketError.protocolError("incomplete HTTP response")
         }
-        let (code, chunked) = try parseHead(raw[raw.startIndex..<sep.lowerBound])
+        let head = try parseResponseHead(raw[raw.startIndex..<sep.lowerBound])
         var body = Data(raw[sep.upperBound...])
-        if chunked {
+        if head.chunked {
             var d = ChunkedDecoder()
             body = try d.feed(body)
+            guard d.finished else { throw SocketError.protocolError("truncated chunked response") }
         }
-        return (code, body)
+        return (head.code, body)
     }
 
-    /// The status code, and whether the body is chunked.
-    static func parseHead(_ head: Data) throws -> (Int, Bool) {
+    /// Parses the status code and framing headers from an HTTP response head.
+    static func parseResponseHead(_ head: Data) throws -> HTTPResponseHead {
         let lines = String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n")
         let parts = lines.first?.split(separator: " ") ?? []
         guard parts.count >= 2, let code = Int(parts[1]) else {
             throw SocketError.protocolError("bad status line")
         }
-        let chunked = lines.dropFirst().contains {
-            let l = $0.lowercased()
-            return l.hasPrefix("transfer-encoding:") && l.contains("chunked")
+        var chunked = false
+        var contentLength: Int? = nil
+        var connectionClose = false
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let val = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces).lowercased()
+            if name == "transfer-encoding" && val.contains("chunked") {
+                chunked = true
+            } else if name == "content-length", let n = Int(val), n >= 0 {
+                contentLength = n
+            } else if name == "connection" && val.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).contains("close") {
+                connectionClose = true
+            }
         }
-        return (code, chunked)
+        return HTTPResponseHead(code: code, chunked: chunked, contentLength: contentLength, connectionClose: connectionClose)
+    }
+
+    /// The status code, and whether the body is chunked.
+    static func parseHead(_ head: Data) throws -> (Int, Bool) {
+        let parsed = try parseResponseHead(head)
+        return (parsed.code, parsed.chunked)
+    }
+
+    /// Reads an HTTP error body without blocking indefinitely on keep-alive sockets.
+    static func readErrorBody(
+        from sock: UnixSocket,
+        head: HTTPResponseHead,
+        initial: Data,
+        maxBytes: Int = 65_536,
+        timeout: TimeInterval = 2
+    ) -> Data {
+        if head.code == 204 || head.code == 304 { return Data() }
+        sock.setTimeout(timeout)
+        if head.chunked {
+            var decoder = ChunkedDecoder()
+            var out = Data()
+            func append(_ piece: Data) {
+                let remaining = maxBytes - out.count
+                if remaining > 0 { out.append(piece.prefix(remaining)) }
+            }
+            if let piece = try? decoder.feed(initial) {
+                append(piece)
+            } else {
+                return Data(initial.prefix(maxBytes))
+            }
+            while !decoder.finished && out.count < maxBytes {
+                guard let more = try? sock.read(), !more.isEmpty else { break }
+                guard let piece = try? decoder.feed(more) else { break }
+                append(piece)
+            }
+            return out
+        }
+        if let length = head.contentLength {
+            let target = min(length, maxBytes)
+            var rest = Data(initial.prefix(maxBytes))
+            while rest.count < target {
+                guard let more = try? sock.read(max: min(65_536, maxBytes - rest.count)), !more.isEmpty else { break }
+                rest.append(more.prefix(maxBytes - rest.count))
+            }
+            return rest
+        }
+        var rest = Data(initial.prefix(maxBytes))
+        while rest.count < maxBytes {
+            guard let more = try? sock.read(max: min(65_536, maxBytes - rest.count)), !more.isEmpty else { break }
+            rest.append(more.prefix(maxBytes - rest.count))
+        }
+        return rest
     }
 
     /// Docker's `{"message": …}`, or the status code.
@@ -609,7 +696,9 @@ struct DockerClient: Sendable {
     }
 
     func removeVolume(_ name: String) throws { try send("DELETE", "/volumes/\(percent(name))") }
-    func removeImage(_ id: String) throws { try send("DELETE", "/images/\(percent(id))?force=1") }
+    func removeImage(_ id: String, force: Bool = true) throws {
+        try send("DELETE", "/images/\(percent(id))\(force ? "?force=1" : "")")
+    }
     func removeNetwork(_ id: String) throws { try send("DELETE", "/networks/\(percent(id))") }
 
     /// Remove everything of `kind` that nothing uses; returns the bytes freed.
@@ -701,13 +790,12 @@ final class DockerStream: @unchecked Sendable {
                     break
                 }
             }
-            let (code, chunked) = try DockerClient.parseHead(head)
-            guard code == 200 else {
-                var rest = body
-                while let more = try? sock.read(), !more.isEmpty { rest.append(more) }
-                if chunked, let d = try? { var c = ChunkedDecoder(); return try c.feed(rest) }() { rest = d }
-                throw DockerClient.failure(code, rest)
+            let parsed = try DockerClient.parseResponseHead(head)
+            guard parsed.code == 200 else {
+                let rest = DockerClient.readErrorBody(from: sock, head: parsed, initial: body)
+                throw DockerClient.failure(parsed.code, rest)
             }
+            let chunked = parsed.chunked
             var decoder = ChunkedDecoder()
             func pass(_ d: Data) throws { deliver(chunked ? try decoder.feed(d) : d) }
             try pass(body)

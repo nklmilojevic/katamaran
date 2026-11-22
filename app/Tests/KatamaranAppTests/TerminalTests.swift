@@ -193,6 +193,60 @@ private final class Collector: @unchecked Sendable {
     #expect(message.contains("kat-test-no-such.sock"))
 }
 
+@MainActor
+@Test func execAttachDoesNotDeadlockOnKeepAliveStartError() async throws {
+    let path = "/tmp/kat-exec-ka-\(getpid())-\(UInt32.random(in: 0...UInt32.max)).sock"
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard rc == 0, listen(fd, 8) == 0 else { throw SocketError.io(errno) }
+    let release = DispatchSemaphore(value: 0)
+    defer {
+        release.signal()
+        close(fd)
+        unlink(path)
+    }
+    Thread {
+        for _ in 0..<2 {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            Thread {
+                var buf = [UInt8](repeating: 0, count: 4096)
+                let n = read(c, &buf, buf.count)
+                let req = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+                if req.hasPrefix("POST /containers/") {
+                    let resp = "HTTP/1.1 201 Created\r\nContent-Length: 13\r\n\r\n{\"Id\":\"e999\"}"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                    close(c)
+                } else {
+                    let body = #"{"message":"container is not running"}"#
+                    let resp = "HTTP/1.1 409 Conflict\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                    // Hold connection open (keep-alive) to verify ExecAttach stops at Content-Length.
+                    _ = release.wait(timeout: .now() + 5)
+                    close(c)
+                }
+            }.start()
+        }
+    }.start()
+
+    let t0 = Date()
+    let attach = ExecAttach(socketPath: path, container: "web", cols: 80, rows: 24)
+    let ended = AsyncStream<ExecAttach.End> { cont in
+        attach.onEnd = { cont.yield($0); cont.finish() }
+    }
+    attach.start()
+    var end: ExecAttach.End?
+    for await e in ended { end = e }
+    #expect(end == .failed("container is not running"))
+    #expect(Date().timeIntervalSince(t0) < 1.5)
+}
+
 // MARK: The engine through Swift
 
 @Test func gridSnapshotReadsTheEngine() {

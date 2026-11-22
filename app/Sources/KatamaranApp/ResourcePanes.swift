@@ -529,7 +529,7 @@ final class ImagesPane: ResourcePane {
         let inUse = image(key).map { !store.containers(usingImage: $0).isEmpty } ?? false
         store.perform("Couldn’t delete \(name)") { client in
             // Forcing an image that a container uses only untags it; let Docker say no instead.
-            if inUse { try client.send("DELETE", "/images/\(key)") } else { try client.removeImage(key) }
+            try client.removeImage(key, force: !inUse)
         }
     }
 

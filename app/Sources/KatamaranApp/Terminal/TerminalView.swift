@@ -20,6 +20,7 @@ final class TerminalView: NSView, NSTextInputClient, NSMenuItemValidation {
     private var shaper: FontShaper?
     private(set) var cols = 80
     private(set) var rows = 24
+    private var lastCellSize: (width: Int, height: Int) = (0, 0)
     private var theme = TerminalTheme.dark
     private let renderSignal = RenderSignal()
 
@@ -184,9 +185,11 @@ final class TerminalView: NSView, NSTextInputClient, NSMenuItemValidation {
     private func updateGridSize() {
         guard let s = shaper, bounds.width > 0, bounds.height > 0 else { return }
         let (c, r) = fittingGrid()
-        guard c != cols || r != rows || renderer.snapshot.cols != c else { return }
+        let cellSize = (width: s.cellWidth, height: s.cellHeight)
+        guard c != cols || r != rows || renderer.snapshot.cols != c || renderer.snapshot.rows != r || cellSize != lastCellSize else { return }
         cols = c
         rows = r
+        lastCellSize = cellSize
         term.resize(cols: c, rows: r, cellWidth: s.cellWidth, cellHeight: s.cellHeight)
         onResize(c, r)
     }

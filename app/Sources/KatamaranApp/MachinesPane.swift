@@ -198,6 +198,7 @@ final class MachinesViewController: NSViewController {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.busy.remove(name)
+                    self.render()
                     if let err { NSAlert(error: err).runModal() }
                     self.refresh()
                 }
@@ -253,6 +254,7 @@ final class MachinesViewController: NSViewController {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.busy.remove(name)
+                self.render()
                 if let err { NSAlert(error: err).runModal() }
                 self.refresh()
             }
@@ -262,9 +264,13 @@ final class MachinesViewController: NSViewController {
     /// `katamaran shell <name>` in Terminal, through a .command file.
     @objc private func openShell(_ sender: NSButton) {
         guard let name = sender.identifier?.rawValue else { return }
-        let env = ProcessInfo.processInfo.environment["KATAMARAN_HOME"].map { "export KATAMARAN_HOME='\($0)'\n" } ?? ""
-        let script = "#!/bin/sh\n\(env)exec '\(AppModel.cliPath())' shell '\(name)'\n"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("katamaran-shell-\(name).command")
+        let script = MachineShellCommand.script(
+            name: name,
+            cliPath: AppModel.cliPath(),
+            katamaranHome: ProcessInfo.processInfo.environment["KATAMARAN_HOME"]
+        )
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(MachineShellCommand.filename(for: name))
         do {
             try script.write(to: url, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
@@ -272,6 +278,26 @@ final class MachinesViewController: NSViewController {
         } catch {
             NSAlert(error: error).runModal()
         }
+    }
+}
+
+/// Builds the `.command` script and safe filename for opening a machine shell in Terminal.
+enum MachineShellCommand {
+    static func script(name: String, cliPath: String, katamaranHome: String?) -> String {
+        let env = katamaranHome.map { "export KATAMARAN_HOME=\(shellQuote($0))\n" } ?? ""
+        return "#!/bin/sh\n\(env)exec \(shellQuote(cliPath)) shell \(shellQuote(name))\n"
+    }
+
+    static func filename(for name: String) -> String {
+        let sanitized = String(name.unicodeScalars.map { s -> Character in
+            let isSafe = ("a"..."z").contains(s)
+                || ("A"..."Z").contains(s)
+                || ("0"..."9").contains(s)
+                || s == "-" || s == "_"
+            return isSafe ? Character(s) : "_"
+        })
+        let stem = sanitized.isEmpty ? "machine" : String(sanitized.prefix(64))
+        return "katamaran-shell-\(stem).command"
     }
 }
 

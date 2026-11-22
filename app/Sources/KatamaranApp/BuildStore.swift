@@ -92,7 +92,17 @@ final class BuildLog {
     private(set) var finished = false
     private(set) var error: String?
     fileprivate var process: Process?
+    fileprivate var readHandle: FileHandle?
+    fileprivate var cancelled = false
     private var splitter = LineSplitter()
+
+    fileprivate func cancel() {
+        cancelled = true
+        readHandle?.readabilityHandler = nil
+        readHandle = nil
+        if let p = process, p.isRunning { p.terminate() }
+        process = nil
+    }
 
     fileprivate func append(_ data: Data) {
         for l in splitter.feed(data) { add(String(decoding: l, as: UTF8.self)) }
@@ -108,6 +118,7 @@ final class BuildLog {
         if let rest = splitter.flush() { add(String(decoding: rest, as: UTF8.self)) }
         finished = true
         self.error = error
+        readHandle = nil
         process = nil
     }
 
@@ -140,6 +151,8 @@ final class BuildStore {
     private(set) var infos: [String: BuildInfo] = [:]
     private var logs: [String: BuildLog] = [:]
     private var fetchingInfo: Set<String> = []
+    private var failedInfo: Set<String> = []
+    private var prefetchingInfo = false
     private var fetchingList = false
     private var timer: Timer?
     private var ticker: Timer?
@@ -168,9 +181,12 @@ final class BuildStore {
     func follow(_ socket: String?) {
         guard socket != self.socket else { return }
         self.socket = socket
-        logs.values.forEach { $0.process?.terminate() }
+        logs.values.forEach { $0.cancel() }
         logs = [:]
         infos = [:]
+        fetchingInfo = []
+        failedInfo = []
+        prefetchingInfo = false
         records = []
         loaded = false
         loadError = nil
@@ -221,7 +237,7 @@ final class BuildStore {
         if !visible {
             // Live logs only stream while someone watches.
             for (id, log) in logs where !log.finished {
-                log.process?.terminate()
+                log.cancel()
                 logs[id] = nil
             }
         } else {
@@ -233,17 +249,17 @@ final class BuildStore {
         guard let cli, !fetchingList else { return }
         fetchingList = true
         let sock = socket
-        Task.detached {
+        BlockingIO.run(on: BlockingIO.buildx) {
             var list: [BuildRecord]? = nil
             var problem: String? = nil
             do { list = BuildRecord.parseList(try cli.run(["history", "ls", "--format", "json"])) }
             catch { problem = error.localizedDescription }
-            let (l, p) = (list, problem)
-            await MainActor.run {
-                self.fetchingList = false
-                guard self.socket == sock else { return }
-                self.apply(l, error: p)
-            }
+            return (list, problem)
+        } completion: { [weak self] l, p in
+            guard let self else { return }
+            self.fetchingList = false
+            guard self.socket == sock else { return }
+            self.apply(l, error: p)
         }
     }
 
@@ -260,37 +276,71 @@ final class BuildStore {
         // Builds that just finished: their details and logs are final now.
         for id in wasRunning where !(record(id)?.isRunning ?? true) {
             infos[id] = nil
+            failedInfo.remove(id)
             if logs[id]?.finished == true || logs[id]?.process == nil { logs[id] = nil }
         }
         for id in infos.keys where !ids.contains(id) { infos[id] = nil }
-        for id in logs.keys where !ids.contains(id) { logs[id]?.process?.terminate(); logs[id] = nil }
+        failedInfo = failedInfo.intersection(ids)
+        for id in logs.keys where !ids.contains(id) { logs[id]?.cancel(); logs[id] = nil }
         if wasRunning != Set(running.map(\.id)) { activityChanged() }
         if visible { fetchInfos() }
         if dirty { changed() }
     }
 
-    /// Details for the latest builds, one at a time, newest first; finished ones are kept.
-    private func fetchInfos() {
-        guard let cli, fetchingInfo.isEmpty else { return }
-        let want = records.prefix(60).first { infos[$0.id] == nil || $0.isRunning && infos[$0.id]?.status != .running }
-        guard let r = want, !(r.isRunning && infos[r.id] != nil) else { return }
-        fetchingInfo.insert(r.id)
+    /// Selects the next build record (within `limit`) needing an `inspect` fetch,
+    /// skipping builds already fetched, currently in flight, or known to have failed.
+    nonisolated static func nextInfoToFetch(
+        records: [BuildRecord],
+        infos: [String: BuildInfo],
+        fetching: Set<String>,
+        failed: Set<String>,
+        limit: Int = 60
+    ) -> String? {
+        records.prefix(limit).first { r in
+            !fetching.contains(r.id) && !failed.contains(r.id) && infos[r.id] == nil
+        }?.id
+    }
+
+    private func fetchInfo(for id: String, isPrefetch: Bool) {
+        guard let cli, !fetchingInfo.contains(id) else {
+            if isPrefetch { prefetchingInfo = false }
+            return
+        }
+        fetchingInfo.insert(id)
         let sock = socket
-        Task.detached {
-            let info = try? BuildInfo.parse(cli.run(["history", "inspect", r.id, "--format", "json"]))
-            await MainActor.run {
-                self.fetchingInfo.remove(r.id)
-                guard self.socket == sock, self.record(r.id) != nil else { return }
-                if let info { self.infos[r.id] = info; self.changed() }
-                if info != nil { self.fetchInfos() }
+        BlockingIO.run(on: BlockingIO.buildx) {
+            try? BuildInfo.parse(cli.run(["history", "inspect", id, "--format", "json"]))
+        } completion: { [weak self] info in
+            guard let self else { return }
+            self.fetchingInfo.remove(id)
+            if isPrefetch { self.prefetchingInfo = false }
+            guard self.socket == sock, self.record(id) != nil else { return }
+            if let info {
+                self.failedInfo.remove(id)
+                self.infos[id] = info
+                self.changed()
+            } else {
+                self.failedInfo.insert(id)
             }
+            if isPrefetch { self.fetchInfos() }
         }
     }
 
-    /// Details now, for the selected build.
+    /// Details for the latest builds, one at a time, newest first; finished ones are kept.
+    private func fetchInfos() {
+        guard cli != nil, !prefetchingInfo else { return }
+        guard let id = Self.nextInfoToFetch(records: records, infos: infos, fetching: fetchingInfo, failed: failedInfo) else { return }
+        prefetchingInfo = true
+        fetchInfo(for: id, isPrefetch: true)
+    }
+
+    /// Details now, for the selected build (even beyond the latest 60).
     func info(_ id: String) -> BuildInfo? {
-        if infos[id] == nil, fetchingInfo.isEmpty { fetchInfos() }
-        return infos[id]
+        if let existing = infos[id] { return existing }
+        if record(id) != nil, !fetchingInfo.contains(id), !failedInfo.contains(id) {
+            fetchInfo(for: id, isPrefetch: false)
+        }
+        return nil
     }
 
     /// The build's progress: streamed while it runs, read once when it's done.
@@ -305,36 +355,59 @@ final class BuildStore {
             let out = Pipe()
             p.standardOutput = out
             p.standardError = out
-            out.fileHandleForReading.readabilityHandler = { [weak log] h in
-                let d = h.availableData
-                guard !d.isEmpty else { h.readabilityHandler = nil; return }
-                DispatchQueue.main.async { log?.append(d); self.changed() }
-            }
-            p.terminationHandler = { [weak log] p in
-                let code = p.terminationStatus
+            let readHandle = out.fileHandleForReading
+            let coord = StreamCompletion()
+            let finishOnMain: @Sendable (Int32) -> Void = { [weak self, weak log] code in
                 DispatchQueue.main.async {
-                    guard let log else { return }
-                    log.finish(code == 0 ? nil : "The build’s progress stopped.")
-                    self.changed()
-                    self.refresh()
+                    MainActor.assumeIsolated {
+                        guard let log, !log.cancelled else { return }
+                        log.finish(code == 0 ? nil : "The build’s progress stopped.")
+                        self?.changed()
+                        self?.refresh()
+                    }
                 }
             }
+
+            readHandle.readabilityHandler = { [weak self, weak log] h in
+                let d = h.availableData
+                if d.isEmpty {
+                    h.readabilityHandler = nil
+                    if let code = coord.markEOF() { finishOnMain(code) }
+                    return
+                }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let log, !log.cancelled else { return }
+                        log.append(d)
+                        self?.changed()
+                    }
+                }
+            }
+            p.terminationHandler = { p in
+                if let code = coord.markExited(p.terminationStatus) { finishOnMain(code) }
+            }
             log.process = p
-            do { try p.run() } catch { log.finish(error.localizedDescription) }
+            log.readHandle = readHandle
+            do {
+                try p.run()
+            } catch {
+                readHandle.readabilityHandler = nil
+                p.terminationHandler = nil
+                log.finish(error.localizedDescription)
+            }
         } else {
             let sock = socket
-            Task.detached {
+            BlockingIO.run(on: BlockingIO.buildx) {
                 var text = "", problem: String? = nil
                 do { text = String(decoding: try cli.run(["history", "logs", id, "--progress", "plain"], timeout: 60, progress: true), as: UTF8.self) }
                 catch { problem = error.localizedDescription }
-                let (t, p) = (text, problem)
-                await MainActor.run {
-                    guard self.socket == sock, self.logs[id] === log else { return }
-                    log.set(t)
-                    if let p { log.finish(p) }
-                    self.trimLogs(keeping: id)
-                    self.changed()
-                }
+                return (text, problem)
+            } completion: { [weak self] t, p in
+                guard let self, self.socket == sock, self.logs[id] === log else { return }
+                log.set(t)
+                if let p { log.finish(p) }
+                self.trimLogs(keeping: id)
+                self.changed()
             }
         }
         return log
@@ -368,14 +441,39 @@ final class BuildStore {
     }
 
     private func perform(_ what: String, _ body: @escaping @Sendable () throws -> Void) {
-        Task.detached {
+        BlockingIO.run(on: BlockingIO.buildx) {
             var failure: String? = nil
             do { try body() } catch { failure = error.localizedDescription }
-            let err = failure
-            await MainActor.run {
-                if let err { self.onError(what, err) }
-                self.refresh()
-            }
+            return failure
+        } completion: { [weak self] err in
+            guard let self else { return }
+            if let err { self.onError(what, err) }
+            self.refresh()
         }
+    }
+}
+
+/// Coordinates pipe EOF from `readabilityHandler` and process exit from `terminationHandler`
+/// so tail lines are never dropped regardless of callback ordering.
+private final class StreamCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pipeEOF = false
+    private var exitedCode: Int32?
+    private var completed = false
+
+    func markEOF() -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        pipeEOF = true
+        guard !completed, let code = exitedCode else { return nil }
+        completed = true
+        return code
+    }
+
+    func markExited(_ code: Int32) -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        exitedCode = code
+        guard !completed, pipeEOF else { return nil }
+        completed = true
+        return code
     }
 }

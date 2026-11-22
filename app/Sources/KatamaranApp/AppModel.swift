@@ -8,9 +8,13 @@ final class AppModel {
     private(set) var status: DaemonStatus?
     private(set) var samples: [Sample] = []
     private(set) var lastError: String?
-    private(set) var busy = false
+    private var busyCount = 0
+    var busy: Bool { busyCount > 0 }
     private(set) var restartRequired = false
     private var observers: [() -> Void] = []
+    private var refreshing = false
+    private var refreshPending = false
+    private var refreshSeq: UInt64 = 0
 
     func observe(_ f: @escaping () -> Void) { observers.append(f) }
     private func changed() { observers.forEach { $0() } }
@@ -42,19 +46,39 @@ final class AppModel {
 
     func fake(_ status: DaemonStatus?) {
         faking = true
+        refreshSeq &+= 1
         apply(status: status, stats: nil, view: nil)
     }
 
-    func refresh() {
+    func refresh(force: Bool = false) {
         guard !faking else { return }
+        if refreshing {
+            if force {
+                refreshSeq &+= 1
+                refreshPending = true
+            }
+            return
+        }
+        refreshing = true
+        refreshPending = false
+        refreshSeq &+= 1
+        let seq = refreshSeq
         let daemon = daemon
-        Task.detached {
+        BlockingIO.run(on: BlockingIO.daemon) {
             let status: DaemonStatus? = try? daemon.decode("status", timeout: 3)
             let stats: StatsResult? = status == nil ? nil : try? daemon.decode("stats", timeout: 3)
             let view: ConfigView? = status == nil ? nil : try? daemon.decode("config.get", timeout: 3)
-            await MainActor.run {
-                guard !self.faking else { return }
+            return (status, stats, view)
+        } completion: { [weak self] status, stats, view in
+            guard let self else { return }
+            self.refreshing = false
+            guard !self.faking else { return }
+            if seq == self.refreshSeq {
                 self.apply(status: status, stats: stats, view: view)
+            }
+            if self.refreshPending {
+                self.refreshPending = false
+                self.refresh()
             }
         }
     }
@@ -73,20 +97,22 @@ final class AppModel {
 
     /// Run a daemon call off the main thread, then refresh.
     /// `done` is told whether the call succeeded, before the refresh.
-    private func perform(_ what: String, done: ((Bool) -> Void)? = nil, _ body: @escaping @Sendable () throws -> Void) {
-        busy = true
+    private func perform(_ what: String, queue: DispatchQueue = BlockingIO.daemon,
+                         done: ((Bool) -> Void)? = nil, _ body: @escaping @Sendable () throws -> Void) {
+        busyCount += 1
         lastError = nil
         changed()
-        Task.detached {
+        BlockingIO.run(on: queue) {
             var failure: String? = nil
             do { try body() } catch { failure = "\(what): \(error.localizedDescription)" }
-            let err = failure
-            await MainActor.run {
-                self.busy = false
-                self.lastError = err
-                done?(err == nil)
-                self.refresh()
-            }
+            return failure
+        } completion: { [weak self] err in
+            guard let self else { return }
+            self.busyCount = max(0, self.busyCount - 1)
+            self.lastError = err
+            done?(err == nil)
+            self.changed()
+            self.refresh(force: true)
         }
     }
 
@@ -110,14 +136,21 @@ final class AppModel {
         perform("restart") { _ = try d.call("restart", timeout: 120) }
     }
 
+    private struct SendableDict: @unchecked Sendable {
+        let value: [String: Any]
+    }
+
     func saveConfig(_ values: [String: Any], done: ((Bool) -> Void)? = nil) {
         let d = daemon
-        perform("settings", done: done) { _ = try d.call("config.set", ["values": values]) }
+        let box = SendableDict(value: values)
+        perform("settings", queue: BlockingIO.config, done: done) {
+            _ = try d.call("config.set", ["values": box.value])
+        }
     }
 
     func k8sReset() {
         let d = daemon
-        perform("kubernetes") { _ = try d.call("k8s.reset", timeout: 60) }
+        perform("kubernetes") { _ = try d.call("k8s.reset", timeout: 300) }
     }
 
     func k8sSyncImages() {
@@ -132,18 +165,43 @@ final class AppModel {
         return dir?.appendingPathComponent("katamaran").path ?? "katamaran"
     }
 
-    nonisolated static func runCLI(_ args: [String]) throws {
+    nonisolated static func runCLI(_ args: [String], executable: String? = nil, timeout: TimeInterval = 60) throws {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: cliPath())
+        p.executableURL = URL(fileURLWithPath: executable ?? cliPath())
         p.arguments = args
+        p.standardInput = FileHandle.nullDevice
         let err = Pipe()
         p.standardError = err
         p.standardOutput = FileHandle.nullDevice
         try p.run()
+        let timeoutLock = NSLock()
+        var timedOut = false
+        let timer = DispatchWorkItem {
+            guard p.isRunning else { return }
+            timeoutLock.lock()
+            timedOut = true
+            timeoutLock.unlock()
+            p.terminate()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
+        if timeout > 0 {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: timer)
+        }
+        // Drain stderr before waiting for exit so a verbose CLI never fills the pipe and deadlocks.
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        timer.cancel()
+        timeoutLock.lock()
+        let didTimeout = timedOut
+        timeoutLock.unlock()
+        if didTimeout {
+            throw SocketError.protocolError("command timed out")
+        }
         if p.terminationStatus != 0 {
-            let msg = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            throw SocketError.protocolError(msg.trimmingCharacters(in: .whitespacesAndNewlines))
+            let msg = String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            throw SocketError.protocolError(msg.isEmpty ? "exit status \(p.terminationStatus)" : msg)
         }
     }
 }

@@ -257,19 +257,24 @@ final class GridSnapshot {
     func update(_ term: OpaquePointer) -> Bool {
         var newInfo = info
         if !valid { newInfo.generation = UInt64.max }
-        let changed = cells.withUnsafeMutableBufferPointer {
+        var changed = cells.withUnsafeMutableBufferPointer {
             kat_term_snapshot(term, &newInfo, $0.baseAddress, $0.count)
         }
         guard changed else { return false }
-        let count = Int(newInfo.cols) * Int(newInfo.rows)
-        if cells.count < count {
+        var count = Int(newInfo.cols) * Int(newInfo.rows)
+        var attempts = 0
+        while cells.count < count && attempts < 4 {
+            attempts += 1
             // Too small for the new size: only `info` was filled.
             cells = [kat_cell](repeating: kat_cell(), count: count)
             newInfo.generation = UInt64.max
-            _ = cells.withUnsafeMutableBufferPointer {
+            changed = cells.withUnsafeMutableBufferPointer {
                 kat_term_snapshot(term, &newInfo, $0.baseAddress, $0.count)
             }
-        } else if cells.count > count {
+            count = Int(newInfo.cols) * Int(newInfo.rows)
+        }
+        guard cells.count >= count else { return false }
+        if cells.count > count {
             cells.removeLast(cells.count - count)
         }
         rowClusters = [[Int: String]](repeating: [:], count: Int(newInfo.rows))
@@ -293,8 +298,9 @@ final class GridSnapshot {
     }
 
     func cell(col: Int, row: Int) -> kat_cell? {
-        guard valid, col >= 0, row >= 0, col < cols, row < rows else { return nil }
-        return cells[row * cols + col]
+        let idx = row * cols + col
+        guard valid, col >= 0, row >= 0, col < cols, row < rows, idx < cells.count else { return nil }
+        return cells[idx]
     }
 }
 

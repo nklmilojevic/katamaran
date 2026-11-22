@@ -70,8 +70,13 @@ final class DockerStore {
         events?.cancel()
         events = nil
         retry?.cancel()
+        retry = nil
         flush?.cancel()
+        flush = nil
         pending = []
+        touched = []
+        loading = []
+        busy = [:]
     }
 
     private func connectEvents() {
@@ -137,7 +142,7 @@ final class DockerStore {
         touched = []
         loading.formUnion(kinds)
         let sock = socket
-        Task.detached {
+        BlockingIO.run(on: BlockingIO.docker) {
             var c: [ContainerSummary]? = nil, v: [VolumeInfo]? = nil, i: [ImageInfo]? = nil, n: [NetworkInfo]? = nil
             var problem: String? = nil
             do {
@@ -148,20 +153,19 @@ final class DockerStore {
             } catch {
                 problem = error.localizedDescription
             }
-            let (cs, vs, ims, ns, err) = (c, v, i, n, problem)
-            await MainActor.run {
-                guard self.socket == sock else { return }
-                self.loading.subtract(kinds)
-                var dirty = !ids.isEmpty || self.loadError != err
-                self.loadError = err
-                if let cs { dirty = dirty || cs != self.containers || !self.loaded.contains(.containers); self.containers = cs; self.loaded.insert(.containers) }
-                if let vs { dirty = dirty || vs != self.volumes || !self.loaded.contains(.volumes); self.volumes = vs; self.loaded.insert(.volumes) }
-                if let ims { dirty = dirty || ims != self.images || !self.loaded.contains(.images); self.images = ims; self.loaded.insert(.images) }
-                if let ns { dirty = dirty || ns != self.networks || !self.loaded.contains(.networks); self.networks = ns; self.loaded.insert(.networks) }
-                self.changedContainers = ids
-                if dirty { self.changed() }
-                self.changedContainers = []
-            }
+            return (c, v, i, n, problem)
+        } completion: { [weak self] cs, vs, ims, ns, err in
+            guard let self, self.socket == sock else { return }
+            self.loading.subtract(kinds)
+            var dirty = !ids.isEmpty || self.loadError != err
+            self.loadError = err
+            if let cs { dirty = dirty || cs != self.containers || !self.loaded.contains(.containers); self.containers = cs; self.loaded.insert(.containers) }
+            if let vs { dirty = dirty || vs != self.volumes || !self.loaded.contains(.volumes); self.volumes = vs; self.loaded.insert(.volumes) }
+            if let ims { dirty = dirty || ims != self.images || !self.loaded.contains(.images); self.images = ims; self.loaded.insert(.images) }
+            if let ns { dirty = dirty || ns != self.networks || !self.loaded.contains(.networks); self.networks = ns; self.loaded.insert(.networks) }
+            self.changedContainers = ids
+            if dirty { self.changed() }
+            self.changedContainers = []
         }
     }
 
@@ -194,28 +198,30 @@ final class DockerStore {
     /// Run `body` against Docker off the main thread; a failure is reported as `what`.
     func perform(_ what: String, _ body: @escaping @Sendable (DockerClient) throws -> Void) {
         guard let client else { return }
-        Task.detached {
+        BlockingIO.run(on: BlockingIO.docker) {
             var failure: String? = nil
             do { try body(client) } catch { failure = error.localizedDescription }
-            let err = failure
-            await MainActor.run {
-                if let err { self.onError(what, err) }
-                // Events cover most changes; prunes of unused things send few.
-                self.refresh(self.interest)
-            }
+            return failure
+        } completion: { [weak self] err in
+            guard let self else { return }
+            if let err { self.onError(what, err) }
+            // Events cover most changes; prunes of unused things send few.
+            self.refresh(self.interest)
         }
     }
 
     /// Containers with an action in flight, so rows can show it until Docker is done.
     private(set) var busy: [String: ContainerAction] = [:]
 
-    private func finished(_ id: String) {
+    private func finished(_ id: String, socket sock: String?) {
+        guard socket == sock else { return }
         busy[id] = nil
         changed()
     }
 
     func act(_ action: ContainerAction, on containers: [ContainerSummary]) {
         let ids = containers.map(\.Id)
+        let sock = socket
         for id in ids { busy[id] = action }
         changed()
         let verb = switch action {
@@ -231,7 +237,9 @@ final class DockerStore {
             var errors: [String] = []
             for id in ids {
                 do { try client.act(id, action) } catch { errors.append(error.localizedDescription) }
-                Task { @MainActor in self.finished(id) }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self.finished(id, socket: sock) }
+                }
             }
             if !errors.isEmpty { throw SocketError.protocolError(errors.joined(separator: "\n")) }
         }

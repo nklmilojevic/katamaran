@@ -378,8 +378,12 @@ func elapsedClock(_ secs: Double) -> String {
 enum BuildCommands {
     static func base(_ socket: String) -> String { "docker -H \(shellQuote("unix://" + socket))" }
 
-    static func logs(_ id: String, socket: String) -> String { "\(base(socket)) buildx history logs \(id)" }
-    static func inspect(_ id: String, socket: String) -> String { "\(base(socket)) buildx history inspect \(id)" }
+    static func logs(_ id: String, socket: String) -> String {
+        "\(base(socket)) buildx history logs --builder default \(shellQuote(id))"
+    }
+    static func inspect(_ id: String, socket: String) -> String {
+        "\(base(socket)) buildx history inspect --builder default \(shellQuote(id))"
+    }
 
     /// The same build again, when its context is a local directory or a URL.
     /// Secret-looking build args are passed by name, so the shell supplies them.

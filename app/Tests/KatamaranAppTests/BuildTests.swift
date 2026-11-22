@@ -271,7 +271,37 @@ private func parse(_ log: String) -> BuildProgressParser {
         // No context in the record (Compose, Bake): nothing to rebuild from.
         let compose = try BuildInfo.parse(Data(#"{"Dockerfile":"Dockerfile"}"#.utf8))
         #expect(BuildCommands.rebuild(compose, tags: [], socket: "/s") == nil)
-        #expect(BuildCommands.logs("abc", socket: "/s") == "docker -H unix:///s buildx history logs abc")
+        #expect(BuildCommands.logs("abc", socket: "/s") == "docker -H unix:///s buildx history logs --builder default abc")
+        #expect(BuildCommands.inspect("abc", socket: "/s") == "docker -H unix:///s buildx history inspect --builder default abc")
+        #expect(BuildCommands.logs("a b'c", socket: "/s") == #"docker -H unix:///s buildx history logs --builder default 'a b'\''c'"#)
+        #expect(BuildCommands.inspect("a b'c", socket: "/s") == #"docker -H unix:///s buildx history inspect --builder default 'a b'\''c'"#)
+    }
+
+    @Test func nextInfoToFetchSkipsFailedInFlightAndFetchedBuilds() throws {
+        let now = Date()
+        let records = [
+            BuildRecord(ref: "default/default/run1", name: "run", status: "Running", createdAt: now),
+            BuildRecord(ref: "default/default/fail1", name: "fail", status: "Error", createdAt: now),
+            BuildRecord(ref: "default/default/ok1", name: "ok", status: "Completed", createdAt: now),
+            BuildRecord(ref: "default/default/ok2", name: "ok2", status: "Completed", createdAt: now),
+        ]
+        let runningInfo = try BuildInfo.parse(Data(#"{"Status":"running"}"#.utf8))
+        // Even if run1 is running and already has info, and fail1 previously failed, ok1 is selected next.
+        let next = BuildStore.nextInfoToFetch(
+            records: records,
+            infos: ["run1": runningInfo],
+            fetching: [],
+            failed: ["fail1"]
+        )
+        #expect(next == "ok1")
+        // If ok1 is in-flight, ok2 is selected.
+        let next2 = BuildStore.nextInfoToFetch(
+            records: records,
+            infos: ["run1": runningInfo],
+            fetching: ["ok1"],
+            failed: ["fail1"]
+        )
+        #expect(next2 == "ok2")
     }
 
     @Test func cliErrors() {

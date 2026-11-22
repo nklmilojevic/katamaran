@@ -66,12 +66,19 @@ enum ExecAPI {
         return (obj?["ExitCode"] as? NSNumber)?.intValue
     }
 
+    /// Splits the response to `start`: the parsed head and whatever bytes of the stream came
+    /// in with it. Nil while the head is incomplete.
+    static func splitUpgradeResponse(_ raw: Data) throws -> (head: HTTPResponseHead, rest: Data)? {
+        guard let sep = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let head = try DockerClient.parseResponseHead(raw[raw.startIndex..<sep.lowerBound])
+        return (head, Data(raw[sep.upperBound...]))
+    }
+
     /// Splits the response to `start`: the status code, and whatever bytes of the stream came
     /// in with the head. Nil while the head is incomplete.
     static func splitUpgrade(_ raw: Data) throws -> (code: Int, rest: Data)? {
-        guard let sep = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
-        let (code, _) = try DockerClient.parseHead(raw[raw.startIndex..<sep.lowerBound])
-        return (code, Data(raw[sep.upperBound...]))
+        guard let split = try splitUpgradeResponse(raw) else { return nil }
+        return (split.head.code, split.rest)
     }
 }
 
@@ -153,8 +160,8 @@ final class ExecAttach: @unchecked Sendable {
     }
 
     /// Hangs up: closes the stream and sends the shell (and what it runs) SIGHUP. `wait`
-    /// blocks until the signal went out (the app is quitting).
-    func close(wait: Bool = false) {
+    /// blocks until the signal went out; `group` runs asynchronously tracked by that group.
+    func close(wait: Bool = false, group: DispatchGroup? = nil) {
         lock.lock()
         let wasOpen = !closed && execID != nil
         closed = true
@@ -163,7 +170,17 @@ final class ExecAttach: @unchecked Sendable {
         guard wasOpen else { return }
         let (path, container, session) = (socketPath, self.container, self.session)
         let work = { ExecAttach.hangUp(socketPath: path, container: container, session: session) }
-        if wait { work() } else { DispatchQueue.global().async(execute: work) }
+        if wait {
+            work()
+        } else if let group {
+            group.enter()
+            BlockingIO.docker.async {
+                work()
+                group.leave()
+            }
+        } else {
+            BlockingIO.docker.async(execute: work)
+        }
     }
 
     private static func hangUp(socketPath: String, container: String, session: String) {
@@ -203,22 +220,24 @@ final class ExecAttach: @unchecked Sendable {
             try sock.write(ExecAPI.request("POST", "/exec/\(id)/start",
                                            body: ExecAPI.startBody(cols: cols, rows: rows), upgrade: true))
             var raw = Data()
-            var head: (code: Int, rest: Data)?
-            while head == nil {
+            var upgraded: (head: HTTPResponseHead, rest: Data)?
+            while upgraded == nil {
                 let chunk = try sock.read()
                 if chunk.isEmpty { throw SocketError.closed }
                 raw.append(chunk)
-                head = try ExecAPI.splitUpgrade(raw)
+                upgraded = try ExecAPI.splitUpgradeResponse(raw)
             }
-            guard let head, head.code == 101 || head.code == 200 else {
-                var rest = head?.rest ?? Data()
-                while let more = try? sock.read(), !more.isEmpty { rest.append(more) }
+            guard let upgraded, upgraded.head.code == 101 || upgraded.head.code == 200 else {
+                let head = upgraded?.head
+                let rest = head.map {
+                    DockerClient.readErrorBody(from: sock, head: $0, initial: upgraded?.rest ?? Data())
+                } ?? (upgraded?.rest ?? Data())
                 throw DockerClient.failure(head?.code ?? 0, rest)
             }
             DispatchQueue.main.async { [self] in if !isClosed { onStart() } }
             // The size may have changed while starting.
             sendResize()
-            if !head.rest.isEmpty { onOutput(head.rest) }
+            if !upgraded.rest.isEmpty { onOutput(upgraded.rest) }
             while true {
                 let chunk = try sock.read()
                 if chunk.isEmpty { break }
