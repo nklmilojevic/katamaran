@@ -35,9 +35,7 @@ final class UnixSocket {
         withUnsafeMutableBytes(of: &addr.sun_path) { buf in
             for (i, b) in bytes.enumerated() { buf[i] = b }
         }
-        var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setTimeout(timeout)
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         let rc = withUnsafePointer(to: &addr) {
@@ -54,12 +52,32 @@ final class UnixSocket {
 
     deinit { close(fd) }
 
+    /// Converts a timeout in seconds into `timeval`, populating `tv_usec` from the
+    /// fractional part and clamping any `timeout > 0` to at least 1 µs so sub-second
+    /// timeouts never collapse to infinite (`0`).
+    static func makeTimeval(_ timeout: TimeInterval) -> timeval {
+        guard timeout.isFinite, timeout > 0 else { return timeval(tv_sec: 0, tv_usec: 0) }
+        let clamped = min(timeout, Double(Int32.max))
+        let totalUsec = max(Int64(1), Int64((clamped * 1_000_000).rounded()))
+        return timeval(tv_sec: Int(totalUsec / 1_000_000), tv_usec: Int32(totalUsec % 1_000_000))
+    }
+
+    func setTimeout(_ timeout: TimeInterval) {
+        var tv = Self.makeTimeval(timeout)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
     func write(_ data: Data) throws {
         try data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
             var off = 0
             while off < buf.count {
                 let n = Darwin.write(fd, buf.baseAddress! + off, buf.count - off)
-                if n < 0 { throw SocketError.io(errno) }
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    throw SocketError.io(errno)
+                }
+                if n == 0 { throw SocketError.closed }
                 off += n
             }
         }
@@ -67,9 +85,14 @@ final class UnixSocket {
 
     func read(max: Int = 65536) throws -> Data {
         var buf = [UInt8](repeating: 0, count: max)
-        let n = Darwin.read(fd, &buf, max)
-        if n < 0 { throw SocketError.io(errno) }
-        return Data(buf[0..<n])
+        while true {
+            let n = Darwin.read(fd, &buf, max)
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw SocketError.io(errno)
+            }
+            return Data(buf[0..<n])
+        }
     }
 
     func shutdownWrite() { Darwin.shutdown(fd, SHUT_WR) }

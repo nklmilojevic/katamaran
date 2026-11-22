@@ -271,12 +271,110 @@ private func parse(_ log: String) -> BuildProgressParser {
         // No context in the record (Compose, Bake): nothing to rebuild from.
         let compose = try BuildInfo.parse(Data(#"{"Dockerfile":"Dockerfile"}"#.utf8))
         #expect(BuildCommands.rebuild(compose, tags: [], socket: "/s") == nil)
-        #expect(BuildCommands.logs("abc", socket: "/s") == "docker -H unix:///s buildx history logs abc")
+        #expect(BuildCommands.logs("abc", socket: "/s") == "docker -H unix:///s buildx history logs --builder default abc")
+        #expect(BuildCommands.inspect("abc", socket: "/s") == "docker -H unix:///s buildx history inspect --builder default abc")
+        #expect(BuildCommands.logs("a b'c", socket: "/s") == #"docker -H unix:///s buildx history logs --builder default 'a b'\''c'"#)
+        #expect(BuildCommands.inspect("a b'c", socket: "/s") == #"docker -H unix:///s buildx history inspect --builder default 'a b'\''c'"#)
+        // Verify copied commands match BuildxCLI's own argument placement (`--builder default` after subcommand).
+        let cli = BuildxCLI(docker: "/usr/local/bin/docker", socket: "/s")
+        #expect(cli.process(["history", "logs", "abc"]).arguments == ["buildx", "history", "logs", "--builder", "default", "abc"])
+        #expect(cli.process(["history", "inspect", "abc"]).arguments == ["buildx", "history", "inspect", "--builder", "default", "abc"])
+    }
+
+    @Test func buildxAcceptsBuilderFlagOnHistoryLogsAndInspectWhenInstalled() throws {
+        guard let docker = BuildxCLI.find() else { return }
+        let cli = BuildxCLI(docker: docker, socket: "/nonexistent")
+        // Only run when the local Docker CLI includes the buildx plugin with `history`.
+        guard let help = try? cli.run(["history", "--help"], timeout: 10),
+              String(decoding: help, as: UTF8.self).contains("logs") else { return }
+        for sub in ["logs", "inspect"] {
+            let out = try cli.run(["history", sub, "--help"], timeout: 10)
+            let text = String(decoding: out, as: UTF8.self)
+            #expect(text.contains("--builder"), "docker buildx history \(sub) --builder default --help should document --builder")
+        }
+    }
+
+    @Test func nextInfoToFetchSkipsFailedInFlightAndFetchedBuilds() throws {
+        let now = Date()
+        let records = [
+            BuildRecord(ref: "default/default/run1", name: "run", status: "Running", createdAt: now),
+            BuildRecord(ref: "default/default/fail1", name: "fail", status: "Error", createdAt: now),
+            BuildRecord(ref: "default/default/ok1", name: "ok", status: "Completed", createdAt: now),
+            BuildRecord(ref: "default/default/ok2", name: "ok2", status: "Completed", createdAt: now),
+        ]
+        let runningInfo = try BuildInfo.parse(Data(#"{"Status":"running"}"#.utf8))
+        let cooldown = ["fail1": now.addingTimeInterval(30)]
+        // Even if run1 is running and already has info, and fail1 is in cooldown, ok1 is selected next.
+        let next = BuildStore.nextInfoToFetch(
+            records: records,
+            infos: ["run1": runningInfo],
+            fetching: [],
+            failedRetryAfter: cooldown,
+            now: now
+        )
+        #expect(next == "ok1")
+        // If ok1 is in-flight, ok2 is selected.
+        let next2 = BuildStore.nextInfoToFetch(
+            records: records,
+            infos: ["run1": runningInfo],
+            fetching: ["ok1"],
+            failedRetryAfter: cooldown,
+            now: now
+        )
+        #expect(next2 == "ok2")
+        // Once the retry cooldown expires, transient failures on finished builds become eligible again.
+        let retry = BuildStore.nextInfoToFetch(
+            records: records,
+            infos: ["run1": runningInfo],
+            fetching: [],
+            failedRetryAfter: cooldown,
+            now: now.addingTimeInterval(31)
+        )
+        #expect(retry == "fail1")
+    }
+
+    @MainActor
+    @Test func buildStoreFollowAdvancesConnectionEpochOnReconnectToSameSocket() {
+        let store = BuildStore()
+        let e0 = store.connectionEpoch
+        store.follow("/tmp/kat-build-test.sock")
+        let e1 = store.connectionEpoch
+        #expect(e1 > e0)
+        store.follow(nil)
+        let e2 = store.connectionEpoch
+        #expect(e2 > e1)
+        store.follow("/tmp/kat-build-test.sock")
+        let e3 = store.connectionEpoch
+        #expect(e3 > e2)
+        store.follow(nil)
     }
 
     @Test func cliErrors() {
         #expect(BuildxCLI.message(Data("ERROR: no such build record\n".utf8)) == "no such build record")
         #expect(BuildxCLI.message(Data("docker: 'buildx' is not a docker command.\nSee 'docker --help'\n".utf8)) == "The Docker CLI has no Buildx plugin.")
         #expect(BuildxCLI.message(Data()) == nil)
+    }
+
+    @Test func streamCompletionCoordinatesEOFExitAndPostExitGrace() async throws {
+        // Case 1: EOF arrives before process exit -> exit returns code immediately.
+        let c1 = StreamCompletion(eofGrace: 0.1)
+        #expect(c1.markEOF() == nil)
+        #expect(c1.markExited(0, onTimeout: { _ in Issue.record("unexpected timeout") }) == 0)
+
+        // Case 2: Process exits before EOF -> EOF completes immediately and suppresses timeout.
+        let c2 = StreamCompletion(eofGrace: 0.15)
+        #expect(c2.markExited(7, onTimeout: { _ in Issue.record("timeout should be cancelled on EOF") }) == nil)
+        #expect(c2.markEOF() == 7)
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Case 3: Descendant holds pipe open after process exit (no EOF) -> completes after grace.
+        let c3 = StreamCompletion(eofGrace: 0.1)
+        let timedOutCode: Int32 = await withCheckedContinuation { cont in
+            let immediate = c3.markExited(0) { code in cont.resume(returning: code) }
+            #expect(immediate == nil)
+        }
+        #expect(timedOutCode == 0)
+        // Late EOF after grace timeout must not complete a second time.
+        #expect(c3.markEOF() == nil)
     }
 }

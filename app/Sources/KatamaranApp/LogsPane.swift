@@ -27,7 +27,10 @@ final class LogsViewController: NSViewController, NSSearchFieldDelegate {
     private var offset: UInt64 = 0
     private var timer: Timer?
     private var generation = 0
+    private var requestSeq: UInt64 = 0
+    private var inFlight = false
     private var partial = ""
+    private var showingError = false
 
     private static let sourceKey = "logsSource"
 
@@ -77,7 +80,11 @@ final class LogsViewController: NSViewController, NSSearchFieldDelegate {
     func setActive(_ active: Bool) {
         timer?.invalidate()
         timer = nil
-        guard active else { return }
+        guard active else {
+            generation += 1
+            inFlight = false
+            return
+        }
         _ = view
         reload()
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -100,30 +107,48 @@ final class LogsViewController: NSViewController, NSSearchFieldDelegate {
 
     private func reload() {
         generation += 1
+        inFlight = false
         text.clear()
         offset = 0
         partial = ""
+        showingError = false
         fetch(["source": source, "lines": 1000])
     }
 
-    private func poll() { fetch(["source": source, "offset": offset]) }
+    private func poll() {
+        guard !inFlight else { return }
+        fetch(["source": source, "offset": offset])
+    }
 
     private func fetch(_ params: [String: Any]) {
+        inFlight = true
+        requestSeq &+= 1
         let d = model.daemon
         let gen = generation
+        let seq = requestSeq
         let p = params as NSDictionary
-        Task.detached {
-            let result: Result<LogChunk, Error> = Result { try d.decode("logs", p as? [String: Any], timeout: 3) }
-            await MainActor.run { self.apply(result, generation: gen) }
+        BlockingIO.run(on: BlockingIO.logs) {
+            Result<LogChunk, Error> { try d.decode("logs", p as? [String: Any], timeout: 3) }
+        } completion: { [weak self] result in
+            self?.apply(result, generation: gen, seq: seq)
         }
     }
 
-    private func apply(_ result: Result<LogChunk, Error>, generation gen: Int) {
-        guard gen == generation else { return }
+    private func apply(_ result: Result<LogChunk, Error>, generation gen: Int, seq: UInt64) {
+        guard gen == generation, seq == requestSeq else { return }
+        inFlight = false
         switch result {
         case .failure(let e):
-            if offset == 0 && partial.isEmpty { text.clear(); text.append(["No log: \(e.localizedDescription)"], error: false) }
+            if offset == 0 && partial.isEmpty {
+                text.clear()
+                text.append(["No log: \(e.localizedDescription)"], error: false)
+                showingError = true
+            }
         case .success(let chunk):
+            if showingError {
+                text.clear()
+                showingError = false
+            }
             if chunk.offset < offset { text.clear(); partial = "" }
             offset = chunk.offset
             guard !chunk.data.isEmpty else { return }

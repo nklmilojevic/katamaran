@@ -66,12 +66,19 @@ enum ExecAPI {
         return (obj?["ExitCode"] as? NSNumber)?.intValue
     }
 
+    /// Splits the response to `start`: the parsed head and whatever bytes of the stream came
+    /// in with it. Nil while the head is incomplete.
+    static func splitUpgradeResponse(_ raw: Data) throws -> (head: HTTPResponseHead, rest: Data)? {
+        guard let sep = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let head = try DockerClient.parseResponseHead(raw[raw.startIndex..<sep.lowerBound])
+        return (head, Data(raw[sep.upperBound...]))
+    }
+
     /// Splits the response to `start`: the status code, and whatever bytes of the stream came
     /// in with the head. Nil while the head is incomplete.
     static func splitUpgrade(_ raw: Data) throws -> (code: Int, rest: Data)? {
-        guard let sep = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
-        let (code, _) = try DockerClient.parseHead(raw[raw.startIndex..<sep.lowerBound])
-        return (code, Data(raw[sep.upperBound...]))
+        guard let split = try splitUpgradeResponse(raw) else { return nil }
+        return (split.head.code, split.rest)
     }
 }
 
@@ -152,9 +159,12 @@ final class ExecAttach: @unchecked Sendable {
         _ = try? client.request("POST", "/exec/\(id)/resize?h=\(s.rows)&w=\(s.cols)", timeout: 5)
     }
 
+    /// Overall deadline covering both sequential socket exchanges of a hang-up request.
+    static let hangUpTimeout: TimeInterval = 6
+
     /// Hangs up: closes the stream and sends the shell (and what it runs) SIGHUP. `wait`
-    /// blocks until the signal went out (the app is quitting).
-    func close(wait: Bool = false) {
+    /// blocks until the signal went out; `group` runs asynchronously tracked by that group.
+    func close(wait: Bool = false, group: DispatchGroup? = nil) {
         lock.lock()
         let wasOpen = !closed && execID != nil
         closed = true
@@ -163,20 +173,86 @@ final class ExecAttach: @unchecked Sendable {
         guard wasOpen else { return }
         let (path, container, session) = (socketPath, self.container, self.session)
         let work = { ExecAttach.hangUp(socketPath: path, container: container, session: session) }
-        if wait { work() } else { DispatchQueue.global().async(execute: work) }
+        if wait {
+            work()
+        } else if let group {
+            group.enter()
+            BlockingIO.docker.async {
+                work()
+                group.leave()
+            }
+        } else {
+            BlockingIO.docker.async(execute: work)
+        }
     }
 
-    private static func hangUp(socketPath: String, container: String, session: String) {
-        guard let sock = try? UnixSocket(path: socketPath, timeout: 3) else { return }
-        try? sock.write(ExecAPI.request("POST", "/containers/\(container)/exec", body: ExecAPI.hangUpBody(session: session)))
+    static func hangUp(socketPath: String, container: String, session: String, timeout: TimeInterval = hangUpTimeout) {
+        let deadline = Date().addingTimeInterval(timeout)
+        let maxResponseBytes = 65_536
+        func remaining() -> TimeInterval { deadline.timeIntervalSinceNow }
+
+        let createTimeout = min(3, remaining())
+        guard createTimeout > 0, let sock = try? UnixSocket(path: socketPath, timeout: createTimeout) else { return }
+        do {
+            try sock.write(ExecAPI.request("POST", "/containers/\(container)/exec", body: ExecAPI.hangUpBody(session: session)))
+        } catch {
+            return
+        }
         var raw = Data()
-        while let chunk = try? sock.read(), !chunk.isEmpty { raw.append(chunk) }
-        guard let (code, body) = try? DockerClient.parse(raw), code == 201 || code == 200,
-              let id = try? ExecAPI.execID(fromCreate: body),
-              let start = try? UnixSocket(path: socketPath, timeout: 3)
-        else { return }
+        var parsedHead: HTTPResponseHead?
+        var chunkedDecoder = ChunkedDecoder()
+        var chunkedBody = Data()
+        var bodyOffset = 0
+        while raw.count < maxResponseBytes {
+            let rem = remaining()
+            guard rem > 0 else { return }
+            sock.setTimeout(min(3, rem))
+            guard let chunk = try? sock.read(max: min(65_536, maxResponseBytes - raw.count)), !chunk.isEmpty else { break }
+            raw.append(chunk)
+            if parsedHead == nil, let sep = raw.range(of: Data("\r\n\r\n".utf8)) {
+                guard let head = try? DockerClient.parseResponseHead(raw[raw.startIndex..<sep.lowerBound]) else { return }
+                parsedHead = head
+                bodyOffset = sep.upperBound
+                if head.chunked {
+                    guard let piece = try? chunkedDecoder.feed(Data(raw[bodyOffset...])) else { return }
+                    chunkedBody.append(piece)
+                    if chunkedDecoder.finished { break }
+                } else if let len = head.contentLength, raw.count - bodyOffset >= len {
+                    break
+                }
+            } else if let head = parsedHead {
+                if head.chunked {
+                    guard let piece = try? chunkedDecoder.feed(chunk) else { return }
+                    chunkedBody.append(piece)
+                    if chunkedDecoder.finished { break }
+                } else if let len = head.contentLength, raw.count - bodyOffset >= len {
+                    break
+                }
+            }
+        }
+        guard let head = parsedHead, head.code == 201 || head.code == 200 else { return }
+        let body: Data
+        if head.chunked {
+            guard chunkedDecoder.finished else { return }
+            body = chunkedBody
+        } else if let len = head.contentLength {
+            body = Data(raw[bodyOffset...].prefix(len))
+        } else {
+            body = Data(raw[bodyOffset...])
+        }
+        guard let id = try? ExecAPI.execID(fromCreate: body) else { return }
+
+        let startTimeout = min(3, remaining())
+        guard startTimeout > 0, let start = try? UnixSocket(path: socketPath, timeout: startTimeout) else { return }
         let detach = (try? JSONSerialization.data(withJSONObject: ["Detach": true, "Tty": false])) ?? Data()
-        try? start.write(ExecAPI.request("POST", "/exec/\(id)/start", body: detach))
+        do {
+            try start.write(ExecAPI.request("POST", "/exec/\(id)/start", body: detach))
+        } catch {
+            return
+        }
+        let readTimeout = min(3, remaining())
+        guard readTimeout > 0 else { return }
+        start.setTimeout(readTimeout)
         _ = try? start.read()
     }
 
@@ -203,22 +279,24 @@ final class ExecAttach: @unchecked Sendable {
             try sock.write(ExecAPI.request("POST", "/exec/\(id)/start",
                                            body: ExecAPI.startBody(cols: cols, rows: rows), upgrade: true))
             var raw = Data()
-            var head: (code: Int, rest: Data)?
-            while head == nil {
+            var upgraded: (head: HTTPResponseHead, rest: Data)?
+            while upgraded == nil {
                 let chunk = try sock.read()
                 if chunk.isEmpty { throw SocketError.closed }
                 raw.append(chunk)
-                head = try ExecAPI.splitUpgrade(raw)
+                upgraded = try ExecAPI.splitUpgradeResponse(raw)
             }
-            guard let head, head.code == 101 || head.code == 200 else {
-                var rest = head?.rest ?? Data()
-                while let more = try? sock.read(), !more.isEmpty { rest.append(more) }
+            guard let upgraded, upgraded.head.code == 101 || upgraded.head.code == 200 else {
+                let head = upgraded?.head
+                let rest = head.map {
+                    DockerClient.readErrorBody(from: sock, head: $0, initial: upgraded?.rest ?? Data())
+                } ?? (upgraded?.rest ?? Data())
                 throw DockerClient.failure(head?.code ?? 0, rest)
             }
             DispatchQueue.main.async { [self] in if !isClosed { onStart() } }
             // The size may have changed while starting.
             sendResize()
-            if !head.rest.isEmpty { onOutput(head.rest) }
+            if !upgraded.rest.isEmpty { onOutput(upgraded.rest) }
             while true {
                 let chunk = try sock.read()
                 if chunk.isEmpty { break }

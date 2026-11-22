@@ -204,11 +204,13 @@ final class SettingsWindowController: NSWindowController {
                 showValues()
             }
         }
-        for control in [login, mount, k8sSwitch, cpuField, cpuStepper, memSlider] as [NSControl] { control.isEnabled = status != nil }
+        for control in [login, mount, cpuField, cpuStepper, memSlider] as [NSControl] { control.isEnabled = status != nil }
         let k8s = status?.k8s
+        let k8sTransitioning = k8s?.state == "starting" || k8s?.state == "stopping"
+        k8sSwitch.isEnabled = status != nil && !model.busy
         let k8sRunning = k8s?.state == "running"
         k8sSyncBtn.isEnabled = status != nil && k8sRunning && !model.busy
-        k8sResetBtn.isEnabled = status != nil && !model.busy
+        k8sResetBtn.isEnabled = status != nil && !model.busy && !k8sTransitioning
         if let k8s, k8s.enabled || k8s.state != "stopped" {
             var desc = k8s.state.capitalized
             if let version = k8s.version, !version.isEmpty { desc += " (\(version))" }
@@ -266,9 +268,12 @@ final class SettingsWindowController: NSWindowController {
         shown = next
         model.saveConfig(values) { [weak self] ok in
             guard let self, !ok else { return }
-            // Show what is actually saved.
-            self.shown = self.model.status?.config
-            self.showValues()
+            self.seen = nil
+            if !self.model.busy {
+                // Show what is actually saved.
+                self.shown = self.model.status?.config
+                self.showValues()
+            }
         }
     }
 
@@ -421,7 +426,7 @@ private final class NoticeGroup: NSView {
         guard let notice else { return true }
         let color: NSColor = switch notice {
         case .daemonNotRunning: .systemGray
-        case .saveFailed: .systemRed
+        case .saveFailed, .kubernetesFailed: .systemRed
         case .restartRequired: .systemOrange
         }
         icon.image = symbolView(notice.symbol, color: color).image

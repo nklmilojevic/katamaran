@@ -181,14 +181,14 @@ final class ContainerDetailViewController: NSViewController {
 
     private func fetchInspect(_ id: String) {
         guard inspecting != id, let client = store.client else { return }
+        let epoch = store.connectionEpoch
         inspecting = id
-        Task.detached {
-            let result = try? client.inspect(id)
-            await MainActor.run {
-                guard self.inspecting == id else { return }
-                self.inspect = result
-                self.refresh()
-            }
+        BlockingIO.run(on: BlockingIO.docker) {
+            try? client.inspect(id)
+        } completion: { [weak self] result in
+            guard let self, self.store.connectionEpoch == epoch, self.inspecting == id else { return }
+            self.inspect = result
+            self.refresh()
         }
     }
 
@@ -614,16 +614,16 @@ final class StatsTabView: NSView, ContainerTabView {
             cpu.detailLabel.stringValue = "\(cur.onlineCPUs) CPUs · \(cur.pids) processes"
             cpu.spark.maxValue = 100
             cpu.spark.values = history.cpu
-            mem.valueLabel.stringValue = bytes(Int64(cur.memoryUsed))
-            mem.detailLabel.stringValue = cur.memoryLimit > 0 ? "of \(bytes(Int64(cur.memoryLimit)))" : " "
+            mem.valueLabel.stringValue = bytes(Int64(clamping: cur.memoryUsed))
+            mem.detailLabel.stringValue = cur.memoryLimit > 0 ? "of \(bytes(Int64(clamping: cur.memoryLimit)))" : " "
             mem.spark.maxValue = (history.mem.max() ?? 0) * 1.25
             mem.spark.values = history.mem
             net.valueLabel.stringValue = "↓ \(rate(r.rx))   ↑ \(rate(r.tx))"
-            net.detailLabel.stringValue = "\(bytes(Int64(cur.netRx))) in · \(bytes(Int64(cur.netTx))) out"
+            net.detailLabel.stringValue = "\(bytes(Int64(clamping: cur.netRx))) in · \(bytes(Int64(clamping: cur.netTx))) out"
             net.spark.maxValue = 1024
             net.spark.values = history.net
             disk.valueLabel.stringValue = "↓ \(rate(r.read))   ↑ \(rate(r.write))"
-            disk.detailLabel.stringValue = "\(bytes(Int64(cur.blockRead))) read · \(bytes(Int64(cur.blockWrite))) written"
+            disk.detailLabel.stringValue = "\(bytes(Int64(clamping: cur.blockRead))) read · \(bytes(Int64(clamping: cur.blockWrite))) written"
             disk.spark.maxValue = 1024
             disk.spark.values = history.disk
         }
@@ -714,7 +714,14 @@ final class LogsTabView: NSView, ContainerTabView, NSSearchFieldDelegate {
         s.onData = { [weak self] d in self?.received(d) }
         s.onEnd = { [weak self, weak s] err in
             guard let self, self.stream === s else { return }
+            if let rest = self.outLines.flush() {
+                self.text.append([String(decoding: rest, as: UTF8.self)], error: false)
+            }
+            if let rest = self.errLines.flush() {
+                self.text.append([String(decoding: rest, as: UTF8.self)], error: true)
+            }
             if let err { self.text.append(["- \(err.localizedDescription) -"], error: true) }
+            if self.follow.state == .on { self.text.scrollToEnd() }
             self.stream = nil
         }
         stream = s

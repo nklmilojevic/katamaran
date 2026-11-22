@@ -117,9 +117,9 @@ final class ContainerTerminal: NSView {
         a.start()
     }
 
-    /// Hangs up (the window closed, or the app quits: `wait`).
-    func close(wait: Bool = false) {
-        attach?.close(wait: wait)
+    /// Hangs up (the window closed, or the app quits: `wait` / `group`).
+    func close(wait: Bool = false, group: DispatchGroup? = nil) {
+        attach?.close(wait: wait, group: group)
         attach = nil
     }
 
@@ -204,12 +204,41 @@ final class EmbeddedTerminalTabView: NSView, ContainerTabView {
             host.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
         empty.onAction = { [weak self] in self?.openInTerminalApp() }
+        store.observe { [weak self] s in self?.pruneTerminals(s) }
         NotificationCenter.default.addObserver(self, selector: #selector(appWillTerminate),
                                                name: NSApplication.willTerminateNotification, object: nil)
     }
 
     @objc private func appWillTerminate() {
-        for t in terminals.values { t.close(wait: true) }
+        let active = Array(terminals.values)
+        terminals.removeAll()
+        shown = nil
+        guard !active.isEmpty else { return }
+        let group = DispatchGroup()
+        for t in active { t.close(group: group) }
+        // Run all hang-up requests concurrently with a finite overall deadline longer than
+        // ExecAttach.hangUpTimeout so normal/slow hang-ups finish cleanly while a stalled
+        // or trickling daemon can never prevent app termination.
+        _ = group.wait(timeout: .now() + ExecAttach.hangUpTimeout + 0.5)
+    }
+
+    private func pruneTerminals(_ s: DockerStore) {
+        if s.socket != nil && !s.loaded.contains(.containers) { return }
+        let keep: Set<String> = s.socket == nil ? [] : Set(s.containers.map(\.Id))
+        let stale = terminals.keys.filter { !keep.contains($0) }
+        guard !stale.isEmpty else { return }
+        for id in stale {
+            guard let t = terminals.removeValue(forKey: id) else { continue }
+            t.close()
+            t.removeFromSuperview()
+            if shown === t { shown = nil }
+        }
+        if let c = container, !keep.contains(c.Id) {
+            container = nil
+            update(focus: false)
+        } else if shown == nil {
+            update(focus: false)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }

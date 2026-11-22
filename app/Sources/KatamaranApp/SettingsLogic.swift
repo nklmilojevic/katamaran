@@ -55,14 +55,18 @@ extension Config {
 enum SettingsNotice: Equatable {
     case daemonNotRunning
     case saveFailed(String)
+    case kubernetesFailed(String)
     case restartRequired
 
     static let errorPrefix = "settings: "
+    static let kubernetesErrorPrefix = "kubernetes: "
 
     init?(status: DaemonStatus?, restartRequired: Bool, lastError: String?) {
         guard let status else { self = .daemonNotRunning; return }
         if let e = lastError, e.hasPrefix(Self.errorPrefix) {
             self = .saveFailed(String(e.dropFirst(Self.errorPrefix.count)))
+        } else if let e = lastError, e.hasPrefix(Self.kubernetesErrorPrefix) {
+            self = .kubernetesFailed(String(e.dropFirst(Self.kubernetesErrorPrefix.count)))
         } else if restartRequired && Phase(status).isUp {
             self = .restartRequired
         } else {
@@ -74,6 +78,7 @@ enum SettingsNotice: Equatable {
         switch self {
         case .daemonNotRunning: "Katamaran isn’t running. Start it to change settings."
         case .saveFailed(let why): "Couldn’t save the change: \(why)"
+        case .kubernetesFailed(let why): "Kubernetes error: \(why)"
         case .restartRequired: "Restart the VM to apply your changes."
         }
     }
@@ -81,7 +86,7 @@ enum SettingsNotice: Equatable {
     var symbol: String {
         switch self {
         case .daemonNotRunning: "power.circle.fill"
-        case .saveFailed: "exclamationmark.triangle.fill"
+        case .saveFailed, .kubernetesFailed: "exclamationmark.triangle.fill"
         case .restartRequired: "arrow.clockwise.circle.fill"
         }
     }
@@ -90,7 +95,7 @@ enum SettingsNotice: Equatable {
     var action: String? {
         switch self {
         case .daemonNotRunning: "Start"
-        case .saveFailed: nil
+        case .saveFailed, .kubernetesFailed: nil
         case .restartRequired: "Restart"
         }
     }

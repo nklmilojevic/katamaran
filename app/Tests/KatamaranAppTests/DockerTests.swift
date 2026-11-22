@@ -55,8 +55,16 @@ private let containersJSON = """
 }
 
 @Test func badChunkSizesThrow() {
-    var d = ChunkedDecoder()
-    #expect(throws: SocketError.self) { try d.feed(Data("zz\r\nhello\r\n".utf8)) }
+    for bad in ["zz\r\nhello\r\n", "-1\r\n", "+4\r\nWiki\r\n", ";abc\r\n", "\r\n", "4\r\nWikiXX0\r\n\r\n"] {
+        var d = ChunkedDecoder()
+        #expect(throws: SocketError.self, "input: \(bad.debugDescription)") {
+            _ = try d.feed(Data(bad.utf8))
+        }
+    }
+    let truncated = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n"
+    #expect(throws: SocketError.self) {
+        _ = try DockerClient.parse(Data(truncated.utf8))
+    }
 }
 
 @Test func responsesParseWithAndWithoutChunking() throws {
@@ -79,6 +87,16 @@ private let containersJSON = """
     #expect(s.feed(Data("tail".utf8)).isEmpty)
     #expect(s.flush() == Data("tail".utf8))
     #expect(s.flush() == nil)
+
+    // Many lines in one chunk should stay linear and preserve order & CRLF stripping.
+    var big = LineSplitter()
+    let count = 5_000
+    let payload = (0..<count).map { "line-\($0)\r\n" }.joined() + "partial"
+    let out = big.feed(Data(payload.utf8))
+    #expect(out.count == count)
+    #expect(out.first == Data("line-0".utf8))
+    #expect(out.last == Data("line-\(count - 1)".utf8))
+    #expect(big.flush() == Data("partial".utf8))
 }
 
 @Test func logFramesSplitIntoStdoutAndStderr() throws {
@@ -416,4 +434,278 @@ private func serve(_ response: [String], delay: TimeInterval = 0.05) throws -> (
 @Test func bytesNeverSayZero() {
     #expect(bytes(0).contains("0"))
     #expect(rate(0).hasSuffix("/s"))
+    #expect(rate(.nan).hasSuffix("/s"))
+    #expect(rate(.infinity).hasSuffix("/s"))
+    #expect(rate(-.infinity).hasSuffix("/s"))
+    #expect(rate(-50).hasSuffix("/s"))
+    #expect(rate(Double(Int64.max)).hasSuffix("/s"))
+    #expect(rate(1e30).hasSuffix("/s"))
+}
+
+@Test func socketTimevalPopulatesMicrosecondsAndClampsSmallPositives() {
+    let zero = UnixSocket.makeTimeval(0)
+    #expect(zero.tv_sec == 0 && zero.tv_usec == 0)
+    let neg = UnixSocket.makeTimeval(-1)
+    #expect(neg.tv_sec == 0 && neg.tv_usec == 0)
+    let tiny = UnixSocket.makeTimeval(1e-9)
+    #expect(tiny.tv_sec == 0 && tiny.tv_usec == 1)
+    let quarter = UnixSocket.makeTimeval(0.25)
+    #expect(quarter.tv_sec == 0 && quarter.tv_usec == 250_000)
+    let oneHalf = UnixSocket.makeTimeval(1.5)
+    #expect(oneHalf.tv_sec == 1 && oneHalf.tv_usec == 500_000)
+    let carry = UnixSocket.makeTimeval(0.9999999)
+    #expect(carry.tv_sec == 1 && carry.tv_usec == 0)
+}
+
+@Test func activitySortIsStrictWeakOrdering() {
+    let rows: [ContainerUsage] = [
+        .init(id: "c", name: "Beta", image: "a", cpu: 0.0, memory: 100, netRate: .nan, diskRate: 0.0, pids: 2),
+        .init(id: "a", name: "beta", image: "a", cpu: 0.0, memory: 100, netRate: 0.0, diskRate: .infinity, pids: 2),
+        .init(id: "b", name: "alpha", image: "a", cpu: .nan, memory: 200, netRate: .nan, diskRate: -.infinity, pids: 1),
+        .init(id: "d", name: "gamma", image: "a", cpu: 12.5, memory: 0, netRate: -0.0, diskRate: 0.0, pids: 5),
+        .init(id: "e", name: "delta", image: "a", cpu: .nan, memory: 100, netRate: 5.0, diskRate: .nan, pids: 2),
+    ]
+    for key in ["name", "cpu", "memory", "net", "disk", "pids"] {
+        for asc in [true, false] {
+            let cmp: (ContainerUsage, ContainerUsage) -> Bool = {
+                ContainerUsage.comesBefore($0, $1, key: key, ascending: asc)
+            }
+            for x in rows {
+                #expect(!cmp(x, x), "irreflexivity failed for \(key) asc=\(asc)")
+                for y in rows {
+                    if cmp(x, y) {
+                        #expect(!cmp(y, x), "antisymmetry failed for \(key) asc=\(asc)")
+                    }
+                    for z in rows where cmp(x, y) && cmp(y, z) {
+                        #expect(cmp(x, z), "transitivity failed for \(key) asc=\(asc)")
+                    }
+                }
+            }
+            let sorted = rows.sorted(by: cmp)
+            #expect(sorted.count == rows.count)
+            // Equal CPU (0.0) tie-breaks deterministically by id ("a" before "c"), and NaNs sort after finite values.
+            if key == "cpu" {
+                let ids = sorted.map(\.id)
+                if asc {
+                    #expect(ids == ["a", "c", "d", "b", "e"])
+                } else {
+                    #expect(ids == ["d", "a", "c", "b", "e"])
+                }
+            }
+        }
+    }
+}
+
+@Test @MainActor func streamsDoNotDeadlockOnKeepAliveErrors() async throws {
+    func serveKeepAlive(_ response: String) throws -> (String, DispatchSemaphore) {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("kat-ka-\(UUID().uuidString.prefix(8)).sock").path
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+        _ = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        } }
+        listen(fd, 1)
+        let release = DispatchSemaphore(value: 0)
+        Thread {
+            let c = accept(fd, nil, nil)
+            var buf = [UInt8](repeating: 0, count: 4096)
+            _ = read(c, &buf, buf.count)
+            _ = response.withCString { write(c, $0, strlen($0)) }
+            // Keep the socket open without closing (HTTP/1.1 keep-alive)!
+            _ = release.wait(timeout: .now() + 5)
+            close(c)
+            close(fd)
+            unlink(path)
+        }.start()
+        return (path, release)
+    }
+
+    // Content-Length error on keep-alive connection.
+    let body = #"{"message":"keep-alive error"}"#
+    let (p1, rel1) = try serveKeepAlive("HTTP/1.1 404 Not Found\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)")
+    defer { rel1.signal() }
+    let t0 = Date()
+    let stream1 = DockerStream(socketPath: p1, path: "/events")
+    let msg1: String? = await withCheckedContinuation { cont in
+        stream1.onEnd = { err in cont.resume(returning: err?.localizedDescription) }
+        stream1.start()
+    }
+    #expect(msg1 == "keep-alive error")
+    #expect(Date().timeIntervalSince(t0) < 1.5)
+
+    // Chunked error on keep-alive connection.
+    let chunkedBody = #"{"message":"chunked keep-alive"}"#
+    let hexLen = String(chunkedBody.utf8.count, radix: 16)
+    let (p2, rel2) = try serveKeepAlive("HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n\(hexLen)\r\n\(chunkedBody)\r\n0\r\n\r\n")
+    defer { rel2.signal() }
+    let t1 = Date()
+    let stream2 = DockerStream(socketPath: p2, path: "/events")
+    let msg2: String? = await withCheckedContinuation { cont in
+        stream2.onEnd = { err in cont.resume(returning: err?.localizedDescription) }
+        stream2.start()
+    }
+    #expect(msg2 == "chunked keep-alive")
+    #expect(Date().timeIntervalSince(t1) < 1.5)
+}
+
+@Test func removeImagePercentEncodesWithAndWithoutForce() throws {
+    func captureRequest(force: Bool, id: String) throws -> String {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("kat-rm-\(UUID().uuidString.prefix(8)).sock").path
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+        _ = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        } }
+        listen(fd, 1)
+        let lock = NSLock()
+        var reqLine = ""
+        let done = DispatchSemaphore(value: 0)
+        Thread {
+            let c = accept(fd, nil, nil)
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = read(c, &buf, buf.count)
+            if n > 0 {
+                let s = String(decoding: buf[0..<n], as: UTF8.self)
+                lock.lock()
+                reqLine = s.components(separatedBy: "\r\n").first ?? ""
+                lock.unlock()
+            }
+            let reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]"
+            _ = reply.withCString { write(c, $0, strlen($0)) }
+            close(c)
+            close(fd)
+            unlink(path)
+            done.signal()
+        }.start()
+        try DockerClient(socketPath: path).removeImage(id, force: force)
+        _ = done.wait(timeout: .now() + 2)
+        lock.lock(); defer { lock.unlock() }
+        return reqLine
+    }
+
+    let forced = try captureRequest(force: true, id: "org/img:1?x")
+    #expect(forced == "DELETE /images/org%2Fimg:1%3Fx?force=1 HTTP/1.1")
+    let unforced = try captureRequest(force: false, id: "org/img:1?x")
+    #expect(unforced == "DELETE /images/org%2Fimg:1%3Fx HTTP/1.1")
+}
+
+@Test @MainActor func dockerStoreRejectsStaleRefreshAcrossSamePathReconnect() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("kat-reconn-\(UUID().uuidString.prefix(8)).sock").path
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard rc == 0, listen(fd, 8) == 0 else { throw SocketError.io(errno) }
+
+    final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        private var arrived = false
+        func nextCall() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            count += 1
+            return count
+        }
+        func markArrived() {
+            lock.lock(); arrived = true; lock.unlock()
+        }
+        var didArrive: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return arrived
+        }
+    }
+    let state = State()
+    let releaseFirstList = DispatchSemaphore(value: 0)
+    let releaseSecondList = DispatchSemaphore(value: 0)
+
+    defer {
+        releaseFirstList.signal()
+        releaseSecondList.signal()
+        close(fd)
+        unlink(path)
+    }
+
+    Thread {
+        while true {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            Thread {
+                defer { close(c) }
+                var buf = [UInt8](repeating: 0, count: 4096)
+                let n = read(c, &buf, buf.count)
+                let req = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+                if req.hasPrefix("GET /containers/json") {
+                    let call = state.nextCall()
+                    if call == 1 {
+                        state.markArrived()
+                        _ = releaseFirstList.wait(timeout: .now() + 5)
+                        let body = #"[{"Id":"old-id","Names":["/old"],"Image":"alpine","State":"running","Status":"Up"}]"#
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                        _ = resp.withCString { write(c, $0, strlen($0)) }
+                    } else {
+                        _ = releaseSecondList.wait(timeout: .now() + 5)
+                        let body = #"[{"Id":"new-id","Names":["/new"],"Image":"alpine","State":"running","Status":"Up"}]"#
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                        _ = resp.withCString { write(c, $0, strlen($0)) }
+                    }
+                } else {
+                    // /events stream: return 200 chunked EOF immediately.
+                    let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                }
+            }.start()
+        }
+    }.start()
+
+    func readyStatus() throws -> DaemonStatus {
+        let json = """
+        {"state":"running","since_ms":0,"daemon":{"pid":1,"home":"/tmp/k"},
+         "versions":{"katamaran":"0.1.0","protocol":1},
+         "config":{"cpus":4,"memory_mib":4096,"mount":false,"launch_at_login":false},
+         "docker":{"state":"ready","socket":"\(path)"},
+         "mount":{"enabled":false,"mounted":false},"ports":[]}
+        """
+        return try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+    }
+
+    let store = DockerStore()
+    store.follow(try readyStatus())
+    let epoch1 = store.connectionEpoch
+    for _ in 0..<100 where !state.didArrive {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(state.didArrive)
+
+    // Disconnect and immediately reconnect to the exact same socket path while fetch #1 is in flight.
+    store.follow(nil)
+    #expect(store.loading.isEmpty)
+    store.follow(try readyStatus())
+    #expect(store.connectionEpoch > epoch1)
+    #expect(store.loading.contains(.containers))
+
+    // Let fetch #1 finish first: it must be rejected so stale "old" data and loading clear do not apply.
+    releaseFirstList.signal()
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(store.containers.isEmpty)
+    #expect(store.loading.contains(.containers))
+
+    // Now let fetch #2 finish: new connection data applies cleanly.
+    releaseSecondList.signal()
+    for _ in 0..<50 where !store.loaded.contains(.containers) {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(store.containers.map(\.name) == ["new"])
+    #expect(store.loading.isEmpty)
+    store.follow(nil)
 }

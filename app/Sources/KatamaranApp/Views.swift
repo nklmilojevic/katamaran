@@ -403,7 +403,10 @@ func bytes(_ n: Int64) -> String {
 }
 
 func rate(_ bytesPerSecond: Double) -> String {
-    bytes(Int64(bytesPerSecond)) + "/s"
+    guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return bytes(0) + "/s" }
+    // Double(Int64.max) rounds up to 2^63, which traps Int64(...), so clamp strictly below 2^63.
+    let clamped = min(bytesPerSecond, Double(Int64.max - 1024))
+    return bytes(Int64(clamped)) + "/s"
 }
 
 func relative(_ date: Date?) -> String {

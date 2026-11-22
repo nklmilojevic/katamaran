@@ -82,15 +82,19 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(SettingsNotice(status: try status(), restartRequired: false, lastError: nil) == nil)
 }
 
-@Test func noticeShowsFailedSavesButNotOtherErrors() throws {
+@Test func noticeShowsFailedSavesAndKubernetesErrorsButNotOtherErrors() throws {
     let failed = SettingsNotice(status: try status(), restartRequired: true, lastError: "settings: cpus must be between 1 and 10")
     #expect(failed == .saveFailed("cpus must be between 1 and 10"))
     #expect(failed?.action == nil)
+    let k8sFailed = SettingsNotice(status: try status(), restartRequired: true, lastError: "kubernetes: cluster reset timed out")
+    #expect(k8sFailed == .kubernetesFailed("cluster reset timed out"))
+    #expect(k8sFailed?.action == nil)
+    #expect(k8sFailed?.message.contains("cluster reset timed out") == true)
     #expect(SettingsNotice(status: try status(), restartRequired: false, lastError: "stop: timed out") == nil)
 }
 
 @Test func symbolsExist() {
-    let notices: [SettingsNotice] = [.daemonNotRunning, .saveFailed("x"), .restartRequired]
+    let notices: [SettingsNotice] = [.daemonNotRunning, .saveFailed("x"), .kubernetesFailed("y"), .restartRequired]
     for name in SettingsPane.allCases.map(\.symbol) + notices.map(\.symbol) {
         #expect(NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil, "\(name)")
     }
@@ -122,4 +126,76 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(FirstRun.shouldRun(bundlePath: "/Applications/Katamaran.app", env: [:]))
     #expect(!FirstRun.shouldRun(bundlePath: "/Users/me/src/katamaran/target/Katamaran.app", env: [:]))
     #expect(!FirstRun.shouldRun(bundlePath: "/Applications/Katamaran.app", env: ["KATAMARAN_HOME": "/tmp/x"]))
+}
+
+@Test func machineShellScriptQuotesSingleQuotesAndSpecialChars() {
+    let script = MachineShellCommand.script(
+        name: "dev'$(id);rm -rf /",
+        cliPath: "/Applications/My's App/katamaran",
+        katamaranHome: "/tmp/it's home/$(whoami)"
+    )
+    #expect(script.hasPrefix("#!/bin/sh\n"))
+    #expect(script.contains(#"export KATAMARAN_HOME='/tmp/it'\''s home/$(whoami)'"#))
+    #expect(script.contains(#"exec '/Applications/My'\''s App/katamaran' shell 'dev'\''$(id);rm -rf /'"#))
+
+    let noHome = MachineShellCommand.script(name: "ubuntu", cliPath: "/usr/local/bin/katamaran", katamaranHome: nil)
+    #expect(noHome == "#!/bin/sh\nexec /usr/local/bin/katamaran shell ubuntu\n")
+}
+
+@Test func machineShellFilenameSanitizesPathSeparatorsAndControlChars() {
+    let f1 = MachineShellCommand.filename(for: "../../etc/passwd")
+    #expect(!f1.contains("/"))
+    #expect(!f1.contains(".."))
+    #expect(f1.hasPrefix("katamaran-shell-") && f1.hasSuffix(".command"))
+
+    let f2 = MachineShellCommand.filename(for: "foo/bar\0baz'qux")
+    #expect(!f2.contains("/"))
+    #expect(!f2.contains("\0"))
+    #expect(!f2.contains("'"))
+    #expect(f2.hasPrefix("katamaran-shell-foo_bar_baz_qux-") && f2.hasSuffix(".command"))
+
+    let f3 = MachineShellCommand.filename(for: "")
+    #expect(f3.hasPrefix("katamaran-shell-machine-") && f3.hasSuffix(".command"))
+
+    // Distinct names that sanitize to the same stem must not collide.
+    #expect(MachineShellCommand.filename(for: "a/b") != MachineShellCommand.filename(for: "a?b"))
+    let longPrefix = String(repeating: "a", count: 70)
+    #expect(MachineShellCommand.filename(for: longPrefix + "1") != MachineShellCommand.filename(for: longPrefix + "2"))
+}
+
+@Test func runCLIDrainsLargeStderrAndEnforcesTimeout() throws {
+    // Large stderr (> 64 KiB macOS pipe buffer) must not deadlock.
+    do {
+        try AppModel.runCLI(
+            ["-c", "head -c 131072 /dev/zero | tr '\\0' 'x' >&2; exit 2"],
+            executable: "/bin/sh",
+            timeout: 5
+        )
+        Issue.record("expected non-zero exit error")
+    } catch let err as SocketError {
+        #expect(err.localizedDescription.count == 131072)
+    }
+
+    // Standard input is nullDevice so reading stdin returns EOF immediately.
+    try AppModel.runCLI(["-c", "cat >/dev/null"], executable: "/bin/sh", timeout: 5)
+
+    // Timeout terminates a hanging child process.
+    let start = Date()
+    do {
+        try AppModel.runCLI(["-c", "sleep 30"], executable: "/bin/sh", timeout: 0.2)
+        Issue.record("expected timeout error")
+    } catch {
+        #expect(error.localizedDescription.contains("timed out"))
+        #expect(Date().timeIntervalSince(start) < 3.0)
+    }
+
+    // Timeout must not hang on stderr EOF if a grandchild inherits the stderr pipe.
+    let grandchildStart = Date()
+    do {
+        try AppModel.runCLI(["-c", "(sleep 5) & sleep 5"], executable: "/bin/sh", timeout: 0.2)
+        Issue.record("expected timeout error with lingering grandchild")
+    } catch {
+        #expect(error.localizedDescription.contains("timed out"))
+        #expect(Date().timeIntervalSince(grandchildStart) < 3.0)
+    }
 }

@@ -94,7 +94,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     private var tabItem: NSToolbarItem?
     private var searchItem: NSSearchToolbarItem?
     private var pruneItem: NSToolbarItem?
-    private var shownPhase: Phase?
+    private struct ShownDockerState: Equatable {
+        let phase: Phase
+        let busy: Bool
+        let errorMessage: String?
+    }
+    private var shownState: ShownDockerState?
     private var listWidth: CGFloat = {
         let w = UserDefaults.standard.double(forKey: MainWindowController.listWidthKey)
         return w > 0 ? w : 380
@@ -225,7 +230,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         section = s
         if remember { UserDefaults.standard.set(s.rawValue, forKey: Self.sectionKey) }
         sidebar.select(s)
-        shownPhase = nil
+        shownState = nil
         refreshChrome()
         if window?.isVisible ?? false { panes[s]?.setActive(true) }
     }
@@ -337,12 +342,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     private func showDockerState() {
         let phase = model.phase
-        guard phase != shownPhase || model.busy else { return }
-        shownPhase = phase
+        let errorMessage = model.status?.error ?? model.lastError
+        let next = ShownDockerState(phase: phase, busy: model.busy, errorMessage: errorMessage)
+        guard next != shownState else { return }
+        shownState = next
         switch phase {
         case .noDaemon, .stopped:
+            let startError = model.lastError?.hasPrefix("start: ") == true ? model.lastError : nil
             dockerState.show(symbol: "sailboat", title: "Katamaran is stopped",
-                             message: "Start the VM to use Docker.", action: "Start", busy: model.busy)
+                             message: startError ?? "Start the VM to use Docker.", action: "Start", busy: model.busy)
         case .starting:
             dockerState.show(symbol: "sailboat", title: "Starting…", message: "Docker will be ready in a moment.", busy: true)
         case .stopping:
@@ -351,7 +359,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             dockerState.show(symbol: "sailboat", title: "Waiting for Docker…", busy: true)
         case .error:
             dockerState.show(symbol: "exclamationmark.triangle", title: "Katamaran ran into a problem",
-                             message: model.status?.error ?? model.lastError ?? "Docker isn’t answering.",
+                             message: errorMessage ?? "Docker isn’t answering.",
                              action: "Restart", busy: model.busy)
             dockerState.onAction = { [weak self] in self?.model.restart() }
             return

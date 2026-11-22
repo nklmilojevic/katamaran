@@ -23,7 +23,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         update()
     }
 
-    func menuWillOpen(_ menu: NSMenu) { model.refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        update()
+        model.refresh(force: true)
+    }
 
     func update() {
         let phase = model.phase
@@ -35,6 +38,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let sig = [
             "\(phase)", "\(model.busy)", "\(model.restartRequired)", model.lastError ?? "", model.status?.error ?? "",
             "\(model.status?.vm != nil)", statusSummary(model.status) ?? "",
+            "\(Updater.shared.isConfigured)", "\(Updater.shared.canCheckForUpdates)",
         ].joined(separator: "|")
         if sig != signature {
             signature = sig

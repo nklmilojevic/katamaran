@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let args = CommandLine.arguments
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let headless = args.contains("--smoke-test") || args.contains("--snapshot")
+        if !headless {
+            Updater.shared.start()
+        }
         NSApp.mainMenu = mainMenu()
         statusMenu = StatusMenu(model: model)
         statusMenu.openWindow = { [weak self] in self?.showMain() }
@@ -38,7 +42,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.observe { [weak self] in self?.store.follow(self?.model.status) }
         store.onError = { [weak self] what, why in self?.showError(what, why) }
 
-        let headless = args.contains("--smoke-test") || args.contains("--snapshot")
         let steps = option("--steps").map { $0.split(separator: ",").map(String.init) } ?? []
         if !steps.isEmpty { model.fake(fakeStatus("stopped")) }
         if headless {
@@ -55,7 +58,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         if !headless {
-            Updater.shared.start()
             runFirstSetupIfNeeded()
         }
         if !headless && !args.contains("--background") && !launchedAtLogin(notification) { showMain() }

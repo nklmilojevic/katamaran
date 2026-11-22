@@ -28,6 +28,36 @@ struct ContainerUsage: Equatable {
     var netRate: Double
     var diskRate: Double
     var pids: UInt64
+
+    /// Strict weak ordering comparator for the Activity table.
+    /// Finite floats sort before non-finite (`NaN`/`±Inf`), and equal values tie-break on `id`.
+    static func comesBefore(_ a: ContainerUsage, _ b: ContainerUsage, key: String, ascending: Bool) -> Bool {
+        func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> Bool {
+            if lhs != rhs { return ascending ? lhs < rhs : lhs > rhs }
+            return a.id < b.id
+        }
+        func compareDouble(_ lhs: Double, _ rhs: Double) -> Bool {
+            switch (lhs.isFinite, rhs.isFinite) {
+            case (true, true):
+                if lhs != rhs { return ascending ? lhs < rhs : lhs > rhs }
+                return a.id < b.id
+            case (true, false):
+                return true
+            case (false, true):
+                return false
+            case (false, false):
+                return a.id < b.id
+            }
+        }
+        switch key {
+        case "name": return compare(a.name.lowercased(), b.name.lowercased())
+        case "memory": return compare(a.memory, b.memory)
+        case "net": return compareDouble(a.netRate, b.netRate)
+        case "disk": return compareDouble(a.diskRate, b.diskRate)
+        case "pids": return compare(a.pids, b.pids)
+        default: return compareDouble(a.cpu, b.cpu)
+        }
+    }
 }
 
 @MainActor
@@ -144,24 +174,39 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
     private func poll() {
         guard !polling, let client = store.client else { return }
         let running = store.containers.filter(\.running)
+        if running.isEmpty {
+            apply([:], [])
+            return
+        }
+        let sock = store.socket
+        let epoch = store.connectionEpoch
         polling = true
-        Task.detached {
+        BlockingIO.run(on: BlockingIO.docker) {
+            let lock = NSLock()
+            let sem = DispatchSemaphore(value: 8)
+            let group = DispatchGroup()
             var readings: [String: StatsSample] = [:]
-            await withTaskGroup(of: (String, StatsSample?).self) { group in
-                var it = running.makeIterator()
-                func next() -> Bool {
-                    guard let c = it.next() else { return false }
-                    group.addTask { (c.Id, try? client.stats(c.Id)) }
-                    return true
-                }
-                for _ in 0..<8 where next() {}
-                while let (id, s) = await group.next() {
-                    if let s { readings[id] = s }
-                    _ = next()
+            for c in running {
+                sem.wait()
+                group.enter()
+                BlockingIO.docker.async {
+                    defer { sem.signal(); group.leave() }
+                    if let s = try? client.stats(c.Id) {
+                        lock.lock()
+                        readings[c.Id] = s
+                        lock.unlock()
+                    }
                 }
             }
-            let result = readings
-            await MainActor.run { self.apply(result, running) }
+            group.wait()
+            return readings
+        } completion: { [weak self] result in
+            guard let self else { return }
+            guard self.store.connectionEpoch == epoch, self.store.socket == sock else {
+                self.polling = false
+                return
+            }
+            self.apply(result, running)
         }
     }
 
@@ -183,17 +228,7 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
     private func sortRows() {
         guard let d = table.sortDescriptors.first, let key = d.key else { return }
         let asc = d.ascending
-        rows.sort { a, b in
-            let less: Bool = switch key {
-            case "name": a.name.lowercased() < b.name.lowercased()
-            case "memory": a.memory < b.memory
-            case "net": a.netRate < b.netRate
-            case "disk": a.diskRate < b.diskRate
-            case "pids": a.pids < b.pids
-            default: a.cpu < b.cpu
-            }
-            return asc ? less : !less
-        }
+        rows.sort { ContainerUsage.comesBefore($0, $1, key: key, ascending: asc) }
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
@@ -229,7 +264,7 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
         text.alignment = .right
         text.stringValue = switch id {
         case "cpu": String(format: "%.1f%%", u.cpu)
-        case "memory": bytes(Int64(u.memory))
+        case "memory": bytes(Int64(clamping: u.memory))
         case "net": rate(u.netRate)
         case "disk": rate(u.diskRate)
         default: "\(u.pids)"
