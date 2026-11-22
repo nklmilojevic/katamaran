@@ -230,3 +230,24 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
         #expect(Date().timeIntervalSince(grandchildStart) < 3.0)
     }
 }
+
+@MainActor
+@Test func updaterConfigurationAndPresentationHelpers() {
+    #expect(Updater.isConfigured(info: [
+        "SUFeedURL": "https://katamaran.rs/appcast.xml",
+        "SUPublicEDKey": "abc123",
+    ]))
+    #expect(!Updater.isConfigured(info: ["SUFeedURL": "https://katamaran.rs/appcast.xml"]))
+    #expect(!Updater.isConfigured(info: ["SUFeedURL": "  ", "SUPublicEDKey": "abc123"]))
+    #expect(!Updater.isConfigured(info: nil))
+
+    #expect(Updater.menuItemTitle(pendingVersion: nil) == "Check for Updates…")
+    #expect(Updater.menuItemTitle(pendingVersion: "  ") == "Check for Updates…")
+    #expect(Updater.menuItemTitle(pendingVersion: "0.7.0") == "Update Available (0.7.0)…")
+
+    #expect(Updater.versionSubtitle(info: ["CFBundleShortVersionString": "0.6.0"]) == "Version 0.6.0")
+    #expect(Updater.versionSubtitle(info: ["CFBundleShortVersionString": "0.6.0"], pendingVersion: "0.7.0") == "Version 0.6.0 · 0.7.0 available")
+    #expect(Updater.versionSubtitle(info: nil, pendingVersion: "0.7.0") == "Version 0.7.0 available")
+    #expect(Updater.versionSubtitle(info: nil, pendingVersion: nil) == nil)
+    #expect(NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil) != nil)
+}

@@ -20,6 +20,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         item.menu = menu
         item.button?.toolTip = "Katamaran"
         model.observe { [weak self] in self?.update() }
+        Updater.shared.observe { [weak self] in self?.update() }
         update()
     }
 
@@ -39,6 +40,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             "\(phase)", "\(model.busy)", "\(model.restartRequired)", model.lastError ?? "", model.status?.error ?? "",
             "\(model.status?.vm != nil)", statusSummary(model.status) ?? "",
             "\(Updater.shared.isConfigured)", "\(Updater.shared.canCheckForUpdates)",
+            Updater.shared.pendingUpdateVersion ?? "",
         ].joined(separator: "|")
         if sig != signature {
             signature = sig
@@ -87,13 +89,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(action("Open Katamaran", #selector(open), symbol: "macwindow", key: "o"))
         if Updater.shared.isConfigured {
+            let pending = Updater.shared.pendingUpdateVersion
             let check = NSMenuItem(
-                title: "Check for Updates…",
+                title: Updater.menuItemTitle(pendingVersion: pending),
                 action: #selector(Updater.checkForUpdates(_:)),
                 keyEquivalent: ""
             )
             check.target = Updater.shared
-            check.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+            if pending != nil {
+                check.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(.init(paletteColors: [.controlAccentColor]))
+            } else {
+                check.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+            }
             check.isEnabled = Updater.shared.canCheckForUpdates
             menu.addItem(check)
         }
