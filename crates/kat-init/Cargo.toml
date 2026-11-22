@@ -10,3 +10,4 @@ publish.workspace = true
 kat-proto.workspace = true
 kat-nfs.workspace = true
 libc.workspace = true
+serde_json.workspace = true

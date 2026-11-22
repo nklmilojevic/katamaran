@@ -159,6 +159,11 @@ pub enum Call {
     MachineStop { name: String },
     MachineDelete { name: String },
     MachineDefault { name: String },
+    K8sStart,
+    K8sStop,
+    K8sReset,
+    K8sKubeconfig,
+    K8sSyncImages,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +197,11 @@ impl Call {
             Call::MachineStop { .. } => "machine.stop",
             Call::MachineDelete { .. } => "machine.delete",
             Call::MachineDefault { .. } => "machine.default",
+            Call::K8sStart => "k8s.start",
+            Call::K8sStop => "k8s.stop",
+            Call::K8sReset => "k8s.reset",
+            Call::K8sKubeconfig => "k8s.kubeconfig",
+            Call::K8sSyncImages => "k8s.sync_images",
         }
     }
 
@@ -292,6 +302,11 @@ impl Call {
                     _ => Call::MachineDefault { name },
                 }
             }
+            "k8s.start" => Call::K8sStart,
+            "k8s.stop" => Call::K8sStop,
+            "k8s.reset" => Call::K8sReset,
+            "k8s.kubeconfig" => Call::K8sKubeconfig,
+            "k8s.sync_images" => Call::K8sSyncImages,
             other => {
                 return Err(RpcError::new(
                     METHOD_NOT_FOUND,
@@ -376,6 +391,8 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Sample>,
     pub docker: DockerInfo,
+    #[serde(default)]
+    pub k8s: K8sStatus,
     pub mount: MountInfo,
     pub ports: Vec<Port>,
 }
@@ -417,6 +434,48 @@ pub enum DockerState {
 pub struct DockerInfo {
     pub state: DockerState,
     pub socket: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct K8sStatus {
+    pub enabled: bool,
+    /// `stopped`, `starting`, `running`, `stopping`, or `failed`.
+    pub state: String,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig: Option<PathBuf>,
+    #[serde(default)]
+    pub dns_domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_port: Option<u16>,
+    #[serde(default)]
+    pub dns_installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Default for K8sStatus {
+    fn default() -> Self {
+        K8sStatus {
+            enabled: false,
+            state: "stopped".into(),
+            installed: false,
+            version: String::new(),
+            api_port: None,
+            context: String::new(),
+            kubeconfig: None,
+            dns_domain: String::new(),
+            dns_port: None,
+            dns_installed: false,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -506,6 +565,11 @@ mod tests {
             Call::MachineStop { name: "dev".into() },
             Call::MachineDelete { name: "dev".into() },
             Call::MachineDefault { name: "dev".into() },
+            Call::K8sStart,
+            Call::K8sStop,
+            Call::K8sReset,
+            Call::K8sKubeconfig,
+            Call::K8sSyncImages,
         ];
         for (i, call) in calls.iter().enumerate() {
             let line = serde_json::to_string(&Request::new(i as u64, call)).unwrap();
@@ -634,6 +698,7 @@ mod tests {
                 state: DockerState::Ready,
                 socket: "/tmp/h/run/docker.sock".into(),
             },
+            k8s: K8sStatus::default(),
             mount: MountInfo {
                 enabled: false,
                 path: None,

@@ -34,6 +34,8 @@ pub struct Config {
     pub auto_forward: bool,
     /// How x86-64 (amd64) programs run in the guest.
     pub amd64: Emulation,
+    /// Run an optional single-node Kubernetes (k3s) cluster inside the VM.
+    pub kubernetes: bool,
 }
 
 impl Default for Config {
@@ -48,12 +50,13 @@ impl Default for Config {
             pause_on_sleep: false,
             auto_forward: true,
             amd64: Emulation::default(),
+            kubernetes: false,
         }
     }
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 8] = [
+pub const KEYS: [&str; 9] = [
     "cpus",
     "memory_mib",
     "mount",
@@ -62,6 +65,7 @@ pub const KEYS: [&str; 8] = [
     "pause_on_sleep",
     "auto_forward",
     "amd64",
+    "kubernetes",
 ];
 
 /// The smallest guest that still runs dockerd comfortably.
@@ -141,6 +145,7 @@ impl Config {
             "pause_on_sleep" => self.pause_on_sleep.to_string(),
             "auto_forward" => self.auto_forward.to_string(),
             "amd64" => self.amd64.to_string(),
+            "kubernetes" => self.kubernetes.to_string(),
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         })
     }
@@ -164,6 +169,7 @@ impl Config {
             "pause_on_sleep" => next.pause_on_sleep = parse_bool(value)?,
             "auto_forward" => next.auto_forward = parse_bool(value)?,
             "amd64" => next.amd64 = value.parse()?,
+            "kubernetes" => next.kubernetes = parse_bool(value)?,
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
@@ -172,10 +178,11 @@ impl Config {
     }
 
     /// Whether a VM started with `self` has to restart to use `saved`. All
-    /// but `launch_at_login` are read at VM start.
+    /// but `launch_at_login` and `kubernetes` are read at VM start.
     pub fn needs_restart_for(&self, saved: &Config) -> bool {
         let applied = Config {
             launch_at_login: saved.launch_at_login,
+            kubernetes: saved.kubernetes,
             ..self.clone()
         };
         applied != *saved

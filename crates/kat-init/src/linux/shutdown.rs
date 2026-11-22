@@ -30,6 +30,11 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
     let t = Instant::now();
     // Machines halt in parallel with the containers; each has
     // `lxc::STOP_SECS` before it is killed.
+    let k8s_stop = thread::spawn(|| {
+        let t = Instant::now();
+        super::k8s::stop_for_shutdown();
+        t.elapsed()
+    });
     let machines = thread::spawn(|| {
         let t = Instant::now();
         let n = super::machines::stop_all();
@@ -41,6 +46,9 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
             format!("{n} stopped")
         });
         nfs.stop();
+    }
+    if let Ok(took) = k8s_stop.join() {
+        super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
     }
     if let Ok((n, took)) = machines.join() {
         super::log(&format!(

@@ -29,10 +29,15 @@ pub fn watch(notifier: Notifier, mut auto: Option<AutoForward>) {
         let mut known = BTreeSet::new();
         loop {
             let mut now = listening();
+            now.retain(|p| !super::k8s::is_internal_port(*p));
             now.extend(super::machines::forwarded_ports());
+            now.extend(super::k8s::forwarded_ports());
             let (added, removed) = diff(&known, &now);
             // An auto-forward gives way before the published port is added.
-            let auto_changes = auto.as_mut().map(|a| a.tick(&now)).unwrap_or_default();
+            let mut auto_changes = auto.as_mut().map(|a| a.tick(&now)).unwrap_or_default();
+            auto_changes
+                .added
+                .retain(|p| !super::k8s::is_internal_port(*p));
             for m in autofwd::messages(&auto_changes.removed, false) {
                 notifier.send(&m);
             }

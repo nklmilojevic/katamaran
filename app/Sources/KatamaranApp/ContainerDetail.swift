@@ -390,7 +390,7 @@ final class InfoTabView: NSView, ContainerTabView {
                     .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ])
-                attr.append(NSAttributedString(string: kv.value.isEmpty ? "—" : kv.value, attributes: [
+                attr.append(NSAttributedString(string: kv.value.isEmpty ? "-" : kv.value, attributes: [
                     .font: NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular),
                     .foregroundColor: NSColor.labelColor,
                 ]))
@@ -552,7 +552,7 @@ final class StatsTabView: NSView, ContainerTabView {
             row2.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         for card in [cpu, mem, net, disk] {
-            card.valueLabel.stringValue = "—"
+            card.valueLabel.stringValue = "-"
             card.spark.capacity = 90
         }
         empty.show(symbol: "chart.xyaxis.line", title: "Not Running", message: "Start the container to see its usage.")
@@ -580,7 +580,7 @@ final class StatsTabView: NSView, ContainerTabView {
         if want != nil && want != lastID {
             history = ([], [], [], [])
             prev = nil
-            for card in [cpu, mem, net, disk] { card.valueLabel.stringValue = "—"; card.detailLabel.stringValue = " "; card.spark.values = [] }
+            for card in [cpu, mem, net, disk] { card.valueLabel.stringValue = "-"; card.detailLabel.stringValue = " "; card.spark.values = [] }
         }
         guard let id = want, let socket = store.socket else { return }
         lastID = id
@@ -714,7 +714,7 @@ final class LogsTabView: NSView, ContainerTabView, NSSearchFieldDelegate {
         s.onData = { [weak self] d in self?.received(d) }
         s.onEnd = { [weak self, weak s] err in
             guard let self, self.stream === s else { return }
-            if let err { self.text.append(["— \(err.localizedDescription) —"], error: true) }
+            if let err { self.text.append(["- \(err.localizedDescription) -"], error: true) }
             self.stream = nil
         }
         stream = s
@@ -1085,7 +1085,7 @@ final class FilesTabView: NSView, ContainerTabView, NSOutlineViewDataSource, NSO
             ])
             return cell
         case "size":
-            text.stringValue = node.isDirectory ? "—" : bytes(node.size)
+            text.stringValue = node.isDirectory ? "-" : bytes(node.size)
             text.textColor = .secondaryLabelColor
             text.alignment = .right
         default:

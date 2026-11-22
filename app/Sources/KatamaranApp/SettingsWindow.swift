@@ -14,6 +14,12 @@ final class SettingsWindowController: NSWindowController {
 
     private let login = NSSwitch()
     private let mount = NSSwitch()
+    private let k8sSwitch = NSSwitch()
+    private let k8sSyncBtn = NSButton(title: "Sync Images", target: nil, action: nil)
+    private let k8sResetBtn = NSButton(title: "Reset Cluster", target: nil, action: nil)
+    private let k8sStatusLabel = NSTextField(labelWithString: "Disabled")
+    private var k8sRow: FormRow!
+    private var k8sStatusRow: FormRow!
     private let cpuField = NSTextField()
     private let cpuStepper = NSStepper()
     private let memSlider = NSSlider()
@@ -28,13 +34,13 @@ final class SettingsWindowController: NSWindowController {
 
     init(model: AppModel) {
         self.model = model
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 200),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 200),
                          styleMask: [.titled, .closable, .fullSizeContentView],
                          backing: .buffered, defer: false)
-        w.toolbarStyle = .preference
-        w.titlebarSeparatorStyle = .none
-        w.isReleasedWhenClosed = false
-        super.init(window: w)
+        win.toolbarStyle = .preference
+        win.titlebarSeparatorStyle = .none
+        win.isReleasedWhenClosed = false
+        super.init(window: win)
         build()
         model.observe { [weak self] in self?.sync() }
     }
@@ -49,6 +55,7 @@ final class SettingsWindowController: NSWindowController {
         let panes: [SettingsPane: [NSView]] = [
             .general: [generalGroup()],
             .resources: [resourcesGroup()],
+            .kubernetes: [kubernetesGroup()],
         ]
         for pane in SettingsPane.allCases {
             let notice = NoticeGroup()
@@ -71,9 +78,9 @@ final class SettingsWindowController: NSWindowController {
     }
 
     private func generalGroup() -> NSView {
-        for s in [login, mount] {
-            s.controlSize = .mini
-            s.target = self
+        for toggle in [login, mount] {
+            toggle.controlSize = .mini
+            toggle.target = self
         }
         login.action = #selector(loginChanged)
         mount.action = #selector(mountChanged)
@@ -135,11 +142,43 @@ final class SettingsWindowController: NSWindowController {
             ])
     }
 
+    private func kubernetesGroup() -> NSView {
+        k8sSwitch.controlSize = .mini
+        k8sSwitch.target = self
+        k8sSwitch.action = #selector(k8sChanged)
+        k8sSyncBtn.target = self
+        k8sSyncBtn.action = #selector(k8sSyncClicked)
+        k8sSyncBtn.bezelStyle = .rounded
+        k8sSyncBtn.controlSize = .small
+        k8sResetBtn.target = self
+        k8sResetBtn.action = #selector(k8sResetClicked)
+        k8sResetBtn.bezelStyle = .rounded
+        k8sResetBtn.controlSize = .small
+        k8sStatusLabel.textColor = .secondaryLabelColor
+        k8sStatusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let actions = NSStackView(views: [k8sSyncBtn, k8sResetBtn])
+        actions.spacing = 8
+        k8sRow = FormRow(
+            "Enable Kubernetes",
+            subtitle: "Single-node k3s cluster sharing Docker’s containerd. Off uses zero resources.",
+            control: k8sSwitch
+        )
+        k8sStatusRow = FormRow("Cluster status", control: k8sStatusLabel)
+        return FormGroup(
+            footer: "Updates ~/.kube/config automatically. Run `kat k8s dns install` for *.k8s.kat.local.",
+            rows: [
+                k8sRow,
+                k8sStatusRow,
+                FormRow("Cluster actions", control: actions),
+            ]
+        )
+    }
+
     // MARK: Showing
 
     /// Open on `pane`, or on the pane last used.
     func present(pane: SettingsPane? = nil) {
-        if let pane, let i = SettingsPane.allCases.firstIndex(of: pane) { tabs.selectedTabViewItemIndex = i }
+        if let pane, let idx = SettingsPane.allCases.firstIndex(of: pane) { tabs.selectedTabViewItemIndex = idx }
         seen = nil
         sync()
         NSApp.activate()
@@ -165,24 +204,40 @@ final class SettingsWindowController: NSWindowController {
                 showValues()
             }
         }
-        for c in [login, mount, cpuField, cpuStepper, memSlider] as [NSControl] { c.isEnabled = status != nil }
+        for control in [login, mount, k8sSwitch, cpuField, cpuStepper, memSlider] as [NSControl] { control.isEnabled = status != nil }
+        let k8s = status?.k8s
+        let k8sRunning = k8s?.state == "running"
+        k8sSyncBtn.isEnabled = status != nil && k8sRunning && !model.busy
+        k8sResetBtn.isEnabled = status != nil && !model.busy
+        if let k8s, k8s.enabled || k8s.state != "stopped" {
+            var desc = k8s.state.capitalized
+            if let version = k8s.version, !version.isEmpty { desc += " (\(version))" }
+            if let port = k8s.apiPort { desc += " · 127.0.0.1:\(port)" }
+            if let err = k8s.error, !err.isEmpty { desc = "Error: \(err)" }
+            k8sStatusLabel.stringValue = desc
+            k8sStatusRow.subtitle = k8s.context.map { "Context: \($0)" }
+        } else {
+            k8sStatusLabel.stringValue = "Disabled"
+            k8sStatusRow.subtitle = nil
+        }
         let path = status?.mount.path ?? config?.mount_path
         mountRow.subtitle = path.map { "At \(($0 as NSString).abbreviatingWithTildeInPath)" }
 
         let notice = SettingsNotice(status: status, restartRequired: model.restartRequired, lastError: model.lastError)
         var changed = false
-        for n in notices { changed = n.show(notice, busy: model.busy) || changed }
+        for noticeView in notices { changed = noticeView.show(notice, busy: model.busy) || changed }
         if changed { fitWindow(animated: window?.isVisible ?? false) }
     }
 
     private func showValues() {
-        guard let c = shown else { return }
-        login.state = c.launch_at_login ? .on : .off
-        mount.state = c.mount ? .on : .off
-        let cpus = limits.clampCPUs(c.cpus)
+        guard let cfg = shown else { return }
+        login.state = cfg.launch_at_login ? .on : .off
+        mount.state = cfg.mount ? .on : .off
+        k8sSwitch.state = (cfg.kubernetes ?? false) ? .on : .off
+        let cpus = limits.clampCPUs(cfg.cpus)
         cpuField.integerValue = cpus
         cpuStepper.integerValue = cpus
-        let gib = limits.memoryGiB(fromMiB: c.memory_mib)
+        let gib = limits.memoryGiB(fromMiB: cfg.memory_mib)
         memSlider.integerValue = gib
         memValue.stringValue = memoryLabel(gib: gib)
     }
@@ -221,16 +276,32 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func mountChanged() { apply { $0.mount = mount.state == .on } }
 
+    @objc private func k8sChanged() { apply { $0.kubernetes = k8sSwitch.state == .on } }
+
+    @objc private func k8sSyncClicked() { model.k8sSyncImages() }
+
+    @objc private func k8sResetClicked() {
+        let alert = NSAlert()
+        alert.messageText = "Reset Kubernetes cluster?"
+        alert.informativeText = "This stops Kubernetes and deletes all cluster state, workloads, and persistent volumes."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            model.k8sReset()
+        }
+    }
+
     @objc private func cpuStepped() {
         cpuField.integerValue = cpuStepper.integerValue
         apply { $0.cpus = cpuStepper.integerValue }
     }
 
     @objc private func cpuTyped() {
-        let n = limits.clampCPUs(cpuField.integerValue)
-        cpuField.integerValue = n
-        cpuStepper.integerValue = n
-        apply { $0.cpus = n }
+        let count = limits.clampCPUs(cpuField.integerValue)
+        cpuField.integerValue = count
+        cpuStepper.integerValue = count
+        apply { $0.cpus = count }
     }
 
     @objc private func memoryMoved() {
@@ -256,8 +327,8 @@ private final class SettingsTabViewController: NSTabViewController {
     var onSelect: (SettingsPane) -> Void = { _ in }
 
     var selectedPane: NSViewController? {
-        let i = selectedTabViewItemIndex
-        return tabViewItems.indices.contains(i) ? tabViewItems[i].viewController : nil
+        let idx = selectedTabViewItemIndex
+        return tabViewItems.indices.contains(idx) ? tabViewItems[idx].viewController : nil
     }
 
     override func tabView(_ tabView: NSTabView, didSelect item: NSTabViewItem?) {
@@ -294,13 +365,13 @@ private final class PaneViewController: NSViewController {
         stack.alignment = .leading
         stack.spacing = 20
         stack.translatesAutoresizingMaskIntoConstraints = false
-        for v in views { v.widthAnchor.constraint(equalToConstant: FormLayout.width).isActive = true }
+        for item in views { item.widthAnchor.constraint(equalToConstant: FormLayout.width).isActive = true }
         let root = NSView()
         root.addSubview(stack)
-        let m = FormLayout.margin
+        let margin = FormLayout.margin
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: m),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: m),
+            stack.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: margin),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: margin),
         ])
         view = root
     }

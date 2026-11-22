@@ -24,8 +24,9 @@ use kat_proto::{GuestStats, PROTOCOL_VERSION, PortProto};
 use serde_json::Value;
 
 use crate::api::{
-    self, Call, ConfigView, DaemonInfo, DockerInfo, DockerState, LogChunk, LogSource, LogsParams,
-    MountInfo, Port, Request, Response, RpcError, Sample, StatsResult, Status, Versions, VmInfo,
+    self, Call, ConfigView, DaemonInfo, DockerInfo, DockerState, K8sStatus, LogChunk, LogSource,
+    LogsParams, MountInfo, Port, Request, Response, RpcError, Sample, StatsResult, Status,
+    Versions, VmInfo,
 };
 use crate::config::{Config, Host};
 use crate::power::{self, PowerEvent};
@@ -64,6 +65,8 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     for d in [&run_dir, &logs] {
         fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     }
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
     let lock = run::lock(&run_dir.join("katamaran.lock"))?;
     if !args.no_log_file {
         redirect_output(&logs.join("daemon.log"))?;
@@ -138,9 +141,41 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
 pub struct Daemon {
     home: PathBuf,
     inner: Mutex<Inner>,
+    k8s: Mutex<K8sRuntime>,
+    /// Serializes Kubernetes start/stop/reset/toggle operations so rapid
+    /// preference changes cannot race or overwrite newer user choices.
+    k8s_op: Mutex<()>,
     changed: Condvar,
     started: SystemTime,
     launchd_label: Option<String>,
+}
+
+struct K8sRuntime {
+    state: String,
+    installed: bool,
+    version: String,
+    api_proxy: Option<crate::k8s::ApiProxy>,
+    dns: Option<crate::k8s::DnsServer>,
+    kubeconfig: Option<PathBuf>,
+    error: Option<String>,
+    /// Set while `k8s_reset` temporarily boots a stopped VM so Docker
+    /// readiness does not auto-start k3s before the reset runs.
+    suppress_autostart: bool,
+}
+
+impl Default for K8sRuntime {
+    fn default() -> Self {
+        K8sRuntime {
+            state: "stopped".into(),
+            installed: false,
+            version: String::new(),
+            api_proxy: None,
+            dns: None,
+            kubeconfig: None,
+            error: None,
+            suppress_autostart: false,
+        }
+    }
 }
 
 struct Inner {
@@ -214,6 +249,8 @@ impl Daemon {
                 generation: 0,
                 exiting: false,
             }),
+            k8s: Mutex::new(K8sRuntime::default()),
+            k8s_op: Mutex::new(()),
             changed: Condvar::new(),
             started: SystemTime::now(),
             launchd_label: std::env::var("XPC_SERVICE_NAME")
@@ -333,109 +370,159 @@ impl Daemon {
         std::process::exit(0)
     }
 
-    fn on_event(&self, generation: u64, e: Event) {
-        let mut g = self.lock();
-        if g.generation != generation {
-            return;
-        }
-        let Inner { run, samples, .. } = &mut *g;
-        let Some(r) = run.as_mut() else { return };
-        match e {
-            Event::Booted {
-                kernel_release,
-                vm_pid,
-                took,
-            } => {
-                r.kernel = Some(kernel_release);
-                r.vm_pid = Some(vm_pid);
-                r.boot = Some(took);
-                r.booted_at = Some(Instant::now());
+    fn on_event(self: &Arc<Self>, generation: u64, e: Event) {
+        let mut auto_start_k8s = false;
+        let mut k8s_failed: Option<String> = None;
+        let mut k8s_reset_runtime = false;
+        {
+            let mut g = self.lock();
+            if g.generation != generation {
+                return;
             }
-            Event::ServiceReady(name) => {
-                if name == "docker" {
-                    r.docker = DockerState::Ready;
-                    let took = r.requested.elapsed();
-                    r.docker_ready = Some(took);
-                    dlog!("docker ready {:.0} ms after the start request", ms(took));
-                    if let Transition::To(to) = g.state.on(Trigger::Ready) {
+            let Inner { run, samples, .. } = &mut *g;
+            let Some(r) = run.as_mut() else { return };
+            match e {
+                Event::Booted {
+                    kernel_release,
+                    vm_pid,
+                    took,
+                } => {
+                    r.kernel = Some(kernel_release);
+                    r.vm_pid = Some(vm_pid);
+                    r.boot = Some(took);
+                    r.booted_at = Some(Instant::now());
+                }
+                Event::ServiceReady(name) => {
+                    if name == "docker" {
+                        r.docker = DockerState::Ready;
+                        let took = r.requested.elapsed();
+                        r.docker_ready = Some(took);
+                        dlog!("docker ready {:.0} ms after the start request", ms(took));
+                        if let Transition::To(to) = g.state.on(Trigger::Ready) {
+                            self.set_state(&mut g, to);
+                        }
+                        if Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+                            auto_start_k8s = true;
+                        }
+                    }
+                }
+                Event::ServiceFailed(name, error) => {
+                    if name == "k8s" {
+                        k8s_failed = Some(error);
+                    } else {
+                        r.problem = Some(format!("{name}: {error}"));
+                    }
+                    if name == "docker" {
+                        r.docker = DockerState::Failed;
+                        // The VM stays up; "running" with Docker failed.
+                        if let Transition::To(to) = g.state.on(Trigger::Ready) {
+                            self.set_state(&mut g, to);
+                        }
+                    }
+                }
+                Event::Mounted(path) => {
+                    r.mounted = true;
+                    r.mount_path = Some(path);
+                }
+                Event::MountFailed(error) => {
+                    r.problem = Some(format!("files not mounted: {error}"));
+                    r.mount_error = Some(error);
+                }
+                Event::PortAdd(proto, port) => {
+                    r.ports.insert((proto, port));
+                }
+                Event::PortRemove(proto, port) => {
+                    r.ports.remove(&(proto, port));
+                }
+                Event::Restarting { why, delay } => {
+                    dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
+                    let mut next = Run::new(r.applied.clone(), r.mount_path.clone());
+                    next.problem = Some(format!("the VM was restarted: {why}"));
+                    *r = next;
+                    k8s_reset_runtime = true;
+                    if let Transition::To(to) = g.state.on(Trigger::Restarting) {
                         self.set_state(&mut g, to);
                     }
                 }
-            }
-            Event::ServiceFailed(name, error) => {
-                r.problem = Some(format!("{name}: {error}"));
-                if name == "docker" {
-                    r.docker = DockerState::Failed;
-                    // The VM stays up; "running" with Docker failed.
-                    if let Transition::To(to) = g.state.on(Trigger::Ready) {
-                        self.set_state(&mut g, to);
+                Event::Stats(st) => {
+                    let cpu = match r.prev_guest {
+                        Some(p) => cpu_percent(&p, &st),
+                        None => 0.0,
+                    };
+                    r.prev_guest = Some(st);
+                    samples.push_back(Sample {
+                        t_ms: unix_ms(SystemTime::now()),
+                        guest_cpu_percent: cpu,
+                        guest_mem_used_mib: st.mem_total_kib.saturating_sub(st.mem_available_kib)
+                            >> 10,
+                        guest_mem_total_mib: st.mem_total_kib >> 10,
+                        host_cpu_percent: r.host_cpu_percent,
+                        host_footprint_mib: r.host_footprint_mib,
+                    });
+                    while samples.len() > STATS_HISTORY {
+                        samples.pop_front();
                     }
                 }
             }
-            Event::Mounted(path) => {
-                r.mounted = true;
-                r.mount_path = Some(path);
-            }
-            Event::MountFailed(error) => {
-                r.problem = Some(format!("files not mounted: {error}"));
-                r.mount_error = Some(error);
-            }
-            Event::PortAdd(proto, port) => {
-                r.ports.insert((proto, port));
-            }
-            Event::PortRemove(proto, port) => {
-                r.ports.remove(&(proto, port));
-            }
-            Event::Restarting { why, delay } => {
-                dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
-                let mut next = Run::new(r.applied.clone(), r.mount_path.clone());
-                next.problem = Some(format!("the VM was restarted: {why}"));
-                *r = next;
-                if let Transition::To(to) = g.state.on(Trigger::Restarting) {
-                    self.set_state(&mut g, to);
-                }
-            }
-            Event::Stats(st) => {
-                let cpu = match r.prev_guest {
-                    Some(p) => cpu_percent(&p, &st),
-                    None => 0.0,
-                };
-                r.prev_guest = Some(st);
-                samples.push_back(Sample {
-                    t_ms: unix_ms(SystemTime::now()),
-                    guest_cpu_percent: cpu,
-                    guest_mem_used_mib: st.mem_total_kib.saturating_sub(st.mem_available_kib) >> 10,
-                    guest_mem_total_mib: st.mem_total_kib >> 10,
-                    host_cpu_percent: r.host_cpu_percent,
-                    host_footprint_mib: r.host_footprint_mib,
-                });
-                while samples.len() > STATS_HISTORY {
-                    samples.pop_front();
-                }
-            }
+            self.changed.notify_all();
         }
-        self.changed.notify_all();
+        if k8s_reset_runtime {
+            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            k.api_proxy = None;
+            k.dns = None;
+            k.state = "stopped".into();
+        }
+        if let Some(err) = k8s_failed {
+            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            k.api_proxy = None;
+            k.dns = None;
+            k.state = "failed".into();
+            k.error = Some(err);
+        }
+        if auto_start_k8s
+            && !self
+                .k8s
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_autostart
+        {
+            let d = self.clone();
+            thread::Builder::new()
+                .name("k8s-autostart".into())
+                .spawn(move || {
+                    if let Err(e) = d.k8s_start_inner(false, true, &mut |m| dlog!("k8s: {m}")) {
+                        dlog!("k8s autostart failed: {e}");
+                    }
+                })
+                .ok();
+        }
     }
 
     fn on_exit(&self, generation: u64, result: anyhow::Result<()>) {
-        let mut g = self.lock();
-        if g.generation != generation {
-            return;
-        }
-        let ok = result.is_ok();
-        match &result {
-            Ok(()) => dlog!("VM stopped"),
-            Err(e) => {
-                dlog!("VM failed: {e:#}");
-                g.error = Some(format!("{e:#}"));
+        {
+            let mut g = self.lock();
+            if g.generation != generation {
+                return;
             }
+            let ok = result.is_ok();
+            match &result {
+                Ok(()) => dlog!("VM stopped"),
+                Err(e) => {
+                    dlog!("VM failed: {e:#}");
+                    g.error = Some(format!("{e:#}"));
+                }
+            }
+            g.control = None;
+            g.run = None;
+            if let Transition::To(to) = g.state.on(Trigger::Exited { ok }) {
+                self.set_state(&mut g, to);
+            }
+            self.changed.notify_all();
         }
-        g.control = None;
-        g.run = None;
-        if let Transition::To(to) = g.state.on(Trigger::Exited { ok }) {
-            self.set_state(&mut g, to);
-        }
-        self.changed.notify_all();
+        let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        k.api_proxy = None;
+        k.dns = None;
+        k.state = "stopped".into();
     }
 
     /// Every [`STATS_INTERVAL`]: ask the guest for its usage and read the VM
@@ -508,6 +595,7 @@ impl Daemon {
                 state: r.map_or(DockerState::Stopped, |r| r.docker),
                 socket: self.home.join("run/docker.sock"),
             },
+            k8s: self.k8s_status(saved.kubernetes),
             mount: MountInfo {
                 enabled: mount_enabled,
                 path: match r {
@@ -547,12 +635,13 @@ impl Daemon {
     }
 
     fn set_config(
-        &self,
+        self: &Arc<Self>,
         values: &std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<ConfigView> {
         let mut cfg = Config::load(&self.home)?;
         let host = Host::current();
         let before = cfg.launch_at_login;
+        let before_k8s = cfg.kubernetes;
         for (k, v) in values {
             cfg.set(k, v, &host)?;
         }
@@ -560,6 +649,22 @@ impl Daemon {
         dlog!("config saved: {values:?}");
         if cfg.launch_at_login != before {
             crate::setup::set_run_at_load(cfg.launch_at_login)?;
+        }
+        if cfg.kubernetes != before_k8s && self.lock().state == VmState::Running {
+            let d = self.clone();
+            let enable = cfg.kubernetes;
+            thread::Builder::new()
+                .name("k8s-toggle".into())
+                .spawn(move || {
+                    if enable {
+                        if let Err(e) = d.k8s_start_inner(false, true, &mut |m| dlog!("k8s: {m}")) {
+                            dlog!("k8s start failed: {e}");
+                        }
+                    } else if let Err(e) = d.k8s_stop_inner(false, true) {
+                        dlog!("k8s stop failed: {e}");
+                    }
+                })
+                .ok();
         }
         self.config_view()
     }
@@ -630,6 +735,29 @@ impl Daemon {
             {
                 self.follow_logs(id, p, &mut out);
                 return;
+            }
+            if let Call::K8sStart = &call {
+                let mut progress = |m: &str| {
+                    let _ = send(
+                        &mut out.try_clone().unwrap(),
+                        &api::Notification {
+                            jsonrpc: api::VERSION.into(),
+                            method: "k8s.progress".into(),
+                            params: serde_json::json!({ "message": m }),
+                        },
+                    );
+                };
+                let resp = match self.k8s_start(&mut progress).and_then(|s| {
+                    serde_json::to_value(s)
+                        .map_err(|e| RpcError::new(api::INTERNAL_ERROR, e.to_string()))
+                }) {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&mut out, &resp).is_err() {
+                    return;
+                }
+                continue;
             }
             if let Call::MachineCreate(c) = &call {
                 let mut progress = |m: &str| {
@@ -740,6 +868,304 @@ impl Daemon {
                 crate::machines::simple(&self.home, &req).map_err(|e| failed(format!("{e:#}")))?;
                 Ok(Value::Null)
             }
+            Call::K8sStart => {
+                let st = self.k8s_start(&mut |m| dlog!("k8s: {m}"))?;
+                value(serde_json::to_value(st))
+            }
+            Call::K8sStop => {
+                self.k8s_stop(true)?;
+                Ok(Value::Null)
+            }
+            Call::K8sReset => {
+                self.k8s_reset()?;
+                Ok(Value::Null)
+            }
+            Call::K8sKubeconfig => {
+                let yaml = self.k8s_kubeconfig()?;
+                Ok(serde_json::json!({ "kubeconfig": yaml }))
+            }
+            Call::K8sSyncImages => {
+                let mut noop = |_: &str| {};
+                crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::SyncImages, &mut noop)
+                    .map_err(|e| failed(format!("{e:#}")))?;
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    fn k8s_status(&self, enabled: bool) -> K8sStatus {
+        let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        let dns_port = k.dns.as_ref().map(|d| d.port);
+        K8sStatus {
+            enabled,
+            state: k.state.clone(),
+            installed: k.installed,
+            version: k.version.clone(),
+            api_port: k.api_proxy.as_ref().map(|p| p.port),
+            context: crate::k8s::context_name().unwrap_or_default(),
+            kubeconfig: k.kubeconfig.clone(),
+            dns_domain: crate::k8s::DNS_DOMAIN.into(),
+            dns_port,
+            dns_installed: crate::k8s::dns_resolver_installed(dns_port),
+            error: k.error.clone(),
+        }
+    }
+
+    fn persist_k8s_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut cfg = Config::load(&self.home)?;
+        if cfg.kubernetes != enabled {
+            cfg.kubernetes = enabled;
+            cfg.save(&self.home)?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_docker_ready(self: &Arc<Self>) -> Result<(), RpcError> {
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        {
+            let g = self.lock();
+            if g.state == VmState::Stopped || g.state == VmState::Error {
+                drop(g);
+                self.start().map_err(failed)?;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut g = self.lock();
+        loop {
+            if g.run
+                .as_ref()
+                .is_some_and(|r| r.docker == DockerState::Ready)
+            {
+                return Ok(());
+            }
+            if g.state == VmState::Error || g.state == VmState::Stopped {
+                return Err(failed(g.error.clone().unwrap_or_else(|| {
+                    "the VM stopped before Kubernetes could start".into()
+                })));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(failed("timed out waiting for the VM to start".into()));
+            }
+            g = self
+                .changed
+                .wait_timeout(g, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn k8s_start(self: &Arc<Self>, progress: &mut dyn FnMut(&str)) -> Result<K8sStatus, RpcError> {
+        self.k8s_start_inner(true, false, progress)
+    }
+
+    fn k8s_start_inner(
+        self: &Arc<Self>,
+        persist_enabled: bool,
+        only_if_config_enabled: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<K8sStatus, RpcError> {
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        if only_if_config_enabled && !Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+            return Ok(self.k8s_status(false));
+        }
+        if persist_enabled {
+            self.persist_k8s_enabled(true)
+                .map_err(|e| failed(format!("{e:#}")))?;
+        }
+        progress("ensuring VM is running");
+        self.wait_for_docker_ready()?;
+        if only_if_config_enabled && !Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+            return Ok(self.k8s_status(false));
+        }
+
+        {
+            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            if k.state == "running" && k.api_proxy.is_some() {
+                drop(k);
+                return Ok(self.k8s_status(true));
+            }
+            k.state = "starting".into();
+            k.error = None;
+        }
+
+        let mut guest_started = false;
+        let res = (|| -> anyhow::Result<(kat_proto::k8s::K8sInfo, crate::k8s::ApiProxy, crate::k8s::DnsServer, PathBuf)> {
+            crate::k8s::ensure_installed(&self.home, progress)?;
+            let info = match crate::k8s::request(
+                &self.home,
+                &kat_proto::k8s::K8sMsg::Start,
+                progress,
+            )? {
+                kat_proto::k8s::K8sMsg::StatusInfo(info) => info,
+                other => anyhow::bail!("unexpected k8s start reply {other:?}"),
+            };
+            guest_started = true;
+            let proxy = crate::k8s::ApiProxy::start(crate::k8s::api_socket_path(&self.home))
+                .context("start Kubernetes API proxy")?;
+            let dns = crate::k8s::DnsServer::start()
+                .context("start Kubernetes DNS responder")?;
+            let raw_kc = match crate::k8s::request(
+                &self.home,
+                &kat_proto::k8s::K8sMsg::Kubeconfig,
+                progress,
+            )? {
+                kat_proto::k8s::K8sMsg::KubeconfigData(yaml) => yaml,
+                other => anyhow::bail!("unexpected kubeconfig reply {other:?}"),
+            };
+            progress("updating ~/.kube/config");
+            let kc_path = crate::k8s::write_and_merge_kubeconfig(&self.home, &raw_kc, proxy.port)?;
+            Ok((info, proxy, dns, kc_path))
+        })();
+
+        match res {
+            Ok((info, proxy, dns, kc_path)) => {
+                let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+                k.state = "running".into();
+                k.installed = info.installed;
+                k.version = info.version;
+                k.api_proxy = Some(proxy);
+                k.dns = Some(dns);
+                k.kubeconfig = Some(kc_path);
+                k.error = None;
+                drop(k);
+                Ok(self.k8s_status(true))
+            }
+            Err(e) => {
+                if guest_started {
+                    let mut noop = |_: &str| {};
+                    if let Err(se) =
+                        crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Stop, &mut noop)
+                    {
+                        dlog!("k8s rollback stop failed: {se:#}");
+                    }
+                }
+                let msg = format!("{e:#}");
+                let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+                k.state = "failed".into();
+                k.api_proxy = None;
+                k.dns = None;
+                k.error = Some(msg.clone());
+                Err(failed(msg))
+            }
+        }
+    }
+
+    fn k8s_stop(&self, disable_config: bool) -> Result<(), RpcError> {
+        self.k8s_stop_inner(disable_config, false)
+    }
+
+    fn k8s_stop_inner(
+        &self,
+        disable_config: bool,
+        only_if_config_disabled: bool,
+    ) -> Result<(), RpcError> {
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        if only_if_config_disabled && Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
+            return Ok(());
+        }
+        let prev_state = {
+            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = k.state.clone();
+            k.state = "stopping".into();
+            prev
+        };
+        // Keep API/DNS relays and saved config intact until the guest confirms
+        // k3s has actually stopped.
+        if self.lock().state.is_active() && crate::k8s::socket_path(&self.home).exists() {
+            let mut noop = |_: &str| {};
+            if let Err(e) =
+                crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Stop, &mut noop)
+            {
+                let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+                k.state = prev_state;
+                k.error = Some(format!("{e:#}"));
+                return Err(failed(format!("{e:#}")));
+            }
+        }
+        if disable_config {
+            self.persist_k8s_enabled(false)
+                .map_err(|e| failed(format!("{e:#}")))?;
+        }
+        let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
+        crate::k8s::remove_kubeconfig(&self.home, &ctx);
+        let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        k.api_proxy = None;
+        k.dns = None;
+        k.kubeconfig = None;
+        k.state = "stopped".into();
+        k.error = None;
+        Ok(())
+    }
+
+    fn k8s_reset(self: &Arc<Self>) -> Result<(), RpcError> {
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
+        let was_stopped = !self.lock().state.is_active();
+        if was_stopped {
+            self.k8s
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_autostart = true;
+        }
+        let reset_res = (|| -> Result<(), RpcError> {
+            if was_stopped {
+                self.wait_for_docker_ready()?;
+            }
+            let mut noop = |_: &str| {};
+            crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Reset, &mut noop)
+                .map_err(|e| failed(format!("{e:#}")))?;
+            Ok(())
+        })();
+        if was_stopped {
+            self.k8s
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_autostart = false;
+            let stop_res = self.stop(true).map_err(failed);
+            reset_res?;
+            stop_res?;
+        } else {
+            reset_res?;
+        }
+        self.persist_k8s_enabled(false)
+            .map_err(|e| failed(format!("{e:#}")))?;
+        crate::k8s::remove_kubeconfig(&self.home, &ctx);
+        let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        k.api_proxy = None;
+        k.dns = None;
+        k.state = "stopped".into();
+        k.kubeconfig = None;
+        k.error = None;
+        Ok(())
+    }
+
+    fn k8s_kubeconfig(&self) -> Result<String, RpcError> {
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        let path = crate::k8s::kubeconfig_path(&self.home);
+        if let Ok(yaml) = fs::read_to_string(&path) {
+            return Ok(yaml);
+        }
+        let api_port = self
+            .k8s
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .api_proxy
+            .as_ref()
+            .map(|p| p.port)
+            .unwrap_or(crate::k8s::DEFAULT_API_PORT);
+        let mut noop = |_: &str| {};
+        match crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Kubeconfig, &mut noop)
+            .map_err(|e| failed(format!("{e:#}")))?
+        {
+            kat_proto::k8s::K8sMsg::KubeconfigData(raw) => {
+                let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
+                Ok(crate::k8s::rewrite_kubeconfig(&raw, &ctx, api_port))
+            }
+            other => Err(failed(format!("unexpected kubeconfig reply {other:?}"))),
         }
     }
 
@@ -919,7 +1345,11 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
         },
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
-        cmdline: String::new(),
+        cmdline: if cfg.kubernetes {
+            "kat.k8s=1".into()
+        } else {
+            String::new()
+        },
         vm_bin: None,
         no_share: false,
         permissions: "caller".into(),

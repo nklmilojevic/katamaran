@@ -407,14 +407,14 @@ func rate(_ bytesPerSecond: Double) -> String {
 }
 
 func relative(_ date: Date?) -> String {
-    guard let date else { return "—" }
+    guard let date else { return "-" }
     let f = RelativeDateTimeFormatter()
     f.unitsStyle = .full
     return f.localizedString(for: date, relativeTo: Date())
 }
 
 func absolute(_ date: Date?) -> String {
-    guard let date else { return "—" }
+    guard let date else { return "-" }
     return DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .short)
 }
 

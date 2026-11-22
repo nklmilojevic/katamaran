@@ -64,9 +64,9 @@ Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `au
 
 When `mount` is enabled, `~/Katamaran` exposes Linux files over NFS:
 
-- `~/Katamaran/docker/volumes/<name>` — named Docker volumes
-- `~/Katamaran/docker/containers/<name>` — running container filesystems
-- `~/Katamaran/machines/<name>` — Linux machine filesystems
+- `~/Katamaran/docker/volumes/<name>` - named Docker volumes
+- `~/Katamaran/docker/containers/<name>` - running container filesystems
+- `~/Katamaran/machines/<name>` - Linux machine filesystems
 
 ## Logs and troubleshooting
 

@@ -46,7 +46,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         let phase = model.phase
 
-        let state = NSMenuItem(title: "Katamaran — \(phase.label)", action: nil, keyEquivalent: "")
+        let state = NSMenuItem(title: "Katamaran - \(phase.label)", action: nil, keyEquivalent: "")
         state.image = dotImage(phase.color, size: 9)
         state.subtitle = statusSummary(model.status) ?? "The daemon isn’t running"
         state.isEnabled = false

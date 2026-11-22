@@ -3,6 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use kat_proto::{
-    AUTO_FORWARD_PORT, DOCKER_PORT, GuestStats, MACHINE_PORT, Msg, NFS_PORT, PortProto, read_msg,
+    AUTO_FORWARD_PORT, DOCKER_PORT, GuestStats, K8S_API_PORT, K8S_PORT, MACHINE_PORT, Msg,
+    NFS_PORT, PortProto, read_msg,
 };
 use kat_vmm::{Disk, HostListener, Permissions, Share, VmConfig};
 
@@ -249,6 +251,10 @@ fn session(
     for d in [&run_dir, &logs, &data_dir] {
         fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     }
+    // Restrict the run directory to the owning user before libkrun binds
+    // host-side vsock Unix sockets (docker.sock, machine.sock, k8s.sock, k8s-api.sock).
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
 
     let data_img = data_dir.join("data.img");
     if !data_img.exists() {
@@ -326,6 +332,18 @@ fn session(
         .chain(std::iter::once(HostListener {
             port: MACHINE_PORT,
             path: crate::machines::socket_path(&state),
+            kernel_only: false,
+            loopback_tcp: false,
+        }))
+        .chain(std::iter::once(HostListener {
+            port: K8S_PORT,
+            path: crate::k8s::socket_path(&state),
+            kernel_only: false,
+            loopback_tcp: false,
+        }))
+        .chain(std::iter::once(HostListener {
+            port: K8S_API_PORT,
+            path: crate::k8s::api_socket_path(&state),
             kernel_only: false,
             loopback_tcp: false,
         }))

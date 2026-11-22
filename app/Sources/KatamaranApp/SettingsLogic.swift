@@ -46,6 +46,7 @@ extension Config {
         if memory_mib != old.memory_mib { v["memory_mib"] = memory_mib }
         if mount != old.mount { v["mount"] = mount }
         if launch_at_login != old.launch_at_login { v["launch_at_login"] = launch_at_login }
+        if kubernetes != old.kubernetes, let kubernetes { v["kubernetes"] = kubernetes }
         return v
     }
 }
@@ -97,12 +98,13 @@ enum SettingsNotice: Equatable {
 
 /// The Settings panes, in toolbar order.
 enum SettingsPane: String, CaseIterable {
-    case general, resources
+    case general, resources, kubernetes
 
     var title: String {
         switch self {
         case .general: "General"
         case .resources: "Resources"
+        case .kubernetes: "Kubernetes"
         }
     }
 
@@ -110,6 +112,7 @@ enum SettingsPane: String, CaseIterable {
         switch self {
         case .general: "gearshape"
         case .resources: "cpu"
+        case .kubernetes: "hexagon"
         }
     }
 }

@@ -59,7 +59,8 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     next = base
     next.launch_at_login = false
     next.mount = false
-    #expect(NSDictionary(dictionary: next.values(changedFrom: base)) == ["launch_at_login": false, "mount": false])
+    next.kubernetes = true
+    #expect(NSDictionary(dictionary: next.values(changedFrom: base)) == ["launch_at_login": false, "mount": false, "kubernetes": true])
     // An odd size from the CLI stays as it is unless memory itself changes.
     var odd = base
     odd.memory_mib = 1536
