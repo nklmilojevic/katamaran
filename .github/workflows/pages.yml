@@ -38,14 +38,16 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh api "repos/$REPO/releases?per_page=15" > "$RUNNER_TEMP/releases.json"
+          gh api --paginate --slurp "repos/$REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
           if python3 -c '
           import json, sys
-          releases = json.load(open(sys.argv[1]))
-          stable = [r for r in releases if not r.get("draft") and not r.get("prerelease")][:10]
+          pages = json.load(open(sys.argv[1]))
+          releases = [r for page in pages for r in page]
           has_sparkle = any(
-              any(a.get("name") == "sparkle.json" for a in r.get("assets", []))
-              for r in stable
+              not r.get("draft")
+              and not r.get("prerelease")
+              and any(a.get("name") == "sparkle.json" for a in r.get("assets", []))
+              for r in releases
           )
           sys.exit(0 if has_sparkle else 1)
           ' "$RUNNER_TEMP/releases.json"; then
