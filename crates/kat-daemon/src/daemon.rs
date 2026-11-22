@@ -500,29 +500,29 @@ impl Daemon {
 
     fn on_exit(&self, generation: u64, result: anyhow::Result<()>) {
         {
-            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
-            k.api_proxy = None;
-            k.dns = None;
-            k.state = "stopped".into();
-        }
-        let mut g = self.lock();
-        if g.generation != generation {
-            return;
-        }
-        let ok = result.is_ok();
-        match &result {
-            Ok(()) => dlog!("VM stopped"),
-            Err(e) => {
-                dlog!("VM failed: {e:#}");
-                g.error = Some(format!("{e:#}"));
+            let mut g = self.lock();
+            if g.generation != generation {
+                return;
             }
+            let ok = result.is_ok();
+            match &result {
+                Ok(()) => dlog!("VM stopped"),
+                Err(e) => {
+                    dlog!("VM failed: {e:#}");
+                    g.error = Some(format!("{e:#}"));
+                }
+            }
+            g.control = None;
+            g.run = None;
+            if let Transition::To(to) = g.state.on(Trigger::Exited { ok }) {
+                self.set_state(&mut g, to);
+            }
+            self.changed.notify_all();
         }
-        g.control = None;
-        g.run = None;
-        if let Transition::To(to) = g.state.on(Trigger::Exited { ok }) {
-            self.set_state(&mut g, to);
-        }
-        self.changed.notify_all();
+        let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+        k.api_proxy = None;
+        k.dns = None;
+        k.state = "stopped".into();
     }
 
     /// Every [`STATS_INTERVAL`]: ask the guest for its usage and read the VM
