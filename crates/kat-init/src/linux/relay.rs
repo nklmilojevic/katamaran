@@ -1,6 +1,7 @@
 //! Serves a guest Unix socket on a vsock port. libkrun listens on a Unix
 //! socket on the Mac and connects each client to this port.
 
+use super::sys;
 use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::OwnedFd;
@@ -9,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
-use super::sys;
 
 const MAX_CONNS: usize = 256;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
