@@ -42,20 +42,6 @@ pub enum ChildTarget {
     Exited,
 }
 
-impl ChildTarget {
-    pub fn send_signal(&self, sig: i32) {
-        match self {
-            ChildTarget::PidFd(fd) => {
-                let _ = sys::pidfd_send_signal(fd, sig);
-            }
-            ChildTarget::Pid(pid) => {
-                unsafe { libc::kill(*pid, sig) };
-            }
-            ChildTarget::Exited => {}
-        }
-    }
-}
-
 impl Reaper {
     pub fn start() -> Reaper {
         let r = Reaper {
@@ -82,7 +68,9 @@ impl Reaper {
     }
 
     /// Like [`Reaper::spawn`], also opening a `pidfd` while the watch table
-    /// lock is held so callers can signal the child safely without PID reuse.
+    /// lock is held. Because `reap_loop` waits with `WNOWAIT` and only reaps
+    /// under `self.watched`, the child cannot be reaped or its PID recycled
+    /// before `pidfd_open` and registration complete.
     pub fn spawn_pidfd(&self, cmd: &mut Command) -> io::Result<(ChildTarget, Receiver<i32>)> {
         let mut watched = self.watched.lock().unwrap();
         let child = cmd.spawn()?;
@@ -96,18 +84,58 @@ impl Reaper {
         watched.insert(pid, tx);
         Ok((target, rx))
     }
+
+    /// Signal `target` without risking PID reuse. On kernels with `pidfd`,
+    /// `pidfd_send_signal` enforces process identity in the kernel; on the
+    /// fallback `ChildTarget::Pid` path, holding `self.watched` prevents
+    /// `reap_loop` from reaping and freeing the PID across the liveness check
+    /// and `kill(2)`.
+    pub fn signal_target(&self, target: &ChildTarget, sig: i32) {
+        match target {
+            ChildTarget::PidFd(fd) => {
+                let _ = sys::pidfd_send_signal(fd, sig);
+            }
+            ChildTarget::Pid(pid) => {
+                let watched = self.watched.lock().unwrap();
+                if watched.contains_key(pid) {
+                    unsafe { libc::kill(*pid, sig) };
+                }
+            }
+            ChildTarget::Exited => {}
+        }
+    }
 }
 
 fn reap_loop(watched: &Mutex<HashMap<i32, Sender<i32>>>) {
     loop {
-        let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if pid < 0 {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Wait without reaping (`WNOWAIT`) so zombies stay pinned until we hold
+        // `watched`; that guarantees `spawn_pidfd` and fallback `signal_target`
+        // can never race with reaping and PID reuse.
+        let rc = unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             // ECHILD: nothing to wait for yet.
             thread::sleep(Duration::from_millis(50));
             continue;
         }
-        if let Some(tx) = watched.lock().unwrap().remove(&pid) {
+        let pid = unsafe { info.si_pid() };
+        if pid <= 0 {
+            continue;
+        }
+        let mut status = 0;
+        let tx = {
+            let mut watched = watched.lock().unwrap();
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped > 0 {
+                watched.remove(&reaped)
+            } else {
+                None
+            }
+        };
+        if let Some(tx) = tx {
             let _ = tx.send(status);
         }
     }
@@ -191,6 +219,7 @@ impl ExitState {
 /// A running service process.
 struct Service {
     name: &'static str,
+    reaper: Reaper,
     target: ChildTarget,
     started: Instant,
     exit: Arc<ExitState>,
@@ -221,35 +250,25 @@ impl Service {
         let (target, status_rx) = reaper.spawn_pidfd(&mut cmd)?;
         let exit = Arc::new(ExitState::new());
         let (exit2, exits) = (exit.clone(), exits.clone());
-        let rx_slot = Arc::new(Mutex::new(Some(status_rx)));
-        let rx_for_thread = rx_slot.clone();
         let waiter = thread::Builder::new()
             .name(format!("{name}-wait"))
             .spawn(move || {
-                let status_rx = rx_for_thread.lock().unwrap().take();
-                if let Some(rx) = status_rx
-                    && let Ok(status) = rx.recv()
-                {
+                if let Ok(status) = status_rx.recv() {
                     *exit2.status.lock().unwrap() = Some(status);
                     exit2.notify.notify_all();
                     let _ = exits.send((index, status));
                 }
             });
         if let Err(e) = waiter {
-            // Only signal if the child has not already been reaped; when pidfd
-            // is available `target.send_signal` is also immune to PID reuse.
-            let already_reaped = rx_slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|rx| rx.try_recv().is_ok());
-            if !already_reaped {
-                target.send_signal(libc::SIGKILL);
-            }
+            // `reaper.signal_target` uses pidfd when available, or holds the
+            // reaper watch-table lock across the liveness check and kill(2) so
+            // `reap_loop` cannot reap and free the PID in between.
+            reaper.signal_target(&target, libc::SIGKILL);
             return Err(e);
         }
         Ok(Arc::new(Service {
             name,
+            reaper: reaper.clone(),
             target,
             started: Instant::now(),
             exit,
@@ -266,7 +285,7 @@ impl Service {
             return;
         }
         let t = Instant::now();
-        self.target.send_signal(libc::SIGTERM);
+        self.reaper.signal_target(&self.target, libc::SIGTERM);
         if !self.exit.wait_timeout(timeout) {
             eprintln!(
                 "kat-init: {} did not stop in {}s, killing it",
@@ -274,7 +293,7 @@ impl Service {
                 timeout.as_secs()
             );
             if !self.has_exited() {
-                self.target.send_signal(libc::SIGKILL);
+                self.reaper.signal_target(&self.target, libc::SIGKILL);
             }
             let _ = self.exit.wait_timeout(Duration::from_secs(2));
         }
@@ -544,7 +563,7 @@ fn start_one(
     };
     ready.map_err(|e| {
         if !service.has_exited() {
-            service.target.send_signal(libc::SIGKILL);
+            reaper.signal_target(&service.target, libc::SIGKILL);
         }
         StartError::NotReady(e)
     })

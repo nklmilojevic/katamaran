@@ -773,7 +773,7 @@ fn unpack(reaper: &Reaper, rootfs: &std::path::Path, conn: &mut UnixStream) -> R
         Ok(h) => h,
         Err(e) => {
             drop(in_w);
-            target.send_signal(libc::SIGKILL);
+            reaper.signal_target(&target, libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             return Err(format!("tar output thread: {e}"));
         }

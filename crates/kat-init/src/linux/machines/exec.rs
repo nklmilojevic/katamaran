@@ -39,10 +39,10 @@ fn send_exit_and_close(w: &Writer, code: i32) -> io::Result<()> {
     machine::write(&mut guard.stream, &MachineMsg::Exit { code })
 }
 
-fn signal_child(target: &Mutex<Option<ChildTarget>>, sig: i32) {
+fn signal_child(reaper: &Reaper, target: &Mutex<Option<ChildTarget>>, sig: i32) {
     let guard = target.lock().unwrap();
     if let Some(t) = guard.as_ref() {
-        t.send_signal(sig);
+        reaper.signal_target(t, sig);
     }
 }
 
@@ -170,6 +170,7 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
     // Input from the host until it hangs up or the child exits.
     let tty = spec.tty.is_some();
     let target_in = target.clone();
+    let reaper_in = reaper.clone();
     let stdin_thread = thread::Builder::new()
         .name("exec-in".into())
         .spawn(move || {
@@ -197,16 +198,16 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
                             unsafe { libc::ioctl(m.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
                         }
                     }
-                    MachineMsg::Signal { signal } => signal_child(&target_in, signal),
+                    MachineMsg::Signal { signal } => signal_child(&reaper_in, &target_in, signal),
                     _ => {}
                 }
             }
             // The client went away: hang up the session like a closed terminal,
             // unless the child has already been reaped.
-            signal_child(&target_in, libc::SIGHUP);
+            signal_child(&reaper_in, &target_in, libc::SIGHUP);
         });
     if let Err(e) = stdin_thread {
-        signal_child(&target, libc::SIGKILL);
+        signal_child(reaper, &target, libc::SIGKILL);
         *target.lock().unwrap() = None;
         let _ = exited.recv_timeout(Duration::from_secs(2));
         return Err(e);
@@ -221,7 +222,7 @@ pub fn exec(reaper: &Reaper, conn: UnixStream, spec: &ExecSpec, user: &str) -> i
         {
             Ok(h) => outputs.push(h),
             Err(e) => {
-                signal_child(&target, libc::SIGKILL);
+                signal_child(reaper, &target, libc::SIGKILL);
                 *target.lock().unwrap() = None;
                 {
                     let mut guard = w.lock().unwrap();
