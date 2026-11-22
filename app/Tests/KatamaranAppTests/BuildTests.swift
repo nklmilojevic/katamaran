@@ -275,6 +275,10 @@ private func parse(_ log: String) -> BuildProgressParser {
         #expect(BuildCommands.inspect("abc", socket: "/s") == "docker -H unix:///s buildx history inspect --builder default abc")
         #expect(BuildCommands.logs("a b'c", socket: "/s") == #"docker -H unix:///s buildx history logs --builder default 'a b'\''c'"#)
         #expect(BuildCommands.inspect("a b'c", socket: "/s") == #"docker -H unix:///s buildx history inspect --builder default 'a b'\''c'"#)
+        // Verify copied commands match BuildxCLI's own argument placement (`--builder default` after subcommand).
+        let cli = BuildxCLI(docker: "/usr/local/bin/docker", socket: "/s")
+        #expect(cli.process(["history", "logs", "abc"]).arguments == ["buildx", "history", "logs", "--builder", "default", "abc"])
+        #expect(cli.process(["history", "inspect", "abc"]).arguments == ["buildx", "history", "inspect", "--builder", "default", "abc"])
     }
 
     @Test func nextInfoToFetchSkipsFailedInFlightAndFetchedBuilds() throws {

@@ -159,6 +159,9 @@ final class ExecAttach: @unchecked Sendable {
         _ = try? client.request("POST", "/exec/\(id)/resize?h=\(s.rows)&w=\(s.cols)", timeout: 5)
     }
 
+    /// Overall deadline covering both sequential socket exchanges of a hang-up request.
+    static let hangUpTimeout: TimeInterval = 6
+
     /// Hangs up: closes the stream and sends the shell (and what it runs) SIGHUP. `wait`
     /// blocks until the signal went out; `group` runs asynchronously tracked by that group.
     func close(wait: Bool = false, group: DispatchGroup? = nil) {
@@ -183,17 +186,47 @@ final class ExecAttach: @unchecked Sendable {
         }
     }
 
-    private static func hangUp(socketPath: String, container: String, session: String) {
-        guard let sock = try? UnixSocket(path: socketPath, timeout: 3) else { return }
-        try? sock.write(ExecAPI.request("POST", "/containers/\(container)/exec", body: ExecAPI.hangUpBody(session: session)))
+    static func hangUp(socketPath: String, container: String, session: String, timeout: TimeInterval = hangUpTimeout) {
+        let deadline = Date().addingTimeInterval(timeout)
+        let maxResponseBytes = 65_536
+        func remaining() -> TimeInterval { deadline.timeIntervalSinceNow }
+
+        let createTimeout = min(3, remaining())
+        guard createTimeout > 0, let sock = try? UnixSocket(path: socketPath, timeout: createTimeout) else { return }
+        do {
+            try sock.write(ExecAPI.request("POST", "/containers/\(container)/exec", body: ExecAPI.hangUpBody(session: session)))
+        } catch {
+            return
+        }
         var raw = Data()
-        while let chunk = try? sock.read(), !chunk.isEmpty { raw.append(chunk) }
+        while raw.count < maxResponseBytes {
+            let rem = remaining()
+            guard rem > 0 else { return }
+            sock.setTimeout(min(3, rem))
+            guard let chunk = try? sock.read(max: min(65_536, maxResponseBytes - raw.count)), !chunk.isEmpty else { break }
+            raw.append(chunk)
+            if let sep = raw.range(of: Data("\r\n\r\n".utf8)),
+               let head = try? DockerClient.parseResponseHead(raw[raw.startIndex..<sep.lowerBound]),
+               let len = head.contentLength,
+               raw.count - sep.upperBound >= len {
+                break
+            }
+        }
         guard let (code, body) = try? DockerClient.parse(raw), code == 201 || code == 200,
-              let id = try? ExecAPI.execID(fromCreate: body),
-              let start = try? UnixSocket(path: socketPath, timeout: 3)
+              let id = try? ExecAPI.execID(fromCreate: body)
         else { return }
+
+        let startTimeout = min(3, remaining())
+        guard startTimeout > 0, let start = try? UnixSocket(path: socketPath, timeout: startTimeout) else { return }
         let detach = (try? JSONSerialization.data(withJSONObject: ["Detach": true, "Tty": false])) ?? Data()
-        try? start.write(ExecAPI.request("POST", "/exec/\(id)/start", body: detach))
+        do {
+            try start.write(ExecAPI.request("POST", "/exec/\(id)/start", body: detach))
+        } catch {
+            return
+        }
+        let readTimeout = min(3, remaining())
+        guard readTimeout > 0 else { return }
+        start.setTimeout(readTimeout)
         _ = try? start.read()
     }
 

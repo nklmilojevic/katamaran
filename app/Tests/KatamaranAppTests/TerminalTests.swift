@@ -321,6 +321,45 @@ private final class Collector: @unchecked Sendable {
     #expect(hangUpStarted.isSet)
 }
 
+@Test func hangUpEnforcesOverallDeadlineAgainstTricklingServer() throws {
+    let path = "/tmp/kat-exec-trickle-\(getpid())-\(UInt32.random(in: 0...UInt32.max)).sock"
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard rc == 0, listen(fd, 4) == 0 else { throw SocketError.io(errno) }
+    defer {
+        close(fd)
+        unlink(path)
+    }
+
+    Thread {
+        let c = accept(fd, nil, nil)
+        guard c >= 0 else { return }
+        defer { close(c) }
+        var one: Int32 = 1
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        var buf = [UInt8](repeating: 0, count: 4096)
+        _ = read(c, &buf, buf.count)
+        let head = "HTTP/1.1 201 Created\r\n\r\n"
+        _ = head.withCString { write(c, $0, strlen($0)) }
+        // Trickle one byte every 50 ms forever; per-read timeout alone would never stop this.
+        for _ in 0..<200 {
+            var byte: UInt8 = 0x20
+            if write(c, &byte, 1) <= 0 { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }.start()
+
+    let start = Date()
+    ExecAttach.hangUp(socketPath: path, container: "web", session: "s1", timeout: 0.35)
+    #expect(Date().timeIntervalSince(start) < 1.5)
+}
+
 // MARK: The engine through Swift
 
 @Test func gridSnapshotReadsTheEngine() {

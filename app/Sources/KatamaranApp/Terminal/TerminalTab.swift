@@ -216,9 +216,10 @@ final class EmbeddedTerminalTabView: NSView, ContainerTabView {
         guard !active.isEmpty else { return }
         let group = DispatchGroup()
         for t in active { t.close(group: group) }
-        // Run all hang-up requests concurrently and wait for them to complete (each socket
-        // carries its own 3 s timeout, so quit remains bounded without abandoning SIGHUP).
-        group.wait()
+        // Run all hang-up requests concurrently with a finite overall deadline longer than
+        // ExecAttach.hangUpTimeout so normal/slow hang-ups finish cleanly while a stalled
+        // or trickling daemon can never prevent app termination.
+        _ = group.wait(timeout: .now() + ExecAttach.hangUpTimeout + 0.5)
     }
 
     private func pruneTerminals(_ s: DockerStore) {
