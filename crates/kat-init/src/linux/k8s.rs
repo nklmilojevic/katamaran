@@ -14,6 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -41,6 +42,8 @@ const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
 const LOG_FILE: &str = "/var/log/k3s.log";
+const PROXY_DIR: &str = "/run/katamaran/k8s-proxy";
+const PROXY_SOCKET: &str = "/run/katamaran/k8s-proxy/proxy.sock";
 pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -124,6 +127,7 @@ struct Running {
     exit_rx: Receiver<()>,
     exited: Arc<Mutex<Option<i32>>>,
     sync_stop: Arc<AtomicBool>,
+    proxy_thread: Option<thread::JoinHandle<()>>,
 }
 
 struct State {
@@ -583,6 +587,10 @@ impl K8s {
                 return;
             }
             K8sMsg::SyncImages => sync_moby_images(&self.reaper).map(|()| K8sMsg::Done),
+            K8sMsg::Proxy => {
+                relay_unix_proxy(conn, Path::new(PROXY_SOCKET));
+                return;
+            }
             other => Err(format!("unexpected request {other:?}")),
         };
         let msg = match reply {
@@ -759,6 +767,7 @@ impl K8s {
                 exit_rx,
                 exited: exited.clone(),
                 sync_stop: sync_stop.clone(),
+                proxy_thread: None,
             });
             st.generation
         };
@@ -785,7 +794,7 @@ impl K8s {
                         // tearing down workloads or restoring sysctls. Safe against
                         // deadlock because exited2 and exit_tx were signaled above.
                         let _op = svc_ref.op_lock.lock().unwrap();
-                        let crashed = {
+                        let (crashed, running) = {
                             let mut st = svc_ref.state.lock().unwrap();
                             // Ignore stale watchers or startup exits already handled
                             // by start_inner/stop_inner.
@@ -796,9 +805,13 @@ impl K8s {
                             st.phase = "failed".into();
                             st.api_ready = false;
                             st.error = msg.clone();
-                            st.running = None;
-                            msg
+                            (msg, st.running.take())
                         };
+                        if let Some(mut r) = running
+                            && let Some(t) = r.proxy_thread.take()
+                        {
+                            let _ = t.join();
+                        }
                         stop_k8s_workloads(&svc_ref.reaper);
                         ACTIVE.store(false, Ordering::SeqCst);
                         FORWARDED.lock().unwrap().clear();
@@ -862,7 +875,7 @@ impl K8s {
                 st.running.take()
             };
             if let Some(r) = running {
-                terminate_running(&r);
+                terminate_running(r);
             }
             stop_k8s_workloads(&self.reaper);
             ACTIVE.store(false, Ordering::SeqCst);
@@ -925,7 +938,7 @@ impl K8s {
                     st.running.take()
                 };
                 if let Some(r) = running {
-                    terminate_running(&r);
+                    terminate_running(r);
                 }
                 stop_k8s_workloads(&self.reaper);
                 ACTIVE.store(false, Ordering::SeqCst);
@@ -959,8 +972,17 @@ impl K8s {
             at_ns: sys::boottime_ns(),
         });
 
-        // Start background Docker -> k8s.io image mirror and Service port watcher.
+        // Start background Docker -> k8s.io image mirror, kubectl proxy, and Service port watcher.
         spawn_image_sync(self.reaper.clone(), sync_stop.clone());
+        let proxy_thread = spawn_api_proxy(self.reaper.clone(), sync_stop.clone());
+        if let Some(t) = proxy_thread {
+            let mut st = self.state.lock().unwrap();
+            if st.generation == my_gen
+                && let Some(r) = st.running.as_mut()
+            {
+                r.proxy_thread = Some(t);
+            }
+        }
         spawn_service_port_watcher(Arc::clone(self), my_gen, sync_stop);
         log("k3s is ready");
         Ok(self.info())
@@ -1017,7 +1039,7 @@ impl K8s {
             let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
         }
         if let Some(r) = running {
-            terminate_running(&r);
+            terminate_running(r);
         }
         if needs_cleanup {
             stop_k8s_workloads(&self.reaper);
@@ -1084,70 +1106,109 @@ impl K8s {
             }
         };
         let _ = upstream.set_nodelay(true);
-        if k8s::write(&mut conn, &K8sMsg::Done).is_err() {
+        relay_guest_stream(conn, upstream);
+    }
+}
+
+trait GuestStream: Read + Write + Send + Sized + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+impl GuestStream for TcpStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+
+impl GuestStream for UnixStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+}
+
+fn relay_unix_proxy(mut conn: UnixStream, socket_path: &Path) {
+    let upstream = match UnixStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = k8s::write(
+                &mut conn,
+                &K8sMsg::Error(format!("connect {}: {e}", socket_path.display())),
+            );
             return;
         }
-        let Ok(mut up_read) = upstream.try_clone() else {
-            return;
-        };
-        let Ok(mut conn_write) = conn.try_clone() else {
-            return;
-        };
-        let down = match thread::Builder::new()
-            .name("k8s-connect-down".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    match up_read.read(&mut buf) {
-                        Ok(0) => {
-                            let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
-                            return;
-                        }
-                        Ok(n) => {
-                            if k8s::write(&mut conn_write, &K8sMsg::Data(buf[..n].to_vec()))
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => {
-                            let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
+    };
+    relay_guest_stream(conn, upstream);
+}
+
+fn relay_guest_stream<S: GuestStream>(mut conn: UnixStream, upstream: S) {
+    if k8s::write(&mut conn, &K8sMsg::Done).is_err() {
+        return;
+    }
+    let Ok(mut up_read) = upstream.try_clone() else {
+        return;
+    };
+    let Ok(mut conn_write) = conn.try_clone() else {
+        return;
+    };
+    let down = match thread::Builder::new()
+        .name("k8s-connect-down".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match up_read.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
+                        return;
+                    }
+                    Ok(n) => {
+                        if k8s::write(&mut conn_write, &K8sMsg::Data(buf[..n].to_vec())).is_err() {
                             return;
                         }
                     }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
+                        return;
+                    }
                 }
-            }) {
-            Ok(h) => h,
-            Err(e) => {
-                log(&format!("spawn k8s-connect-down: {e}"));
-                let _ = upstream.shutdown(Shutdown::Both);
-                return;
             }
-        };
-        let mut up_write = upstream;
-        let mut clean_eof = false;
-        loop {
-            match k8s::read(&mut conn) {
-                Ok(Some(K8sMsg::Data(d))) => {
-                    if up_write.write_all(&d).is_err() {
-                        break;
-                    }
-                }
-                Ok(Some(K8sMsg::DataEnd)) => {
-                    clean_eof = true;
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            log(&format!("spawn k8s-connect-down: {e}"));
+            let _ = upstream.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+    let mut up_write = upstream;
+    let mut clean_eof = false;
+    loop {
+        match k8s::read(&mut conn) {
+            Ok(Some(K8sMsg::Data(d))) => {
+                if up_write.write_all(&d).is_err() {
                     break;
                 }
-                Ok(Some(_)) | Ok(None) | Err(_) => break,
             }
+            Ok(Some(K8sMsg::DataEnd)) => {
+                clean_eof = true;
+                break;
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => break,
         }
-        if clean_eof {
-            let _ = up_write.shutdown(Shutdown::Write);
-        } else {
-            let _ = up_write.shutdown(Shutdown::Both);
-        }
-        let _ = down.join();
     }
+    if clean_eof {
+        let _ = up_write.shutdown(Shutdown::Write);
+    } else {
+        let _ = up_write.shutdown(Shutdown::Both);
+    }
+    let _ = down.join();
 }
 
 fn prepare_dirs_and_sysctls(reaper: &Reaper) -> Result<(), String> {
@@ -1220,7 +1281,7 @@ fn restore_bridge_netfilter() {
     }
 }
 
-fn terminate_running(r: &Running) {
+fn terminate_running(mut r: Running) {
     r.sync_stop.store(true, Ordering::SeqCst);
     if r.exited.lock().unwrap().is_none() {
         unsafe { libc::kill(r.pid, libc::SIGTERM) };
@@ -1229,6 +1290,9 @@ fn terminate_running(r: &Running) {
             unsafe { libc::kill(r.pid, libc::SIGKILL) };
             let _ = r.exit_rx.recv_timeout(Duration::from_secs(3));
         }
+    }
+    if let Some(t) = r.proxy_thread.take() {
+        let _ = t.join();
     }
 }
 
@@ -1593,6 +1657,118 @@ fn api_is_ready(reaper: &Reaper) -> bool {
 
 fn read_kubeconfig() -> Result<String, String> {
     fs::read_to_string(KUBECONFIG).map_err(|e| format!("read {KUBECONFIG}: {e}"))
+}
+
+/// Create `dir` as a root-only (mode 0700) non-symlink directory so that the
+/// credentialed `kubectl proxy` Unix socket inside it is never reachable by
+/// unprivileged or host-network workloads.
+fn prepare_proxy_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::other(format!(
+                "refusing symlinked proxy directory {}",
+                dir.display()
+            )));
+        }
+        Ok(meta) if !meta.file_type().is_dir() => {
+            return Err(io::Error::other(format!(
+                "proxy directory {} is not a directory",
+                dir.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(dir)?;
+        }
+        Err(e) => return Err(e),
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+/// Keeps `kubectl proxy` running on a root-only Unix socket (`PROXY_SOCKET`)
+/// until `stop`, restarting it if it exits, and removes the socket when `stop`
+/// is set. Running on a private Unix socket keeps the credentialed proxy off
+/// the guest loopback shared with `hostNetwork: true` pods and containers.
+fn spawn_api_proxy(reaper: Reaper, stop: Arc<AtomicBool>) -> Option<thread::JoinHandle<()>> {
+    match thread::Builder::new()
+        .name("k8s-proxy".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if let Err(e) = prepare_proxy_dir(Path::new(PROXY_DIR)) {
+                    log(&format!("prepare {PROXY_DIR}: {e}"));
+                    sleep_unless(&stop, Duration::from_secs(2));
+                    continue;
+                }
+                let _ = fs::remove_file(PROXY_SOCKET);
+                let mut cmd = Command::new(BIN);
+                cmd.args([
+                    "kubectl",
+                    "--kubeconfig",
+                    KUBECONFIG,
+                    "proxy",
+                    &format!("--unix-socket={PROXY_SOCKET}"),
+                ])
+                .env("PATH", PATH)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+                // Restrict socket permissions from birth (no group/other bits).
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::umask(0o077);
+                        Ok(())
+                    });
+                }
+                let (pid, status_rx) = match reaper.spawn(&mut cmd) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log(&format!("spawn kubectl proxy: {e}"));
+                        sleep_unless(&stop, Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        if status_rx.try_recv().is_err() {
+                            unsafe { libc::kill(pid, libc::SIGTERM) };
+                            if status_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                                unsafe { libc::kill(pid, libc::SIGKILL) };
+                                let _ = status_rx.recv_timeout(Duration::from_secs(1));
+                            }
+                        }
+                        let _ = fs::remove_file(PROXY_SOCKET);
+                        return;
+                    }
+                    match status_rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(status) => {
+                            log(&format!("kubectl proxy {}", describe_status(status)));
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                let _ = fs::remove_file(PROXY_SOCKET);
+                sleep_unless(&stop, Duration::from_secs(1));
+            }
+            let _ = fs::remove_file(PROXY_SOCKET);
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            log(&format!("spawn k8s-proxy thread: {e}"));
+            None
+        }
+    }
+}
+
+fn sleep_unless(stop: &AtomicBool, d: Duration) {
+    let end = Instant::now() + d;
+    while !stop.load(Ordering::Acquire) && Instant::now() < end {
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Periodically read NodePort and LoadBalancer ports from Kubernetes services
@@ -2262,5 +2438,70 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 ";
         let ports = parse_service_ports(out);
         assert_eq!(ports, BTreeSet::from([8080, 30080, 31080, 31443]));
+    }
+
+    #[test]
+    fn prepare_proxy_dir_sets_private_mode_and_rejects_symlinks() {
+        let base = temp_dir("proxy-dir");
+        let dir = base.join("k8s-proxy");
+        prepare_proxy_dir(&dir).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // Loosened permissions are tightened back to 0700.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_proxy_dir(&dir).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // Symlinked proxy directory is rejected.
+        let link = base.join("proxy-link");
+        symlink(&dir, &link).unwrap();
+        assert!(prepare_proxy_dir(&link).is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn relay_unix_proxy_forwards_bytes_over_private_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let base = temp_dir("proxy-relay");
+        let dir = base.join("k8s-proxy");
+        prepare_proxy_dir(&dir).unwrap();
+        let sock = dir.join("proxy.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let upstream = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(&buf[..n]).unwrap();
+        });
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let sock_for_relay = sock.clone();
+        let relay = thread::spawn(move || relay_unix_proxy(server, &sock_for_relay));
+
+        assert_eq!(k8s::read(&mut client).unwrap(), Some(K8sMsg::Done));
+        k8s::write(&mut client, &K8sMsg::Data(b"GET /api/v1/pods".to_vec())).unwrap();
+        k8s::write(&mut client, &K8sMsg::DataEnd).unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            match k8s::read(&mut client).unwrap() {
+                Some(K8sMsg::Data(d)) => received.extend_from_slice(&d),
+                Some(K8sMsg::DataEnd) | None => break,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(received, b"GET /api/v1/pods");
+        relay.join().unwrap();
+        upstream.join().unwrap();
+        let _ = fs::remove_dir_all(&base);
     }
 }

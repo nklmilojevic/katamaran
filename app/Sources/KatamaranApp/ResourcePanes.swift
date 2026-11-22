@@ -9,13 +9,45 @@ struct ResourceRow: Equatable {
     var tint: NSColor
     var inUse: Bool
     var deletable: Bool
+    /// A status dot on the tile (pods).
+    var dot: NSColor? = nil
+}
+
+/// What the shared resource list and detail views show: grouped rows, and
+/// the selection's details with Delete and an optional open action.
+@MainActor
+protocol ResourceSource: AnyObject {
+    var listVC: ResourceListViewController { get }
+    var query: String { get }
+    var noun: String { get }
+    var emptySymbol: String { get }
+    var emptyMessage: String { get }
+    /// Whether the rows have been fetched at least once.
+    var isLoaded: Bool { get }
+    /// The list's sections, in order; empty ones are left out.
+    var groups: [(title: String, rows: [ResourceRow])] { get }
+    func rows() -> [ResourceRow]
+    func row(_ key: String) -> ResourceRow?
+    func headerSubtitle(_ key: String) -> String
+    func details(_ key: String) -> [NSView]
+    /// Changes whenever `details(key)` would produce different views.
+    func detailVersion(_ key: String) -> AnyHashable?
+    /// Where the detail's open button goes (Finder, a browser), if anywhere.
+    func reveal(_ key: String) -> URL?
+    var revealTitle: String { get }
+    var revealSymbol: String { get }
+    func confirmDelete(_ key: String)
+}
+
+extension ResourceSource {
+    func detailVersion(_ key: String) -> AnyHashable? { nil }
 }
 
 /// Volumes, images and networks share one layout: a list in "In Use" and
 /// "Unused" sections, and the selection's details with Delete. Subclasses
 /// say what's in them.
 @MainActor
-class ResourcePane: SectionPane {
+class ResourcePane: SectionPane, ResourceSource {
     let store: DockerStore
     let kind: DockerKind
     private(set) lazy var listVC = ResourceListViewController(pane: self)
@@ -66,11 +98,20 @@ class ResourcePane: SectionPane {
     func delete(_ key: String) {}
     func deleteMessage(_ key: String) -> String { "" }
     func reveal(_ key: String) -> URL? { nil }
+    var revealTitle: String { "Open in Finder" }
+    var revealSymbol: String { "folder" }
     var pruneTitle: String? { nil }
     func prune() {}
 
     var sections: UsageSections<ResourceRow> {
         UsageSections(rows(), query: query, name: \.title, search: searchable, inUse: \.inUse)
+    }
+
+    var isLoaded: Bool { store.loaded.contains(kind) }
+
+    var groups: [(title: String, rows: [ResourceRow])] {
+        let s = sections
+        return [("In Use", s.inUse), ("Unused", s.unused)]
     }
 
     func row(_ key: String) -> ResourceRow? { rows().first { $0.key == key } }
@@ -91,7 +132,7 @@ class ResourcePane: SectionPane {
 
 @MainActor
 final class ResourceListViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
-    private unowned let pane: ResourcePane
+    private unowned let pane: ResourceSource
     private let table = NSTableView()
     private let empty = EmptyStateView()
     private enum Row: Equatable { case header(String), item(ResourceRow) }
@@ -100,7 +141,7 @@ final class ResourceListViewController: NSViewController, NSTableViewDataSource,
     var onSelect: (String?) -> Void = { _ in }
     private var reloading = false
 
-    init(pane: ResourcePane) {
+    init(pane: ResourceSource) {
         self.pane = pane
         super.init(nibName: nil, bundle: nil)
     }
@@ -130,11 +171,12 @@ final class ResourceListViewController: NSViewController, NSTableViewDataSource,
 
     func reload() {
         guard isViewLoaded else { return }
-        let s = pane.sections
         var next: [Row] = []
-        if !s.inUse.isEmpty { next.append(.header("In Use")); next += s.inUse.map(Row.item) }
-        if !s.unused.isEmpty { next.append(.header("Unused")); next += s.unused.map(Row.item) }
-        let loaded = pane.store.loaded.contains(pane.kind)
+        for g in pane.groups where !g.rows.isEmpty {
+            next.append(.header(g.title))
+            next += g.rows.map(Row.item)
+        }
+        let loaded = pane.isLoaded
         empty.isHidden = !next.isEmpty || !loaded
         if pane.rows().isEmpty {
             empty.show(symbol: pane.emptySymbol, title: "No \(pane.noun.capitalized)s", message: pane.emptyMessage)
@@ -239,6 +281,7 @@ final class ResourceCell: NSTableCellView {
         tile.symbol = r.symbol
         tile.tint = r.tint
         tile.dimmed = !r.inUse
+        tile.dot = r.dot
         name.stringValue = r.title
         detail.stringValue = r.subtitle
         delete.isHidden = !r.deletable
@@ -251,7 +294,7 @@ final class ResourceCell: NSTableCellView {
 @MainActor
 final class ResourceDetailViewController: NSViewController {
     private var separator: NSBox?
-    private unowned let pane: ResourcePane
+    private unowned let pane: ResourceSource
     private let tile = IconTile(size: 36)
     private let name = label(font: .systemFont(ofSize: 15, weight: .semibold), color: .labelColor)
     private let sub = label(font: .systemFont(ofSize: NSFont.smallSystemFontSize), color: .secondaryLabelColor)
@@ -260,17 +303,38 @@ final class ResourceDetailViewController: NSViewController {
     private let content = ScrollingStack()
     private let empty = EmptyStateView()
     private let header = NSView()
-    private var key: String?
+    private(set) var key: String?
     private var shown: ResourceRow?
+    private var shownDetail: AnyHashable?
+    /// Shown instead of the details (a pod's logs), below the header.
+    private var body: NSView?
+    private var bodyTop: NSLayoutYAxisAnchor?
+    /// Told after the selection changes, before the reload.
+    var onSelect: (String?) -> Void = { _ in }
 
-    init(pane: ResourcePane) {
+    init(pane: ResourceSource) {
         self.pane = pane
         super.init(nibName: nil, bundle: nil)
         pane.listVC.onSelect = { [weak self] k in
             self?.key = k
             self?.shown = nil
+            self?.shownDetail = nil
+            self?.onSelect(k)
             self?.reload()
         }
+    }
+
+    /// Show `view` in place of the details, or the details again with nil.
+    func setBody(_ view: NSView?) {
+        _ = self.view
+        guard view !== body else { return }
+        body?.removeFromSuperview()
+        body = view
+        if let view, let top = bodyTop {
+            self.view.addSubview(view)
+            pin(view, to: self.view, top: top)
+        }
+        reload()
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -322,6 +386,7 @@ final class ResourceDetailViewController: NSViewController {
             line.heightAnchor.constraint(equalToConstant: 1),
         ])
         separator = line
+        bodyTop = line.bottomAnchor
         pin(content.scroll, to: root, top: line.bottomAnchor)
         pin(empty, to: root, top: root.safeAreaLayoutGuide.topAnchor)
         empty.show(symbol: nil, title: "No Selection")
@@ -335,18 +400,25 @@ final class ResourceDetailViewController: NSViewController {
         empty.isHidden = row != nil
         header.isHidden = row == nil
         separator?.isHidden = row == nil
-        content.scroll.isHidden = row == nil
+        content.scroll.isHidden = row == nil || body != nil
+        body?.isHidden = row == nil
         guard let row, let key else { return }
         tile.symbol = row.symbol
         tile.tint = row.tint
         tile.dimmed = !row.inUse
+        tile.dot = row.dot
         name.stringValue = row.title
         sub.stringValue = pane.headerSubtitle(key)
         delete.isEnabled = row.deletable
         reveal.isHidden = pane.reveal(key) == nil
+        reveal.title = pane.revealTitle
+        reveal.image = NSImage(systemSymbolName: pane.revealSymbol, accessibilityDescription: nil)
         // Rebuilding the groups would reset the scroll position for nothing.
-        if row != shown {
+        let detail = pane.detailVersion(key)
+        let needsDetails = detail != nil ? (detail != shownDetail) : (row != shown)
+        if needsDetails {
             shown = row
+            shownDetail = detail
             content.set(pane.details(key))
         }
     }

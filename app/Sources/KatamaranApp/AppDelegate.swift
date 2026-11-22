@@ -39,8 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenu = StatusMenu(model: model)
         statusMenu.openWindow = { [weak self] in self?.showMain() }
         statusMenu.openSettings = { [weak self] in self?.settings.present() }
-        model.observe { [weak self] in self?.store.follow(self?.model.status) }
+        model.observe { [weak self] in
+            self?.store.follow(self?.model.status)
+            K8sStore.shared.follow(self?.model.status)
+        }
         store.onError = { [weak self] what, why in self?.showError(what, why) }
+        K8sStore.shared.onError = { [weak self] what, why in self?.showError(what, why) }
 
         let steps = option("--steps").map { $0.split(separator: ",").map(String.init) } ?? []
         if !steps.isEmpty { model.fake(fakeStatus("stopped")) }
@@ -176,7 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }(),
         ])
         var view: [NSMenuItem] = MainSection.allCases.enumerated().map { i, s in
-            let m = item(s.title, #selector(showSection(_:)), "\(i + 1)", target: self)
+            let m = item(s.title, #selector(showSection(_:)), i < 9 ? "\(i + 1)" : "", target: self)
             m.tag = i
             return m
         }

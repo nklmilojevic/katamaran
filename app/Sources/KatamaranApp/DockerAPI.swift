@@ -544,19 +544,25 @@ struct DockerClient: Sendable {
     let socketPath: String
 
     func request(_ method: String, _ path: String, timeout: TimeInterval = 15) throws -> (Int, Data) {
+        try DockerClient.exchange(socketPath, host: "docker", method, path, timeout: timeout)
+    }
+
+    /// One HTTP request over a Unix socket, read to the end.
+    static func exchange(_ socketPath: String, host: String, _ method: String, _ path: String,
+                         timeout: TimeInterval) throws -> (Int, Data) {
         let sock = try UnixSocket(path: socketPath, timeout: timeout)
-        try sock.write(Data(DockerClient.head(method, path).utf8))
+        try sock.write(Data(head(method, path, host: host).utf8))
         var raw = Data()
         while true {
             let chunk = try sock.read()
             if chunk.isEmpty { break }
             raw.append(chunk)
         }
-        return try DockerClient.parse(raw)
+        return try parse(raw)
     }
 
-    static func head(_ method: String, _ path: String, close: Bool = true) -> String {
-        "\(method) \(path) HTTP/1.1\r\nHost: docker\r\nUser-Agent: katamaran-app\r\nContent-Length: 0\r\n"
+    static func head(_ method: String, _ path: String, close: Bool = true, host: String = "docker") -> String {
+        "\(method) \(path) HTTP/1.1\r\nHost: \(host)\r\nUser-Agent: katamaran-app\r\nContent-Length: 0\r\n"
             + (close ? "Connection: close\r\n" : "") + "\r\n"
     }
 
@@ -652,10 +658,10 @@ struct DockerClient: Sendable {
         return rest
     }
 
-    /// Docker's `{"message": …}`, or the status code.
-    static func failure(_ code: Int, _ body: Data) -> SocketError {
+    /// API error `{"message": …}`, or the status code.
+    static func failure(_ code: Int, _ body: Data, service: String = "Docker") -> SocketError {
         let msg = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["message"] as? String
-        return SocketError.protocolError(msg ?? "Docker answered HTTP \(code)")
+        return SocketError.protocolError(msg ?? "\(service) answered HTTP \(code)")
     }
 
     func get<T: Decodable>(_ path: String, as: T.Type = T.self, timeout: TimeInterval = 15) throws -> T {
@@ -732,15 +738,19 @@ enum DockerKind: String, CaseIterable, Sendable { case containers, volumes, imag
 final class DockerStream: @unchecked Sendable {
     private let socketPath: String
     private let path: String
+    private let host: String
+    private let service: String
     private let lock = NSLock()
     private var socket: UnixSocket?
     private var cancelled = false
     var onData: (Data) -> Void = { _ in }
     var onEnd: (Error?) -> Void = { _ in }
 
-    init(socketPath: String, path: String) {
+    init(socketPath: String, path: String, host: String = "docker", service: String = "Docker") {
         self.socketPath = socketPath
         self.path = path
+        self.host = host
+        self.service = service
     }
 
     func start() {
@@ -776,7 +786,7 @@ final class DockerStream: @unchecked Sendable {
             socket = sock
             lock.unlock()
             defer { lock.lock(); socket = nil; lock.unlock() }
-            try sock.write(Data(DockerClient.head("GET", path, close: false).utf8))
+            try sock.write(Data(DockerClient.head("GET", path, close: false, host: host).utf8))
 
             var head = Data()
             var body = Data()
@@ -793,16 +803,37 @@ final class DockerStream: @unchecked Sendable {
             let parsed = try DockerClient.parseResponseHead(head)
             guard parsed.code == 200 else {
                 let rest = DockerClient.readErrorBody(from: sock, head: parsed, initial: body)
-                throw DockerClient.failure(parsed.code, rest)
+                throw DockerClient.failure(parsed.code, rest, service: service)
             }
-            let chunked = parsed.chunked
-            var decoder = ChunkedDecoder()
-            func pass(_ d: Data) throws { deliver(chunked ? try decoder.feed(d) : d) }
-            try pass(body)
-            while !decoder.finished {
-                let chunk = try sock.read()
-                if chunk.isEmpty { break }
-                try pass(chunk)
+            if parsed.chunked {
+                var decoder = ChunkedDecoder()
+                try deliver(decoder.feed(body))
+                while !decoder.finished {
+                    let chunk = try sock.read()
+                    if chunk.isEmpty { break }
+                    try deliver(decoder.feed(chunk))
+                }
+            } else if let length = parsed.contentLength {
+                var remaining = length
+                if remaining > 0 && !body.isEmpty {
+                    let take = body.prefix(remaining)
+                    remaining -= take.count
+                    deliver(Data(take))
+                }
+                while remaining > 0 {
+                    let chunk = try sock.read(max: min(65_536, remaining))
+                    if chunk.isEmpty { break }
+                    let take = chunk.prefix(remaining)
+                    remaining -= take.count
+                    deliver(Data(take))
+                }
+            } else {
+                deliver(body)
+                while true {
+                    let chunk = try sock.read()
+                    if chunk.isEmpty { break }
+                    deliver(chunk)
+                }
             }
         } catch {
             failure = error

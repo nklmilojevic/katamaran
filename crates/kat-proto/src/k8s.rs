@@ -13,6 +13,7 @@
 //! | `Kubeconfig`     | –                                          | `KubeconfigData`, or `Error`                |
 //! | `Connect`        | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
 //! | `SyncImages`     | –                                          | `Done`, or `Error`                          |
+//! | `Proxy`          | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
 
 use std::io::{self, Read, Write};
 
@@ -39,6 +40,9 @@ pub enum K8sMsg {
         port: u16,
     },
     SyncImages,
+    /// Connect to the guest's root-only `kubectl proxy` Unix socket for
+    /// authenticated plain-HTTP Kubernetes API access from the host app.
+    Proxy,
     Data(Vec<u8>),
     DataEnd,
     StatusInfo(K8sInfo),
@@ -71,6 +75,7 @@ mod kind {
     pub const KUBECONFIG: u16 = 0x806;
     pub const CONNECT: u16 = 0x807;
     pub const SYNC_IMAGES: u16 = 0x808;
+    pub const PROXY: u16 = 0x809;
     pub const DATA: u16 = 0x80a;
     pub const DATA_END: u16 = 0x80b;
     pub const STATUS_INFO: u16 = 0x80c;
@@ -105,6 +110,7 @@ impl K8sMsg {
                 kind::CONNECT
             }
             K8sMsg::SyncImages => kind::SYNC_IMAGES,
+            K8sMsg::Proxy => kind::PROXY,
             K8sMsg::Data(d) => {
                 put_bytes(b, d);
                 kind::DATA
@@ -161,6 +167,7 @@ impl K8sMsg {
                 port: c.u16()?,
             },
             kind::SYNC_IMAGES => K8sMsg::SyncImages,
+            kind::PROXY => K8sMsg::Proxy,
             kind::DATA => {
                 let n = c.u32()? as usize;
                 K8sMsg::Data(c.take(n)?.to_vec())
@@ -232,6 +239,7 @@ mod tests {
                 port: 443,
             },
             K8sMsg::SyncImages,
+            K8sMsg::Proxy,
             K8sMsg::Data(vec![1, 2, 3, 4]),
             K8sMsg::DataEnd,
             K8sMsg::StatusInfo(K8sInfo {
@@ -274,6 +282,7 @@ mod tests {
                 port: 0,
             },
             K8sMsg::SyncImages,
+            K8sMsg::Proxy,
             K8sMsg::Data(vec![]),
             K8sMsg::DataEnd,
             K8sMsg::StatusInfo(K8sInfo::default()),

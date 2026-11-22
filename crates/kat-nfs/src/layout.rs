@@ -185,11 +185,17 @@ mod tests {
         std::fs::write(d.join("machines/.default"), b"dev\n").unwrap();
         assert_eq!(
             l.anchors(VDir::Machines),
-            vec![(AnchorKey::Machine("dev".into()), d.join("machines/dev/rootfs"))]
+            vec![(
+                AnchorKey::Machine("dev".into()),
+                d.join("machines/dev/rootfs")
+            )]
         );
         assert_eq!(
             l.find(VDir::Machines, "dev"),
-            Some((AnchorKey::Machine("dev".into()), d.join("machines/dev/rootfs")))
+            Some((
+                AnchorKey::Machine("dev".into()),
+                d.join("machines/dev/rootfs")
+            ))
         );
         assert_eq!(l.find(VDir::Machines, "half"), None);
         assert_eq!(l.find(VDir::Machines, ".default"), None);

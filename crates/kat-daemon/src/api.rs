@@ -446,6 +446,9 @@ pub struct K8sStatus {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_port: Option<u16>,
+    /// Plain-HTTP Kubernetes API socket, while the cluster is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_socket: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub context: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -468,6 +471,7 @@ impl Default for K8sStatus {
             installed: false,
             version: String::new(),
             api_port: None,
+            proxy_socket: None,
             context: String::new(),
             kubeconfig: None,
             dns_domain: String::new(),

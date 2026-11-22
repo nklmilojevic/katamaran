@@ -77,6 +77,7 @@ struct K8sStatus: Decodable, Equatable {
     var installed: Bool
     var version: String?
     var apiPort: UInt16?
+    var proxySocket: String?
     var context: String?
     var kubeconfig: String?
     var dnsDomain: String?
@@ -87,6 +88,7 @@ struct K8sStatus: Decodable, Equatable {
     enum CodingKeys: String, CodingKey {
         case enabled, state, installed, version, context, kubeconfig, error
         case apiPort = "api_port"
+        case proxySocket = "proxy_socket"
         case dnsDomain = "dns_domain"
         case dnsPort = "dns_port"
         case dnsInstalled = "dns_installed"

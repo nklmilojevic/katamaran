@@ -210,11 +210,7 @@ impl Nodes {
     }
 
     pub fn handle(&self, id: Id) -> [u8; HANDLE_LEN] {
-        let instance = if fixed(id) {
-            0
-        } else {
-            self.instance
-        };
+        let instance = if fixed(id) { 0 } else { self.instance };
         let mut h = [0u8; HANDLE_LEN];
         h[..8].copy_from_slice(&instance.to_be_bytes());
         h[8..].copy_from_slice(&id.to_be_bytes());

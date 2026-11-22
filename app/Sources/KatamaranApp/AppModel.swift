@@ -148,6 +148,11 @@ final class AppModel {
         }
     }
 
+    func k8sStart() {
+        let d = daemon
+        perform("kubernetes") { _ = try d.call("k8s.start", timeout: 300) }
+    }
+
     func k8sReset() {
         let d = daemon
         perform("kubernetes") { _ = try d.call("k8s.reset", timeout: 300) }
