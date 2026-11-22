@@ -14,6 +14,9 @@ final class SettingsWindowController: NSWindowController {
 
     private let login = NSSwitch()
     private let mount = NSSwitch()
+    private let autoUpdates = NSSwitch()
+    private let checkUpdatesBtn = NSButton(title: "Check Now", target: nil, action: nil)
+    private var updatesCheckRow: FormRow?
     private let k8sSwitch = NSSwitch()
     private let k8sSyncBtn = NSButton(title: "Sync Images", target: nil, action: nil)
     private let k8sResetBtn = NSButton(title: "Reset Cluster", target: nil, action: nil)
@@ -43,6 +46,7 @@ final class SettingsWindowController: NSWindowController {
         super.init(window: win)
         build()
         model.observe { [weak self] in self?.sync() }
+        Updater.shared.observe { [weak self] in self?.syncUpdates() }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -52,8 +56,12 @@ final class SettingsWindowController: NSWindowController {
     private func build() {
         tabs.tabStyle = .toolbar
         tabs.transitionOptions = .crossfade
+        var generalViews: [NSView] = [generalGroup()]
+        if Updater.shared.isConfigured {
+            generalViews.append(updatesGroup())
+        }
         let panes: [SettingsPane: [NSView]] = [
-            .general: [generalGroup()],
+            .general: generalViews,
             .resources: [resourcesGroup()],
             .kubernetes: [kubernetesGroup()],
         ]
@@ -87,6 +95,30 @@ final class SettingsWindowController: NSWindowController {
         mountRow = FormRow("Show VM files in Finder", control: mount)
         return FormGroup(footer: "Turning file sharing on or off takes effect the next time the VM starts.",
                          rows: [FormRow("Start Katamaran at login", control: login), mountRow])
+    }
+
+    private func updatesGroup() -> NSView {
+        autoUpdates.controlSize = .mini
+        autoUpdates.target = self
+        autoUpdates.action = #selector(autoUpdatesChanged)
+        checkUpdatesBtn.target = self
+        checkUpdatesBtn.action = #selector(checkUpdatesClicked)
+        checkUpdatesBtn.bezelStyle = .rounded
+        checkUpdatesBtn.controlSize = .small
+        let checkRow = FormRow(
+            "Software updates",
+            subtitle: Updater.versionSubtitle(info: Bundle.main.infoDictionary),
+            control: checkUpdatesBtn
+        )
+        updatesCheckRow = checkRow
+        return FormGroup(
+            header: "Updates",
+            footer: "Checks once a day and shows an update dialog when a new version is available.",
+            rows: [
+                FormRow("Check for updates automatically", control: autoUpdates),
+                checkRow,
+            ]
+        )
     }
 
     private func resourcesGroup() -> NSView {
@@ -229,6 +261,19 @@ final class SettingsWindowController: NSWindowController {
         var changed = false
         for noticeView in notices { changed = noticeView.show(notice, busy: model.busy) || changed }
         if changed { fitWindow(animated: window?.isVisible ?? false) }
+        syncUpdates()
+    }
+
+    private func syncUpdates() {
+        guard Updater.shared.isConfigured else { return }
+        autoUpdates.state = Updater.shared.automaticallyChecksForUpdates ? .on : .off
+        checkUpdatesBtn.isEnabled = Updater.shared.canCheckForUpdates
+        let pending = Updater.shared.pendingUpdateVersion
+        checkUpdatesBtn.title = pending != nil ? "View Update…" : "Check Now"
+        updatesCheckRow?.subtitle = Updater.versionSubtitle(
+            info: Bundle.main.infoDictionary,
+            pendingVersion: pending
+        )
     }
 
     private func showValues() {
@@ -280,6 +325,14 @@ final class SettingsWindowController: NSWindowController {
     @objc private func loginChanged() { apply { $0.launch_at_login = login.state == .on } }
 
     @objc private func mountChanged() { apply { $0.mount = mount.state == .on } }
+
+    @objc private func autoUpdatesChanged() {
+        Updater.shared.automaticallyChecksForUpdates = autoUpdates.state == .on
+    }
+
+    @objc private func checkUpdatesClicked() {
+        Updater.shared.checkForUpdates(checkUpdatesBtn)
+    }
 
     @objc private func k8sChanged() { apply { $0.kubernetes = k8sSwitch.state == .on } }
 

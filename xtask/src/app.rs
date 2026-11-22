@@ -304,7 +304,7 @@ pub fn info_plist_full(
             let feed_url = xml_escape(feed_url);
             let public_key = xml_escape(public_key);
             format!(
-                "\t<key>SUFeedURL</key>\n\t<string>{feed_url}</string>\n\t<key>SUPublicEDKey</key>\n\t<string>{public_key}</string>\n"
+                "\t<key>SUFeedURL</key>\n\t<string>{feed_url}</string>\n\t<key>SUPublicEDKey</key>\n\t<string>{public_key}</string>\n\t<key>SUEnableAutomaticChecks</key>\n\t<true/>\n\t<key>SUScheduledCheckInterval</key>\n\t<integer>86400</integer>\n\t<key>SUAllowsAutomaticUpdates</key>\n\t<false/>\n"
             )
         }
         None => String::new(),
@@ -492,6 +492,10 @@ mod tests {
         assert_plutil_lint("valid", &text);
         assert!(text.contains("<key>LSUIElement</key>\n\t<true/>"));
         assert!(text.contains("<string>1.2.3</string>"));
+        assert!(!text.contains("<key>SUFeedURL</key>"));
+        assert!(!text.contains("<key>SUEnableAutomaticChecks</key>"));
+        assert!(!text.contains("<key>SUScheduledCheckInterval</key>"));
+        assert!(!text.contains("<key>SUAllowsAutomaticUpdates</key>"));
     }
 
     #[test]
@@ -511,5 +515,8 @@ mod tests {
         assert!(plist.contains("key+&lt;foo&gt;&amp;bar"));
         assert!(plist.contains("1.2.3-beta&lt;1&gt;&amp;&quot;&apos;"));
         assert!(plist.contains("42&amp;&lt;build&gt;"));
+        assert!(plist.contains("<key>SUEnableAutomaticChecks</key>\n\t<true/>"));
+        assert!(plist.contains("<key>SUScheduledCheckInterval</key>\n\t<integer>86400</integer>"));
+        assert!(plist.contains("<key>SUAllowsAutomaticUpdates</key>\n\t<false/>"));
     }
 }
