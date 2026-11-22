@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.0 - 2026-11-22
+
+This release adds Kubernetes Pods and Services views to the main window. You can now see and manage your cluster without `kubectl` on the Mac.
+
+### New features
+
+- Add a Kubernetes group to the sidebar with Pods and Services views. Pods show status, readiness, restarts, and age, with followed logs for each container. Services show type, ports, selector, and selected pods. You can delete both kinds of resource.
+- Open a LoadBalancer or NodePort service on `localhost` from the Services view. The ports are already forwarded, so the link works at once.
+- Show or hide system namespaces with a new option in the More menu. The app hides them by default.
+- See the state of the VM or cluster in the Kubernetes views. Use Start, Turn On, or Try Again to fix the problem from the same view.
+
+### Other changes
+
+- The View menu shortcuts now stop at ⌘1 to ⌘9. The Logs section no longer has a shortcut.
+- The `status` output now includes `k8s.proxy_socket` while the cluster runs. The app uses a private Unix socket to reach the cluster, and `docs/app.md` explains how to move it with `KATAMARAN_HOME`.
+
 ## v0.5.0 - 2026-11-22
 
 This release adds optional single-node Kubernetes to the Katamaran VM. It also makes the daemon, the guest init, the NFS server, and the app more secure and more reliable.
