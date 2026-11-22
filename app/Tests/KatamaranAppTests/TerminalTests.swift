@@ -247,6 +247,80 @@ private final class Collector: @unchecked Sendable {
     #expect(Date().timeIntervalSince(t0) < 1.5)
 }
 
+@MainActor
+@Test func closeGroupWaitsForSlowHangUpBeyondOneAndAHalfSeconds() async throws {
+    let path = "/tmp/kat-exec-hup-\(getpid())-\(UInt32.random(in: 0...UInt32.max)).sock"
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard rc == 0, listen(fd, 8) == 0 else { throw SocketError.io(errno) }
+
+    final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.lock(); value = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    }
+    let hangUpStarted = Flag()
+    defer {
+        close(fd)
+        unlink(path)
+    }
+
+    Thread {
+        while true {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            Thread {
+                defer { close(c) }
+                var buf = [UInt8](repeating: 0, count: 8192)
+                let n = read(c, &buf, buf.count)
+                let req = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+                if req.hasPrefix("POST /containers/") && req.contains("kill -HUP") {
+                    // Simulate slow Docker response (> 1.5s) during quit-time hang-up.
+                    Thread.sleep(forTimeInterval: 1.7)
+                    let resp = "HTTP/1.1 201 Created\r\nContent-Length: 13\r\n\r\n{\"Id\":\"hup1\"}"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                } else if req.hasPrefix("POST /exec/hup1/start") {
+                    hangUpStarted.set()
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                } else if req.hasPrefix("POST /containers/") {
+                    let resp = "HTTP/1.1 201 Created\r\nContent-Length: 13\r\n\r\n{\"Id\":\"e100\"}"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                } else if req.hasPrefix("POST /exec/e100/start") {
+                    let resp = "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n$ "
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                    while read(c, &buf, buf.count) > 0 {}
+                } else {
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                }
+            }.start()
+        }
+    }.start()
+
+    let attach = ExecAttach(socketPath: path, container: "web", cols: 80, rows: 24)
+    let started = AsyncStream<Void> { cont in
+        attach.onStart = { cont.yield(); cont.finish() }
+    }
+    attach.start()
+    for await _ in started {}
+
+    let group = DispatchGroup()
+    attach.close(group: group)
+    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        group.notify(queue: .main) { cont.resume() }
+    }
+
+    #expect(hangUpStarted.isSet)
+}
+
 // MARK: The engine through Swift
 
 @Test func gridSnapshotReadsTheEngine() {

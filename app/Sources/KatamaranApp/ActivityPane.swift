@@ -179,6 +179,7 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
             return
         }
         let sock = store.socket
+        let epoch = store.connectionEpoch
         polling = true
         BlockingIO.run(on: BlockingIO.docker) {
             let lock = NSLock()
@@ -201,7 +202,7 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
             return readings
         } completion: { [weak self] result in
             guard let self else { return }
-            guard self.store.socket == sock else {
+            guard self.store.connectionEpoch == epoch, self.store.socket == sock else {
                 self.polling = false
                 return
             }

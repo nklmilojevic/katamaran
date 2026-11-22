@@ -592,3 +592,120 @@ private func serve(_ response: [String], delay: TimeInterval = 0.05) throws -> (
     let unforced = try captureRequest(force: false, id: "org/img:1?x")
     #expect(unforced == "DELETE /images/org%2Fimg:1%3Fx HTTP/1.1")
 }
+
+@Test @MainActor func dockerStoreRejectsStaleRefreshAcrossSamePathReconnect() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("kat-reconn-\(UUID().uuidString.prefix(8)).sock").path
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard rc == 0, listen(fd, 8) == 0 else { throw SocketError.io(errno) }
+
+    final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        private var arrived = false
+        func nextCall() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            count += 1
+            return count
+        }
+        func markArrived() {
+            lock.lock(); arrived = true; lock.unlock()
+        }
+        var didArrive: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return arrived
+        }
+    }
+    let state = State()
+    let releaseFirstList = DispatchSemaphore(value: 0)
+    let releaseSecondList = DispatchSemaphore(value: 0)
+
+    defer {
+        releaseFirstList.signal()
+        releaseSecondList.signal()
+        close(fd)
+        unlink(path)
+    }
+
+    Thread {
+        while true {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            Thread {
+                defer { close(c) }
+                var buf = [UInt8](repeating: 0, count: 4096)
+                let n = read(c, &buf, buf.count)
+                let req = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+                if req.hasPrefix("GET /containers/json") {
+                    let call = state.nextCall()
+                    if call == 1 {
+                        state.markArrived()
+                        _ = releaseFirstList.wait(timeout: .now() + 5)
+                        let body = #"[{"Id":"old-id","Names":["/old"],"Image":"alpine","State":"running","Status":"Up"}]"#
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                        _ = resp.withCString { write(c, $0, strlen($0)) }
+                    } else {
+                        _ = releaseSecondList.wait(timeout: .now() + 5)
+                        let body = #"[{"Id":"new-id","Names":["/new"],"Image":"alpine","State":"running","Status":"Up"}]"#
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                        _ = resp.withCString { write(c, $0, strlen($0)) }
+                    }
+                } else {
+                    // /events stream: return 200 chunked EOF immediately.
+                    let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                }
+            }.start()
+        }
+    }.start()
+
+    func readyStatus() throws -> DaemonStatus {
+        let json = """
+        {"state":"running","since_ms":0,"daemon":{"pid":1,"home":"/tmp/k"},
+         "versions":{"katamaran":"0.1.0","protocol":1},
+         "config":{"cpus":4,"memory_mib":4096,"mount":false,"launch_at_login":false},
+         "docker":{"state":"ready","socket":"\(path)"},
+         "mount":{"enabled":false,"mounted":false},"ports":[]}
+        """
+        return try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+    }
+
+    let store = DockerStore()
+    store.follow(try readyStatus())
+    let epoch1 = store.connectionEpoch
+    for _ in 0..<100 where !state.didArrive {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(state.didArrive)
+
+    // Disconnect and immediately reconnect to the exact same socket path while fetch #1 is in flight.
+    store.follow(nil)
+    #expect(store.loading.isEmpty)
+    store.follow(try readyStatus())
+    #expect(store.connectionEpoch > epoch1)
+    #expect(store.loading.contains(.containers))
+
+    // Let fetch #1 finish first: it must be rejected so stale "old" data and loading clear do not apply.
+    releaseFirstList.signal()
+    try await Task.sleep(for: .milliseconds(150))
+    #expect(store.containers.isEmpty)
+    #expect(store.loading.contains(.containers))
+
+    // Now let fetch #2 finish: new connection data applies cleanly.
+    releaseSecondList.signal()
+    for _ in 0..<50 where !store.loaded.contains(.containers) {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(store.containers.map(\.name) == ["new"])
+    #expect(store.loading.isEmpty)
+    store.follow(nil)
+}

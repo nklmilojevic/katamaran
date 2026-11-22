@@ -165,6 +165,37 @@ final class AppModel {
         return dir?.appendingPathComponent("katamaran").path ?? "katamaran"
     }
 
+    private final class StderrCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        private var eofSignaled = false
+        private let eofSem = DispatchSemaphore(value: 0)
+
+        func append(_ chunk: Data) {
+            lock.lock()
+            data.append(chunk)
+            lock.unlock()
+        }
+
+        func markEOF() {
+            lock.lock()
+            let first = !eofSignaled
+            eofSignaled = true
+            lock.unlock()
+            if first { eofSem.signal() }
+        }
+
+        func waitForEOF(timeout: TimeInterval) {
+            _ = eofSem.wait(timeout: .now() + timeout)
+        }
+
+        var captured: Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
+    }
+
     nonisolated static func runCLI(_ args: [String], executable: String? = nil, timeout: TimeInterval = 60) throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: executable ?? cliPath())
@@ -173,34 +204,56 @@ final class AppModel {
         let err = Pipe()
         p.standardError = err
         p.standardOutput = FileHandle.nullDevice
-        try p.run()
-        let timeoutLock = NSLock()
-        var timedOut = false
-        let timer = DispatchWorkItem {
-            guard p.isRunning else { return }
-            timeoutLock.lock()
-            timedOut = true
-            timeoutLock.unlock()
-            p.terminate()
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
-                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+
+        let collector = StderrCollector()
+        let exitSem = DispatchSemaphore(value: 0)
+        let readHandle = err.fileHandleForReading
+
+        // Drain stderr asynchronously via readabilityHandler so a verbose CLI never fills the
+        // pipe buffer and a grandchild retaining the stderr fd can never hang timeout/exit.
+        readHandle.readabilityHandler = { h in
+            let chunk = h.availableData
+            if chunk.isEmpty {
+                h.readabilityHandler = nil
+                collector.markEOF()
+                return
             }
+            collector.append(chunk)
         }
+        p.terminationHandler = { _ in exitSem.signal() }
+        defer {
+            readHandle.readabilityHandler = nil
+            p.terminationHandler = nil
+        }
+
+        try p.run()
+
+        let waitResult: DispatchTimeoutResult
         if timeout > 0 {
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: timer)
+            waitResult = exitSem.wait(timeout: .now() + timeout)
+        } else {
+            exitSem.wait()
+            waitResult = .success
         }
-        // Drain stderr before waiting for exit so a verbose CLI never fills the pipe and deadlocks.
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        timer.cancel()
-        timeoutLock.lock()
-        let didTimeout = timedOut
-        timeoutLock.unlock()
-        if didTimeout {
+
+        if waitResult == .timedOut {
+            if p.isRunning { p.terminate() }
+            if exitSem.wait(timeout: .now() + 2) == .timedOut && p.isRunning {
+                kill(p.processIdentifier, SIGKILL)
+                _ = exitSem.wait(timeout: .now() + 2)
+            }
+            readHandle.readabilityHandler = nil
             throw SocketError.protocolError("command timed out")
         }
+
+        p.waitUntilExit()
+        // Wait briefly for remaining buffered stderr to reach EOF; if a background grandchild
+        // inherited the pipe, stop waiting rather than hanging indefinitely.
+        collector.waitForEOF(timeout: 1)
+        readHandle.readabilityHandler = nil
+
         if p.terminationStatus != 0 {
-            let msg = String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            let msg = String(decoding: collector.captured, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             throw SocketError.protocolError(msg.isEmpty ? "exit status \(p.terminationStatus)" : msg)
         }
     }

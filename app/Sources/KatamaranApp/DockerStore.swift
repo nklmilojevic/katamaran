@@ -9,6 +9,9 @@ final class DockerStore {
     static let shared = DockerStore()
 
     private(set) var socket: String?
+    /// Monotonic generation incremented on every socket transition so completions from an
+    /// older connection to the same socket path are rejected.
+    private(set) var connectionEpoch: UInt64 = 0
     private(set) var containers: [ContainerSummary] = []
     private(set) var volumes: [VolumeInfo] = []
     private(set) var images: [ImageInfo] = []
@@ -67,6 +70,7 @@ final class DockerStore {
     }
 
     private func disconnect() {
+        connectionEpoch &+= 1
         events?.cancel()
         events = nil
         retry?.cancel()
@@ -142,6 +146,7 @@ final class DockerStore {
         touched = []
         loading.formUnion(kinds)
         let sock = socket
+        let epoch = connectionEpoch
         BlockingIO.run(on: BlockingIO.docker) {
             var c: [ContainerSummary]? = nil, v: [VolumeInfo]? = nil, i: [ImageInfo]? = nil, n: [NetworkInfo]? = nil
             var problem: String? = nil
@@ -155,7 +160,7 @@ final class DockerStore {
             }
             return (c, v, i, n, problem)
         } completion: { [weak self] cs, vs, ims, ns, err in
-            guard let self, self.socket == sock else { return }
+            guard let self, self.connectionEpoch == epoch, self.socket == sock else { return }
             self.loading.subtract(kinds)
             var dirty = !ids.isEmpty || self.loadError != err
             self.loadError = err
@@ -198,12 +203,14 @@ final class DockerStore {
     /// Run `body` against Docker off the main thread; a failure is reported as `what`.
     func perform(_ what: String, _ body: @escaping @Sendable (DockerClient) throws -> Void) {
         guard let client else { return }
+        let sock = socket
+        let epoch = connectionEpoch
         BlockingIO.run(on: BlockingIO.docker) {
             var failure: String? = nil
             do { try body(client) } catch { failure = error.localizedDescription }
             return failure
         } completion: { [weak self] err in
-            guard let self else { return }
+            guard let self, self.connectionEpoch == epoch, self.socket == sock else { return }
             if let err { self.onError(what, err) }
             // Events cover most changes; prunes of unused things send few.
             self.refresh(self.interest)
@@ -213,8 +220,8 @@ final class DockerStore {
     /// Containers with an action in flight, so rows can show it until Docker is done.
     private(set) var busy: [String: ContainerAction] = [:]
 
-    private func finished(_ id: String, socket sock: String?) {
-        guard socket == sock else { return }
+    private func finished(_ id: String, epoch: UInt64, socket sock: String?) {
+        guard connectionEpoch == epoch, socket == sock else { return }
         busy[id] = nil
         changed()
     }
@@ -222,6 +229,7 @@ final class DockerStore {
     func act(_ action: ContainerAction, on containers: [ContainerSummary]) {
         let ids = containers.map(\.Id)
         let sock = socket
+        let epoch = connectionEpoch
         for id in ids { busy[id] = action }
         changed()
         let verb = switch action {
@@ -238,7 +246,7 @@ final class DockerStore {
             for id in ids {
                 do { try client.act(id, action) } catch { errors.append(error.localizedDescription) }
                 DispatchQueue.main.async {
-                    MainActor.assumeIsolated { self.finished(id, socket: sock) }
+                    MainActor.assumeIsolated { self.finished(id, epoch: epoch, socket: sock) }
                 }
             }
             if !errors.isEmpty { throw SocketError.protocolError(errors.joined(separator: "\n")) }

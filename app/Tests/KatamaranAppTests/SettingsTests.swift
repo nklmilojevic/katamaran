@@ -183,4 +183,14 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
         #expect(error.localizedDescription.contains("timed out"))
         #expect(Date().timeIntervalSince(start) < 3.0)
     }
+
+    // Timeout must not hang on stderr EOF if a grandchild inherits the stderr pipe.
+    let grandchildStart = Date()
+    do {
+        try AppModel.runCLI(["-c", "(sleep 5) & sleep 5"], executable: "/bin/sh", timeout: 0.2)
+        Issue.record("expected timeout error with lingering grandchild")
+    } catch {
+        #expect(error.localizedDescription.contains("timed out"))
+        #expect(Date().timeIntervalSince(grandchildStart) < 3.0)
+    }
 }

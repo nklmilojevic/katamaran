@@ -151,9 +151,14 @@ final class BuildStore {
     private(set) var infos: [String: BuildInfo] = [:]
     private var logs: [String: BuildLog] = [:]
     private var fetchingInfo: Set<String> = []
-    private var failedInfo: Set<String> = []
+    /// Failed `history inspect` attempts mapped to the earliest time they may be retried.
+    private var failedInfo: [String: Date] = [:]
     private var prefetchingInfo = false
     private var fetchingList = false
+    /// Monotonic generation incremented on every `follow` socket transition so completions
+    /// from an older connection to the same socket path cannot mutate new fetch state.
+    private(set) var connectionEpoch: UInt64 = 0
+    static let inspectRetryCooldown: TimeInterval = 30
     private var timer: Timer?
     private var ticker: Timer?
     private var observers: [(BuildStore) -> Void] = []
@@ -180,13 +185,15 @@ final class BuildStore {
 
     func follow(_ socket: String?) {
         guard socket != self.socket else { return }
+        connectionEpoch &+= 1
         self.socket = socket
         logs.values.forEach { $0.cancel() }
         logs = [:]
         infos = [:]
         fetchingInfo = []
-        failedInfo = []
+        failedInfo = [:]
         prefetchingInfo = false
+        fetchingList = false
         records = []
         loaded = false
         loadError = nil
@@ -249,6 +256,7 @@ final class BuildStore {
         guard let cli, !fetchingList else { return }
         fetchingList = true
         let sock = socket
+        let epoch = connectionEpoch
         BlockingIO.run(on: BlockingIO.buildx) {
             var list: [BuildRecord]? = nil
             var problem: String? = nil
@@ -256,9 +264,8 @@ final class BuildStore {
             catch { problem = error.localizedDescription }
             return (list, problem)
         } completion: { [weak self] l, p in
-            guard let self else { return }
+            guard let self, self.connectionEpoch == epoch, self.socket == sock else { return }
             self.fetchingList = false
-            guard self.socket == sock else { return }
             self.apply(l, error: p)
         }
     }
@@ -276,11 +283,11 @@ final class BuildStore {
         // Builds that just finished: their details and logs are final now.
         for id in wasRunning where !(record(id)?.isRunning ?? true) {
             infos[id] = nil
-            failedInfo.remove(id)
+            failedInfo.removeValue(forKey: id)
             if logs[id]?.finished == true || logs[id]?.process == nil { logs[id] = nil }
         }
         for id in infos.keys where !ids.contains(id) { infos[id] = nil }
-        failedInfo = failedInfo.intersection(ids)
+        failedInfo = failedInfo.filter { ids.contains($0.key) }
         for id in logs.keys where !ids.contains(id) { logs[id]?.cancel(); logs[id] = nil }
         if wasRunning != Set(running.map(\.id)) { activityChanged() }
         if visible { fetchInfos() }
@@ -288,16 +295,19 @@ final class BuildStore {
     }
 
     /// Selects the next build record (within `limit`) needing an `inspect` fetch,
-    /// skipping builds already fetched, currently in flight, or known to have failed.
+    /// skipping builds already fetched, currently in flight, or still in failure cooldown.
     nonisolated static func nextInfoToFetch(
         records: [BuildRecord],
         infos: [String: BuildInfo],
         fetching: Set<String>,
-        failed: Set<String>,
+        failedRetryAfter: [String: Date],
+        now: Date = Date(),
         limit: Int = 60
     ) -> String? {
         records.prefix(limit).first { r in
-            !fetching.contains(r.id) && !failed.contains(r.id) && infos[r.id] == nil
+            guard !fetching.contains(r.id), infos[r.id] == nil else { return false }
+            if let retryAfter = failedRetryAfter[r.id], retryAfter > now { return false }
+            return true
         }?.id
     }
 
@@ -308,19 +318,23 @@ final class BuildStore {
         }
         fetchingInfo.insert(id)
         let sock = socket
+        let epoch = connectionEpoch
         BlockingIO.run(on: BlockingIO.buildx) {
             try? BuildInfo.parse(cli.run(["history", "inspect", id, "--format", "json"]))
         } completion: { [weak self] info in
-            guard let self else { return }
+            guard let self, self.connectionEpoch == epoch, self.socket == sock else { return }
             self.fetchingInfo.remove(id)
             if isPrefetch { self.prefetchingInfo = false }
-            guard self.socket == sock, self.record(id) != nil else { return }
+            guard self.record(id) != nil else {
+                if isPrefetch { self.fetchInfos() }
+                return
+            }
             if let info {
-                self.failedInfo.remove(id)
+                self.failedInfo.removeValue(forKey: id)
                 self.infos[id] = info
                 self.changed()
             } else {
-                self.failedInfo.insert(id)
+                self.failedInfo[id] = Date().addingTimeInterval(Self.inspectRetryCooldown)
             }
             if isPrefetch { self.fetchInfos() }
         }
@@ -329,7 +343,12 @@ final class BuildStore {
     /// Details for the latest builds, one at a time, newest first; finished ones are kept.
     private func fetchInfos() {
         guard cli != nil, !prefetchingInfo else { return }
-        guard let id = Self.nextInfoToFetch(records: records, infos: infos, fetching: fetchingInfo, failed: failedInfo) else { return }
+        guard let id = Self.nextInfoToFetch(
+            records: records,
+            infos: infos,
+            fetching: fetchingInfo,
+            failedRetryAfter: failedInfo
+        ) else { return }
         prefetchingInfo = true
         fetchInfo(for: id, isPrefetch: true)
     }
@@ -337,7 +356,9 @@ final class BuildStore {
     /// Details now, for the selected build (even beyond the latest 60).
     func info(_ id: String) -> BuildInfo? {
         if let existing = infos[id] { return existing }
-        if record(id) != nil, !fetchingInfo.contains(id), !failedInfo.contains(id) {
+        let now = Date()
+        let eligible = failedInfo[id].map { now >= $0 } ?? true
+        if record(id) != nil, !fetchingInfo.contains(id), eligible {
             fetchInfo(for: id, isPrefetch: false)
         }
         return nil
@@ -397,13 +418,14 @@ final class BuildStore {
             }
         } else {
             let sock = socket
+            let epoch = connectionEpoch
             BlockingIO.run(on: BlockingIO.buildx) {
                 var text = "", problem: String? = nil
                 do { text = String(decoding: try cli.run(["history", "logs", id, "--progress", "plain"], timeout: 60, progress: true), as: UTF8.self) }
                 catch { problem = error.localizedDescription }
                 return (text, problem)
             } completion: { [weak self] t, p in
-                guard let self, self.socket == sock, self.logs[id] === log else { return }
+                guard let self, self.connectionEpoch == epoch, self.socket == sock, self.logs[id] === log else { return }
                 log.set(t)
                 if let p { log.finish(p) }
                 self.trimLogs(keeping: id)
@@ -441,12 +463,13 @@ final class BuildStore {
     }
 
     private func perform(_ what: String, _ body: @escaping @Sendable () throws -> Void) {
+        let epoch = connectionEpoch
         BlockingIO.run(on: BlockingIO.buildx) {
             var failure: String? = nil
             do { try body() } catch { failure = error.localizedDescription }
             return failure
         } completion: { [weak self] err in
-            guard let self else { return }
+            guard let self, self.connectionEpoch == epoch else { return }
             if let err { self.onError(what, err) }
             self.refresh()
         }

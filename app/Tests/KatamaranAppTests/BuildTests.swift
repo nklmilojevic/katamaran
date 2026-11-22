@@ -286,12 +286,14 @@ private func parse(_ log: String) -> BuildProgressParser {
             BuildRecord(ref: "default/default/ok2", name: "ok2", status: "Completed", createdAt: now),
         ]
         let runningInfo = try BuildInfo.parse(Data(#"{"Status":"running"}"#.utf8))
-        // Even if run1 is running and already has info, and fail1 previously failed, ok1 is selected next.
+        let cooldown = ["fail1": now.addingTimeInterval(30)]
+        // Even if run1 is running and already has info, and fail1 is in cooldown, ok1 is selected next.
         let next = BuildStore.nextInfoToFetch(
             records: records,
             infos: ["run1": runningInfo],
             fetching: [],
-            failed: ["fail1"]
+            failedRetryAfter: cooldown,
+            now: now
         )
         #expect(next == "ok1")
         // If ok1 is in-flight, ok2 is selected.
@@ -299,9 +301,35 @@ private func parse(_ log: String) -> BuildProgressParser {
             records: records,
             infos: ["run1": runningInfo],
             fetching: ["ok1"],
-            failed: ["fail1"]
+            failedRetryAfter: cooldown,
+            now: now
         )
         #expect(next2 == "ok2")
+        // Once the retry cooldown expires, transient failures on finished builds become eligible again.
+        let retry = BuildStore.nextInfoToFetch(
+            records: records,
+            infos: ["run1": runningInfo],
+            fetching: [],
+            failedRetryAfter: cooldown,
+            now: now.addingTimeInterval(31)
+        )
+        #expect(retry == "fail1")
+    }
+
+    @MainActor
+    @Test func buildStoreFollowAdvancesConnectionEpochOnReconnectToSameSocket() {
+        let store = BuildStore()
+        let e0 = store.connectionEpoch
+        store.follow("/tmp/kat-build-test.sock")
+        let e1 = store.connectionEpoch
+        #expect(e1 > e0)
+        store.follow(nil)
+        let e2 = store.connectionEpoch
+        #expect(e2 > e1)
+        store.follow("/tmp/kat-build-test.sock")
+        let e3 = store.connectionEpoch
+        #expect(e3 > e2)
+        store.follow(nil)
     }
 
     @Test func cliErrors() {

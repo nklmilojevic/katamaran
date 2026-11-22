@@ -181,11 +181,12 @@ final class ContainerDetailViewController: NSViewController {
 
     private func fetchInspect(_ id: String) {
         guard inspecting != id, let client = store.client else { return }
+        let epoch = store.connectionEpoch
         inspecting = id
         BlockingIO.run(on: BlockingIO.docker) {
             try? client.inspect(id)
         } completion: { [weak self] result in
-            guard let self, self.inspecting == id else { return }
+            guard let self, self.store.connectionEpoch == epoch, self.inspecting == id else { return }
             self.inspect = result
             self.refresh()
         }
