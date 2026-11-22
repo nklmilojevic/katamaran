@@ -535,6 +535,33 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
     result
 }
 
+/// Return the `kubectl config` delete subcommands needed for entries named
+/// `ctx` that actually exist in the parsed `kubectl config view -o json`
+/// document. Only deleting present entries keeps removal idempotent without
+/// relying on `kubectl` exit behavior for absent keys.
+fn kubeconfig_delete_subcommands(doc: &serde_json::Value, ctx: &str) -> Vec<&'static str> {
+    const SECTIONS: [(&str, &str); 3] = [
+        ("contexts", "delete-context"),
+        ("clusters", "delete-cluster"),
+        ("users", "delete-user"),
+    ];
+    let mut subcommands = Vec::new();
+    for (section, subcmd) in SECTIONS {
+        let present = doc
+            .get(section)
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("name").and_then(|n| n.as_str()) == Some(ctx))
+            });
+        if present {
+            subcommands.push(subcmd);
+        }
+    }
+    subcommands
+}
+
 /// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
 pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
     match fs::remove_file(kubeconfig_path(home)) {
@@ -549,20 +576,35 @@ pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
     if !user_cfg.is_file() {
         return Ok(());
     }
-    for key in [
-        format!("contexts.{ctx}"),
-        format!("clusters.{ctx}"),
-        format!("users.{ctx}"),
-    ] {
+    let raw =
+        fs::read_to_string(&user_cfg).with_context(|| format!("read {}", user_cfg.display()))?;
+    if !raw.contains(ctx) {
+        return Ok(());
+    }
+    let view = kubectl_cmd()
+        .args(["config", "view", "--raw", "-o", "json"])
+        .env("KUBECONFIG", &user_cfg)
+        .stdin(Stdio::null())
+        .output()
+        .context("run kubectl config view --raw -o json")?;
+    if !view.status.success() {
+        bail!(
+            "kubectl config view --raw -o json failed: {}",
+            String::from_utf8_lossy(&view.stderr).trim()
+        );
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&view.stdout)
+        .context("parse kubectl config view --raw -o json output")?;
+    for subcmd in kubeconfig_delete_subcommands(&doc, ctx) {
         let out = kubectl_cmd()
-            .args(["config", "unset", &key])
+            .args(["config", subcmd, ctx])
             .env("KUBECONFIG", &user_cfg)
             .stdin(Stdio::null())
             .output()
-            .with_context(|| format!("run kubectl config unset {key}"))?;
+            .with_context(|| format!("run kubectl config {subcmd} {ctx}"))?;
         if !out.status.success() {
             bail!(
-                "kubectl config unset {key} failed: {}",
+                "kubectl config {subcmd} {ctx} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
@@ -799,5 +841,37 @@ users:
         let q_other = make_query("example.com", 1);
         let resp_other = build_dns_response(&q_other, Ipv4Addr::LOCALHOST).unwrap();
         assert_eq!(resp_other[3] & 0x0F, 3); // NXDOMAIN
+    }
+
+    #[test]
+    fn kubeconfig_delete_subcommands_selects_only_present_entries() {
+        let empty: serde_json::Value = serde_json::json!({
+            "kind": "Config",
+            "apiVersion": "v1",
+            "clusters": null,
+            "contexts": null,
+            "users": null
+        });
+        assert!(kubeconfig_delete_subcommands(&empty, "katamaran").is_empty());
+
+        let partial: serde_json::Value = serde_json::json!({
+            "contexts": [{"name": "other"}, {"name": "katamaran"}],
+            "clusters": [{"name": "other"}],
+            "users": [{"name": "katamaran"}]
+        });
+        assert_eq!(
+            kubeconfig_delete_subcommands(&partial, "katamaran"),
+            vec!["delete-context", "delete-user"]
+        );
+
+        let full: serde_json::Value = serde_json::json!({
+            "contexts": [{"name": "katamaran-dev"}],
+            "clusters": [{"name": "katamaran-dev"}],
+            "users": [{"name": "katamaran-dev"}]
+        });
+        assert_eq!(
+            kubeconfig_delete_subcommands(&full, "katamaran-dev"),
+            vec!["delete-context", "delete-cluster", "delete-user"]
+        );
     }
 }
