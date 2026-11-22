@@ -240,14 +240,45 @@ fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
     }
 }
 
-fn forward(target: &str, local: Option<u16>) -> anyhow::Result<()> {
-    let (addr, port_str) = target
-        .rsplit_once(':')
-        .with_context(|| format!("expected <ip>:<port>, got {target:?}"))?;
-    let port: u16 = port_str
+fn parse_forward_target(target: &str) -> anyhow::Result<(String, u16)> {
+    let sock_addr: std::net::SocketAddr = target
         .parse()
-        .with_context(|| format!("invalid port {port_str:?}"))?;
+        .with_context(|| format!("expected <ip>:<port> or [<ipv6>]:<port>, got {target:?}"))?;
+    if sock_addr.port() == 0 {
+        bail!("target port must be non-zero");
+    }
+    Ok((sock_addr.ip().to_string(), sock_addr.port()))
+}
+
+fn forward(target: &str, local: Option<u16>) -> anyhow::Result<()> {
+    let (addr, port) = parse_forward_target(target)?;
     let local_port = local.unwrap_or(port);
     let home = crate::state_dir()?;
-    k8s::forward_guest_tcp(&home, addr.to_string(), port, local_port)
+    k8s::forward_guest_tcp(&home, addr, port, local_port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_forward_targets_ipv4_and_ipv6() {
+        assert_eq!(
+            parse_forward_target("10.43.0.1:443").unwrap(),
+            ("10.43.0.1".to_string(), 443)
+        );
+        assert_eq!(
+            parse_forward_target("[fd00::1]:8080").unwrap(),
+            ("fd00::1".to_string(), 8080)
+        );
+        assert_eq!(
+            parse_forward_target("[::1]:6443").unwrap(),
+            ("::1".to_string(), 6443)
+        );
+        assert!(parse_forward_target("10.43.0.1:0").is_err());
+        assert!(parse_forward_target("[::1]:0").is_err());
+        assert!(parse_forward_target("not-an-ip:80").is_err());
+        assert!(parse_forward_target("10.43.0.1").is_err());
+        assert!(parse_forward_target("::1:80").is_err());
+    }
 }
