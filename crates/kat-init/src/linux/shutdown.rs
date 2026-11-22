@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -113,28 +114,33 @@ fn step(name: &str, f: impl FnOnce() -> String) {
 
 /// Stop every running container in parallel. Returns how many were asked.
 fn stop_containers(timeout: Duration) -> usize {
-    let Some(list) = docker_request("GET /containers/json") else {
+    let deadline = Instant::now() + timeout;
+    let Some(list) = docker_request_until("GET /containers/json", deadline) else {
         return 0;
     };
     let ids = container_ids(&list);
-    let deadline = Instant::now() + timeout;
     let mut workers = Vec::with_capacity(ids.len());
+    let mut fallback_streams = Vec::new();
     for id in &ids {
         let req = format!("POST /containers/{id}/stop?t={CONTAINER_STOP_SECS}");
         match thread::Builder::new()
             .name("shutdown-container".into())
-            .spawn(move || docker_request(&req))
+            .spawn(move || docker_request_until(&req, deadline))
         {
             Ok(w) => workers.push(w),
             Err(e) => {
                 super::log(&format!("shutdown: spawn container stop thread: {e}"));
-                if Instant::now() < deadline {
-                    let _ = docker_request(&format!(
-                        "POST /containers/{id}/stop?t={CONTAINER_STOP_SECS}"
-                    ));
+                if let Some(stream) = send_docker_request(
+                    &format!("POST /containers/{id}/stop?t={CONTAINER_STOP_SECS}"),
+                    deadline,
+                ) {
+                    fallback_streams.push(stream);
                 }
             }
         }
+    }
+    if !fallback_streams.is_empty() {
+        drain_streams_until(fallback_streams, deadline);
     }
     for w in workers {
         while !w.is_finished() && Instant::now() < deadline {
@@ -147,15 +153,96 @@ fn stop_containers(timeout: Duration) -> usize {
     ids.len()
 }
 
-/// A request without a body over the Docker socket. HTTP/1.0 keeps the
-/// response unchunked, so the body can be scanned as is.
-fn docker_request(request_line: &str) -> Option<String> {
+/// Send an HTTP/1.0 request without a body over the Docker socket, bounded by
+/// `deadline`, and return the open socket so the caller can read or poll its
+/// response without exceeding the shared time budget.
+fn send_docker_request(request_line: &str, deadline: Instant) -> Option<UnixStream> {
+    let rem = deadline.checked_duration_since(Instant::now())?;
+    if rem.is_zero() {
+        return None;
+    }
     let mut s = UnixStream::connect(DOCKER_SOCKET).ok()?;
-    s.set_read_timeout(Some(CONTAINERS_TIMEOUT)).ok()?;
+    s.set_write_timeout(Some(rem)).ok()?;
     write!(s, "{request_line} HTTP/1.0\r\nHost: docker\r\n\r\n").ok()?;
-    let mut resp = String::new();
-    s.read_to_string(&mut resp).ok()?;
-    Some(resp)
+    Some(s)
+}
+
+/// A request without a body over the Docker socket, strictly bounded by
+/// `deadline` across both write and read I/O. HTTP/1.0 keeps the response
+/// unchunked, so the body can be scanned as is.
+fn docker_request_until(request_line: &str, deadline: Instant) -> Option<String> {
+    let mut s = send_docker_request(request_line, deadline)?;
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let rem = deadline.checked_duration_since(Instant::now())?;
+        if rem.is_zero() {
+            break;
+        }
+        s.set_read_timeout(Some(rem)).ok()?;
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    String::from_utf8(resp).ok()
+}
+
+/// Poll and drain fallback stop sockets concurrently until all finish or the
+/// shared `deadline` expires.
+fn drain_streams_until(mut streams: Vec<UnixStream>, deadline: Instant) {
+    let mut buf = [0u8; 4096];
+    while !streams.is_empty() {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if rem.is_zero() {
+            break;
+        }
+        let mut pfds: Vec<libc::pollfd> = streams
+            .iter()
+            .map(|s| libc::pollfd {
+                fd: s.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let timeout_ms = rem.as_millis().min(i32::MAX as u128) as i32;
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if rc == 0 {
+            break;
+        }
+        let mut i = 0;
+        while i < streams.len() {
+            if pfds[i].revents != 0 {
+                let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                    return;
+                };
+                if rem.is_zero() {
+                    return;
+                }
+                let _ = streams[i].set_read_timeout(Some(rem));
+                match streams[i].read(&mut buf) {
+                    Ok(n) if n > 0 => i += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => i += 1,
+                    _ => {
+                        streams.swap_remove(i);
+                        pfds.swap_remove(i);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// The `"Id"` of each container in a `/containers/json` response.
@@ -232,5 +319,14 @@ mod tests {
         assert_eq!(container_ids(resp), vec!["8dfafdbc3a40", "9cd87474be90"]);
         assert!(container_ids("HTTP/1.0 200 OK\r\n\r\n[]").is_empty());
         assert!(container_ids("[{\"Id\":\"../etc\"}]").is_empty());
+    }
+
+    #[test]
+    fn drain_streams_respects_shared_deadline() {
+        let (a1, _a2) = UnixStream::pair().unwrap();
+        let (b1, _b2) = UnixStream::pair().unwrap();
+        let t = Instant::now();
+        drain_streams_until(vec![a1, b1], t + Duration::from_millis(60));
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
 }

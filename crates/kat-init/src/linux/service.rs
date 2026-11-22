@@ -2,14 +2,14 @@
 //! included), and running containerd + dockerd with readiness and exit
 //! reporting to the host.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -191,7 +191,7 @@ impl ExitState {
 /// A running service process.
 struct Service {
     name: &'static str,
-    pid: i32,
+    target: ChildTarget,
     started: Instant,
     exit: Arc<ExitState>,
 }
@@ -218,25 +218,39 @@ impl Service {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        let (pid, status_rx) = reaper.spawn(&mut cmd)?;
+        let (target, status_rx) = reaper.spawn_pidfd(&mut cmd)?;
         let exit = Arc::new(ExitState::new());
         let (exit2, exits) = (exit.clone(), exits.clone());
+        let rx_slot = Arc::new(Mutex::new(Some(status_rx)));
+        let rx_for_thread = rx_slot.clone();
         let waiter = thread::Builder::new()
             .name(format!("{name}-wait"))
             .spawn(move || {
-                if let Ok(status) = status_rx.recv() {
+                let status_rx = rx_for_thread.lock().unwrap().take();
+                if let Some(rx) = status_rx
+                    && let Ok(status) = rx.recv()
+                {
                     *exit2.status.lock().unwrap() = Some(status);
                     exit2.notify.notify_all();
                     let _ = exits.send((index, status));
                 }
             });
         if let Err(e) = waiter {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // Only signal if the child has not already been reaped; when pidfd
+            // is available `target.send_signal` is also immune to PID reuse.
+            let already_reaped = rx_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|rx| rx.try_recv().is_ok());
+            if !already_reaped {
+                target.send_signal(libc::SIGKILL);
+            }
             return Err(e);
         }
         Ok(Arc::new(Service {
             name,
-            pid,
+            target,
             started: Instant::now(),
             exit,
         }))
@@ -252,14 +266,16 @@ impl Service {
             return;
         }
         let t = Instant::now();
-        unsafe { libc::kill(self.pid, libc::SIGTERM) };
+        self.target.send_signal(libc::SIGTERM);
         if !self.exit.wait_timeout(timeout) {
             eprintln!(
                 "kat-init: {} did not stop in {}s, killing it",
                 self.name,
                 timeout.as_secs()
             );
-            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            if !self.has_exited() {
+                self.target.send_signal(libc::SIGKILL);
+            }
             let _ = self.exit.wait_timeout(Duration::from_secs(2));
         }
         eprintln!(
@@ -358,18 +374,97 @@ enum StartError {
     NotReady(String),
 }
 
+/// Pick which service is due to start at `now`, in dependency order
+/// (`CONTAINERD` before `DOCKERD`). If `DOCKERD` is due while `containerd` is
+/// not alive, defer `DOCKERD` into `dockerd_pending` so it starts once
+/// `containerd` becomes ready again.
+fn pick_due_start(
+    retry_at: &mut [Option<Instant>; 2],
+    dockerd_pending: &mut bool,
+    containerd_alive: bool,
+    now: Instant,
+) -> Option<usize> {
+    if retry_at[CONTAINERD].is_some_and(|t| t <= now) {
+        retry_at[CONTAINERD] = None;
+        return Some(CONTAINERD);
+    }
+    if retry_at[DOCKERD].is_some_and(|t| t <= now) {
+        retry_at[DOCKERD] = None;
+        if containerd_alive {
+            return Some(DOCKERD);
+        }
+        *dockerd_pending = true;
+    }
+    None
+}
+
 fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
     let (exits, exited) = mpsc::channel();
     let mut backoff = [backoff(), backoff()];
-    let mut to_start = VecDeque::from([CONTAINERD]);
+    let mut retry_at: [Option<Instant>; 2] = [Some(Instant::now()), None];
     let mut dockerd_pending = true;
+
+    let handle_exit =
+        |i: usize, status: i32, backoff: &mut [Backoff; 2], retry_at: &mut [Option<Instant>; 2]| {
+            if i == CONTAINERD && inner.reloading_containerd.swap(false, Ordering::SeqCst) {
+                retry_at[CONTAINERD] = Some(Instant::now());
+                return;
+            }
+            let ran_for = inner.services.lock().unwrap()[i]
+                .as_ref()
+                .map_or(Duration::ZERO, |s| s.started.elapsed());
+            let delay = backoff[i].next(ran_for);
+            let name = NAMES[i];
+            if backoff[i].failures() > MAX_RESTARTS {
+                notifier.failed(
+                    name,
+                    format!(
+                        "{name} {}; gave up after {MAX_RESTARTS} restarts",
+                        describe_status(status)
+                    ),
+                );
+                retry_at[i] = None;
+                return;
+            }
+            notifier.failed(
+                name,
+                format!(
+                    "{name} {}; restarting in {} ms",
+                    describe_status(status),
+                    delay.as_millis()
+                ),
+            );
+            retry_at[i] = Some(Instant::now() + delay);
+        };
+
     loop {
-        while let Some(i) = to_start.pop_front() {
+        if inner.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        // Drain all pending exit notifications before starting or retrying
+        // anything so containerd failures are never starved behind dockerd
+        // spawn backoff.
+        while let Ok((i, status)) = exited.try_recv() {
+            if inner.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            handle_exit(i, status, &mut backoff, &mut retry_at);
+        }
+
+        let containerd_alive = inner.services.lock().unwrap()[CONTAINERD]
+            .as_ref()
+            .is_some_and(|s| !s.has_exited());
+        if let Some(i) = pick_due_start(
+            &mut retry_at,
+            &mut dockerd_pending,
+            containerd_alive,
+            Instant::now(),
+        ) {
             match start_one(reaper, &exits, inner, i) {
                 Ok(()) if i == CONTAINERD => {
                     if dockerd_pending {
                         dockerd_pending = false;
-                        to_start.push_back(DOCKERD);
+                        retry_at[DOCKERD] = Some(Instant::now());
                     }
                 }
                 Ok(()) => notifier.send(&Msg::ServiceReady {
@@ -383,57 +478,36 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
                     if backoff[i].failures() > MAX_RESTARTS {
                         notifier
                             .failed(name, format!("{e}; gave up after {MAX_RESTARTS} restarts"));
+                        retry_at[i] = None;
                     } else {
                         notifier
                             .failed(name, format!("{e}; restarting in {} ms", delay.as_millis()));
-                        if !sleep_unless_stopping(delay, &inner.stopping) {
-                            return;
-                        }
-                        to_start.push_back(i);
+                        retry_at[i] = Some(Instant::now() + delay);
                     }
                 }
-                // The process is gone or killed; its exit restarts it below.
-                // If containerd failed, dockerd remains pending until containerd is ready.
+                // The process is gone or killed; its exit restarts it via `exited`.
+                // If containerd failed, dockerd stays pending until containerd is ready.
                 Err(StartError::NotReady(e)) => notifier.failed(NAMES[i], e),
             }
+            continue;
         }
-        let Ok((i, status)) = exited.recv() else {
-            return;
+
+        let wait = match retry_at.into_iter().flatten().min() {
+            Some(dl) => dl
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(20)),
+            None => Duration::from_millis(50),
         };
-        if inner.stopping.load(Ordering::SeqCst) {
-            return;
+        match exited.recv_timeout(wait) {
+            Ok((i, status)) => {
+                if inner.stopping.load(Ordering::SeqCst) {
+                    return;
+                }
+                handle_exit(i, status, &mut backoff, &mut retry_at);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
-        if i == CONTAINERD && inner.reloading_containerd.swap(false, Ordering::SeqCst) {
-            to_start.push_back(CONTAINERD);
-            continue;
-        }
-        let ran_for = inner.services.lock().unwrap()[i]
-            .as_ref()
-            .map_or(Duration::ZERO, |s| s.started.elapsed());
-        let delay = backoff[i].next(ran_for);
-        let name = NAMES[i];
-        if backoff[i].failures() > MAX_RESTARTS {
-            notifier.failed(
-                name,
-                format!(
-                    "{name} {}; gave up after {MAX_RESTARTS} restarts",
-                    describe_status(status)
-                ),
-            );
-            continue;
-        }
-        notifier.failed(
-            name,
-            format!(
-                "{name} {}; restarting in {} ms",
-                describe_status(status),
-                delay.as_millis()
-            ),
-        );
-        if !sleep_unless_stopping(delay, &inner.stopping) {
-            return;
-        }
-        to_start.push_back(i);
     }
 }
 
@@ -459,34 +533,21 @@ fn start_one(
     }
     let service = Service::spawn(reaper, exits, i, program, &args)
         .map_err(|e| StartError::SpawnFailed(format!("start {}: {e}", NAMES[i])))?;
-    let (pid, exit) = (service.pid, service.exit.clone());
-    services[i] = Some(service);
+    services[i] = Some(service.clone());
     drop(services);
 
     let ready = match i {
-        CONTAINERD => wait_ready(NAMES[i], &exit, || {
+        CONTAINERD => wait_ready(NAMES[i], &service.exit, || {
             UnixStream::connect(CONTAINERD_SOCKET).is_ok()
         }),
-        _ => wait_ready(NAMES[i], &exit, docker_ping),
+        _ => wait_ready(NAMES[i], &service.exit, docker_ping),
     };
     ready.map_err(|e| {
-        if !exit.has_exited() {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        if !service.has_exited() {
+            service.target.send_signal(libc::SIGKILL);
         }
         StartError::NotReady(e)
     })
-}
-
-/// Sleep for `d`, waking early if `stopping` is set. Returns false if it was.
-fn sleep_unless_stopping(d: Duration, stopping: &AtomicBool) -> bool {
-    let deadline = Instant::now() + d;
-    while Instant::now() < deadline {
-        if stopping.load(Ordering::SeqCst) {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(20).min(deadline - Instant::now()));
-    }
-    !stopping.load(Ordering::SeqCst)
 }
 
 /// `GET /_ping` over the Docker socket.
@@ -526,5 +587,30 @@ mod tests {
     fn describes_wait_status() {
         assert_eq!(describe_status(1 << 8), "exited with status 1");
         assert_eq!(describe_status(9), "killed by signal 9");
+    }
+
+    #[test]
+    fn due_start_prioritizes_containerd_and_defers_dockerd_when_down() {
+        let t0 = Instant::now();
+        let mut retry_at = [Some(t0), Some(t0)];
+        let mut dockerd_pending = false;
+        // Containerd is always picked first when both are due.
+        assert_eq!(
+            pick_due_start(&mut retry_at, &mut dockerd_pending, false, t0),
+            Some(CONTAINERD)
+        );
+        // Dockerd due while containerd is not alive defers into dockerd_pending.
+        assert_eq!(
+            pick_due_start(&mut retry_at, &mut dockerd_pending, false, t0),
+            None
+        );
+        assert!(dockerd_pending);
+        assert_eq!(retry_at[DOCKERD], None);
+        // Once containerd is alive, a due dockerd retry starts immediately.
+        retry_at[DOCKERD] = Some(t0);
+        assert_eq!(
+            pick_due_start(&mut retry_at, &mut dockerd_pending, true, t0),
+            Some(DOCKERD)
+        );
     }
 }

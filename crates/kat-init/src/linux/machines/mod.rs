@@ -34,8 +34,29 @@ use super::sys;
 const PORT_INTERVAL: Duration = Duration::from_millis(500);
 const FIRST_BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
-const MAX_TAR_OUTPUT: u64 = 64 << 10;
+const MAX_TAR_OUTPUT: usize = 64 << 10;
 const MAX_ERROR_BYTES: usize = 64 << 10;
+
+/// Read `r` to EOF, retaining at most `max_bytes` and discarding the rest so a
+/// verbose child never blocks on a closed or full pipe.
+fn drain_capped(mut r: impl Read, max_bytes: usize) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let keep = max_bytes.saturating_sub(out.len()).min(n);
+                if keep > 0 {
+                    out.extend_from_slice(&buf[..keep]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 /// Truncate an error message safely on a UTF-8 boundary so an encoded
 /// `MachineMsg::Error` frame can never exceed `kat_proto::MAX_FRAME`.
@@ -741,19 +762,18 @@ fn unpack(reaper: &Reaper, rootfs: &std::path::Path, conn: &mut UnixStream) -> R
     .stdin(Stdio::from(in_r))
     .stdout(Stdio::from(out_w.try_clone().map_err(|e| e.to_string())?))
     .stderr(Stdio::from(out_w));
-    let (pid, exited) = reaper.spawn(&mut c).map_err(|e| format!("tar: {e}"))?;
+    let (target, exited) = reaper
+        .spawn_pidfd(&mut c)
+        .map_err(|e| format!("tar: {e}"))?;
     drop(c);
     let errors = match thread::Builder::new()
         .name("tar-stderr".into())
-        .spawn(move || {
-            let mut out = Vec::new();
-            let _ = File::from(out_r).take(MAX_TAR_OUTPUT).read_to_end(&mut out);
-            String::from_utf8_lossy(&out).into_owned()
-        }) {
+        .spawn(move || drain_capped(File::from(out_r), MAX_TAR_OUTPUT))
+    {
         Ok(h) => h,
         Err(e) => {
             drop(in_w);
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            target.send_signal(libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             return Err(format!("tar output thread: {e}"));
         }
@@ -842,5 +862,25 @@ mod tests {
             assert!(alloc.lock().unwrap().contains(&ip));
         }
         assert!(!alloc.lock().unwrap().contains(&ip));
+    }
+
+    #[test]
+    fn drain_capped_consumes_pipe_past_limit() {
+        let (r, w) = cmd::pipe().unwrap();
+        let total = MAX_TAR_OUTPUT * 4;
+        let writer = thread::spawn(move || {
+            let mut wf = File::from(w);
+            let chunk = vec![b'x'; 8192];
+            let mut left = total;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                wf.write_all(&chunk[..n]).unwrap();
+                left -= n;
+            }
+        });
+        let captured = drain_capped(File::from(r), MAX_TAR_OUTPUT);
+        writer.join().unwrap();
+        assert_eq!(captured.len(), MAX_TAR_OUTPUT);
+        assert!(captured.bytes().all(|b| b == b'x'));
     }
 }
