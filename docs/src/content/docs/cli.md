@@ -82,7 +82,7 @@ kat config get [KEY]
 
 ### `kat config set`
 
-Update one or more settings and validate them against the Mac's hardware limits. Changes apply on the next VM start (except `launch_at_login`, which updates the LaunchAgent immediately).
+Update one or more settings and validate them against the Mac's hardware limits. Changes apply on the next VM start (except `launch_at_login`, which updates the LaunchAgent immediately, and `kubernetes`, which starts or stops k3s immediately when the VM is running).
 
 ```sh
 kat config set cpus 6
@@ -209,6 +209,95 @@ kat ssh [DEST] [-- <CMD>...]
 ```
 
 `DEST` is `<machine>` or `<user>@<machine>`. Omit `DEST` to connect to the default machine.
+
+## Kubernetes commands
+
+`kat k8s` (aliased as `kat kubernetes`) manages the optional single-node Kubernetes (`k3s`) cluster inside the VM.
+
+### `kat k8s status`
+
+Show Kubernetes state, k3s version, API endpoint, kubeconfig context and path, and `*.k8s.kat.local` DNS status.
+
+```sh
+kat k8s status [--json]
+```
+
+| Option | Description |
+|---|---|
+| `--json` | Emit the Kubernetes status payload as JSON |
+
+### `kat k8s start`
+
+Enable and start the Kubernetes cluster, downloading the pinned `k3s` binary on first use and merging the `katamaran` context into `~/.kube/config`.
+
+```sh
+kat k8s start
+```
+
+### `kat k8s stop`
+
+Stop Kubernetes and disable auto-start on VM boot. Uses zero resources when off.
+
+```sh
+kat k8s stop
+```
+
+### `kat k8s reset`
+
+Stop Kubernetes and delete all cluster state, workloads, and persistent volumes.
+
+```sh
+kat k8s reset
+```
+
+### `kat k8s kubeconfig`
+
+Print the cluster kubeconfig YAML, or print the path to `~/.katamaran/run/kubeconfig.yaml`.
+
+```sh
+kat k8s kubeconfig [--path]
+```
+
+| Option | Description |
+|---|---|
+| `--path` | Print the path to `<home>/run/kubeconfig.yaml` instead of its contents |
+
+### `kat k8s sync-images`
+
+Mirror locally built Docker images into Kubernetes immediately.
+
+```sh
+kat k8s sync-images
+```
+
+### `kat k8s dns`
+
+Manage macOS DNS resolution for `*.k8s.kat.local` via `/etc/resolver/k8s.kat.local`.
+
+```sh
+kat k8s dns status
+kat k8s dns install
+kat k8s dns uninstall
+```
+
+| Subcommand | Description |
+|---|---|
+| `status` | Show whether `/etc/resolver/k8s.kat.local` is installed |
+| `install` | Install `/etc/resolver/k8s.kat.local` pointing to the local DNS responder (uses `sudo` once; requires Kubernetes to be running) |
+| `uninstall` | Remove `/etc/resolver/k8s.kat.local` (uses `sudo` once) |
+
+### `kat k8s forward`
+
+Forward a local TCP port on `127.0.0.1` directly to a Pod IP or Service ClusterIP inside the guest.
+
+```sh
+kat k8s forward <TARGET> [--local <PORT>]
+```
+
+| Argument / Option | Default | Description |
+|---|---|---|
+| `<TARGET>` | required | Guest target `<ip>:<port>` (for example `10.43.0.1:443` or `10.42.0.5:8080`) |
+| `--local <PORT>` | target port | Local TCP port on `127.0.0.1` |
 
 ## Foreground and diagnostic commands
 

@@ -99,6 +99,10 @@ fn main() -> anyhow::Result<()> {
             "-p",
             "kat-daemon",
             "-p",
+            "kat-nfs",
+            "-p",
+            "kat-term",
+            "-p",
             "xtask",
         ])),
         Task::Build => {

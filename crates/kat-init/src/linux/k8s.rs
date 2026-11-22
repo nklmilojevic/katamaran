@@ -8,15 +8,16 @@
 //! `moby` namespace into `k8s.io`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,12 +37,15 @@ const BIN_DIR: &str = "/var/lib/katamaran/k3s/bin";
 const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
+const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
+const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
 const LOG_FILE: &str = "/var/log/k3s.log";
 pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_K8S_CONNS: usize = 256;
 
 /// Internal k3s/Kubernetes control-plane ports that must not be auto-forwarded
 /// to the Mac's `127.0.0.1` by `ports::watch` (`6443` has its own dedicated
@@ -50,7 +54,57 @@ const INTERNAL_PORTS: [u16; 6] = [6443, 6444, 10250, 10256, 10257, 10259];
 
 static SERVICE: OnceLock<Arc<K8s>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+static IMAGE_SYNC_LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn try_acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| ConnGuard(Arc::clone(active)))
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Wrapper around `UnixStream` that checks `SHUTTING_DOWN` on socket read
+/// timeouts without losing partially read frame bytes.
+struct ShutdownReader<'a>(&'a mut UnixStream);
+
+impl Read for ShutdownReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "VM is shutting down",
+                ));
+            }
+            match self.0.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                res => return res,
+            }
+        }
+    }
+}
 
 pub fn is_internal_port(port: u16) -> bool {
     ACTIVE.load(Ordering::Relaxed) && INTERNAL_PORTS.contains(&port)
@@ -115,16 +169,32 @@ pub fn start_service(
     let _ = SERVICE.set(svc.clone());
     let listener = sys::vsock_listen(K8S_PORT)?;
     let s = svc.clone();
+    let active = Arc::new(AtomicUsize::new(0));
     thread::Builder::new().name("k8s".into()).spawn(move || {
         loop {
             match sys::accept(&listener) {
                 Ok(fd) => {
+                    let Some(guard) = ConnGuard::try_acquire(&active, MAX_K8S_CONNS) else {
+                        log(&format!(
+                            "connection limit ({MAX_K8S_CONNS}) reached on vsock {K8S_PORT}"
+                        ));
+                        continue;
+                    };
                     let s = s.clone();
-                    thread::spawn(move || s.serve(UnixStream::from(fd)));
+                    if let Err(e) =
+                        thread::Builder::new()
+                            .name("k8s-conn".into())
+                            .spawn(move || {
+                                let _guard = guard;
+                                s.serve(UnixStream::from(fd));
+                            })
+                    {
+                        log(&format!("spawn k8s-conn: {e}"));
+                    }
                 }
                 Err(e) => {
                     log(&format!("accept on vsock {K8S_PORT}: {e}"));
-                    return;
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         }
@@ -134,6 +204,7 @@ pub fn start_service(
 
 /// Stop k3s cleanly during VM shutdown.
 pub fn stop_for_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
     if let Some(svc) = SERVICE.get() {
         let _ = svc.stop_inner(None);
     }
@@ -145,70 +216,353 @@ const CRI_PLUGINS: [&str; 3] = [
     "io.containerd.cri.v1.runtime",
 ];
 
-/// Ensure `/etc/containerd/config.toml` has CRI plugins enabled while leaving
-/// any other entries in `disabled_plugins` untouched. Returns `true` if the
-/// file was modified (meaning an already-running `containerd` must be restarted
-/// to load CRI).
-pub fn ensure_containerd_cri() -> bool {
-    let path = "/etc/containerd/config.toml";
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
+const CONTAINERD_BASE_CONFIG: &str = "/etc/containerd/config.toml";
+const CONTAINERD_CRI_CONFIG: &str = "/run/katamaran/containerd-cri.toml";
+
+fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", target.display()))?;
+    let target_mode = match fs::metadata(target) {
+        Ok(meta) => meta.permissions().mode() & 0o7777,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
+        Err(e) => return Err(format!("stat {}: {e}", target.display())),
     };
-    let Some(updated) = strip_cri_from_disabled_plugins(&text) else {
-        return false;
-    };
-    if let Err(e) = fs::write(path, updated) {
-        log(&format!("update {path}: {e}"));
-        return false;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".into());
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.katamaran.{pid}.{seq}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let write_res = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        f.set_permissions(fs::Permissions::from_mode(target_mode))?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
     }
-    true
+    if let Err(e) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            target.display()
+        ));
+    }
+    Ok(())
 }
 
-/// Remove only CRI plugin IDs from `disabled_plugins = [...]`, preserving all
-/// other disabled plugins. Returns `None` if no CRI plugin was disabled.
+/// Outcome of preparing an ephemeral CRI-enabled runtime config for containerd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerdCriConfig {
+    /// Path to pass via `containerd --config`.
+    pub path: String,
+    /// True if the runtime config was created or its contents changed.
+    pub updated: bool,
+}
+
+/// Prepare an ephemeral CRI-enabled containerd config under `/run/katamaran/`
+/// derived from `/etc/containerd/config.toml` without ever modifying the
+/// managed base config file.
+///
+/// The generated file is validated with `containerd --config <tmp> config dump`
+/// before it is committed. Returns `Ok(None)` when `/etc/containerd/config.toml`
+/// does not exist or does not disable CRI plugins.
+pub fn ensure_containerd_cri(reaper: &Reaper) -> Result<Option<ContainerdCriConfig>, String> {
+    prepare_containerd_cri_config(
+        Path::new(CONTAINERD_BASE_CONFIG),
+        Path::new(CONTAINERD_CRI_CONFIG),
+        |tmp| validate_containerd_config(reaper, tmp),
+    )
+}
+
+fn prepare_containerd_cri_config(
+    base_path: &Path,
+    out_path: &Path,
+    validate: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<Option<ContainerdCriConfig>, String> {
+    let text = match fs::read_to_string(base_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let _ = fs::remove_file(out_path);
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("read {}: {e}", base_path.display())),
+    };
+    let Some(updated) = strip_cri_from_disabled_plugins(&text) else {
+        let _ = fs::remove_file(out_path);
+        return Ok(None);
+    };
+
+    if matches!(fs::symlink_metadata(out_path), Ok(meta) if meta.file_type().is_file() && (meta.permissions().mode() & 0o777) == 0o600)
+        && fs::read_to_string(out_path).ok().as_deref() == Some(updated.as_str())
+    {
+        return Ok(Some(ContainerdCriConfig {
+            path: out_path.to_string_lossy().into_owned(),
+            updated: false,
+        }));
+    }
+
+    let parent = out_path.parent().ok_or_else(|| {
+        format!(
+            "containerd runtime config {} has no parent directory",
+            out_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".containerd-cri.{}.{seq}.tmp", std::process::id()));
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    if let Err(e) = f.write_all(updated.as_bytes()).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    drop(f);
+
+    if let Err(e) = validate(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp, out_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("commit {}: {e}", out_path.display()));
+    }
+    Ok(Some(ContainerdCriConfig {
+        path: out_path.to_string_lossy().into_owned(),
+        updated: true,
+    }))
+}
+
+fn validate_containerd_config(reaper: &Reaper, path: &Path) -> Result<(), String> {
+    let mut cmd = Command::new("/usr/bin/containerd");
+    cmd.arg("--config").arg(path).args(["config", "dump"]);
+    let (code, out) = run_reaped(reaper, &mut cmd, Duration::from_secs(10))
+        .map_err(|e| format!("validate containerd config {}: {e}", path.display()))?;
+    if code != 0 {
+        return Err(format!(
+            "containerd rejected generated config {} (exit {code}): {}",
+            path.display(),
+            out.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Split a TOML line into `(code, comment)` at the first unquoted `#`.
+fn strip_toml_comment(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if b == b'"' {
+            in_double = true;
+        } else if b == b'\'' {
+            in_single = true;
+        } else if b == b'#' {
+            return (&line[..i], &line[i..]);
+        }
+    }
+    (line, "")
+}
+
+/// Split comma-separated TOML array items, ignoring commas inside quoted strings.
+fn split_toml_array_items(s: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if b == b'"' {
+            in_double = true;
+        } else if b == b'\'' {
+            in_single = true;
+        } else if b == b',' {
+            items.push(&s[start..i]);
+            start = i + 1;
+        }
+    }
+    items.push(&s[start..]);
+    items
+}
+
+/// Remove only CRI plugin IDs from top-level `disabled_plugins = [...]`,
+/// preserving all other disabled plugins, nested `[table]` sections, inline
+/// comments, and multiline arrays. Returns `None` if no CRI plugin was disabled.
 fn strip_cri_from_disabled_plugins(text: &str) -> Option<String> {
-    let mut changed = false;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut any_changed = false;
+    let mut in_table = false;
     let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("disabled_plugins")
+        if trimmed.starts_with('[') {
+            in_table = true;
+        }
+        if !in_table
+            && let Some(rest) = trimmed.strip_prefix("disabled_plugins")
             && let Some(rhs) = rest.trim_start().strip_prefix('=')
         {
-            let rhs = rhs.trim();
-            if let Some(inner) = rhs.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                let mut kept = Vec::new();
-                for item in inner.split(',') {
-                    let raw = item.trim();
-                    if raw.is_empty() {
+            // Strip any trailing `# ...` comment before inspecting `[` / `]`.
+            let (code, comment) = strip_toml_comment(rhs);
+            let code_trimmed = code.trim();
+            if let Some(after_open) = code_trimmed.strip_prefix('[') {
+                if let Some(inner) = after_open.strip_suffix(']') {
+                    // Single-line array.
+                    let mut line_changed = false;
+                    let mut kept = Vec::new();
+                    for item in split_toml_array_items(inner) {
+                        let raw = item.trim();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        let unquoted = raw.trim_matches(|c| c == '"' || c == '\'');
+                        if CRI_PLUGINS.contains(&unquoted) {
+                            line_changed = true;
+                        } else {
+                            kept.push(raw);
+                        }
+                    }
+                    if line_changed {
+                        any_changed = true;
+                        if !kept.is_empty() {
+                            let indent = &line[..line.len() - trimmed.len()];
+                            let comment_suffix = if comment.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {comment}")
+                            };
+                            out.push_str(&format!(
+                                "{indent}disabled_plugins = [{}]{comment_suffix}\n",
+                                kept.join(", ")
+                            ));
+                        }
+                        i += 1;
                         continue;
                     }
-                    let unquoted = raw.trim_matches(|c| c == '"' || c == '\'');
-                    if CRI_PLUGINS.contains(&unquoted) {
-                        changed = true;
-                    } else {
-                        kept.push(raw);
+                } else {
+                    // Multiline array: `after_open` already has any `# comment`
+                    // stripped from the opening line; find the closing `]`.
+                    let mut end = None;
+                    for (j, l) in lines.iter().enumerate().skip(i + 1) {
+                        let (lcode, _) = strip_toml_comment(l);
+                        if lcode.trim_end().ends_with(']') {
+                            end = Some(j);
+                            break;
+                        }
                     }
-                }
-                if changed {
-                    let indent = &line[..line.len() - trimmed.len()];
-                    if !kept.is_empty() {
-                        out.push_str(&format!(
-                            "{indent}disabled_plugins = [{}]\n",
-                            kept.join(", ")
-                        ));
+                    if let Some(end_idx) = end {
+                        let mut body = String::from(after_open);
+                        body.push('\n');
+                        for l in &lines[i + 1..end_idx] {
+                            let (lcode, _) = strip_toml_comment(l);
+                            body.push_str(lcode);
+                            body.push('\n');
+                        }
+                        let (end_code, end_comment) = strip_toml_comment(lines[end_idx]);
+                        let end_before_close =
+                            end_code.trim_end().strip_suffix(']').unwrap_or(end_code);
+                        body.push_str(end_before_close);
+
+                        let mut block_changed = false;
+                        let mut kept = Vec::new();
+                        for item in split_toml_array_items(&body) {
+                            let raw = item.trim();
+                            if raw.is_empty() {
+                                continue;
+                            }
+                            let unquoted = raw.trim_matches(|c| c == '"' || c == '\'');
+                            if CRI_PLUGINS.contains(&unquoted) {
+                                block_changed = true;
+                            } else {
+                                kept.push(raw.to_string());
+                            }
+                        }
+                        if block_changed {
+                            any_changed = true;
+                            if !kept.is_empty() {
+                                let indent = &line[..line.len() - trimmed.len()];
+                                let comment_suffix = if end_comment.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" {end_comment}")
+                                };
+                                out.push_str(&format!(
+                                    "{indent}disabled_plugins = [{}]{comment_suffix}\n",
+                                    kept.join(", ")
+                                ));
+                            }
+                            i = end_idx + 1;
+                            continue;
+                        } else {
+                            for l in &lines[i..=end_idx] {
+                                out.push_str(l);
+                                out.push('\n');
+                            }
+                            i = end_idx + 1;
+                            continue;
+                        }
                     }
-                    continue;
                 }
             }
         }
         out.push_str(line);
         out.push('\n');
+        i += 1;
     }
-    changed.then_some(out)
+    any_changed.then_some(out)
 }
 
 impl K8s {
-    fn serve(&self, mut conn: UnixStream) {
+    fn serve(self: &Arc<Self>, mut conn: UnixStream) {
         let req = match k8s::read(&mut conn) {
             Ok(Some(m)) => m,
             Ok(None) => return,
@@ -255,7 +609,13 @@ impl K8s {
     }
 
     fn install(&self, conn: &mut UnixStream, version: &str) -> Result<(), String> {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         let _guard = self.op_lock.lock().unwrap();
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         if self.state.lock().unwrap().running.is_some() {
             return Err("stop Kubernetes before installing a new k3s binary".into());
         }
@@ -266,11 +626,15 @@ impl K8s {
         fs::create_dir_all(BIN_DIR).map_err(|e| format!("create {BIN_DIR}: {e}"))?;
         let tmp = format!("{BIN}.tmp");
         let _ = fs::remove_file(&tmp);
+        let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
         let res = (|| -> Result<(), String> {
             let mut f = File::create(&tmp).map_err(|e| format!("create {tmp}: {e}"))?;
+            let mut total_bytes = 0u64;
+            let mut reader = ShutdownReader(&mut *conn);
             loop {
-                match k8s::read(&mut *conn).map_err(|e| format!("read binary stream: {e}"))? {
+                match k8s::read(&mut reader).map_err(|e| format!("read binary stream: {e}"))? {
                     Some(K8sMsg::Data(chunk)) => {
+                        total_bytes += chunk.len() as u64;
                         f.write_all(&chunk)
                             .map_err(|e| format!("write {tmp}: {e}"))?;
                     }
@@ -283,15 +647,21 @@ impl K8s {
                     }
                 }
             }
+            if total_bytes == 0 {
+                return Err("received empty k3s binary".into());
+            }
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return Err("aborted: VM is shutting down".into());
+            }
             f.sync_all().map_err(|e| format!("sync {tmp}: {e}"))?;
             drop(f);
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("chmod {tmp}: {e}"))?;
             fs::rename(&tmp, BIN).map_err(|e| format!("install {BIN}: {e}"))?;
-            fs::write(VERSION_FILE, format!("{version}\n"))
-                .map_err(|e| format!("write {VERSION_FILE}: {e}"))?;
+            write_atomic(Path::new(VERSION_FILE), format!("{version}\n").as_bytes())?;
             Ok(())
         })();
+        let _ = conn.set_read_timeout(None);
         if res.is_err() {
             let _ = fs::remove_file(&tmp);
         } else {
@@ -300,8 +670,14 @@ impl K8s {
         res
     }
 
-    fn start_inner(&self, conn: &mut UnixStream) -> Result<K8sInfo, String> {
+    fn start_inner(self: &Arc<Self>, conn: &mut UnixStream) -> Result<K8sInfo, String> {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         let _guard = self.op_lock.lock().unwrap();
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         {
             let st = self.state.lock().unwrap();
             if st.phase == "running" && st.api_ready {
@@ -317,14 +693,10 @@ impl K8s {
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
-        if ensure_containerd_cri() {
-            let _ = k8s::write(
-                &mut *conn,
-                &K8sMsg::Progress("enabling CRI in containerd".into()),
-            );
-            self.docker.restart_containerd();
+        self.activate_containerd_cri(conn)?;
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
         }
-        wait_containerd()?;
 
         let _ = k8s::write(&mut *conn, &K8sMsg::Progress("starting k3s server".into()));
         sys::mkdir("/var/log").map_err(|e| format!("mkdir /var/log: {e}"))?;
@@ -352,6 +724,7 @@ impl K8s {
             "--tls-san=k8s.kat.local",
             "--https-listen-port=6443",
             "--kubelet-arg=fail-swap-on=false",
+            &format!("--kubelet-arg=root-dir={KUBELET_DIR}"),
             "--kube-proxy-arg=proxy-mode=nftables",
         ])
         .env("PATH", PATH)
@@ -359,10 +732,14 @@ impl K8s {
         .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
         .stderr(log_file);
 
-        enable_bridge_netfilter();
+        enable_bridge_netfilter()?;
+        // Mark active before spawning k3s so ports::watch ignores internal
+        // control-plane ports (e.g. 6443) from the moment k3s binds them.
+        ACTIVE.store(true, Ordering::SeqCst);
         let (pid, status_rx) = match self.reaper.spawn(&mut cmd) {
             Ok(v) => v,
             Err(e) => {
+                ACTIVE.store(false, Ordering::SeqCst);
                 restore_bridge_netfilter();
                 return Err(format!("spawn k3s: {e}"));
             }
@@ -371,7 +748,6 @@ impl K8s {
         let (exit_tx, exit_rx) = mpsc::channel();
         let sync_stop = Arc::new(AtomicBool::new(false));
 
-        ACTIVE.store(true, Ordering::SeqCst);
         let my_gen = {
             let mut st = self.state.lock().unwrap();
             st.generation += 1;
@@ -389,46 +765,136 @@ impl K8s {
 
         // Watch process exit asynchronously so crashes are reported to the host.
         {
-            let svc_ref = SERVICE.get().cloned();
+            let svc_ref = Arc::clone(self);
             let exited2 = exited.clone();
             let sync_stop2 = sync_stop.clone();
-            thread::Builder::new()
+            let status_rx_slot = Arc::new(Mutex::new(Some(status_rx)));
+            let status_rx_watch = Arc::clone(&status_rx_slot);
+            if let Err(e) = thread::Builder::new()
                 .name("k3s-watch".into())
                 .spawn(move || {
-                    if let Ok(status) = status_rx.recv() {
+                    let rx = status_rx_watch.lock().unwrap().take();
+                    if let Some(rx) = rx
+                        && let Ok(status) = rx.recv()
+                    {
                         *exited2.lock().unwrap() = Some(status);
                         sync_stop2.store(true, Ordering::SeqCst);
                         let _ = exit_tx.send(());
-                        if let Some(svc) = svc_ref {
-                            // Serialize crash cleanup with start_inner/stop_inner so a
-                            // replacement cluster cannot launch while this watcher is
-                            // tearing down workloads or restoring sysctls. Safe against
-                            // deadlock because exited2 and exit_tx were signaled above.
-                            let _op = svc.op_lock.lock().unwrap();
-                            let crashed = {
-                                let mut st = svc.state.lock().unwrap();
-                                // Ignore stale watchers or startup exits already handled
-                                // by start_inner/stop_inner.
-                                if st.generation != my_gen || st.phase != "running" {
-                                    return;
-                                }
-                                let msg = format!("k3s {}", describe_status(status));
-                                st.phase = "failed".into();
-                                st.api_ready = false;
-                                st.error = msg.clone();
-                                st.running = None;
-                                msg
-                            };
-                            stop_k8s_workloads(&svc.reaper);
-                            ACTIVE.store(false, Ordering::SeqCst);
-                            FORWARDED.lock().unwrap().clear();
-                            restore_bridge_netfilter();
-                            svc.notifier.failed("k8s", crashed);
-                        }
+                        // Serialize crash cleanup with start_inner/stop_inner so a
+                        // replacement cluster cannot launch while this watcher is
+                        // tearing down workloads or restoring sysctls. Safe against
+                        // deadlock because exited2 and exit_tx were signaled above.
+                        let _op = svc_ref.op_lock.lock().unwrap();
+                        let crashed = {
+                            let mut st = svc_ref.state.lock().unwrap();
+                            // Ignore stale watchers or startup exits already handled
+                            // by start_inner/stop_inner.
+                            if st.generation != my_gen || st.phase != "running" {
+                                return;
+                            }
+                            let msg = format!("k3s {}", describe_status(status));
+                            st.phase = "failed".into();
+                            st.api_ready = false;
+                            st.error = msg.clone();
+                            st.running = None;
+                            msg
+                        };
+                        stop_k8s_workloads(&svc_ref.reaper);
+                        ACTIVE.store(false, Ordering::SeqCst);
+                        FORWARDED.lock().unwrap().clear();
+                        restore_bridge_netfilter();
+                        svc_ref.notifier.failed("k8s", crashed);
                     }
                 })
-                .ok();
+            {
+                let err = format!("spawn k3s-watch: {e}");
+                sync_stop.store(true, Ordering::SeqCst);
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                let rx = status_rx_slot.lock().unwrap().take();
+                let reaped = match rx {
+                    Some(rx) => {
+                        if rx.recv_timeout(STOP_TIMEOUT).is_ok() {
+                            true
+                        } else {
+                            log(
+                                "k3s did not stop in time after k3s-watch spawn failure, killing it",
+                            );
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                            rx.recv_timeout(Duration::from_secs(3)).is_ok()
+                        }
+                    }
+                    None => false,
+                };
+                if reaped {
+                    stop_k8s_workloads(&self.reaper);
+                    ACTIVE.store(false, Ordering::SeqCst);
+                    FORWARDED.lock().unwrap().clear();
+                    restore_bridge_netfilter();
+                } else {
+                    log(&format!(
+                        "k3s pid {pid} did not exit after SIGKILL; skipping workload teardown"
+                    ));
+                }
+                let final_err = if reaped {
+                    err
+                } else {
+                    format!("{err} (k3s pid {pid} did not exit within timeout)")
+                };
+                let mut st = self.state.lock().unwrap();
+                if st.generation == my_gen {
+                    st.phase = "failed".into();
+                    st.api_ready = false;
+                    st.error = final_err.clone();
+                    if reaped {
+                        st.running = None;
+                    }
+                }
+                return Err(final_err);
+            }
         }
+
+        let abort_for_shutdown = || -> Result<K8sInfo, String> {
+            let err = "aborted: VM is shutting down".to_string();
+            let running = {
+                let mut st = self.state.lock().unwrap();
+                st.phase = "stopping".into();
+                st.api_ready = false;
+                st.running.take()
+            };
+            if let Some(r) = running {
+                terminate_running(&r);
+            }
+            stop_k8s_workloads(&self.reaper);
+            ACTIVE.store(false, Ordering::SeqCst);
+            FORWARDED.lock().unwrap().clear();
+            restore_bridge_netfilter();
+            let mut st = self.state.lock().unwrap();
+            if st.generation == my_gen {
+                st.phase = "stopped".into();
+                st.api_ready = false;
+                st.error.clear();
+            }
+            Err(err)
+        };
+
+        let cleanup_startup_exit = |status: i32| -> Result<K8sInfo, String> {
+            let err = format!(
+                "k3s exited during startup ({}); see {LOG_FILE}",
+                describe_status(status)
+            );
+            stop_k8s_workloads(&self.reaper);
+            let mut st = self.state.lock().unwrap();
+            if st.generation == my_gen {
+                st.phase = "failed".into();
+                st.api_ready = false;
+                st.error = err.clone();
+                st.running = None;
+            }
+            ACTIVE.store(false, Ordering::SeqCst);
+            FORWARDED.lock().unwrap().clear();
+            restore_bridge_netfilter();
+            Err(err)
+        };
 
         let _ = k8s::write(
             &mut *conn,
@@ -436,22 +902,11 @@ impl K8s {
         );
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return abort_for_shutdown();
+            }
             if let Some(status) = *exited.lock().unwrap() {
-                let err = format!(
-                    "k3s exited during startup ({}); see {LOG_FILE}",
-                    describe_status(status)
-                );
-                stop_k8s_workloads(&self.reaper);
-                let mut st = self.state.lock().unwrap();
-                if st.generation == my_gen {
-                    st.phase = "failed".into();
-                    st.error = err.clone();
-                    st.running = None;
-                }
-                ACTIVE.store(false, Ordering::SeqCst);
-                FORWARDED.lock().unwrap().clear();
-                restore_bridge_netfilter();
-                return Err(err);
+                return cleanup_startup_exit(status);
             }
             if api_is_ready(&self.reaper) {
                 break;
@@ -486,8 +941,15 @@ impl K8s {
             thread::sleep(Duration::from_millis(250));
         }
 
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return abort_for_shutdown();
+        }
         {
             let mut st = self.state.lock().unwrap();
+            if let Some(status) = *exited.lock().unwrap() {
+                drop(st);
+                return cleanup_startup_exit(status);
+            }
             st.phase = "running".into();
             st.api_ready = true;
             st.error.clear();
@@ -499,9 +961,37 @@ impl K8s {
 
         // Start background Docker -> k8s.io image mirror and Service port watcher.
         spawn_image_sync(self.reaper.clone(), sync_stop.clone());
-        spawn_service_port_watcher(self.reaper.clone(), sync_stop);
+        spawn_service_port_watcher(Arc::clone(self), my_gen, sync_stop);
         log("k3s is ready");
         Ok(self.info())
+    }
+
+    fn activate_containerd_cri(&self, conn: &mut UnixStream) -> Result<(), String> {
+        match ensure_containerd_cri(&self.reaper)? {
+            Some(cfg) => {
+                let needs_reload = cfg.updated
+                    || self.docker.containerd_config().as_deref() != Some(cfg.path.as_str());
+                if needs_reload {
+                    let _ = k8s::write(
+                        &mut *conn,
+                        &K8sMsg::Progress("enabling CRI in containerd".into()),
+                    );
+                    self.docker
+                        .reload_containerd_config(Some(cfg.path), Duration::from_secs(30))?;
+                } else {
+                    wait_containerd()?;
+                }
+            }
+            None => {
+                if self.docker.containerd_config().is_some() {
+                    self.docker
+                        .reload_containerd_config(None, Duration::from_secs(30))?;
+                } else {
+                    wait_containerd()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn stop_inner(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
@@ -544,9 +1034,16 @@ impl K8s {
     }
 
     fn reset_inner(&self, conn: &mut UnixStream) -> Result<(), String> {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         let _guard = self.op_lock.lock().unwrap();
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         self.stop_locked(Some(&mut *conn))?;
         let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
+        unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
         if Path::new(DATA_DIR).exists() {
             // Try btrfs subvolume delete first (instant if it is a subvolume),
             // falling back to recursive removal.
@@ -556,6 +1053,10 @@ impl K8s {
             if Path::new(DATA_DIR).exists() {
                 fs::remove_dir_all(DATA_DIR).map_err(|e| format!("remove {DATA_DIR}: {e}"))?;
             }
+        }
+        if Path::new(LEGACY_KUBELET_DIR).exists() {
+            fs::remove_dir_all(LEGACY_KUBELET_DIR)
+                .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
         }
         let _ = fs::remove_file(KUBECONFIG);
         log("k3s cluster data reset");
@@ -592,41 +1093,58 @@ impl K8s {
         let Ok(mut conn_write) = conn.try_clone() else {
             return;
         };
-        let down = thread::spawn(move || {
-            let mut buf = vec![0u8; CHUNK];
-            loop {
-                match up_read.read(&mut buf) {
-                    Ok(0) => {
-                        let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
-                        return;
-                    }
-                    Ok(n) => {
-                        if k8s::write(&mut conn_write, &K8sMsg::Data(buf[..n].to_vec())).is_err() {
+        let down = match thread::Builder::new()
+            .name("k8s-connect-down".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    match up_read.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
+                            return;
+                        }
+                        Ok(n) => {
+                            if k8s::write(&mut conn_write, &K8sMsg::Data(buf[..n].to_vec()))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
                             return;
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => {
-                        let _ = k8s::write(&mut conn_write, &K8sMsg::DataEnd);
-                        return;
-                    }
                 }
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                log(&format!("spawn k8s-connect-down: {e}"));
+                let _ = upstream.shutdown(Shutdown::Both);
+                return;
             }
-        });
+        };
         let mut up_write = upstream;
-        while let Ok(Some(msg)) = k8s::read(&mut conn) {
-            match msg {
-                K8sMsg::Data(d) => {
+        let mut clean_eof = false;
+        loop {
+            match k8s::read(&mut conn) {
+                Ok(Some(K8sMsg::Data(d))) => {
                     if up_write.write_all(&d).is_err() {
                         break;
                     }
                 }
-                K8sMsg::DataEnd => {
-                    let _ = up_write.shutdown(Shutdown::Write);
+                Ok(Some(K8sMsg::DataEnd)) => {
+                    clean_eof = true;
                     break;
                 }
-                _ => break,
+                Ok(Some(_)) | Ok(None) | Err(_) => break,
             }
+        }
+        if clean_eof {
+            let _ = up_write.shutdown(Shutdown::Write);
+        } else {
+            let _ = up_write.shutdown(Shutdown::Both);
         }
         let _ = down.join();
     }
@@ -652,24 +1170,41 @@ fn prepare_dirs_and_sysctls(reaper: &Reaper) -> Result<(), String> {
     Ok(())
 }
 
-const BRIDGE_NF_SYSCTLS: [&str; 2] = [
+const BRIDGE_NF_SYSCTLS: [&str; 3] = [
+    "/proc/sys/net/ipv4/ip_forward",
     "/proc/sys/net/bridge/bridge-nf-call-iptables",
     "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
 ];
-static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 2]>> = Mutex::new(None);
+static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 3]>> = Mutex::new(None);
 
-fn enable_bridge_netfilter() {
-    let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
+fn enable_bridge_netfilter() -> Result<(), String> {
     let mut saved = SAVED_BRIDGE_NF.lock().unwrap();
-    if saved.is_none() {
-        *saved = Some([
-            fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
-            fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
-        ]);
+    let prev = match *saved {
+        Some(ref p) => p.clone(),
+        None => {
+            let p = [
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[2]).ok(),
+            ];
+            *saved = Some(p.clone());
+            p
+        }
+    };
+    for (i, path) in BRIDGE_NF_SYSCTLS.iter().enumerate() {
+        if let Err(e) = fs::write(path, "1\n") {
+            for j in (0..i).rev() {
+                if let Some(ref v) = prev[j]
+                    && let Err(re) = fs::write(BRIDGE_NF_SYSCTLS[j], v)
+                {
+                    log(&format!("rollback {}: {re}", BRIDGE_NF_SYSCTLS[j]));
+                }
+            }
+            *saved = None;
+            return Err(format!("enable {path}: {e}"));
+        }
     }
-    for path in BRIDGE_NF_SYSCTLS {
-        let _ = fs::write(path, "1\n");
-    }
+    Ok(())
 }
 
 fn restore_bridge_netfilter() {
@@ -677,8 +1212,10 @@ fn restore_bridge_netfilter() {
         return;
     };
     for (path, val) in BRIDGE_NF_SYSCTLS.iter().zip(prev) {
-        if let Some(v) = val {
-            let _ = fs::write(path, v);
+        if let Some(v) = val
+            && let Err(e) = fs::write(path, v)
+        {
+            log(&format!("restore {path}: {e}"));
         }
     }
 }
@@ -695,13 +1232,109 @@ fn terminate_running(r: &Running) {
     }
 }
 
+/// Unescape octal escape sequences (`\040`, `\011`, `\012`, `\134`) used in
+/// `/proc/self/mountinfo` mount point paths.
+fn unescape_mountinfo_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let d0 = bytes[i + 1];
+            let d1 = bytes[i + 2];
+            let d2 = bytes[i + 3];
+            if (b'0'..=b'3').contains(&d0)
+                && (b'0'..=b'7').contains(&d1)
+                && (b'0'..=b'7').contains(&d2)
+            {
+                let val = ((d0 - b'0') << 6) | ((d1 - b'0') << 3) | (d2 - b'0');
+                out.push(val);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Parse `/proc/self/mountinfo` and return all mount points matching any of
+/// `prefixes` (retaining repeated/stacked mounts), sorted deepest nested mount
+/// first and topmost stacked mount first.
+fn mounts_under_prefixes(mountinfo: &str, prefixes: &[&str]) -> Vec<String> {
+    let mut mounts: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in mountinfo.lines().enumerate() {
+        let Some(raw_mp) = line.split_whitespace().nth(4) else {
+            continue;
+        };
+        let mp = unescape_mountinfo_path(raw_mp);
+        if prefixes.iter().any(|p| is_under_prefix(&mp, p)) {
+            mounts.push((idx, mp));
+        }
+    }
+    mounts.sort_by(|(ia, a), (ib, b)| b.len().cmp(&a.len()).then_with(|| ib.cmp(ia)));
+    mounts.into_iter().map(|(_, mp)| mp).collect()
+}
+
+fn umount_detach(target: &str) -> io::Result<()> {
+    let c = CString::new(target)?;
+    if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } < 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("umount(MNT_DETACH) {target}: {e}"),
+        ));
+    }
+    Ok(())
+}
+
+fn unmount_paths_under(prefixes: &[&str]) -> Result<(), String> {
+    let text = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
+    let mut failures = Vec::new();
+    for mp in mounts_under_prefixes(&text, prefixes) {
+        if let Err(e) = sys::umount(&mp)
+            && let Err(de) = umount_detach(&mp)
+        {
+            let msg = format!("unmount {mp} failed ({e}); detach failed: {de}");
+            log(&msg);
+            failures.push(msg);
+        }
+    }
+    let after = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("re-read /proc/self/mountinfo: {e}"))?;
+    let remaining = mounts_under_prefixes(&after, prefixes);
+    if !remaining.is_empty() {
+        let detail = if failures.is_empty() {
+            format!("mounts still active: {}", remaining.join(", "))
+        } else {
+            format!(
+                "mounts still active ({}): {}",
+                remaining.join(", "),
+                failures.join("; ")
+            )
+        };
+        return Err(detail);
+    }
+    Ok(())
+}
+
 /// Stop and remove Kubernetes tasks/containers in the shared containerd
-/// `k8s.io` namespace and tear down CNI interfaces without touching Docker's
-/// `moby` namespace.
+/// `k8s.io` namespace and tear down CNI interfaces, kube-proxy nftables rules,
+/// and kubelet/data-dir mounts without touching Docker's `moby` namespace.
 fn stop_k8s_workloads(reaper: &Reaper) {
     let mut ls = Command::new("/usr/bin/ctr");
     ls.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io", "tasks", "ls", "-q"]);
-    if let Ok((0, out)) = run_reaped(reaper, &mut ls, Duration::from_secs(10)) {
+    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut ls, Duration::from_secs(10)) {
         let ids: Vec<&str> = out
             .lines()
             .map(str::trim)
@@ -765,7 +1398,7 @@ fn stop_k8s_workloads(reaper: &Reaper) {
         "ls",
         "-q",
     ]);
-    if let Ok((0, out)) = run_reaped(reaper, &mut cls, Duration::from_secs(10)) {
+    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut cls, Duration::from_secs(10)) {
         for id in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
             let mut rm = Command::new("/usr/bin/ctr");
             rm.args([
@@ -784,6 +1417,23 @@ fn stop_k8s_workloads(reaper: &Reaper) {
         let mut del = Command::new("/sbin/ip");
         del.args(["link", "delete", iface]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
+    }
+    let nft_bin = [
+        "/usr/sbin/nft",
+        "/sbin/nft",
+        "/usr/bin/nft",
+        "/var/lib/katamaran/k3s/data/current/bin/nft",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).is_file())
+    .unwrap_or("nft");
+    for family in ["ip", "ip6"] {
+        let mut del = Command::new(nft_bin);
+        del.args(["delete", "table", family, "kube-proxy"]);
+        let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
+    }
+    if let Err(e) = unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
+        log(&format!("cleanup mounts: {e}"));
     }
 }
 
@@ -821,12 +1471,100 @@ fn ensure_symlink(link: &str, target: &str) -> Result<(), String> {
 fn wait_containerd() -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
         if UnixStream::connect(CONTAINERD_SOCKET).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
     Err(format!("containerd socket {CONTAINERD_SOCKET} not ready"))
+}
+
+/// Drain `r` completely to EOF so the child never blocks on a full pipe, while
+/// retaining at most `limit` bytes for diagnostics or parsing.
+fn drain_capped(mut r: impl Read, limit: usize) -> String {
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = limit.saturating_sub(captured.len());
+                if room > 0 {
+                    captured.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
+/// Run `cmd` under PID 1's reaper capturing `stdout` and `stderr` separately
+/// so warnings printed to stderr cannot corrupt stdout parsing.
+fn run_reaped_split(
+    reaper: &Reaper,
+    cmd: &mut Command,
+    timeout: Duration,
+) -> io::Result<(i32, String, String)> {
+    let (out_r, out_w) = pipe()?;
+    let (err_r, err_w) = pipe()?;
+    cmd.env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_w))
+        .stderr(Stdio::from(err_w));
+    let (pid, exited) = reaper.spawn(cmd)?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let out_t = match thread::Builder::new()
+        .name("k8s-cmd-out".into())
+        .spawn(move || drain_capped(File::from(out_r), 1 << 20))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Err(e);
+        }
+    };
+    let err_t = match thread::Builder::new()
+        .name("k8s-cmd-err".into())
+        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            return Err(e);
+        }
+    };
+
+    let status = match exited.recv_timeout(timeout) {
+        Ok(s) => s,
+        Err(RecvTimeoutError::Timeout) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            let _ = err_t.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{:?} timed out", cmd.get_program()),
+            ));
+        }
+        Err(RecvTimeoutError::Disconnected) => -1,
+    };
+    let stdout = out_t.join().unwrap_or_default();
+    let stderr = err_t.join().unwrap_or_default();
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    };
+    Ok((code, stdout, stderr))
 }
 
 fn api_is_ready(reaper: &Reaper) -> bool {
@@ -860,23 +1598,35 @@ fn read_kubeconfig() -> Result<String, String> {
 /// Periodically read NodePort and LoadBalancer ports from Kubernetes services
 /// so `ports::watch` forwards them on `127.0.0.1:<port>` on macOS (kube-proxy
 /// in nftables mode and ServiceLB use DNAT rules rather than listening sockets).
-fn spawn_service_port_watcher(reaper: Reaper, stop: Arc<AtomicBool>) {
+fn spawn_service_port_watcher(svc: Arc<K8s>, my_gen: u64, stop: Arc<AtomicBool>) {
     let _ = thread::Builder::new()
         .name("k8s-ports".into())
         .spawn(move || {
+            let update_if_current = |ports: Option<BTreeSet<u16>>| {
+                let st = svc.state.lock().unwrap();
+                if ACTIVE.load(Ordering::SeqCst) && st.generation == my_gen {
+                    let mut fwd = FORWARDED.lock().unwrap();
+                    match ports {
+                        Some(p) => *fwd = p,
+                        None => fwd.clear(),
+                    }
+                }
+            };
             while !stop.load(Ordering::Relaxed) {
-                if let Some(ports) = query_service_ports(&reaper) {
-                    *FORWARDED.lock().unwrap() = ports;
+                if let Some(ports) = query_service_ports(&svc.reaper)
+                    && !stop.load(Ordering::Relaxed)
+                {
+                    update_if_current(Some(ports));
                 }
                 for _ in 0..8 {
                     if stop.load(Ordering::Relaxed) {
-                        FORWARDED.lock().unwrap().clear();
+                        update_if_current(None);
                         return;
                     }
                     thread::sleep(Duration::from_millis(250));
                 }
             }
-            FORWARDED.lock().unwrap().clear();
+            update_if_current(None);
         });
 }
 
@@ -892,10 +1642,10 @@ fn query_service_ports(reaper: &Reaper) -> Option<BTreeSet<u16>> {
         "-o",
         "jsonpath={range .items[*]}{.spec.type}{\" \"}{range .spec.ports[*]}{.protocol}:{.port}:{.nodePort}{\" \"}{end}{\"\\n\"}{end}",
     ]);
-    let (0, out) = run_reaped(reaper, &mut cmd, Duration::from_secs(5)).ok()? else {
+    let (0, stdout, _) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(5)).ok()? else {
         return None;
     };
-    Some(parse_service_ports(&out))
+    Some(parse_service_ports(&stdout))
 }
 
 fn parse_service_ports(out: &str) -> BTreeSet<u16> {
@@ -1030,8 +1780,9 @@ fn is_docker_image_sync_event(line: &str) -> bool {
 }
 
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
+    let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let moby = list_ctr_images(reaper, "moby")?;
-    let k8s = list_ctr_images(reaper, "k8s.io").unwrap_or_default();
+    let k8s = list_ctr_images(reaper, "k8s.io")?;
     let mut failures = Vec::new();
     for (name, digest) in moby {
         if name.starts_with("sha256:") || name.contains("<none>") {
@@ -1055,13 +1806,18 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
 fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, String>, String> {
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "ls"]);
-    let (code, text) = run_reaped(reaper, &mut cmd, Duration::from_secs(15))
+    let (code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
         .map_err(|e| format!("ctr images ls ({ns}): {e}"))?;
     if code != 0 {
-        return Err(format!("ctr images ls ({ns}) failed: {}", text.trim()));
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!("ctr images ls ({ns}) failed: {detail}"));
     }
     let mut map = HashMap::new();
-    for line in text.lines().skip(1) {
+    for line in stdout.lines().skip(1) {
         let mut fields = line.split_whitespace();
         let Some(name) = fields.next() else {
             continue;
@@ -1128,16 +1884,42 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
     };
     imp.stdin(Stdio::null()).stderr(Stdio::null());
 
-    let exp_err_t = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = File::from(exp_err_r).take(64 << 10).read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).trim().to_string()
-    });
-    let imp_err_t = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = File::from(imp_err_r).take(64 << 10).read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).trim().to_string()
-    });
+    let kill_both = || {
+        unsafe {
+            libc::kill(exp_pid, libc::SIGKILL);
+            libc::kill(imp_pid, libc::SIGKILL);
+        }
+        let _ = exp_rx.recv_timeout(Duration::from_secs(2));
+        let _ = imp_rx.recv_timeout(Duration::from_secs(2));
+    };
+
+    let exp_err_t = match thread::Builder::new()
+        .name("k8s-ctr-exp-err".into())
+        .spawn(move || {
+            drain_capped(File::from(exp_err_r), 64 << 10)
+                .trim()
+                .to_string()
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            kill_both();
+            return Err(format!("spawn ctr export stderr reader: {e}"));
+        }
+    };
+    let imp_err_t = match thread::Builder::new()
+        .name("k8s-ctr-imp-err".into())
+        .spawn(move || {
+            drain_capped(File::from(imp_err_r), 64 << 10)
+                .trim()
+                .to_string()
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            kill_both();
+            let _ = exp_err_t.join();
+            return Err(format!("spawn ctr import stderr reader: {e}"));
+        }
+    };
 
     let deadline = Instant::now() + timeout;
     let wait_one = |pid: i32, rx: &Receiver<i32>, label: &str| -> Result<i32, String> {
@@ -1174,4 +1956,311 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
 
 fn log(msg: &str) {
     eprintln!("kat-init: k8s: {msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("kat-init-k8s-{name}-{}-{seq}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn strip_cri_preserves_other_disabled_plugins_and_tables() {
+        let input = concat!(
+            "version = 4\n",
+            "disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.snapshotter.v1.zfs\"]\n",
+            "[plugins.example]\n",
+            "  disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+        );
+        let out = strip_cri_from_disabled_plugins(input).unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "version = 4\n",
+                "disabled_plugins = [\"io.containerd.snapshotter.v1.zfs\"]\n",
+                "[plugins.example]\n",
+                "  disabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn strip_cri_returns_none_when_no_cri_disabled() {
+        let input = "version = 4\ndisabled_plugins = [\"io.containerd.snapshotter.v1.zfs\"]\n";
+        assert_eq!(strip_cri_from_disabled_plugins(input), None);
+    }
+
+    #[test]
+    fn strip_cri_handles_multiple_lines_and_preserves_non_cri() {
+        let input = "\
+version = 2
+disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"other.plugin\"]
+[plugins.\"example\"]
+  disabled_plugins = [\"keep.me\", \"also.keep\"] # untouched
+";
+        let got = strip_cri_from_disabled_plugins(input).unwrap();
+        assert_eq!(
+            got,
+            "\
+version = 2
+disabled_plugins = [\"other.plugin\"]
+[plugins.\"example\"]
+  disabled_plugins = [\"keep.me\", \"also.keep\"] # untouched
+"
+        );
+        assert!(strip_cri_from_disabled_plugins(&got).is_none());
+    }
+
+    #[test]
+    fn strip_cri_handles_inline_comments() {
+        let input_keep =
+            "disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"foo\"] # keep comment\n";
+        let got = strip_cri_from_disabled_plugins(input_keep).unwrap();
+        assert_eq!(got, "disabled_plugins = [\"foo\"] # keep comment\n");
+
+        let input_all_cri = "disabled_plugins = [\"io.containerd.grpc.v1.cri\"] # disable cri\n";
+        let got_all = strip_cri_from_disabled_plugins(input_all_cri).unwrap();
+        assert_eq!(got_all, "");
+    }
+
+    #[test]
+    fn strip_cri_handles_multiline_arrays() {
+        let input = "\
+version = 2
+disabled_plugins = [
+  \"io.containerd.grpc.v1.cri\", # cri grpc
+  \"io.containerd.cri.v1.images\",
+  \"io.containerd.snapshotter.v1.aufs\",
+] # end
+[other]
+disabled_plugins = [
+  \"keep.one\",
+  \"keep.two\",
+]
+";
+        let got = strip_cri_from_disabled_plugins(input).unwrap();
+        assert_eq!(
+            got,
+            "\
+version = 2
+disabled_plugins = [\"io.containerd.snapshotter.v1.aufs\"] # end
+[other]
+disabled_plugins = [
+  \"keep.one\",
+  \"keep.two\",
+]
+"
+        );
+        assert!(strip_cri_from_disabled_plugins(&got).is_none());
+
+        let only_cri_multiline = "\
+version = 2
+disabled_plugins = [ # opening comment ]
+  \"io.containerd.grpc.v1.cri\",
+  \"io.containerd.cri.v1.runtime\",
+]
+";
+        assert_eq!(
+            strip_cri_from_disabled_plugins(only_cri_multiline).unwrap(),
+            "version = 2\n"
+        );
+
+        let opening_comment_with_kept = "\
+version = 2
+disabled_plugins = [ # note
+  \"io.containerd.grpc.v1.cri\",
+  \"io.containerd.snapshotter.v1.zfs\",
+]
+";
+        assert_eq!(
+            strip_cri_from_disabled_plugins(opening_comment_with_kept).unwrap(),
+            "version = 2\ndisabled_plugins = [\"io.containerd.snapshotter.v1.zfs\"]\n"
+        );
+    }
+
+    #[test]
+    fn write_atomic_preserves_existing_permissions_and_restricts_new_files() {
+        let dir = temp_dir("atomic");
+        let existing = dir.join("config.toml");
+        fs::write(&existing, "old\n").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&existing, b"new\n").unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let new_file = dir.join("version");
+        write_atomic(&new_file, b"v1.37.2+k3s1\n").unwrap();
+        assert_eq!(
+            fs::metadata(&new_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_cri_config_never_modifies_base_file_or_symlink() {
+        let dir = temp_dir("symlink");
+        let real_base = dir.join("managed.toml");
+        let base_link = dir.join("config.toml");
+        let out_path = dir.join("run/containerd-cri.toml");
+
+        let original = concat!(
+            "version = 4\n",
+            "disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\", \"io.containerd.cri.v1.runtime\"]\n",
+            "[grpc]\n",
+            "  address = \"/run/containerd/containerd.sock\"\n",
+        );
+        fs::write(&real_base, original).unwrap();
+        fs::set_permissions(&real_base, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&real_base, &base_link).unwrap();
+
+        let cfg = prepare_containerd_cri_config(&base_link, &out_path, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.updated);
+        assert_eq!(cfg.path, out_path.to_string_lossy());
+
+        // Managed config symlink, target, contents, and permissions remain untouched.
+        assert!(
+            fs::symlink_metadata(&base_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&base_link).unwrap(), real_base);
+        assert_eq!(fs::read_to_string(&real_base).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&real_base).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        // Runtime override is private and stripped of CRI plugins.
+        assert_eq!(
+            fs::symlink_metadata(&out_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let generated = fs::read_to_string(&out_path).unwrap();
+        assert!(!generated.contains("disabled_plugins"));
+        assert!(generated.contains("address = \"/run/containerd/containerd.sock\""));
+
+        // Second call with unchanged base is idempotent (updated = false).
+        let second = prepare_containerd_cri_config(&base_link, &out_path, |_| {
+            panic!("validator should not rerun when generated config is already up to date")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!second.updated);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_cri_config_rejects_invalid_output_without_committing() {
+        let dir = temp_dir("invalid");
+        let base = dir.join("config.toml");
+        let out_path = dir.join("run/containerd-cri.toml");
+        fs::write(
+            &base,
+            "version = 4\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n",
+        )
+        .unwrap();
+
+        let err = prepare_containerd_cri_config(&base, &out_path, |_| {
+            Err("invalid containerd config".into())
+        })
+        .unwrap_err();
+        assert!(err.contains("invalid containerd config"));
+        assert!(!out_path.exists());
+
+        // No leftover temp files in output directory.
+        let leftover: Vec<_> = fs::read_dir(out_path.parent().unwrap()).unwrap().collect();
+        assert!(leftover.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_cri_config_removes_stale_override_when_not_needed() {
+        let dir = temp_dir("cleanup");
+        let base = dir.join("config.toml");
+        let out_path = dir.join("run/containerd-cri.toml");
+        fs::create_dir_all(out_path.parent().unwrap()).unwrap();
+        fs::write(&out_path, "stale\n").unwrap();
+        fs::write(&base, "version = 4\n").unwrap();
+
+        let res = prepare_containerd_cri_config(&base, &out_path, |_| Ok(())).unwrap();
+        assert_eq!(res, None);
+        assert!(!out_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mounts_under_prefixes_sorts_deepest_first_retains_stacked_and_unescapes() {
+        let mountinfo = "\
+10 1 0:1 / / rw - ext4 /dev/vda rw
+20 10 0:2 / /var/lib/katamaran/k3s/data rw - btrfs /dev/vdb rw
+21 20 0:3 / /var/lib/katamaran/k3s/data/agent/kubelet/pods/a/volumes/k8s.io~secret/tok rw - tmpfs tmpfs rw
+22 20 0:4 / /var/lib/katamaran/k3s/data/agent/kubelet/pods/a rw - tmpfs tmpfs rw
+25 22 0:7 / /var/lib/katamaran/k3s/data/agent/kubelet/pods/a rw - overlay overlay rw
+23 10 0:5 / /var/lib/kubelet/pods/my\\040pod/vol rw - tmpfs tmpfs rw
+24 10 0:6 / /var/lib/kubelet2/unrelated rw - tmpfs tmpfs rw
+";
+        let got = mounts_under_prefixes(mountinfo, &[DATA_DIR, LEGACY_KUBELET_DIR]);
+        assert_eq!(
+            got,
+            vec![
+                "/var/lib/katamaran/k3s/data/agent/kubelet/pods/a/volumes/k8s.io~secret/tok",
+                "/var/lib/katamaran/k3s/data/agent/kubelet/pods/a",
+                "/var/lib/katamaran/k3s/data/agent/kubelet/pods/a",
+                "/var/lib/kubelet/pods/my pod/vol",
+                "/var/lib/katamaran/k3s/data",
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_capped_reads_past_limit_to_eof() {
+        let data = vec![b'x'; 128 << 10];
+        let mut cursor = io::Cursor::new(data);
+        let out = drain_capped(&mut cursor, 64 << 10);
+        assert_eq!(out.len(), 64 << 10);
+        assert_eq!(cursor.position(), 128 << 10);
+    }
+
+    #[test]
+    fn conn_guard_enforces_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let g1 = ConnGuard::try_acquire(&active, 1).unwrap();
+        assert!(ConnGuard::try_acquire(&active, 1).is_none());
+        drop(g1);
+        assert!(ConnGuard::try_acquire(&active, 1).is_some());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn parses_service_ports_correctly() {
+        let out = "\
+ClusterIP TCP:80:
+NodePort TCP:80:30080 UDP:53:30053
+LoadBalancer TCP:8080:31080 TCP:6443:31443
+";
+        let ports = parse_service_ports(out);
+        assert_eq!(ports, BTreeSet::from([8080, 30080, 31080, 31443]));
+    }
 }

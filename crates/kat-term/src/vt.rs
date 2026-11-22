@@ -24,8 +24,9 @@ pub struct Effects {
 /// A libghostty-vt terminal.
 pub struct Vt {
     raw: ffi::Terminal,
-    /// Heap-allocated so the userdata pointer libghostty-vt keeps stays valid when `Vt` moves.
-    effects: Box<Effects>,
+    /// Heap-allocated raw pointer so libghostty-vt's userdata pointer does not alias a Rust `Box`
+    /// while C callbacks execute.
+    effects: *mut Effects,
     /// Mouse selection state (click count, anchor, dragging), and an event of each kind.
     gesture: ffi::SelectionGesture,
     press: ffi::SelectionGestureEvent,
@@ -33,7 +34,8 @@ pub struct Vt {
     release: ffi::SelectionGestureEvent,
 }
 
-// libghostty-vt terminals have no thread affinity; `Vt` is only used behind a mutex.
+// libghostty-vt terminals have no thread affinity; `Vt` is only used behind a mutex, and
+// `effects` is uniquely owned by `Vt` (`Effects: Send`).
 unsafe impl Send for Vt {}
 
 /// A selection: both ends as (column, row from the top of the scrollback), in the order the
@@ -143,45 +145,48 @@ unsafe fn ghostty_str(s: &ffi::String) -> &[u8] {
 
 impl Vt {
     /// A terminal keeping at least `scrollback` lines of history.
-    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
-        let mut raw: ffi::Terminal = ptr::null_mut();
-        let r =
-            unsafe { ffi::ghostty_terminal_new(ptr::null(), &mut raw, cols.max(1), rows.max(1)) };
-        assert!(
-            r == ffi::Result::SUCCESS && !raw.is_null(),
-            "ghostty_terminal_new failed ({r})"
-        );
-        set_scrollback(raw, scrollback);
+    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Option<Self> {
+        let mut vt = Self {
+            raw: ptr::null_mut(),
+            effects: ptr::null_mut(),
+            gesture: ptr::null_mut(),
+            press: ptr::null_mut(),
+            drag: ptr::null_mut(),
+            release: ptr::null_mut(),
+        };
+        let r = unsafe {
+            ffi::ghostty_terminal_new(ptr::null(), &mut vt.raw, cols.max(1), rows.max(1))
+        };
+        if r != ffi::Result::SUCCESS || vt.raw.is_null() {
+            return None;
+        }
+        set_scrollback(vt.raw, scrollback);
         unsafe {
             // No byte limit on top: the line limit alone decides.
             let unlimited = usize::MAX;
             ffi::ghostty_terminal_set(
-                raw,
+                vt.raw,
                 ffi::TerminalOption::SCROLLBACK_MAX_BYTES,
                 (&unlimited as *const usize).cast(),
             );
         }
-        let mut gesture: ffi::SelectionGesture = ptr::null_mut();
-        let events = [
-            ffi::SelectionGestureEventType::PRESS,
-            ffi::SelectionGestureEventType::DRAG,
-            ffi::SelectionGestureEventType::RELEASE,
-        ]
-        .map(|ty| {
-            let mut ev: ffi::SelectionGestureEvent = ptr::null_mut();
-            unsafe { ffi::ghostty_selection_gesture_event_new(ptr::null(), &mut ev, ty) };
-            ev
-        });
-        unsafe { ffi::ghostty_selection_gesture_new(ptr::null(), &mut gesture) };
-        let mut vt = Self {
-            raw,
-            effects: Box::default(),
-            gesture,
-            press: events[0],
-            drag: events[1],
-            release: events[2],
-        };
-        let ud = &mut *vt.effects as *mut Effects as *const c_void;
+        for (slot, ty) in [
+            (&mut vt.press, ffi::SelectionGestureEventType::PRESS),
+            (&mut vt.drag, ffi::SelectionGestureEventType::DRAG),
+            (&mut vt.release, ffi::SelectionGestureEventType::RELEASE),
+        ] {
+            let r = unsafe { ffi::ghostty_selection_gesture_event_new(ptr::null(), slot, ty) };
+            if r != ffi::Result::SUCCESS || slot.is_null() {
+                return None;
+            }
+        }
+        let r = unsafe { ffi::ghostty_selection_gesture_new(ptr::null(), &mut vt.gesture) };
+        if r != ffi::Result::SUCCESS || vt.gesture.is_null() {
+            return None;
+        }
+        vt.effects = Box::into_raw(Box::default());
+        let raw = vt.raw;
+        let ud = vt.effects as *const c_void;
         let write_pty: ffi::TerminalWritePtyFn = Some(on_write_pty);
         let bell: ffi::TerminalBellFn = Some(on_bell);
         let title: ffi::TerminalTitleChangedFn = Some(on_title);
@@ -213,7 +218,7 @@ impl Vt {
             ffi::ghostty_terminal_set(raw, O::KITTY_IMAGE_MEDIUM_TEMP_FILE, ptr::null());
             ffi::ghostty_terminal_set(raw, O::GLYPH_PROTOCOL, (&off as *const bool).cast());
         }
-        vt
+        Some(vt)
     }
 
     pub(crate) fn raw(&self) -> ffi::Terminal {
@@ -221,7 +226,8 @@ impl Vt {
     }
 
     pub fn effects(&mut self) -> &mut Effects {
-        &mut self.effects
+        // SAFETY: `self.effects` is uniquely owned by `Vt` and no C call is active.
+        unsafe { &mut *self.effects }
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -231,12 +237,15 @@ impl Vt {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u32, cell_height: u32) {
-        self.effects.size = ffi::SizeReportSize {
-            rows,
-            columns: cols,
-            cell_width,
-            cell_height,
-        };
+        // SAFETY: no libghostty-vt C call is active while updating `effects`.
+        unsafe {
+            (*self.effects).size = ffi::SizeReportSize {
+                rows,
+                columns: cols,
+                cell_width,
+                cell_height,
+            };
+        }
         unsafe {
             ffi::ghostty_terminal_resize(
                 self.raw,
@@ -555,6 +564,7 @@ impl Vt {
         let mut f: ffi::Formatter = ptr::null_mut();
         if unsafe { ffi::ghostty_formatter_terminal_new(ptr::null(), &mut f, self.raw) }
             != ffi::Result::SUCCESS
+            || f.is_null()
         {
             return Vec::new();
         }
@@ -605,11 +615,20 @@ fn empty_selection() -> ffi::Selection {
 impl Drop for Vt {
     fn drop(&mut self) {
         unsafe {
-            ffi::ghostty_selection_gesture_free(self.gesture, self.raw);
-            for ev in [self.press, self.drag, self.release] {
-                ffi::ghostty_selection_gesture_event_free(ev);
+            if !self.gesture.is_null() {
+                ffi::ghostty_selection_gesture_free(self.gesture, self.raw);
             }
-            ffi::ghostty_terminal_free(self.raw)
+            for ev in [self.press, self.drag, self.release] {
+                if !ev.is_null() {
+                    ffi::ghostty_selection_gesture_event_free(ev);
+                }
+            }
+            if !self.raw.is_null() {
+                ffi::ghostty_terminal_free(self.raw);
+            }
+            if !self.effects.is_null() {
+                drop(Box::from_raw(self.effects));
+            }
         }
     }
 }
@@ -699,25 +718,33 @@ pub struct RenderCursor {
 
 pub use ffi::CursorStyle;
 
-impl Default for Render {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Render {
-    pub fn new() -> Self {
+    pub fn new() -> Option<Self> {
         let mut r = Self {
             state: ptr::null_mut(),
             rows: ptr::null_mut(),
             cells: ptr::null_mut(),
         };
         unsafe {
-            ffi::ghostty_render_state_new(ptr::null(), &mut r.state);
-            ffi::ghostty_render_state_row_iterator_new(ptr::null(), &mut r.rows);
-            ffi::ghostty_render_state_row_cells_new(ptr::null(), &mut r.cells);
+            if ffi::ghostty_render_state_new(ptr::null(), &mut r.state) != ffi::Result::SUCCESS
+                || r.state.is_null()
+            {
+                return None;
+            }
+            if ffi::ghostty_render_state_row_iterator_new(ptr::null(), &mut r.rows)
+                != ffi::Result::SUCCESS
+                || r.rows.is_null()
+            {
+                return None;
+            }
+            if ffi::ghostty_render_state_row_cells_new(ptr::null(), &mut r.cells)
+                != ffi::Result::SUCCESS
+                || r.cells.is_null()
+            {
+                return None;
+            }
         }
-        r
+        Some(r)
     }
 
     /// Bring it up to date with `vt`; whether anything changed since rows were last read.
@@ -919,9 +946,15 @@ impl Render {
 impl Drop for Render {
     fn drop(&mut self) {
         unsafe {
-            ffi::ghostty_render_state_row_cells_free(self.cells);
-            ffi::ghostty_render_state_row_iterator_free(self.rows);
-            ffi::ghostty_render_state_free(self.state);
+            if !self.cells.is_null() {
+                ffi::ghostty_render_state_row_cells_free(self.cells);
+            }
+            if !self.rows.is_null() {
+                ffi::ghostty_render_state_row_iterator_free(self.rows);
+            }
+            if !self.state.is_null() {
+                ffi::ghostty_render_state_free(self.state);
+            }
         }
     }
 }

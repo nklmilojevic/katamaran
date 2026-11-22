@@ -34,14 +34,38 @@ def download_meta(repo, tag):
     return meta
 
 
-def collect(repo, limit):
-    """sparkle.json of the newest `limit` non-draft, non-prerelease releases."""
-    releases = json.loads(
-        gh("release", "list", "--repo", repo, "--limit", str(limit + 5),
-           "--json", "tagName,isDraft,isPrerelease")
+def flatten_releases(raw):
+    """Accept either a flat release list or a `gh api --paginate --slurp` list of pages."""
+    if raw and isinstance(raw[0], list):
+        return [r for page in raw for r in page]
+    return raw
+
+
+def fetch_releases(repo):
+    """Fetch all GitHub releases across every page."""
+    raw = json.loads(
+        gh("api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100")
     )
-    tags = [r["tagName"] for r in releases
-            if not r["isDraft"] and not r["isPrerelease"]][:limit]
+    return flatten_releases(raw)
+
+
+def sparkle_release_tags(releases, limit=None):
+    """Tags of published non-draft, non-prerelease releases that carry sparkle.json."""
+    tags = [
+        r["tag_name"]
+        for r in releases
+        if not r.get("draft")
+        and not r.get("prerelease")
+        and any(a.get("name") == "sparkle.json" for a in r.get("assets", []))
+    ]
+    return tags if limit is None else tags[:limit]
+
+
+def collect(repo, limit, releases=None):
+    """sparkle.json of the newest `limit` non-draft, non-prerelease releases."""
+    if releases is None:
+        releases = fetch_releases(repo)
+    tags = sparkle_release_tags(releases, limit=limit)
     return [m for m in (download_meta(repo, t) for t in tags) if m]
 
 
@@ -100,8 +124,16 @@ def main():
     ap.add_argument("--repo", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--limit", type=int, default=10, help="newest releases to list")
+    ap.add_argument(
+        "--releases-json",
+        help="path to pre-fetched GitHub releases JSON (flat or `gh api --paginate --slurp`)",
+    )
     args = ap.parse_args()
-    items = collect(args.repo, args.limit)
+    releases = None
+    if args.releases_json:
+        with open(args.releases_json, encoding="utf-8") as f:
+            releases = flatten_releases(json.load(f))
+    items = collect(args.repo, args.limit, releases=releases)
     if not items:
         sys.exit("no release carries a sparkle.json; refusing to publish an empty appcast")
     with open(args.output, "w", encoding="utf-8") as f:

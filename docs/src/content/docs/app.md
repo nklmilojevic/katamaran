@@ -48,14 +48,10 @@ The main window sidebar groups management views into three sections.
 
 ## Settings window
 
-Open **Settings** from the menu bar or press `Cmd+,` to adjust:
+Open **Settings** from the menu bar or press `Cmd+,`. Settings are organized into three toolbar panes:
 
-- CPU count (`cpus`)
-- Memory limit (`memory_mib`)
-- x86-64 emulation mode (`amd64`)
-- Automatic port forwarding (`auto_forward`)
-- macOS NFS file mount (`mount` and `mount_path`)
-- Start at login (`launch_at_login`)
-- Pause VM while Mac sleeps (`pause_on_sleep`)
+- **General**: Toggle **Start Katamaran at login** (`launch_at_login`) and **Show VM files in Finder** (`mount`).
+- **Resources**: Adjust **CPUs** (`cpus`) and **Memory** (`memory_mib`).
+- **Kubernetes**: Toggle **Enable Kubernetes** (`kubernetes`), inspect live **Cluster status** (state, k3s version, API address, and kubeconfig context), and run **Sync Images** (mirrors locally built Docker images into Kubernetes) or **Reset Cluster** (stops Kubernetes and wipes all cluster state, workloads, and persistent volumes after confirmation).
 
-Changes write atomically to `~/.katamaran/config.toml` and indicate when a VM restart is required.
+Additional settings (`amd64`, `auto_forward`, `mount_path`, and `pause_on_sleep`) can be changed with `kat config set` or in `~/.katamaran/config.toml`. Changes write atomically to `~/.katamaran/config.toml` and display a notice with a **Restart** button when a VM restart is required.
