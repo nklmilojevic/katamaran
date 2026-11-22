@@ -28,7 +28,6 @@ impl T {
         let mut info = GridInfo::default();
         assert!(unsafe { kat_term_snapshot(self.0, &mut info, std::ptr::null_mut(), 0) });
         let mut cells = vec![Cell::default(); info.cols as usize * info.rows as usize];
-        info.generation = 0;
         assert!(unsafe { kat_term_snapshot(self.0, &mut info, cells.as_mut_ptr(), cells.len()) });
         (info, cells)
     }
@@ -354,4 +353,83 @@ fn reset_and_screen_text() {
     assert!(unsafe { kat_term_has_selection(t.0) });
     unsafe { kat_term_reset(t.0) };
     assert_eq!(t.row(0), "");
+}
+
+#[test]
+fn snapshot_two_step_sizing_preserves_generation_until_copied() {
+    let t = T::new(10, 2);
+    t.feed("hi");
+
+    // Step 1: query size with NULL buffer; generation must stay 0 so step 2 copies cells.
+    let mut info = GridInfo::default();
+    assert!(unsafe { kat_term_snapshot(t.0, &mut info, std::ptr::null_mut(), 0) });
+    assert_eq!((info.cols, info.rows, info.generation), (10, 2, 0));
+
+    // Step 2: retry immediately without touching info.generation.
+    let mut cells = vec![Cell::default(); info.cols as usize * info.rows as usize];
+    assert!(unsafe { kat_term_snapshot(t.0, &mut info, cells.as_mut_ptr(), cells.len()) });
+    assert_ne!(info.generation, 0);
+    assert_eq!(cells[0].ch, 'h' as u32);
+    assert_eq!(cells[1].ch, 'i' as u32);
+
+    // Step 3: unchanged returns false.
+    assert!(!unsafe { kat_term_snapshot(t.0, &mut info, cells.as_mut_ptr(), cells.len()) });
+
+    // Resize larger: old buffer is too small, so generation stays at previous value.
+    let gen_before = info.generation;
+    unsafe { kat_term_resize(t.0, 20, 4, 10, 20) };
+    assert!(unsafe { kat_term_snapshot(t.0, &mut info, cells.as_mut_ptr(), cells.len()) });
+    assert_eq!((info.cols, info.rows, info.generation), (20, 4, gen_before));
+
+    // Retry with resized buffer copies cells and advances generation.
+    cells.resize(info.cols as usize * info.rows as usize, Cell::default());
+    assert!(unsafe { kat_term_snapshot(t.0, &mut info, cells.as_mut_ptr(), cells.len()) });
+    assert_ne!(info.generation, gen_before);
+    assert_eq!(cells[0].ch, 'h' as u32);
+    assert!(!unsafe { kat_term_snapshot(t.0, &mut info, cells.as_mut_ptr(), cells.len()) });
+}
+
+#[test]
+fn huge_geometry_and_wheel_lines_do_not_overflow() {
+    let t = T::new(10, 4);
+    t.feed("hello world");
+    unsafe { kat_term_resize(t.0, 10, 4, u32::MAX, u32::MAX) };
+
+    // Mouse selection & drag with u32::MAX cell dimensions must not panic.
+    let press = KatMouseEvent {
+        kind: 0,
+        button: 0,
+        mods: 0,
+        clicks: 1,
+        col: 5,
+        row: 2,
+        right_half: true,
+        x: u32::MAX,
+        y: u32::MAX,
+    };
+    let send_mouse = |ev: &KatMouseEvent| {
+        let mut out = KatBytes {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        let _ = unsafe { kat_term_mouse(t.0, ev, &mut out) };
+        take(out)
+    };
+    let _ = send_mouse(&press);
+    let drag = KatMouseEvent { kind: 2, ..press };
+    let _ = send_mouse(&drag);
+
+    // Mouse reporting with u32::MAX cell dimensions and i32::MAX / i32::MIN wheel lines.
+    t.feed("\x1b[?1000h\x1b[?1006h");
+    let _ = send_mouse(&press);
+    let up = take(unsafe { kat_term_wheel(t.0, i32::MAX, 5, 2, 0) });
+    let down = take(unsafe { kat_term_wheel(t.0, i32::MIN, 5, 2, 0) });
+    // Each clamped wheel event produces one SGR sequence (< 20 bytes), bounded at 1024 events.
+    assert!(!up.is_empty() && up.len() <= 1024 * 20);
+    assert!(!down.is_empty() && down.len() <= 1024 * 20);
+
+    // Alternate scroll mode also clamps lines.
+    t.feed("\x1b[?1000l\x1b[?1049h\x1b[?1007h");
+    let arrows = take(unsafe { kat_term_wheel(t.0, i32::MAX, 0, 0, 0) });
+    assert_eq!(arrows.len(), 1024 * 3);
 }

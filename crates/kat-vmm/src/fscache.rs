@@ -29,8 +29,9 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,7 +73,7 @@ impl Timeouts {
         let secs = |k: &str| {
             var(k)
                 .and_then(|v| v.parse::<f64>().ok())
-                .map(Duration::from_secs_f64)
+                .and_then(|v| Duration::try_from_secs_f64(v).ok())
         };
         let timeout = secs("KATAMARAN_FS_TIMEOUT");
         Some(Timeouts {
@@ -137,13 +138,18 @@ pub fn plan(nodes: &impl Nodes, share: u32, root: &Path, events: &[fsevents::Eve
     // Directory path -> the node id the guest holds it by, once per batch.
     let mut dirs: HashMap<&Path, Option<u64>> = HashMap::new();
     for (p, flags) in events {
+        if flags & (flag::USER_DROPPED | flag::KERNEL_DROPPED) != 0 {
+            return everything(nodes, share);
+        }
         let path = Path::new(p);
+        if flags & flag::RESCAN != 0
+            && (p.is_empty() || path.starts_with(root) || root.starts_with(path))
+        {
+            return everything(nodes, share);
+        }
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
-        if flags & flag::RESCAN != 0 {
-            return everything(nodes, share);
-        }
         // The guest holds a name only in a directory it holds.
         let parent = match (rel.as_os_str().is_empty(), path.parent(), path.file_name()) {
             (true, _, _) => None,
@@ -214,15 +220,22 @@ pub struct Share {
     pub cache: GuestCache,
 }
 
+/// Bounded channel depth so a paused or stalled VM cannot grow memory without limit.
+const QUEUE_BOUND: usize = 1024;
+/// Write timeout on the guest socket so a stalled/paused guest does not wedge `serve`.
+const GUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 enum Input {
     Guest(UnixStream),
     Fs(Vec<fsevents::Event>),
+    Overflow,
 }
 
 /// Watch every share and send what the guest must drop to the agent, which
 /// connects through `listener`. Runs for the life of the process.
 pub fn start(shares: Vec<Share>, listener: UnixListener) -> io::Result<()> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(QUEUE_BOUND);
+    let overflow = Arc::new(AtomicBool::new(false));
     let roots: Vec<String> = shares
         .iter()
         .map(|s| {
@@ -233,8 +246,13 @@ pub fn start(shares: Vec<Share>, listener: UnixListener) -> io::Result<()> {
         })
         .collect();
     let fs_tx = Mutex::new(tx.clone());
+    let fs_overflow = Arc::clone(&overflow);
     let stream = Stream::start(&roots, &[], LATENCY, move |events| {
-        let _ = fs_tx.lock().unwrap().send(Input::Fs(events));
+        let tx = fs_tx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(TrySendError::Full(_)) = tx.try_send(Input::Fs(events)) {
+            fs_overflow.store(true, Ordering::Release);
+            let _ = tx.try_send(Input::Overflow);
+        }
     })?;
     thread::Builder::new()
         .name("fscache accept".into())
@@ -244,12 +262,12 @@ pub fn start(shares: Vec<Share>, listener: UnixListener) -> io::Result<()> {
         .name("fscache".into())
         .spawn(move || {
             let _stream = stream;
-            serve(&rx, &shares, roots);
+            serve(&rx, &overflow, &shares, roots);
         })?;
     Ok(())
 }
 
-fn accept(listener: &UnixListener, tx: &Sender<Input>) {
+fn accept(listener: &UnixListener, tx: &SyncSender<Input>) {
     for conn in listener.incoming() {
         match conn {
             Ok(c) => {
@@ -268,12 +286,27 @@ fn debug_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAMARAN_FSCACHE_DEBUG").is_some())
 }
 
-fn serve(rx: &Receiver<Input>, shares: &[Share], roots: Vec<PathBuf>) {
+fn serve(rx: &Receiver<Input>, overflow: &AtomicBool, shares: &[Share], roots: Vec<PathBuf>) {
+    serve_with_recheck(rx, overflow, &roots, |i| shares[i].cache.view(), RECHECK);
+}
+
+fn serve_with_recheck<N: Nodes>(
+    rx: &Receiver<Input>,
+    overflow: &AtomicBool,
+    roots: &[PathBuf],
+    view_of: impl Fn(usize) -> Option<N>,
+    recheck: Duration,
+) {
     let mut guest: Option<UnixStream> = None;
     let mut again: VecDeque<(Instant, Vec<fsevents::Event>)> = VecDeque::new();
+    let mut rescan_again: Option<Instant> = None;
     loop {
-        let first = match again.front() {
-            Some((at, _)) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+        let next_deadline = match (again.front().map(|(at, _)| *at), rescan_again) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let first = match next_deadline {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(i) => Some(i),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -285,30 +318,60 @@ fn serve(rx: &Receiver<Input>, shares: &[Share], roots: Vec<PathBuf>) {
         };
         let mut events = Vec::new();
         let mut rescan = false;
+        let mut schedule_rescan_recheck = false;
         for input in first.into_iter().chain(rx.try_iter()) {
             match input {
                 Input::Guest(conn) => {
+                    let _ = conn.set_write_timeout(Some(GUEST_WRITE_TIMEOUT));
                     // Whatever the guest cached before it connected may be stale.
                     guest = Some(conn);
                     rescan = true;
+                    schedule_rescan_recheck = true;
                 }
                 Input::Fs(e) => events.extend(e),
+                Input::Overflow => {
+                    rescan = true;
+                    schedule_rescan_recheck = true;
+                }
             }
         }
-        if !events.is_empty() {
-            again.push_back((Instant::now() + RECHECK, events.clone()));
+        if overflow.swap(false, Ordering::AcqRel) {
+            rescan = true;
+            schedule_rescan_recheck = true;
+            again.clear();
         }
         let now = Instant::now();
+        if !rescan && !events.is_empty() {
+            if again.len() >= QUEUE_BOUND {
+                again.clear();
+                rescan = true;
+                schedule_rescan_recheck = true;
+            } else {
+                again.push_back((now + recheck, events.clone()));
+            }
+        }
+        if let Some(at) = rescan_again
+            && at <= now
+        {
+            rescan_again = None;
+            rescan = true;
+        }
+        if schedule_rescan_recheck {
+            again.clear();
+            rescan_again = Some(now + recheck);
+        }
         while let Some((_, due)) = again.pop_front_if(|(at, _)| *at <= now) {
             events.extend(due);
         }
         let Some(conn) = guest.as_mut() else {
+            again.clear();
+            rescan_again = None;
             continue;
         };
         let t = Instant::now();
         let mut invals = Vec::new();
-        for (i, (share, root)) in shares.iter().zip(&roots).enumerate() {
-            let Some(view) = share.cache.view() else {
+        for (i, root) in roots.iter().enumerate() {
+            let Some(view) = view_of(i) else {
                 continue;
             };
             if rescan {
@@ -335,6 +398,8 @@ fn serve(rx: &Receiver<Input>, shares: &[Share], roots: Vec<PathBuf>) {
             if let Err(e) = write_frame(conn, &chunk) {
                 log::warn!("fscache: guest gone: {e}");
                 guest = None;
+                again.clear();
+                rescan_again = None;
                 break;
             }
         }
@@ -524,6 +589,11 @@ mod tests {
     #[test]
     fn lost_events_drop_everything() {
         let (t, nodes) = setup("lost");
+        let all = [
+            Inval::ExpireDir { share: 0, dir: 1 },
+            Inval::ExpireDir { share: 0, dir: 2 },
+            inode(3, true),
+        ];
         let out = plan(
             &nodes,
             0,
@@ -533,14 +603,39 @@ mod tests {
                 ev(&t.0, "d", flag::MUST_SCAN_SUB_DIRS),
             ],
         );
+        assert_eq!(out, all);
+
+        // USER_DROPPED and KERNEL_DROPPED arrive with "" or "/" (outside root).
+        for path in ["", "/", "/some/other/path"] {
+            assert_eq!(
+                plan(&nodes, 0, &t.0, &[(path.into(), flag::USER_DROPPED)]),
+                all,
+                "USER_DROPPED on {path:?}"
+            );
+            assert_eq!(
+                plan(&nodes, 0, &t.0, &[(path.into(), flag::KERNEL_DROPPED)]),
+                all,
+                "KERNEL_DROPPED on {path:?}"
+            );
+        }
+
+        // MUST_SCAN_SUB_DIRS on an ancestor of root (or empty path) drops everything.
+        let ancestor = t.0.parent().unwrap().display().to_string();
         assert_eq!(
-            out,
-            [
-                Inval::ExpireDir { share: 0, dir: 1 },
-                Inval::ExpireDir { share: 0, dir: 2 },
-                inode(3, true)
-            ]
+            plan(&nodes, 0, &t.0, &[(ancestor, flag::MUST_SCAN_SUB_DIRS)]),
+            all
         );
+        assert_eq!(
+            plan(&nodes, 0, &t.0, &[("".into(), flag::MUST_SCAN_SUB_DIRS)]),
+            all
+        );
+
+        // MUST_SCAN_SUB_DIRS on an unrelated sibling does not drop this share.
+        let sibling =
+            t.0.with_file_name("unrelated-sibling")
+                .display()
+                .to_string();
+        assert!(plan(&nodes, 0, &t.0, &[(sibling, flag::MUST_SCAN_SUB_DIRS)]).is_empty());
     }
 
     #[test]
@@ -571,5 +666,93 @@ mod tests {
                 negative: Duration::ZERO,
             })
         );
+        // Invalid float values fall back to defaults without panicking.
+        for bad in ["-1", "NaN", "inf", "-inf", "1e400"] {
+            assert_eq!(
+                Timeouts::parse(|k| match k {
+                    "KATAMARAN_FS_TIMEOUT" | "KATAMARAN_FS_NEGATIVE" => Some(bad.to_string()),
+                    _ => None,
+                }),
+                Some(long),
+                "bad value {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_rescan_rechecks_after_delay_without_more_events() {
+        let (t, nodes) = setup("overflow-recheck");
+        let (mut guest_rx, host_tx) = UnixStream::pair().unwrap();
+        guest_rx
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let root = t.0.clone();
+        let nodes_bg = Table(Arc::clone(&nodes.0));
+        let overflow_bg = Arc::clone(&overflow);
+        let h = thread::spawn(move || {
+            serve_with_recheck(
+                &rx,
+                &overflow_bg,
+                &[root],
+                |_| Some(Table(Arc::clone(&nodes_bg.0))),
+                Duration::from_millis(40),
+            );
+        });
+
+        let mut buf = Vec::new();
+        // Connect guest: receives initial full invalidation and its delayed recheck.
+        tx.send(Input::Guest(host_tx)).unwrap();
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+
+        // Trigger overflow with no subsequent FSEvents.
+        overflow.store(true, Ordering::Release);
+        tx.send(Input::Overflow).unwrap();
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+
+        // A concurrent guest lookup populates a new node right after the first invalidation.
+        fs::write(t.0.join("d/late"), "v").unwrap();
+        nodes.hold(&t.0.join("d/late"), 4, Some((2, "late")));
+
+        // Without any more events, the delayed overflow recheck invalidates everything including node 4.
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&everything(&nodes, 0))[0]);
+
+        // No further frame should be sent after the delayed recheck completes.
+        guest_rx
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let err = kat_proto::fscache::read_frame(&mut guest_rx, &mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        drop(tx);
+        h.join().unwrap();
     }
 }

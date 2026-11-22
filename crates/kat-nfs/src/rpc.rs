@@ -7,6 +7,8 @@ use crate::xdr::{Garbage, Reader, Writer};
 
 /// Largest record accepted: a 1 MiB WRITE plus headers, with room to spare.
 pub const MAX_RECORD: usize = (2 << 20) + 4096;
+/// Bound on consecutive zero-length non-final fragments in one record.
+const MAX_EMPTY_FRAGMENTS: usize = 16;
 
 const LAST_FRAGMENT: u32 = 1 << 31;
 const CALL: u32 = 0;
@@ -29,11 +31,14 @@ pub const GARBAGE_ARGS: u32 = 4;
 /// `Ok(None)` on EOF at a record boundary.
 pub fn read_record<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<Option<()>> {
     let mut filled = 0;
+    let mut empty_frags = 0;
     loop {
         let mut h = [0u8; 4];
         match r.read_exact(&mut h) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && filled == 0 => {
+            Err(e)
+                if e.kind() == io::ErrorKind::UnexpectedEof && filled == 0 && empty_frags == 0 =>
+            {
                 buf.clear();
                 return Ok(None);
             }
@@ -56,6 +61,17 @@ pub fn read_record<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> io::Result<Option<(
         if h & LAST_FRAGMENT != 0 {
             buf.truncate(filled);
             return Ok(Some(()));
+        }
+        if len == 0 {
+            empty_frags += 1;
+            if empty_frags > MAX_EMPTY_FRAGMENTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many empty RPC fragments",
+                ));
+            }
+        } else {
+            empty_frags = 0;
         }
     }
 }
@@ -274,6 +290,32 @@ mod tests {
         assert_eq!(parse_call(&[1, 2]).err(), Some(Reject::Unparseable));
         assert!(denied(&Reject::RpcMismatch(5)).is_some());
         assert!(denied(&Reject::NotACall).is_none());
+    }
+
+    #[test]
+    fn rejects_excessive_empty_fragments() {
+        let mut wire = Vec::new();
+        for _ in 0..=MAX_EMPTY_FRAGMENTS {
+            wire.extend_from_slice(&0u32.to_be_bytes());
+        }
+        wire.extend_from_slice(&(2u32 | LAST_FRAGMENT).to_be_bytes());
+        wire.extend_from_slice(b"ok");
+        let mut buf = Vec::new();
+        let err = read_record(&mut wire.as_slice(), &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut ok_wire = Vec::new();
+        for _ in 0..MAX_EMPTY_FRAGMENTS {
+            ok_wire.extend_from_slice(&0u32.to_be_bytes());
+        }
+        ok_wire.extend_from_slice(&(2u32 | LAST_FRAGMENT).to_be_bytes());
+        ok_wire.extend_from_slice(b"ok");
+        assert!(
+            read_record(&mut ok_wire.as_slice(), &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, b"ok");
     }
 
     #[test]
