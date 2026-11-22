@@ -56,8 +56,15 @@ final class Updater: NSObject, NSMenuItemValidation {
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
-        NSApp.activate()
+        activateForUpdateUI()
         controller?.checkForUpdates(sender)
+    }
+
+    /// Cooperative `NSApp.activate()` does not reliably activate an inactive
+    /// `.accessory` (`LSUIElement`) app; match Sparkle's `SPUStandardUserDriver`
+    /// activation path so update dialogs and alerts come forward.
+    private func activateForUpdateUI() {
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     nonisolated func validateMenuItem(_ item: NSMenuItem) -> Bool {
@@ -122,14 +129,14 @@ extension Updater: SPUStandardUserDriverDelegate {
                 changed()
             }
             if handleShowingUpdate {
-                NSApp.activate()
+                activateForUpdateUI()
             }
         }
     }
 
     nonisolated func standardUserDriverWillShowModalAlert() {
         MainActor.assumeIsolated {
-            NSApp.activate()
+            activateForUpdateUI()
         }
     }
 
