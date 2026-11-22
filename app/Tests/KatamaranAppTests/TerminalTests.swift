@@ -360,6 +360,65 @@ private final class Collector: @unchecked Sendable {
     #expect(Date().timeIntervalSince(start) < 1.5)
 }
 
+@Test func hangUpHandlesChunkedKeepAliveCreateResponse() throws {
+    let path = "/tmp/kat-exec-chunked-hup-\(getpid())-\(UInt32.random(in: 0...UInt32.max)).sock"
+    unlink(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in for (i, b) in path.utf8.enumerated() { buf[i] = b } }
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard rc == 0, listen(fd, 4) == 0 else { throw SocketError.io(errno) }
+
+    final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.lock(); value = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    }
+    let startSent = Flag()
+    let releaseCreate = DispatchSemaphore(value: 0)
+    defer {
+        releaseCreate.signal()
+        close(fd)
+        unlink(path)
+    }
+
+    Thread {
+        for _ in 0..<2 {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            Thread {
+                defer { close(c) }
+                var one: Int32 = 1
+                setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+                var buf = [UInt8](repeating: 0, count: 4096)
+                let n = read(c, &buf, buf.count)
+                let req = n > 0 ? String(decoding: buf[0..<n], as: UTF8.self) : ""
+                if req.hasPrefix("POST /containers/") {
+                    let body = #"{"Id":"hup-chunked"}"#
+                    let hex = String(body.utf8.count, radix: 16)
+                    let resp = "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n\(hex)\r\n\(body)\r\n0\r\n\r\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                    // Hold create connection open (keep-alive) until test finishes.
+                    _ = releaseCreate.wait(timeout: .now() + 5)
+                } else if req.hasPrefix("POST /exec/hup-chunked/start") {
+                    startSent.set()
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                }
+            }.start()
+        }
+    }.start()
+
+    let t0 = Date()
+    ExecAttach.hangUp(socketPath: path, container: "web", session: "s1", timeout: 4)
+    #expect(startSent.isSet)
+    #expect(Date().timeIntervalSince(t0) < 1.5)
+}
+
 // MARK: The engine through Swift
 
 @Test func gridSnapshotReadsTheEngine() {

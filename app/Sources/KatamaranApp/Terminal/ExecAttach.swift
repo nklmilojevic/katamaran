@@ -199,22 +199,48 @@ final class ExecAttach: @unchecked Sendable {
             return
         }
         var raw = Data()
+        var parsedHead: HTTPResponseHead?
+        var chunkedDecoder = ChunkedDecoder()
+        var chunkedBody = Data()
+        var bodyOffset = 0
         while raw.count < maxResponseBytes {
             let rem = remaining()
             guard rem > 0 else { return }
             sock.setTimeout(min(3, rem))
             guard let chunk = try? sock.read(max: min(65_536, maxResponseBytes - raw.count)), !chunk.isEmpty else { break }
             raw.append(chunk)
-            if let sep = raw.range(of: Data("\r\n\r\n".utf8)),
-               let head = try? DockerClient.parseResponseHead(raw[raw.startIndex..<sep.lowerBound]),
-               let len = head.contentLength,
-               raw.count - sep.upperBound >= len {
-                break
+            if parsedHead == nil, let sep = raw.range(of: Data("\r\n\r\n".utf8)) {
+                guard let head = try? DockerClient.parseResponseHead(raw[raw.startIndex..<sep.lowerBound]) else { return }
+                parsedHead = head
+                bodyOffset = sep.upperBound
+                if head.chunked {
+                    guard let piece = try? chunkedDecoder.feed(Data(raw[bodyOffset...])) else { return }
+                    chunkedBody.append(piece)
+                    if chunkedDecoder.finished { break }
+                } else if let len = head.contentLength, raw.count - bodyOffset >= len {
+                    break
+                }
+            } else if let head = parsedHead {
+                if head.chunked {
+                    guard let piece = try? chunkedDecoder.feed(chunk) else { return }
+                    chunkedBody.append(piece)
+                    if chunkedDecoder.finished { break }
+                } else if let len = head.contentLength, raw.count - bodyOffset >= len {
+                    break
+                }
             }
         }
-        guard let (code, body) = try? DockerClient.parse(raw), code == 201 || code == 200,
-              let id = try? ExecAPI.execID(fromCreate: body)
-        else { return }
+        guard let head = parsedHead, head.code == 201 || head.code == 200 else { return }
+        let body: Data
+        if head.chunked {
+            guard chunkedDecoder.finished else { return }
+            body = chunkedBody
+        } else if let len = head.contentLength {
+            body = Data(raw[bodyOffset...].prefix(len))
+        } else {
+            body = Data(raw[bodyOffset...])
+        }
+        guard let id = try? ExecAPI.execID(fromCreate: body) else { return }
 
         let startTimeout = min(3, remaining())
         guard startTimeout > 0, let start = try? UnixSocket(path: socketPath, timeout: startTimeout) else { return }
