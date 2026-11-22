@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 
 /// A machine as the daemon's `machine.list` reports it
 /// (`crates/kat-daemon/src/machines.rs`).
@@ -296,8 +297,12 @@ enum MachineShellCommand {
                 || s == "-" || s == "_"
             return isSafe ? Character(s) : "_"
         })
-        let stem = sanitized.isEmpty ? "machine" : String(sanitized.prefix(64))
-        return "katamaran-shell-\(stem).command"
+        let stem = sanitized.isEmpty ? "machine" : String(sanitized.prefix(48))
+        let digest = SHA256.hash(data: Data(name.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "katamaran-shell-\(stem)-\(digest).command"
     }
 }
 

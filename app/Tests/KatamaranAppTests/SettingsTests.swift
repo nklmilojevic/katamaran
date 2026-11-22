@@ -152,10 +152,15 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(!f2.contains("/"))
     #expect(!f2.contains("\0"))
     #expect(!f2.contains("'"))
-    #expect(f2 == "katamaran-shell-foo_bar_baz_qux.command")
+    #expect(f2.hasPrefix("katamaran-shell-foo_bar_baz_qux-") && f2.hasSuffix(".command"))
 
     let f3 = MachineShellCommand.filename(for: "")
-    #expect(f3 == "katamaran-shell-machine.command")
+    #expect(f3.hasPrefix("katamaran-shell-machine-") && f3.hasSuffix(".command"))
+
+    // Distinct names that sanitize to the same stem must not collide.
+    #expect(MachineShellCommand.filename(for: "a/b") != MachineShellCommand.filename(for: "a?b"))
+    let longPrefix = String(repeating: "a", count: 70)
+    #expect(MachineShellCommand.filename(for: longPrefix + "1") != MachineShellCommand.filename(for: longPrefix + "2"))
 }
 
 @Test func runCLIDrainsLargeStderrAndEnforcesTimeout() throws {
