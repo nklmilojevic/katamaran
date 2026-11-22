@@ -133,6 +133,23 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
+/// Extract the first `ProgramArguments` entry from a LaunchAgent XML plist.
+fn plist_executable(text: &str) -> Option<String> {
+    let after_key = text.split_once("<key>ProgramArguments</key>")?.1;
+    let after_array = after_key.split_once("<array>")?.1;
+    let after_start = after_array.split_once("<string>")?.1;
+    let raw = after_start.split_once("</string>")?.0;
+    Some(xml_unescape(raw))
+}
+
 /// The LaunchAgent: `katamaran daemon --start`, restarted after a crash
 /// (not after a clean exit, so `uninstall` and `daemon.shutdown` stick),
 /// with time to stop the VM on SIGTERM.
@@ -257,25 +274,60 @@ fn launchctl(args: &[&str]) -> anyhow::Result<()> {
 
 /// Start the installed LaunchAgent now, if there is one. Returns whether it was.
 pub fn kickstart_if_installed() -> anyhow::Result<bool> {
-    kickstart_installed(false)
-}
-
-/// Restart the installed LaunchAgent now (`kickstart -k`), if there is one.
-/// Used after shutting down a stale daemon so launchd starts the new binary
-/// even if the previous process just finished exiting.
-pub fn restart_launchd_if_installed() -> anyhow::Result<bool> {
-    kickstart_installed(true)
-}
-
-fn kickstart_installed(kill_existing: bool) -> anyhow::Result<bool> {
     let label = Identity::resolve(None)?.label();
     if !is_loaded(&label) {
         return Ok(false);
     }
+    launchctl(&["kickstart", &service_target(&label)])?;
+    Ok(true)
+}
+
+/// Restart the installed LaunchAgent for the currently running binary, if one
+/// is loaded. If the existing plist points at a different executable, rewrite
+/// and reload it first (subject to `guard_unsuffixed`) so launchd starts this
+/// binary rather than the old one.
+pub fn restart_launchd_for_current_exe() -> anyhow::Result<bool> {
+    let id = Identity::resolve(None)?;
+    let label = id.label();
+    if !is_loaded(&label) {
+        return Ok(false);
+    }
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let plist_file = plist_path(&label)?;
     let target = service_target(&label);
-    if kill_existing {
+    let points_here = fs::read_to_string(&plist_file)
+        .ok()
+        .and_then(|text| plist_executable(&text))
+        .map(|p| {
+            let p = PathBuf::from(p);
+            p.canonicalize().unwrap_or(p) == exe
+        })
+        .unwrap_or(false);
+    if points_here {
         launchctl(&["kickstart", "-k", &target])?;
-    } else {
+        return Ok(true);
+    }
+
+    guard_unsuffixed(&id, &exe)?;
+    let home = crate::state_dir()?;
+    let logs = home.join("logs");
+    fs::create_dir_all(&logs)?;
+    let cfg = Config::load(&home)?;
+    fs::create_dir_all(plist_file.parent().unwrap())?;
+    let home_env = std::env::var_os("KATAMARAN_HOME").map(|_| home.as_path());
+    fs::write(
+        &plist_file,
+        plist(&label, &exe, home_env, &logs, cfg.launch_at_login),
+    )
+    .with_context(|| format!("write {}", plist_file.display()))?;
+    launchctl(&["bootout", &target])?;
+    wait_unloaded(&label, Duration::from_secs(10))?;
+    launchctl(&[
+        "bootstrap",
+        &format!("gui/{}", uid()),
+        &plist_file.to_string_lossy(),
+    ])?;
+    if !cfg.launch_at_login {
         launchctl(&["kickstart", &target])?;
     }
     Ok(true)
@@ -692,6 +744,9 @@ mod tests {
         let no_home = plist("l", Path::new("/k"), None, Path::new("/l"), false);
         assert!(!no_home.contains("EnvironmentVariables"));
         assert!(no_home.contains("<key>RunAtLoad</key>\n\t<false/>"));
+        assert_eq!(plist_executable(&p).as_deref(), Some("/opt/k&k/katamaran"));
+        assert_eq!(plist_executable(&no_home).as_deref(), Some("/k"));
+        assert_eq!(plist_executable("<plist></plist>"), None);
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn ensure_daemon_inner(mut recycled_stale: bool) -> anyhow::Result<Client> {
         }
     }
     let started_by_launchd = if recycled_stale {
-        crate::setup::restart_launchd_if_installed()?
+        crate::setup::restart_launchd_for_current_exe()?
     } else {
         crate::setup::kickstart_if_installed()?
     };
@@ -93,7 +93,11 @@ fn ensure_daemon_inner(mut recycled_stale: bool) -> anyhow::Result<Client> {
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if let Ok(c) = Client::connect(&sock) {
+        if let Ok(mut c) = Client::connect(&sock) {
+            if recycled_stale {
+                let status = c.status()?;
+                verify_restarted_version(&status.versions.katamaran, env!("CARGO_PKG_VERSION"))?;
+            }
             return Ok(c);
         }
         if Instant::now() > deadline {
@@ -102,6 +106,15 @@ fn ensure_daemon_inner(mut recycled_stale: bool) -> anyhow::Result<Client> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn verify_restarted_version(actual: &str, expected: &str) -> anyhow::Result<()> {
+    if actual != expected {
+        bail!(
+            "daemon restarted as version {actual}, expected {expected}; run `kat setup` to update the LaunchAgent"
+        );
+    }
+    Ok(())
 }
 
 /// Run `katamaran daemon` detached from this terminal.
@@ -539,6 +552,12 @@ mod tests {
         assert!(
             stale.contains("daemon is on 0.1.0, CLI is 0.6.0; run `kat restart` to upgrade"),
             "mismatched daemon version should warn: {stale}"
+        );
+        assert!(verify_restarted_version("0.6.0", "0.6.0").is_ok());
+        let err = verify_restarted_version("0.1.0", "0.6.0").unwrap_err();
+        assert!(
+            err.to_string().contains("kat setup"),
+            "unexpected error: {err}"
         );
     }
 }
