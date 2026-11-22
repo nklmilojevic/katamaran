@@ -970,10 +970,6 @@ impl Daemon {
         if only_if_config_enabled && !Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
             return Ok(self.k8s_status(false));
         }
-        if persist_enabled {
-            self.persist_k8s_enabled(true)
-                .map_err(|e| failed(format!("{e:#}")))?;
-        }
         progress("ensuring VM is running");
         self.wait_for_docker_ready()?;
         if only_if_config_enabled && !Config::load(&self.home).is_ok_and(|c| c.kubernetes) {
@@ -1021,6 +1017,19 @@ impl Daemon {
 
         match res {
             Ok((info, proxy, dns, kc_path)) => {
+                if persist_enabled && let Err(e) = self.persist_k8s_enabled(true) {
+                    dlog!("k8s config persist failed: {e:#}");
+                    let mut noop = |_: &str| {};
+                    let _ =
+                        crate::k8s::request(&self.home, &kat_proto::k8s::K8sMsg::Stop, &mut noop);
+                    let msg = format!("{e:#}");
+                    let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+                    k.state = "failed".into();
+                    k.api_proxy = None;
+                    k.dns = None;
+                    k.error = Some(msg.clone());
+                    return Err(failed(msg));
+                }
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
                 k.state = "running".into();
                 k.installed = info.installed;
@@ -1090,7 +1099,7 @@ impl Daemon {
                 .map_err(|e| failed(format!("{e:#}")))?;
         }
         let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
-        crate::k8s::remove_kubeconfig(&self.home, &ctx);
+        crate::k8s::remove_kubeconfig(&self.home, &ctx).map_err(|e| failed(format!("{e:#}")))?;
         let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
         k.api_proxy = None;
         k.dns = None;
@@ -1133,7 +1142,7 @@ impl Daemon {
         }
         self.persist_k8s_enabled(false)
             .map_err(|e| failed(format!("{e:#}")))?;
-        crate::k8s::remove_kubeconfig(&self.home, &ctx);
+        crate::k8s::remove_kubeconfig(&self.home, &ctx).map_err(|e| failed(format!("{e:#}")))?;
         let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
         k.api_proxy = None;
         k.dns = None;

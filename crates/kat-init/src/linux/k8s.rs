@@ -149,19 +149,23 @@ const CRI_PLUGINS: [&str; 3] = [
 /// any other entries in `disabled_plugins` untouched. Returns `true` if the
 /// file was modified (meaning an already-running `containerd` must be restarted
 /// to load CRI).
-pub fn ensure_containerd_cri() -> bool {
+pub fn ensure_containerd_cri() -> Result<bool, String> {
     let path = "/etc/containerd/config.toml";
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("read {path}: {e}")),
     };
     let Some(updated) = strip_cri_from_disabled_plugins(&text) else {
-        return false;
+        return Ok(false);
     };
-    if let Err(e) = fs::write(path, updated) {
-        log(&format!("update {path}: {e}"));
-        return false;
+    let tmp = "/etc/containerd/config.toml.tmp";
+    fs::write(tmp, updated).map_err(|e| format!("write {tmp}: {e}"))?;
+    if let Err(e) = fs::rename(tmp, path) {
+        let _ = fs::remove_file(tmp);
+        return Err(format!("replace {path}: {e}"));
     }
-    true
+    Ok(true)
 }
 
 /// Remove only CRI plugin IDs from `disabled_plugins = [...]`, preserving all
@@ -317,7 +321,7 @@ impl K8s {
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
-        if ensure_containerd_cri() {
+        if ensure_containerd_cri()? {
             let _ = k8s::write(
                 &mut *conn,
                 &K8sMsg::Progress("enabling CRI in containerd".into()),
@@ -359,7 +363,7 @@ impl K8s {
         .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
         .stderr(log_file);
 
-        enable_bridge_netfilter();
+        enable_bridge_netfilter()?;
         let (pid, status_rx) = match self.reaper.spawn(&mut cmd) {
             Ok(v) => v,
             Err(e) => {
@@ -658,18 +662,25 @@ const BRIDGE_NF_SYSCTLS: [&str; 2] = [
 ];
 static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 2]>> = Mutex::new(None);
 
-fn enable_bridge_netfilter() {
-    let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
-    let mut saved = SAVED_BRIDGE_NF.lock().unwrap();
-    if saved.is_none() {
-        *saved = Some([
-            fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
-            fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
-        ]);
+fn enable_bridge_netfilter() -> Result<(), String> {
+    fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
+        .map_err(|e| format!("enable /proc/sys/net/ipv4/ip_forward: {e}"))?;
+    {
+        let mut saved = SAVED_BRIDGE_NF.lock().unwrap();
+        if saved.is_none() {
+            *saved = Some([
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
+                fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
+            ]);
+        }
     }
     for path in BRIDGE_NF_SYSCTLS {
-        let _ = fs::write(path, "1\n");
+        if let Err(e) = fs::write(path, "1\n") {
+            restore_bridge_netfilter();
+            return Err(format!("enable {path}: {e}"));
+        }
     }
+    Ok(())
 }
 
 fn restore_bridge_netfilter() {

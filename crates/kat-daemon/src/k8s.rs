@@ -15,8 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -33,6 +32,30 @@ pub const SOCKET_NAME: &str = "k8s.sock";
 pub const API_SOCKET_NAME: &str = "k8s-api.sock";
 pub const KUBECONFIG_NAME: &str = "kubeconfig.yaml";
 pub const DEFAULT_API_PORT: u16 = 6443;
+const MAX_RELAY_CONNS: usize = 256;
+
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl ConnSlot {
+    fn try_acquire(counter: &Arc<AtomicUsize>) -> Option<ConnSlot> {
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_RELAY_CONNS {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(ConnSlot(counter.clone())),
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
 pub const DEFAULT_DNS_PORT: u16 = 15353;
@@ -184,6 +207,7 @@ impl ApiProxy {
         let port = addr.port();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let active = Arc::new(AtomicUsize::new(0));
         let thread = thread::Builder::new()
             .name(format!("k8s-api-{port}"))
             .spawn(move || {
@@ -192,10 +216,14 @@ impl ApiProxy {
                         return;
                     }
                     let Ok(client) = conn else { continue };
+                    let Some(slot) = ConnSlot::try_acquire(&active) else {
+                        continue;
+                    };
                     let sock = api_socket.clone();
                     let _ = thread::Builder::new()
                         .name("k8s-api-conn".into())
                         .spawn(move || {
+                            let _slot = slot;
                             let _ = relay_tcp_to_unix(client, &sock);
                         });
                 }
@@ -250,11 +278,17 @@ pub fn forward_guest_tcp(
         .with_context(|| format!("bind 127.0.0.1:{local_port}"))?;
     let bound = listener.local_addr()?.port();
     println!("Forwarding 127.0.0.1:{bound} -> {guest_addr}:{guest_port} (Ctrl-C to stop)");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(client) = conn else { continue };
+        let Some(slot) = ConnSlot::try_acquire(&active) else {
+            eprintln!("katamaran: k8s forward connection limit ({MAX_RELAY_CONNS}) reached");
+            continue;
+        };
         let home = home.to_path_buf();
         let addr = guest_addr.clone();
         thread::spawn(move || {
+            let _slot = slot;
             if let Err(e) = relay_k8s_connect(&home, client, &addr, guest_port) {
                 eprintln!("katamaran: k8s forward {addr}:{guest_port}: {e}");
             }
@@ -502,24 +536,38 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
 }
 
 /// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
-pub fn remove_kubeconfig(home: &Path, ctx: &str) {
-    let _ = fs::remove_file(kubeconfig_path(home));
+pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
+    match fs::remove_file(kubeconfig_path(home)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("remove local kubeconfig"),
+    }
     let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
+        return Ok(());
     };
     let user_cfg = user_home.join(".kube/config");
     if !user_cfg.is_file() {
-        return;
+        return Ok(());
     }
-    for sub in ["delete-context", "delete-cluster", "delete-user"] {
-        let _ = kubectl_cmd()
-            .args(["config", sub, ctx])
+    for key in [
+        format!("contexts.{ctx}"),
+        format!("clusters.{ctx}"),
+        format!("users.{ctx}"),
+    ] {
+        let out = kubectl_cmd()
+            .args(["config", "unset", &key])
             .env("KUBECONFIG", &user_cfg)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .output()
+            .with_context(|| format!("run kubectl config unset {key}"))?;
+        if !out.status.success() {
+            bail!(
+                "kubectl config unset {key} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
     }
+    Ok(())
 }
 
 /// Minimal UDP DNS responder for `k8s.kat.local` and `*.k8s.kat.local` -> `127.0.0.1`.
