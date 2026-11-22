@@ -549,13 +549,13 @@ fn session(
             Ok(Input::Forward(_, net::Event::Forwarded(proto, port))) => {
                 on_event(Event::PortAdd(proto, port));
             }
-            Ok(Input::Forward(
-                _,
-                net::Event::Removed(proto, port) | net::Event::RemoveFailed(proto, port, _),
-            )) => {
+            Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
                 on_event(Event::PortRemove(proto, port));
             }
-            Ok(Input::Forward(_, net::Event::Refused(..) | net::Event::Transient(..))) => {}
+            Ok(Input::Forward(
+                _,
+                net::Event::Refused(..) | net::Event::Transient(..) | net::Event::RemoveFailed(..),
+            )) => {}
             Ok(Input::Guest(_, Some(Msg::AutoForwardAdd { proto, port }))) => {
                 match auto_forwards.add(port) {
                     Ok(true) => {

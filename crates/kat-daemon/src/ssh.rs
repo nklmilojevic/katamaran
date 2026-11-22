@@ -197,12 +197,29 @@ fn valid_direct_tcpip_target(host: &str, port: u32, machine: &str) -> Option<u16
     allowed.then_some(port)
 }
 
+/// Bounded per-channel host-to-guest frame queue so stalled guest reads
+/// apply SSH flow-control backpressure instead of growing memory unboundedly.
+const GUEST_WRITE_QUEUE: usize = 64;
+
 struct GuestChan {
-    tx: mpsc::UnboundedSender<MachineMsg>,
+    tx: mpsc::Sender<MachineMsg>,
     reader: AbortHandle,
+    writer: AbortHandle,
 }
 
 impl GuestChan {
+    fn spawn(stream: UnixStream, handle: russh::server::Handle, ch: ChannelId) -> Self {
+        let (reader, writer) = stream.into_split();
+        let (tx, rx) = mpsc::channel(GUEST_WRITE_QUEUE);
+        let writer_task = tokio::spawn(pump_write(rx, writer));
+        let reader_task = tokio::spawn(pump_read(handle, ch, reader));
+        GuestChan {
+            tx,
+            reader: reader_task.abort_handle(),
+            writer: writer_task.abort_handle(),
+        }
+    }
+
     fn close(self) {
         drop(self);
     }
@@ -211,6 +228,7 @@ impl GuestChan {
 impl Drop for GuestChan {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer.abort();
     }
 }
 
@@ -230,10 +248,16 @@ struct Handler {
 }
 
 impl Handler {
-    fn send(&self, ch: ChannelId, m: MachineMsg) {
-        if let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) {
-            let _ = g.tx.send(m);
-        }
+    async fn send(&self, ch: ChannelId, m: MachineMsg) {
+        let Some(tx) = self
+            .chans
+            .get(&ch)
+            .and_then(|c| c.guest.as_ref())
+            .map(|g| g.tx.clone())
+        else {
+            return;
+        };
+        let _ = tx.send(m).await;
     }
 
     /// Start `argv` (empty: login shell) for a session channel.
@@ -263,14 +287,7 @@ impl Handler {
         let handle = session.handle();
         match started {
             Ok(s) => {
-                let (reader, writer) = s.into_split();
-                let (tx, rx) = mpsc::unbounded_channel();
-                tokio::spawn(pump_write(rx, writer));
-                let reader_task = tokio::spawn(pump_read(handle, ch, reader));
-                self.chans.entry(ch).or_default().guest = Some(GuestChan {
-                    tx,
-                    reader: reader_task.abort_handle(),
-                });
+                self.chans.entry(ch).or_default().guest = Some(GuestChan::spawn(s, handle, ch));
                 let _ = session.channel_success(ch);
             }
             Err(e) => {
@@ -284,7 +301,7 @@ impl Handler {
 
 /// Write queued host-to-guest frames asynchronously so SSH callbacks never
 /// block the runtime or deadlock against guest output.
-async fn pump_write(mut rx: mpsc::UnboundedReceiver<MachineMsg>, mut w: OwnedWriteHalf) {
+async fn pump_write(mut rx: mpsc::Receiver<MachineMsg>, mut w: OwnedWriteHalf) {
     while let Some(msg) = rx.recv().await {
         if write_frame(&mut w, &msg).await.is_err() {
             break;
@@ -384,19 +401,12 @@ impl russh::server::Handler for Handler {
             return Ok(());
         };
         let ch = channel.id();
-        let (reader, writer) = s.into_split();
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(pump_write(rx, writer));
         reply.accept().await;
         let h = session.handle();
-        let reader_task = tokio::spawn(pump_read(h, ch, reader));
         self.chans.insert(
             ch,
             Chan {
-                guest: Some(GuestChan {
-                    tx,
-                    reader: reader_task.abort_handle(),
-                }),
+                guest: Some(GuestChan::spawn(s, h, ch)),
                 ..Chan::default()
             },
         );
@@ -494,7 +504,8 @@ impl russh::server::Handler for Handler {
                 rows: row_height.min(u16::MAX as u32) as u16,
                 cols: col_width.min(u16::MAX as u32) as u16,
             },
-        );
+        )
+        .await;
         Ok(())
     }
 
@@ -504,7 +515,7 @@ impl russh::server::Handler for Handler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(channel, MachineMsg::Data(data.to_vec()));
+        self.send(channel, MachineMsg::Data(data.to_vec())).await;
         Ok(())
     }
 
@@ -513,7 +524,7 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(channel, MachineMsg::DataEnd);
+        self.send(channel, MachineMsg::DataEnd).await;
         Ok(())
     }
 
@@ -537,7 +548,7 @@ impl russh::server::Handler for Handler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(signal) = signal_number(&signal) {
-            self.send(channel, MachineMsg::Signal { signal });
+            self.send(channel, MachineMsg::Signal { signal }).await;
         }
         Ok(())
     }
@@ -668,6 +679,50 @@ mod tests {
             a.shutdown().await.unwrap();
             assert_eq!(read_frame(&mut b).await.unwrap(), Some(sent));
             assert_eq!(read_frame(&mut b).await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn aborting_writer_closes_guest_socket_even_when_stalled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (host, mut guest) = UnixStream::pair().unwrap();
+            let (_reader, writer) = host.into_split();
+            let (tx, rx) = mpsc::channel(GUEST_WRITE_QUEUE);
+            let writer_task = tokio::spawn(pump_write(rx, writer));
+            let writer_abort = writer_task.abort_handle();
+
+            // Fill both the kernel Unix socket buffer and the bounded channel
+            // without reading from `guest`, simulating a stalled guest reader.
+            let chunk = vec![0x42u8; 32 << 10];
+            let mut hit_full = false;
+            for _ in 0..(GUEST_WRITE_QUEUE + 256) {
+                match tx.try_send(MachineMsg::Data(chunk.clone())) {
+                    Ok(()) => tokio::task::yield_now().await,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        hit_full = true;
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+            assert!(hit_full, "bounded queue must apply backpressure");
+
+            // Aborting the writer releases the write half so draining the guest
+            // sees EOF instead of hanging forever.
+            writer_abort.abort();
+            let _ = writer_task.await;
+            drop(_reader);
+            let mut buf = vec![0u8; 64 << 10];
+            loop {
+                let n = guest.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
         });
     }
 }

@@ -230,6 +230,7 @@ const DEFAULT_RELEASES: [(&str, &str); 3] = [
 /// Validate an image directory path from the remote index.
 pub fn valid_image_path(path: &str) -> bool {
     path.starts_with("/images/")
+        && path.ends_with('/')
         && !path.contains("..")
         && !path.contains('@')
         && !path.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -524,6 +525,7 @@ archlinux;current;arm64;default;20261118_04:18;/images/archlinux/current/arm64/d
         for bad in [
             "/other/alpine/",
             "images/alpine/",
+            "/images/alpine/3.24/arm64/default/20261117_13:01",
             "/images/alpine/../etc/",
             "/images/alpine@evil.com/",
             "/images/alpine/3.24 /",

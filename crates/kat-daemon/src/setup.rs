@@ -322,7 +322,7 @@ pub fn setup(args: SetupArgs) -> anyhow::Result<()> {
     if is_loaded(&label) {
         launchctl(&["bootout", &service_target(&label)])?;
         wait_gone(&sock, Duration::from_secs(70))?;
-        wait_unloaded(&label, Duration::from_secs(10));
+        wait_unloaded(&label, Duration::from_secs(10))?;
     }
     launchctl(&[
         "bootstrap",
@@ -403,12 +403,19 @@ fn wait_gone(sock: &Path, timeout: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wait briefly until launchd finishes tearing down `label` after `bootout`.
-fn wait_unloaded(label: &str, timeout: Duration) {
+/// Wait until launchd finishes tearing down `label` after `bootout`.
+fn wait_unloaded(label: &str, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
-    while is_loaded(label) && Instant::now() < deadline {
+    while is_loaded(label) {
+        if Instant::now() >= deadline {
+            bail!(
+                "{label} was still loaded in launchd after {}s",
+                timeout.as_secs()
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+    Ok(())
 }
 
 fn find_docker() -> PathBuf {
