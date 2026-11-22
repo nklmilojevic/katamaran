@@ -462,33 +462,40 @@ pub fn dmg(root: &Path) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn info_plist_is_valid() {
-        let dir = std::env::temp_dir().join(format!("xtask-plist-{}", std::process::id()));
+    #[cfg(target_os = "macos")]
+    fn assert_plutil_lint(name: &str, plist: &str) {
+        let dir = std::env::temp_dir().join(format!("xtask-plist-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("Info.plist");
-        std::fs::write(&f, super::info_plist("1.2.3")).unwrap();
+        std::fs::write(&f, plist).unwrap();
         let out = std::process::Command::new("plutil")
             .arg("-lint")
             .arg(&f)
             .output()
             .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
+            "plutil -lint failed:\nstdout: {}\nstderr: {}\nplist:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            plist,
         );
-        let text = std::fs::read_to_string(&f).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn assert_plutil_lint(_name: &str, _plist: &str) {}
+
+    #[test]
+    fn info_plist_is_valid() {
+        let text = super::info_plist("1.2.3");
+        assert_plutil_lint("valid", &text);
         assert!(text.contains("<key>LSUIElement</key>\n\t<true/>"));
         assert!(text.contains("<string>1.2.3</string>"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn info_plist_escapes_xml_special_chars() {
-        let dir = std::env::temp_dir().join(format!("xtask-plist-xml-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("Info.plist");
         let plist = super::info_plist_full(
             "1.2.3-beta<1>&\"'",
             "42&<build>",
@@ -497,25 +504,12 @@ mod tests {
                 "key+<foo>&bar",
             )),
         );
-        std::fs::write(&f, &plist).unwrap();
-        let out = std::process::Command::new("plutil")
-            .arg("-lint")
-            .arg(&f)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "plutil -lint failed:\nstdout: {}\nstderr: {}\nplist:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-            plist,
-        );
+        assert_plutil_lint("xml", &plist);
         assert!(plist.contains(
             "https://example.com/appcast.xml?channel=beta&amp;arch=arm64&amp;q=&quot;test&quot;&apos;"
         ));
         assert!(plist.contains("key+&lt;foo&gt;&amp;bar"));
         assert!(plist.contains("1.2.3-beta&lt;1&gt;&amp;&quot;&apos;"));
         assert!(plist.contains("42&amp;&lt;build&gt;"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
