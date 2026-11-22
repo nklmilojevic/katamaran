@@ -93,11 +93,14 @@ final class BuildLog {
     private(set) var error: String?
     fileprivate var process: Process?
     fileprivate var readHandle: FileHandle?
+    fileprivate var completion: StreamCompletion?
     fileprivate var cancelled = false
     private var splitter = LineSplitter()
 
     fileprivate func cancel() {
         cancelled = true
+        completion?.cancel()
+        completion = nil
         readHandle?.readabilityHandler = nil
         readHandle = nil
         if let p = process, p.isRunning { p.terminate() }
@@ -118,6 +121,7 @@ final class BuildLog {
         if let rest = splitter.flush() { add(String(decoding: rest, as: UTF8.self)) }
         finished = true
         self.error = error
+        completion = nil
         readHandle = nil
         process = nil
     }
@@ -378,13 +382,15 @@ final class BuildStore {
             p.standardError = out
             let readHandle = out.fileHandleForReading
             let coord = StreamCompletion()
+            let epoch = connectionEpoch
             let finishOnMain: @Sendable (Int32) -> Void = { [weak self, weak log] code in
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let log, !log.cancelled else { return }
                         log.finish(code == 0 ? nil : "The build’s progress stopped.")
-                        self?.changed()
-                        self?.refresh()
+                        guard let self, self.connectionEpoch == epoch else { return }
+                        self.changed()
+                        self.refresh()
                     }
                 }
             }
@@ -405,13 +411,19 @@ final class BuildStore {
                 }
             }
             p.terminationHandler = { p in
-                if let code = coord.markExited(p.terminationStatus) { finishOnMain(code) }
+                let code = coord.markExited(p.terminationStatus) { timedOutCode in
+                    readHandle.readabilityHandler = nil
+                    finishOnMain(timedOutCode)
+                }
+                if let code { finishOnMain(code) }
             }
             log.process = p
             log.readHandle = readHandle
+            log.completion = coord
             do {
                 try p.run()
             } catch {
+                coord.cancel()
                 readHandle.readabilityHandler = nil
                 p.terminationHandler = nil
                 log.finish(error.localizedDescription)
@@ -477,26 +489,69 @@ final class BuildStore {
 }
 
 /// Coordinates pipe EOF from `readabilityHandler` and process exit from `terminationHandler`
-/// so tail lines are never dropped regardless of callback ordering.
-private final class StreamCompletion: @unchecked Sendable {
+/// so tail lines are never dropped regardless of callback ordering, while bounding how long
+/// completion waits for pipe EOF after process exit (in case a descendant inherited the pipe).
+final class StreamCompletion: @unchecked Sendable {
     private let lock = NSLock()
     private var pipeEOF = false
     private var exitedCode: Int32?
     private var completed = false
+    private var eofTimer: DispatchWorkItem?
+    private let eofGrace: TimeInterval
+
+    init(eofGrace: TimeInterval = 1.0) {
+        self.eofGrace = eofGrace
+    }
 
     func markEOF() -> Int32? {
         lock.lock(); defer { lock.unlock() }
         pipeEOF = true
+        eofTimer?.cancel()
+        eofTimer = nil
         guard !completed, let code = exitedCode else { return nil }
         completed = true
         return code
     }
 
-    func markExited(_ code: Int32) -> Int32? {
-        lock.lock(); defer { lock.unlock() }
+    func markExited(_ code: Int32, onTimeout: @escaping @Sendable (Int32) -> Void) -> Int32? {
+        lock.lock()
         exitedCode = code
-        guard !completed, pipeEOF else { return nil }
+        if completed {
+            lock.unlock()
+            return nil
+        }
+        if pipeEOF {
+            completed = true
+            eofTimer?.cancel()
+            eofTimer = nil
+            lock.unlock()
+            return code
+        }
+        eofTimer?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, let timedOutCode = self.completeOnTimeout() else { return }
+            onTimeout(timedOutCode)
+        }
+        eofTimer = item
+        let delay = eofGrace
+        lock.unlock()
+        BlockingIO.buildx.asyncAfter(deadline: .now() + delay, execute: item)
+        return nil
+    }
+
+    private func completeOnTimeout() -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        eofTimer = nil
+        guard !completed, let code = exitedCode else { return nil }
         completed = true
         return code
+    }
+
+    func cancel() {
+        lock.lock()
+        completed = true
+        eofTimer?.cancel()
+        eofTimer = nil
+        lock.unlock()
     }
 }

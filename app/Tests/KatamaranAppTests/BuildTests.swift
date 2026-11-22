@@ -341,4 +341,27 @@ private func parse(_ log: String) -> BuildProgressParser {
         #expect(BuildxCLI.message(Data("docker: 'buildx' is not a docker command.\nSee 'docker --help'\n".utf8)) == "The Docker CLI has no Buildx plugin.")
         #expect(BuildxCLI.message(Data()) == nil)
     }
+
+    @Test func streamCompletionCoordinatesEOFExitAndPostExitGrace() async throws {
+        // Case 1: EOF arrives before process exit -> exit returns code immediately.
+        let c1 = StreamCompletion(eofGrace: 0.1)
+        #expect(c1.markEOF() == nil)
+        #expect(c1.markExited(0, onTimeout: { _ in Issue.record("unexpected timeout") }) == 0)
+
+        // Case 2: Process exits before EOF -> EOF completes immediately and suppresses timeout.
+        let c2 = StreamCompletion(eofGrace: 0.15)
+        #expect(c2.markExited(7, onTimeout: { _ in Issue.record("timeout should be cancelled on EOF") }) == nil)
+        #expect(c2.markEOF() == 7)
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Case 3: Descendant holds pipe open after process exit (no EOF) -> completes after grace.
+        let c3 = StreamCompletion(eofGrace: 0.1)
+        let timedOutCode: Int32 = await withCheckedContinuation { cont in
+            let immediate = c3.markExited(0) { code in cont.resume(returning: code) }
+            #expect(immediate == nil)
+        }
+        #expect(timedOutCode == 0)
+        // Late EOF after grace timeout must not complete a second time.
+        #expect(c3.markEOF() == nil)
+    }
 }
