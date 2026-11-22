@@ -133,19 +133,21 @@ pub struct Encoders {
 // Only used behind the terminal's mutex.
 unsafe impl Send for Encoders {}
 
-impl Default for Encoders {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for Encoders {
     fn drop(&mut self) {
         unsafe {
-            ffi::ghostty_key_event_free(self.key_event);
-            ffi::ghostty_key_encoder_free(self.key);
-            ffi::ghostty_mouse_event_free(self.mouse_event);
-            ffi::ghostty_mouse_encoder_free(self.mouse);
+            if !self.key_event.is_null() {
+                ffi::ghostty_key_event_free(self.key_event);
+            }
+            if !self.key.is_null() {
+                ffi::ghostty_key_encoder_free(self.key);
+            }
+            if !self.mouse_event.is_null() {
+                ffi::ghostty_mouse_event_free(self.mouse_event);
+            }
+            if !self.mouse.is_null() {
+                ffi::ghostty_mouse_encoder_free(self.mouse);
+            }
         }
     }
 }
@@ -160,7 +162,7 @@ pub struct Grid {
 }
 
 impl Encoders {
-    pub fn new() -> Self {
+    pub fn new() -> Option<Self> {
         let mut e = Self {
             key: ptr::null_mut(),
             key_event: ptr::null_mut(),
@@ -168,12 +170,28 @@ impl Encoders {
             mouse_event: ptr::null_mut(),
         };
         unsafe {
-            ffi::ghostty_key_encoder_new(ptr::null(), &mut e.key);
-            ffi::ghostty_key_event_new(ptr::null(), &mut e.key_event);
-            ffi::ghostty_mouse_encoder_new(ptr::null(), &mut e.mouse);
-            ffi::ghostty_mouse_event_new(ptr::null(), &mut e.mouse_event);
+            if ffi::ghostty_key_encoder_new(ptr::null(), &mut e.key) != ffi::Result::SUCCESS
+                || e.key.is_null()
+            {
+                return None;
+            }
+            if ffi::ghostty_key_event_new(ptr::null(), &mut e.key_event) != ffi::Result::SUCCESS
+                || e.key_event.is_null()
+            {
+                return None;
+            }
+            if ffi::ghostty_mouse_encoder_new(ptr::null(), &mut e.mouse) != ffi::Result::SUCCESS
+                || e.mouse.is_null()
+            {
+                return None;
+            }
+            if ffi::ghostty_mouse_event_new(ptr::null(), &mut e.mouse_event) != ffi::Result::SUCCESS
+                || e.mouse_event.is_null()
+            {
+                return None;
+            }
         }
-        e
+        Some(e)
     }
 
     /// Bytes for the program for a key, in the terminal's current modes (legacy or the kitty
@@ -258,8 +276,10 @@ impl Encoders {
         };
         // Within the cell the app put the pointer in (the pixel position may be anywhere).
         let (cw, ch) = (grid.cell_width.max(1), grid.cell_height.max(1));
-        let x = ev.col as u32 * cw + ev.x.saturating_sub(ev.col as u32 * cw).min(cw - 1);
-        let y = ev.row as u32 * ch + ev.y.saturating_sub(ev.row as u32 * ch).min(ch - 1);
+        let x0 = (ev.col as u32).saturating_mul(cw);
+        let y0 = (ev.row as u32).saturating_mul(ch);
+        let x = x0.saturating_add(ev.x.saturating_sub(x0).min(cw - 1));
+        let y = y0.saturating_add(ev.y.saturating_sub(y0).min(ch - 1));
         self.encode_mouse(
             vt,
             action,
@@ -282,6 +302,7 @@ impl Encoders {
         m: u8,
         grid: Grid,
     ) -> Option<Vec<u8>> {
+        let lines = lines.clamp(-1024, 1024);
         if lines == 0 {
             return None;
         }
@@ -296,8 +317,8 @@ impl Encoders {
                 ffi::MouseButton::FIVE
             };
             let pos = (
-                col as u32 * grid.cell_width.max(1),
-                row as u32 * grid.cell_height.max(1),
+                (col as u32).saturating_mul(grid.cell_width.max(1)),
+                (row as u32).saturating_mul(grid.cell_height.max(1)),
             );
             for _ in 0..lines.unsigned_abs() {
                 out.extend(self.encode_mouse(
@@ -342,8 +363,8 @@ impl Encoders {
     ) -> Option<Vec<u8>> {
         let size = ffi::MouseEncoderSize {
             size: std::mem::size_of::<ffi::MouseEncoderSize>(),
-            screen_width: grid.cols as u32 * grid.cell_width.max(1),
-            screen_height: grid.rows as u32 * grid.cell_height.max(1),
+            screen_width: (grid.cols as u32).saturating_mul(grid.cell_width.max(1)),
+            screen_height: (grid.rows as u32).saturating_mul(grid.cell_height.max(1)),
             cell_width: grid.cell_width.max(1),
             cell_height: grid.cell_height.max(1),
             ..Default::default()

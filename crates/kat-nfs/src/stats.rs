@@ -10,8 +10,12 @@
 //! over.
 
 use std::fmt::Write as _;
+use std::io;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicI32, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -168,12 +172,25 @@ pub fn report() -> String {
     out
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn errno() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
 extern "C" fn on_usr1(_: libc::c_int) {
-    let fd = WAKE.load(Relaxed);
+    // SAFETY: save and restore thread-local errno across async-signal-safe write().
+    let saved = unsafe { *errno() };
+    let fd = WAKE.load(Acquire);
     if fd >= 0 {
         // SAFETY: write() is async-signal-safe and the byte is on the stack.
         unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
     }
+    unsafe { *errno() = saved };
 }
 
 /// Print [`report`] to stderr whenever the process gets `SIGUSR1`. The
@@ -192,7 +209,7 @@ pub fn report_on_sigusr1() {
     }
     // SAFETY: the descriptor was just created; a full pipe only drops wakeups.
     unsafe { libc::fcntl(write_fd, libc::F_SETFL, libc::O_NONBLOCK) };
-    WAKE.store(write_fd, Relaxed);
+    WAKE.store(write_fd, Release);
     // SAFETY: the handler only writes to the pipe.
     unsafe { libc::signal(libc::SIGUSR1, on_usr1 as *const () as libc::sighandler_t) };
     let _ = thread::Builder::new()
@@ -204,7 +221,8 @@ pub fn report_on_sigusr1() {
                 let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     eprint!("nfsd: stats\n{}", report());
-                } else if n == 0 {
+                } else if n == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                {
                     return;
                 }
             }

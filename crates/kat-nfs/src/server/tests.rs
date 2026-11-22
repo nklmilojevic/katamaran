@@ -803,7 +803,10 @@ fn spotlight_markers_look_up_and_read_empty() {
             (a.ftype, a.mode, a.nlink, a.uid, a.gid, a.size, a.used),
             (1, 0o444, 1, 0, 0, 0, 0)
         );
-        assert_eq!((a.fileid, a.mtime, a.ctime, a.atime), (id, started, started, started));
+        assert_eq!(
+            (a.fileid, a.mtime, a.ctime, a.atime),
+            (id, started, started, started)
+        );
         assert_eq!(t.getattr(&fh).unwrap(), a);
         // Fixed handles, like the virtual directories': instance 0.
         assert_eq!(&fh[..8], &[0; 8]);
@@ -873,4 +876,176 @@ fn spotlight_markers_cannot_be_changed() {
     assert!(t.data().join("f").is_file());
     assert!(!t.data().join("away").exists());
     assert!(!t.data().join("copy").exists());
+}
+
+#[test]
+fn remove_rmdir_and_rename_reject_paths_with_slashes() {
+    let mut t = T::new("path-escape");
+    let v1 = t.path("docker/volumes/v1").unwrap();
+    let outside = t.dir.join("outside.txt");
+    std::fs::write(&outside, b"keep").unwrap();
+    std::fs::create_dir(t.data().join("a")).unwrap();
+    std::fs::write(t.data().join("a/b"), b"keep").unwrap();
+    t.create(&v1, "ok", 0o644).unwrap();
+
+    for bad in [
+        "/etc/passwd",
+        "../foo",
+        "../../../outside.txt",
+        "a/b",
+        "",
+        ".",
+        "..",
+        outside.to_str().unwrap(),
+    ] {
+        assert_eq!(t.remove(&v1, bad, false), Err(INVAL), "REMOVE {bad:?}");
+        assert_eq!(t.remove(&v1, bad, true), Err(INVAL), "RMDIR {bad:?}");
+        assert_eq!(
+            t.rename(&v1, bad, &v1, "dst"),
+            Err(INVAL),
+            "RENAME from {bad:?}"
+        );
+        assert_eq!(
+            t.rename(&v1, "ok", &v1, bad),
+            Err(INVAL),
+            "RENAME to {bad:?}"
+        );
+    }
+    assert!(outside.is_file());
+    assert!(t.data().join("a/b").is_file());
+}
+
+#[test]
+fn setattr_truncate_fbig_and_write_count_and_unchecked_symlink() {
+    let mut t = T::new("setattr-write-create");
+    let v1 = t.path("docker/volumes/v1").unwrap();
+    let f = t.create(&v1, "f", 0o644).unwrap();
+
+    // SETATTR truncate > i64::MAX returns FBIG.
+    let s = t.setattr(&f, |w| {
+        sattr(w, None, Some(i64::MAX as u64 + 1));
+        w.bool(false);
+    });
+    assert_eq!(s, FBIG);
+
+    // WRITE with count > data.len() returns INVAL.
+    let res = t.nfs(7, |w| {
+        w.opaque(&f).u64(0).u32(10).u32(0).opaque(b"short");
+    });
+    let mut r = Reader::new(&res);
+    assert_eq!(r.u32(), Ok(INVAL));
+
+    // WRITE with count < data.len() writes only count bytes.
+    let res = t.nfs(7, |w| {
+        w.opaque(&f).u64(0).u32(3).u32(0).opaque(b"abcdef");
+    });
+    let mut r = Reader::new(&res);
+    assert_eq!(r.u32(), Ok(OK));
+    skip_wcc(&mut r);
+    assert_eq!(r.u32(), Ok(3));
+    assert_eq!(t.read(&f, 0, 16).unwrap(), (b"abc".to_vec(), true));
+
+    // UNCHECKED create over an existing symlink returns EXIST, not STALE.
+    t.symlink(&v1, "sym", "f").unwrap();
+    let res = t.nfs(8, |w| {
+        w.opaque(&v1).opaque(b"sym").u32(0);
+        sattr(w, Some(0o644), None);
+    });
+    assert_eq!(T::new_reply(&res), Err(EXIST));
+}
+
+#[test]
+fn readdir_bad_cookie_and_clamped_max() {
+    let mut t = T::new("readdir-cookie");
+    let v1 = t.path("docker/volumes/v1").unwrap();
+    for i in 0..5 {
+        t.create(&v1, &format!("f{i}"), 0o644).unwrap();
+    }
+
+    // First page gets a valid verifier.
+    let res = t.nfs(16, |w| {
+        w.opaque(&v1).u64(0).fixed(&[0; 8]).u32(4096);
+    });
+    let mut r = Reader::new(&res);
+    assert_eq!(r.u32(), Ok(OK));
+    get_post_op(&mut r);
+    let verf: [u8; 8] = r.fixed(8).unwrap().try_into().unwrap();
+
+    // Unknown verifier with non-zero cookie -> BAD_COOKIE.
+    for proc_ in [16u32, 17] {
+        let res = t.nfs(proc_, |w| {
+            w.opaque(&v1).u64(1).fixed(&[0xaa; 8]);
+            if proc_ == 17 {
+                w.u32(4096);
+            }
+            w.u32(4096);
+        });
+        let mut r = Reader::new(&res);
+        assert_eq!(r.u32(), Ok(BAD_COOKIE));
+    }
+
+    // Valid verifier with out-of-range cookie -> BAD_COOKIE.
+    let res = t.nfs(16, |w| {
+        w.opaque(&v1).u64(9999).fixed(&verf).u32(4096);
+    });
+    let mut r = Reader::new(&res);
+    assert_eq!(r.u32(), Ok(BAD_COOKIE));
+
+    // Huge max (u32::MAX) is clamped to MAX_IO so replies never overflow record marks.
+    let mut big = T::new("readdir-max");
+    let bv1 = big.path("docker/volumes/v1").unwrap();
+    let pad = "a".repeat(200);
+    for i in 0..3200 {
+        std::fs::write(big.data().join(format!("{i:04}-{pad}")), b"").unwrap();
+    }
+    let res = big.nfs(17, |w| {
+        w.opaque(&bv1)
+            .u64(0)
+            .fixed(&[0; 8])
+            .u32(u32::MAX)
+            .u32(u32::MAX);
+    });
+    assert!(
+        res.len() <= MAX_IO as usize,
+        "reply len {} exceeded MAX_IO",
+        res.len()
+    );
+    let mut r = Reader::new(&res);
+    assert_eq!(r.u32(), Ok(OK));
+    get_post_op(&mut r);
+    let _verf = r.fixed(8).unwrap();
+    let mut count = 0;
+    while r.bool().unwrap() {
+        r.u64().unwrap();
+        r.opaque(255).unwrap();
+        r.u64().unwrap();
+        get_post_op(&mut r);
+        if r.bool().unwrap() {
+            r.opaque(64).unwrap();
+        }
+        count += 1;
+    }
+    let eof = r.bool().unwrap();
+    assert!(count > 0);
+    assert!(
+        !eof,
+        "3200 long entries must be paged when max is clamped to MAX_IO"
+    );
+}
+
+#[test]
+fn readdir_returns_stale_when_dir_evicted_mid_listing() {
+    let mut t = T::new("readdir-stale");
+    let v1 = t.path("docker/volumes/v1").unwrap();
+    let d = t.mkdir(&v1, "sub").unwrap();
+    t.create(&d, "a", 0o644).unwrap();
+    let dir_id = t.s.node(&d).unwrap();
+    // Simulate `dir_id` being evicted from `nodes` while holding an open fd.
+    let real_fd = t.s.real(dir_id).unwrap().loc.dir().unwrap();
+    t.s.nodes.lock().unwrap().forget(dir_id);
+    assert_eq!(t.s.entry(dir_id, Some(&real_fd), b"a", CRED), Err(STALE));
+    assert_eq!(
+        t.s.entry(dir_id, Some(&real_fd), b"missing", CRED),
+        Ok(None)
+    );
 }

@@ -99,6 +99,15 @@ pub fn cname(name: &[u8]) -> io::Result<CString> {
     CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
+/// A single directory entry name: non-empty, not `.` or `..`, and containing
+/// neither `/` nor NUL.
+fn component(name: &[u8]) -> io::Result<CString> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    cname(name)
+}
+
 fn cpath(p: &Path) -> io::Result<CString> {
     cname(p.as_os_str().as_bytes())
 }
@@ -118,7 +127,7 @@ pub fn walk(dir: &OwnedFd, name: &[u8]) -> io::Result<OwnedFd> {
 }
 
 pub fn openat(dir: &OwnedFd, name: &[u8], flags: libc::c_int, mode: u32) -> io::Result<OwnedFd> {
-    let n = cname(name)?;
+    let n = component(name)?;
     let flags = flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd =
         check(unsafe { libc::openat(dir.as_raw_fd(), n.as_ptr(), flags, mode as libc::c_uint) })?;
@@ -127,7 +136,9 @@ pub fn openat(dir: &OwnedFd, name: &[u8], flags: libc::c_int, mode: u32) -> io::
 
 /// Reopen a directory we hold (possibly an `O_PATH` one) with `flags`.
 pub fn reopen_dir(dir: &OwnedFd, flags: libc::c_int) -> io::Result<OwnedFd> {
-    openat(dir, b".", flags | libc::O_DIRECTORY, 0)
+    let flags = flags | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = check(unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), flags, 0) })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 pub fn fstat(fd: &OwnedFd) -> io::Result<Stat> {
@@ -138,7 +149,7 @@ pub fn fstat(fd: &OwnedFd) -> io::Result<Stat> {
 }
 
 pub fn statat(dir: &OwnedFd, name: &[u8]) -> io::Result<Stat> {
-    let n = cname(name)?;
+    let n = component(name)?;
     let mut st = MaybeUninit::<libc::stat>::uninit();
     check(unsafe {
         libc::fstatat(
@@ -161,38 +172,38 @@ pub fn stat_path(p: &Path) -> io::Result<Stat> {
 }
 
 pub fn mkdirat(dir: &OwnedFd, name: &[u8], mode: u32) -> io::Result<()> {
-    let n = cname(name)?;
+    let n = component(name)?;
     check(unsafe { libc::mkdirat(dir.as_raw_fd(), n.as_ptr(), mode as libc::mode_t) })?;
     Ok(())
 }
 
 pub fn symlinkat(target: &[u8], dir: &OwnedFd, name: &[u8]) -> io::Result<()> {
-    let (t, n) = (cname(target)?, cname(name)?);
+    let (t, n) = (cname(target)?, component(name)?);
     check(unsafe { libc::symlinkat(t.as_ptr(), dir.as_raw_fd(), n.as_ptr()) })?;
     Ok(())
 }
 
 pub fn unlinkat(dir: &OwnedFd, name: &[u8], is_dir: bool) -> io::Result<()> {
-    let n = cname(name)?;
+    let n = component(name)?;
     let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
     check(unsafe { libc::unlinkat(dir.as_raw_fd(), n.as_ptr(), flags) })?;
     Ok(())
 }
 
 pub fn renameat(from: &OwnedFd, fname: &[u8], to: &OwnedFd, tname: &[u8]) -> io::Result<()> {
-    let (f, t) = (cname(fname)?, cname(tname)?);
+    let (f, t) = (component(fname)?, component(tname)?);
     check(unsafe { libc::renameat(from.as_raw_fd(), f.as_ptr(), to.as_raw_fd(), t.as_ptr()) })?;
     Ok(())
 }
 
 pub fn linkat(from: &OwnedFd, fname: &[u8], to: &OwnedFd, tname: &[u8]) -> io::Result<()> {
-    let (f, t) = (cname(fname)?, cname(tname)?);
+    let (f, t) = (component(fname)?, component(tname)?);
     check(unsafe { libc::linkat(from.as_raw_fd(), f.as_ptr(), to.as_raw_fd(), t.as_ptr(), 0) })?;
     Ok(())
 }
 
 pub fn readlinkat(dir: &OwnedFd, name: &[u8]) -> io::Result<Vec<u8>> {
-    let n = cname(name)?;
+    let n = component(name)?;
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
     let len = unsafe {
         libc::readlinkat(
@@ -211,7 +222,7 @@ pub fn readlinkat(dir: &OwnedFd, name: &[u8]) -> io::Result<Vec<u8>> {
 
 /// chown without following a symlink. `None` leaves an id unchanged.
 pub fn chownat(dir: &OwnedFd, name: &[u8], uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
-    let n = cname(name)?;
+    let n = component(name)?;
     check(unsafe {
         libc::fchownat(
             dir.as_raw_fd(),
@@ -240,10 +251,50 @@ pub fn fchmod(fd: &OwnedFd, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// chmod of a non-symlink by name (symlinks have no mode of their own).
-pub fn chmodat(dir: &OwnedFd, name: &[u8], mode: u32) -> io::Result<()> {
-    let n = cname(name)?;
-    check(unsafe { libc::fchmodat(dir.as_raw_fd(), n.as_ptr(), mode as libc::mode_t, 0) })?;
+/// chmod of a non-symlink by name without following symlinks, verified against
+/// `ident`. Used as fallback for special files (FIFOs, sockets) or files that
+/// cannot be opened `O_RDONLY`.
+#[cfg(target_os = "linux")]
+pub fn chmodat_nofollow(
+    dir: &OwnedFd,
+    name: &[u8],
+    mode: u32,
+    ident: (u64, u64),
+) -> io::Result<()> {
+    let fd = openat(dir, name, libc::O_PATH, 0)?;
+    let st = fstat(&fd)?;
+    if st.is_symlink() || st.ident() != ident {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    let proc_fd = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    check(unsafe { libc::chmod(proc_fd.as_ptr(), mode as libc::mode_t) })?;
+    Ok(())
+}
+
+/// chmod of a non-symlink by name without following symlinks, verified against
+/// `ident`. Used as fallback for special files (FIFOs, sockets) or files that
+/// cannot be opened `O_RDONLY`.
+#[cfg(not(target_os = "linux"))]
+pub fn chmodat_nofollow(
+    dir: &OwnedFd,
+    name: &[u8],
+    mode: u32,
+    ident: (u64, u64),
+) -> io::Result<()> {
+    let n = component(name)?;
+    let st = statat(dir, name)?;
+    if st.is_symlink() || st.ident() != ident {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    check(unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            n.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
     Ok(())
 }
 
@@ -269,7 +320,7 @@ fn timespec(t: SetTime) -> libc::timespec {
 }
 
 pub fn utimensat(dir: &OwnedFd, name: &[u8], atime: SetTime, mtime: SetTime) -> io::Result<()> {
-    let n = cname(name)?;
+    let n = component(name)?;
     let ts = [timespec(atime), timespec(mtime)];
     check(unsafe {
         libc::utimensat(
@@ -289,7 +340,9 @@ pub fn futimens(fd: &OwnedFd, atime: SetTime, mtime: SetTime) -> io::Result<()> 
 }
 
 pub fn ftruncate(fd: &OwnedFd, size: u64) -> io::Result<()> {
-    check(unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) })?;
+    let size =
+        libc::off_t::try_from(size).map_err(|_| io::Error::from_raw_os_error(libc::EFBIG))?;
+    check(unsafe { libc::ftruncate(fd.as_raw_fd(), size) })?;
     Ok(())
 }
 
@@ -345,6 +398,9 @@ pub fn pwrite_all(fd: &OwnedFd, data: &[u8], off: u64) -> io::Result<()> {
                 continue;
             }
             return Err(e);
+        }
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
         }
         done += n as usize;
     }
@@ -504,5 +560,53 @@ mod tests {
         assert!(!name_ok(b"a/b"));
         assert!(!name_ok(b"a\0b"));
         assert!(!name_ok(&[b'x'; 256]));
+    }
+
+    #[test]
+    fn at_ops_reject_paths_and_dot_entries() {
+        let d = tmp("comp");
+        let root = open_anchor(&d).unwrap();
+        for bad in [
+            b"".as_slice(),
+            b".",
+            b"..",
+            b"/etc/passwd",
+            b"../foo",
+            b"a/b",
+            b"a\0b",
+        ] {
+            assert_eq!(
+                statat(&root, bad).unwrap_err().raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                openat(&root, bad, libc::O_RDONLY, 0)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                unlinkat(&root, bad, false).unwrap_err().raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                renameat(&root, bad, &root, b"ok")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                renameat(&root, b"ok", &root, bad)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+        }
+        let f = openat(&root, b"f", libc::O_CREAT | libc::O_RDWR, 0o644).unwrap();
+        assert_eq!(
+            ftruncate(&f, u64::MAX).unwrap_err().raw_os_error(),
+            Some(libc::EFBIG)
+        );
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
