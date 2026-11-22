@@ -188,6 +188,9 @@ c tar --version | head -1
 c dockerd --validate --config-file /etc/docker/daemon.json
 echo "daemon.json OK"
 c containerd --config /etc/containerd/config.toml config dump >/dev/null && echo "containerd config OK"
+grep -v '^disabled_plugins' "$X/etc/containerd/config.toml" > "$X/tmp/containerd-cri.toml"
+c containerd --config /tmp/containerd-cri.toml config dump >/dev/null && echo "containerd CRI config OK"
+rm -f "$X/tmp/containerd-cri.toml"
 c sh -c 'echo "busybox sh OK: $(busybox | head -1)"'
 EOF
 }

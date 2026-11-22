@@ -15,8 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -33,6 +32,30 @@ pub const SOCKET_NAME: &str = "k8s.sock";
 pub const API_SOCKET_NAME: &str = "k8s-api.sock";
 pub const KUBECONFIG_NAME: &str = "kubeconfig.yaml";
 pub const DEFAULT_API_PORT: u16 = 6443;
+const MAX_RELAY_CONNS: usize = 256;
+
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl ConnSlot {
+    fn try_acquire(counter: &Arc<AtomicUsize>) -> Option<ConnSlot> {
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_RELAY_CONNS {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(ConnSlot(counter.clone())),
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
 pub const DEFAULT_DNS_PORT: u16 = 15353;
@@ -184,6 +207,7 @@ impl ApiProxy {
         let port = addr.port();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let active = Arc::new(AtomicUsize::new(0));
         let thread = thread::Builder::new()
             .name(format!("k8s-api-{port}"))
             .spawn(move || {
@@ -192,10 +216,14 @@ impl ApiProxy {
                         return;
                     }
                     let Ok(client) = conn else { continue };
+                    let Some(slot) = ConnSlot::try_acquire(&active) else {
+                        continue;
+                    };
                     let sock = api_socket.clone();
                     let _ = thread::Builder::new()
                         .name("k8s-api-conn".into())
                         .spawn(move || {
+                            let _slot = slot;
                             let _ = relay_tcp_to_unix(client, &sock);
                         });
                 }
@@ -250,11 +278,17 @@ pub fn forward_guest_tcp(
         .with_context(|| format!("bind 127.0.0.1:{local_port}"))?;
     let bound = listener.local_addr()?.port();
     println!("Forwarding 127.0.0.1:{bound} -> {guest_addr}:{guest_port} (Ctrl-C to stop)");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(client) = conn else { continue };
+        let Some(slot) = ConnSlot::try_acquire(&active) else {
+            eprintln!("katamaran: k8s forward connection limit ({MAX_RELAY_CONNS}) reached");
+            continue;
+        };
         let home = home.to_path_buf();
         let addr = guest_addr.clone();
         thread::spawn(move || {
+            let _slot = slot;
             if let Err(e) = relay_k8s_connect(&home, client, &addr, guest_port) {
                 eprintln!("katamaran: k8s forward {addr}:{guest_port}: {e}");
             }
@@ -501,25 +535,81 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
     result
 }
 
+/// Return the `kubectl config` delete subcommands needed for entries named
+/// `ctx` that actually exist in the parsed `kubectl config view -o json`
+/// document. Only deleting present entries keeps removal idempotent without
+/// relying on `kubectl` exit behavior for absent keys.
+fn kubeconfig_delete_subcommands(doc: &serde_json::Value, ctx: &str) -> Vec<&'static str> {
+    const SECTIONS: [(&str, &str); 3] = [
+        ("contexts", "delete-context"),
+        ("clusters", "delete-cluster"),
+        ("users", "delete-user"),
+    ];
+    let mut subcommands = Vec::new();
+    for (section, subcmd) in SECTIONS {
+        let present = doc
+            .get(section)
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("name").and_then(|n| n.as_str()) == Some(ctx))
+            });
+        if present {
+            subcommands.push(subcmd);
+        }
+    }
+    subcommands
+}
+
 /// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
-pub fn remove_kubeconfig(home: &Path, ctx: &str) {
-    let _ = fs::remove_file(kubeconfig_path(home));
+pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
+    match fs::remove_file(kubeconfig_path(home)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("remove local kubeconfig"),
+    }
     let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
+        return Ok(());
     };
     let user_cfg = user_home.join(".kube/config");
     if !user_cfg.is_file() {
-        return;
+        return Ok(());
     }
-    for sub in ["delete-context", "delete-cluster", "delete-user"] {
-        let _ = kubectl_cmd()
-            .args(["config", sub, ctx])
+    let raw =
+        fs::read_to_string(&user_cfg).with_context(|| format!("read {}", user_cfg.display()))?;
+    if !raw.contains(ctx) {
+        return Ok(());
+    }
+    let view = kubectl_cmd()
+        .args(["config", "view", "--raw", "-o", "json"])
+        .env("KUBECONFIG", &user_cfg)
+        .stdin(Stdio::null())
+        .output()
+        .context("run kubectl config view --raw -o json")?;
+    if !view.status.success() {
+        bail!(
+            "kubectl config view --raw -o json failed: {}",
+            String::from_utf8_lossy(&view.stderr).trim()
+        );
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&view.stdout)
+        .context("parse kubectl config view --raw -o json output")?;
+    for subcmd in kubeconfig_delete_subcommands(&doc, ctx) {
+        let out = kubectl_cmd()
+            .args(["config", subcmd, ctx])
             .env("KUBECONFIG", &user_cfg)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .output()
+            .with_context(|| format!("run kubectl config {subcmd} {ctx}"))?;
+        if !out.status.success() {
+            bail!(
+                "kubectl config {subcmd} {ctx} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
     }
+    Ok(())
 }
 
 /// Minimal UDP DNS responder for `k8s.kat.local` and `*.k8s.kat.local` -> `127.0.0.1`.
@@ -751,5 +841,37 @@ users:
         let q_other = make_query("example.com", 1);
         let resp_other = build_dns_response(&q_other, Ipv4Addr::LOCALHOST).unwrap();
         assert_eq!(resp_other[3] & 0x0F, 3); // NXDOMAIN
+    }
+
+    #[test]
+    fn kubeconfig_delete_subcommands_selects_only_present_entries() {
+        let empty: serde_json::Value = serde_json::json!({
+            "kind": "Config",
+            "apiVersion": "v1",
+            "clusters": null,
+            "contexts": null,
+            "users": null
+        });
+        assert!(kubeconfig_delete_subcommands(&empty, "katamaran").is_empty());
+
+        let partial: serde_json::Value = serde_json::json!({
+            "contexts": [{"name": "other"}, {"name": "katamaran"}],
+            "clusters": [{"name": "other"}],
+            "users": [{"name": "katamaran"}]
+        });
+        assert_eq!(
+            kubeconfig_delete_subcommands(&partial, "katamaran"),
+            vec!["delete-context", "delete-user"]
+        );
+
+        let full: serde_json::Value = serde_json::json!({
+            "contexts": [{"name": "katamaran-dev"}],
+            "clusters": [{"name": "katamaran-dev"}],
+            "users": [{"name": "katamaran-dev"}]
+        });
+        assert_eq!(
+            kubeconfig_delete_subcommands(&full, "katamaran-dev"),
+            vec!["delete-context", "delete-cluster", "delete-user"]
+        );
     }
 }

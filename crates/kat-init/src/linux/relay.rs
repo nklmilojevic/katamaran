@@ -5,7 +5,11 @@ use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+
+const MAX_TCP_RELAY_CONNS: usize = 256;
 
 use super::sys;
 
@@ -52,14 +56,21 @@ fn relay(conn: OwnedFd, target: &str) -> io::Result<()> {
 /// Serves a guest TCP endpoint (e.g. `127.0.0.1:6443`) on a vsock port.
 pub fn serve_tcp_on_vsock(port: u32, target: &'static str) -> io::Result<()> {
     let listener = sys::vsock_listen(port)?;
+    let active = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
         .name(format!("relay-tcp-{port}"))
         .spawn(move || {
             loop {
                 match sys::accept(&listener) {
                     Ok(conn) => {
+                        if active.fetch_add(1, Ordering::AcqRel) >= MAX_TCP_RELAY_CONNS {
+                            active.fetch_sub(1, Ordering::AcqRel);
+                            continue;
+                        }
+                        let active = active.clone();
                         thread::spawn(move || {
                             let _ = relay_tcp(conn, target);
+                            active.fetch_sub(1, Ordering::AcqRel);
                         });
                     }
                     Err(e) => {
