@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.0 - 2026-11-22
+
+This release adds automatic update checks. The app now tells you when a new version is ready.
+
+### New features
+
+- Release builds check for updates one time each day. A native dialog shows the new version, also when the app runs only in the menu bar.
+- The status bar menu and the app menu show `Update Available (x.y.z)…` when a new version exists. You can open the update from there.
+- **Settings → General** has a new **Updates** section on release builds. It has a **Check for updates automatically** toggle and a **Check Now** or **View Update…** button.
+
 ## v0.6.1 - 2026-11-22
 
 This release makes upgrades safer. The daemon now restarts after an upgrade, so the CLI and the app do not talk to an old daemon.
