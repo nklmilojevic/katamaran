@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.5.0 - 2026-11-22
+
+This release adds optional single-node Kubernetes to the Katamaran VM. It also makes the daemon, the guest init, the NFS server, and the app more secure and more reliable.
+
+### New features
+
+- Add optional single-node Kubernetes (k3s) inside the Katamaran VM. It is off by default and uses no resources when it is off. Use `kat k8s start|stop`, `kat config set kubernetes=on|off`, or Settings to turn it on or off without a VM restart.
+- The Kubernetes cluster uses the existing `containerd` and mirrors images from `docker build` into the cluster, so pods run local images without a push. The `kat k8s reset` command wipes the cluster state.
+- The host gets the Kubernetes API, a `katamaran` context in `~/.kube/config`, automatic forwards for `NodePort` and `LoadBalancer` services, and DNS for `*.k8s.kat.local`. Use `kat k8s forward` for direct Pod and Service IP access.
+- Add a Kubernetes tab to the app Settings. It has an enable switch, the cluster status, Sync Images, and Reset Cluster.
+
+### Fixes
+
+- Harden the NFS server against path escape, symlink races, and incorrect directory listings. This protects the files in your shared folders.
+- Make the VM pause and resume signals and the file event cache in `kat-vmm` safer. Lost file events now invalidate the cache correctly.
+- Fix memory safety problems in the terminal library `kat-term`.
+- Harden the app against shell command injection in machine shell commands. Fix HTTP response handling, reconnect problems, and stuck Start and Restart states in the UI.
+- Make the daemon more reliable. SSH proxy channels no longer block, the VM handshake has a deadline, and the NFS mount and unmount steps are safer. Other fixes cover config saves, the setup restart, and image downloads.
+- Make the guest init more reliable. Fixes cover limits on connections, retries after accept errors, process ID reuse, stuck pipes, and checks on protocol frame sizes.
+
+### Other changes
+
+- Replace all em-dashes in the app and the documentation with normal dashes.
+- Document the Kubernetes feature in the README, the agent skill, and the documentation site.
+- Fix the release scripts and the build so they work on Linux runners, and escape special characters in `Info.plist` values.
+- Update the `russh` SSH library to 0.65.4. This includes upstream security fixes.
+
 ## v0.4.0 - 2026-11-20
 
 This release makes it easier to get Katamaran. It also fixes the `binfmt_misc` mask in `kat-init`.
