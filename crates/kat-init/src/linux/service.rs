@@ -227,6 +227,12 @@ fn wait_ready(
 struct ContainerdConfigState {
     path: Option<String>,
     generation: u64,
+    /// True once `containerd` has reached `Ready` with the current `path` and
+    /// `generation`. Only an unproven override is rolled back to the stock
+    /// config on startup failure; a proven-good override is retained across
+    /// later transient containerd restarts so a running k3s server never loses
+    /// CRI.
+    proven_ready: bool,
     waiter: Option<ReloadWaiter>,
 }
 
@@ -290,6 +296,7 @@ impl DockerStack {
             let mut cfg = self.inner.containerd_config.lock().unwrap();
             cfg.generation += 1;
             cfg.path = config;
+            cfg.proven_ready = false;
             cfg.waiter = Some(ReloadWaiter {
                 target_generation: cfg.generation,
                 tx,
@@ -319,8 +326,12 @@ impl DockerStack {
                     {
                         cfg.waiter = None;
                     }
-                    if cfg.generation == target_generation && cfg.path.is_some() {
+                    if cfg.generation == target_generation
+                        && cfg.path.is_some()
+                        && !cfg.proven_ready
+                    {
                         cfg.generation += 1;
+                        cfg.proven_ready = false;
                         cfg.path.take()
                     } else {
                         None
@@ -371,6 +382,27 @@ impl Drop for SuperviseExit<'_> {
     }
 }
 
+fn mark_containerd_ready(inner: &Inner, generation: u64) {
+    let waiter = {
+        let mut cfg = inner.containerd_config.lock().unwrap();
+        if cfg.generation == generation {
+            cfg.proven_ready = true;
+        }
+        if cfg
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.target_generation <= generation)
+        {
+            cfg.waiter.take()
+        } else {
+            None
+        }
+    };
+    if let Some(w) = waiter {
+        let _ = w.tx.send(Ok(()));
+    }
+}
+
 fn notify_containerd_waiter(inner: &Inner, generation: u64, result: Result<(), String>) {
     let waiter = {
         let mut cfg = inner.containerd_config.lock().unwrap();
@@ -396,12 +428,14 @@ fn fail_containerd_waiter(inner: &Inner, reason: String) {
     }
 }
 
-/// Roll back a failed runtime override config to the stock `/etc/containerd/config.toml`
-/// if no newer config change has superseded `failed_generation`.
+/// Roll back a failed newly activated runtime override config to the stock
+/// `/etc/containerd/config.toml` if no newer config change has superseded
+/// `failed_generation` and this override has not already been proven ready.
 fn rollback_containerd_config(inner: &Inner, failed_generation: u64) -> Option<String> {
     let mut cfg = inner.containerd_config.lock().unwrap();
-    if cfg.generation == failed_generation && cfg.path.is_some() {
+    if cfg.generation == failed_generation && cfg.path.is_some() && !cfg.proven_ready {
         cfg.generation += 1;
+        cfg.proven_ready = false;
         cfg.path.take()
     } else {
         None
@@ -468,7 +502,7 @@ fn supervise(reaper: &Reaper, notifier: &Notifier, inner: &Inner) {
             match outcome {
                 StartOutcome::Ready => {
                     if let Some(run) = containerd_run {
-                        notify_containerd_waiter(inner, run.generation, Ok(()));
+                        mark_containerd_ready(inner, run.generation);
                     } else if i == DOCKERD {
                         notifier.send(&Msg::ServiceReady {
                             name: "docker".into(),
@@ -675,7 +709,7 @@ mod tests {
             Some("/run/katamaran/containerd-cri.toml")
         );
 
-        // Matching generation clears path and bumps generation.
+        // Matching generation clears path and bumps generation when unproven.
         assert_eq!(
             rollback_containerd_config(&inner, 2).as_deref(),
             Some("/run/katamaran/containerd-cri.toml")
@@ -683,6 +717,37 @@ mod tests {
         let cfg = inner.containerd_config.lock().unwrap();
         assert_eq!(cfg.path, None);
         assert_eq!(cfg.generation, 3);
+    }
+
+    #[test]
+    fn proven_ready_override_is_preserved_after_transient_restart_failure() {
+        let inner = Inner::default();
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut cfg = inner.containerd_config.lock().unwrap();
+            cfg.path = Some("/run/katamaran/containerd-cri.toml".into());
+            cfg.generation = 4;
+            cfg.proven_ready = false;
+            cfg.waiter = Some(ReloadWaiter {
+                target_generation: 4,
+                tx,
+            });
+        }
+
+        // Initial activation reaches Ready: waiter succeeds and override is proven.
+        mark_containerd_ready(&inner, 4);
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
+        assert!(inner.containerd_config.lock().unwrap().proven_ready);
+
+        // A subsequent transient restart failure must NOT discard the CRI override.
+        assert_eq!(rollback_containerd_config(&inner, 4), None);
+        let cfg = inner.containerd_config.lock().unwrap();
+        assert_eq!(
+            cfg.path.as_deref(),
+            Some("/run/katamaran/containerd-cri.toml")
+        );
+        assert_eq!(cfg.generation, 4);
+        assert!(cfg.proven_ready);
     }
 
     #[test]
