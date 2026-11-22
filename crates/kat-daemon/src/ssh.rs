@@ -24,7 +24,7 @@ use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
 pub struct SshFiles {
@@ -205,26 +205,46 @@ const GUEST_CTRL_QUEUE: usize = 16;
 /// Grace period on `channel_close` to flush queued stdin/`DataEnd` to a
 /// reading guest before aborting a stalled writer.
 const CLOSE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Maximum time to wait for the guest machine service to accept a new `Exec`
+/// or `Connect` handshake.
+const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 struct GuestChan {
     data_tx: Option<mpsc::Sender<MachineMsg>>,
     ctrl_tx: Option<mpsc::Sender<MachineMsg>>,
-    reader: AbortHandle,
-    writer: Option<JoinHandle<()>>,
+    stop_read: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl GuestChan {
-    fn spawn(stream: UnixStream, handle: russh::server::Handle, ch: ChannelId) -> Self {
-        let (reader, writer) = stream.into_split();
+    /// Spawn a channel task off the SSH handler loop so connecting and pumping
+    /// never stall other multiplexed channels.
+    fn spawn_task<F, Fut>(build: F) -> Self
+    where
+        F: FnOnce(
+            mpsc::Receiver<MachineMsg>,
+            mpsc::Receiver<MachineMsg>,
+            oneshot::Receiver<()>,
+        ) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let (data_tx, data_rx) = mpsc::channel(GUEST_WRITE_QUEUE);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(GUEST_CTRL_QUEUE);
-        let writer_task = tokio::spawn(pump_write(ctrl_rx, data_rx, writer));
-        let reader_task = tokio::spawn(pump_read(handle, ch, reader));
+        let (stop_read, stop_read_rx) = oneshot::channel();
+        let task = tokio::spawn(build(ctrl_rx, data_rx, stop_read_rx));
         GuestChan {
             data_tx: Some(data_tx),
             ctrl_tx: Some(ctrl_tx),
-            reader: reader_task.abort_handle(),
-            writer: Some(writer_task),
+            stop_read: Some(stop_read),
+            task: Some(task),
         }
     }
 
@@ -257,17 +277,16 @@ impl GuestChan {
 
     /// Close on client `channel_close`: stop reading immediately, drop the
     /// senders so `pump_write` flushes already-queued stdin/`DataEnd` to a
-    /// reading guest, and abort `pump_write` after `grace` if the guest is
-    /// stalled.
+    /// reading guest, and abort the task after `grace` if the guest is stalled.
     fn close_graceful(mut self, grace: std::time::Duration) {
-        self.reader.abort();
+        self.stop_read.take();
         self.data_tx.take();
         self.ctrl_tx.take();
-        if let Some(writer) = self.writer.take() {
-            let abort = writer.abort_handle();
+        if let Some(task) = self.task.take() {
+            let abort = task.abort_handle();
             tokio::spawn(async move {
                 tokio::select! {
-                    _ = writer => {}
+                    _ = task => {}
                     _ = tokio::time::sleep(grace) => {
                         abort.abort();
                     }
@@ -283,11 +302,69 @@ impl GuestChan {
 
 impl Drop for GuestChan {
     fn drop(&mut self) {
-        self.reader.abort();
-        if let Some(writer) = self.writer.take() {
-            writer.abort();
+        self.stop_read.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
+}
+
+/// Drive the guest read and write pumps concurrently until the guest closes or
+/// the write side finishes draining after `close_graceful`.
+async fn run_pumps(
+    stream: UnixStream,
+    handle: russh::server::Handle,
+    ch: ChannelId,
+    ctrl_rx: mpsc::Receiver<MachineMsg>,
+    data_rx: mpsc::Receiver<MachineMsg>,
+    stop_read: oneshot::Receiver<()>,
+) {
+    let (reader, writer) = stream.into_split();
+    let reader_task = tokio::spawn(async move {
+        tokio::select! {
+            _ = pump_read(handle, ch, reader) => true,
+            _ = stop_read => false,
+        }
+    });
+    let _abort_reader = AbortOnDrop(reader_task.abort_handle());
+    tokio::pin!(reader_task);
+    let mut write_fut = std::pin::pin!(pump_write(ctrl_rx, data_rx, writer));
+    tokio::select! {
+        _ = &mut write_fut => {}
+        res = &mut reader_task => {
+            if matches!(res, Ok(false)) {
+                write_fut.await;
+            }
+        }
+    }
+}
+
+/// Connect to the guest's machine service and complete a `Connect` handshake
+/// within `timeout`.
+async fn connect_direct_tcpip(
+    home: &Path,
+    machine: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> anyhow::Result<UnixStream> {
+    tokio::time::timeout(timeout, async {
+        let mut s = connect_guest(home).await?;
+        write_frame(
+            &mut s,
+            &MachineMsg::Connect {
+                name: machine.to_string(),
+                port,
+            },
+        )
+        .await?;
+        match read_frame(&mut s).await? {
+            Some(MachineMsg::Done) => Ok(s),
+            Some(MachineMsg::Error(e)) => bail!("{e}"),
+            other => bail!("unexpected answer {other:?}"),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("guest connect timed out after {}s", timeout.as_secs()))?
 }
 
 #[derive(Default)]
@@ -338,8 +415,9 @@ impl Handler {
         }
     }
 
-    /// Start `argv` (empty: login shell) for a session channel.
-    async fn run(&mut self, ch: ChannelId, argv: Vec<String>, session: &mut Session) {
+    /// Start `argv` (empty: login shell) for a session channel without blocking
+    /// the SSH handler loop on guest connection setup.
+    fn run(&mut self, ch: ChannelId, argv: Vec<String>, session: &mut Session) {
         if self.chans.get(&ch).is_some_and(|c| c.guest.is_some()) {
             let _ = session.channel_failure(ch);
             return;
@@ -357,24 +435,37 @@ impl Handler {
             argv,
             tty,
         };
-        let started = async {
-            let mut s = connect_guest(&self.home).await?;
-            write_frame(&mut s, &MachineMsg::Exec(spec)).await?;
-            Ok::<_, anyhow::Error>(s)
-        }
-        .await;
+        let home = self.home.clone();
         let handle = session.handle();
-        match started {
-            Ok(s) => {
-                self.chans.entry(ch).or_default().guest = Some(GuestChan::spawn(s, handle, ch));
-                let _ = session.channel_success(ch);
+        let guest = GuestChan::spawn_task(move |ctrl_rx, data_rx, stop_read| async move {
+            let started = tokio::time::timeout(GUEST_CONNECT_TIMEOUT, async {
+                let mut s = connect_guest(&home).await?;
+                write_frame(&mut s, &MachineMsg::Exec(spec)).await?;
+                Ok::<_, anyhow::Error>(s)
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "guest exec timed out after {}s",
+                    GUEST_CONNECT_TIMEOUT.as_secs()
+                )
+            })
+            .and_then(|r| r);
+            match started {
+                Ok(s) => {
+                    let _ = handle.channel_success(ch).await;
+                    run_pumps(s, handle, ch, ctrl_rx, data_rx, stop_read).await;
+                }
+                Err(e) => {
+                    let _ = handle
+                        .extended_data(ch, 1, format!("katamaran: {e:#}\r\n").into_bytes())
+                        .await;
+                    let _ = handle.channel_failure(ch).await;
+                    let _ = handle.close(ch).await;
+                }
             }
-            Err(e) => {
-                let _ = session.extended_data(ch, 1, format!("katamaran: {e:#}\r\n").into_bytes());
-                let _ = session.channel_failure(ch);
-                let _ = session.close(ch);
-            }
-        }
+        });
+        self.chans.entry(ch).or_default().guest = Some(guest);
     }
 }
 
@@ -470,33 +561,26 @@ impl russh::server::Handler for Handler {
         else {
             return Ok(());
         };
-        let conn = async {
-            let mut s = connect_guest(&self.home).await?;
-            write_frame(
-                &mut s,
-                &MachineMsg::Connect {
-                    name: self.machine.clone(),
-                    port,
-                },
-            )
-            .await?;
-            match read_frame(&mut s).await? {
-                Some(MachineMsg::Done) => Ok(s),
-                Some(MachineMsg::Error(e)) => bail!("{e}"),
-                other => bail!("unexpected answer {other:?}"),
-            }
-        }
-        .await;
-        let Ok(s) = conn else {
-            return Ok(());
-        };
         let ch = channel.id();
-        reply.accept().await;
+        let home = self.home.clone();
+        let machine = self.machine.clone();
         let h = session.handle();
+        // Run the guest Connect handshake off the SSH handler loop so a stalled
+        // guest cannot hold up other multiplexed channels on this connection.
+        let guest = GuestChan::spawn_task(move |ctrl_rx, data_rx, stop_read| async move {
+            let Ok(s) = connect_direct_tcpip(&home, &machine, port, GUEST_CONNECT_TIMEOUT).await
+            else {
+                // Dropping `reply` sends SSH_MSG_CHANNEL_OPEN_FAILURE.
+                drop(reply);
+                return;
+            };
+            reply.accept().await;
+            run_pumps(s, h, ch, ctrl_rx, data_rx, stop_read).await;
+        });
         self.chans.insert(
             ch,
             Chan {
-                guest: Some(GuestChan::spawn(s, h, ch)),
+                guest: Some(guest),
                 ..Chan::default()
             },
         );
@@ -544,7 +628,7 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.run(channel, Vec::new(), session).await;
+        self.run(channel, Vec::new(), session);
         Ok(())
     }
 
@@ -555,8 +639,7 @@ impl russh::server::Handler for Handler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(data).into_owned();
-        self.run(channel, vec!["/bin/sh".into(), "-c".into(), cmd], session)
-            .await;
+        self.run(channel, vec!["/bin/sh".into(), "-c".into(), cmd], session);
         Ok(())
     }
 
@@ -571,8 +654,7 @@ impl russh::server::Handler for Handler {
                 channel,
                 vec!["/bin/sh".into(), "-c".into(), SFTP.into()],
                 session,
-            )
-            .await;
+            );
         } else {
             session.channel_failure(channel)?;
         }
@@ -772,6 +854,29 @@ mod tests {
         });
     }
 
+    fn test_guest_chan(stream: UnixStream) -> GuestChan {
+        GuestChan::spawn_task(move |ctrl_rx, data_rx, stop_read| async move {
+            let (mut reader, writer) = stream.into_split();
+            let reader_task = tokio::spawn(async move {
+                tokio::select! {
+                    _ = read_frame(&mut reader) => true,
+                    _ = stop_read => false,
+                }
+            });
+            let _abort_reader = AbortOnDrop(reader_task.abort_handle());
+            tokio::pin!(reader_task);
+            let mut write_fut = std::pin::pin!(pump_write(ctrl_rx, data_rx, writer));
+            tokio::select! {
+                _ = &mut write_fut => {}
+                res = &mut reader_task => {
+                    if matches!(res, Ok(false)) {
+                        write_fut.await;
+                    }
+                }
+            }
+        })
+    }
+
     #[test]
     fn stalled_guest_channel_does_not_block_multiplexed_channels_or_close() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -781,37 +886,11 @@ mod tests {
         rt.block_on(async {
             // Channel 1: guest never reads.
             let (host1, mut guest1) = UnixStream::pair().unwrap();
-            let (r1, w1) = host1.into_split();
-            let (data_tx1, data_rx1) = mpsc::channel(GUEST_WRITE_QUEUE);
-            let (ctrl_tx1, ctrl_rx1) = mpsc::channel(GUEST_CTRL_QUEUE);
-            let w_task1 = tokio::spawn(pump_write(ctrl_rx1, data_rx1, w1));
-            let r_task1 = tokio::spawn(async move {
-                let mut r = r1;
-                let _ = read_frame(&mut r).await;
-            });
-            let stalled = GuestChan {
-                data_tx: Some(data_tx1),
-                ctrl_tx: Some(ctrl_tx1),
-                reader: r_task1.abort_handle(),
-                writer: Some(w_task1),
-            };
+            let stalled = test_guest_chan(host1);
 
             // Channel 2: healthy multiplexed guest reading concurrently.
             let (host2, mut guest2) = UnixStream::pair().unwrap();
-            let (r2, w2) = host2.into_split();
-            let (data_tx2, data_rx2) = mpsc::channel(GUEST_WRITE_QUEUE);
-            let (ctrl_tx2, ctrl_rx2) = mpsc::channel(GUEST_CTRL_QUEUE);
-            let w_task2 = tokio::spawn(pump_write(ctrl_rx2, data_rx2, w2));
-            let r_task2 = tokio::spawn(async move {
-                let mut r = r2;
-                let _ = read_frame(&mut r).await;
-            });
-            let healthy = GuestChan {
-                data_tx: Some(data_tx2),
-                ctrl_tx: Some(ctrl_tx2),
-                reader: r_task2.abort_handle(),
-                writer: Some(w_task2),
-            };
+            let healthy = test_guest_chan(host2);
 
             // Pump frames into channel 1 until its bounded queue overflows.
             // `try_enqueue_data` must return `false` without hanging the runtime.
@@ -867,20 +946,7 @@ mod tests {
             // Case 1: client sends Data + DataEnd then immediately closes.
             // Guest must still receive all queued frames and DataEnd before EOF.
             let (host, mut guest) = UnixStream::pair().unwrap();
-            let (r, w) = host.into_split();
-            let (data_tx, data_rx) = mpsc::channel(GUEST_WRITE_QUEUE);
-            let (ctrl_tx, ctrl_rx) = mpsc::channel(GUEST_CTRL_QUEUE);
-            let w_task = tokio::spawn(pump_write(ctrl_rx, data_rx, w));
-            let r_task = tokio::spawn(async move {
-                let mut r = r;
-                let _ = read_frame(&mut r).await;
-            });
-            let ch = GuestChan {
-                data_tx: Some(data_tx),
-                ctrl_tx: Some(ctrl_tx),
-                reader: r_task.abort_handle(),
-                writer: Some(w_task),
-            };
+            let ch = test_guest_chan(host);
             assert!(
                 ch.try_enqueue_data(MachineMsg::Data(b"first".to_vec()))
                     .await
@@ -909,20 +975,7 @@ mod tests {
             // Case 2: stalled guest stops reading; close_graceful aborts the
             // writer once the grace period expires so draining sees EOF.
             let (host, mut guest) = UnixStream::pair().unwrap();
-            let (r, w) = host.into_split();
-            let (data_tx, data_rx) = mpsc::channel(GUEST_WRITE_QUEUE);
-            let (ctrl_tx, ctrl_rx) = mpsc::channel(GUEST_CTRL_QUEUE);
-            let w_task = tokio::spawn(pump_write(ctrl_rx, data_rx, w));
-            let r_task = tokio::spawn(async move {
-                let mut r = r;
-                let _ = read_frame(&mut r).await;
-            });
-            let ch = GuestChan {
-                data_tx: Some(data_tx),
-                ctrl_tx: Some(ctrl_tx),
-                reader: r_task.abort_handle(),
-                writer: Some(w_task),
-            };
+            let ch = test_guest_chan(host);
             let chunk = vec![0x55u8; 32 << 10];
             for _ in 0..(GUEST_WRITE_QUEUE + 256) {
                 if !ch.try_enqueue_data(MachineMsg::Data(chunk.clone())).await {
@@ -939,5 +992,41 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn connect_direct_tcpip_times_out_when_guest_stalls() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let home = std::env::temp_dir().join(format!("kat-ssh-conn-to-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("run")).unwrap();
+        let sock = crate::machines::socket_path(&home);
+
+        rt.block_on(async {
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let _server = tokio::spawn(async move {
+                // Accept and never answer `Connect`.
+                if let Ok((_conn, _)) = listener.accept().await {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            });
+
+            let t = std::time::Instant::now();
+            let err =
+                connect_direct_tcpip(&home, "dev", 8080, std::time::Duration::from_millis(80))
+                    .await
+                    .unwrap_err();
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(1),
+                "timed out too slowly: {:?}",
+                t.elapsed()
+            );
+            assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        });
+
+        let _ = fs::remove_dir_all(&home);
     }
 }
