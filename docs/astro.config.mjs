@@ -83,6 +83,7 @@ export default defineConfig({
 						'file-sharing',
 						'networking',
 						'machines',
+						'kubernetes',
 						'amd64',
 						'app',
 						'build-from-source',

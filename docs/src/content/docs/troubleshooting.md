@@ -25,7 +25,7 @@ kat logs --source vm -n 200
 kat logs --source gvproxy -n 200
 ```
 
-Add `-f` to follow any stream live. Inside the guest, containerd and dockerd also write to `/var/log/containerd.log` and `/var/log/dockerd.log`.
+Add `-f` to follow any stream live. Inside the guest, containerd, dockerd, and k3s also write to `/var/log/containerd.log`, `/var/log/dockerd.log`, and `/var/log/k3s.log`.
 
 ## Measure boot stages
 
@@ -97,6 +97,39 @@ lsof -nP -iTCP:<PORT> -sTCP:LISTEN
 ```
 
 3. Verify the port appears in `kat status` and check `kat logs --source gvproxy`.
+
+## Kubernetes cluster will not start or `kubectl` cannot connect
+
+1. Check cluster state, API address, and any reported error:
+
+```sh
+kat k8s status
+```
+
+2. Confirm `kubectl` is targeting the `katamaran` context (or point `KUBECONFIG` at katamaran's kubeconfig if `kubectl` was not installed when k3s started):
+
+```sh
+kubectl config current-context
+kubectl config use-context katamaran
+# Or use the standalone kubeconfig directly:
+export KUBECONFIG="$(kat k8s kubeconfig --path)"
+```
+
+3. Inspect daemon and guest console logs for `k3s` errors:
+
+```sh
+kat logs --source daemon -n 200
+kat logs --source console -n 200
+```
+
+4. If a local image fails with `ErrImagePull`, run `kat k8s sync-images` and set `imagePullPolicy: IfNotPresent` (or `Never`) on the container spec.
+
+5. To wipe a broken cluster state without touching Docker containers or Linux machines, reset Kubernetes and start it again:
+
+```sh
+kat k8s reset
+kat k8s start
+```
 
 ## Reset all VM data
 

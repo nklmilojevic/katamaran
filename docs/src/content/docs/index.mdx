@@ -29,9 +29,10 @@ katamaran pairs a custom Hypervisor.framework virtual machine monitor (based on 
   <LinkCard title="File sharing" href="/file-sharing/" description="Use fast bind mounts, host inotify events, and Linux files in Finder." />
   <LinkCard title="Networking" href="/networking/" description="Reach containers on localhost, reach macOS through host.docker.internal, and resolve DNS." />
   <LinkCard title="Linux machines" href="/machines/" description="Create LXC machines and connect with kat shell or SSH." />
+  <LinkCard title="Kubernetes" href="/kubernetes/" description="Run an optional single-node k3s cluster with image sync, service forwarding, and *.k8s.kat.local DNS." />
   <LinkCard title="Command-line reference" href="/cli/" description="Look up every katamaran subcommand, argument, and flag." />
   <LinkCard title="Configuration reference" href="/configuration/" description="Tune CPU count, memory limit, Rosetta, NFS mounts, and sleep behavior." />
   <LinkCard title="Architecture" href="/architecture/" description="Read how libkrun, direct FUSE hypercalls, in-process gvproxy, and memory reclaim work." />
 </CardGrid>
 
-katamaran requires an Apple silicon Mac (M1 or later) running macOS 15 or later. An optional single-node Kubernetes (`k3s`) cluster is available via `kat k8s` and uses zero resources when off.
+katamaran requires an Apple silicon Mac (M1 or later) running macOS 15 or later. An optional single-node Kubernetes (`k3s`) cluster is available via [Kubernetes (`kat k8s`)](/kubernetes/) and uses zero resources when off.

@@ -212,7 +212,7 @@ kat ssh [DEST] [-- <CMD>...]
 
 ## Kubernetes commands
 
-`kat k8s` (aliased as `kat kubernetes`) manages the optional single-node Kubernetes (`k3s`) cluster inside the VM.
+`kat k8s` (aliased as `kat kubernetes`) manages the optional single-node Kubernetes (`k3s`) cluster inside the VM. See the [Kubernetes guide](/kubernetes/) for setup, image syncing, Ingress DNS, and networking details.
 
 ### `kat k8s status`
 
