@@ -586,23 +586,40 @@ fn prepare_dirs_and_sysctls(reaper: &Reaper) -> Result<(), String> {
     ensure_symlink("/etc/cni/net.d", &cni_conf_target)?;
     ensure_symlink("/opt/cni/bin", &format!("{DATA_DIR}/data/current/bin"))?;
 
-    // Enable IP forwarding and bridge netfilter while k3s is active.
-    for path in [
-        "/proc/sys/net/ipv4/ip_forward",
-        "/proc/sys/net/bridge/bridge-nf-call-iptables",
-        "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
-    ] {
-        let _ = fs::write(path, "1\n");
-    }
+    // Enable IP forwarding and bridge netfilter while k3s is active,
+    // preserving prior bridge-nf values so stop restores them accurately.
+    enable_bridge_netfilter();
     Ok(())
 }
 
+const BRIDGE_NF_SYSCTLS: [&str; 2] = [
+    "/proc/sys/net/bridge/bridge-nf-call-iptables",
+    "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
+];
+static SAVED_BRIDGE_NF: Mutex<Option<[Option<String>; 2]>> = Mutex::new(None);
+
+fn enable_bridge_netfilter() {
+    let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1\n");
+    let mut saved = SAVED_BRIDGE_NF.lock().unwrap();
+    if saved.is_none() {
+        *saved = Some([
+            fs::read_to_string(BRIDGE_NF_SYSCTLS[0]).ok(),
+            fs::read_to_string(BRIDGE_NF_SYSCTLS[1]).ok(),
+        ]);
+    }
+    for path in BRIDGE_NF_SYSCTLS {
+        let _ = fs::write(path, "1\n");
+    }
+}
+
 fn restore_bridge_netfilter() {
-    for path in [
-        "/proc/sys/net/bridge/bridge-nf-call-iptables",
-        "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
-    ] {
-        let _ = fs::write(path, "0\n");
+    let Some(prev) = SAVED_BRIDGE_NF.lock().unwrap().take() else {
+        return;
+    };
+    for (path, val) in BRIDGE_NF_SYSCTLS.iter().zip(prev) {
+        if let Some(v) = val {
+            let _ = fs::write(path, v);
+        }
     }
 }
 
