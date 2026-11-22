@@ -415,6 +415,36 @@ pub fn write_and_merge_kubeconfig(
     Ok(local_path)
 }
 
+/// Locate `kubectl` even under a minimal LaunchAgent `PATH`.
+fn find_kubectl() -> PathBuf {
+    let candidates = [
+        Some(PathBuf::from("/opt/homebrew/bin/kubectl")),
+        Some(PathBuf::from("/usr/local/bin/kubectl")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".nix-profile/bin/kubectl")),
+        Some(PathBuf::from("/run/current-system/sw/bin/kubectl")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/kubectl")),
+    ];
+    for path in candidates.into_iter().flatten() {
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("kubectl")
+}
+
+fn kubectl_cmd() -> Command {
+    let mut cmd = Command::new("kubectl");
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join("kubectl").is_file() {
+                return cmd;
+            }
+        }
+    }
+    cmd = Command::new(find_kubectl());
+    cmd
+}
+
 /// Merge `local_cfg` into `user_cfg` using a private temporary copy so the
 /// live `~/.kube/config` is never mutated if `kubectl` is missing or fails.
 fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> anyhow::Result<()> {
@@ -439,7 +469,7 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
     let result = (|| -> anyhow::Result<()> {
         // Strip any stale entry for `ctx` from the scratch copy only.
         for sub in ["delete-context", "delete-cluster", "delete-user"] {
-            let _ = Command::new("kubectl")
+            let _ = kubectl_cmd()
                 .args(["config", sub, ctx])
                 .env("KUBECONFIG", &scratch)
                 .stdin(Stdio::null())
@@ -449,7 +479,7 @@ fn merge_into_user_kubeconfig(user_cfg: &Path, local_cfg: &Path, ctx: &str) -> a
                 .context("run kubectl (is kubectl installed on PATH?)")?;
         }
         let combined = format!("{}:{}", scratch.display(), local_cfg.display());
-        let out = Command::new("kubectl")
+        let out = kubectl_cmd()
             .args(["config", "view", "--raw", "--flatten"])
             .env("KUBECONFIG", combined)
             .stdin(Stdio::null())
@@ -482,7 +512,7 @@ pub fn remove_kubeconfig(home: &Path, ctx: &str) {
         return;
     }
     for sub in ["delete-context", "delete-cluster", "delete-user"] {
-        let _ = Command::new("kubectl")
+        let _ = kubectl_cmd()
             .args(["config", sub, ctx])
             .env("KUBECONFIG", &user_cfg)
             .stdin(Stdio::null())

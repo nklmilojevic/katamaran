@@ -211,39 +211,48 @@ impl K8s {
 
     fn install(&self, conn: &mut UnixStream, version: &str) -> Result<(), String> {
         let _guard = self.op_lock.lock().unwrap();
+        if self.state.lock().unwrap().running.is_some() {
+            return Err("stop Kubernetes before installing a new k3s binary".into());
+        }
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress(format!("installing k3s {version}")),
         );
         fs::create_dir_all(BIN_DIR).map_err(|e| format!("create {BIN_DIR}: {e}"))?;
         let tmp = format!("{BIN}.tmp");
-        let mut f = File::create(&tmp).map_err(|e| format!("create {tmp}: {e}"))?;
-        loop {
-            match k8s::read(&mut *conn).map_err(|e| format!("read binary stream: {e}"))? {
-                Some(K8sMsg::Data(chunk)) => {
-                    f.write_all(&chunk)
-                        .map_err(|e| format!("write {tmp}: {e}"))?;
-                }
-                Some(K8sMsg::DataEnd) => break,
-                Some(other) => {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(format!("expected Data/DataEnd, got {other:?}"));
-                }
-                None => {
-                    let _ = fs::remove_file(&tmp);
-                    return Err("unexpected EOF while receiving k3s binary".into());
+        let _ = fs::remove_file(&tmp);
+        let res = (|| -> Result<(), String> {
+            let mut f = File::create(&tmp).map_err(|e| format!("create {tmp}: {e}"))?;
+            loop {
+                match k8s::read(&mut *conn).map_err(|e| format!("read binary stream: {e}"))? {
+                    Some(K8sMsg::Data(chunk)) => {
+                        f.write_all(&chunk)
+                            .map_err(|e| format!("write {tmp}: {e}"))?;
+                    }
+                    Some(K8sMsg::DataEnd) => break,
+                    Some(other) => {
+                        return Err(format!("expected Data/DataEnd, got {other:?}"));
+                    }
+                    None => {
+                        return Err("unexpected EOF while receiving k3s binary".into());
+                    }
                 }
             }
+            f.sync_all().map_err(|e| format!("sync {tmp}: {e}"))?;
+            drop(f);
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod {tmp}: {e}"))?;
+            fs::rename(&tmp, BIN).map_err(|e| format!("install {BIN}: {e}"))?;
+            fs::write(VERSION_FILE, format!("{version}\n"))
+                .map_err(|e| format!("write {VERSION_FILE}: {e}"))?;
+            Ok(())
+        })();
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        } else {
+            log(&format!("installed k3s {version}"));
         }
-        f.sync_all().map_err(|e| format!("sync {tmp}: {e}"))?;
-        drop(f);
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod {tmp}: {e}"))?;
-        fs::rename(&tmp, BIN).map_err(|e| format!("install {BIN}: {e}"))?;
-        fs::write(VERSION_FILE, format!("{version}\n"))
-            .map_err(|e| format!("write {VERSION_FILE}: {e}"))?;
-        log(&format!("installed k3s {version}"));
-        Ok(())
+        res
     }
 
     fn start_inner(&self, conn: &mut UnixStream) -> Result<K8sInfo, String> {
@@ -305,10 +314,14 @@ impl K8s {
         .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
         .stderr(log_file);
 
-        let (pid, status_rx) = self
-            .reaper
-            .spawn(&mut cmd)
-            .map_err(|e| format!("spawn k3s: {e}"))?;
+        enable_bridge_netfilter();
+        let (pid, status_rx) = match self.reaper.spawn(&mut cmd) {
+            Ok(v) => v,
+            Err(e) => {
+                restore_bridge_netfilter();
+                return Err(format!("spawn k3s: {e}"));
+            }
+        };
         let exited = Arc::new(Mutex::new(None));
         let (exit_tx, exit_rx) = mpsc::channel();
         let sync_stop = Arc::new(AtomicBool::new(false));
@@ -448,6 +461,11 @@ impl K8s {
 
     fn stop_inner(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
         let _guard = self.op_lock.lock().unwrap();
+        self.stop_locked(conn)
+    }
+
+    /// Caller must hold `self.op_lock`.
+    fn stop_locked(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
         let (running, needs_cleanup) = {
             let mut st = self.state.lock().unwrap();
             let needs_cleanup = st.running.is_some() || st.phase != "stopped";
@@ -481,8 +499,8 @@ impl K8s {
     }
 
     fn reset_inner(&self, conn: &mut UnixStream) -> Result<(), String> {
-        self.stop_inner(Some(conn))?;
         let _guard = self.op_lock.lock().unwrap();
+        self.stop_locked(Some(&mut *conn))?;
         let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
         if Path::new(DATA_DIR).exists() {
             // Try btrfs subvolume delete first (instant if it is a subvolume),
@@ -586,9 +604,6 @@ fn prepare_dirs_and_sysctls(reaper: &Reaper) -> Result<(), String> {
     ensure_symlink("/etc/cni/net.d", &cni_conf_target)?;
     ensure_symlink("/opt/cni/bin", &format!("{DATA_DIR}/data/current/bin"))?;
 
-    // Enable IP forwarding and bridge netfilter while k3s is active,
-    // preserving prior bridge-nf values so stop restores them accurately.
-    enable_bridge_netfilter();
     Ok(())
 }
 

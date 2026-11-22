@@ -253,11 +253,13 @@ impl DockerStack {
     /// Restart containerd cleanly (without reporting a failure or backoff)
     /// so config changes such as enabling CRI take effect on demand.
     pub fn restart_containerd(&self) {
-        self.inner
-            .reloading_containerd
-            .store(true, Ordering::SeqCst);
         let services = self.inner.services.lock().unwrap();
-        if let Some(s) = &services[CONTAINERD] {
+        if let Some(s) = &services[CONTAINERD]
+            && !s.has_exited()
+        {
+            self.inner
+                .reloading_containerd
+                .store(true, Ordering::SeqCst);
             s.stop(STOP_TIMEOUT[CONTAINERD]);
         }
     }
