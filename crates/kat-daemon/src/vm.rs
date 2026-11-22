@@ -70,8 +70,15 @@ fn handshake(
     child: &mut Child,
     timeout: Duration,
 ) -> anyhow::Result<(UnixStream, Hello)> {
-    let mut conn = accept_guest(listener, child, timeout)?;
+    let deadline = Instant::now() + timeout;
+    let mut conn = accept_guest(listener, child, deadline, timeout)?;
     conn.set_nonblocking(false)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("guest handshake timed out after {}s", timeout.as_secs());
+    }
+    conn.set_read_timeout(Some(remaining))?;
+    conn.set_write_timeout(Some(remaining))?;
     let hello = match read_msg(&mut conn)? {
         Some(Msg::Hello(h)) => h,
         Some(other) => bail!("expected Hello, got {other:?}"),
@@ -83,12 +90,19 @@ fn handshake(
             hello.protocol
         );
     }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("guest handshake timed out after {}s", timeout.as_secs());
+    }
+    conn.set_write_timeout(Some(remaining))?;
     write_msg(
         &mut conn,
         &Msg::SetTime {
             unix_ns: unix_now_ns(),
         },
     )?;
+    conn.set_read_timeout(None)?;
+    conn.set_write_timeout(None)?;
     Ok((conn, hello))
 }
 
@@ -102,12 +116,21 @@ impl RunningVm {
     }
 }
 
+impl Drop for RunningVm {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 fn accept_guest(
     listener: &UnixListener,
     child: &mut Child,
+    deadline: Instant,
     timeout: Duration,
 ) -> anyhow::Result<UnixStream> {
-    let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
             Ok((conn, _)) => return Ok(conn),
@@ -132,6 +155,7 @@ pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> anyhow::Result
         }
         if Instant::now() >= deadline {
             child.kill().ok();
+            child.wait().ok();
             bail!("VM did not power off within {}s", timeout.as_secs());
         }
         thread::sleep(Duration::from_micros(200));
@@ -141,7 +165,9 @@ pub fn wait_with_timeout(child: &mut Child, timeout: Duration) -> anyhow::Result
 pub fn vm_bin(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     match explicit {
         Some(p) => Ok(p.to_path_buf()),
-        None => Ok(std::env::current_exe()?.with_file_name("katamaran-vm")),
+        None => Ok(std::env::current_exe()?
+            .canonicalize()?
+            .with_file_name("katamaran-vm")),
     }
 }
 

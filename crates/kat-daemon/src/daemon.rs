@@ -14,6 +14,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -40,6 +41,32 @@ const STATS_HISTORY: usize = 150;
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rotate `daemon.log` at startup beyond this size.
 const LOG_ROTATE_BYTES: u64 = 4 << 20;
+/// Maximum concurrent client connections served by the daemon socket.
+const MAX_CLIENTS: usize = 128;
+const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
+
+struct ClientGuard(Arc<AtomicUsize>);
+
+impl ClientGuard {
+    fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let mut cur = counter.load(Ordering::Acquire);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(ClientGuard(counter.clone())),
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 #[derive(clap::Args)]
 pub struct DaemonArgs {
@@ -125,13 +152,30 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
         dlog!("start: {e}");
     }
 
+    let active_clients = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(conn) => {
+                let Some(guard) = ClientGuard::try_acquire(&active_clients, MAX_CLIENTS) else {
+                    dlog!("rejecting client: connection limit ({MAX_CLIENTS}) reached");
+                    continue;
+                };
                 let d = d.clone();
-                thread::spawn(move || d.serve(conn));
+                if let Err(e) =
+                    thread::Builder::new()
+                        .name("daemon-client".into())
+                        .spawn(move || {
+                            let _guard = guard;
+                            d.serve(conn);
+                        })
+                {
+                    dlog!("spawn client thread: {e}");
+                }
             }
-            Err(e) => dlog!("accept: {e}"),
+            Err(e) => {
+                dlog!("accept: {e}");
+                thread::sleep(ACCEPT_ERR_BACKOFF);
+            }
         }
     }
     drop(lock);
@@ -141,6 +185,8 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
 pub struct Daemon {
     home: PathBuf,
     inner: Mutex<Inner>,
+    /// Serializes config read-modify-write updates in [`Self::set_config`].
+    config_lock: Mutex<()>,
     k8s: Mutex<K8sRuntime>,
     /// Serializes Kubernetes start/stop/reset/toggle operations so rapid
     /// preference changes cannot race or overwrite newer user choices.
@@ -249,6 +295,7 @@ impl Daemon {
                 generation: 0,
                 exiting: false,
             }),
+            config_lock: Mutex::new(()),
             k8s: Mutex::new(K8sRuntime::default()),
             k8s_op: Mutex::new(()),
             changed: Condvar::new(),
@@ -289,6 +336,8 @@ impl Daemon {
         } else {
             crate::nfs::mount_point(args.mount.as_deref())
         };
+        let prev_state = g.state;
+        let prev_error = g.error.clone();
         g.generation += 1;
         let generation = g.generation;
         g.error = None;
@@ -303,13 +352,19 @@ impl Daemon {
             cfg.memory_mib
         );
         let d = self.clone();
-        thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("vm-supervisor".into())
             .spawn(move || {
                 let result = run::run_vm(&args, rx, &mut |e| d.on_event(generation, e));
                 d.on_exit(generation, result);
             })
-            .map_err(|e| e.to_string())?;
+        {
+            g.control = None;
+            g.run = None;
+            g.error = prev_error;
+            self.set_state(&mut g, prev_state);
+            return Err(e.to_string());
+        }
         Ok(())
     }
 
@@ -638,21 +693,25 @@ impl Daemon {
         self: &Arc<Self>,
         values: &std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<ConfigView> {
-        let mut cfg = Config::load(&self.home)?;
-        let host = Host::current();
-        let before = cfg.launch_at_login;
-        let before_k8s = cfg.kubernetes;
-        for (k, v) in values {
-            cfg.set(k, v, &host)?;
-        }
-        cfg.save(&self.home)?;
-        dlog!("config saved: {values:?}");
-        if cfg.launch_at_login != before {
-            crate::setup::set_run_at_load(cfg.launch_at_login)?;
-        }
-        if cfg.kubernetes != before_k8s && self.lock().state == VmState::Running {
+        let (cfg_kubernetes, before_k8s) = {
+            let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = Config::load(&self.home)?;
+            let host = Host::current();
+            let before = cfg.launch_at_login;
+            let before_k8s = cfg.kubernetes;
+            for (k, v) in values {
+                cfg.set(k, v, &host)?;
+            }
+            cfg.save(&self.home)?;
+            dlog!("config saved: {values:?}");
+            if cfg.launch_at_login != before {
+                crate::setup::set_run_at_load(cfg.launch_at_login, self.launchd_label.as_deref())?;
+            }
+            (cfg.kubernetes, before_k8s)
+        };
+        if cfg_kubernetes != before_k8s && self.lock().state == VmState::Running {
             let d = self.clone();
-            let enable = cfg.kubernetes;
+            let enable = cfg_kubernetes;
             thread::Builder::new()
                 .name("k8s-toggle".into())
                 .spawn(move || {
@@ -762,7 +821,7 @@ impl Daemon {
             if let Call::MachineCreate(c) = &call {
                 let mut progress = |m: &str| {
                     let _ = send(
-                        &mut out.try_clone().unwrap(),
+                        &mut out,
                         &api::Notification {
                             jsonrpc: api::VERSION.into(),
                             method: "machine.progress".into(),
@@ -1294,7 +1353,7 @@ pub fn read_log(path: &Path, p: &LogsParams) -> anyhow::Result<LogChunk> {
     let len = f.metadata()?.len();
     let (start, keep_lines) = match p.offset {
         // The file was recreated (the console log is, at every start).
-        Some(off) if off > len => (0, None),
+        Some(off) if off > len => (len.saturating_sub(MAX_CHUNK), None),
         Some(off) => (off.max(len.saturating_sub(MAX_CHUNK)), None),
         None => (len.saturating_sub(MAX_CHUNK), Some(p.lines.unwrap_or(200))),
     };
@@ -1540,6 +1599,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!((again.data.as_str(), again.offset), ("new\n", 4));
+
+        // Recreated file larger than MAX_CHUNK with offset > len is capped to MAX_CHUNK.
+        let big_len = MAX_CHUNK as usize + 1024;
+        fs::write(&path, vec![b'a'; big_len]).unwrap();
+        let capped = read_log(
+            &path,
+            &LogsParams {
+                offset: Some(big_len as u64 + 100),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.data.len(), MAX_CHUNK as usize);
+        assert_eq!(capped.offset, big_len as u64);
         fs::remove_dir_all(&dir).unwrap();
     }
 

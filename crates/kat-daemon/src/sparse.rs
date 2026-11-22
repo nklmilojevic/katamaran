@@ -84,35 +84,47 @@ pub fn unpack(packed: &Path, dest: &Path) -> anyhow::Result<()> {
     }
     let size = read_u64(&mut r)?.context("truncated header")?;
     let tmp = dest.with_extension("img.tmp");
-    let mut out = File::create(&tmp)?;
-    out.set_len(size)?;
-    let mut buf = vec![0u8; 1 << 20];
-    while let Some(off) = read_u64(&mut r)? {
-        let len = read_u64(&mut r)?.context("truncated record")?;
-        if off.checked_add(len).is_none_or(|end| end > size) {
-            bail!("record beyond the image size");
+    let res = (|| -> anyhow::Result<()> {
+        let mut out = File::create(&tmp)?;
+        out.set_len(size)?;
+        let mut buf = vec![0u8; 1 << 20];
+        while let Some(off) = read_u64(&mut r)? {
+            let len = read_u64(&mut r)?.context("truncated record")?;
+            if off.checked_add(len).is_none_or(|end| end > size) {
+                bail!("record beyond the image size");
+            }
+            out.seek(SeekFrom::Start(off))?;
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(buf.len() as u64) as usize;
+                r.read_exact(&mut buf[..n])?;
+                out.write_all(&buf[..n])?;
+                left -= n as u64;
+            }
         }
-        out.seek(SeekFrom::Start(off))?;
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(buf.len() as u64) as usize;
-            r.read_exact(&mut buf[..n])?;
-            out.write_all(&buf[..n])?;
-            left -= n as u64;
-        }
+        out.sync_all()?;
+        fs::rename(&tmp, dest)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    out.sync_all()?;
-    fs::rename(&tmp, dest)?;
-    Ok(())
+    res
 }
 
 fn read_u64(r: &mut impl Read) -> io::Result<Option<u64>> {
     let mut b = [0u8; 8];
-    match r.read_exact(&mut b) {
-        Ok(()) => Ok(Some(u64::from_le_bytes(b))),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e),
+    loop {
+        match r.read(&mut b[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(_) => unreachable!(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
+    r.read_exact(&mut b[1..])?;
+    Ok(Some(u64::from_le_bytes(b)))
 }
 
 #[cfg(test)]
@@ -156,6 +168,36 @@ mod tests {
             assert_eq!(x, y, "byte {off}");
         }
         assert!(unpack(&src, &dir.join("bad.img")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_truncated_trailing_records_and_cleans_up_tmp() {
+        let dir = std::env::temp_dir().join(format!("kat-sparse-trunc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 0 trailing bytes after header is valid EOF.
+        let mut empty: &[u8] = &[];
+        assert_eq!(read_u64(&mut empty).unwrap(), None);
+
+        // 1..=7 trailing bytes must fail with UnexpectedEof and remove the temp file.
+        for trailing in 1..=7usize {
+            let packed = dir.join(format!("trunc-{trailing}.sparse"));
+            let mut data = Vec::new();
+            data.extend_from_slice(MAGIC);
+            data.extend_from_slice(&4096u64.to_le_bytes());
+            data.extend_from_slice(&vec![0xabu8; trailing]);
+            fs::write(&packed, &data).unwrap();
+
+            let dest = dir.join(format!("out-{trailing}.img"));
+            let err = unpack(&packed, &dest).unwrap_err();
+            let io_err = err.downcast_ref::<io::Error>().expect("io error");
+            assert_eq!(io_err.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(!dest.exists());
+            assert!(!dest.with_extension("img.tmp").exists());
+        }
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

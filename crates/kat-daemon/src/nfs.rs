@@ -28,6 +28,9 @@ use std::ffi::CString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -221,10 +224,15 @@ pub fn mount_args(port: u16) -> Vec<u8> {
 pub fn port_file(run_dir: &Path) -> anyhow::Result<PathBuf> {
     let dir = run_dir.join("nfs");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    if std::fs::symlink_metadata(&dir)?.uid() != unsafe { libc::getuid() } {
+    let meta =
+        std::fs::symlink_metadata(&dir).with_context(|| format!("inspect {}", dir.display()))?;
+    if !meta.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    if meta.uid() != unsafe { libc::getuid() } {
         bail!("{} belongs to another user", dir.display());
     }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir.join("nfs.port"))
 }
 
@@ -361,18 +369,39 @@ pub fn recover(dir: &Path, port_file: &Path) -> anyhow::Result<bool> {
 /// Mount the export on `dir`, creating it if needed. Refuses a directory
 /// with files of its own in it (Finder's litter aside): `~/katamaran` is the
 /// same folder on a case-insensitive disk.
+#[allow(dead_code)]
 pub fn mount(dir: &Path, port_file: &Path) -> anyhow::Result<Duration> {
+    mount_cancellable(dir, port_file, &AtomicBool::new(false))
+}
+
+/// Like [`mount`], but aborts promptly if `cancel` becomes `true`.
+pub fn mount_cancellable(
+    dir: &Path,
+    port_file: &Path,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Duration> {
     let t = Instant::now();
+    if cancel.load(Ordering::Acquire) {
+        bail!("mount cancelled");
+    }
     recover(dir, port_file)?;
     check_folder(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let port = read_port(port_file)?;
-    if let Err(e) = mount_syscall(dir, port) {
-        eprintln!(
-            "katamaran: mount(2) of {} failed, trying mount_nfs: {e:#}",
-            dir.display()
-        );
-        mount_nfs(dir, port)?;
+    if cancel.load(Ordering::Acquire) {
+        bail!("mount cancelled");
+    }
+    match mount_syscall(dir, port, cancel) {
+        Ok(()) => {}
+        Err(MountSyscallErr::Os(e)) => {
+            eprintln!(
+                "katamaran: mount(2) of {} failed, trying mount_nfs: {e:#}",
+                dir.display()
+            );
+            mount_nfs(dir, port, cancel)?;
+        }
+        Err(MountSyscallErr::TimedOut(e)) => return Err(e),
+        Err(MountSyscallErr::Cancelled) => bail!("mount cancelled"),
     }
     if !mounted_at(dir).is_some_and(|m| m.is_ours(port_file)) {
         bail!("mounted but {} is not ours", dir.display());
@@ -380,16 +409,26 @@ pub fn mount(dir: &Path, port_file: &Path) -> anyhow::Result<Duration> {
     Ok(t.elapsed())
 }
 
+enum MountSyscallErr {
+    Os(anyhow::Error),
+    TimedOut(anyhow::Error),
+    Cancelled,
+}
+
 /// Mount with `mount(2)`, which, unlike `mount_nfs`, can name the source.
 /// It runs on its own thread so that a server that never answers costs
 /// [`MOUNT_TIMEOUT`], not the daemon.
-fn mount_syscall(dir: &Path, port: u16) -> anyhow::Result<()> {
-    let on = dir
+fn mount_syscall(dir: &Path, port: u16, cancel: &AtomicBool) -> Result<(), MountSyscallErr> {
+    let on_path = dir
         .canonicalize()
-        .with_context(|| format!("resolve {}", dir.display()))?;
-    let on = CString::new(on.into_os_string().into_encoded_bytes())?;
+        .with_context(|| format!("resolve {}", dir.display()))
+        .map_err(MountSyscallErr::Os)?;
+    let on = CString::new(on_path.clone().into_os_string().into_encoded_bytes())
+        .map_err(|e| MountSyscallErr::Os(e.into()))?;
     let args = mount_args(port);
     let (tx, rx) = std::sync::mpsc::channel();
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let abandoned_bg = abandoned.clone();
     std::thread::Builder::new()
         .name("nfs-mount".into())
         .spawn(move || {
@@ -401,19 +440,53 @@ fn mount_syscall(dir: &Path, port: u16) -> anyhow::Result<()> {
                     args.as_ptr() as *mut libc::c_void,
                 )
             };
-            let _ = tx.send(if r == 0 {
-                Ok(())
+            if r == 0 {
+                if abandoned_bg.load(Ordering::SeqCst) {
+                    let _ = unmount_now(&on_path, true);
+                    return;
+                }
+                if tx.send(Ok(())).is_err() {
+                    let _ = unmount_now(&on_path, true);
+                }
             } else {
-                Err(std::io::Error::last_os_error())
-            });
-        })?;
-    match rx.recv_timeout(MOUNT_TIMEOUT) {
-        Ok(r) => Ok(r?),
-        Err(_) => bail!("mount(2) did not finish in {}s", MOUNT_TIMEOUT.as_secs()),
+                let _ = tx.send(Err(std::io::Error::last_os_error()));
+            }
+        })
+        .map_err(|e| MountSyscallErr::Os(e.into()))?;
+    let deadline = Instant::now() + MOUNT_TIMEOUT;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            abandoned.store(true, Ordering::SeqCst);
+            if rx.try_recv().is_ok_and(|res| res.is_ok()) {
+                let _ = unmount_now(dir, true);
+            }
+            return Err(MountSyscallErr::Cancelled);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            abandoned.store(true, Ordering::SeqCst);
+            if rx.try_recv().is_ok_and(|res| res.is_ok()) {
+                let _ = unmount_now(dir, true);
+            }
+            return Err(MountSyscallErr::TimedOut(anyhow::anyhow!(
+                "mount(2) did not finish in {}s",
+                MOUNT_TIMEOUT.as_secs()
+            )));
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => return Err(MountSyscallErr::Os(e.into())),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(MountSyscallErr::Os(anyhow::anyhow!(
+                    "mount(2) thread exited unexpectedly"
+                )));
+            }
+        }
     }
 }
 
-fn mount_nfs(dir: &Path, port: u16) -> anyhow::Result<()> {
+fn mount_nfs(dir: &Path, port: u16, cancel: &AtomicBool) -> anyhow::Result<()> {
     let mut child = Command::new("/sbin/mount_nfs")
         .arg("-o")
         .arg(options(port))
@@ -428,6 +501,11 @@ fn mount_nfs(dir: &Path, port: u16) -> anyhow::Result<()> {
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
+        }
+        if cancel.load(Ordering::Acquire) {
+            child.kill().ok();
+            child.wait().ok();
+            bail!("mount_nfs cancelled");
         }
         if Instant::now() >= deadline {
             child.kill().ok();
@@ -472,10 +550,20 @@ fn check_folder(dir: &Path) -> anyhow::Result<()> {
 /// something (a shell's cwd, an open Finder window) keeps it busy, because
 /// the server is about to go away. Returns whether a mount was removed.
 pub fn unmount(dir: &Path, port_file: &Path) -> anyhow::Result<bool> {
+    unmount_impl(dir, port_file, false)
+}
+
+/// Force-unmount our mount on `dir` immediately (for when the VM has already
+/// died and a polite unmount would stall against a dead server).
+pub fn unmount_force(dir: &Path, port_file: &Path) -> anyhow::Result<bool> {
+    unmount_impl(dir, port_file, true)
+}
+
+fn unmount_impl(dir: &Path, port_file: &Path, force: bool) -> anyhow::Result<bool> {
     if !mounted_at(dir).is_some_and(|m| m.is_ours(port_file)) {
         return Ok(false);
     }
-    if unmount_now(dir, false).is_err() {
+    if force || unmount_now(dir, false).is_err() {
         unmount_now(dir, true)?;
     }
     Ok(true)
@@ -671,5 +759,19 @@ mod tests {
         std::fs::write(&p, "51234\n").unwrap();
         assert_eq!(read_port(&p).unwrap(), 51234);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn port_file_rejects_symlink_directory() {
+        let d = std::env::temp_dir().join(format!("kat-nfs-sym-{}", std::process::id()));
+        let target = std::env::temp_dir().join(format!("kat-nfs-sym-t-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, d.join("nfs")).unwrap();
+        assert!(port_file(&d).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
     }
 }

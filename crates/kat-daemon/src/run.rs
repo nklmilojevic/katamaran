@@ -5,6 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -119,6 +121,10 @@ enum Input {
     /// control channel closed.
     Guest(u64, Option<Msg>),
     Control(Control),
+    /// Result of applying a port forward change for VM session `.0`.
+    Forward(u64, net::Event),
+    /// Result of mounting the guest's NFS share for VM session `.0`.
+    Mounted(u64, PathBuf, Result<Duration, String>),
 }
 
 /// How a VM session ended.
@@ -277,6 +283,9 @@ fn session(
     {
         println!("katamaran: removed a stale mount at {}", dir.display());
     }
+    if let Some(port) = &nfs_port {
+        let _ = fs::remove_file(port);
+    }
     let console_log = logs.join("console.log");
     File::create(&console_log)?;
 
@@ -285,13 +294,14 @@ fn session(
     } else {
         // gvproxy in the VM process when built as a library, unless a
         // gvproxy binary was asked for.
-        let library = std::env::current_exe()?.with_file_name("libgvproxy.dylib");
+        let exe = std::env::current_exe()?.canonicalize()?;
+        let library = exe.with_file_name("libgvproxy.dylib");
         let log = logs.join("gvproxy.log");
         Some(match &args.gvproxy {
             None if library.is_file() => Gvproxy::in_process(&library, &run_dir, &log, args.mtu)?,
             Some(bin) => Gvproxy::start(bin, &run_dir, &log, args.mtu)?,
             None => {
-                let bin = std::env::current_exe()?.with_file_name("gvproxy");
+                let bin = exe.with_file_name("gvproxy");
                 Gvproxy::start(&bin, &run_dir, &log, args.mtu)?
             }
         })
@@ -410,22 +420,30 @@ fn session(
     fs::write(&pid_file, format!("{vm_pid}\n"))?;
 
     let forwarder = match &gvproxy {
-        Some(g) => Some(net::spawn_forwarder(GvproxyApi {
-            socket: g.api_socket.clone(),
-            guest: g.network().guest_ip,
-        })?),
+        Some(g) => {
+            let fwd_tx = tx.clone();
+            Some(net::spawn_forwarder(
+                GvproxyApi {
+                    socket: g.api_socket.clone(),
+                    guest: g.network().guest_ip,
+                },
+                move |e| {
+                    let _ = fwd_tx.send(Input::Forward(id, e));
+                },
+            )?)
+        }
         None => None,
     };
 
+    let control = lifecycle::Control::new(&running.conn)?;
     // File changes on the Mac, for the paths guest processes watch.
     let shares = cfg
         .shares
         .iter()
         .map(|s| (s.guest_path.clone(), s.host_path.clone()))
         .collect();
-    let watcher = crate::fswatch::Watcher::start(shares, running.conn.try_clone()?);
+    let watcher = crate::fswatch::Watcher::start(shares, control.clone());
 
-    let control = lifecycle::Control::new(&running.conn)?;
     let clock = ClockSync::start(control.clone())?;
     let watchdog = Watchdog::start(control.clone())?;
 
@@ -453,10 +471,16 @@ fn session(
 
     let mut auto_forwards = crate::autofwd::AutoForwards::new(&autofwd_sock);
     let mut mounted = false;
+    let mut paused = false;
+    let mount_cancel = Arc::new(AtomicBool::new(false));
+    let mut mount_task: Option<thread::JoinHandle<()>> = None;
     let end = loop {
         match rx.recv() {
-            // From an earlier session's reader.
-            Ok(Input::Guest(from, _)) if from != id => {}
+            // From an earlier session's reader or worker.
+            Ok(Input::Guest(from, _))
+            | Ok(Input::Forward(from, _))
+            | Ok(Input::Mounted(from, _, _))
+                if from != id => {}
             Ok(Input::Guest(_, Some(Msg::ServiceReady { name, .. }))) => {
                 println!(
                     "katamaran: {name} ready after {}",
@@ -469,19 +493,20 @@ fn session(
                 if docker {
                     mounted = true;
                     println!("  export DOCKER_HOST=unix://{}", docker_sock.display());
-                    if let Some((dir, port_file)) = &files {
-                        match nfs::mount(dir, port_file) {
-                            Ok(t) => {
-                                println!(
-                                    "katamaran: files mounted at {} in {}",
-                                    dir.display(),
-                                    ms(t)
-                                );
-                                on_event(Event::Mounted(dir.clone()));
-                            }
+                    if let Some((dir, port_file)) = files.clone() {
+                        let tx = tx.clone();
+                        let cancel = mount_cancel.clone();
+                        match thread::Builder::new().name("nfs-mount-task".into()).spawn(
+                            move || {
+                                let res = nfs::mount_cancellable(&dir, &port_file, &cancel)
+                                    .map_err(|e| format!("{e:#}"));
+                                let _ = tx.send(Input::Mounted(id, dir, res));
+                            },
+                        ) {
+                            Ok(h) => mount_task = Some(h),
                             Err(e) => {
-                                eprintln!("katamaran: files not mounted: {e:#}");
-                                on_event(Event::MountFailed(format!("{e:#}")));
+                                eprintln!("katamaran: files not mounted: {e}");
+                                on_event(Event::MountFailed(e.to_string()));
                             }
                         }
                     }
@@ -492,6 +517,21 @@ fn session(
                     }
                 }
             }
+            Ok(Input::Mounted(_, dir, res)) => {
+                if let Some(h) = mount_task.take() {
+                    let _ = h.join();
+                }
+                match res {
+                    Ok(t) => {
+                        println!("katamaran: files mounted at {} in {}", dir.display(), ms(t));
+                        on_event(Event::Mounted(dir));
+                    }
+                    Err(e) => {
+                        eprintln!("katamaran: files not mounted: {e}");
+                        on_event(Event::MountFailed(e));
+                    }
+                }
+            }
             Ok(Input::Guest(_, Some(Msg::ServiceFailed { name, error }))) => {
                 eprintln!("katamaran: {name} failed: {error}");
                 on_event(Event::ServiceFailed(name, error));
@@ -499,15 +539,23 @@ fn session(
             Ok(Input::Guest(_, Some(Msg::PortAdd { proto, port }))) => {
                 if let Some(f) = &forwarder {
                     let _ = f.send(PortChange::Add(proto, port));
-                    on_event(Event::PortAdd(proto, port));
                 }
             }
             Ok(Input::Guest(_, Some(Msg::PortRemove { proto, port }))) => {
                 if let Some(f) = &forwarder {
                     let _ = f.send(PortChange::Remove(proto, port));
-                    on_event(Event::PortRemove(proto, port));
                 }
             }
+            Ok(Input::Forward(_, net::Event::Forwarded(proto, port))) => {
+                on_event(Event::PortAdd(proto, port));
+            }
+            Ok(Input::Forward(
+                _,
+                net::Event::Removed(proto, port) | net::Event::RemoveFailed(proto, port, _),
+            )) => {
+                on_event(Event::PortRemove(proto, port));
+            }
+            Ok(Input::Forward(_, net::Event::Refused(..) | net::Event::Transient(..))) => {}
             Ok(Input::Guest(_, Some(Msg::AutoForwardAdd { proto, port }))) => {
                 match auto_forwards.add(port) {
                     Ok(true) => {
@@ -559,10 +607,11 @@ fn session(
                     println!("katamaran: the Mac woke up");
                 }
                 // Before the ack: the Mac sleeps once it has it.
-                if args.pause_on_sleep
-                    && let Err(e) = lifecycle::set_vm_paused(vm_pid as i32, sleeping)
-                {
-                    eprintln!("katamaran: pause={sleeping}: {e}");
+                if args.pause_on_sleep {
+                    match lifecycle::set_vm_paused(vm_pid as i32, sleeping) {
+                        Ok(_) => paused = sleeping,
+                        Err(e) => eprintln!("katamaran: pause={sleeping}: {e}"),
+                    }
                 }
                 watchdog.set_paused(sleeping);
                 if !sleeping {
@@ -576,7 +625,14 @@ fn session(
                 watcher.stop();
                 watchdog.stop();
                 println!("katamaran: shutting down");
-                unmount(files.as_ref());
+                if paused && let Err(e) = lifecycle::set_vm_paused(vm_pid as i32, false) {
+                    eprintln!("katamaran: resume before shutdown: {e}");
+                }
+                mount_cancel.store(true, Ordering::Release);
+                if let Some(h) = mount_task.take() {
+                    let _ = h.join();
+                }
+                unmount(files.as_ref(), false);
                 // A stop must never turn into a restart, so failures here
                 // are reported, not returned.
                 let t = Instant::now();
@@ -595,7 +651,11 @@ fn session(
             Ok(Input::Guest(_, None)) => {
                 watcher.stop();
                 watchdog.stop();
-                unmount(files.as_ref());
+                mount_cancel.store(true, Ordering::Release);
+                if let Some(h) = mount_task.take() {
+                    let _ = h.join();
+                }
+                unmount(files.as_ref(), true);
                 // The disk must be closed before a new VM opens it.
                 let status = vm::wait_with_timeout(&mut running.child, Duration::from_secs(10))
                     .map_or_else(|e| format!("{e:#}"), |s| s.to_string());
@@ -614,11 +674,16 @@ fn session(
 
 /// Unmount the guest's files before the guest goes away, so nothing on the
 /// Mac is left waiting on a dead server.
-fn unmount(files: Option<&(PathBuf, PathBuf)>) {
+fn unmount(files: Option<&(PathBuf, PathBuf)>, force: bool) {
     let Some((dir, port_file)) = files else {
         return;
     };
-    match nfs::unmount(dir, port_file) {
+    let res = if force {
+        nfs::unmount_force(dir, port_file)
+    } else {
+        nfs::unmount(dir, port_file)
+    };
+    match res {
         Ok(true) => println!("katamaran: unmounted {}", dir.display()),
         Ok(false) => {}
         Err(e) => eprintln!("katamaran: unmount {}: {e:#}", dir.display()),
@@ -643,9 +708,13 @@ fn clone_template(template: &Path, dest: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let tmp = dest.with_extension("img.tmp");
-    fs::copy(template, &tmp)
-        .with_context(|| format!("clone {} to {}", template.display(), tmp.display()))?;
-    fs::rename(&tmp, dest)?;
+    let res = fs::copy(template, &tmp)
+        .with_context(|| format!("clone {} to {}", template.display(), tmp.display()))
+        .and_then(|_| fs::rename(&tmp, dest).map_err(anyhow::Error::from));
+    if let Err(e) = res {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     println!("katamaran: created data disk {}", dest.display());
     Ok(())
 }

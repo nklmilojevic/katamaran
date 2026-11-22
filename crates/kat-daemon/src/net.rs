@@ -100,10 +100,20 @@ impl Gvproxy {
         let child = Arc::new(Mutex::new(child));
         let stopping = Arc::new(AtomicBool::new(false));
         let watcher = {
-            let (child, stopping, log) = (child.clone(), stopping.clone(), log.to_path_buf());
-            thread::Builder::new()
+            let (watch_child, watch_stopping, watch_log) =
+                (child.clone(), stopping.clone(), log.to_path_buf());
+            match thread::Builder::new()
                 .name("gvproxy-watch".into())
-                .spawn(move || watch(&child, &stopping, &log))?
+                .spawn(move || watch(&watch_child, &watch_stopping, &watch_log))
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    let mut c = child.lock().unwrap();
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    return Err(e.into());
+                }
+            }
         };
         Ok(Gvproxy {
             child: Some(child),
@@ -295,10 +305,27 @@ fn write_token(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
+/// Why a forwarder API call failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardError {
+    /// gvproxy could not be reached yet (socket not up / transient I/O).
+    Transient(String),
+    /// gvproxy answered and refused the port (e.g. already in use).
+    Refused(String),
+}
+
+impl std::fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForwardError::Transient(m) | ForwardError::Refused(m) => f.write_str(m),
+        }
+    }
+}
+
 /// What the reconciler needs from gvproxy; a trait so tests can fake it.
 pub trait ForwardApi {
-    fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), String>;
-    fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), String>;
+    fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError>;
+    fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError>;
 }
 
 /// gvproxy's forwarder API over its `-services` Unix socket.
@@ -308,7 +335,7 @@ pub struct GvproxyApi {
 }
 
 impl ForwardApi for GvproxyApi {
-    fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), String> {
+    fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
         let body = format!(
             r#"{{"local":"127.0.0.1:{port}","remote":"{}:{port}","protocol":"{}"}}"#,
             self.guest,
@@ -317,7 +344,7 @@ impl ForwardApi for GvproxyApi {
         post(&self.socket, "/services/forwarder/expose", &body)
     }
 
-    fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), String> {
+    fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
         let body = format!(
             r#"{{"local":"127.0.0.1:{port}","protocol":"{}"}}"#,
             proto.as_str()
@@ -326,7 +353,7 @@ impl ForwardApi for GvproxyApi {
     }
 }
 
-fn post(socket: &Path, path: &str, body: &str) -> Result<(), String> {
+fn post(socket: &Path, path: &str, body: &str) -> Result<(), ForwardError> {
     let send = || -> io::Result<String> {
         let mut s = UnixStream::connect(socket)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -335,8 +362,8 @@ fn post(socket: &Path, path: &str, body: &str) -> Result<(), String> {
         s.read_to_string(&mut resp)?;
         Ok(resp)
     };
-    let resp = send().map_err(|e| format!("gvproxy API: {e}"))?;
-    parse_response(&resp)
+    let resp = send().map_err(|e| ForwardError::Transient(format!("gvproxy API: {e}")))?;
+    parse_response(&resp).map_err(ForwardError::Refused)
 }
 
 fn http_post(path: &str, body: &str) -> String {
@@ -380,6 +407,7 @@ pub struct Forwards<A: ForwardApi> {
 pub enum Event {
     Forwarded(PortProto, u16),
     Refused(PortProto, u16, String),
+    Transient(PortProto, u16, String),
     Removed(PortProto, u16),
     RemoveFailed(PortProto, u16, String),
 }
@@ -403,10 +431,11 @@ impl<A: ForwardApi> Forwards<A> {
                 self.active.insert(key);
                 Some(Event::Forwarded(proto, port))
             }
-            Err(e) => {
+            Err(ForwardError::Refused(e)) => {
                 self.refused.insert(key, e.clone());
                 Some(Event::Refused(proto, port, e))
             }
+            Err(ForwardError::Transient(e)) => Some(Event::Transient(proto, port, e)),
         }
     }
 
@@ -420,7 +449,7 @@ impl<A: ForwardApi> Forwards<A> {
         }
         Some(match self.api.unexpose(proto, port) {
             Ok(()) => Event::Removed(proto, port),
-            Err(e) => Event::RemoveFailed(proto, port, e),
+            Err(e) => Event::RemoveFailed(proto, port, e.to_string()),
         })
     }
 
@@ -436,8 +465,11 @@ pub enum PortChange {
 }
 
 /// Apply guest port changes on a worker thread, so a slow gvproxy call never
-/// holds up the control loop.
-pub fn spawn_forwarder(api: GvproxyApi) -> anyhow::Result<Sender<PortChange>> {
+/// holds up the control loop. Reports each resulting [`Event`] to `on_event`.
+pub fn spawn_forwarder(
+    api: GvproxyApi,
+    mut on_event: impl FnMut(Event) + Send + 'static,
+) -> anyhow::Result<Sender<PortChange>> {
     let (tx, rx) = mpsc::channel::<PortChange>();
     thread::Builder::new()
         .name("port-forward".into())
@@ -450,6 +482,7 @@ pub fn spawn_forwarder(api: GvproxyApi) -> anyhow::Result<Sender<PortChange>> {
                 };
                 if let Some(e) = event {
                     report(&e);
+                    on_event(e);
                 }
             }
         })?;
@@ -463,6 +496,10 @@ fn report(e: &Event) {
         }
         Event::Refused(proto, port, why) => eprintln!(
             "katamaran: cannot forward 127.0.0.1:{port}/{} ({why}); skipped",
+            proto.as_str()
+        ),
+        Event::Transient(proto, port, why) => eprintln!(
+            "katamaran: transient error forwarding 127.0.0.1:{port}/{} ({why})",
             proto.as_str()
         ),
         Event::Removed(proto, port) => {
@@ -485,19 +522,27 @@ mod tests {
     #[derive(Default)]
     struct FakeApi {
         busy: BTreeSet<u16>,
+        transient: bool,
         calls: Vec<String>,
     }
 
     impl ForwardApi for &mut FakeApi {
-        fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), String> {
+        fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
             self.calls.push(format!("expose {port}/{}", proto.as_str()));
+            if self.transient {
+                return Err(ForwardError::Transient(
+                    "gvproxy API: connection refused".into(),
+                ));
+            }
             if self.busy.contains(&port) {
-                return Err("listen tcp 127.0.0.1: address already in use".into());
+                return Err(ForwardError::Refused(
+                    "listen tcp 127.0.0.1: address already in use".into(),
+                ));
             }
             Ok(())
         }
 
-        fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), String> {
+        fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
             self.calls
                 .push(format!("unexpose {port}/{}", proto.as_str()));
             Ok(())
@@ -545,6 +590,21 @@ mod tests {
         assert!(matches!(f.add(TCP, 5000), Some(Event::Refused(..))));
         drop(f);
         assert_eq!(api.calls, ["expose 5000/tcp", "expose 5000/tcp"]);
+    }
+
+    #[test]
+    fn transient_gvproxy_error_is_not_permanently_refused() {
+        let mut api = FakeApi {
+            transient: true,
+            ..Default::default()
+        };
+        let mut f = Forwards::new(&mut api);
+        assert!(matches!(
+            f.add(TCP, 8080),
+            Some(Event::Transient(TCP, 8080, _))
+        ));
+        f.api.transient = false;
+        assert_eq!(f.add(TCP, 8080), Some(Event::Forwarded(TCP, 8080)));
     }
 
     #[test]
@@ -640,7 +700,7 @@ mod tests {
         api.expose(TCP, port).unwrap();
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
         let again = api.expose(TCP, port).unwrap_err();
-        assert!(again.contains("already running"), "{again}");
+        assert!(again.to_string().contains("already running"), "{again}");
         api.unexpose(TCP, port).unwrap();
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
         gv.stop();

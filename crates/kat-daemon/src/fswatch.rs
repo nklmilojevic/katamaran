@@ -25,16 +25,16 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kat_proto::{FsEvent, FsOp, Msg, write_msg};
+use kat_proto::{FsEvent, FsOp, Msg};
 
 use crate::fsevents::{self, Stream, flag};
+use crate::lifecycle::Control;
 
 /// FSEvents' latency: changes within it arrive together.
 const LATENCY: f64 = 0.01;
@@ -69,7 +69,7 @@ enum Input {
 
 impl Watcher {
     /// `shares` maps guest paths to host paths. Events go out on `out`.
-    pub fn start(shares: Vec<(String, PathBuf)>, out: UnixStream) -> Watcher {
+    pub fn start(shares: Vec<(String, PathBuf)>, out: Control) -> Watcher {
         let (tx, rx) = mpsc::channel();
         let fs_tx = tx.clone();
         let thread = thread::Builder::new()
@@ -95,6 +95,10 @@ impl Watcher {
 
     /// Stop watching; no message is sent after this returns.
     pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
         let _ = self.tx.send(Input::Stop);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -102,7 +106,13 @@ impl Watcher {
     }
 }
 
-fn run(rx: &Receiver<Input>, fs_tx: Sender<Input>, mut st: State, mut out: UnixStream) {
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run(rx: &Receiver<Input>, fs_tx: Sender<Input>, mut st: State, out: Control) {
     let fs_tx = Arc::new(Mutex::new(fs_tx));
     let mut streams: HashMap<String, Stream> = HashMap::new();
     let mut update_at: Option<Instant> = None;
@@ -182,7 +192,7 @@ fn run(rx: &Receiver<Input>, fs_tx: Sender<Input>, mut st: State, mut out: UnixS
             let events = st.process(batch, &due, now);
             debug(format_args!("guest events {events:?}"));
             for chunk in events.chunks(BATCH) {
-                if write_msg(&mut out, &Msg::FsEvents(chunk.to_vec())).is_err() {
+                if out.send(&Msg::FsEvents(chunk.to_vec())).is_err() {
                     return;
                 }
             }
@@ -371,12 +381,24 @@ impl State {
                 "" => "",
                 r => r.strip_prefix('/')?,
             };
-            let host = if rest.is_empty() {
-                h.clone()
+            let mut rel = PathBuf::new();
+            for comp in Path::new(rest).components() {
+                match comp {
+                    Component::Normal(c) => rel.push(c),
+                    Component::CurDir => {}
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                        return None;
+                    }
+                }
+            }
+            let root = std::fs::canonicalize(h).ok()?;
+            let host = if rel.as_os_str().is_empty() {
+                root.clone()
             } else {
-                h.join(rest)
+                root.join(&rel)
             };
-            Some(std::fs::canonicalize(&host).unwrap_or(host))
+            let resolved = canonicalize_or_ancestor(&host)?;
+            resolved.starts_with(&root).then_some(resolved)
         })
     }
 
@@ -851,10 +873,36 @@ impl State {
     }
 }
 
+/// Canonicalize `path`, or its longest existing ancestor with the remaining
+/// non-existent normal components re-joined. Rejects dangling symlinks.
+fn canonicalize_or_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&cur) {
+            let mut resolved = canon;
+            for comp in tail.into_iter().rev() {
+                resolved.push(comp);
+            }
+            return Some(resolved);
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tail.push(cur.file_name()?.to_os_string());
+                if !cur.pop() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Write;
+    use std::os::unix::net::UnixStream;
 
     use kat_proto::read_msg;
 
@@ -1312,10 +1360,63 @@ mod tests {
     }
 
     #[test]
+    fn host_path_rejects_traversal_and_symlink_escapes() {
+        let share = Tmp::new("share");
+        let outside = Tmp::new("outside");
+        fs::create_dir_all(share.0.join("sub")).unwrap();
+        fs::write(share.0.join("sub/ok.txt"), "ok").unwrap();
+        fs::write(outside.0.join("secret.txt"), "secret").unwrap();
+
+        std::os::unix::fs::symlink(&outside.0, share.0.join("escape_dir")).unwrap();
+        std::os::unix::fs::symlink(outside.0.join("secret.txt"), share.0.join("escape_file"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            outside.0.join("does-not-exist"),
+            share.0.join("dangling_escape"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(share.0.join("sub"), share.0.join("inside_link")).unwrap();
+
+        let st = State::new(vec![("/g".into(), share.0.clone())]);
+
+        // Valid paths inside the share root.
+        assert_eq!(st.host_path("/g"), Some(share.0.clone()));
+        assert_eq!(
+            st.host_path("/g/sub/ok.txt"),
+            Some(share.0.join("sub/ok.txt"))
+        );
+        assert_eq!(
+            st.host_path("/g/sub/nonexistent"),
+            Some(share.0.join("sub/nonexistent"))
+        );
+        assert_eq!(
+            st.host_path("/g/inside_link/ok.txt"),
+            Some(share.0.join("sub/ok.txt"))
+        );
+
+        // ParentDir / RootDir traversal rejected.
+        assert_eq!(st.host_path("/g/.."), None);
+        assert_eq!(st.host_path("/g/../outside"), None);
+        assert_eq!(st.host_path("/g/sub/../../outside"), None);
+        assert_eq!(st.host_path("/g//etc/passwd"), None);
+
+        // Symlinks escaping outside the share root rejected (existing, non-existent leaf, dangling).
+        assert_eq!(st.host_path("/g/escape_dir"), None);
+        assert_eq!(st.host_path("/g/escape_dir/secret.txt"), None);
+        assert_eq!(st.host_path("/g/escape_dir/nonexistent"), None);
+        assert_eq!(st.host_path("/g/escape_file"), None);
+        assert_eq!(st.host_path("/g/dangling_escape"), None);
+        assert_eq!(st.host_path("/g/dangling_escape/child"), None);
+    }
+
+    #[test]
     fn watcher_sends_events_from_fsevents() {
         let t = Tmp::new("watcher");
         let (host, mut guest) = UnixStream::pair().unwrap();
-        let w = Watcher::start(vec![("/g".into(), t.0.clone())], host);
+        let w = Watcher::start(
+            vec![("/g".into(), t.0.clone())],
+            Control::new(&host).unwrap(),
+        );
         w.handle(Msg::FsWatch {
             id: 9,
             dir: true,

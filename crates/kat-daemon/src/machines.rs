@@ -9,6 +9,7 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -19,6 +20,7 @@ pub const SOCKET_NAME: &str = "machine.sock";
 const IMAGES: &str = "https://images.linuxcontainers.org";
 const ARCH: &str = "arm64";
 const VARIANT: &str = "default";
+static PART_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A machine as the API reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +227,14 @@ const DEFAULT_RELEASES: [(&str, &str); 3] = [
     ("archlinux", "current"),
 ];
 
+/// Validate an image directory path from the remote index.
+pub fn valid_image_path(path: &str) -> bool {
+    path.starts_with("/images/")
+        && !path.contains("..")
+        && !path.contains('@')
+        && !path.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// Pick an image from the server's `index-system`
 /// (`distro;release;arch;variant;serial;path` per line).
 pub fn pick(index: &str, distro: &str, release: Option<&str>) -> Result<Image, String> {
@@ -232,7 +242,12 @@ pub fn pick(index: &str, distro: &str, release: Option<&str>) -> Result<Image, S
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.trim().split(';').collect();
-            (f.len() == 6 && f[0] == distro && f[2] == ARCH && f[3] == VARIANT).then(|| Image {
+            (f.len() == 6
+                && f[0] == distro
+                && f[2] == ARCH
+                && f[3] == VARIANT
+                && valid_image_path(f[5]))
+            .then(|| Image {
                 distro: f[0].into(),
                 release: f[1].into(),
                 serial: f[4].into(),
@@ -298,7 +313,18 @@ pub fn cache_name(i: &Image) -> String {
 
 pub(crate) fn curl(url: &str, out: &Path) -> anyhow::Result<()> {
     let status = Command::new("/usr/bin/curl")
-        .args(["-fsSL", "--retry", "3", "--connect-timeout", "15", "-o"])
+        .args([
+            "-fsSL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "15",
+            "--speed-time",
+            "30",
+            "--speed-limit",
+            "1",
+            "-o",
+        ])
         .arg(out)
         .arg(url)
         .status()
@@ -311,7 +337,18 @@ pub(crate) fn curl(url: &str, out: &Path) -> anyhow::Result<()> {
 
 fn curl_text(url: &str) -> anyhow::Result<String> {
     let out = Command::new("/usr/bin/curl")
-        .args(["-fsSL", "--retry", "3", "--connect-timeout", "15", url])
+        .args([
+            "-fsSL",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "15",
+            "--speed-time",
+            "30",
+            "--speed-limit",
+            "1",
+            url,
+        ])
         .output()
         .context("run curl")?;
     if !out.status.success() {
@@ -329,6 +366,13 @@ pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
         .arg(path)
         .output()
         .context("run shasum")?;
+    if !out.status.success() {
+        bail!(
+            "shasum failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
@@ -348,6 +392,9 @@ pub fn fetch(
     image: &Image,
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<PathBuf> {
+    if !valid_image_path(&image.path) {
+        bail!("invalid image path {:?}", image.path);
+    }
     fs::create_dir_all(cache)?;
     let file = cache.join(cache_name(image));
     if file.is_file() {
@@ -359,20 +406,31 @@ pub fn fetch(
     let want = sha256_of(&sums, "rootfs.tar.xz").context("rootfs.tar.xz is not in SHA256SUMS")?;
     progress(&format!("downloading {} {}", image.distro, image.release));
     let t = Instant::now();
-    let tmp = file.with_extension("part");
-    curl(&format!("{base}rootfs.tar.xz"), &tmp)?;
-    let got = sha256_file(&tmp)?;
-    if got != want {
-        let _ = fs::remove_file(&tmp);
-        bail!("rootfs.tar.xz checksum mismatch: {got}, expected {want}");
-    }
-    let size = fs::metadata(&tmp)?.len();
-    progress(&format!(
-        "downloaded {:.1} MB in {:.1} s",
-        size as f64 / 1e6,
-        t.elapsed().as_secs_f64()
+    let n = PART_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = cache.join(format!(
+        "{}.part.{}.{n}",
+        cache_name(image),
+        std::process::id()
     ));
-    fs::rename(&tmp, &file)?;
+    let download = (|| -> anyhow::Result<()> {
+        curl(&format!("{base}rootfs.tar.xz"), &tmp)?;
+        let got = sha256_file(&tmp)?;
+        if got != want {
+            bail!("rootfs.tar.xz checksum mismatch: {got}, expected {want}");
+        }
+        let size = fs::metadata(&tmp)?.len();
+        progress(&format!(
+            "downloaded {:.1} MB in {:.1} s",
+            size as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        ));
+        fs::rename(&tmp, &file)?;
+        Ok(())
+    })();
+    if let Err(e) = download {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     let prefix = format!("{}-{}-", image.distro, image.release).replace([':', '/'], "-");
     for e in fs::read_dir(cache)?.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
@@ -456,5 +514,24 @@ archlinux;current;arm64;default;20261118_04:18;/images/archlinux/current/arm64/d
         );
         let v = serde_json::to_value(Machine::from_info(MachineInfo::default(), None)).unwrap();
         assert!(v.get("ip").is_none() && v.get("path").is_none());
+    }
+
+    #[test]
+    fn validates_image_paths_and_shasum_errors() {
+        assert!(valid_image_path(
+            "/images/alpine/3.24/arm64/default/20261117_13:01/"
+        ));
+        for bad in [
+            "/other/alpine/",
+            "images/alpine/",
+            "/images/alpine/../etc/",
+            "/images/alpine@evil.com/",
+            "/images/alpine/3.24 /",
+            "/images/alpine/\n/",
+            "/images/alpine/\0/",
+        ] {
+            assert!(!valid_image_path(bad), "{bad:?}");
+        }
+        assert!(sha256_file(Path::new("/nonexistent/katamaran-sha-test")).is_err());
     }
 }

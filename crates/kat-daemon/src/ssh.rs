@@ -10,17 +10,22 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use kat_proto::machine::{self, ExecSpec, MachineMsg, Tty};
+use kat_proto::machine::{ExecSpec, MachineMsg, Tty};
 use russh::keys::PrivateKey;
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 pub struct SshFiles {
     pub config: PathBuf,
@@ -31,8 +36,14 @@ pub struct SshFiles {
 /// The ssh directory under the home: host key, known_hosts and the config
 /// to Include from `~/.ssh/config`. Created on first use.
 pub fn ensure_files() -> anyhow::Result<SshFiles> {
+    let id = crate::setup::Identity::resolve(None)?;
+    ensure_files_for(&id)
+}
+
+/// Like [`ensure_files`], using an already-resolved [`crate::setup::Identity`].
+pub fn ensure_files_for(id: &crate::setup::Identity) -> anyhow::Result<SshFiles> {
     let home = crate::state_dir()?;
-    let host = crate::setup::Identity::resolve(None)?.context();
+    let host = id.context();
     let dir = home.join("ssh");
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -141,54 +152,126 @@ const SFTP: &str = "for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/s
     [ -x \"$p\" ] && exec \"$p\"; done; \
     echo 'no sftp-server in this machine; install openssh-sftp-server' >&2; exit 127";
 
+async fn connect_guest(home: &Path) -> anyhow::Result<UnixStream> {
+    let path = crate::machines::socket_path(home);
+    UnixStream::connect(&path).await.with_context(|| {
+        format!(
+            "the VM is not running ({}); start it with `katamaran start`",
+            path.display()
+        )
+    })
+}
+
+async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &MachineMsg) -> io::Result<()> {
+    w.write_all(&msg.encode()).await?;
+    w.flush().await
+}
+
+async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Option<MachineMsg>> {
+    let mut first = [0u8; 1];
+    if r.read(&mut first).await? == 0 {
+        return Ok(None);
+    }
+    let mut len = [0u8; 4];
+    len[0] = first[0];
+    r.read_exact(&mut len[1..]).await?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len < 2 {
+        return Err(kat_proto::ProtoError::Truncated.into());
+    }
+    if len > kat_proto::MAX_FRAME {
+        return Err(kat_proto::ProtoError::FrameTooLarge(len).into());
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    let k = u16::from_le_bytes([body[0], body[1]]);
+    Ok(Some(MachineMsg::decode(k, &body[2..])?))
+}
+
+/// Validate a `direct-tcpip` (`ssh -L`) target: only localhost or the machine's
+/// own non-empty name, and a non-zero TCP port.
+fn valid_direct_tcpip_target(host: &str, port: u32, machine: &str) -> Option<u16> {
+    let port = u16::try_from(port).ok().filter(|&p| p != 0)?;
+    let allowed = matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || (!machine.is_empty() && host == machine);
+    allowed.then_some(port)
+}
+
+struct GuestChan {
+    tx: mpsc::UnboundedSender<MachineMsg>,
+    reader: AbortHandle,
+}
+
+impl GuestChan {
+    fn close(self) {
+        drop(self);
+    }
+}
+
+impl Drop for GuestChan {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
 #[derive(Default)]
 struct Chan {
     env: Vec<(String, String)>,
     tty: Option<Tty>,
     /// The guest connection once the channel runs something.
-    guest: Option<Arc<Mutex<UnixStream>>>,
+    guest: Option<GuestChan>,
 }
 
 struct Handler {
     home: PathBuf,
     machine: String,
     user: String,
-    rt: tokio::runtime::Handle,
     chans: HashMap<ChannelId, Chan>,
 }
 
 impl Handler {
-    fn send(&mut self, ch: ChannelId, m: &MachineMsg) {
-        if let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.clone()) {
-            let _ = machine::write(&mut *g.lock().unwrap(), m);
+    fn send(&self, ch: ChannelId, m: MachineMsg) {
+        if let Some(g) = self.chans.get(&ch).and_then(|c| c.guest.as_ref()) {
+            let _ = g.tx.send(m);
         }
     }
 
     /// Start `argv` (empty: login shell) for a session channel.
-    fn run(&mut self, ch: ChannelId, argv: Vec<String>, session: &mut Session) {
-        let c = self.chans.entry(ch).or_default();
+    async fn run(&mut self, ch: ChannelId, argv: Vec<String>, session: &mut Session) {
+        if self.chans.get(&ch).is_some_and(|c| c.guest.is_some()) {
+            let _ = session.channel_failure(ch);
+            return;
+        }
+        let (env, tty) = {
+            let c = self.chans.entry(ch).or_default();
+            (c.env.clone(), c.tty.clone())
+        };
         let spec = ExecSpec {
             machine: self.machine.clone(),
             user: self.user.clone(),
             cwd: String::new(),
-            env: c.env.clone(),
+            env,
             argv,
-            tty: c.tty.clone(),
+            tty,
         };
-        let started = crate::machines::connect(&self.home).and_then(|mut s| {
-            machine::write(&mut s, &MachineMsg::Exec(spec))?;
-            Ok(s)
-        });
+        let started = async {
+            let mut s = connect_guest(&self.home).await?;
+            write_frame(&mut s, &MachineMsg::Exec(spec)).await?;
+            Ok::<_, anyhow::Error>(s)
+        }
+        .await;
         let handle = session.handle();
         match started {
             Ok(s) => {
-                let reader = s.try_clone();
-                c.guest = Some(Arc::new(Mutex::new(s)));
+                let (reader, writer) = s.into_split();
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(pump_write(rx, writer));
+                let reader_task = tokio::spawn(pump_read(handle, ch, reader));
+                self.chans.entry(ch).or_default().guest = Some(GuestChan {
+                    tx,
+                    reader: reader_task.abort_handle(),
+                });
                 let _ = session.channel_success(ch);
-                if let Ok(r) = reader {
-                    let rt = self.rt.clone();
-                    std::thread::spawn(move || pump(rt, handle, ch, r));
-                }
             }
             Err(e) => {
                 let _ = session.extended_data(ch, 1, format!("katamaran: {e:#}\r\n").into_bytes());
@@ -199,43 +282,48 @@ impl Handler {
     }
 }
 
+/// Write queued host-to-guest frames asynchronously so SSH callbacks never
+/// block the runtime or deadlock against guest output.
+async fn pump_write(mut rx: mpsc::UnboundedReceiver<MachineMsg>, mut w: OwnedWriteHalf) {
+    while let Some(msg) = rx.recv().await {
+        if write_frame(&mut w, &msg).await.is_err() {
+            break;
+        }
+    }
+    let _ = w.shutdown().await;
+}
+
 /// Guest frames to the SSH channel, until the process exits or the
 /// connection ends.
-fn pump(rt: tokio::runtime::Handle, h: russh::server::Handle, ch: ChannelId, mut r: UnixStream) {
+async fn pump_read(h: russh::server::Handle, ch: ChannelId, mut r: OwnedReadHalf) {
     loop {
-        match machine::read(&mut r) {
+        match read_frame(&mut r).await {
             Ok(Some(MachineMsg::Stdout(d) | MachineMsg::Data(d))) => {
-                if rt.block_on(h.data(ch, d)).is_err() {
+                if h.data(ch, d).await.is_err() {
                     return;
                 }
             }
             Ok(Some(MachineMsg::Stderr(d))) => {
-                let _ = rt.block_on(h.extended_data(ch, 1, d));
+                let _ = h.extended_data(ch, 1, d).await;
             }
             Ok(Some(MachineMsg::Done | MachineMsg::Progress(_))) => {}
             Ok(Some(MachineMsg::Exit { code })) => {
-                rt.block_on(async {
-                    let _ = h.exit_status_request(ch, code as u32).await;
-                    let _ = h.eof(ch).await;
-                    let _ = h.close(ch).await;
-                });
+                let _ = h.exit_status_request(ch, code as u32).await;
+                let _ = h.eof(ch).await;
+                let _ = h.close(ch).await;
                 return;
             }
             Ok(Some(MachineMsg::Error(e))) => {
-                rt.block_on(async {
-                    let _ = h
-                        .extended_data(ch, 1, format!("katamaran: {e}\r\n").into_bytes())
-                        .await;
-                    let _ = h.exit_status_request(ch, 255).await;
-                    let _ = h.close(ch).await;
-                });
+                let _ = h
+                    .extended_data(ch, 1, format!("katamaran: {e}\r\n").into_bytes())
+                    .await;
+                let _ = h.exit_status_request(ch, 255).await;
+                let _ = h.close(ch).await;
                 return;
             }
             _ => {
-                rt.block_on(async {
-                    let _ = h.eof(ch).await;
-                    let _ = h.close(ch).await;
-                });
+                let _ = h.eof(ch).await;
+                let _ = h.close(ch).await;
                 return;
             }
         }
@@ -271,43 +359,47 @@ impl russh::server::Handler for Handler {
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Only the machine itself: localhost, or its own name.
-        let local = ["localhost", "127.0.0.1", "::1", self.machine.as_str()];
-        let Ok(port) = u16::try_from(port_to_connect) else {
+        let Some(port) = valid_direct_tcpip_target(host_to_connect, port_to_connect, &self.machine)
+        else {
             return Ok(());
         };
-        if !local.contains(&host_to_connect) {
-            return Ok(());
-        }
-        let conn = crate::machines::connect(&self.home).and_then(|mut s| {
-            machine::write(
+        let conn = async {
+            let mut s = connect_guest(&self.home).await?;
+            write_frame(
                 &mut s,
                 &MachineMsg::Connect {
                     name: self.machine.clone(),
                     port,
                 },
-            )?;
-            match machine::read(&mut s)? {
+            )
+            .await?;
+            match read_frame(&mut s).await? {
                 Some(MachineMsg::Done) => Ok(s),
                 Some(MachineMsg::Error(e)) => bail!("{e}"),
                 other => bail!("unexpected answer {other:?}"),
             }
-        });
+        }
+        .await;
         let Ok(s) = conn else {
             return Ok(());
         };
         let ch = channel.id();
-        let reader = s.try_clone()?;
+        let (reader, writer) = s.into_split();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(pump_write(rx, writer));
+        reply.accept().await;
+        let h = session.handle();
+        let reader_task = tokio::spawn(pump_read(h, ch, reader));
         self.chans.insert(
             ch,
             Chan {
-                guest: Some(Arc::new(Mutex::new(s))),
+                guest: Some(GuestChan {
+                    tx,
+                    reader: reader_task.abort_handle(),
+                }),
                 ..Chan::default()
             },
         );
-        reply.accept().await;
-        let (rt, h) = (self.rt.clone(), session.handle());
-        std::thread::spawn(move || pump(rt, h, ch, reader));
         Ok(())
     }
 
@@ -352,7 +444,7 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.run(channel, Vec::new(), session);
+        self.run(channel, Vec::new(), session).await;
         Ok(())
     }
 
@@ -363,7 +455,8 @@ impl russh::server::Handler for Handler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8_lossy(data).into_owned();
-        self.run(channel, vec!["/bin/sh".into(), "-c".into(), cmd], session);
+        self.run(channel, vec!["/bin/sh".into(), "-c".into(), cmd], session)
+            .await;
         Ok(())
     }
 
@@ -378,7 +471,8 @@ impl russh::server::Handler for Handler {
                 channel,
                 vec!["/bin/sh".into(), "-c".into(), SFTP.into()],
                 session,
-            );
+            )
+            .await;
         } else {
             session.channel_failure(channel)?;
         }
@@ -396,7 +490,7 @@ impl russh::server::Handler for Handler {
     ) -> Result<(), Self::Error> {
         self.send(
             channel,
-            &MachineMsg::Resize {
+            MachineMsg::Resize {
                 rows: row_height.min(u16::MAX as u32) as u16,
                 cols: col_width.min(u16::MAX as u32) as u16,
             },
@@ -410,7 +504,7 @@ impl russh::server::Handler for Handler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(channel, &MachineMsg::Data(data.to_vec()));
+        self.send(channel, MachineMsg::Data(data.to_vec()));
         Ok(())
     }
 
@@ -419,7 +513,7 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.send(channel, &MachineMsg::DataEnd);
+        self.send(channel, MachineMsg::DataEnd);
         Ok(())
     }
 
@@ -431,7 +525,7 @@ impl russh::server::Handler for Handler {
         if let Some(c) = self.chans.remove(&channel)
             && let Some(g) = c.guest
         {
-            let _ = g.lock().unwrap().shutdown(std::net::Shutdown::Both);
+            g.close();
         }
         Ok(())
     }
@@ -443,7 +537,7 @@ impl russh::server::Handler for Handler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(signal) = signal_number(&signal) {
-            self.send(channel, &MachineMsg::Signal { signal });
+            self.send(channel, MachineMsg::Signal { signal });
         }
         Ok(())
     }
@@ -474,7 +568,6 @@ pub fn proxy() -> anyhow::Result<()> {
         home,
         machine: String::new(),
         user: String::new(),
-        rt: rt.handle().clone(),
         chans: HashMap::new(),
     };
     rt.block_on(async move {
@@ -541,5 +634,40 @@ mod tests {
         assert_eq!(signal_number(&Sig::TERM), Some(libc::SIGTERM));
         assert_eq!(signal_number(&Sig::USR1), Some(10));
         assert_eq!(signal_number(&Sig::Custom("X".into())), None);
+    }
+
+    #[test]
+    fn validates_direct_tcpip_targets() {
+        assert_eq!(valid_direct_tcpip_target("localhost", 8080, ""), Some(8080));
+        assert_eq!(valid_direct_tcpip_target("127.0.0.1", 80, ""), Some(80));
+        assert_eq!(valid_direct_tcpip_target("::1", 443, "dev"), Some(443));
+        assert_eq!(valid_direct_tcpip_target("dev", 5432, "dev"), Some(5432));
+
+        // Empty host must never be accepted even when machine name is empty.
+        assert_eq!(valid_direct_tcpip_target("", 8080, ""), None);
+        assert_eq!(valid_direct_tcpip_target("", 8080, "dev"), None);
+        // Port 0 and out-of-range ports must be rejected.
+        assert_eq!(valid_direct_tcpip_target("localhost", 0, "dev"), None);
+        assert_eq!(valid_direct_tcpip_target("dev", 0, "dev"), None);
+        assert_eq!(valid_direct_tcpip_target("localhost", 65536, "dev"), None);
+        // Unrelated hosts must be rejected.
+        assert_eq!(valid_direct_tcpip_target("example.com", 80, "dev"), None);
+        assert_eq!(valid_direct_tcpip_target("other", 80, "dev"), None);
+    }
+
+    #[test]
+    fn async_frames_round_trip_over_unix_stream() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut a, mut b) = UnixStream::pair().unwrap();
+            let sent = MachineMsg::Data(b"hello async".to_vec());
+            write_frame(&mut a, &sent).await.unwrap();
+            a.shutdown().await.unwrap();
+            assert_eq!(read_frame(&mut b).await.unwrap(), Some(sent));
+            assert_eq!(read_frame(&mut b).await.unwrap(), None);
+        });
     }
 }
