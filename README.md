@@ -32,7 +32,7 @@ DNS queries resolve through the macOS system resolver (`dns_sd`) with answer cac
 
 ### Active 64 KiB memory reclaim and adaptive idle polling
 
-Guest RAM maps in separate 64 KiB XNU VM entries so freed 64 KiB blocks reported by virtio-balloon are replaced with fresh anonymous mappings and removed from macOS's physical footprint immediately. Inside Linux, `kat-init` trims idle file and reclaimable slab caches through cgroup v2 `memory.reclaim` and compacts fragmented memory once after workloads finish.
+Guest RAM maps in separate 64 KiB XNU VM entries so freed 64 KiB blocks reported by virtio-balloon are replaced with fresh anonymous mappings and removed from macOS's physical footprint immediately. Inside Linux, `kat-init` enables an LZ4-compressed `zram` swap device sized to guest RAM to absorb memory spikes without disk I/O or OOM thrashing, trims idle file and reclaimable slab caches through cgroup v2 `memory.reclaim`, and compacts fragmented memory after workloads finish.
 
 Waking a halted vCPU from WFI on Hypervisor.framework costs tens of microseconds. The guest kernel defines `TIF_POLLING_NRFLAG` on arm64 and polls adaptively before halting, keeping request-response traffic between containers fast while dropping back to zero polling when idle.
 

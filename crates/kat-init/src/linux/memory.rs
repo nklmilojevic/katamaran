@@ -26,7 +26,10 @@
 //! The controller samples once a second and does nothing while the guest is
 //! under memory pressure (PSI), when the kernel is reclaiming by itself.
 
+use std::ffi::CString;
 use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,7 +41,19 @@ const TICK: Duration = Duration::from_secs(2);
 const REPORTING_ORDER: usize = 4;
 const PAGE: u64 = 4096;
 
-/// Kernel settings for prompt reporting, applied once at boot.
+const ZRAM_DEV: &str = "/dev/zram0";
+const ZRAM_SYSFS: &str = "/sys/block/zram0";
+/// Minimum zram disk size (16 MiB) so tiny test configs never create a tiny
+/// swap area.
+const ZRAM_MIN_BYTES: u64 = 16 * MIB;
+const SWAP_FLAG_PREFER: libc::c_int = 0x8000;
+const SWAP_FLAG_PRIO_MASK: libc::c_int = 0x7fff;
+const SWAP_FLAG_DISCARD: libc::c_int = 0x10000;
+const SWAP_FLAG_DISCARD_PAGES: libc::c_int = 0x40000;
+const ZRAM_SWAP_PRIO: libc::c_int = 100;
+
+/// Kernel settings for prompt reporting and compressed zram swap, applied once
+/// at boot.
 pub fn tune() {
     let settings = [
         (
@@ -52,6 +67,96 @@ pub fn tune() {
             super::log(&format!("memory: {path} = {value}: {e}"));
         }
     }
+    match setup_zram_swap() {
+        Ok(Some(bytes)) => {
+            // zram is compressed RAM with no seek cost: disable multi-page
+            // swap readahead and treat cold anonymous pages equally with file
+            // cache under pressure so workloads do not thrash executable/metadata
+            // pages down to zero before swapping idle anonymous memory.
+            for (path, value) in [
+                ("/proc/sys/vm/page-cluster", "0"),
+                ("/proc/sys/vm/swappiness", "100"),
+            ] {
+                if let Err(e) = fs::write(path, value) {
+                    super::log(&format!("memory: {path} = {value}: {e}"));
+                }
+            }
+            super::log(&format!(
+                "memory: enabled {} MiB lz4 zram swap on {ZRAM_DEV}",
+                bytes / MIB
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => super::log(&format!("memory: zram swap not enabled: {e}")),
+    }
+}
+
+/// Target zram virtual swap size: 100% of guest RAM (matching OrbStack),
+/// aligned down to 4 KiB pages and clamped to the Linux v1 swap header limit.
+pub fn zram_disksize(total_bytes: u64) -> Option<u64> {
+    let max_bytes = u64::from(u32::MAX) * PAGE;
+    let aligned = (total_bytes.min(max_bytes) / PAGE) * PAGE;
+    (aligned >= ZRAM_MIN_BYTES).then_some(aligned)
+}
+
+/// Build a Linux v1 swap header page (`union swap_header` in `include/linux/swap.h`)
+/// for a swap area of `size_bytes` bytes (4 KiB pages).
+pub fn swap_header(size_bytes: u64) -> Option<[u8; PAGE as usize]> {
+    let pages = size_bytes / PAGE;
+    if pages < 10 || pages > u64::from(u32::MAX) {
+        return None;
+    }
+    let mut page = [0u8; PAGE as usize];
+    // `version = 1` at offset 1024, `last_page = pages - 1` at offset 1028,
+    // `nr_badpages = 0` at offset 1032, `SWAPSPACE2` magic at PAGE_SIZE - 10.
+    page[1024..1028].copy_from_slice(&1u32.to_ne_bytes());
+    page[1028..1032].copy_from_slice(&((pages - 1) as u32).to_ne_bytes());
+    page[PAGE as usize - 10..].copy_from_slice(b"SWAPSPACE2");
+    Some(page)
+}
+
+/// Configure `/dev/zram0` as an LZ4 compressed swap device sized to guest RAM.
+/// Returns `Ok(None)` when the kernel has no zram device or it is already sized.
+fn setup_zram_swap() -> io::Result<Option<u64>> {
+    let disksize_path = format!("{ZRAM_SYSFS}/disksize");
+    if !Path::new(&disksize_path).exists() || !Path::new(ZRAM_DEV).exists() {
+        return Ok(None);
+    }
+    if fs::read_to_string(&disksize_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|n| n > 0)
+    {
+        return Ok(None);
+    }
+    let total = read_sample()
+        .map(|s| s.total)
+        .ok_or_else(|| io::Error::other("could not read MemTotal"))?;
+    let Some(size) = zram_disksize(total) else {
+        return Ok(None);
+    };
+    let comp_path = format!("{ZRAM_SYSFS}/comp_algorithm");
+    if let Err(e) = fs::write(&comp_path, "lz4") {
+        super::log(&format!("memory: {comp_path} = lz4: {e}"));
+    }
+    fs::write(&disksize_path, size.to_string())?;
+    let header = swap_header(size).ok_or_else(|| io::Error::other("invalid zram swap size"))?;
+    {
+        let mut dev = fs::OpenOptions::new().write(true).open(ZRAM_DEV)?;
+        dev.write_all(&header)?;
+        dev.flush()?;
+    }
+    let dev_c = CString::new(ZRAM_DEV)?;
+    let flags = SWAP_FLAG_PREFER
+        | (ZRAM_SWAP_PRIO & SWAP_FLAG_PRIO_MASK)
+        | SWAP_FLAG_DISCARD
+        | SWAP_FLAG_DISCARD_PAGES;
+    if unsafe { libc::swapon(dev_c.as_ptr(), flags) } < 0 {
+        let e = io::Error::last_os_error();
+        let _ = fs::write(format!("{ZRAM_SYSFS}/reset"), "1");
+        return Err(e);
+    }
+    Ok(Some(size))
 }
 
 /// Start the controller thread.
@@ -75,7 +180,13 @@ fn run(policy: Policy) -> ! {
             let t = Instant::now();
             let r = match action {
                 Action::Reclaim(bytes) => {
-                    fs::write("/sys/fs/cgroup/memory.reclaim", bytes.to_string())
+                    // Trim only idle file/slab cache (`swappiness=0`) so proactive
+                    // cache trimming never pushes active container anonymous pages
+                    // into zram; natural memory pressure still swaps via vm.swappiness.
+                    fs::write(
+                        "/sys/fs/cgroup/memory.reclaim",
+                        format!("{bytes} swappiness=0"),
+                    )
                 }
                 Action::Compact => fs::write("/proc/sys/vm/compact_memory", "1"),
             };
@@ -445,5 +556,32 @@ mod tests {
         };
         let reportable = kib([1, 2, 4, 3, 1, 1, 414]) + kib([84, 66, 23, 14, 7, 20, 364]);
         assert_eq!(s.fragmented, 3276380 * 1024 - reportable);
+    }
+
+    #[test]
+    fn zram_size_and_swap_header_layout() {
+        assert_eq!(zram_disksize(8 * MIB), None);
+        assert_eq!(zram_disksize(2 * GIB + 1234), Some(2 * GIB));
+        assert_eq!(zram_disksize(16 * GIB), Some(16 * GIB));
+
+        assert!(swap_header(0).is_none());
+        assert!(swap_header(8 * PAGE).is_none());
+        let hdr = swap_header(2 * GIB).expect("valid swap header");
+        assert_eq!(
+            u32::from_ne_bytes(hdr[1024..1028].try_into().unwrap()),
+            1,
+            "swap version"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(hdr[1028..1032].try_into().unwrap()),
+            ((2 * GIB / PAGE) - 1) as u32,
+            "last_page"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(hdr[1032..1036].try_into().unwrap()),
+            0,
+            "nr_badpages"
+        );
+        assert_eq!(&hdr[PAGE as usize - 10..], b"SWAPSPACE2");
     }
 }

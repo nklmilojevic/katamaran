@@ -392,6 +392,57 @@ fn idle_page_cache_is_trimmed_and_given_back() {
 
 #[test]
 #[ignore = "boots the system VM; run with `cargo xtask test-vm`"]
+fn zram_swap_absorbs_memory_spike_and_reclaims() {
+    let vm = Vm::start(&["--memory-mib", "2048"]);
+    let pid = vm.vm_pid();
+    let swaps = vm.docker(&["run", "--rm", IMAGE, "cat", "/proc/swaps"]);
+    assert!(swaps.contains("/dev/zram0"), "expected zram0 swap: {swaps}");
+    let meminfo = vm.docker(&["run", "--rm", IMAGE, "cat", "/proc/meminfo"]);
+    let swap_total_kib: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("SwapTotal:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap_or(0);
+    assert!(
+        swap_total_kib >= 1500 * 1024,
+        "SwapTotal too small ({swap_total_kib} KiB): {meminfo}"
+    );
+
+    thread::sleep(Duration::from_secs(15));
+    let idle = footprint(pid);
+
+    // Allocate 2.5 GiB of non-zero compressible data inside a 2 GiB VM:
+    // without zram swap this hits global OOM immediately; with LZ4 zram it
+    // completes cleanly and discards the swapped pages back to free RAM on exit.
+    let out = vm.docker(&[
+        "run",
+        "--rm",
+        "--tmpfs",
+        "/m:size=3g",
+        IMAGE,
+        "sh",
+        "-c",
+        "yes 'katamaran-zram-compressible-payload-0123456789abcdef' | head -c 2684354560 > /m/x && stat -c %s /m/x",
+    ]);
+    assert!(
+        out.trim().ends_with("2684354560"),
+        "write failed or OOMed: {out}"
+    );
+
+    let took = within(Duration::from_secs(60), "footprint back near idle", || {
+        footprint(pid) <= idle + 512 * MIB
+    });
+    eprintln!(
+        "zram spike: swap {} MiB, idle {} MiB, {} MiB after {took:?}",
+        swap_total_kib / 1024,
+        idle / MIB,
+        footprint(pid) / MIB
+    );
+    vm.stop();
+}
+
+#[test]
+#[ignore = "boots the system VM; run with `cargo xtask test-vm`"]
 fn disk_space_goes_back_to_apfs_after_deleting_5gib() {
     let vm = Vm::start(&[]);
     let before = vm.data_img_bytes();
