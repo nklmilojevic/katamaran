@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.0 - 2026-11-23
+
+This release adds compressed swap to the guest VM. The VM now handles memory spikes better and is less likely to stop a process because of low memory.
+
+### New features
+
+- The guest VM now uses an LZ4 `zram` swap device that is the same size as the guest RAM. Heavy workloads, such as large asset builds next to running containers, now cause fewer out-of-memory kills.
+- Idle file cache trimming now does not swap out the pages of active containers.
+
+### Other changes
+
+- Add a Kubernetes guide to the documentation.
+- The `README.md` and the architecture page now describe `zram` swap in the memory reclaim overview.
+
 ## v0.7.0 - 2026-11-22
 
 This release adds automatic update checks. The app now tells you when a new version is ready.
