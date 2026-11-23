@@ -118,8 +118,31 @@ pub fn swap_header(size_bytes: u64) -> Option<[u8; PAGE as usize]> {
 /// Configure `/dev/zram0` as an LZ4 compressed swap device sized to guest RAM.
 /// Returns `Ok(None)` when the kernel has no zram device or it is already sized.
 fn setup_zram_swap() -> io::Result<Option<u64>> {
-    let disksize_path = format!("{ZRAM_SYSFS}/disksize");
-    if !Path::new(&disksize_path).exists() || !Path::new(ZRAM_DEV).exists() {
+    let sysfs = Path::new(ZRAM_SYSFS);
+    let dev = Path::new(ZRAM_DEV);
+    if !sysfs.join("disksize").exists() || !dev.exists() {
+        return Ok(None);
+    }
+    let total = read_sample()
+        .map(|s| s.total)
+        .ok_or_else(|| io::Error::other("could not read MemTotal"))?;
+    setup_zram_swap_with(sysfs, dev, total, |path, flags| {
+        let dev_c = CString::new(path.as_os_str().as_encoded_bytes())?;
+        if unsafe { libc::swapon(dev_c.as_ptr(), flags) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+fn setup_zram_swap_with(
+    sysfs: &Path,
+    dev_path: &Path,
+    total: u64,
+    swapon: impl FnOnce(&Path, libc::c_int) -> io::Result<()>,
+) -> io::Result<Option<u64>> {
+    let disksize_path = sysfs.join("disksize");
+    if !disksize_path.exists() || !dev_path.exists() {
         return Ok(None);
     }
     if fs::read_to_string(&disksize_path)
@@ -129,31 +152,29 @@ fn setup_zram_swap() -> io::Result<Option<u64>> {
     {
         return Ok(None);
     }
-    let total = read_sample()
-        .map(|s| s.total)
-        .ok_or_else(|| io::Error::other("could not read MemTotal"))?;
     let Some(size) = zram_disksize(total) else {
         return Ok(None);
     };
-    let comp_path = format!("{ZRAM_SYSFS}/comp_algorithm");
+    let comp_path = sysfs.join("comp_algorithm");
     if let Err(e) = fs::write(&comp_path, "lz4") {
-        super::log(&format!("memory: {comp_path} = lz4: {e}"));
+        super::log(&format!("memory: {} = lz4: {e}", comp_path.display()));
     }
     fs::write(&disksize_path, size.to_string())?;
-    let header = swap_header(size).ok_or_else(|| io::Error::other("invalid zram swap size"))?;
-    {
-        let mut dev = fs::OpenOptions::new().write(true).open(ZRAM_DEV)?;
-        dev.write_all(&header)?;
-        dev.flush()?;
-    }
-    let dev_c = CString::new(ZRAM_DEV)?;
-    let flags = SWAP_FLAG_PREFER
-        | (ZRAM_SWAP_PRIO & SWAP_FLAG_PRIO_MASK)
-        | SWAP_FLAG_DISCARD
-        | SWAP_FLAG_DISCARD_PAGES;
-    if unsafe { libc::swapon(dev_c.as_ptr(), flags) } < 0 {
-        let e = io::Error::last_os_error();
-        let _ = fs::write(format!("{ZRAM_SYSFS}/reset"), "1");
+    let init = (|| -> io::Result<()> {
+        let header = swap_header(size).ok_or_else(|| io::Error::other("invalid zram swap size"))?;
+        {
+            let mut dev = fs::OpenOptions::new().write(true).open(dev_path)?;
+            dev.write_all(&header)?;
+            dev.flush()?;
+        }
+        let flags = SWAP_FLAG_PREFER
+            | (ZRAM_SWAP_PRIO & SWAP_FLAG_PRIO_MASK)
+            | SWAP_FLAG_DISCARD
+            | SWAP_FLAG_DISCARD_PAGES;
+        swapon(dev_path, flags)
+    })();
+    if let Err(e) = init {
+        let _ = fs::write(sysfs.join("reset"), "1");
         return Err(e);
     }
     Ok(Some(size))
@@ -583,5 +604,56 @@ mod tests {
             "nr_badpages"
         );
         assert_eq!(&hdr[PAGE as usize - 10..], b"SWAPSPACE2");
+    }
+
+    #[test]
+    fn zram_setup_resets_device_on_header_or_swapon_failure() {
+        let base = std::env::temp_dir().join(format!("kat-zram-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let sysfs = base.join("sysfs");
+        fs::create_dir_all(&sysfs).unwrap();
+
+        // 1. Device open/write failure after setting disksize resets zram0 and preserves error.
+        let dir_dev = base.join("dev-is-dir");
+        fs::create_dir_all(&dir_dev).unwrap();
+        fs::write(sysfs.join("disksize"), "0\n").unwrap();
+        fs::write(sysfs.join("comp_algorithm"), "[lzo-rle] lz4\n").unwrap();
+        let err = setup_zram_swap_with(&sysfs, &dir_dev, 2 * GIB, |_, _| Ok(())).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+        assert_eq!(fs::read_to_string(sysfs.join("reset")).unwrap(), "1");
+
+        // 2. swapon failure after header write also resets zram0 and preserves error.
+        let file_dev = base.join("zram0");
+        fs::write(&file_dev, b"").unwrap();
+        fs::write(sysfs.join("disksize"), "0\n").unwrap();
+        let _ = fs::remove_file(sysfs.join("reset"));
+        let err = setup_zram_swap_with(&sysfs, &file_dev, 2 * GIB, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(fs::read_to_string(sysfs.join("reset")).unwrap(), "1");
+
+        // 3. Success writes header, calls swapon with discard flags, and does not reset.
+        fs::write(sysfs.join("disksize"), "0\n").unwrap();
+        let _ = fs::remove_file(sysfs.join("reset"));
+        let mut got_flags = 0;
+        let sized = setup_zram_swap_with(&sysfs, &file_dev, 2 * GIB, |_, flags| {
+            got_flags = flags;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sized, Some(2 * GIB));
+        assert_eq!(
+            got_flags,
+            SWAP_FLAG_PREFER
+                | (ZRAM_SWAP_PRIO & SWAP_FLAG_PRIO_MASK)
+                | SWAP_FLAG_DISCARD
+                | SWAP_FLAG_DISCARD_PAGES
+        );
+        assert!(!sysfs.join("reset").exists());
+        assert_eq!(fs::read(&file_dev).unwrap().len(), PAGE as usize);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
