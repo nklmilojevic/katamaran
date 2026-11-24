@@ -197,6 +197,65 @@ fn read_http_header(stream: &mut UnixStream) -> (String, Vec<u8>) {
     }
 }
 
+/// Split an HTTP response into `(header, decoded_body)`, decoding `chunked`
+/// transfer encoding when present.
+fn decode_http_response(resp: &str) -> (&str, String) {
+    let (hdr, raw_body) = resp
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("malformed HTTP response: {resp:?}"));
+    let is_chunked = hdr.lines().any(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    });
+    if !is_chunked {
+        return (hdr, raw_body.to_string());
+    }
+    let mut out = String::new();
+    let mut rest = raw_body;
+    loop {
+        let (size_line, after_size) = rest
+            .split_once("\r\n")
+            .unwrap_or_else(|| panic!("truncated chunk size in {resp:?}"));
+        let size_hex = size_line.split(';').next().unwrap().trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .unwrap_or_else(|e| panic!("bad chunk size {size_hex:?}: {e}"));
+        if size == 0 {
+            break;
+        }
+        assert!(
+            after_size.len() >= size + 2,
+            "truncated chunk payload of {size} bytes"
+        );
+        out.push_str(&after_size[..size]);
+        rest = &after_size[size + 2..];
+    }
+    (hdr, out)
+}
+
+/// Verify a Docker `POST /images/create` response succeeded at both the HTTP
+/// and streamed JSON layers, returning the created image ID (`sha256:...`).
+fn assert_import_succeeded(label: &str, resp: &str) -> String {
+    let (hdr, body) = decode_http_response(resp);
+    assert!(
+        hdr.starts_with("HTTP/1.1 200"),
+        "{label} HTTP status: {resp}"
+    );
+    let mut image_id = None;
+    for item in serde_json::Deserializer::from_str(&body).into_iter::<serde_json::Value>() {
+        let obj = item.unwrap_or_else(|e| panic!("{label}: invalid JSON record ({e}): {body}"));
+        assert!(
+            obj.get("error").is_none() && obj.get("errorDetail").is_none(),
+            "{label}: Docker reported stream error: {obj}"
+        );
+        if let Some(status) = obj.get("status").and_then(|s| s.as_str())
+            && status.starts_with("sha256:")
+        {
+            image_id = Some(status.to_string());
+        }
+    }
+    image_id.unwrap_or_else(|| panic!("{label}: no imported image ID in stream: {body}"))
+}
+
 /// Regression test for the virtio-vsock blocking-send deadlock:
 /// 1. A stalled host reader on a >12 MiB guest->host Docker stream must not
 ///    freeze the VMM event loop or starve other Docker / control-channel I/O.
@@ -246,7 +305,7 @@ fn concurrent_bidirectional_docker_streams_do_not_deadlock() {
         s.write_all(&[0u8; 1024]).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 200"), "seed import: {resp}");
+        assert_import_succeeded("seed import", &resp);
     }
 
     // Connection A: stream the 16 MiB image guest -> host (HTTP/1.0 avoids chunking).
@@ -325,9 +384,29 @@ fn concurrent_bidirectional_docker_streams_do_not_deadlock() {
 
     let mut import_resp = String::new();
     import.read_to_string(&mut import_resp).unwrap();
+    let copied_id = assert_import_succeeded("piped import", &import_resp);
+
+    let inspect_resp = http(
+        &sock,
+        "GET /images/kattest:copy/json HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    let (inspect_hdr, inspect_body) = decode_http_response(&inspect_resp);
     assert!(
-        import_resp.starts_with("HTTP/1.1 200"),
-        "piped import failed: {import_resp}"
+        inspect_hdr.starts_with("HTTP/1.1 200"),
+        "inspect kattest:copy failed: {inspect_resp}"
+    );
+    let inspected: serde_json::Value =
+        serde_json::from_str(&inspect_body).expect("parse image inspect JSON");
+    assert_eq!(
+        inspected.get("Id").and_then(|v| v.as_str()),
+        Some(copied_id.as_str()),
+        "inspected image ID mismatch: {inspected}"
+    );
+    let inspected_size = inspected.get("Size").and_then(|v| v.as_u64()).unwrap_or(0);
+    assert!(
+        inspected_size >= BLOB_BYTES as u64,
+        "expected kattest:copy size >= {BLOB_BYTES}, got {inspected_size}"
     );
 
     let ping_after = http(
