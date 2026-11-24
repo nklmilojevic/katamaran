@@ -111,6 +111,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             local_port,
             peer_port,
             flags,
+            fwd_cnt,
         } => {
             pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
@@ -121,7 +122,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_flags(flags)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
-                .set_fwd_cnt(0);
+                .set_fwd_cnt(fwd_cnt);
         }
         MuxerRx::ConnResponse {
             local_port,

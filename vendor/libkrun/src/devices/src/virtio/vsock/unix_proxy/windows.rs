@@ -264,16 +264,12 @@ pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacke
     }
 }
 
-pub(crate) fn do_shutdown(proxy: &mut super::UnixProxy, pkt: &VsockPacket) {
-    let recv_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-    let send_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
-
-    let how = if recv_off && send_off {
-        SD_BOTH
-    } else if recv_off {
-        SD_RECEIVE
-    } else {
-        SD_SEND
+pub(crate) fn do_shutdown_dirs(proxy: &mut super::UnixProxy, recv_off: bool, send_off: bool) {
+    let how = match (recv_off, send_off) {
+        (true, true) => SD_BOTH,
+        (true, false) => SD_RECEIVE,
+        (false, true) => SD_SEND,
+        (false, false) => return,
     };
 
     let _ret = unsafe { shutdown(proxy.fd.as_raw_socket() as SOCKET, how) };
