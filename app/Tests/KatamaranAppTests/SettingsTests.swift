@@ -251,3 +251,39 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(Updater.versionSubtitle(info: nil, pendingVersion: nil) == nil)
     #expect(NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil) != nil)
 }
+
+@Test func daemonStatusDecodesPortErrors() throws {
+    let clean = try status()
+    #expect(clean.port_errors == nil)
+    #expect(clean.portError(port: 80) == nil)
+    #expect(clean.portErrorSummary == nil)
+    #expect(clean.portErrorDetails == nil)
+
+    let json = """
+    {"state": "running", "since_ms": 0,
+     "daemon": {"pid": 1, "home": "/tmp/k"},
+     "versions": {"katamaran": "0.8.0", "protocol": 3},
+     "config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "docker": {"state": "ready", "socket": "/tmp/k/run/docker.sock"},
+     "mount": {"enabled": true, "mounted": true},
+     "ports": [],
+     "port_errors": [
+       {"proto": "tcp", "port": 80, "error": "address already in use"},
+       {"proto": "tcp", "port": 443, "error": "permission denied"}
+     ]}
+    """
+    let decoded = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+    #expect(decoded.portError(proto: "TCP", port: 80) == "address already in use")
+    #expect(decoded.portError(proto: "udp", port: 80) == nil)
+    #expect(decoded.portError(port: 443) == "permission denied")
+    #expect(decoded.portErrorSummary == "Ports not forwarded: 80/tcp, 443/tcp")
+    #expect(decoded.portErrorDetails == "80/tcp: address already in use\n443/tcp: permission denied")
+
+    let singleJSON = json.replacingOccurrences(
+        of: #",\s*\{"proto": "tcp", "port": 443, "error": "permission denied"\}"#,
+        with: "",
+        options: .regularExpression
+    )
+    let single = try JSONDecoder().decode(DaemonStatus.self, from: Data(singleJSON.utf8))
+    #expect(single.portErrorSummary == "Port 80/tcp not forwarded")
+}

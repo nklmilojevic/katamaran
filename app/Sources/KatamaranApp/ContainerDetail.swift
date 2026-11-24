@@ -49,6 +49,7 @@ final class ContainerDetailViewController: NSViewController {
         tab = ContainerTab(rawValue: UserDefaults.standard.integer(forKey: Self.tabKey)) ?? .info
         super.init(nibName: nil, bundle: nil)
         store.observe { [weak self] s in self?.storeChanged(s) }
+        model.observe { [weak self] in self?.refresh() }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -303,7 +304,7 @@ final class DetailHeader: NSView {
 final class InfoTabView: NSView, ContainerTabView {
     private let model: AppModel
     private let content = ScrollingStack()
-    private var shown: (ContainerSummary, ContainerInspect?)?
+    private var shown: (ContainerSummary, ContainerInspect?, [PortError])?
 
     init(model: AppModel) {
         self.model = model
@@ -318,8 +319,9 @@ final class InfoTabView: NSView, ContainerTabView {
 
     func show(_ c: ContainerSummary?, _ inspect: ContainerInspect?) {
         guard let c else { return }
-        if let s = shown, s.0 == c, s.1 == inspect { return }
-        shown = (c, inspect)
+        let portErrors = model.status?.port_errors ?? []
+        if let s = shown, s.0 == c, s.1 == inspect, s.2 == portErrors { return }
+        shown = (c, inspect, portErrors)
         var groups: [NSView] = []
 
         var general: [NSView] = [
@@ -342,9 +344,18 @@ final class InfoTabView: NSView, ContainerTabView {
         if !bindings.isEmpty {
             var seen = Set<UInt16>()
             let links = bindings.filter { seen.insert($0.host).inserted }.map { b -> NSView in
+                let arrow = label("→ \(b.container)/\(b.proto)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
+                if let err = model.status?.portError(proto: b.proto, port: b.host) {
+                    let addr = label("localhost:\(b.host)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
+                    let warn = symbolView("exclamationmark.triangle.fill", color: .systemOrange, size: 13)
+                    let note = label("Not forwarded", font: .systemFont(ofSize: NSFont.smallSystemFontSize), color: .systemOrange)
+                    let row = NSStackView(views: [addr, arrow, warn, note])
+                    row.spacing = 6
+                    row.toolTip = "Port \(b.host)/\(b.proto) could not be forwarded on macOS: \(err)"
+                    return row
+                }
                 let link = linkButton("localhost:\(b.host)", target: self, action: #selector(openPort(_:)), tag: Int(b.host))
                 link.isEnabled = b.proto == "tcp"
-                let arrow = label("→ \(b.container)/\(b.proto)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
                 let row = NSStackView(views: [link, arrow])
                 row.spacing = 6
                 return row

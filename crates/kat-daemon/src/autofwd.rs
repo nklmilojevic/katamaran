@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -107,7 +107,7 @@ impl AutoForwards {
         if self.active.contains_key(&port) {
             return Ok(false);
         }
-        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        let listener = crate::net::LoopbackTcpListener::bind(port)?;
         listener.set_nonblocking(true)?;
         let (wake_r, wake_w) = wakeup_pipe()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -161,7 +161,7 @@ impl Drop for AutoForwards {
 }
 
 fn accept_loop(
-    listener: TcpListener,
+    listener: crate::net::LoopbackTcpListener,
     wake_r: OwnedFd,
     guest: &Path,
     port: u16,
@@ -283,6 +283,7 @@ fn copy(r: &mut impl Read, w: &mut impl Write) -> io::Result<u64> {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::net::TcpListener;
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
@@ -461,6 +462,26 @@ mod tests {
         assert_eq!(fwd.active_conns.load(Ordering::Acquire), 0);
         assert!(fwd.add(port).unwrap());
         assert_eq!(round_trip(port, "ok"), format!("{port}:ok"));
+        fwd.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forwards_privileged_low_port() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-low-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fwd = AutoForwards::new(&fake_guest(&dir));
+        let mut bound = None;
+        for port in (900u16..=1023).rev() {
+            if matches!(fwd.add(port), Ok(true)) {
+                bound = Some(port);
+                break;
+            }
+        }
+        let port = bound.expect("auto-forward a free privileged port < 1024");
+        assert_eq!(round_trip(port, "hi"), format!("{port}:hi"));
+        assert!(fwd.remove(port));
         fwd.clear();
         std::fs::remove_dir_all(&dir).unwrap();
     }

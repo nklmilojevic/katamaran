@@ -16,6 +16,7 @@ struct DaemonStatus: Decodable, Equatable {
     var k8s: K8sStatus?
     var mount: MountInfo
     var ports: [Port]
+    var port_errors: [PortError]?
 }
 
 struct DaemonInfo: Decodable, Equatable {
@@ -105,6 +106,34 @@ struct MountInfo: Decodable, Equatable {
 struct Port: Decodable, Equatable, Hashable {
     var proto: String
     var port: UInt16
+}
+
+struct PortError: Decodable, Equatable, Hashable {
+    var proto: String
+    var port: UInt16
+    var error: String
+}
+
+extension DaemonStatus {
+    func portError(proto: String = "tcp", port: UInt16) -> String? {
+        port_errors?.first {
+            $0.port == port && $0.proto.caseInsensitiveCompare(proto) == .orderedSame
+        }?.error
+    }
+
+    var portErrorSummary: String? {
+        guard let errs = port_errors, !errs.isEmpty else { return nil }
+        if errs.count == 1, let first = errs.first {
+            return "Port \(first.port)/\(first.proto) not forwarded"
+        }
+        let list = errs.map { "\($0.port)/\($0.proto)" }.joined(separator: ", ")
+        return "Ports not forwarded: \(list)"
+    }
+
+    var portErrorDetails: String? {
+        guard let errs = port_errors, !errs.isEmpty else { return nil }
+        return errs.map { "\($0.port)/\($0.proto): \($0.error)" }.joined(separator: "\n")
+    }
 }
 
 struct LogChunk: Decodable {

@@ -304,6 +304,14 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
             .collect();
         line("ports", ports.join(", "));
     }
+    if !s.port_errors.is_empty() {
+        let failed: Vec<String> = s
+            .port_errors
+            .iter()
+            .map(|p| format!("{}/{} ({})", p.port, p.proto, p.error))
+            .collect();
+        line("port err", failed.join("; "));
+    }
     let mut versions = format!(
         "katamaran {} · protocol {}",
         s.versions.katamaran, s.versions.protocol
@@ -530,6 +538,7 @@ mod tests {
                 proto: "tcp".into(),
                 port: 8080,
             }],
+            port_errors: vec![],
         };
         let text = summary(&s);
         assert!(text.starts_with("katamaran: running, up 1m15s\n"), "{text}");
@@ -537,10 +546,23 @@ mod tests {
         assert!(text.contains("guest 3% CPU, 500/3900 MiB"), "{text}");
         assert!(text.contains("/Users/me/Katamaran (mounted)"), "{text}");
         assert!(text.contains("8080/tcp"), "{text}");
+        assert!(!text.contains("port err"), "{text}");
         assert!(text.contains("pending"), "{text}");
         assert!(
             !text.contains("k8s"),
             "default disabled k8s should be omitted: {text}"
+        );
+
+        let mut with_port_err = s.clone();
+        with_port_err.port_errors.push(PortError {
+            proto: "tcp".into(),
+            port: 80,
+            error: "address already in use".into(),
+        });
+        let err_text = summary(&with_port_err);
+        assert!(
+            err_text.contains("port err   80/tcp (address already in use)"),
+            "{err_text}"
         );
 
         let same = summary_for(&s, "0.1.0");

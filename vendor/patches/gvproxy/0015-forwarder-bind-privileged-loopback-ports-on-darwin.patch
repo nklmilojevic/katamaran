@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: katamaran <katamaran@localhost>
+Date: Tue, 24 Nov 2026 10:30:30 +0100
+Subject: [PATCH] forwarder: bind privileged loopback ports via lo0 on darwin
+
+On macOS, XNU rejects unprivileged binds below port 1024 on specific
+addresses such as 127.0.0.1 while allowing wildcard binds (0.0.0.0 / ::).
+When binding a loopback address below port 1024 fails with EACCES, fall
+back to a wildcard socket scoped to lo0 via IP_BOUND_IF/IPV6_BOUND_IF
+and drop any connection or datagram whose endpoints are not loopback.
+---
+ pkg/services/forwarder/listen_darwin.go      | 176 +++++++++++++++++++
+ pkg/services/forwarder/listen_darwin_test.go | 170 ++++++++++++++++++
+ pkg/services/forwarder/listen_other.go       |  17 ++
+ pkg/services/forwarder/ports.go              |   3 +-
+ 4 files changed, 365 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/services/forwarder/listen_darwin.go
+ create mode 100644 pkg/services/forwarder/listen_darwin_test.go
+ create mode 100644 pkg/services/forwarder/listen_other.go
+
+diff --git a/pkg/services/forwarder/listen_darwin.go b/pkg/services/forwarder/listen_darwin.go
+new file mode 100644
+index 0000000..ebf48fa
+--- /dev/null
++++ b/pkg/services/forwarder/listen_darwin.go
+@@ -0,0 +1,176 @@
++//go:build darwin
++
++package forwarder
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"strconv"
++	"syscall"
++
++	"golang.org/x/sys/unix"
++)
++
++const privilegedPortLimit = 1024
++
++// listenLoopbackTCP binds a TCP listener on laddr. On macOS, XNU rejects
++// unprivileged binds to ports < 1024 on specific addresses such as 127.0.0.1,
++// while permitting wildcard binds (0.0.0.0 / ::). When a loopback bind on a
++// low port fails with EACCES, fall back to a wildcard socket scoped to lo0
++// via IP_BOUND_IF/IPV6_BOUND_IF and drop any accepted connection whose local
++// or remote endpoint is not loopback.
++func listenLoopbackTCP(network, laddr string) (net.Listener, error) {
++	ln, err := net.Listen(network, laddr)
++	if err == nil || !errors.Is(err, syscall.EACCES) {
++		return ln, err
++	}
++	ip, port, ok := privilegedLoopbackHostPort(laddr)
++	if !ok {
++		return nil, err
++	}
++	lo, ifErr := net.InterfaceByName("lo0")
++	if ifErr != nil {
++		return nil, err
++	}
++	isV4 := ip.To4() != nil
++	bindNet, bindAddr, ctrl := loopbackBindSpec(isV4, true, port, lo.Index)
++	lc := net.ListenConfig{Control: ctrl}
++	rawLn, bindErr := lc.Listen(context.Background(), bindNet, bindAddr)
++	if bindErr != nil {
++		return nil, bindErr
++	}
++	return &loopbackOnlyListener{Listener: rawLn, isV4: isV4}, nil
++}
++
++// listenLoopbackUDP binds a UDP listener on addr, applying the same macOS
++// lo0-scoped wildcard fallback for privileged loopback ports (< 1024).
++func listenLoopbackUDP(addr *net.UDPAddr) (udpConn, error) {
++	conn, err := net.ListenUDP("udp", addr)
++	if err == nil {
++		return conn, nil
++	}
++	if !errors.Is(err, syscall.EACCES) {
++		return nil, err
++	}
++	if addr == nil || addr.IP == nil || !addr.IP.IsLoopback() || addr.Port <= 0 || addr.Port >= privilegedPortLimit {
++		return nil, err
++	}
++	lo, ifErr := net.InterfaceByName("lo0")
++	if ifErr != nil {
++		return nil, err
++	}
++	isV4 := addr.IP.To4() != nil
++	bindNet, bindAddr, ctrl := loopbackBindSpec(isV4, false, addr.Port, lo.Index)
++	lc := net.ListenConfig{Control: ctrl}
++	pc, bindErr := lc.ListenPacket(context.Background(), bindNet, bindAddr)
++	if bindErr != nil {
++		return nil, bindErr
++	}
++	return &loopbackUDPConn{PacketConn: pc, isV4: isV4}, nil
++}
++
++func privilegedLoopbackHostPort(laddr string) (net.IP, int, bool) {
++	host, portStr, err := net.SplitHostPort(laddr)
++	if err != nil {
++		return nil, 0, false
++	}
++	ip := net.ParseIP(host)
++	if ip == nil || !ip.IsLoopback() {
++		return nil, 0, false
++	}
++	port, err := strconv.Atoi(portStr)
++	if err != nil || port <= 0 || port >= privilegedPortLimit {
++		return nil, 0, false
++	}
++	return ip, port, true
++}
++
++func loopbackBindSpec(isV4, isTCP bool, port, ifIndex int) (string, string, func(string, string, syscall.RawConn) error) {
++	var bindNet, bindAddr string
++	if isV4 {
++		if isTCP {
++			bindNet = "tcp4"
++		} else {
++			bindNet = "udp4"
++		}
++		bindAddr = fmt.Sprintf("0.0.0.0:%d", port)
++	} else {
++		if isTCP {
++			bindNet = "tcp6"
++		} else {
++			bindNet = "udp6"
++		}
++		bindAddr = fmt.Sprintf("[::]:%d", port)
++	}
++	ctrl := func(_, _ string, c syscall.RawConn) error {
++		var sockErr error
++		if err := c.Control(func(fd uintptr) {
++			if isV4 {
++				sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, ifIndex)
++			} else {
++				if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
++					sockErr = err
++					return
++				}
++				sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, ifIndex)
++			}
++		}); err != nil {
++			return err
++		}
++		return sockErr
++	}
++	return bindNet, bindAddr, ctrl
++}
++
++func isLoopbackIPForFamily(ip net.IP, isV4 bool) bool {
++	if ip == nil || !ip.IsLoopback() {
++		return false
++	}
++	if isV4 {
++		return ip.To4() != nil
++	}
++	return ip.To4() == nil
++}
++
++func isLoopbackTCPAddrs(local, remote net.Addr, isV4 bool) bool {
++	la, ok1 := local.(*net.TCPAddr)
++	ra, ok2 := remote.(*net.TCPAddr)
++	return ok1 && ok2 && isLoopbackIPForFamily(la.IP, isV4) && isLoopbackIPForFamily(ra.IP, isV4)
++}
++
++type loopbackOnlyListener struct {
++	net.Listener
++	isV4 bool
++}
++
++func (l *loopbackOnlyListener) Accept() (net.Conn, error) {
++	for {
++		c, err := l.Listener.Accept()
++		if err != nil {
++			return nil, err
++		}
++		if isLoopbackTCPAddrs(c.LocalAddr(), c.RemoteAddr(), l.isV4) {
++			return c, nil
++		}
++		_ = c.Close()
++	}
++}
++
++type loopbackUDPConn struct {
++	net.PacketConn
++	isV4 bool
++}
++
++func (u *loopbackUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
++	for {
++		n, from, err := u.PacketConn.ReadFrom(b)
++		if err != nil {
++			return 0, nil, err
++		}
++		if ua, ok := from.(*net.UDPAddr); ok && isLoopbackIPForFamily(ua.IP, u.isV4) {
++			return n, from, nil
++		}
++	}
++}
+diff --git a/pkg/services/forwarder/listen_darwin_test.go b/pkg/services/forwarder/listen_darwin_test.go
+new file mode 100644
+index 0000000..b4a7f7a
+--- /dev/null
++++ b/pkg/services/forwarder/listen_darwin_test.go
+@@ -0,0 +1,170 @@
++//go:build darwin
++
++package forwarder
++
++import (
++	"fmt"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func bindFreeLowTCP(t *testing.T, host string) (net.Listener, int) {
++	t.Helper()
++	for port := 1023; port >= 900; port-- {
++		ln, err := listenLoopbackTCP("tcp", fmt.Sprintf("%s:%d", host, port))
++		if err == nil {
++			return ln, port
++		}
++	}
++	t.Fatal("could not find a free privileged TCP port in 900..1023")
++	return nil, 0
++}
++
++func TestListenLoopbackTCPPrivilegedPortIPv4(t *testing.T) {
++	ln, port := bindFreeLowTCP(t, "127.0.0.1")
++	defer ln.Close()
++
++	// Duplicate bind on the same port must fail.
++	if dup, err := listenLoopbackTCP("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
++		_ = dup.Close()
++		t.Fatalf("expected duplicate bind on port %d to fail", port)
++	}
++
++	done := make(chan error, 1)
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			done <- err
++			return
++		}
++		defer conn.Close()
++		_, err = io.Copy(conn, conn)
++		done <- err
++	}()
++
++	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
++	if err != nil {
++		t.Fatalf("dial 127.0.0.1:%d: %v", port, err)
++	}
++	if _, err := c.Write([]byte("hello-low-port")); err != nil {
++		t.Fatal(err)
++	}
++	_ = c.(*net.TCPConn).CloseWrite()
++	got, err := io.ReadAll(c)
++	_ = c.Close()
++	if err != nil || string(got) != "hello-low-port" {
++		t.Fatalf("echo got %q, err %v", got, err)
++	}
++	if err := <-done; err != nil {
++		t.Fatalf("server: %v", err)
++	}
++}
++
++func TestListenLoopbackTCPPrivilegedPortIPv6(t *testing.T) {
++	ln, port := bindFreeLowTCP(t, "[::1]")
++	defer ln.Close()
++
++	done := make(chan error, 1)
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			done <- err
++			return
++		}
++		defer conn.Close()
++		_, err = io.Copy(conn, conn)
++		done <- err
++	}()
++
++	c, err := net.DialTimeout("tcp", fmt.Sprintf("[::1]:%d", port), 2*time.Second)
++	if err != nil {
++		t.Fatalf("dial [::1]:%d: %v", port, err)
++	}
++	if _, err := c.Write([]byte("v6-ok")); err != nil {
++		t.Fatal(err)
++	}
++	_ = c.(*net.TCPConn).CloseWrite()
++	got, err := io.ReadAll(c)
++	_ = c.Close()
++	if err != nil || string(got) != "v6-ok" {
++		t.Fatalf("echo got %q, err %v", got, err)
++	}
++	if err := <-done; err != nil {
++		t.Fatalf("server: %v", err)
++	}
++}
++
++func TestListenLoopbackUDPPrivilegedPort(t *testing.T) {
++	var (
++		srv  udpConn
++		port int
++	)
++	for p := 1023; p >= 900; p-- {
++		c, err := listenLoopbackUDP(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p})
++		if err == nil {
++			srv = c
++			port = p
++			break
++		}
++	}
++	if srv == nil {
++		t.Fatal("could not find a free privileged UDP port in 900..1023")
++	}
++	defer srv.Close()
++
++	done := make(chan error, 1)
++	go func() {
++		buf := make([]byte, 64)
++		_ = srv.SetReadDeadline(time.Now().Add(2 * time.Second))
++		n, from, err := srv.ReadFrom(buf)
++		if err != nil {
++			done <- err
++			return
++		}
++		_, err = srv.WriteTo(buf[:n], from)
++		done <- err
++	}()
++
++	cli, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer cli.Close()
++	_ = cli.SetDeadline(time.Now().Add(2 * time.Second))
++	if _, err := cli.Write([]byte("ping")); err != nil {
++		t.Fatal(err)
++	}
++	buf := make([]byte, 64)
++	n, err := cli.Read(buf)
++	if err != nil || string(buf[:n]) != "ping" {
++		t.Fatalf("udp echo got %q, err %v", buf[:n], err)
++	}
++	if err := <-done; err != nil {
++		t.Fatalf("udp server: %v", err)
++	}
++}
++
++func TestLoopbackAddrFiltering(t *testing.T) {
++	v4Loop := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80}
++	v4Peer := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 54321}
++	v4Lan := &net.TCPAddr{IP: net.IPv4(192, 168, 1, 10), Port: 80}
++	v6Loop := &net.TCPAddr{IP: net.IPv6loopback, Port: 80}
++
++	if !isLoopbackTCPAddrs(v4Loop, v4Peer, true) {
++		t.Fatal("expected IPv4 loopback pair to be accepted")
++	}
++	if isLoopbackTCPAddrs(v4Lan, v4Peer, true) {
++		t.Fatal("expected non-loopback local addr to be rejected")
++	}
++	if isLoopbackTCPAddrs(v4Loop, v4Lan, true) {
++		t.Fatal("expected non-loopback remote addr to be rejected")
++	}
++	if isLoopbackTCPAddrs(v6Loop, v6Loop, true) {
++		t.Fatal("expected IPv6 loopback on IPv4 listener to be rejected")
++	}
++	if !isLoopbackTCPAddrs(v6Loop, v6Loop, false) {
++		t.Fatal("expected IPv6 loopback pair to be accepted")
++	}
++}
+diff --git a/pkg/services/forwarder/listen_other.go b/pkg/services/forwarder/listen_other.go
+new file mode 100644
+index 0000000..b88d495
+--- /dev/null
++++ b/pkg/services/forwarder/listen_other.go
+@@ -0,0 +1,17 @@
++//go:build !darwin
++
++package forwarder
++
++import "net"
++
++func listenLoopbackTCP(network, laddr string) (net.Listener, error) {
++	return net.Listen(network, laddr)
++}
++
++func listenLoopbackUDP(addr *net.UDPAddr) (udpConn, error) {
++	conn, err := net.ListenUDP("udp", addr)
++	if err != nil {
++		return nil, err
++	}
++	return conn, nil
++}
+diff --git a/pkg/services/forwarder/ports.go b/pkg/services/forwarder/ports.go
+index c236cf6..6e651a1 100644
+--- a/pkg/services/forwarder/ports.go
++++ b/pkg/services/forwarder/ports.go
+@@ -210,7 +210,7 @@ func (f *PortsForwarder) Expose(protocol types.TransportProtocol, local, remote
+ 		if err != nil {
+ 			return err
+ 		}
+-		listener, err := net.ListenUDP("udp", addr)
++		listener, err := listenLoopbackUDP(addr)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -238,6 +238,7 @@ func (f *PortsForwarder) Expose(protocol types.TransportProtocol, local, remote
+ 		}
+ 
+ 		var p tcpproxy.Proxy
++		p.ListenFunc = listenLoopbackTCP
+ 		p.AddRoute(local, guestTarget{
+ 			addr: remote,
+ 			dial: func(ctx context.Context, src net.Addr) (halfCloser, error) {
+-- 
+2.56.0
+
