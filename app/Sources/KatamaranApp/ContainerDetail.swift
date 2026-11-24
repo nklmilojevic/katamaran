@@ -342,8 +342,7 @@ final class InfoTabView: NSView, ContainerTabView {
         }
         var network: [NSView] = []
         if !bindings.isEmpty {
-            var seen = Set<UInt16>()
-            let links = bindings.filter { seen.insert($0.host).inserted }.map { b -> NSView in
+            let links = Self.uniqueHostBindings(bindings).map { b -> NSView in
                 let arrow = label("→ \(b.container)/\(b.proto)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
                 if let err = model.status?.portError(proto: b.proto, port: b.host) {
                     let addr = label("localhost:\(b.host)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
@@ -411,6 +410,11 @@ final class InfoTabView: NSView, ContainerTabView {
             groups.append(FormGroup(header: "Labels", rows: rows))
         }
         content.set(groups)
+    }
+
+    static func uniqueHostBindings(_ bindings: [PortBinding]) -> [PortBinding] {
+        var seen = Set<Port>()
+        return bindings.filter { seen.insert(Port(proto: $0.proto.lowercased(), port: $0.host)).inserted }
     }
 
     private func stateText(_ i: ContainerInspect, _ c: ContainerSummary) -> String {

@@ -286,4 +286,22 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     )
     let single = try JSONDecoder().decode(DaemonStatus.self, from: Data(singleJSON.utf8))
     #expect(single.portErrorSummary == "Port 80/tcp not forwarded")
+
+    // Service reveal skips failed ports and returns nil when every port failed.
+    #expect(K8sGrouping.firstReachableLocalPort([80, 443], status: decoded) == nil)
+    #expect(K8sGrouping.firstReachableLocalPort([80, 8080], status: decoded) == 8080)
+    #expect(K8sGrouping.firstReachableLocalPort([80, 443], status: clean) == 80)
+}
+
+@MainActor
+@Test func containerBindingsDeduplicateByHostAndProtocol() {
+    let bindings = [
+        PortBinding(host: 53, container: 53, proto: "udp"),
+        PortBinding(host: 53, container: 53, proto: "UDP"),
+        PortBinding(host: 53, container: 53, proto: "tcp"),
+        PortBinding(host: 53, container: 53, proto: "tcp"),
+    ]
+    let unique = InfoTabView.uniqueHostBindings(bindings)
+    #expect(unique.count == 2)
+    #expect(unique.map(\.proto) == ["udp", "tcp"])
 }

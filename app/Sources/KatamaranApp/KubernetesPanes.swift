@@ -203,6 +203,13 @@ enum K8sGrouping {
     static func serviceSubtitle(_ s: K8sService) -> String {
         [s.type, s.portsLabel].filter { !$0.isEmpty }.joined(separator: " · ")
     }
+
+    /// First local port that macOS did not refuse to bind, or nil if every port failed.
+    static func firstReachableLocalPort(_ localPorts: [Int], status: DaemonStatus?) -> Int? {
+        localPorts.first { port in
+            UInt16(exactly: port).flatMap { status?.portError(proto: "tcp", port: $0) } == nil
+        }
+    }
 }
 
 // MARK: - Pods
@@ -480,11 +487,9 @@ final class ServicesPane: KubernetesPane {
     }
 
     override func reveal(_ key: String) -> URL? {
-        guard let localPorts = store.service(key)?.localPorts else { return nil }
-        let preferred = localPorts.first { port in
-            UInt16(exactly: port).flatMap { model.status?.portError(proto: "tcp", port: $0) } == nil
-        } ?? localPorts.first
-        return preferred.flatMap { URL(string: "http://localhost:\($0)") }
+        guard let localPorts = store.service(key)?.localPorts,
+              let port = K8sGrouping.firstReachableLocalPort(localPorts, status: model.status) else { return nil }
+        return URL(string: "http://localhost:\(port)")
     }
 
     private struct ServiceDetailState: Hashable {
