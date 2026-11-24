@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.1 - 2026-11-24
+
+This release fixes a deadlock in the VM network transport. Large Docker streams over `docker.sock` now work without a hang.
+
+### Fixes
+
+- Fix a deadlock in the virtio-vsock Unix proxy. Before, a command such as `docker export <image> | docker run -i ...` could stop the VM. After the fix, `docker ps` and `docker version` stay responsive, and the guest keeps answering watchdog pings.
+
 ## v0.9.0 - 2026-11-24
 
 This release lets you publish privileged ports, such as 80 and 443, without root on macOS. It also shows port forwards that fail.
