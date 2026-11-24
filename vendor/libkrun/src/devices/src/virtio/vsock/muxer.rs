@@ -57,6 +57,7 @@ pub enum MuxerRx {
         local_port: u32,
         peer_port: u32,
         flags: u32,
+        fwd_cnt: u32,
     },
     GetnameResponse {
         local_port: u32,
@@ -771,12 +772,14 @@ impl VsockMuxer {
     fn process_op_response(&self, pkt: &VsockPacket) {
         debug!("OP_RESPONSE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let update = self
-            .proxy_map
-            .read()
-            .unwrap()
-            .get(&id)
-            .map(|proxy| proxy.lock().unwrap().process_op_response(pkt));
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.process_op_response(pkt);
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            update
+        });
         update
             .as_ref()
             .and_then(|u| u.push_accept)
@@ -796,12 +799,28 @@ impl VsockMuxer {
     fn process_op_shutdown(&self, pkt: &VsockPacket) {
         debug!("OP_SHUTDOWN");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy| {
+            let mut proxy = proxy.lock().unwrap();
+            let mut update = proxy.shutdown(pkt);
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            update
+        });
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
+        }
+    }
+
+    fn process_op_credit_request(&self, pkt: &VsockPacket) {
+        debug!("OP_CREDIT_REQUEST");
+        let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let update = self
             .proxy_map
             .read()
             .unwrap()
             .get(&id)
-            .map(|proxy| proxy.lock().unwrap().shutdown(pkt));
+            .map(|proxy| proxy.lock().unwrap().send_credit_update());
         if let Some(update) = update {
             self.process_proxy_update(id, update);
         }
@@ -828,14 +847,20 @@ impl VsockMuxer {
     fn process_stream_rw(&self, pkt: &VsockPacket) {
         debug!("OP_RW");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
             debug!(
                 "allowing OP_RW: src={} dst={}",
                 pkt.src_port(),
                 pkt.dst_port()
             );
             let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.sendmsg(pkt);
+            let mut update = proxy.sendmsg(pkt);
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            update
+        });
+        if let Some(update) = update {
             self.process_proxy_update(id, update);
         } else {
             debug!("invalid OP_RW for {}, sending reset", pkt.src_port());
@@ -873,7 +898,12 @@ impl VsockMuxer {
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            Some(proxy_lock.lock().unwrap().release())
+            let mut proxy = proxy_lock.lock().unwrap();
+            let mut update = proxy.release();
+            if let Some((id, fd, events)) = update.polling.take() {
+                self.update_polling(id, fd, events);
+            }
+            Some(update)
         } else {
             debug!("invalid OP_RST for {}", pkt.src_port());
             None
@@ -912,6 +942,7 @@ impl VsockMuxer {
             uapi::VSOCK_OP_REQUEST => self.process_op_request(pkt),
             uapi::VSOCK_OP_RESPONSE => self.process_op_response(pkt),
             uapi::VSOCK_OP_SHUTDOWN => self.process_op_shutdown(pkt),
+            uapi::VSOCK_OP_CREDIT_REQUEST => self.process_op_credit_request(pkt),
             uapi::VSOCK_OP_CREDIT_UPDATE => self.process_op_credit_update(pkt),
             uapi::VSOCK_OP_RW => self.process_stream_rw(pkt),
             uapi::VSOCK_OP_RST => self.process_stream_rst(pkt),

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::Wrapping;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -43,6 +43,13 @@ pub struct UnixProxy {
     pub(crate) peer_shutdown: u32,
     /// The host end reached EOF and the guest was sent SHUTDOWN_SEND.
     pub(crate) local_shutdown: bool,
+    /// The host end closed its read side (send failed) and the guest was sent SHUTDOWN_RCV.
+    pub(crate) local_recv_shutdown: bool,
+    /// Guest-to-host bytes waiting for the host socket to become writable.
+    pub(crate) tx_buf: VecDeque<u8>,
+    /// The guest asked to shut down its send side while `tx_buf` still had
+    /// buffered bytes; `shutdown(SHUT_WR)` runs once `tx_buf` drains.
+    pub(crate) pending_peer_shutdown_send: bool,
     pub(crate) peer_fwd_cnt: Wrapping<u32>,
     pub(crate) peer_buf_alloc: u32,
     pub(crate) tx_cnt: Wrapping<u32>,
@@ -78,6 +85,9 @@ impl UnixProxy {
             control_port,
             peer_shutdown: 0,
             local_shutdown: false,
+            local_recv_shutdown: false,
+            tx_buf: VecDeque::new(),
+            pending_peer_shutdown_send: false,
             peer_fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             tx_cnt: Wrapping(0),
@@ -107,6 +117,9 @@ impl UnixProxy {
             control_port: 0,
             peer_shutdown: 0,
             local_shutdown: false,
+            local_recv_shutdown: false,
+            tx_buf: VecDeque::new(),
+            pending_peer_shutdown_send: false,
             fd,
             status: ProxyStatus::ReverseInit,
             mem,
@@ -142,17 +155,78 @@ impl UnixProxy {
             local_port: self.local_port,
             peer_port: self.peer_port,
             flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
+            fwd_cnt: self.tx_cnt.0,
         };
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    /// Readiness to poll the host socket for: nothing once it reached EOF.
+    /// Tell the guest the host end will receive no more data.
+    pub(crate) fn push_shutdown_recv(&self) {
+        let rx = MuxerRx::Shutdown {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            flags: uapi::VSOCK_FLAGS_SHUTDOWN_RCV,
+            fwd_cnt: self.tx_cnt.0,
+        };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    /// Report the current forwarded byte count (`tx_cnt`) to the guest.
+    pub(crate) fn push_credit_update(&mut self) {
+        self.last_tx_cnt_sent = self.tx_cnt;
+        let rx = MuxerRx::CreditUpdate {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            fwd_cnt: self.tx_cnt.0,
+        };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    /// Readiness to poll the host socket for reads: nothing once EOF or guest
+    /// RCV shutdown has occurred.
     pub(crate) fn read_interest(&self) -> EventSet {
-        if self.local_shutdown {
+        if self.status != ProxyStatus::Connected
+            || self.local_shutdown
+            || (self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0)
+        {
             EventSet::empty()
         } else {
             EventSet::IN
         }
+    }
+
+    /// Combined readiness to poll the host socket for: read while connected
+    /// and open, write while connecting or draining buffered guest-to-host bytes.
+    pub(crate) fn poll_interest(&self) -> EventSet {
+        match self.status {
+            ProxyStatus::Connecting => EventSet::IN | EventSet::OUT,
+            ProxyStatus::Connected => {
+                let mut ev = self.read_interest();
+                if !self.tx_buf.is_empty() && !self.local_recv_shutdown {
+                    ev |= EventSet::OUT;
+                }
+                ev
+            }
+            ProxyStatus::WaitingCreditUpdate => {
+                if !self.tx_buf.is_empty() && !self.local_recv_shutdown {
+                    EventSet::OUT
+                } else {
+                    EventSet::empty()
+                }
+            }
+            _ => EventSet::empty(),
+        }
+    }
+
+    /// Whether both directions of the relayed stream are finished and no
+    /// buffered guest-to-host data remains to be flushed.
+    pub(crate) fn is_fully_shutdown(&self) -> bool {
+        let host_to_guest_done =
+            self.local_shutdown || (self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0);
+        let guest_to_host_done = self.local_recv_shutdown
+            || ((self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0)
+                && self.tx_buf.is_empty());
+        host_to_guest_done && guest_to_host_done
     }
 
     pub(crate) fn peer_avail_credit(&self) -> usize {
@@ -282,6 +356,21 @@ impl Proxy for UnixProxy {
         sys::update_peer_credit(self, pkt)
     }
 
+    fn send_credit_update(&mut self) -> ProxyUpdate {
+        if matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) {
+            self.push_credit_update();
+            ProxyUpdate {
+                signal_queue: true,
+                ..Default::default()
+            }
+        } else {
+            ProxyUpdate::default()
+        }
+    }
+
     fn push_op_request(&self) {
         sys::push_op_request(self)
     }
@@ -302,14 +391,25 @@ impl Proxy for UnixProxy {
             return ProxyUpdate::default();
         }
 
+        let prev_interest = self.poll_interest();
+        let new_flags = shutdown & !self.peer_shutdown;
         self.peer_shutdown |= shutdown;
-        sys::do_shutdown(self, pkt);
 
-        // Fully done once the guest stops both directions, or stops sending
-        // after the host end already reached EOF.
-        let guest_done_sending = self.peer_shutdown & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
-        if self.peer_shutdown != SHUTDOWN_MASK && !(self.local_shutdown && guest_done_sending) {
-            return ProxyUpdate::default();
+        let recv_off = new_flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+        let send_off = new_flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+        let defer_send = send_off && !self.tx_buf.is_empty() && !self.local_recv_shutdown;
+        if defer_send {
+            self.pending_peer_shutdown_send = true;
+        }
+        sys::do_shutdown_dirs(self, recv_off, send_off && !defer_send);
+
+        if !self.is_fully_shutdown() {
+            let next_interest = self.poll_interest();
+            let mut update = ProxyUpdate::default();
+            if next_interest != prev_interest {
+                update.polling = Some((self.id, self.as_raw_fd(), next_interest));
+            }
+            return update;
         }
 
         self.push_reset();

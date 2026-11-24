@@ -261,16 +261,22 @@ impl Epoll {
                         ));
                     }
                 }
-                let _ = unsafe {
-                    libc::kevent(
-                        self.queue,
-                        kevs.as_ptr() as *const libc::kevent,
-                        kevs.len() as i32,
-                        ptr::null_mut(),
-                        0,
-                        ptr::null(),
-                    )
-                };
+                // Delete each filter individually: XNU aborts a batched
+                // kevent() changelist (with nevents=0) on the first ENOENT,
+                // which would leave EVFILT_WRITE registered whenever
+                // EVFILT_READ was not present.
+                for kev in &kevs {
+                    let _ = unsafe {
+                        libc::kevent(
+                            self.queue,
+                            kev as *const Kevent as *const libc::kevent,
+                            1,
+                            ptr::null_mut(),
+                            0,
+                            ptr::null(),
+                        )
+                    };
+                }
             }
         }
         Ok(())
@@ -480,5 +486,45 @@ mod tests {
         assert_eq!(ev_count, 1);
         assert_eq!(ready_events[0].data(), event_fd_1.as_raw_fd() as u64);
         assert_eq!(ready_events[0].events(), EventSet::IN.bits());
+    }
+
+    #[test]
+    fn test_delete_write_only_filter() {
+        use std::os::unix::net::UnixStream;
+
+        let mut epoll = Epoll::new().unwrap();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let wake = EventFd::new(EFD_NONBLOCK).unwrap();
+        wake.write(1).unwrap();
+
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                a.as_raw_fd(),
+                &EpollEvent::new(EventSet::OUT, 1),
+            )
+            .unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                wake.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, 2),
+            )
+            .unwrap();
+
+        let mut ready = vec![EpollEvent::default(); 4];
+        let n = epoll.wait(4, 100, &mut ready).unwrap();
+        assert_eq!(n, 2);
+
+        // Deleting with empty EventSet must still remove EVFILT_WRITE even when
+        // EVFILT_READ was never registered on `a`.
+        epoll
+            .ctl(ControlOperation::Delete, a.as_raw_fd(), &EpollEvent::default())
+            .unwrap();
+
+        let n = epoll.wait(4, 100, &mut ready).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(ready[0].data(), 2);
+        assert_eq!(ready[0].events(), EventSet::IN.bits());
     }
 }

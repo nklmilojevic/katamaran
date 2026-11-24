@@ -156,3 +156,189 @@ fn docker_api_is_served_and_survives_half_close() {
 
     vm.stop();
 }
+
+/// Build a valid POSIX ustar header for a single regular file `name` of `size` bytes.
+fn tar_header(name: &str, size: u64) -> [u8; 512] {
+    let mut hdr = [0u8; 512];
+    hdr[..name.len()].copy_from_slice(name.as_bytes());
+    hdr[100..108].copy_from_slice(b"0000644\0");
+    hdr[108..116].copy_from_slice(b"0000000\0");
+    hdr[116..124].copy_from_slice(b"0000000\0");
+    let size_oct = format!("{size:011o}\0");
+    hdr[124..136].copy_from_slice(size_oct.as_bytes());
+    hdr[136..148].copy_from_slice(b"00000000000\0");
+    hdr[148..156].fill(b' ');
+    hdr[156] = b'0';
+    hdr[257..263].copy_from_slice(b"ustar\0");
+    hdr[263..265].copy_from_slice(b"00");
+    let sum: u32 = hdr.iter().map(|&b| u32::from(b)).sum();
+    let cksum = format!("{sum:06o}\0 ");
+    hdr[148..156].copy_from_slice(cksum.as_bytes());
+    hdr
+}
+
+/// Read an HTTP response header up to `\r\n\r\n`, returning `(header, leftover_body_bytes)`.
+fn read_http_header(stream: &mut UnixStream) -> (String, Vec<u8>) {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).expect("read HTTP response header");
+        assert!(
+            n > 0,
+            "EOF before end of HTTP header: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        raw.extend_from_slice(&buf[..n]);
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            let hdr = String::from_utf8_lossy(&raw[..pos]).into_owned();
+            let rest = raw[pos + 4..].to_vec();
+            return (hdr, rest);
+        }
+    }
+}
+
+/// Regression test for the virtio-vsock blocking-send deadlock:
+/// 1. A stalled host reader on a >12 MiB guest->host Docker stream must not
+///    freeze the VMM event loop or starve other Docker / control-channel I/O.
+/// 2. Piping a >16 MiB guest->host Docker stream (`images/get`) directly into a
+///    concurrent host->guest Docker stream (`images/create?fromSrc=-`) over
+///    `docker.sock` must complete without deadlocking on vsock credit updates.
+#[test]
+#[ignore = "boots the system VM; run with `cargo xtask test-vm`"]
+fn concurrent_bidirectional_docker_streams_do_not_deadlock() {
+    let mut vm = Vm::start();
+    vm.wait_for("docker ready", Duration::from_secs(120));
+    let sock = vm.docker_socket();
+
+    // Import an incompressible 16 MiB image so both host socket buffers (4 MiB)
+    // and the vsock per-connection credit window (8 MiB) overflow.
+    const BLOB_BYTES: usize = 16 * 1024 * 1024;
+    let tar_len = 512 + BLOB_BYTES + 1024;
+    {
+        let mut s = UnixStream::connect(&sock).expect("connect docker socket for import");
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(60))).unwrap();
+        write!(
+            s,
+            "POST /images/create?fromSrc=-&repo=kattest&tag=blob HTTP/1.1\r\n\
+             Host: docker\r\n\
+             Content-Type: application/x-tar\r\n\
+             Content-Length: {tar_len}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        s.write_all(&tar_header("blob.bin", BLOB_BYTES as u64))
+            .unwrap();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut left = BLOB_BYTES;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            for word in chunk[..n].chunks_exact_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                word.copy_from_slice(&state.to_le_bytes());
+            }
+            s.write_all(&chunk[..n]).unwrap();
+            left -= n;
+        }
+        s.write_all(&[0u8; 1024]).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "seed import: {resp}");
+    }
+
+    // Connection A: stream the 16 MiB image guest -> host (HTTP/1.0 avoids chunking).
+    let mut export = UnixStream::connect(&sock).expect("connect docker socket for export");
+    export
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    export
+        .write_all(b"GET /images/kattest:blob/get HTTP/1.0\r\nHost: docker\r\n\r\n")
+        .unwrap();
+    let (export_hdr, export_rest) = read_http_header(&mut export);
+    assert!(
+        export_hdr.starts_with("HTTP/1.0 200"),
+        "export header: {export_hdr}"
+    );
+
+    // Pause reading Connection A so the guest fills its 4 MiB host socket buffer
+    // and overflows into the non-blocking vsock TX queue. A concurrent /_ping on
+    // a separate socket must still succeed promptly instead of hanging.
+    thread::sleep(Duration::from_millis(500));
+    let ping_while_stalled = http(
+        &sock,
+        "GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert!(
+        ping_while_stalled.starts_with("HTTP/1.1 200"),
+        "ping stalled while export reader was paused: {ping_while_stalled:?}"
+    );
+
+    // Connection B: pipe Connection A directly into a concurrent host -> guest
+    // import over docker.sock, mirroring `docker export | docker run -i`.
+    let mut import = UnixStream::connect(&sock).expect("connect docker socket for pipe import");
+    import
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    import
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    import
+        .write_all(
+            b"POST /images/create?fromSrc=-&repo=kattest&tag=copy HTTP/1.1\r\n\
+              Host: docker\r\n\
+              Content-Type: application/x-tar\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .unwrap();
+
+    let mut piped_bytes: usize = 0;
+    let write_chunk = |dst: &mut UnixStream, data: &[u8]| {
+        if data.is_empty() {
+            return;
+        }
+        write!(dst, "{:x}\r\n", data.len()).unwrap();
+        dst.write_all(data).unwrap();
+        dst.write_all(b"\r\n").unwrap();
+    };
+    write_chunk(&mut import, &export_rest);
+    piped_bytes += export_rest.len();
+
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        let n = export.read(&mut buf).expect("read export stream");
+        if n == 0 {
+            break;
+        }
+        write_chunk(&mut import, &buf[..n]);
+        piped_bytes += n;
+    }
+    import.write_all(b"0\r\n\r\n").unwrap();
+    assert!(
+        piped_bytes >= BLOB_BYTES,
+        "expected >= {BLOB_BYTES} piped bytes, got {piped_bytes}"
+    );
+
+    let mut import_resp = String::new();
+    import.read_to_string(&mut import_resp).unwrap();
+    assert!(
+        import_resp.starts_with("HTTP/1.1 200"),
+        "piped import failed: {import_resp}"
+    );
+
+    let ping_after = http(
+        &sock,
+        "GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n",
+        false,
+    );
+    assert!(
+        ping_after.starts_with("HTTP/1.1 200"),
+        "ping after bidirectional pipe: {ping_after:?}"
+    );
+
+    vm.stop();
+}

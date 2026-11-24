@@ -129,9 +129,12 @@ impl MuxerThread {
             self.update_polling(polling.0, polling.1, polling.2);
         }
 
+        let mut should_signal = update.signal_queue;
+
         if let Some(credit_rx) = update.push_credit_req {
             debug!("send_credit_request");
             self.send_credit_request(credit_rx);
+            should_signal = true;
         }
 
         match update.remove_proxy {
@@ -147,8 +150,6 @@ impl MuxerThread {
                 }
             }
         }
-
-        let mut should_signal = update.signal_queue;
 
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);

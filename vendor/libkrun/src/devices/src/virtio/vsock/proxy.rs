@@ -106,6 +106,9 @@ pub trait Proxy: Send + AsRawFd {
     ) -> ProxyUpdate;
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
     fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+    fn send_credit_update(&mut self) -> ProxyUpdate {
+        ProxyUpdate::default()
+    }
     fn push_op_request(&self) {}
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn enqueue_accept(&mut self) {}
