@@ -96,6 +96,8 @@ pub enum Event {
     MountFailed(String),
     PortAdd(PortProto, u16),
     PortRemove(PortProto, u16),
+    PortFailed(PortProto, u16, String),
+    PortErrorClear(PortProto, u16),
     Stats(GuestStats),
     /// The VM died and starts again after `delay`; [`Event::Booted`] and
     /// the rest follow as for the first boot.
@@ -554,10 +556,13 @@ fn session(
             Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
                 on_event(Event::PortRemove(proto, port));
             }
-            Ok(Input::Forward(
-                _,
-                net::Event::Refused(..) | net::Event::Transient(..) | net::Event::RemoveFailed(..),
-            )) => {}
+            Ok(Input::Forward(_, net::Event::Refused(proto, port, why))) => {
+                on_event(Event::PortFailed(proto, port, why));
+            }
+            Ok(Input::Forward(_, net::Event::RefusedCleared(proto, port))) => {
+                on_event(Event::PortErrorClear(proto, port));
+            }
+            Ok(Input::Forward(_, net::Event::Transient(..) | net::Event::RemoveFailed(..))) => {}
             Ok(Input::Guest(_, Some(Msg::AutoForwardAdd { proto, port }))) => {
                 match auto_forwards.add(port) {
                     Ok(true) => {
@@ -568,10 +573,13 @@ fn session(
                         on_event(Event::PortAdd(proto, port));
                     }
                     Ok(false) => {}
-                    Err(e) => eprintln!(
-                        "katamaran: cannot auto-forward 127.0.0.1:{port}/{} ({e}); skipped",
-                        proto.as_str()
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "katamaran: cannot auto-forward 127.0.0.1:{port}/{} ({e}); skipped",
+                            proto.as_str()
+                        );
+                        on_event(Event::PortFailed(proto, port, e.to_string()));
+                    }
                 }
             }
             Ok(Input::Guest(_, Some(Msg::AutoForwardRemove { proto, port }))) => {
@@ -581,6 +589,8 @@ fn session(
                         proto.as_str()
                     );
                     on_event(Event::PortRemove(proto, port));
+                } else {
+                    on_event(Event::PortErrorClear(proto, port));
                 }
             }
             Ok(Input::Guest(

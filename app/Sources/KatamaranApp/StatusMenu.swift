@@ -38,6 +38,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
         let sig = [
             "\(phase)", "\(model.busy)", "\(model.restartRequired)", model.lastError ?? "", model.status?.error ?? "",
+            model.status?.portErrorDetails ?? "",
             "\(model.status?.vm != nil)", statusSummary(model.status) ?? "",
             "\(Updater.shared.isConfigured)", "\(Updater.shared.canCheckForUpdates)",
             Updater.shared.pendingUpdateVersion ?? "",
@@ -62,6 +63,14 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             i.toolTip = message
             i.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(paletteColors: [.systemRed]))
+            i.isEnabled = false
+            menu.addItem(i)
+        }
+        if let portSummary = model.status?.portErrorSummary {
+            let i = NSMenuItem(title: portSummary.count > 90 ? String(portSummary.prefix(90)) + "…" : portSummary, action: nil, keyEquivalent: "")
+            i.toolTip = model.status?.portErrorDetails
+            i.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(paletteColors: [.systemOrange]))
             i.isEnabled = false
             menu.addItem(i)
         }

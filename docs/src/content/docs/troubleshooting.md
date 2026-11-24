@@ -96,7 +96,7 @@ umount -f ~/Katamaran
 lsof -nP -iTCP:<PORT> -sTCP:LISTEN
 ```
 
-3. Verify the port appears in `kat status` and check `kat logs --source gvproxy`.
+3. Check `kat status` for `port err` entries (or `port_errors` in `kat status --json`) and inspect `kat logs --source gvproxy` and `kat logs --source daemon`.
 
 ## Kubernetes cluster will not start or `kubectl` cannot connect
 

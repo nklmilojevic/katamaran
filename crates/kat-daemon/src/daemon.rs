@@ -7,7 +7,7 @@
 //! clients read. SIGTERM (launchd's bootout) and SIGINT stop the VM cleanly
 //! before the daemon exits.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -26,8 +26,8 @@ use serde_json::Value;
 
 use crate::api::{
     self, Call, ConfigView, DaemonInfo, DockerInfo, DockerState, K8sStatus, LogChunk, LogSource,
-    LogsParams, MountInfo, Port, Request, Response, RpcError, Sample, StatsResult, Status,
-    Versions, VmInfo,
+    LogsParams, MountInfo, Port, PortError, Request, Response, RpcError, Sample, StatsResult,
+    Status, Versions, VmInfo,
 };
 use crate::config::{Config, Host};
 use crate::power::{self, PowerEvent};
@@ -253,6 +253,7 @@ struct Run {
     mount_error: Option<String>,
     problem: Option<String>,
     ports: BTreeSet<(PortProto, u16)>,
+    port_errors: BTreeMap<(PortProto, u16), String>,
     prev_guest: Option<GuestStats>,
     prev_host: Option<(Instant, u64)>,
     host_cpu_percent: f64,
@@ -275,6 +276,7 @@ impl Run {
             mount_error: None,
             problem: None,
             ports: BTreeSet::new(),
+            port_errors: BTreeMap::new(),
             prev_guest: None,
             prev_host: None,
             host_cpu_percent: 0.0,
@@ -488,10 +490,19 @@ impl Daemon {
                     r.mount_error = Some(error);
                 }
                 Event::PortAdd(proto, port) => {
+                    r.port_errors.remove(&(proto, port));
                     r.ports.insert((proto, port));
                 }
                 Event::PortRemove(proto, port) => {
                     r.ports.remove(&(proto, port));
+                    r.port_errors.remove(&(proto, port));
+                }
+                Event::PortFailed(proto, port, error) => {
+                    r.ports.remove(&(proto, port));
+                    r.port_errors.insert((proto, port), error);
+                }
+                Event::PortErrorClear(proto, port) => {
+                    r.port_errors.remove(&(proto, port));
                 }
                 Event::Restarting { why, delay } => {
                     dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
@@ -687,6 +698,18 @@ impl Daemon {
                         .map(|(p, port)| Port {
                             proto: p.as_str().into(),
                             port: *port,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            port_errors: r
+                .map(|r| {
+                    r.port_errors
+                        .iter()
+                        .map(|((p, port), error)| PortError {
+                            proto: p.as_str().into(),
+                            port: *port,
+                            error: error.clone(),
                         })
                         .collect()
                 })
@@ -2100,6 +2123,55 @@ mod tests {
         }
         assert!(!kc.exists());
         guest.join().unwrap();
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn tracks_and_clears_port_forward_errors() {
+        let home = temp("port-errors");
+        let d = Daemon::new(home.clone());
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Running;
+            g.run = Some(Run::new(Config::default(), None));
+        }
+        d.on_event(
+            1,
+            Event::PortFailed(PortProto::Tcp, 80, "address already in use".into()),
+        );
+        let st = d.status();
+        assert!(st.ports.is_empty());
+        assert_eq!(
+            st.port_errors,
+            vec![PortError {
+                proto: "tcp".into(),
+                port: 80,
+                error: "address already in use".into(),
+            }]
+        );
+
+        // Successful bind replaces the error.
+        d.on_event(1, Event::PortAdd(PortProto::Tcp, 80));
+        let st = d.status();
+        assert_eq!(
+            st.ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 80,
+            }]
+        );
+        assert!(st.port_errors.is_empty());
+
+        // Another failure is cleared on PortErrorClear.
+        d.on_event(
+            1,
+            Event::PortFailed(PortProto::Tcp, 443, "address already in use".into()),
+        );
+        assert_eq!(d.status().port_errors.len(), 1);
+        d.on_event(1, Event::PortErrorClear(PortProto::Tcp, 443));
+        assert!(d.status().port_errors.is_empty());
 
         fs::remove_dir_all(&home).unwrap();
     }

@@ -395,6 +395,9 @@ pub struct Status {
     pub k8s: K8sStatus,
     pub mount: MountInfo,
     pub ports: Vec<Port>,
+    /// Ports the guest tried to expose that could not be bound on macOS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_errors: Vec<PortError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -496,6 +499,13 @@ pub struct MountInfo {
 pub struct Port {
     pub proto: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PortError {
+    pub proto: String,
+    pub port: u16,
+    pub error: String,
 }
 
 /// One resource sample: the guest's own view plus the VM process on the Mac.
@@ -713,12 +723,25 @@ mod tests {
                 proto: "tcp".into(),
                 port: 8080,
             }],
+            port_errors: vec![],
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["state"], "running");
         assert_eq!(v["docker"]["state"], "ready");
         assert!(v.get("error").is_none());
+        assert!(v.get("port_errors").is_none());
         let back: Status = serde_json::from_value(v).unwrap();
         assert_eq!(back, status);
+
+        let mut with_err = status;
+        with_err.port_errors.push(PortError {
+            proto: "tcp".into(),
+            port: 80,
+            error: "address already in use".into(),
+        });
+        let v = serde_json::to_value(&with_err).unwrap();
+        assert_eq!(v["port_errors"][0]["port"], 80);
+        let back: Status = serde_json::from_value(v).unwrap();
+        assert_eq!(back, with_err);
     }
 }

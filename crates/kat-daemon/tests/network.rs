@@ -136,6 +136,12 @@ fn free_port() -> u16 {
         .port()
 }
 
+fn free_low_port() -> Option<u16> {
+    std::iter::once(80u16)
+        .chain((900u16..=1023).rev())
+        .find(|&p| TcpListener::bind(("0.0.0.0", p)).is_ok())
+}
+
 fn http_get(port: u16) -> Option<String> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
@@ -238,6 +244,41 @@ getent hosts github.com >/dev/null && echo getaddrinfo=ok"#;
         Duration::from_secs(5),
     );
     assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+
+    // Privileged port (< 1024, e.g. `-p 80:80`) is forwarded without root.
+    if let Some(low) = free_low_port() {
+        let cid = vm.docker(&[
+            "run",
+            "-d",
+            "-p",
+            &format!("{low}:80"),
+            IMAGE,
+            "sh",
+            "-c",
+            server,
+        ]);
+        let cid = String::from_utf8_lossy(&cid.stdout).trim().to_string();
+        let started = Instant::now();
+        loop {
+            if http_get(low).is_some_and(|r| r.contains("hello-from-k8n")) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "127.0.0.1:{low} not reachable within 3 s"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!(
+            "privileged port {low} reachable {:?} after the container started",
+            started.elapsed()
+        );
+        vm.docker(&["rm", "-f", &cid]);
+        vm.wait_for(
+            &format!("stopped forwarding 127.0.0.1:{low}/tcp"),
+            Duration::from_secs(5),
+        );
+    }
 
     vm.stop();
 }

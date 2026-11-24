@@ -25,7 +25,10 @@ class KubernetesPane: SectionPane, ResourceSource {
         self.model = model
         self.kind = kind
         store.observe { [weak self] _ in self?.reloadAll() }
-        model.observe { [weak self] in self?.onChange() }
+        model.observe { [weak self] in
+            self?.detailVC.reload()
+            self?.onChange()
+        }
     }
 
     func reloadAll() {
@@ -199,6 +202,13 @@ enum K8sGrouping {
     /// "LoadBalancer · 80:30080/TCP"
     static func serviceSubtitle(_ s: K8sService) -> String {
         [s.type, s.portsLabel].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    /// First local port that macOS did not refuse to bind, or nil if every port failed.
+    static func firstReachableLocalPort(_ localPorts: [Int], status: DaemonStatus?) -> Int? {
+        localPorts.first { port in
+            UInt16(exactly: port).flatMap { status?.portError(proto: "tcp", port: $0) } == nil
+        }
     }
 }
 
@@ -477,17 +487,24 @@ final class ServicesPane: KubernetesPane {
     }
 
     override func reveal(_ key: String) -> URL? {
-        store.service(key)?.localPorts.first.flatMap { URL(string: "http://localhost:\($0)") }
+        guard let localPorts = store.service(key)?.localPorts,
+              let port = K8sGrouping.firstReachableLocalPort(localPorts, status: model.status) else { return nil }
+        return URL(string: "http://localhost:\(port)")
     }
 
     private struct ServiceDetailState: Hashable {
         var service: K8sService
         var pods: [String]
+        var portErrors: [PortError]
     }
 
     override func detailVersion(_ key: String) -> AnyHashable? {
         guard let s = store.service(key) else { return nil }
-        return ServiceDetailState(service: s, pods: store.pods(for: s).map(\.name).sorted())
+        return ServiceDetailState(
+            service: s,
+            pods: store.pods(for: s).map(\.name).sorted(),
+            portErrors: model.status?.port_errors ?? []
+        )
     }
 
     override func details(_ key: String) -> [NSView] {
@@ -506,9 +523,16 @@ final class ServicesPane: KubernetesPane {
             return InfoRow(p.name ?? "port", v, mono: true)
         }
         if !ports.isEmpty { groups.append(FormGroup(header: "Ports", rows: ports)) }
-        let local = s.localPorts.compactMap { URL(string: "http://localhost:\($0)") }
-        if !local.isEmpty {
-            groups.append(FormGroup(header: "On this Mac", rows: [InfoRow("Open", view: URLLinks(local))]))
+        let localPorts = s.localPorts
+        if !localPorts.isEmpty {
+            let entries = localPorts.compactMap { port -> (URL, String?)? in
+                guard let url = URL(string: "http://localhost:\(port)") else { return nil }
+                let err = UInt16(exactly: port).flatMap { model.status?.portError(proto: "tcp", port: $0) }
+                return (url, err)
+            }
+            if !entries.isEmpty {
+                groups.append(FormGroup(header: "On this Mac", rows: [InfoRow("Open", view: ServicePortLinks(entries))]))
+            }
         }
         let pods = store.pods(for: s)
         if let sel = s.spec?.selector, !sel.isEmpty {
@@ -534,19 +558,29 @@ final class ServicesPane: KubernetesPane {
     }
 }
 
-/// URLs as links in a details row.
+/// Localhost service URLs, marking any port that macOS refused to bind.
 @MainActor
-final class URLLinks: NSStackView {
+final class ServicePortLinks: NSStackView {
     private let urls: [URL]
 
-    init(_ urls: [URL]) {
-        self.urls = urls
+    init(_ entries: [(URL, String?)]) {
+        self.urls = entries.map(\.0)
         super.init(frame: .zero)
         orientation = .vertical
         alignment = .leading
         spacing = 4
-        for (i, u) in urls.enumerated() {
-            addArrangedSubview(linkButton(u.absoluteString, target: self, action: #selector(open(_:)), tag: i))
+        for (i, entry) in entries.enumerated() {
+            if let err = entry.1 {
+                let addr = label(entry.0.absoluteString, font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
+                let warn = symbolView("exclamationmark.triangle.fill", color: .systemOrange, size: 13)
+                let note = label("Not forwarded", font: .systemFont(ofSize: NSFont.smallSystemFontSize), color: .systemOrange)
+                let row = NSStackView(views: [addr, warn, note])
+                row.spacing = 6
+                row.toolTip = "Port could not be forwarded on macOS: \(err)"
+                addArrangedSubview(row)
+            } else {
+                addArrangedSubview(linkButton(entry.0.absoluteString, target: self, action: #selector(open(_:)), tag: i))
+            }
         }
     }
 

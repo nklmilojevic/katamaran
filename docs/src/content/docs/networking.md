@@ -18,6 +18,10 @@ curl http://127.0.0.1:8080/
 
 The guest watches wildcard TCP listeners in the root network namespace (such as `docker-proxy`) via netlink `sock_diag` and asks gvproxy to expose those ports on macOS.
 
+Privileged ports below `1024` (such as `80` and `443`) work without administrator privileges on macOS: when `127.0.0.1:<port>` returns `EACCES`, katamaran binds a wildcard socket scoped to `lo0` (`IP_BOUND_IF`) and drops non-loopback endpoints so traffic remains local to your Mac.
+
+If macOS refuses to bind a port (for example because another macOS service already holds it), `kat status` lists it under `port err` (and `port_errors` in `kat status --json`) and the app marks the port as not forwarded.
+
 ### Automatic port forwarding
 
 When `auto_forward` is enabled (the default), katamaran also forwards unpublished TCP ports that containers listen on inside their own network namespaces directly to `127.0.0.1:<port>` on your Mac over virtio-vsock.

@@ -439,14 +439,14 @@ pub fn forward_guest_tcp(
     guest_port: u16,
     local_port: u16,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", local_port))
+    let listener = crate::net::LoopbackTcpListener::bind(local_port)
         .with_context(|| format!("bind 127.0.0.1:{local_port}"))?;
     let bound = listener.local_addr()?.port();
     println!("Forwarding 127.0.0.1:{bound} -> {guest_addr}:{guest_port} (Ctrl-C to stop)");
     let active = Arc::new(AtomicUsize::new(0));
-    for conn in listener.incoming() {
-        let client = match conn {
-            Ok(c) => c,
+    loop {
+        let client = match listener.accept() {
+            Ok((c, _)) => c,
             Err(e) => {
                 eprintln!("katamaran: k8s forward accept: {e}");
                 thread::sleep(Duration::from_millis(50));
@@ -472,7 +472,6 @@ pub fn forward_guest_tcp(
             eprintln!("katamaran: k8s forward spawn worker: {e}");
         }
     }
-    Ok(())
 }
 
 pub fn relay_k8s_connect<S: Duplex>(

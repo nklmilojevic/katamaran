@@ -14,7 +14,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -419,6 +420,7 @@ pub struct Forwards<A: ForwardApi> {
 pub enum Event {
     Forwarded(PortProto, u16),
     Refused(PortProto, u16, String),
+    RefusedCleared(PortProto, u16),
     Transient(PortProto, u16, String),
     Removed(PortProto, u16),
     RemoveFailed(PortProto, u16, String),
@@ -454,7 +456,7 @@ impl<A: ForwardApi> Forwards<A> {
     pub fn remove(&mut self, proto: PortProto, port: u16) -> Option<Event> {
         let key = (proto, port);
         if self.refused.remove(&key).is_some() {
-            return None;
+            return Some(Event::RefusedCleared(proto, port));
         }
         if !self.active.contains(&key) {
             return None;
@@ -623,6 +625,7 @@ fn report(e: &Event) {
             "katamaran: cannot forward 127.0.0.1:{port}/{} ({why}); skipped",
             proto.as_str()
         ),
+        Event::RefusedCleared(..) => {}
         Event::Transient(proto, port, why) => eprintln!(
             "katamaran: transient error forwarding 127.0.0.1:{port}/{} ({why})",
             proto.as_str()
@@ -638,6 +641,152 @@ fn report(e: &Event) {
             proto.as_str()
         ),
     }
+}
+
+/// A TCP listener bound to `127.0.0.1:<port>`.
+///
+/// On macOS, XNU rejects unprivileged binds below port 1024 on specific
+/// addresses such as `127.0.0.1`, while permitting wildcard (`0.0.0.0`) binds.
+/// When binding a low port on `127.0.0.1` fails with `PermissionDenied`, fall
+/// back to `0.0.0.0:<port>` scoped to `lo0` via `IP_BOUND_IF` and drop any
+/// accepted connection whose local or remote address is not IPv4 loopback.
+pub struct LoopbackTcpListener {
+    inner: TcpListener,
+    filter_loopback: bool,
+}
+
+impl LoopbackTcpListener {
+    pub fn bind(port: u16) -> io::Result<Self> {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(inner) => Ok(Self {
+                inner,
+                filter_loopback: false,
+            }),
+            #[cfg(target_os = "macos")]
+            Err(e) if port > 0 && port < 1024 && e.kind() == io::ErrorKind::PermissionDenied => {
+                let inner = bind_darwin_low_port(port)?;
+                Ok(Self {
+                    inner,
+                    filter_loopback: true,
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        loop {
+            let (stream, peer) = self.inner.accept()?;
+            if !self.filter_loopback {
+                return Ok((stream, peer));
+            }
+            if let Ok(local) = stream.local_addr()
+                && is_loopback_v4_pair(local, peer)
+            {
+                return Ok((stream, peer));
+            }
+        }
+    }
+}
+
+impl AsRawFd for LoopbackTcpListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+fn is_loopback_v4_pair(local: SocketAddr, peer: SocketAddr) -> bool {
+    matches!(
+        (local, peer),
+        (SocketAddr::V4(l), SocketAddr::V4(p)) if l.ip().is_loopback() && p.ip().is_loopback()
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn bind_darwin_low_port(port: u16) -> io::Result<TcpListener> {
+    const IP_BOUND_IF: libc::c_int = 25;
+
+    let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+    if lo0 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lo0 interface not found",
+        ));
+    }
+
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh open socket descriptor owned by this function.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let one: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let if_idx: libc::c_uint = lo0;
+    if unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IP,
+            IP_BOUND_IF,
+            (&if_idx as *const libc::c_uint).cast(),
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let addr = libc::sockaddr_in {
+        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr { s_addr: 0 },
+        sin_zero: [0; 8],
+    };
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    if unsafe { libc::listen(fd.as_raw_fd(), 128) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(TcpListener::from(fd))
 }
 
 #[cfg(test)]
@@ -710,7 +859,8 @@ mod tests {
             Some(Event::Refused(TCP, 5000, _))
         ));
         assert_eq!(f.add(TCP, 5000), None);
-        // Never exposed, so removing it must not call unexpose.
+        // Never exposed, so removing it clears the refusal without calling unexpose.
+        assert_eq!(f.remove(TCP, 5000), Some(Event::RefusedCleared(TCP, 5000)));
         assert_eq!(f.remove(TCP, 5000), None);
         assert!(matches!(f.add(TCP, 5000), Some(Event::Refused(..))));
         drop(f);
@@ -1078,8 +1228,65 @@ mod tests {
         assert!(again.to_string().contains("already running"), "{again}");
         api.unexpose(TCP, port).unwrap();
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+
+        // Privileged port (< 1024): exposes unprivileged on macOS via lo0-scoped wildcard.
+        let mut exposed_low = None;
+        for candidate in (900u16..=1023).rev() {
+            if api.expose(TCP, candidate).is_ok() {
+                exposed_low = Some(candidate);
+                break;
+            }
+        }
+        let low = exposed_low.expect("gvproxy should expose a free privileged port < 1024");
+        assert!(
+            LoopbackTcpListener::bind(low).is_err(),
+            "duplicate bind on exposed low port {low} should fail"
+        );
+        api.unexpose(TCP, low).unwrap();
+        assert!(LoopbackTcpListener::bind(low).is_ok());
+
         gv.stop();
         assert!(!gv.api_socket.exists(), "gvproxy left its socket behind");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn loopback_tcp_listener_binds_low_port_and_filters_endpoints() {
+        let mut bound = None;
+        for port in (900u16..=1023).rev() {
+            if let Ok(listener) = LoopbackTcpListener::bind(port) {
+                bound = Some((port, listener));
+                break;
+            }
+        }
+        let (port, listener) = bound.expect("bind a free privileged port < 1024");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        assert!(
+            LoopbackTcpListener::bind(port).is_err(),
+            "second bind on port {port} should fail"
+        );
+
+        let server = thread::spawn(move || {
+            let (mut conn, peer) = listener.accept().unwrap();
+            assert!(peer.ip().is_loopback());
+            let mut buf = [0u8; 4];
+            conn.read_exact(&mut buf).unwrap();
+            conn.write_all(&buf).unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(b"ping").unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ping");
+        server.join().unwrap();
+
+        let lo: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let lo_peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.5:80".parse().unwrap();
+        let v6: SocketAddr = "[::1]:80".parse().unwrap();
+        assert!(is_loopback_v4_pair(lo, lo_peer));
+        assert!(!is_loopback_v4_pair(lan, lo_peer));
+        assert!(!is_loopback_v4_pair(lo, lan));
+        assert!(!is_loopback_v4_pair(v6, v6));
     }
 }
