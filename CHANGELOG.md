@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.0 - 2026-11-24
+
+This release lets you publish privileged ports, such as 80 and 443, without root on macOS. It also shows port forwards that fail.
+
+### New features
+
+- Privileged host ports below 1024 now work without root on macOS. For example, `-p 80:80` and `-p 443:443` now work on `127.0.0.1`. This also applies to `auto_forward` and `kat k8s forward`.
+- Failed port forwards now show in `kat status` under `port err`. The daemon status API reports them in `port_errors`. `Katamaran.app` shows a warning and an error tooltip in place of a dead `localhost` link.
+
 ## v0.8.0 - 2026-11-23
 
 This release adds compressed swap to the guest VM. The VM now handles memory spikes better and is less likely to stop a process because of low memory.
