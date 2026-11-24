@@ -293,11 +293,11 @@ fn concurrent_bidirectional_docker_streams_do_not_deadlock() {
         let mut left = BLOB_BYTES;
         while left > 0 {
             let n = left.min(chunk.len());
-            for word in chunk[..n].chunks_exact_mut(8) {
+            for word in chunk[..n].as_chunks_mut::<8>().0 {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                word.copy_from_slice(&state.to_le_bytes());
+                *word = state.to_le_bytes();
             }
             s.write_all(&chunk[..n]).unwrap();
             left -= n;
