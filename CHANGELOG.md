@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.10.0 - 2026-11-25
+
+This release adds Landlock sandbox support to the guest kernel. Container workloads that use Landlock now work in katamaran.
+
+### New features
+
+- The guest kernel now enables the Landlock LSM. Container workloads that use unprivileged Landlock sandboxing, such as `aube` with `jailBuilds: true`, now work inside katamaran.
+
 ## v0.9.1 - 2026-11-24
 
 This release fixes a deadlock in the VM network transport. Large Docker streams over `docker.sock` now work without a hang.
