@@ -421,3 +421,164 @@ fn concurrent_bidirectional_docker_streams_do_not_deadlock() {
 
     vm.stop();
 }
+
+/// Regression test for Landlock LSM support inside default (unprivileged)
+/// containers: verifies the kernel exposes Landlock ABI >= 7, Docker's
+/// default seccomp profile allows the Landlock syscalls, and filesystem
+/// (including virtio-fs bind mounts and truncate) plus TCP bind rules are
+/// enforced.
+#[test]
+#[ignore = "boots the system VM and uses the internet; run with `cargo xtask test-vm`"]
+fn landlock_sandboxes_containers() {
+    let mut vm = Vm::start();
+    vm.wait_for("docker ready", Duration::from_secs(120));
+
+    let work = vm.home.join("landlock");
+    std::fs::create_dir_all(work.join("allowed")).unwrap();
+    std::fs::create_dir_all(work.join("denied")).unwrap();
+    std::fs::write(work.join("denied/existing"), "keep").unwrap();
+
+    let probe = r#"
+import ctypes, errno, os, socket, struct
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.prctl.restype = ctypes.c_int
+
+SYS_LANDLOCK_CREATE_RULESET = 444
+SYS_LANDLOCK_ADD_RULE = 445
+SYS_LANDLOCK_RESTRICT_SELF = 446
+LANDLOCK_CREATE_RULESET_VERSION = 1
+LANDLOCK_RULE_PATH_BENEATH = 1
+LANDLOCK_ACCESS_FS_WRITE_FILE = 1 << 1
+LANDLOCK_ACCESS_FS_MAKE_REG = 1 << 8
+LANDLOCK_ACCESS_FS_TRUNCATE = 1 << 14
+LANDLOCK_ACCESS_NET_BIND_TCP = 1 << 0
+PR_SET_NO_NEW_PRIVS = 38
+
+abi = libc.syscall(
+    ctypes.c_long(SYS_LANDLOCK_CREATE_RULESET),
+    ctypes.c_void_p(0),
+    ctypes.c_size_t(0),
+    ctypes.c_uint32(LANDLOCK_CREATE_RULESET_VERSION),
+)
+assert abi >= 7, f"expected Landlock ABI >= 7, got {abi} (errno={ctypes.get_errno()})"
+
+os.makedirs("/tmp/allowed", exist_ok=True)
+os.makedirs("/tmp/denied", exist_ok=True)
+
+handled_fs = (
+    LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_MAKE_REG
+    | LANDLOCK_ACCESS_FS_TRUNCATE
+)
+ruleset_attr = ctypes.create_string_buffer(
+    struct.pack("<QQQ", handled_fs, LANDLOCK_ACCESS_NET_BIND_TCP, 0)
+)
+ruleset_fd = libc.syscall(
+    ctypes.c_long(SYS_LANDLOCK_CREATE_RULESET),
+    ctypes.byref(ruleset_attr),
+    ctypes.c_size_t(24),
+    ctypes.c_uint32(0),
+)
+assert ruleset_fd >= 0, f"landlock_create_ruleset failed: {os.strerror(ctypes.get_errno())}"
+
+for path in ("/work/allowed", "/tmp/allowed"):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        rule = ctypes.create_string_buffer(struct.pack("<Qi", handled_fs, fd))
+        rc = libc.syscall(
+            ctypes.c_long(SYS_LANDLOCK_ADD_RULE),
+            ctypes.c_int(ruleset_fd),
+            ctypes.c_int(LANDLOCK_RULE_PATH_BENEATH),
+            ctypes.byref(rule),
+            ctypes.c_uint32(0),
+        )
+        assert rc == 0, f"landlock_add_rule({path}) failed: {os.strerror(ctypes.get_errno())}"
+    finally:
+        os.close(fd)
+
+assert libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0, os.strerror(ctypes.get_errno())
+rc = libc.syscall(
+    ctypes.c_long(SYS_LANDLOCK_RESTRICT_SELF),
+    ctypes.c_int(ruleset_fd),
+    ctypes.c_uint32(0),
+)
+assert rc == 0, f"landlock_restrict_self failed: {os.strerror(ctypes.get_errno())}"
+os.close(ruleset_fd)
+
+for ok_path in ("/work/allowed/ok", "/tmp/allowed/ok"):
+    with open(ok_path, "w") as f:
+        f.write("ok")
+
+for deny_path in ("/work/denied/fail", "/tmp/denied/fail"):
+    try:
+        open(deny_path, "w").close()
+    except PermissionError as e:
+        assert e.errno == errno.EACCES, e
+    else:
+        raise AssertionError(f"expected EACCES creating {deny_path}")
+
+try:
+    os.truncate("/work/denied/existing", 0)
+except PermissionError as e:
+    assert e.errno == errno.EACCES, e
+else:
+    raise AssertionError("expected EACCES truncating /work/denied/existing")
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("127.0.0.1", 18999))
+except PermissionError as e:
+    assert e.errno == errno.EACCES, e
+else:
+    raise AssertionError("expected EACCES binding TCP port under Landlock")
+finally:
+    sock.close()
+
+print(f"landlock_abi={abi}")
+"#;
+    std::fs::write(work.join("probe.py"), probe).unwrap();
+
+    let mount = format!("{}:/work", work.display());
+    let out = Command::new("docker")
+        .env(
+            "DOCKER_HOST",
+            format!("unix://{}", vm.docker_socket().display()),
+        )
+        .env_remove("DOCKER_CONTEXT")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &mount,
+            "alpine:3.24.4",
+            "sh",
+            "-c",
+            "apk add -q python3 >/dev/null && python3 /work/probe.py",
+        ])
+        .output()
+        .expect("run docker landlock probe");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "landlock probe failed ({})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.lines().any(|l| l.starts_with("landlock_abi=")),
+        "missing landlock_abi in output:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("allowed/ok")).unwrap(),
+        "ok"
+    );
+    assert!(!work.join("denied/fail").exists());
+    assert_eq!(
+        std::fs::read_to_string(work.join("denied/existing")).unwrap(),
+        "keep"
+    );
+
+    vm.stop();
+}
