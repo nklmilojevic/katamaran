@@ -232,6 +232,39 @@ pub fn accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
     }
 }
 
+/// Accept a vsock connection with `SOCK_CLOEXEC`, returning the socket,
+/// the peer `sockaddr_vm`, and the address length populated by the kernel.
+pub fn vsock_accept(
+    listener: &OwnedFd,
+) -> io::Result<(OwnedFd, libc::sockaddr_vm, libc::socklen_t)> {
+    loop {
+        let mut addr: libc::sockaddr_vm = unsafe { mem::zeroed() };
+        let mut len = mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        let fd = unsafe {
+            libc::accept4(
+                listener.as_raw_fd(),
+                (&mut addr as *mut libc::sockaddr_vm).cast::<libc::sockaddr>(),
+                &mut len,
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, addr, len));
+        }
+        let e = io::Error::last_os_error();
+        if matches!(
+            e.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionAborted
+        ) || e.raw_os_error() == Some(libc::EPROTO)
+        {
+            continue;
+        }
+        return Err(e);
+    }
+}
+
 pub fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     if fd < 0 {

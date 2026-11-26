@@ -24,12 +24,46 @@ pub const CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
 pub const DOCKER_SOCKET: &str = "/run/docker.sock";
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+struct WatchedChild {
+    token: u64,
+    tx: Sender<i32>,
+}
+
+#[derive(Default)]
+struct WatchTable {
+    next_token: u64,
+    children: HashMap<i32, WatchedChild>,
+}
+
+impl WatchTable {
+    fn register(&mut self, pid: i32) -> (u64, Receiver<i32>) {
+        self.next_token += 1;
+        let token = self.next_token;
+        let (tx, rx) = mpsc::channel();
+        self.children.insert(pid, WatchedChild { token, tx });
+        (token, rx)
+    }
+
+    fn matches(&self, pid: i32, token: u64) -> bool {
+        self.children.get(&pid).is_some_and(|w| w.token == token)
+    }
+}
+
 /// Reaps all children. PID 1 inherits every orphan, so something must wait
 /// for them; processes started through [`Reaper::spawn`] also get their exit
 /// status delivered on a channel.
 #[derive(Clone)]
 pub struct Reaper {
-    watched: Arc<Mutex<HashMap<i32, Sender<i32>>>>,
+    watched: Arc<Mutex<WatchTable>>,
+}
+
+/// Identity-pinned handle for a child spawned in its own process group.
+/// `token` uniquely identifies this spawn inside [`Reaper`], so once the
+/// leader is reaped a recycled PID can never match this handle.
+#[derive(Clone, Copy, Debug)]
+pub struct PgrpTarget {
+    pid: i32,
+    token: u64,
 }
 
 /// How to signal a spawned child without racing PID reuse.
@@ -37,7 +71,8 @@ pub enum ChildTarget {
     /// Kernel pidfd: `pidfd_send_signal` returns `ESRCH` once reaped.
     PidFd(OwnedFd),
     /// Fallback when `pidfd_open` is unavailable on the kernel.
-    Pid(i32),
+    /// `token` pins this specific spawn so a recycled PID can never match.
+    Pid { pid: i32, token: u64 },
     /// The child had already exited and been reaped before `pidfd_open` ran.
     Exited,
 }
@@ -45,7 +80,7 @@ pub enum ChildTarget {
 impl Reaper {
     pub fn start() -> Reaper {
         let r = Reaper {
-            watched: Arc::new(Mutex::new(HashMap::new())),
+            watched: Arc::new(Mutex::new(WatchTable::default())),
         };
         let watched = r.watched.clone();
         thread::Builder::new()
@@ -59,12 +94,19 @@ impl Reaper {
     /// status. The lock is held across spawn and registration so an
     /// immediate exit cannot be reaped before it is watched.
     pub fn spawn(&self, cmd: &mut Command) -> io::Result<(i32, Receiver<i32>)> {
-        let mut watched = self.watched.lock().unwrap();
+        let (target, rx) = self.spawn_pgrp(cmd)?;
+        Ok((target.pid, rx))
+    }
+
+    /// Spawn `cmd` and return a token-pinned [`PgrpTarget`] plus a channel
+    /// yielding its wait status. The lock is held across spawn and
+    /// registration so an immediate exit cannot be reaped before it is watched.
+    pub fn spawn_pgrp(&self, cmd: &mut Command) -> io::Result<(PgrpTarget, Receiver<i32>)> {
+        let mut table = self.watched.lock().unwrap();
         let child = cmd.spawn()?;
         let pid = child.id() as i32;
-        let (tx, rx) = mpsc::channel();
-        watched.insert(pid, tx);
-        Ok((pid, rx))
+        let (token, rx) = table.register(pid);
+        Ok((PgrpTarget { pid, token }, rx))
     }
 
     /// Like [`Reaper::spawn`], also opening a `pidfd` while the watch table
@@ -72,32 +114,41 @@ impl Reaper {
     /// under `self.watched`, the child cannot be reaped or its PID recycled
     /// before `pidfd_open` and registration complete.
     pub fn spawn_pidfd(&self, cmd: &mut Command) -> io::Result<(ChildTarget, Receiver<i32>)> {
-        let mut watched = self.watched.lock().unwrap();
+        let (target, _, rx) = self.spawn_pidfd_pgrp(cmd)?;
+        Ok((target, rx))
+    }
+
+    /// Like [`Reaper::spawn_pidfd`], also returning a token-pinned
+    /// [`PgrpTarget`] for safe process-group signaling of session/pgrp leaders.
+    pub fn spawn_pidfd_pgrp(
+        &self,
+        cmd: &mut Command,
+    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)> {
+        let mut table = self.watched.lock().unwrap();
         let child = cmd.spawn()?;
         let pid = child.id() as i32;
+        let (token, rx) = table.register(pid);
         let target = match sys::pidfd_open(pid) {
             Ok(fd) => ChildTarget::PidFd(fd),
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => ChildTarget::Exited,
-            Err(_) => ChildTarget::Pid(pid),
+            Err(_) => ChildTarget::Pid { pid, token },
         };
-        let (tx, rx) = mpsc::channel();
-        watched.insert(pid, tx);
-        Ok((target, rx))
+        Ok((target, PgrpTarget { pid, token }, rx))
     }
 
     /// Signal `target` without risking PID reuse. On kernels with `pidfd`,
     /// `pidfd_send_signal` enforces process identity in the kernel; on the
-    /// fallback `ChildTarget::Pid` path, holding `self.watched` prevents
-    /// `reap_loop` from reaping and freeing the PID across the liveness check
-    /// and `kill(2)`.
+    /// fallback `ChildTarget::Pid` path, holding `self.watched` and matching
+    /// `token` prevents `reap_loop` from reaping and freeing the PID across
+    /// the liveness check and `kill(2)`.
     pub fn signal_target(&self, target: &ChildTarget, sig: i32) {
         match target {
             ChildTarget::PidFd(fd) => {
                 let _ = sys::pidfd_send_signal(fd, sig);
             }
-            ChildTarget::Pid(pid) => {
-                let watched = self.watched.lock().unwrap();
-                if watched.contains_key(pid) {
+            ChildTarget::Pid { pid, token } => {
+                let table = self.watched.lock().unwrap();
+                if table.matches(*pid, *token) {
                     unsafe { libc::kill(*pid, sig) };
                 }
             }
@@ -106,22 +157,36 @@ impl Reaper {
     }
 
     /// Signal process group `-pid` only while `pid` is still registered in
-    /// `self.watched`. Because `reap_loop` waits with `WNOWAIT` and only reaps
-    /// under `self.watched`, holding `self.watched` prevents the leader from
-    /// being reaped and its PID/PGID from being reused before `kill(-pid, sig)`.
+    /// `self.watched`. Prefer [`Self::signal_pgrp_target`] for callers that
+    /// may signal concurrently with child exit and reaping.
     pub fn signal_pgrp(&self, pid: i32, sig: i32) {
-        let watched = self.watched.lock().unwrap();
-        if watched.contains_key(&pid) {
+        let table = self.watched.lock().unwrap();
+        if table.children.contains_key(&pid) {
             unsafe { libc::kill(-pid, sig) };
+        }
+    }
+
+    /// Signal process group `-target.pid` only while the exact spawn
+    /// identified by `target` is still registered in `self.watched` (not yet
+    /// reaped). Because `reap_loop` waits with `WNOWAIT` and only reaps under
+    /// `self.watched`, holding the lock guarantees neither the PID nor its
+    /// PGID can be reused before `kill(-target.pid, sig)` runs.
+    pub fn signal_pgrp_target(&self, target: PgrpTarget, sig: i32) -> bool {
+        let table = self.watched.lock().unwrap();
+        if table.matches(target.pid, target.token) {
+            unsafe { libc::kill(-target.pid, sig) };
+            true
+        } else {
+            false
         }
     }
 }
 
-fn reap_loop(watched: &Mutex<HashMap<i32, Sender<i32>>>) {
+fn reap_loop(watched: &Mutex<WatchTable>) {
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // Wait without reaping (`WNOWAIT`) so zombies stay pinned until we hold
-        // `watched`; that guarantees `spawn_pidfd` and fallback `signal_target`
+        // `watched`; that guarantees `spawn_pidfd` and token-guarded signaling
         // can never race with reaping and PID reuse.
         let rc = unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
         if rc < 0 {
@@ -138,10 +203,10 @@ fn reap_loop(watched: &Mutex<HashMap<i32, Sender<i32>>>) {
         }
         let mut status = 0;
         let tx = {
-            let mut watched = watched.lock().unwrap();
+            let mut table = watched.lock().unwrap();
             let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if reaped > 0 {
-                watched.remove(&reaped)
+                table.children.remove(&reaped).map(|w| w.tx)
             } else {
                 None
             }
@@ -982,5 +1047,20 @@ mod tests {
 
         notify_containerd_waiter(&inner, 5, Ok(()));
         assert_eq!(rx.try_recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn watch_table_token_rejects_recycled_pid() {
+        let mut table = WatchTable::default();
+        let (tok1, _rx1) = table.register(4242);
+        assert!(table.matches(4242, tok1));
+
+        // Simulate reaping PID 4242 and reusing the same PID for a new child.
+        table.children.remove(&4242);
+        assert!(!table.matches(4242, tok1));
+        let (tok2, _rx2) = table.register(4242);
+        assert_ne!(tok1, tok2);
+        assert!(!table.matches(4242, tok1));
+        assert!(table.matches(4242, tok2));
     }
 }

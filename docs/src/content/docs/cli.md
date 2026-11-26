@@ -74,6 +74,8 @@ kat version
 
 Open an interactive root shell directly in the Linux VM's own namespaces (unlike `kat shell`, which connects to an LXC Linux machine). Useful for inspecting `containerd`, `dockerd`, `k3s`, sysctls, rlimits, and `/var/log/*`. Starts the VM automatically if it is stopped.
 
+A pseudo-terminal is allocated only if both stdin and stdout are terminals. To request one explicitly, use `kat vm exec -t -- <CMD>`.
+
 ```sh
 kat vm shell [-w <DIR>] [-e <KEY=VALUE>]... [-- <CMD>...]
 ```
@@ -88,12 +90,12 @@ kat vm shell [-w <DIR>] [-e <KEY=VALUE>]... [-- <CMD>...]
 Run a command as `root` directly in the Linux VM's own namespaces. Designed for scripting: no pseudo-terminal is allocated by default, keeping `stdout` and `stderr` separate and preserving the command's exit code. Starts the VM automatically if it is stopped.
 
 ```sh
-kat vm exec [-t] [-w <DIR>] [-e <KEY=VALUE>]... -- <CMD>...
+kat vm exec [-t] [-w <DIR>] [-e <KEY=VALUE>]... [--] <CMD>...
 ```
 
 | Option | Default | Description |
 |---|---|---|
-| `-t`, `--tty` | off | Allocate a pseudo-terminal |
+| `-t`, `--tty` | off | Allocate a pseudo-terminal and combine the command's stdout and stderr on stdout |
 | `-w`, `--workdir <DIR>` | `/root` | Working directory inside the VM |
 | `-e`, `--env <KEY=VALUE>` | none | Extra environment variable (`KEY=VALUE`, or `KEY` to copy from the host); repeatable |
 

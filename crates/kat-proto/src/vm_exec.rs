@@ -1,13 +1,20 @@
 //! VM root shell and exec protocol, spoken on [`crate::VM_EXEC_PORT`].
 //!
-//! The host opens one connection per session and sends one [`VmExecMsg::Exec`]
-//! frame (same framing as [`crate::Msg`], kinds 0x901-0x91f):
+//! The host opens one connection per session (same framing as [`crate::Msg`],
+//! kinds 0x901-0x91f):
 //!
-//! 1. Host sends `Exec(ExecSpec)`.
-//! 2. Guest validates and spawns the process in the VM's root namespaces, then
+//! 1. Optionally, host sends `Ping` and guest replies `Pong` as a
+//!    side-effect-free readiness probe before submitting a command.
+//! 2. Host sends `Exec(ExecSpec)` once.
+//! 3. Guest validates and spawns the process in the VM's root namespaces, then
 //!    answers `Started` (or `Error` if spawning failed).
-//! 3. Host streams stdin as `Data`, `DataEnd`, plus `Resize` and `Signal`.
-//! 4. Guest streams `Stdout` / `Stderr`, then `Exit { code }` (or `Error`).
+//! 4. Host streams stdin as `Data`, `DataEnd`, plus `Resize` and `Signal`.
+//!    `DataEnd` closes piped stdin. In a PTY session it triggers canonical EOF
+//!    using the terminal's configured `VEOF` character when the line discipline
+//!    is in canonical mode (`ICANON`) — flushing any pending partial line
+//!    before delivering EOF — and injects no control byte in noncanonical/raw
+//!    mode, where `DataEnd` cannot signal EOF to the guest process.
+//! 5. Guest streams `Stdout` / `Stderr`, then `Exit { code }` (or `Error`).
 
 use std::io::{self, Read, Write};
 
@@ -22,13 +29,24 @@ pub enum VmExecMsg {
     Exec(ExecSpec),
     Data(Vec<u8>),
     DataEnd,
-    Resize { rows: u16, cols: u16 },
-    Signal { signal: i32 },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    Signal {
+        signal: i32,
+    },
     Started,
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
-    Exit { code: i32 },
+    Exit {
+        code: i32,
+    },
     Error(String),
+    /// Side-effect-free readiness probe sent before [`VmExecMsg::Exec`].
+    Ping,
+    /// Readiness reply to [`VmExecMsg::Ping`].
+    Pong,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,6 +71,8 @@ mod kind {
     pub const STDERR: u16 = 0x908;
     pub const EXIT: u16 = 0x909;
     pub const ERROR: u16 = 0x90a;
+    pub const PING: u16 = 0x90b;
+    pub const PONG: u16 = 0x90c;
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -118,6 +138,8 @@ impl VmExecMsg {
                 put_str(b, e);
                 kind::ERROR
             }
+            VmExecMsg::Ping => kind::PING,
+            VmExecMsg::Pong => kind::PONG,
         };
         let len = (buf.len() - 4) as u32;
         buf[0..4].copy_from_slice(&len.to_le_bytes());
@@ -185,6 +207,8 @@ impl VmExecMsg {
                 code: r.u32()? as i32,
             },
             kind::ERROR => VmExecMsg::Error(r.string()?),
+            kind::PING => VmExecMsg::Ping,
+            kind::PONG => VmExecMsg::Pong,
             other => return Err(ProtoError::UnknownKind(other)),
         };
         if !r.buf.is_empty() {
@@ -262,6 +286,8 @@ mod tests {
             VmExecMsg::Exit { code: 42 },
             VmExecMsg::Exit { code: -1 },
             VmExecMsg::Error("exec failed".into()),
+            VmExecMsg::Ping,
+            VmExecMsg::Pong,
         ]
     }
 
@@ -345,6 +371,20 @@ mod tests {
             let err = read(&mut &bytes[..n]).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "len {n}");
         }
+        // Feed only the length header so EOF cannot be mistaken for size rejection.
+        let header = ((MAX_FRAME + 1) as u32).to_le_bytes();
+        let err = read(&mut header.as_slice()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.get_ref().and_then(|e| e.downcast_ref::<ProtoError>()),
+            Some(&ProtoError::FrameTooLarge(MAX_FRAME + 1))
+        );
+        let short_header = 1u32.to_le_bytes();
+        let err = read(&mut short_header.as_slice()).unwrap_err();
+        assert_eq!(
+            err.get_ref().and_then(|e| e.downcast_ref::<ProtoError>()),
+            Some(&ProtoError::Truncated)
+        );
         let mut out = Vec::new();
         let err = write(&mut out, &VmExecMsg::Error("e".repeat(MAX_FRAME))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

@@ -34,11 +34,13 @@ Unlike `kat shell` (which opens a Linux LXC machine), `kat vm shell` and `kat vm
 ```sh
 kat vm shell
 kat vm exec -- sysctl fs.nr_open
-kat vm exec -- sh -c 'grep "open files" /proc/$(pidof containerd)/limits'
+kat vm exec -- sh -c 'pid=$(pgrep -xo -P 1 containerd) || { echo "containerd is not running" >&2; exit 1; }; grep "open files" "/proc/$pid/limits"'
 kat vm exec -- tail -n 100 /var/log/containerd.log
 ```
 
 `kat vm exec` does not allocate a PTY by default, so `stdout`, `stderr`, and exit codes behave cleanly in scripts. Pass `-t` to allocate a PTY for interactive tools such as `top`.
+
+If you upgraded katamaran while the VM was running and the CLI reports that the VM shell service is unavailable, run `kat restart` to start a VM with the new service.
 
 ## Measure boot stages
 
