@@ -161,6 +161,15 @@ pub fn start_service(
     notifier: Notifier,
     docker: DockerStack,
 ) -> io::Result<Arc<K8s>> {
+    if let Err(e) = migrate_legacy_tracking_on_boot(
+        Path::new(ROOT),
+        Path::new(DATA_DIR),
+        Path::new(DATA_VERSION_FILE),
+        Path::new(VERSION_FILE),
+        Path::new(DATA_VERSION_TRACKED_FILE),
+    ) {
+        log(&format!("migrate legacy k3s version tracking: {e}"));
+    }
     let svc = Arc::new(K8s {
         reaper,
         notifier,
@@ -443,9 +452,42 @@ fn check_datastore_compatible(
     Ok(())
 }
 
-/// Seed any legacy datastore version marker (only while untracked and only if
-/// `bin_version_file` is present) and persist `tracked_file` before `reset`
-/// unmounts or deletes cluster data. Never blocks resetting an unmarked datastore.
+/// One-time boot migration for guests that already have `/var/lib/katamaran/k3s`
+/// from a pre-tracking katamaran release: seeds `.katamaran-version` from an
+/// existing legacy `bin/version` (when `server/` exists without a data marker)
+/// and writes `.datastore-version-tracked` so subsequent unmarked restores on the
+/// running VM are rejected instead of inheriting `bin/version`. Does nothing when
+/// `root` does not exist so unused Kubernetes keeps zero disk footprint.
+fn migrate_legacy_tracking_on_boot(
+    root: &Path,
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+    tracked_file: &Path,
+) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("stat {}: {e}", root.display())),
+    }
+    if is_datastore_version_tracked(tracked_file)? {
+        return Ok(());
+    }
+    if datastore_exists(data_dir)?
+        && read_trimmed_file(data_version_file)?.is_none()
+        && let Some(prev) = read_trimmed_file(bin_version_file)?
+    {
+        write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
+    }
+    mark_datastore_version_tracked(tracked_file)
+}
+
+/// Seed any legacy datastore version marker (best-effort while untracked and only
+/// when reading `data_version_file` returns `Ok(None)` and `bin_version_file`
+/// returns `Ok(Some(_))`) and persist `tracked_file` before `reset` unmounts or
+/// deletes cluster data. Unreadable legacy version metadata is logged rather than
+/// blocking `kat k8s reset`, while writing `tracked_file` remains required before
+/// deleting cluster data.
 fn prepare_reset_tracking_with(
     data_dir: &Path,
     data_version_file: &Path,
@@ -456,11 +498,38 @@ fn prepare_reset_tracking_with(
     if is_datastore_version_tracked(tracked_file)? {
         return Ok(());
     }
-    if datastore_exists(data_dir)?
-        && read_trimmed_file(data_version_file)?.is_none()
-        && let Some(prev) = read_trimmed_file(bin_version_file)?
-    {
-        write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
+    match datastore_exists(data_dir) {
+        Ok(true) => match read_trimmed_file(data_version_file) {
+            Ok(None) => match read_trimmed_file(bin_version_file) {
+                Ok(Some(prev)) => {
+                    if let Err(e) = write_atomic(data_version_file, format!("{prev}\n").as_bytes())
+                    {
+                        log(&format!(
+                            "seed {} before reset: {e}",
+                            data_version_file.display()
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log(&format!(
+                        "read {} before reset: {e}",
+                        bin_version_file.display()
+                    ));
+                }
+            },
+            Ok(Some(_)) => {}
+            Err(e) => {
+                log(&format!(
+                    "read {} before reset: {e}",
+                    data_version_file.display()
+                ));
+            }
+        },
+        Ok(false) => {}
+        Err(e) => {
+            log(&format!("inspect {} before reset: {e}", data_dir.display()));
+        }
     }
     if let Some(parent) = tracked_file.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -3614,6 +3683,115 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(deleted);
         assert!(tracked_file.exists());
         assert!(!data_dir.exists());
+
+        // 5. Resetting an untracked legacy datastore with invalid UTF-8 in bin/version
+        // (or .katamaran-version) still writes the tracking sentinel BEFORE deleting data.
+        fs::remove_file(&tracked_file).unwrap();
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(&db_file, b"corrupt-legacy-metadata").unwrap();
+        fs::write(&bin_version_file, [0xff, 0xfe, 0x0a]).unwrap();
+        let mut sentinel_existed_before_delete = false;
+        reset_with_tracking(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            write_atomic,
+            || {
+                sentinel_existed_before_delete = tracked_file.exists();
+                fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(sentinel_existed_before_delete);
+        assert!(tracked_file.exists());
+        assert!(!data_dir.exists());
+
+        // Invalid UTF-8 in .katamaran-version also does not block reset.
+        fs::remove_file(&tracked_file).unwrap();
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(&data_version_file, [0xff, 0xfe]).unwrap();
+        let mut sentinel_existed_before_delete = false;
+        reset_with_tracking(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            write_atomic,
+            || {
+                sentinel_existed_before_delete = tracked_file.exists();
+                fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(sentinel_existed_before_delete);
+        assert!(tracked_file.exists());
+        assert!(!data_dir.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boot_migration_enables_tracking_without_touching_unused_guests() {
+        let dir = temp_dir("boot-migration");
+        let root = dir.join("k3s");
+        let data_dir = root.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = root.join("bin/version");
+        let tracked_file = root.join(".datastore-version-tracked");
+
+        // 1. Unused VM (root absent): boot migration does nothing and creates no files.
+        migrate_legacy_tracking_on_boot(
+            &root,
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+        )
+        .unwrap();
+        assert!(!root.exists());
+
+        // 2. Legacy VM reset on an older Katamaran (bin/version exists, data/ absent):
+        // boot enables tracking so a subsequent unmarked restore cannot inherit bin/version.
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        fs::write(&bin_version_file, "v1.32.5+k3s1\n").unwrap();
+        migrate_legacy_tracking_on_boot(
+            &root,
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+        )
+        .unwrap();
+        assert!(tracked_file.exists());
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(data_dir.join("server/db/state.db"), b"restored-v1.37").unwrap();
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        // 3. Legacy VM with an existing cluster: boot seeds .katamaran-version and enables tracking.
+        fs::remove_file(&tracked_file).unwrap();
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+        migrate_legacy_tracking_on_boot(
+            &root,
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+        )
+        .unwrap();
+        assert!(tracked_file.exists());
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

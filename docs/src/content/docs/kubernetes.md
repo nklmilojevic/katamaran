@@ -67,7 +67,7 @@ katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<ver
      - `/var/lib/katamaran/k3s/data/storage/` (where k3s's default `local-path` StorageClass stores volume files) and any custom persistent-volume or `hostPath` directories used by your workloads.
   2. **To restore**, keep Kubernetes stopped (`kat k8s stop`) and restore from the same backup set:
      - Restore `/var/lib/katamaran/k3s/data/server/` (removing any newer `state.db-wal` or `state.db-shm` files left by the newer release).
-     - Restore the matching `/var/lib/katamaran/k3s/data/.katamaran-version` file (from the backed-up `.katamaran-version`, or from the saved legacy `/var/lib/katamaran/k3s/bin/version` tag). Katamaran refuses to start if `server/` exists without a valid `.katamaran-version` marker or if `.katamaran-version` still records a newer minor.
+     - Restore the matching `/var/lib/katamaran/k3s/data/.katamaran-version` file (from the backed-up `.katamaran-version`, or from the saved legacy `/var/lib/katamaran/k3s/bin/version` tag). Once datastore version tracking is enabled (automatically on first boot for an existing `/var/lib/katamaran/k3s`, or after any install, start, or reset on a katamaran release with `k8s_version`), katamaran refuses to start if `server/` exists without a valid `.katamaran-version` marker or if `.katamaran-version` records a newer minor or skips minors. Always restore `.katamaran-version` alongside `server/` (including before first boot if restoring into an offline disk image).
      - Restore the matching `/var/lib/katamaran/k3s/data/storage/` contents and any custom PV directories so volume files match the restored PV/PVC records.
   3. Set `k8s_version` to the release tag from that backup (for example `kat config set k8s_version=v1.32.5+k3s1`) and run `kat k8s start`.
 
@@ -75,7 +75,7 @@ katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<ver
 
 ### Migrating an unmarked cluster from an older katamaran release
 
-Once a VM has installed, started, or reset Kubernetes on a katamaran release with `k8s_version` support, katamaran creates a tracking sentinel (`/var/lib/katamaran/k3s/.datastore-version-tracked`) beside `bin/` so an unmarked datastore restore cannot inherit an unrelated installed binary's version.
+Once a VM with Kubernetes state boots (or installs, starts, or resets Kubernetes) on a katamaran release with `k8s_version` support, katamaran creates a tracking sentinel (`/var/lib/katamaran/k3s/.datastore-version-tracked`) beside `bin/` so an unmarked datastore restore cannot inherit an unrelated installed binary's version.
 
 If you later roll back to an older katamaran release without `k8s_version`, run `kat k8s reset` there, and initialize a new cluster on that older release, the older `reset` removes `/var/lib/katamaran/k3s/data/` while leaving the tracking sentinel intact, and the older release recreates `data/` without `.katamaran-version`. When you upgrade katamaran again, katamaran refuses to start that unmarked datastore until its version is recorded.
 
