@@ -38,8 +38,11 @@ pub struct Config {
     pub amd64: Emulation,
     /// Run an optional single-node Kubernetes (k3s) cluster inside the VM.
     pub kubernetes: bool,
-    /// The open-files limit (RLIMIT_NOFILE) of the guest's containerd,
-    /// dockerd and every container.
+    /// The open-files limit (RLIMIT_NOFILE, soft and hard) the guest sets at
+    /// boot; containerd, dockerd and workloads inherit it unless they set
+    /// their own. Not written when default, so older versions, which deny
+    /// unknown keys, still read a saved config.
+    #[serde(skip_serializing_if = "is_default_nofile")]
     pub nofile: u32,
 }
 
@@ -81,6 +84,10 @@ pub const DEFAULT_NOFILE: u32 = 1 << 20;
 pub const MIN_NOFILE: u32 = 1024;
 /// Within the kernel's ceiling for `fs.nr_open`.
 pub const MAX_NOFILE: u32 = 1 << 30;
+
+fn is_default_nofile(n: &u32) -> bool {
+    *n == DEFAULT_NOFILE
+}
 
 /// The smallest guest that still runs dockerd comfortably.
 pub const MIN_MEMORY_MIB: u32 = 1024;
@@ -457,6 +464,17 @@ mod tests {
         assert!(cfg.set("nofile", "lots", &HOST).is_err());
         assert!(Config::parse("nofile = 100").is_err());
         assert_eq!(Config::parse("nofile = 262144").unwrap().nofile, 262_144);
+    }
+
+    #[test]
+    fn default_nofile_is_not_saved() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("nofile"), "{text}");
+        let mut cfg = Config::default();
+        cfg.set("nofile", "65536", &HOST).unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("nofile = 65536"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
     }
 
     #[test]
