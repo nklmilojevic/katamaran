@@ -435,6 +435,7 @@ fn session(
             );
         }
     }
+    let relay_budget = crate::autofwd::RelayBudget::from_process_limits();
     let forwarder = match &gvproxy {
         Some(g) => {
             let fwd_tx = tx.clone();
@@ -453,7 +454,12 @@ fn session(
                     // the private run directory.
                     let sockets = g.api_socket.parent().unwrap_or(&run_dir).to_path_buf();
                     net::spawn_forwarder(
-                        net::AddressesApi::new(api, &sockets, &args.forward_addresses),
+                        net::AddressesApi::with_budget(
+                            api,
+                            &sockets,
+                            &args.forward_addresses,
+                            relay_budget.clone(),
+                        ),
                         on_event,
                     )?
                 },
@@ -496,9 +502,10 @@ fn session(
         });
     }
 
-    let mut auto_forwards = crate::autofwd::AutoForwards::with(
+    let mut auto_forwards = crate::autofwd::AutoForwards::with_budget(
         crate::autofwd::Upstream::AutoForward(autofwd_sock.clone()),
         &args.forward_addresses,
+        relay_budget,
     );
     let mut mounted = false;
     let mut paused = false;

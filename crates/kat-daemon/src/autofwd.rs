@@ -27,10 +27,11 @@ pub const MAX_CONNS: usize = 256;
 /// Default per-port connection ceiling for published ports (isolates a busy
 /// service from starving unrelated ports).
 pub const PUBLISHED_MAX_CONNS_PER_PORT: usize = 128;
-/// Default aggregate connection ceiling across all published ports, bounded
-/// further by the daemon's `RLIMIT_NOFILE` so combined traffic leaves
-/// descriptors and threads for the control plane.
+/// Default aggregate connection ceiling for published ports.
 pub const PUBLISHED_MAX_CONNS_TOTAL: usize = 512;
+/// Upper bound on process-wide concurrent relays across both automatic and
+/// published forwarders, further clamped by `RLIMIT_NOFILE`.
+const PROCESS_MAX_RELAY_CONNS: usize = 512;
 /// Each live relay holds two TCP fds (cloned) and two Unix fds (cloned).
 const FDS_PER_RELAY: usize = 4;
 /// Maximum connections accepted from a single listening socket per poll wake,
@@ -39,22 +40,60 @@ const MAX_ACCEPT_BATCH: usize = 16;
 const COPY_BUF_SIZE: usize = 64 << 10;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Connection budget policy for forwarded listeners.
+/// Daemon-wide relay connection budget derived from `RLIMIT_NOFILE` and shared
+/// across automatic and published forwarders, so combined relay traffic leaves
+/// file descriptors and threads for the daemon's RPC control plane and
+/// listening sockets.
+#[derive(Clone, Debug)]
+pub struct RelayBudget {
+    active: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl RelayBudget {
+    /// Size a shared relay budget from this process's soft `RLIMIT_NOFILE`.
+    pub fn from_process_limits() -> Self {
+        Self::new(process_relay_ceiling(current_nofile_limit()))
+    }
+
+    pub fn new(max: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    #[cfg(test)]
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn try_acquire(&self) -> Option<ConnGuard> {
+        ConnGuard::try_acquire(&self.active, self.max)
+    }
+}
+
+/// Connection budget policy for forwarded listeners (applied alongside the
+/// shared [`RelayBudget`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnLimit {
-    /// One shared cap across all forwarded ports (used for automatic container
-    /// forwards so unpublished containers cannot exhaust daemon resources).
+    /// One shared cap across all forwarded ports in this forwarder (used for
+    /// automatic container forwards).
     Shared(usize),
     /// Both an independent per-port cap (so one busy service cannot starve
-    /// unrelated ports) and a shared aggregate cap across all ports (so
-    /// combined traffic leaves descriptors and threads for the control plane).
+    /// unrelated ports) and a class aggregate cap across all published ports.
     PerPort { per_port: usize, total: usize },
 }
 
-/// Default connection policy for published ports, sized with descriptor
-/// headroom relative to this process's soft `RLIMIT_NOFILE`.
-pub fn published_conn_limit() -> ConnLimit {
-    published_conn_limit_for(current_nofile_limit())
+/// Default connection policy for published ports given a process relay budget.
+pub fn published_conn_limit_for_budget(budget_max: usize) -> ConnLimit {
+    let total = PUBLISHED_MAX_CONNS_TOTAL.min(budget_max.max(1));
+    let per_port = PUBLISHED_MAX_CONNS_PER_PORT.min((total / 2).max(1));
+    ConnLimit::PerPort { per_port, total }
 }
 
 fn current_nofile_limit() -> Option<u64> {
@@ -72,7 +111,7 @@ fn current_nofile_limit() -> Option<u64> {
     }
 }
 
-fn published_conn_limit_for(nofile: Option<u64>) -> ConnLimit {
+fn process_relay_ceiling(nofile: Option<u64>) -> usize {
     let fd_cap = match nofile {
         Some(n) => {
             let n = usize::try_from(n).unwrap_or(usize::MAX);
@@ -86,11 +125,9 @@ fn published_conn_limit_for(nofile: Option<u64>) -> ConnLimit {
             };
             (usable / FDS_PER_RELAY).max(1)
         }
-        None => PUBLISHED_MAX_CONNS_TOTAL,
+        None => PROCESS_MAX_RELAY_CONNS,
     };
-    let total = PUBLISHED_MAX_CONNS_TOTAL.min(fd_cap);
-    let per_port = PUBLISHED_MAX_CONNS_PER_PORT.min((total / 2).max(1));
-    ConnLimit::PerPort { per_port, total }
+    PROCESS_MAX_RELAY_CONNS.min(fd_cap)
 }
 
 /// Where a forwarded connection goes.
@@ -186,6 +223,7 @@ pub struct AutoForwards {
     active: BTreeMap<u16, Forward>,
     active_conns: Arc<AtomicUsize>,
     conn_limit: ConnLimit,
+    budget: RelayBudget,
 }
 
 impl AutoForwards {
@@ -199,20 +237,49 @@ impl AutoForwards {
         )
     }
 
-    /// Forwards from `addrs` to `upstream`.
+    /// Forwards from `addrs` to `upstream` using a fresh process-derived budget.
+    #[cfg(test)]
     pub fn with(upstream: Upstream, addrs: &[Ipv4Addr]) -> AutoForwards {
-        let limit = match upstream {
-            Upstream::AutoForward(_) => ConnLimit::Shared(MAX_CONNS),
-            Upstream::PerPort(_) => published_conn_limit(),
-        };
-        Self::with_limit(upstream, addrs, limit)
+        Self::with_budget(upstream, addrs, RelayBudget::from_process_limits())
     }
 
-    /// Forwards from `addrs` to `upstream` with an explicit connection policy.
+    /// Forwards from `addrs` to `upstream`, sharing `budget` with other
+    /// forwarders in the same daemon process.
+    pub fn with_budget(
+        upstream: Upstream,
+        addrs: &[Ipv4Addr],
+        budget: RelayBudget,
+    ) -> AutoForwards {
+        let limit = match upstream {
+            Upstream::AutoForward(_) => ConnLimit::Shared(MAX_CONNS),
+            Upstream::PerPort(_) => published_conn_limit_for_budget(budget.max()),
+        };
+        Self::with_limit_and_budget(upstream, addrs, limit, budget)
+    }
+
+    /// Forwards from `addrs` to `upstream` with an explicit connection policy
+    /// and a process-derived shared budget.
+    #[cfg(test)]
     pub fn with_limit(
         upstream: Upstream,
         addrs: &[Ipv4Addr],
         conn_limit: ConnLimit,
+    ) -> AutoForwards {
+        Self::with_limit_and_budget(
+            upstream,
+            addrs,
+            conn_limit,
+            RelayBudget::from_process_limits(),
+        )
+    }
+
+    /// Forwards from `addrs` to `upstream` with an explicit subordinate policy
+    /// and shared process budget.
+    pub fn with_limit_and_budget(
+        upstream: Upstream,
+        addrs: &[Ipv4Addr],
+        conn_limit: ConnLimit,
+        budget: RelayBudget,
     ) -> AutoForwards {
         AutoForwards {
             upstream,
@@ -220,6 +287,7 @@ impl AutoForwards {
             active: BTreeMap::new(),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_limit,
+            budget,
         }
     }
 
@@ -276,8 +344,9 @@ impl AutoForwards {
             label: addrs_label(&bound),
             port,
             stop: stop.clone(),
-            total_conns: self.active_conns.clone(),
-            max_total_conns,
+            process_budget: self.budget.clone(),
+            class_conns: self.active_conns.clone(),
+            max_class_conns: max_total_conns,
             port_conns,
             max_port_conns,
             accept_batch: MAX_ACCEPT_BATCH,
@@ -326,11 +395,12 @@ impl Drop for AutoForwards {
     }
 }
 
-/// RAII permit holding the aggregate connection slot and (for per-port
-/// policies) the port's own slot. Dropping on spawn error or relay exit
-/// releases both.
+/// RAII permit holding the process-wide shared relay slot, this forwarder's
+/// class slot, and (for per-port policies) the port's own isolation slot.
+/// Dropping on spawn error or relay exit releases every acquired guard.
 struct RelayPermit {
-    _total: ConnGuard,
+    _process: ConnGuard,
+    _class: ConnGuard,
     _port: Option<ConnGuard>,
 }
 
@@ -342,10 +412,15 @@ impl RelayPermit {
             }
             _ => None,
         };
-        let total = ConnGuard::try_acquire(&ctx.total_conns, ctx.max_total_conns)
-            .ok_or(("aggregate", ctx.max_total_conns))?;
+        let class = ConnGuard::try_acquire(&ctx.class_conns, ctx.max_class_conns)
+            .ok_or(("class", ctx.max_class_conns))?;
+        let process = ctx
+            .process_budget
+            .try_acquire()
+            .ok_or(("shared", ctx.process_budget.max()))?;
         Ok(RelayPermit {
-            _total: total,
+            _process: process,
+            _class: class,
             _port: port,
         })
     }
@@ -356,8 +431,9 @@ struct AcceptCtx {
     label: String,
     port: u16,
     stop: Arc<AtomicBool>,
-    total_conns: Arc<AtomicUsize>,
-    max_total_conns: usize,
+    process_budget: RelayBudget,
+    class_conns: Arc<AtomicUsize>,
+    max_class_conns: usize,
     port_conns: Option<Arc<AtomicUsize>>,
     max_port_conns: Option<usize>,
     accept_batch: usize,
@@ -721,41 +797,143 @@ mod tests {
 
     #[test]
     fn published_conn_limit_scales_with_nofile_headroom() {
+        assert_eq!(process_relay_ceiling(Some(256)), 32);
         assert_eq!(
-            published_conn_limit_for(Some(256)),
+            published_conn_limit_for_budget(32),
             ConnLimit::PerPort {
                 per_port: 16,
                 total: 32
             }
         );
+        assert_eq!(process_relay_ceiling(Some(1024)), 128);
         assert_eq!(
-            published_conn_limit_for(Some(1024)),
+            published_conn_limit_for_budget(128),
             ConnLimit::PerPort {
                 per_port: 64,
                 total: 128
             }
         );
+        assert_eq!(process_relay_ceiling(Some(2560)), 320);
         assert_eq!(
-            published_conn_limit_for(Some(2560)),
+            published_conn_limit_for_budget(320),
             ConnLimit::PerPort {
                 per_port: 128,
                 total: 320
             }
         );
+        assert_eq!(process_relay_ceiling(Some(10240)), PROCESS_MAX_RELAY_CONNS);
         assert_eq!(
-            published_conn_limit_for(Some(10240)),
+            published_conn_limit_for_budget(PROCESS_MAX_RELAY_CONNS),
             ConnLimit::PerPort {
                 per_port: PUBLISHED_MAX_CONNS_PER_PORT,
                 total: PUBLISHED_MAX_CONNS_TOTAL
             }
         );
-        assert_eq!(
-            published_conn_limit_for(None),
-            ConnLimit::PerPort {
-                per_port: PUBLISHED_MAX_CONNS_PER_PORT,
-                total: PUBLISHED_MAX_CONNS_TOTAL
-            }
+        assert_eq!(process_relay_ceiling(None), PROCESS_MAX_RELAY_CONNS);
+    }
+
+    #[test]
+    fn shared_budget_caps_combined_published_and_automatic_forwards() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let shared = RelayBudget::new(3);
+        let guest_sock = fake_guest(&dir);
+        let mut auto = AutoForwards::with_limit_and_budget(
+            Upstream::AutoForward(guest_sock),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::Shared(10),
+            shared.clone(),
         );
+        let mut published = AutoForwards::with_limit_and_budget(
+            Upstream::PerPort(dir.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::PerPort {
+                per_port: 10,
+                total: 10,
+            },
+            shared.clone(),
+        );
+
+        let auto_port = add_free_port(&mut auto);
+        let pub_port = add_free_port(&mut published);
+
+        // Echo server behind the PerPort Unix socket for `pub_port`.
+        let pub_listener = UnixListener::bind(Upstream::socket(&dir, pub_port)).unwrap();
+        pub_listener.set_nonblocking(true).unwrap();
+        let pub_stop = Arc::new(AtomicBool::new(false));
+        let pub_stop2 = pub_stop.clone();
+        let pub_server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !pub_stop2.load(Ordering::SeqCst) {
+                let mut pfd = libc::pollfd {
+                    fd: pub_listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, 20) } <= 0 {
+                    continue;
+                }
+                if let Ok((mut c, _)) = pub_listener.accept() {
+                    let _ = c.set_nonblocking(false);
+                    handlers.push(thread::spawn(move || {
+                        let _ = c.write_all(b"gv:");
+                        if let Ok(mut rest) = c.try_clone() {
+                            let _ = copy(&mut rest, &mut c);
+                        }
+                        let _ = c.shutdown(Shutdown::Write);
+                    }));
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let open_echo = |port: u16, prefix: &str, tag: &[u8]| -> TcpStream {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(tag).unwrap();
+            let mut buf = vec![0u8; prefix.len() + tag.len()];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf[..prefix.len()], prefix.as_bytes());
+            s
+        };
+
+        // 2 automatic relays + 1 published relay fills the shared budget of 3.
+        let a1 = open_echo(auto_port, &format!("{auto_port}:"), b"1");
+        let a2 = open_echo(auto_port, &format!("{auto_port}:"), b"2");
+        let p1 = open_echo(pub_port, "gv:", b"3");
+        assert_eq!(shared.active(), 3);
+
+        // Both forwarders are now capped by the shared budget even though
+        // neither subordinate limit (10) has been reached.
+        assert_conn_rejected(auto_port);
+        assert_conn_rejected(pub_port);
+
+        // Dropping an automatic connection frees shared capacity for a
+        // published connection to succeed.
+        drop(a1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while shared.active() >= 3 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(round_trip(pub_port, "shared-ok"), "gv:shared-ok");
+
+        drop(a2);
+        drop(p1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while shared.active() != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(shared.active(), 0);
+
+        auto.clear();
+        published.clear();
+        pub_stop.store(true, Ordering::SeqCst);
+        pub_server.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn assert_conn_rejected(port: u16) {
@@ -859,8 +1037,9 @@ mod tests {
             label: "127.0.0.1".into(),
             port,
             stop: Arc::new(AtomicBool::new(false)),
-            total_conns: Arc::new(AtomicUsize::new(0)),
-            max_total_conns: 0,
+            process_budget: RelayBudget::new(16),
+            class_conns: Arc::new(AtomicUsize::new(0)),
+            max_class_conns: 0,
             port_conns: None,
             max_port_conns: None,
             accept_batch: 2,
@@ -899,8 +1078,9 @@ mod tests {
             label: "172.16.1.200".into(),
             port: filt_port,
             stop: Arc::new(AtomicBool::new(false)),
-            total_conns: Arc::new(AtomicUsize::new(0)),
-            max_total_conns: 16,
+            process_budget: RelayBudget::new(16),
+            class_conns: Arc::new(AtomicUsize::new(0)),
+            max_class_conns: 16,
             port_conns: None,
             max_port_conns: None,
             accept_batch: 2,
@@ -950,8 +1130,9 @@ mod tests {
             label: "127.0.0.1".into(),
             port: p1,
             stop: stop.clone(),
-            total_conns: Arc::new(AtomicUsize::new(0)),
-            max_total_conns: 16,
+            process_budget: RelayBudget::new(16),
+            class_conns: Arc::new(AtomicUsize::new(0)),
+            max_class_conns: 16,
             port_conns: None,
             max_port_conns: None,
             accept_batch: 2,

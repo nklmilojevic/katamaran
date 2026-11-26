@@ -449,14 +449,31 @@ pub struct AddressesApi {
 
 impl AddressesApi {
     /// `sockets` is the (private) directory for gvproxy's per-port sockets.
+    #[cfg(test)]
     pub fn new(gvproxy: GvproxyApi, sockets: &Path, addrs: &[Ipv4Addr]) -> Self {
+        Self::with_budget(
+            gvproxy,
+            sockets,
+            addrs,
+            crate::autofwd::RelayBudget::from_process_limits(),
+        )
+    }
+
+    /// Like [`Self::new`], sharing `budget` with the daemon's automatic
+    /// forwarder so combined relays respect one process-wide descriptor cap.
+    pub fn with_budget(
+        gvproxy: GvproxyApi,
+        sockets: &Path,
+        addrs: &[Ipv4Addr],
+        budget: crate::autofwd::RelayBudget,
+    ) -> Self {
         AddressesApi {
             gvproxy,
             sockets: sockets.to_path_buf(),
-            listeners: crate::autofwd::AutoForwards::with_limit(
+            listeners: crate::autofwd::AutoForwards::with_budget(
                 crate::autofwd::Upstream::PerPort(sockets.to_path_buf()),
                 addrs,
-                crate::autofwd::published_conn_limit(),
+                budget,
             ),
             upstream: BTreeMap::new(),
         }
@@ -2106,6 +2123,49 @@ mod tests {
         }
     }
 
+    /// Read a complete HTTP/1.1 request (headers up to `\r\n\r\n` plus the full
+    /// `Content-Length` body), handling arbitrary chunking across `read` calls.
+    fn read_http_request(conn: &mut UnixStream) -> Option<(String, String)> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            match conn.read(&mut tmp) {
+                Ok(0) => return None,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        };
+        let head = std::str::from_utf8(&buf[..header_end]).ok()?;
+        let path = head.lines().next()?.split_whitespace().nth(1)?.to_string();
+        let content_len = head
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while buf.len() < body_start + content_len {
+            match conn.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        let body_end = (body_start + content_len).min(buf.len());
+        let body = String::from_utf8_lossy(&buf[body_start..body_end]).into_owned();
+        Some((path, body))
+    }
+
     /// Minimal fake gvproxy `-services` server implementing `/forwarder/expose`
     /// and `/forwarder/unexpose` for `protocol: "unix"` with echo sockets and
     /// configurable lost-response fault injection.
@@ -2140,17 +2200,11 @@ mod tests {
             let thread = thread::spawn(move || {
                 let mut proxies: BTreeMap<PathBuf, FakeUnixProxy> = BTreeMap::new();
                 while let Some(mut conn) = accept_unix_until_stop(&listener, &s_stop) {
-                    let mut raw = vec![0u8; 4096];
-                    let n = conn.read(&mut raw).unwrap_or(0);
-                    if n == 0 {
+                    let Some((path, body)) = read_http_request(&mut conn) else {
                         continue;
-                    }
-                    let req = String::from_utf8_lossy(&raw[..n]);
-                    let first_line = req.lines().next().unwrap_or("");
-                    let path = first_line.split_whitespace().nth(1).unwrap_or("");
-                    let body = req.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                    };
                     let json: serde_json::Value =
-                        serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                     let local = PathBuf::from(json["local"].as_str().unwrap_or(""));
 
                     let write_resp = |conn: &mut UnixStream, status: &str, msg: &str| {
@@ -2161,7 +2215,7 @@ mod tests {
                         let _ = conn.write_all(r.as_bytes());
                     };
 
-                    match path {
+                    match path.as_str() {
                         "/services/forwarder/expose" => {
                             if proxies.contains_key(&local) {
                                 write_resp(
