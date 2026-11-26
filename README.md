@@ -195,6 +195,7 @@ Settings live in `~/.katamaran/config.toml` and take effect at the next VM start
 | `launch_at_login` | `true` | Start the daemon and VM when you log in |
 | `pause_on_sleep` | `false` | Freeze vCPUs while the Mac sleeps |
 | `kubernetes` | `false` | Enable the optional single-node Kubernetes (`k3s`) cluster |
+| `nofile` | `1048576` | Open-files limit (`ulimit -n`) set at guest boot; containerd, dockerd, and workloads inherit it unless they set their own |
 
 ### Browse Linux files in Finder
 

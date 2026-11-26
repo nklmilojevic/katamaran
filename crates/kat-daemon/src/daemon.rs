@@ -1639,11 +1639,7 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
         },
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
-        cmdline: if cfg.kubernetes {
-            "kat.k8s=1".into()
-        } else {
-            String::new()
-        },
+        cmdline: guest_cmdline(cfg),
         vm_bin: None,
         no_share: false,
         permissions: "caller".into(),
@@ -1656,6 +1652,15 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
         no_auto_forward: !cfg.auto_forward,
         amd64: cfg.amd64,
     })
+}
+
+/// Kernel command-line options that carry `cfg` to the guest's init.
+fn guest_cmdline(cfg: &Config) -> String {
+    let mut c = format!("kat.nofile={}", cfg.nofile);
+    if cfg.kubernetes {
+        c.push_str(" kat.k8s=1");
+    }
+    c
 }
 
 /// `$KATAMARAN_GUEST_DIR`, the app bundle's `Contents/Resources/guest`, or
@@ -1780,6 +1785,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn guest_cmdline_carries_nofile_and_kubernetes() {
+        let mut cfg = Config::default();
+        assert_eq!(guest_cmdline(&cfg), "kat.nofile=1048576");
+        cfg.nofile = 65536;
+        cfg.kubernetes = true;
+        assert_eq!(guest_cmdline(&cfg), "kat.nofile=65536 kat.k8s=1");
     }
 
     #[test]

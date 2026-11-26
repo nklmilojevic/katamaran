@@ -21,6 +21,15 @@ kubernetes = false
 
 Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately).
 
+Some settings, such as `nofile`, are not in the app's Settings window. Change them with the CLI or by editing `config.toml`:
+
+```sh
+kat config set nofile=65536
+kat restart
+```
+
+`nofile` is only written to `config.toml` when it differs from the default. Before downgrading to a katamaran version without `nofile`, remove a custom `nofile` line, since older versions reject unknown keys.
+
 ## Settings keys
 
 | Key | Type | Default | Valid values |
@@ -34,6 +43,7 @@ Edit settings with `kat config set` or the **Settings** window in the app, then 
 | `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
 | `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
+| `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) set at guest boot, like `LimitNOFILE` in Docker Desktop. containerd, dockerd, and containers and pods inherit it unless they set their own (for example `docker run --ulimit nofile=...`). |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
 

@@ -243,6 +243,74 @@ fn daemon_runs_the_vm_for_the_cli() {
     assert!(log.contains("VM stopped"), "{log}");
 }
 
+/// `ulimit -Sn` and `ulimit -Hn` in a fresh container on the VM's own
+/// Docker socket (never the host's Docker context).
+fn container_nofile(socket: &Path) -> (String, String) {
+    let out = Command::new("docker")
+        .env("DOCKER_HOST", format!("unix://{}", socket.display()))
+        .env_remove("DOCKER_CONTEXT")
+        .args([
+            "run",
+            "--rm",
+            "alpine:3.24.4",
+            "sh",
+            "-c",
+            "ulimit -Sn; ulimit -Hn",
+        ])
+        .output()
+        .expect("run docker");
+    let stdout = ok(&out, "docker run ulimit");
+    let mut lines = stdout.lines().map(str::to_owned);
+    (
+        lines.next().unwrap_or_default(),
+        lines.next().unwrap_or_default(),
+    )
+}
+
+#[test]
+#[ignore = "boots the system VM and uses the internet; run with `cargo xtask test-vm`"]
+fn containers_inherit_the_configured_nofile_limit() {
+    let home = root().join(format!("target/tdn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    // Above the kernel's stock fs.nr_open (1048576), so init must raise it.
+    ok(
+        &cli(
+            &home,
+            None,
+            &[
+                "config",
+                "set",
+                "cpus=2",
+                "memory=2G",
+                "mount=off",
+                "nofile=2097152",
+            ],
+        ),
+        "config set",
+    );
+    let _daemon = Daemon::spawn(&home);
+    ok(&cli(&home, None, &["start"]), "start");
+    let s = status_json(&home);
+    let sock = PathBuf::from(s["docker"]["socket"].as_str().unwrap());
+    assert_eq!(
+        container_nofile(&sock),
+        ("2097152".into(), "2097152".into())
+    );
+
+    ok(
+        &cli(&home, None, &["config", "set", "nofile=1048576"]),
+        "config set",
+    );
+    let saved = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(!saved.contains("nofile"), "{saved}");
+    ok(&cli(&home, None, &["restart"]), "restart");
+    assert_eq!(
+        container_nofile(&sock),
+        ("1048576".into(), "1048576".into())
+    );
+}
+
 /// Undo `katamaran setup` whatever happens.
 struct Installed {
     home: PathBuf,

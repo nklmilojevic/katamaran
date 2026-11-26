@@ -38,6 +38,12 @@ pub struct Config {
     pub amd64: Emulation,
     /// Run an optional single-node Kubernetes (k3s) cluster inside the VM.
     pub kubernetes: bool,
+    /// The open-files limit (RLIMIT_NOFILE, soft and hard) the guest sets at
+    /// boot; containerd, dockerd and workloads inherit it unless they set
+    /// their own. Not written when default, so older versions, which deny
+    /// unknown keys, still read a saved config.
+    #[serde(skip_serializing_if = "is_default_nofile")]
+    pub nofile: u32,
 }
 
 impl Default for Config {
@@ -53,12 +59,13 @@ impl Default for Config {
             auto_forward: true,
             amd64: Emulation::default(),
             kubernetes: false,
+            nofile: DEFAULT_NOFILE,
         }
     }
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 10] = [
     "cpus",
     "memory_mib",
     "mount",
@@ -68,7 +75,19 @@ pub const KEYS: [&str; 9] = [
     "auto_forward",
     "amd64",
     "kubernetes",
+    "nofile",
 ];
+
+/// What Docker Desktop, OrbStack and Colima give containers.
+pub const DEFAULT_NOFILE: u32 = 1 << 20;
+/// Below this, dockerd and containerd themselves run short.
+pub const MIN_NOFILE: u32 = 1024;
+/// Within the kernel's ceiling for `fs.nr_open`.
+pub const MAX_NOFILE: u32 = 1 << 30;
+
+fn is_default_nofile(n: &u32) -> bool {
+    *n == DEFAULT_NOFILE
+}
 
 /// The smallest guest that still runs dockerd comfortably.
 pub const MIN_MEMORY_MIB: u32 = 1024;
@@ -156,6 +175,7 @@ impl Config {
             "auto_forward" => self.auto_forward.to_string(),
             "amd64" => self.amd64.to_string(),
             "kubernetes" => self.kubernetes.to_string(),
+            "nofile" => self.nofile.to_string(),
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         })
     }
@@ -180,6 +200,11 @@ impl Config {
             "auto_forward" => next.auto_forward = parse_bool(value)?,
             "amd64" => next.amd64 = value.parse()?,
             "kubernetes" => next.kubernetes = parse_bool(value)?,
+            "nofile" => {
+                next.nofile = value
+                    .parse()
+                    .with_context(|| format!("nofile: {value:?}"))?
+            }
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
@@ -210,6 +235,9 @@ impl Config {
             && !p.is_absolute()
         {
             bail!("mount_path must be absolute");
+        }
+        if !(MIN_NOFILE..=MAX_NOFILE).contains(&self.nofile) {
+            bail!("nofile must be between {MIN_NOFILE} and {MAX_NOFILE}");
         }
         Ok(())
     }
@@ -422,6 +450,31 @@ mod tests {
         assert_eq!(cfg.get("auto_forward").unwrap(), "false");
         assert!(started.needs_restart_for(&cfg));
         assert!(!Config::parse("auto_forward = false").unwrap().auto_forward);
+    }
+
+    #[test]
+    fn nofile_defaults_high_and_is_a_vm_setting() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.nofile, 1_048_576);
+        let started = cfg.clone();
+        cfg.set("nofile", "65536", &HOST).unwrap();
+        assert_eq!(cfg.get("nofile").unwrap(), "65536");
+        assert!(started.needs_restart_for(&cfg));
+        assert!(cfg.set("nofile", "512", &HOST).is_err());
+        assert!(cfg.set("nofile", "lots", &HOST).is_err());
+        assert!(Config::parse("nofile = 100").is_err());
+        assert_eq!(Config::parse("nofile = 262144").unwrap().nofile, 262_144);
+    }
+
+    #[test]
+    fn default_nofile_is_not_saved() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("nofile"), "{text}");
+        let mut cfg = Config::default();
+        cfg.set("nofile", "65536", &HOST).unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("nofile = 65536"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
     }
 
     #[test]
