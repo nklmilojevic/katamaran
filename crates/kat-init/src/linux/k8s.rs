@@ -7,15 +7,17 @@
 //! and `nftables` kube-proxy, and mirrors locally built Docker images from the
 //! `moby` namespace into `k8s.io`.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
+use std::hash::Hasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -287,8 +289,13 @@ fn parse_k3s_minor(version: &str) -> Option<(u32, u32)> {
 
 /// True once k3s has initialized server state under `data_dir`.
 /// `prepare_dirs_and_sysctls` only creates `agent/etc/cni/net.d`, never `server/`.
-fn datastore_exists(data_dir: &Path) -> bool {
-    data_dir.join("server").exists()
+fn datastore_exists(data_dir: &Path) -> Result<bool, String> {
+    let server_dir = data_dir.join("server");
+    match fs::symlink_metadata(&server_dir) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {}: {e}", server_dir.display())),
+    }
 }
 
 fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
@@ -302,23 +309,50 @@ fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+fn missing_datastore_version_error(
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+) -> String {
+    format!(
+        "existing cluster data under {} has no version marker ({} or {}); \
+         cannot verify minor-version compatibility. While Kubernetes is stopped, \
+         either restore the matching {} marker recorded with your verified \
+         datastore backup, or back up any state you need and run `kat k8s reset` \
+         to delete cluster data and persistent volumes before starting fresh.",
+        data_dir.display(),
+        data_version_file.display(),
+        bin_version_file.display(),
+        data_version_file.display(),
+    )
+}
+
 /// Return the k3s version associated with an existing datastore under `data_dir`.
 ///
 /// Prefers `data_version_file` inside `data_dir` so `reset` clears it together
 /// with cluster data while leaving `bin_version_file` intact. For datastores
 /// created before `data_version_file` existed, falls back to `bin_version_file`.
+/// Rejects an existing `server/` directory when both version markers are absent
+/// so an older binary cannot silently open an unmarked restored datastore.
 fn effective_datastore_version(
     data_dir: &Path,
     data_version_file: &Path,
     bin_version_file: &Path,
 ) -> Result<Option<String>, String> {
-    if !datastore_exists(data_dir) {
+    if !datastore_exists(data_dir)? {
         return Ok(None);
     }
     if let Some(v) = read_trimmed_file(data_version_file)? {
         return Ok(Some(v));
     }
-    read_trimmed_file(bin_version_file)
+    if let Some(v) = read_trimmed_file(bin_version_file)? {
+        return Ok(Some(v));
+    }
+    Err(missing_datastore_version_error(
+        data_dir,
+        data_version_file,
+        bin_version_file,
+    ))
 }
 
 /// Refuse to install or start a lower Kubernetes minor against an existing
@@ -339,15 +373,22 @@ fn check_datastore_compatible(
     let existing_mm = parse_k3s_minor(&existing).ok_or_else(|| {
         format!(
             "cannot determine minor version of existing cluster data ({existing:?}); \
-             back up any state you need and run `kat k8s reset` before starting {target_version}"
+             while Kubernetes is stopped, either restore a matching datastore backup \
+             together with its {} version marker, or back up any state you need and \
+             run `kat k8s reset` before starting {target_version}",
+            data_version_file.display()
         )
     })?;
     if target_mm < existing_mm {
         return Err(format!(
             "refusing to use k3s {target_version} with existing {existing} cluster data: \
-             Kubernetes does not support minor-version downgrades. Back up any state you need, \
-             run `kat k8s reset` to delete cluster data and persistent volumes, then run \
-             `kat k8s start` (or restore a matching datastore backup)."
+             Kubernetes does not support minor-version downgrades. To start fresh, back up \
+             any state you need, run `kat k8s reset` to delete cluster data and persistent \
+             volumes, then run `kat k8s start`. To roll back to a pre-upgrade datastore \
+             backup instead, stop Kubernetes and restore both the datastore and its \
+             matching {} version marker from that backup before starting {target_version} \
+             (see the Kubernetes guide's rollback procedure).",
+            data_version_file.display()
         ));
     }
     Ok(())
@@ -361,16 +402,153 @@ fn seed_datastore_version_if_missing(
     data_version_file: &Path,
     bin_version_file: &Path,
 ) -> Result<(), String> {
-    if !datastore_exists(data_dir) {
+    if !datastore_exists(data_dir)? {
         return Ok(());
     }
     if read_trimmed_file(data_version_file)?.is_some() {
         return Ok(());
     }
-    if let Some(prev) = read_trimmed_file(bin_version_file)? {
-        write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
+    let Some(prev) = read_trimmed_file(bin_version_file)? else {
+        return Err(missing_datastore_version_error(
+            data_dir,
+            data_version_file,
+            bin_version_file,
+        ));
+    };
+    write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DatastoreEntryKind {
+    File {
+        len: u64,
+        hash_sip: u64,
+        hash_fnv: u64,
+    },
+    Dir,
+    Symlink(PathBuf),
+    Other(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatastoreEntry {
+    rel_path: PathBuf,
+    dev: u64,
+    ino: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    kind: DatastoreEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DatastoreSnapshot {
+    Absent,
+    Present(Vec<DatastoreEntry>),
+}
+
+fn hash_file(path: &Path) -> io::Result<(u64, u64, u64)> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut sip = DefaultHasher::new();
+    let mut fnv: u64 = 0xcbf29ce484222325;
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        let chunk = &buf[..n];
+        sip.write(chunk);
+        for &b in chunk {
+            fnv ^= u64::from(b);
+            fnv = fnv.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok((total, sip.finish(), fnv))
+}
+
+fn collect_datastore_entries(
+    path: &Path,
+    rel_path: PathBuf,
+    out: &mut Vec<DatastoreEntry>,
+) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    let ft = meta.file_type();
+    let kind = if ft.is_file() {
+        let (len, hash_sip, hash_fnv) = hash_file(path)?;
+        DatastoreEntryKind::File {
+            len,
+            hash_sip,
+            hash_fnv,
+        }
+    } else if ft.is_dir() {
+        DatastoreEntryKind::Dir
+    } else if ft.is_symlink() {
+        DatastoreEntryKind::Symlink(fs::read_link(path)?)
+    } else {
+        DatastoreEntryKind::Other(meta.mode())
+    };
+    out.push(DatastoreEntry {
+        rel_path: rel_path.clone(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+        kind,
+    });
+    if ft.is_dir() {
+        let mut children: Vec<_> = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        children.sort_by_key(|e| e.file_name());
+        for entry in children {
+            let child_rel = rel_path.join(entry.file_name());
+            collect_datastore_entries(&entry.path(), child_rel, out)?;
+        }
     }
     Ok(())
+}
+
+/// Fingerprint `data_dir/server` (structure, metadata, and regular-file contents)
+/// so a failed startup that exited before touching the datastore can safely roll
+/// back `.katamaran-version`, while any modification keeps the updated marker.
+fn snapshot_datastore(data_dir: &Path) -> io::Result<DatastoreSnapshot> {
+    let server_dir = data_dir.join("server");
+    match fs::symlink_metadata(&server_dir) {
+        Ok(_) => {
+            let mut entries = Vec::new();
+            collect_datastore_entries(&server_dir, PathBuf::new(), &mut entries)?;
+            Ok(DatastoreSnapshot::Present(entries))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DatastoreSnapshot::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+fn rollback_data_version_if_untouched(
+    data_dir: &Path,
+    data_version_file: &Path,
+    prev_data_version: Option<&str>,
+    before: Option<&DatastoreSnapshot>,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    match snapshot_datastore(data_dir) {
+        Ok(after) if &after == before => {
+            restore_data_version(data_version_file, prev_data_version);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log(&format!(
+                "snapshot {} after startup failure: {e}; keeping updated version marker",
+                data_dir.display()
+            ));
+        }
+    }
 }
 
 fn restore_data_version(path: &Path, prev: Option<&str>) {
@@ -921,16 +1099,27 @@ impl K8s {
         .stderr(log_file);
 
         let prev_data_version = read_trimmed_file(Path::new(DATA_VERSION_FILE))?;
-        let wrote_data_version = if prev_data_version.as_deref() != Some(installed_version.as_str())
-        {
+        let wrote_data_version = prev_data_version.as_deref() != Some(installed_version.as_str());
+        let before_datastore = if wrote_data_version {
+            match snapshot_datastore(Path::new(DATA_DIR)) {
+                Ok(snap) => Some(snap),
+                Err(e) => {
+                    log(&format!(
+                        "snapshot {DATA_DIR} before starting k3s: {e}; \
+                         startup failure will keep updated version marker"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if wrote_data_version {
             write_atomic(
                 Path::new(DATA_VERSION_FILE),
                 format!("{installed_version}\n").as_bytes(),
             )?;
-            true
-        } else {
-            false
-        };
+        }
         if let Err(e) = enable_bridge_netfilter() {
             if wrote_data_version {
                 restore_data_version(Path::new(DATA_VERSION_FILE), prev_data_version.as_deref());
@@ -1042,6 +1231,14 @@ impl K8s {
                 };
                 if reaped {
                     stop_k8s_workloads(&self.reaper);
+                    if wrote_data_version {
+                        rollback_data_version_if_untouched(
+                            Path::new(DATA_DIR),
+                            Path::new(DATA_VERSION_FILE),
+                            prev_data_version.as_deref(),
+                            before_datastore.as_ref(),
+                        );
+                    }
                     ACTIVE.store(false, Ordering::SeqCst);
                     FORWARDED.lock().unwrap().clear();
                     restore_bridge_netfilter();
@@ -1076,10 +1273,16 @@ impl K8s {
                 st.api_ready = false;
                 st.running.take()
             };
-            if let Some(r) = running {
-                terminate_running(r);
-            }
+            let reaped = running.is_none_or(terminate_running);
             stop_k8s_workloads(&self.reaper);
+            if reaped && wrote_data_version {
+                rollback_data_version_if_untouched(
+                    Path::new(DATA_DIR),
+                    Path::new(DATA_VERSION_FILE),
+                    prev_data_version.as_deref(),
+                    before_datastore.as_ref(),
+                );
+            }
             ACTIVE.store(false, Ordering::SeqCst);
             FORWARDED.lock().unwrap().clear();
             restore_bridge_netfilter();
@@ -1098,6 +1301,14 @@ impl K8s {
                 describe_status(status)
             );
             stop_k8s_workloads(&self.reaper);
+            if wrote_data_version {
+                rollback_data_version_if_untouched(
+                    Path::new(DATA_DIR),
+                    Path::new(DATA_VERSION_FILE),
+                    prev_data_version.as_deref(),
+                    before_datastore.as_ref(),
+                );
+            }
             let mut st = self.state.lock().unwrap();
             if st.generation == my_gen {
                 st.phase = "failed".into();
@@ -1139,10 +1350,16 @@ impl K8s {
                     st.api_ready = false;
                     st.running.take()
                 };
-                if let Some(r) = running {
-                    terminate_running(r);
-                }
+                let reaped = running.is_none_or(terminate_running);
                 stop_k8s_workloads(&self.reaper);
+                if reaped && wrote_data_version {
+                    rollback_data_version_if_untouched(
+                        Path::new(DATA_DIR),
+                        Path::new(DATA_VERSION_FILE),
+                        prev_data_version.as_deref(),
+                        before_datastore.as_ref(),
+                    );
+                }
                 ACTIVE.store(false, Ordering::SeqCst);
                 FORWARDED.lock().unwrap().clear();
                 restore_bridge_netfilter();
@@ -1241,7 +1458,7 @@ impl K8s {
             let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
         }
         if let Some(r) = running {
-            terminate_running(r);
+            let _ = terminate_running(r);
         }
         if needs_cleanup {
             stop_k8s_workloads(&self.reaper);
@@ -1483,19 +1700,24 @@ fn restore_bridge_netfilter() {
     }
 }
 
-fn terminate_running(mut r: Running) {
+fn terminate_running(mut r: Running) -> bool {
     r.sync_stop.store(true, Ordering::SeqCst);
-    if r.exited.lock().unwrap().is_none() {
+    let reaped = if r.exited.lock().unwrap().is_some() {
+        true
+    } else {
         unsafe { libc::kill(r.pid, libc::SIGTERM) };
-        if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_err() {
+        if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_ok() {
+            true
+        } else {
             log("k3s did not stop in time, killing it");
             unsafe { libc::kill(r.pid, libc::SIGKILL) };
-            let _ = r.exit_rx.recv_timeout(Duration::from_secs(3));
+            r.exit_rx.recv_timeout(Duration::from_secs(3)).is_ok()
         }
-    }
+    };
     if let Some(t) = r.proxy_thread.take() {
         let _ = t.join();
     }
+    reaped
 }
 
 /// Unescape octal escape sequences (`\040`, `\011`, `\012`, `\134`) used in
@@ -2339,7 +2561,6 @@ fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2763,6 +2984,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(err.contains("v1.32.5+k3s1"), "{err}");
         assert!(err.contains("v1.37.2+k3s1"), "{err}");
         assert!(err.contains("kat k8s reset"), "{err}");
+        assert!(err.contains(".katamaran-version"), "{err}");
         assert!(!data_version_file.exists());
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
@@ -2798,10 +3020,44 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         )
         .unwrap_err();
         assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        assert!(err.contains(".katamaran-version"), "{err}");
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
+        // Existing server/ with both version markers absent (e.g. a restored backup
+        // onto a fresh disk without metadata) must be rejected without modifying data_dir.
+        fs::remove_file(&data_version_file).unwrap();
+        fs::remove_file(&bin_version_file).unwrap();
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+        assert!(err.contains(".katamaran-version"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+        assert!(!data_version_file.exists());
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+        assert!(
+            seed_datastore_version_if_missing(&data_dir, &data_version_file, &bin_version_file)
+                .is_err()
+        );
+
+        // Whitespace-only markers are treated the same as missing markers.
+        fs::write(&data_version_file, "   \n").unwrap();
+        fs::write(&bin_version_file, "\n").unwrap();
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.37.2+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
         // After reset removes data_dir, starting a lower minor is allowed even while
-        // bin_version_file still records the previous installed binary.
+        // bin_version_file still records the previous installed binary (or is absent).
         fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
         fs::remove_dir_all(&data_dir).unwrap();
         check_datastore_compatible(
@@ -2811,9 +3067,25 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "v1.32.5+k3s1",
         )
         .unwrap();
+        fs::remove_file(&bin_version_file).unwrap();
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap();
 
-        // Empty data_dir without server/ (e.g. failed pre-start) does not block switching.
+        // Empty data_dir without server/ (e.g. failed pre-start) does not block switching,
+        // even when both markers are absent or a stale data marker exists.
         fs::create_dir_all(data_dir.join("agent/etc/cni/net.d")).unwrap();
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap();
         fs::write(&data_version_file, "v1.37.2+k3s1\n").unwrap();
         check_datastore_compatible(
             &data_dir,
@@ -2822,6 +3094,116 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "v1.32.5+k3s1",
         )
         .unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_failure_rolls_back_data_version_only_when_datastore_untouched() {
+        let dir = temp_dir("datastore-rollback");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = dir.join("bin/version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        let db_file = data_dir.join("server/db/state.db");
+        fs::write(&db_file, b"v1.32-state-0001").unwrap();
+        fs::write(&data_version_file, "v1.32.5+k3s1\n").unwrap();
+        fs::write(&bin_version_file, "v1.33.0+k3s1\n").unwrap();
+
+        // 1. Process exits during startup without touching server/: version marker
+        // rolls back so the operator can return to v1.32.5+k3s1.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.32.5+k3s1\n"
+        );
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap();
+
+        // 2. Process modifies state.db in place (even with identical length) before
+        // exiting: version marker stays bumped and blocks returning to v1.32.5+k3s1.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(&db_file, b"v1.33-state-0001").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+        assert!(
+            check_datastore_compatible(
+                &data_dir,
+                &data_version_file,
+                &bin_version_file,
+                "v1.32.5+k3s1",
+            )
+            .is_err()
+        );
+
+        // 3. Process creates a WAL file under server/db/ before exiting: marker stays bumped.
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(data_dir.join("server/db/state.db-wal"), b"wal-frame").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+
+        // 4. Missing pre-spawn snapshot fails safe and keeps the updated marker.
+        write_atomic(&data_version_file, b"v1.34.0+k3s1\n").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.33.0+k3s1"),
+            None,
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.34.0+k3s1\n"
+        );
+
+        // 5. Fresh data_dir without server/: removes marker if server/ stays absent,
+        // keeps marker if k3s created server/ before exiting.
+        fs::remove_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let before = snapshot_datastore(&data_dir).unwrap();
+        assert_eq!(before, DatastoreSnapshot::Absent);
+        write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
+        rollback_data_version_if_untouched(&data_dir, &data_version_file, None, Some(&before));
+        assert!(!data_version_file.exists());
+
+        write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
+        fs::create_dir_all(data_dir.join("server")).unwrap();
+        rollback_data_version_if_untouched(&data_dir, &data_version_file, None, Some(&before));
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

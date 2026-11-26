@@ -55,11 +55,17 @@ kat config set k8s_version=default   # back to the pinned build
 katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<version>/` and verifies it against the SHA-256 published in the release's `sha256sum-arm64.txt` (the pinned build is checked against a checksum built into katamaran). The new version is installed at the next Kubernetes start, so a running cluster picks it up after `kat k8s stop && kat k8s start` or `kat restart`.
 
 - **Upgrading while keeping cluster state:** follow the [K3s manual upgrade guide](https://docs.k3s.io/upgrades/manual) — back up your cluster state first and upgrade one minor version at a time without skipping intermediate minors. Clearing `k8s_version` (`kat config set k8s_version=default`) selects the pinned release immediately on the next Kubernetes start rather than stepping through intermediate minors; if your cluster is more than one minor behind the pinned build, upgrade one minor at a time or reset the cluster first.
-- **Switching to an older minor (or starting fresh):** Kubernetes does not support minor-version downgrades against an existing datastore, and katamaran refuses to start an older minor against newer cluster data. To switch to an older minor with a fresh cluster:
+- **Switching to an older minor (fresh cluster):** Kubernetes does not support minor-version downgrades against an existing datastore, and katamaran refuses to start an older minor against newer cluster data. To switch to an older minor with a fresh cluster:
   1. Back up any cluster state or data you need.
   2. Set the desired release tag (for example `kat config set k8s_version=v1.32.5+k3s1`).
   3. Run `kat k8s reset` **before** the first start of that tag — this stops Kubernetes, deletes all cluster data, workloads, and persistent volumes, and disables auto-start.
   4. Run `kat k8s start` to initialize the cluster on the selected release and re-enable auto-start.
+- **Backing up and restoring a SQLite datastore for rollback:** to roll back a minor upgrade while keeping pre-upgrade cluster state (see the [K3s rollback guide](https://docs.k3s.io/upgrades/roll-back)), record the cluster's `k3s` release tag alongside the datastore backup so katamaran can verify minor-version compatibility on restore:
+  1. **Before upgrading**, stop Kubernetes (`kat k8s stop`) and back up `/var/lib/katamaran/k3s/data/server/` (including `server/db/`) **together with** `/var/lib/katamaran/k3s/data/.katamaran-version` (if `.katamaran-version` does not exist yet on an older cluster, record the exact `k3s` tag from `kat k8s status` to restore as `.katamaran-version`).
+  2. **To restore**, keep Kubernetes stopped (`kat k8s stop`) and restore both the backed-up datastore under `/var/lib/katamaran/k3s/data/server/` (removing any newer `state.db-wal` or `state.db-shm` files left by the newer release) **and** its matching `/var/lib/katamaran/k3s/data/.katamaran-version` file. Katamaran refuses to start if `server/` exists without a version marker or if `.katamaran-version` still records a newer minor.
+  3. Set `k8s_version` to the release tag from that backup (for example `kat config set k8s_version=v1.32.5+k3s1`) and run `kat k8s start`.
+
+  Do not change `/var/lib/katamaran/k3s/data/.katamaran-version` without restoring matching cluster data — mismatched metadata allows an older `k3s` binary to open a newer datastore and can corrupt cluster state.
 
 ## Connect with `kubectl`
 
