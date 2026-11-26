@@ -162,7 +162,7 @@ pub enum Call {
     MachineDefault { name: String },
     K8sStart,
     K8sStop,
-    K8sReset,
+    K8sReset { images: bool },
     K8sKubeconfig,
     K8sSyncImages,
     K8sMarkVersion { version: String },
@@ -201,7 +201,7 @@ impl Call {
             Call::MachineDefault { .. } => "machine.default",
             Call::K8sStart => "k8s.start",
             Call::K8sStop => "k8s.stop",
-            Call::K8sReset => "k8s.reset",
+            Call::K8sReset { .. } => "k8s.reset",
             Call::K8sKubeconfig => "k8s.kubeconfig",
             Call::K8sSyncImages => "k8s.sync_images",
             Call::K8sMarkVersion { .. } => "k8s.mark_version",
@@ -220,6 +220,7 @@ impl Call {
             | Call::MachineDelete { name }
             | Call::MachineDefault { name } => serde_json::json!({ "name": name }),
             Call::K8sMarkVersion { version } => serde_json::json!({ "version": version }),
+            Call::K8sReset { images } => serde_json::json!({ "images": images }),
             _ => Value::Null,
         }
     }
@@ -337,7 +338,19 @@ impl Call {
             }
             "k8s.start" => Call::K8sStart,
             "k8s.stop" => Call::K8sStop,
-            "k8s.reset" => Call::K8sReset,
+            "k8s.reset" => {
+                #[derive(Deserialize, Default)]
+                #[serde(default, deny_unknown_fields)]
+                struct P {
+                    images: bool,
+                }
+                let P { images } = if p.is_null() {
+                    P::default()
+                } else {
+                    serde_json::from_value(p.clone()).map_err(bad)?
+                };
+                Call::K8sReset { images }
+            }
             "k8s.kubeconfig" => Call::K8sKubeconfig,
             "k8s.sync_images" => Call::K8sSyncImages,
             "k8s.mark_version" => {
@@ -633,7 +646,8 @@ mod tests {
             Call::MachineDefault { name: "dev".into() },
             Call::K8sStart,
             Call::K8sStop,
-            Call::K8sReset,
+            Call::K8sReset { images: false },
+            Call::K8sReset { images: true },
             Call::K8sKubeconfig,
             Call::K8sSyncImages,
             Call::K8sMarkVersion {
@@ -684,6 +698,18 @@ mod tests {
             Call::parse(&req("stop", Value::Null)).unwrap(),
             Call::Stop { wait: false }
         );
+        assert_eq!(
+            Call::parse(&req("k8s.reset", Value::Null)).unwrap(),
+            Call::K8sReset { images: false }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset", json!({}))).unwrap(),
+            Call::K8sReset { images: false }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset", json!({"images": true}))).unwrap(),
+            Call::K8sReset { images: true }
+        );
     }
 
     #[test]
@@ -692,6 +718,14 @@ mod tests {
         assert_eq!(code(req("reboot", Value::Null)), METHOD_NOT_FOUND);
         assert_eq!(code(req("stop", json!({"wait": "yes"}))), INVALID_PARAMS);
         assert_eq!(code(req("stop", json!({"force": true}))), INVALID_PARAMS);
+        assert_eq!(
+            code(req("k8s.reset", json!({"images": "yes"}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("k8s.reset", json!({"force": true}))),
+            INVALID_PARAMS
+        );
         assert_eq!(
             code(req("logs", json!({"source": "kernel"}))),
             INVALID_PARAMS

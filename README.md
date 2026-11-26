@@ -244,6 +244,7 @@ kat k8s dns install
 kat k8s forward 10.43.0.1:443 --local 8443
 kat k8s stop
 kat k8s reset
+kat k8s reset --images
 ```
 
 ### Inspect logs and shell into the VM

@@ -43,6 +43,14 @@ To wipe all cluster state, workloads, and persistent volumes and start fresh:
 kat k8s reset
 ```
 
+By default, `kat k8s reset` keeps cached images in containerd's `k8s.io` namespace so restarting the cluster does not need to re-pull them. To also clear all images in `k8s.io` (for example, to benchmark cold starts or reproduce first-run image pulls) without touching Docker images in the `moby` namespace:
+
+```sh
+kat k8s reset --images
+```
+
+Note that when Kubernetes starts again (`kat k8s start`), local Docker images in `moby` are mirrored back into `k8s.io` by automatic image sync.
+
 ## Choose the k3s version
 
 Each katamaran release pins a tested `k3s` build. To keep the local cluster on the same minor as production, set `k8s_version` to any [k3s release tag](https://github.com/k3s-io/k3s/releases) from `v1.31` on:
@@ -217,7 +225,7 @@ If `--local` is omitted, katamaran binds the same port number on `127.0.0.1`.
 
 ## Storage and host paths
 
-- **Cluster data**: `k3s` stores its state and `local-path` persistent volumes under `/var/lib/katamaran/k3s/data` on the VM's btrfs `data.img` disk (as a btrfs subvolume when supported, making `kat k8s reset` fast).
+- **Cluster data**: `k3s` stores its state and `local-path` persistent volumes under `/var/lib/katamaran/k3s/data` on the VM's btrfs `data.img` disk (as a btrfs subvolume when supported, making `kat k8s reset` fast). Container images live separately in containerd's shared store (`/var/lib/containerd`) under the `k8s.io` namespace, so `kat k8s reset` keeps them unless `--images` is passed.
 - **Host directories**: Because katamaran mounts `/Users` into the VM at the same path, Kubernetes `hostPath` volumes pointing to directories under `/Users` access your macOS files directly.
 
 ## Customize `k3s` server flags and config

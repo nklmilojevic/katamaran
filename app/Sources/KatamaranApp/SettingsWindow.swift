@@ -341,12 +341,20 @@ final class SettingsWindowController: NSWindowController {
     @objc private func k8sResetClicked() {
         let alert = NSAlert()
         alert.messageText = "Reset Kubernetes cluster?"
-        alert.informativeText = "This stops Kubernetes and deletes all cluster state, workloads, and persistent volumes."
+        alert.informativeText = "This stops Kubernetes and deletes all cluster state, workloads, and persistent volumes. Cached images in containerd’s k8s.io namespace are kept by default; Docker images are untouched."
         alert.alertStyle = .warning
+        let removeImages = NSButton(
+            checkboxWithTitle: "Also remove cached Kubernetes images (k8s.io)",
+            target: nil,
+            action: nil
+        )
+        removeImages.state = .off
+        removeImages.sizeToFit()
+        alert.accessoryView = removeImages
         alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            model.k8sReset()
+            model.k8sReset(images: removeImages.state == .on)
         }
     }
 

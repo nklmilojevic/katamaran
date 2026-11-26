@@ -139,10 +139,12 @@ kat logs --source console -n 200
 
 4. If a local image fails with `ErrImagePull`, run `kat k8s sync-images` and set `imagePullPolicy: IfNotPresent` (or `Never`) on the container spec.
 
-5. To wipe a broken cluster state without touching Docker containers or Linux machines, reset Kubernetes and start it again:
+5. To wipe a broken cluster state without touching Docker containers or Linux machines, reset Kubernetes and start it again (`kat k8s reset` keeps cached `k8s.io` images by default; add `--images` to clear them too):
 
 ```sh
 kat k8s reset
+# Or also clear cached k8s.io images:
+kat k8s reset --images
 kat k8s start
 ```
 

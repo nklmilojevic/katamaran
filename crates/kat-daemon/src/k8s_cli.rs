@@ -24,7 +24,15 @@ pub enum K8sCmd {
     /// Stop Kubernetes and disable auto-start (zero overhead when off).
     Stop,
     /// Stop Kubernetes and wipe all cluster state and persistent volumes.
-    Reset,
+    ///
+    /// Cached images in containerd's `k8s.io` namespace are kept by default so
+    /// restarting Kubernetes does not re-pull them. Pass `--images` to also
+    /// clear all images in `k8s.io` (Docker's `moby` namespace is untouched).
+    Reset {
+        /// Also remove all images in containerd's `k8s.io` namespace.
+        #[arg(long)]
+        images: bool,
+    },
     /// Record the verified k3s version tag of an existing unmarked cluster datastore.
     MarkVersion {
         /// Independently verified k3s release tag (for example `v1.37.2+k3s1`).
@@ -66,7 +74,7 @@ pub fn run(cmd: K8sCmd) -> anyhow::Result<()> {
         K8sCmd::Status { json } => status(json),
         K8sCmd::Start => start(),
         K8sCmd::Stop => stop(),
-        K8sCmd::Reset => reset(),
+        K8sCmd::Reset { images } => reset(images),
         K8sCmd::MarkVersion { version } => mark_version(&version),
         K8sCmd::Kubeconfig { path } => kubeconfig(path),
         K8sCmd::SyncImages => sync_images(),
@@ -165,10 +173,14 @@ fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reset() -> anyhow::Result<()> {
+fn reset(images: bool) -> anyhow::Result<()> {
     let mut c = Client::connect_default()?;
-    c.call(&Call::K8sReset)?;
-    println!("katamaran: Kubernetes cluster reset");
+    c.call(&Call::K8sReset { images })?;
+    if images {
+        println!("katamaran: Kubernetes cluster reset (k8s.io images cleared)");
+    } else {
+        println!("katamaran: Kubernetes cluster reset");
+    }
     Ok(())
 }
 
@@ -428,5 +440,22 @@ mod tests {
         });
         assert!(installed.contains("resolver installed"), "{installed}");
         assert!(!installed.contains("kat k8s dns install"), "{installed}");
+    }
+
+    #[test]
+    fn parses_reset_images_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: K8sCmd,
+        }
+
+        let default = Wrapper::try_parse_from(["k8s", "reset"]).unwrap();
+        assert!(matches!(default.cmd, K8sCmd::Reset { images: false }));
+
+        let with_images = Wrapper::try_parse_from(["k8s", "reset", "--images"]).unwrap();
+        assert!(matches!(with_images.cmd, K8sCmd::Reset { images: true }));
     }
 }

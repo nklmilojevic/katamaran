@@ -10,6 +10,7 @@
 //! | `Start`          | optional `extra_args`, `config_yaml`       | `Progress`…, then `StatusInfo` / `Error`    |
 //! | `Stop`           | –                                          | `Progress`…, then `Done` / `Error`          |
 //! | `Reset`          | –                                          | `Progress`…, then `Done` / `Error`          |
+//! |                  | (optional `images: u8` flag, 0 or 1)       |                                             |
 //! | `Kubeconfig`     | –                                          | `KubeconfigData`, or `Error`                |
 //! | `Connect`        | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
 //! | `SyncImages`     | –                                          | `Done`, or `Error`                          |
@@ -42,7 +43,10 @@ pub enum K8sMsg {
         config_yaml: Option<String>,
     },
     Stop,
-    Reset,
+    Reset {
+        /// Also remove all images in containerd's `k8s.io` namespace.
+        images: bool,
+    },
     Kubeconfig,
     /// Dial an arbitrary IPv4/IPv6 address and TCP port inside the guest
     /// (used for direct Pod IP `10.42.x.x` and Service ClusterIP `10.43.x.x`
@@ -156,7 +160,14 @@ impl K8sMsg {
                 kind::START
             }
             K8sMsg::Stop => kind::STOP,
-            K8sMsg::Reset => kind::RESET,
+            K8sMsg::Reset { images } => {
+                // Omit payload when `images` is false so older guests still decode default resets;
+                // send `1` when true so older guests reject `--images` rather than silently keeping images.
+                if *images {
+                    b.push(1);
+                }
+                kind::RESET
+            }
             K8sMsg::Kubeconfig => kind::KUBECONFIG,
             K8sMsg::Connect { addr, port } => {
                 put_str(b, addr);
@@ -248,7 +259,13 @@ impl K8sMsg {
                 }
             }
             kind::STOP => K8sMsg::Stop,
-            kind::RESET => K8sMsg::Reset,
+            kind::RESET => K8sMsg::Reset {
+                images: if c.buf.is_empty() {
+                    false
+                } else {
+                    flag(&mut c, "k8s reset images")?
+                },
+            },
             kind::KUBECONFIG => K8sMsg::Kubeconfig,
             kind::CONNECT => K8sMsg::Connect {
                 addr: c.string()?,
@@ -1007,7 +1024,8 @@ mod tests {
                 config_yaml: Some("write-kubeconfig-mode: '0600'\n".into()),
             },
             K8sMsg::Stop,
-            K8sMsg::Reset,
+            K8sMsg::Reset { images: false },
+            K8sMsg::Reset { images: true },
             K8sMsg::Kubeconfig,
             K8sMsg::Connect {
                 addr: "10.43.0.1".into(),
@@ -1070,7 +1088,8 @@ mod tests {
                 config_yaml: Some("write-kubeconfig-mode: '0600'\n".into()),
             },
             K8sMsg::Stop,
-            K8sMsg::Reset,
+            K8sMsg::Reset { images: false },
+            K8sMsg::Reset { images: true },
             K8sMsg::Kubeconfig,
             K8sMsg::Connect {
                 addr: String::new(),
@@ -1147,5 +1166,36 @@ mod tests {
             K8sMsg::decode(kind::START, &bogus),
             Err(ProtoError::Truncated)
         ));
+    }
+
+    #[test]
+    fn reset_wire_compatibility_and_validation() {
+        // Default reset keeps an empty payload for backwards compatibility.
+        let default_frame = K8sMsg::Reset { images: false }.encode();
+        assert_eq!(&default_frame[HEADER..], &[]);
+        assert_eq!(
+            K8sMsg::decode(kind::RESET, &[]).unwrap(),
+            K8sMsg::Reset { images: false }
+        );
+        assert_eq!(
+            K8sMsg::decode(kind::RESET, &[0]).unwrap(),
+            K8sMsg::Reset { images: false }
+        );
+
+        let with_images = K8sMsg::Reset { images: true }.encode();
+        assert_eq!(&with_images[HEADER..], &[1]);
+        assert_eq!(
+            K8sMsg::decode(kind::RESET, &[1]).unwrap(),
+            K8sMsg::Reset { images: true }
+        );
+
+        assert_eq!(
+            K8sMsg::decode(kind::RESET, &[2]),
+            Err(ProtoError::InvalidValue("k8s reset images", 2))
+        );
+        assert_eq!(
+            K8sMsg::decode(kind::RESET, &[1, 0]),
+            Err(ProtoError::TrailingBytes(1))
+        );
     }
 }

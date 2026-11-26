@@ -1056,8 +1056,8 @@ impl Daemon {
                 self.k8s_stop(true)?;
                 Ok(Value::Null)
             }
-            Call::K8sReset => {
-                self.k8s_reset()?;
+            Call::K8sReset { images } => {
+                self.k8s_reset(*images)?;
                 Ok(Value::Null)
             }
             Call::K8sKubeconfig => {
@@ -1443,7 +1443,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn k8s_reset(self: &Arc<Self>) -> Result<(), RpcError> {
+    fn k8s_reset(self: &Arc<Self>, remove_images: bool) -> Result<(), RpcError> {
         let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
         let failed = |m: String| RpcError::new(api::FAILED, m);
         let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
@@ -1463,11 +1463,16 @@ impl Daemon {
             }
             let mut stream =
                 crate::k8s::connect(&self.home).map_err(|e| failed(format!("{e:#}")))?;
-            kat_proto::k8s::write(&mut stream, &kat_proto::k8s::K8sMsg::Reset)
-                .map_err(|e| failed(format!("{e:#}")))?;
+            kat_proto::k8s::write(
+                &mut stream,
+                &kat_proto::k8s::K8sMsg::Reset {
+                    images: remove_images,
+                },
+            )
+            .map_err(|e| failed(format!("{e:#}")))?;
             guest_reset_attempted = true;
-            let mut noop = |_: &str| {};
-            crate::k8s::read_answer(&mut stream, &mut noop)
+            let mut progress = |m: &str| dlog!("k8s reset: {m}");
+            crate::k8s::read_answer(&mut stream, &mut progress)
                 .map_err(|e| failed(format!("{e:#}")))?;
             Ok(())
         })();
@@ -2239,7 +2244,7 @@ mod tests {
             k.state = "running".into();
             k.kubeconfig = Some(kc.clone());
         }
-        let err = d.k8s_reset().unwrap_err();
+        let err = d.k8s_reset(false).unwrap_err();
         assert!(
             err.message.contains("not running"),
             "unexpected err: {}",
@@ -2259,14 +2264,14 @@ mod tests {
         let guest = thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
-            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset);
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
             kat_proto::k8s::write(
                 &mut conn,
                 &kat_proto::k8s::K8sMsg::Error("remove data failed".into()),
             )
             .unwrap();
         });
-        let err = d.k8s_reset().unwrap_err();
+        let err = d.k8s_reset(false).unwrap_err();
         assert!(
             err.message.contains("remove data failed"),
             "unexpected err: {}",
@@ -2360,6 +2365,35 @@ mod tests {
             assert_eq!(k.state, "stopped");
             assert!(k.error.is_none());
         }
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_forwards_images_flag_to_guest() {
+        let home = temp("k8s-reset-images");
+        let d = Daemon::new(home.clone());
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Progress("removing k8s.io images".into()),
+            )
+            .unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+        d.k8s_reset(true).unwrap();
+        guest.join().unwrap();
+        assert_eq!(d.k8s.lock().unwrap().state, "stopped");
 
         fs::remove_dir_all(&home).unwrap();
     }

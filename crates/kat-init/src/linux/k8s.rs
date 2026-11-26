@@ -68,6 +68,10 @@ pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const IMAGE_RM_BATCH_SIZE: usize = 64;
+const IMAGE_LS_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_RM_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_RM_SYNC_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_K8S_CONNS: usize = 256;
 
 /// Internal k3s/Kubernetes control-plane ports that must not be auto-forwarded
@@ -2008,7 +2012,7 @@ impl K8s {
                 .start_inner(&mut conn, &extra_args, config_yaml.as_deref())
                 .map(K8sMsg::StatusInfo),
             K8sMsg::Stop => self.stop_inner(Some(&mut conn)).map(|()| K8sMsg::Done),
-            K8sMsg::Reset => self.reset_inner(&mut conn).map(|()| K8sMsg::Done),
+            K8sMsg::Reset { images } => self.reset_inner(&mut conn, images).map(|()| K8sMsg::Done),
             K8sMsg::Kubeconfig => read_kubeconfig().map(K8sMsg::KubeconfigData),
             K8sMsg::Connect { addr, port } => {
                 self.connect(conn, &addr, port);
@@ -2687,7 +2691,7 @@ impl K8s {
         Ok(())
     }
 
-    fn reset_inner(&self, conn: &mut UnixStream) -> Result<(), String> {
+    fn reset_inner(&self, conn: &mut UnixStream, remove_images: bool) -> Result<(), String> {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
@@ -2703,7 +2707,10 @@ impl K8s {
         // Remove the managed config copy first: if that fails, nothing has
         // been destroyed yet and the reset error is accurate.
         sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
-        let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
+        let _ = k8s::write(
+            &mut *conn,
+            &K8sMsg::Progress("removing cluster data".into()),
+        );
         unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
         if Path::new(DATA_DIR).exists() {
             // Try btrfs subvolume delete first (instant if it is a subvolume),
@@ -2720,7 +2727,21 @@ impl K8s {
                 .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
         }
         let _ = fs::remove_file(KUBECONFIG);
-        log("k3s cluster data reset");
+        if remove_images {
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return Err("aborted: VM is shutting down".into());
+            }
+            let _ = k8s::write(
+                &mut *conn,
+                &K8sMsg::Progress("removing k8s.io images".into()),
+            );
+            clear_k8s_images(&self.reaper)?;
+        }
+        log(if remove_images {
+            "k3s cluster data and k8s.io images reset"
+        } else {
+            "k3s cluster data reset"
+        });
         Ok(())
     }
 
@@ -3109,10 +3130,9 @@ fn unmount_paths_under(prefixes: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Stop and remove Kubernetes tasks/containers in the shared containerd
-/// `k8s.io` namespace and tear down CNI interfaces, kube-proxy nftables rules,
-/// and kubelet/data-dir mounts without touching Docker's `moby` namespace.
-fn stop_k8s_workloads(reaper: &Reaper) {
+/// Stop and remove Kubernetes tasks and containers in containerd's `k8s.io`
+/// namespace without touching Docker's `moby` namespace.
+fn stop_k8s_containers(reaper: &Reaper) {
     let mut ls = Command::new("/usr/bin/ctr");
     ls.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io", "tasks", "ls", "-q"]);
     if let Ok((0, out, _)) = run_reaped_split(reaper, &mut ls, Duration::from_secs(10)) {
@@ -3194,6 +3214,13 @@ fn stop_k8s_workloads(reaper: &Reaper) {
             let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
         }
     }
+}
+
+/// Stop and remove Kubernetes tasks/containers in the shared containerd
+/// `k8s.io` namespace and tear down CNI interfaces, kube-proxy nftables rules,
+/// and kubelet/data-dir mounts without touching Docker's `moby` namespace.
+fn stop_k8s_workloads(reaper: &Reaper) {
+    stop_k8s_containers(reaper);
     for iface in ["cni0", "flannel.1"] {
         let mut del = Command::new("/sbin/ip");
         del.args(["link", "delete", iface]);
@@ -3627,7 +3654,7 @@ fn watch_docker_image_events(
     stop: &AtomicBool,
 ) -> io::Result<()> {
     watch_docker_image_events_with(socket_path, stop, || {
-        if let Err(e) = sync_moby_images(reaper) {
+        if let Err(e) = sync_moby_images_inner(reaper, Some(stop)) {
             log(&format!("background image sync: {e}"));
         }
     })
@@ -3674,7 +3701,7 @@ fn watch_docker_image_events_with(
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
                 continue;
@@ -3689,7 +3716,7 @@ fn watch_docker_image_events_with(
     // while this sync runs buffer as events on this stream.
     on_sync();
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Acquire) {
             return Ok(());
         }
         line.clear();
@@ -3781,7 +3808,14 @@ impl SyncLogState {
 }
 
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
+    sync_moby_images_inner(reaper, None)
+}
+
+fn sync_moby_images_inner(reaper: &Reaper, stop: Option<&AtomicBool>) -> Result<(), String> {
     let mut sync_log = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+        return Ok(());
+    }
     let mut failures: Vec<String> = Vec::new();
     let mut only_refs: Option<HashSet<String>> = None;
     let mut logged_unknown: Vec<String> = Vec::new();
@@ -3789,6 +3823,9 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     let mut completed_full_scan = false;
 
     for attempt in 0..=MAX_SYNC_RETRIES {
+        if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+            return Ok(());
+        }
         // Re-read the emulation state on every pass so a retry never acts on
         // a stale reading.
         let emulation = current_emulation_mode(&mut logged_unknown);
@@ -3828,6 +3865,9 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         let mut retry_refs: HashSet<String> = HashSet::new();
 
         for (name, img) in candidates {
+            if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+                return Ok(());
+            }
             // `moby-dangling@<digest>` is how Docker's containerd image store
             // keeps untagged images; never mirror or report those.
             if name.starts_with("sha256:")
@@ -4979,6 +5019,110 @@ impl CtrImage {
 struct CtrPlatformRow {
     digest: String,
     platforms: String,
+}
+
+/// Remove all images in containerd's `k8s.io` namespace without touching
+/// Docker's `moby` namespace. Deletes earlier batches asynchronously and runs
+/// the final delete with `--sync` so containerd's GC reclaims unreferenced
+/// `k8s.io` content blobs and snapshots before returning.
+fn clear_k8s_images(reaper: &Reaper) -> Result<(), String> {
+    wait_containerd()?;
+    let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return Err("aborted: VM is shutting down".into());
+    }
+    // Remove any lingering k8s.io tasks/containers (for example from an unclean
+    // shutdown when k3s was already in the "stopped" phase) so nothing pins snapshots.
+    stop_k8s_containers(reaper);
+    clear_k8s_images_with(
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        |args, timeout| run_ctr_k8s(reaper, args, timeout),
+    )
+}
+
+fn run_ctr_k8s(
+    reaper: &Reaper,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(i32, String, String), String> {
+    let mut cmd = Command::new("/usr/bin/ctr");
+    cmd.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io"]);
+    cmd.args(args);
+    run_reaped_split(reaper, &mut cmd, timeout)
+        .map_err(|e| format!("ctr {}: {e}", args.first().copied().unwrap_or_default()))
+}
+
+fn ctr_error_detail<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
+    let err = stderr.trim();
+    if err.is_empty() { stdout.trim() } else { err }
+}
+
+fn parse_ctr_image_refs(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn plan_image_rm_batches(refs: &[String], batch_size: usize) -> Vec<(bool, &[String])> {
+    let batch_size = batch_size.max(1);
+    let Some((last, rest)) = refs.split_last() else {
+        return Vec::new();
+    };
+    let mut plan = Vec::new();
+    for chunk in rest.chunks(batch_size) {
+        plan.push((false, chunk));
+    }
+    plan.push((true, std::slice::from_ref(last)));
+    plan
+}
+
+fn clear_k8s_images_with<S, R>(shutting_down: S, mut run: R) -> Result<(), String>
+where
+    S: Fn() -> bool,
+    R: FnMut(&[&str], Duration) -> Result<(i32, String, String), String>,
+{
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    let (code, stdout, stderr) = run(&["images", "ls", "-q"], IMAGE_LS_TIMEOUT)?;
+    if code != 0 {
+        return Err(format!(
+            "ctr images ls (k8s.io) failed: {}",
+            ctr_error_detail(&stdout, &stderr)
+        ));
+    }
+    let refs = parse_ctr_image_refs(&stdout);
+    if refs.is_empty() {
+        return Ok(());
+    }
+    for (sync, batch) in plan_image_rm_batches(&refs, IMAGE_RM_BATCH_SIZE) {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        let mut args: Vec<&str> = Vec::with_capacity(batch.len() + 4);
+        args.extend(["images", "rm"]);
+        if sync {
+            args.push("--sync");
+        }
+        args.push("--");
+        args.extend(batch.iter().map(String::as_str));
+        let timeout = if sync {
+            IMAGE_RM_SYNC_TIMEOUT
+        } else {
+            IMAGE_RM_BATCH_TIMEOUT
+        };
+        let (code, stdout, stderr) = run(&args, timeout)?;
+        if code != 0 {
+            return Err(format!(
+                "ctr images rm (k8s.io) failed: {}",
+                ctr_error_detail(&stdout, &stderr)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Returns `image_ref -> image` for all images in a containerd namespace.
@@ -8328,5 +8472,126 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         );
         assert!(check_running_settings_match(&running, &["--debug".to_string()], None).is_err());
         assert!(check_running_settings_match(&running, &[], Some(&json_b)).is_err());
+    }
+
+    #[test]
+    fn parse_ctr_image_refs_trims_and_skips_blank_lines() {
+        let out = "\n  docker.io/library/alpine:3.24  \n\nimport-2026-11-26@sha256:abcd\n  \n";
+        assert_eq!(
+            parse_ctr_image_refs(out),
+            vec![
+                "docker.io/library/alpine:3.24".to_string(),
+                "import-2026-11-26@sha256:abcd".to_string(),
+            ]
+        );
+        assert!(parse_ctr_image_refs(" \n\t\n").is_empty());
+    }
+
+    #[test]
+    fn plan_image_rm_batches_runs_sync_only_on_last_image() {
+        let empty: Vec<String> = Vec::new();
+        assert!(plan_image_rm_batches(&empty, 64).is_empty());
+
+        let one = vec!["img:0".to_string()];
+        assert_eq!(plan_image_rm_batches(&one, 64), vec![(true, &one[..])]);
+
+        let three: Vec<String> = (0..3).map(|i| format!("img:{i}")).collect();
+        assert_eq!(
+            plan_image_rm_batches(&three, 64),
+            vec![(false, &three[..2]), (true, &three[2..])]
+        );
+
+        let many: Vec<String> = (0..137).map(|i| format!("img:{i}")).collect();
+        let plan = plan_image_rm_batches(&many, 64);
+        assert_eq!(plan.len(), 4);
+        assert_eq!((plan[0].0, plan[0].1.len()), (false, 64));
+        assert_eq!((plan[1].0, plan[1].1.len()), (false, 64));
+        assert_eq!((plan[2].0, plan[2].1.len()), (false, 8));
+        assert_eq!((plan[3].0, plan[3].1), (true, &many[136..]));
+    }
+
+    #[test]
+    fn clear_k8s_images_with_handles_empty_batches_errors_and_shutdown() {
+        // Empty namespace: only `images ls -q` runs.
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        clear_k8s_images_with(
+            || false,
+            |args, _| {
+                calls.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok((0, String::new(), String::new()))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, vec![vec!["images", "ls", "-q"]]);
+
+        // Multiple images: earlier refs deleted without --sync, final ref with --sync, all after `--`.
+        calls.clear();
+        let mut timeouts = Vec::new();
+        clear_k8s_images_with(
+            || false,
+            |args, timeout| {
+                calls.push(args.iter().map(|s| (*s).to_string()).collect());
+                timeouts.push(timeout);
+                if args == ["images", "ls", "-q"] {
+                    Ok((
+                        0,
+                        "docker.io/library/busybox:latest\n-weird:tag\nrancher/mirrored-pause:3.6\n"
+                            .into(),
+                        String::new(),
+                    ))
+                } else {
+                    Ok((0, String::new(), String::new()))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                vec!["images", "ls", "-q"],
+                vec![
+                    "images",
+                    "rm",
+                    "--",
+                    "docker.io/library/busybox:latest",
+                    "-weird:tag",
+                ],
+                vec!["images", "rm", "--sync", "--", "rancher/mirrored-pause:3.6",],
+            ]
+        );
+        assert_eq!(
+            timeouts,
+            vec![
+                IMAGE_LS_TIMEOUT,
+                IMAGE_RM_BATCH_TIMEOUT,
+                IMAGE_RM_SYNC_TIMEOUT
+            ]
+        );
+
+        // Non-zero exit from `images ls` surfaces stderr detail.
+        let err = clear_k8s_images_with(
+            || false,
+            |_, _| Ok((1, String::new(), "dial unix failed\n".into())),
+        )
+        .unwrap_err();
+        assert!(err.contains("ctr images ls (k8s.io) failed: dial unix failed"));
+
+        // Non-zero exit from `images rm` stops and surfaces error.
+        let err = clear_k8s_images_with(
+            || false,
+            |args, _| {
+                if args == ["images", "ls", "-q"] {
+                    Ok((0, "a:1\nb:2\n".into(), String::new()))
+                } else {
+                    Ok((1, String::new(), "permission denied\n".into()))
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("ctr images rm (k8s.io) failed: permission denied"));
+
+        // Shutdown flag aborts before running `ctr`.
+        let err = clear_k8s_images_with(|| true, |_, _| panic!("should not run")).unwrap_err();
+        assert!(err.contains("VM is shutting down"));
     }
 }

@@ -153,9 +153,10 @@ final class AppModel {
         perform("kubernetes") { _ = try d.call("k8s.start", timeout: 300) }
     }
 
-    func k8sReset() {
+    func k8sReset(images: Bool = false) {
         let d = daemon
-        perform("kubernetes") { _ = try d.call("k8s.reset", timeout: 300) }
+        let params: [String: Any]? = images ? ["images": true] : nil
+        perform("kubernetes") { _ = try d.call("k8s.reset", params, timeout: 300) }
     }
 
     func k8sSyncImages() {
