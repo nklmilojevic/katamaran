@@ -56,6 +56,8 @@ pub const SOCKET_NAME: &str = "k8s.sock";
 pub const API_SOCKET_NAME: &str = "k8s-api.sock";
 pub const KUBECONFIG_NAME: &str = "kubeconfig.yaml";
 pub const PROXY_SOCKET_NAME: &str = "k8s-proxy.sock";
+pub const K3S_CONFIG_NAME: &str = "k3s-config.yaml";
+pub const MAX_K3S_CONFIG_BYTES: usize = 256 << 10;
 pub const DEFAULT_API_PORT: u16 = 6443;
 
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
@@ -82,6 +84,44 @@ pub fn proxy_socket_path(home: &Path) -> PathBuf {
 
 pub fn kubeconfig_path(home: &Path) -> PathBuf {
     home.join("run").join(KUBECONFIG_NAME)
+}
+
+pub fn k3s_config_path(home: &Path) -> PathBuf {
+    home.join(K3S_CONFIG_NAME)
+}
+
+/// Read `<home>/k3s-config.yaml` if present.
+pub fn read_k3s_config(home: &Path) -> anyhow::Result<Option<String>> {
+    let path = k3s_config_path(home);
+    let f = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    f.take((MAX_K3S_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() > MAX_K3S_CONFIG_BYTES {
+        bail!(
+            "{} exceeds maximum size of {MAX_K3S_CONFIG_BYTES} bytes",
+            path.display()
+        );
+    }
+    let yaml = String::from_utf8(bytes)
+        .with_context(|| format!("{} must be valid UTF-8", path.display()))?;
+    Ok(Some(yaml))
+}
+
+/// Build the guest `K8sMsg::Start` request from `config.toml` and optional `<home>/k3s-config.yaml`.
+pub fn build_start_msg(home: &Path) -> anyhow::Result<K8sMsg> {
+    let cfg = crate::config::Config::load(home)?;
+    let extra_args = cfg.k8s_server_extra_args();
+    let config_yaml = read_k3s_config(home)?;
+    Ok(K8sMsg::Start {
+        extra_args,
+        config_yaml,
+    })
 }
 
 pub fn cache_binary_path(home: &Path, version: &str) -> PathBuf {
@@ -1853,5 +1893,59 @@ users:
         assert!(resolve_symlink_target(&loop_a).is_err());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_start_msg_includes_config_flags_and_k3s_config_yaml() {
+        let home = std::env::temp_dir().join(format!(
+            "kat-k8s-start-msg-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+
+        // Empty defaults when neither config.toml nor k3s-config.yaml exist.
+        assert_eq!(
+            build_start_msg(&home).unwrap(),
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: None,
+            }
+        );
+
+        // Combines k8s_disable, k8s_args, and k3s-config.yaml.
+        let mut cfg = crate::config::Config::default();
+        let host = crate::config::Host {
+            cpus: 255,
+            memory_mib: 32768,
+        };
+        cfg.set("k8s_disable", "traefik,servicelb", &host).unwrap();
+        cfg.set("k8s_args", "--debug --node-label=env=dev", &host)
+            .unwrap();
+        cfg.save(&home).unwrap();
+        let yaml = "write-kubeconfig-mode: '0600'\n";
+        fs::write(k3s_config_path(&home), yaml).unwrap();
+
+        assert_eq!(
+            build_start_msg(&home).unwrap(),
+            K8sMsg::Start {
+                extra_args: vec![
+                    "--disable=traefik".into(),
+                    "--disable=servicelb".into(),
+                    "--debug".into(),
+                    "--node-label=env=dev".into(),
+                ],
+                config_yaml: Some(yaml.into()),
+            }
+        );
+
+        // Rejects invalid UTF-8 and oversized k3s-config.yaml.
+        fs::write(k3s_config_path(&home), [0xff, 0xfe]).unwrap();
+        assert!(build_start_msg(&home).is_err());
+
+        fs::write(k3s_config_path(&home), vec![b'a'; MAX_K3S_CONFIG_BYTES + 1]).unwrap();
+        assert!(build_start_msg(&home).is_err());
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

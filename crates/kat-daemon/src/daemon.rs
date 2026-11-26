@@ -1155,11 +1155,8 @@ impl Daemon {
             PathBuf,
         )> {
             crate::k8s::ensure_installed(&self.home, progress)?;
-            let info = match crate::k8s::request(
-                &self.home,
-                &kat_proto::k8s::K8sMsg::Start,
-                progress,
-            )? {
+            let start_msg = crate::k8s::build_start_msg(&self.home)?;
+            let info = match crate::k8s::request(&self.home, &start_msg, progress)? {
                 kat_proto::k8s::K8sMsg::StatusInfo(info) => info,
                 other => anyhow::bail!("unexpected k8s start reply {other:?}"),
             };

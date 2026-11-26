@@ -54,6 +54,7 @@ const SERVER_VERSION_STAMP: &str = ".katamaran-k3s-version";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
+const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
 const LOG_FILE: &str = "/var/log/k3s.log";
 const PROXY_DIR: &str = "/run/katamaran/k8s-proxy";
 const PROXY_SOCKET: &str = "/run/katamaran/k8s-proxy/proxy.sock";
@@ -1963,7 +1964,12 @@ impl K8s {
         let reply = match req {
             K8sMsg::Status => Ok(K8sMsg::StatusInfo(self.info())),
             K8sMsg::Install { version } => self.install(&mut conn, &version).map(|()| K8sMsg::Done),
-            K8sMsg::Start => self.start_inner(&mut conn).map(K8sMsg::StatusInfo),
+            K8sMsg::Start {
+                extra_args,
+                config_yaml,
+            } => self
+                .start_inner(&mut conn, &extra_args, config_yaml.as_deref())
+                .map(K8sMsg::StatusInfo),
             K8sMsg::Stop => self.stop_inner(Some(&mut conn)).map(|()| K8sMsg::Done),
             K8sMsg::Reset => self.reset_inner(&mut conn).map(|()| K8sMsg::Done),
             K8sMsg::Kubeconfig => read_kubeconfig().map(K8sMsg::KubeconfigData),
@@ -2119,7 +2125,12 @@ impl K8s {
         res
     }
 
-    fn start_inner(self: &Arc<Self>, conn: &mut UnixStream) -> Result<K8sInfo, String> {
+    fn start_inner(
+        self: &Arc<Self>,
+        conn: &mut UnixStream,
+        extra_args: &[String],
+        config_yaml: Option<&str>,
+    ) -> Result<K8sInfo, String> {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
@@ -2155,14 +2166,28 @@ impl K8s {
             &state_db_probe(),
             |cmd| self.run_sqlite_cmd(cmd),
         )?;
+        let server_args = build_k3s_server_args(extra_args)?;
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
+        sync_k3s_config(Path::new(K3S_CONFIG_PATH), config_yaml)?;
         self.activate_containerd_cri(conn)?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
+        }
+
+        if !extra_args.is_empty() || config_yaml.is_some() {
+            log(&format!(
+                "starting k3s with {} extra arg(s){}",
+                extra_args.len(),
+                if config_yaml.is_some() {
+                    " and /etc/rancher/k3s/config.yaml"
+                } else {
+                    ""
+                }
+            ));
         }
 
         let _ = k8s::write(&mut *conn, &K8sMsg::Progress("starting k3s server".into()));
@@ -2174,30 +2199,11 @@ impl K8s {
             .map_err(|e| format!("open {LOG_FILE}: {e}"))?;
 
         let mut cmd = Command::new(BIN);
-        cmd.args([
-            "server",
-            &format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
-            &format!("--data-dir={DATA_DIR}"),
-            &format!("--write-kubeconfig={KUBECONFIG}"),
-            "--write-kubeconfig-mode=0600",
-            "--node-name=katamaran",
-            "--flannel-backend=host-gw",
-            "--cluster-cidr=10.42.0.0/16",
-            "--service-cidr=10.43.0.0/16",
-            "--cluster-dns=10.43.0.10",
-            "--tls-san=127.0.0.1",
-            "--tls-san=localhost",
-            "--tls-san=katamaran",
-            "--tls-san=k8s.kat.local",
-            "--https-listen-port=6443",
-            "--kubelet-arg=fail-swap-on=false",
-            &format!("--kubelet-arg=root-dir={KUBELET_DIR}"),
-            "--kube-proxy-arg=proxy-mode=nftables",
-        ])
-        .env("PATH", PATH)
-        .stdin(Stdio::null())
-        .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log_file);
+        cmd.args(&server_args)
+            .env("PATH", PATH)
+            .stdin(Stdio::null())
+            .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log_file);
 
         let prev_data_version = match read_marker_file(Path::new(DATA_VERSION_FILE))? {
             MarkerFile::Present(v) => Some(v),
@@ -2644,6 +2650,7 @@ impl K8s {
                 .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
         }
         let _ = fs::remove_file(KUBECONFIG);
+        let _ = fs::remove_file(K3S_CONFIG_PATH);
         log("k3s cluster data reset");
         Ok(())
     }
@@ -2671,6 +2678,57 @@ impl K8s {
         let _ = upstream.set_nodelay(true);
         relay_guest_stream(conn, upstream);
     }
+}
+
+fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
+    let mut args = vec![
+        "server".to_string(),
+        format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
+        format!("--data-dir={DATA_DIR}"),
+        format!("--write-kubeconfig={KUBECONFIG}"),
+        "--write-kubeconfig-mode=0600".to_string(),
+        "--node-name=katamaran".to_string(),
+        "--flannel-backend=host-gw".to_string(),
+        "--cluster-cidr=10.42.0.0/16".to_string(),
+        "--service-cidr=10.43.0.0/16".to_string(),
+        "--cluster-dns=10.43.0.10".to_string(),
+        "--tls-san=127.0.0.1".to_string(),
+        "--tls-san=localhost".to_string(),
+        "--tls-san=katamaran".to_string(),
+        "--tls-san=k8s.kat.local".to_string(),
+        "--https-listen-port=6443".to_string(),
+        "--kubelet-arg=fail-swap-on=false".to_string(),
+        format!("--kubelet-arg=root-dir={KUBELET_DIR}"),
+        "--kube-proxy-arg=proxy-mode=nftables".to_string(),
+    ];
+    for arg in extra_args {
+        if arg.is_empty() {
+            return Err("k8s_args must not contain empty arguments".into());
+        }
+        if arg.contains('\0') {
+            return Err("k8s_args must not contain NUL bytes".into());
+        }
+        args.push(arg.clone());
+    }
+    Ok(args)
+}
+
+fn sync_k3s_config(path: &Path, config_yaml: Option<&str>) -> Result<(), String> {
+    match config_yaml {
+        Some(yaml) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+            write_atomic(path, yaml.as_bytes())?;
+        }
+        None => match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        },
+    }
+    Ok(())
 }
 
 trait GuestStream: Read + Write + Send + Sized + 'static {
@@ -8046,5 +8104,44 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         });
         assert_eq!(detected.as_deref(), Some(expected.as_str()));
         assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+    }
+
+    #[test]
+    fn build_k3s_server_args_appends_extra_args_and_rejects_invalid() {
+        let base = build_k3s_server_args(&[]).unwrap();
+        assert_eq!(base[0], "server");
+        assert!(base.iter().any(|a| a == "--https-listen-port=6443"));
+
+        let extra = vec!["--disable=traefik".to_string(), "--debug".to_string()];
+        let with_extra = build_k3s_server_args(&extra).unwrap();
+        assert_eq!(with_extra.len(), base.len() + 2);
+        assert_eq!(&with_extra[base.len()..], extra.as_slice());
+
+        assert!(build_k3s_server_args(&[String::new()]).is_err());
+        assert!(build_k3s_server_args(&["--foo=\0bar".to_string()]).is_err());
+    }
+
+    #[test]
+    fn sync_k3s_config_writes_updates_and_removes() {
+        let base = temp_dir("k3s-config");
+        let cfg = base.join("etc/rancher/k3s/config.yaml");
+
+        // Removing when absent is a no-op.
+        sync_k3s_config(&cfg, None).unwrap();
+        assert!(!cfg.exists());
+
+        // Writing creates parent dirs and sets 0600 permissions.
+        sync_k3s_config(&cfg, Some("disable:\n  - traefik\n")).unwrap();
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "disable:\n  - traefik\n");
+        assert_eq!(
+            fs::symlink_metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Passing None removes a previously synced file.
+        sync_k3s_config(&cfg, None).unwrap();
+        assert!(!cfg.exists());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

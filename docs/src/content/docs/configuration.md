@@ -19,7 +19,7 @@ amd64 = "auto"
 kubernetes = false
 ```
 
-Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately; `k8s_version` applies at the next Kubernetes start).
+Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately; changes to `k8s_version`, `k8s_disable`, and `k8s_args` apply on the next Kubernetes start).
 
 Some settings, such as `nofile`, are not in the app's Settings window. Change them with the CLI or by editing `config.toml`:
 
@@ -44,6 +44,8 @@ kat restart
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
 | `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
 | `k8s_version` | string (optional) | Pinned build (unset) | A supported k3s release tag, `v1.31` or newer (for example `"v1.32.5+k3s1"`). To reset to the pinned build, remove the key from `config.toml` or run `kat config set k8s_version=default` (or `kat config set k8s_version=`). Applies at the next Kubernetes start. Before rolling back to an older katamaran release without `k8s_version`: (1) if you ran a custom k3s release, stop Kubernetes and disable auto-start (`kat k8s stop`, setting `kubernetes = false`) so the older daemon does not automatically start its pinned k3s build against the retained datastore; (2) clear the key with `kat config set k8s_version=default`, or, if you already rolled back, remove the `k8s_version` line (and set `kubernetes = false` if you have a custom k3s datastore) in `config.toml`, because older releases reject unknown keys and cannot start the VM until `k8s_version` is removed; (3) compare the retained datastore's k3s version against the destination katamaran release's pinned k3s before enabling Kubernetes again: use a supported sequential minor-upgrade path, restore a matching backup, or run `kat k8s reset` rather than skipping minors or downgrading in place. When upgrading an existing cluster from an older release (or after resetting and recreating a cluster on an older release), katamaran accepts it automatically when `server/db/state.db` shows it was last run by `v1.37.2+k3s1` (the only build older releases pinned); otherwise, follow [Migrating an unmarked cluster from an older katamaran release](/kubernetes/#migrating-an-unmarked-cluster-from-an-older-katamaran-release). See [Choose the k3s version](/kubernetes/#choose-the-k3s-version) for sequential minor upgrades, backup/restore, and reset options. |
+| `k8s_disable` | string array | `[]` | Bundled `k3s` components to disable (for example `["traefik"]`, or `kat config set k8s_disable=traefik,servicelb`). Passed as `--disable=<name>` on `k3s` start. |
+| `k8s_args` | string array | `[]` | Extra CLI arguments appended to `k3s server` (in `kat config set`, space-separated with shell-style quoting; empty string clears). Applies on `k3s` start. |
 | `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) set at guest boot, like `LimitNOFILE` in Docker Desktop. containerd, dockerd, and containers and pods inherit it unless they set their own (for example `docker run --ulimit nofile=...`). |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
@@ -55,6 +57,7 @@ All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
 | Path | Contents |
 |---|---|
 | `config.toml` | Saved configuration |
+| `k3s-config.yaml` | Optional user `k3s` configuration file synced to `/etc/rancher/k3s/config.yaml` when Kubernetes starts |
 | `data/data.img` | Sparse btrfs disk image for Docker, containerd, and LXC machines |
 | `run/docker.sock` | Docker Engine Unix socket relayed from the guest |
 | `run/daemon.sock` | Control socket used by the CLI and macOS app |

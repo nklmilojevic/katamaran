@@ -56,7 +56,7 @@ pub enum ConfigCmd {
     Get { key: Option<String> },
     /// Change settings: `set cpus 2`, or `set cpus=2 memory=8G mount=off`.
     Set {
-        #[arg(required = true, num_args = 1..)]
+        #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
         pairs: Vec<String>,
     },
 }
@@ -405,10 +405,17 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
         }
         ConfigCmd::Set { pairs } => {
             let values = parse_pairs(&pairs)?;
-            let restart = match daemon {
+            let k8s_opts_changed = (values.contains_key("k8s_disable")
+                || values.contains_key("k8s_args"))
+                && !values.contains_key("kubernetes");
+            let (restart, k8s_restart) = match daemon {
                 Some(mut c) => {
                     let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
-                    v.restart_required
+                    let k8s_active = k8s_opts_changed
+                        && c.status().ok().is_some_and(|s| {
+                            matches!(s.k8s.state.as_str(), "running" | "starting")
+                        });
+                    (v.restart_required, k8s_active)
                 }
                 None => {
                     let home = crate::state_dir()?;
@@ -421,12 +428,17 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
                     if values.contains_key("launch_at_login") {
                         crate::setup::set_run_at_load(cfg.launch_at_login, None)?;
                     }
-                    false
+                    (false, false)
                 }
             };
             println!("saved");
             if restart {
                 println!("`katamaran restart` applies it to the running VM");
+            }
+            if k8s_restart {
+                println!(
+                    "`kat k8s stop && kat k8s start` applies Kubernetes changes to the running cluster"
+                );
             }
         }
     }
@@ -581,5 +593,44 @@ mod tests {
             err.to_string().contains("kat setup"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn config_set_cli_accepts_hyphenated_k8s_args() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: ConfigCmd,
+        }
+
+        let w =
+            Wrapper::try_parse_from(["config", "set", "k8s_args", "--disable=traefik"]).unwrap();
+        let ConfigCmd::Set { pairs } = w.cmd else {
+            panic!("expected ConfigCmd::Set");
+        };
+        let map = parse_pairs(&pairs).unwrap();
+        assert_eq!(
+            map.get("k8s_args").map(String::as_str),
+            Some("--disable=traefik")
+        );
+
+        let w2 = Wrapper::try_parse_from([
+            "config",
+            "set",
+            "k8s_args=--disable=traefik --debug",
+            "k8s_disable=traefik",
+        ])
+        .unwrap();
+        let ConfigCmd::Set { pairs } = w2.cmd else {
+            panic!("expected ConfigCmd::Set");
+        };
+        let map2 = parse_pairs(&pairs).unwrap();
+        assert_eq!(
+            map2.get("k8s_args").map(String::as_str),
+            Some("--disable=traefik --debug")
+        );
+        assert_eq!(map2.get("k8s_disable").map(String::as_str), Some("traefik"));
     }
 }

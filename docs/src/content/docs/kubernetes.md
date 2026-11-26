@@ -218,6 +218,55 @@ If `--local` is omitted, katamaran binds the same port number on `127.0.0.1`.
 - **Cluster data**: `k3s` stores its state and `local-path` persistent volumes under `/var/lib/katamaran/k3s/data` on the VM's btrfs `data.img` disk (as a btrfs subvolume when supported, making `kat k8s reset` fast).
 - **Host directories**: Because katamaran mounts `/Users` into the VM at the same path, Kubernetes `hostPath` volumes pointing to directories under `/Users` access your macOS files directly.
 
+## Customize `k3s` server flags and config
+
+You can disable bundled `k3s` components (such as Traefik when installing your own ingress controller), pass extra `k3s server` flags, or supply a `k3s` YAML config file:
+
+### Disable bundled components (`k8s_disable`)
+
+```sh
+kat config set k8s_disable=traefik
+# Disable multiple components:
+kat config set k8s_disable=traefik,servicelb
+# Re-enable all bundled components:
+kat config set k8s_disable=""
+```
+
+Each entry is passed to `k3s server` as `--disable=<name>` and stored in `~/.katamaran/config.toml` as `k8s_disable = ["traefik"]`.
+
+### Pass extra `k3s server` flags (`k8s_args`)
+
+Set `k8s_args` in `~/.katamaran/config.toml`:
+
+```toml
+k8s_args = [
+  "--disable=traefik",
+  "--kube-apiserver-arg=feature-gates=Foo=true",
+]
+```
+
+Or via `kat config set` (space-separated, supporting single/double quotes):
+
+```sh
+kat config set k8s_args="--kube-apiserver-arg=audit-log-path=- --debug"
+kat config set k8s_args=""
+```
+
+### Use a `k3s` config file (`~/.katamaran/k3s-config.yaml`)
+
+If `~/.katamaran/k3s-config.yaml` (or `$KATAMARAN_HOME/k3s-config.yaml`) exists on your Mac, katamaran copies it to `/etc/rancher/k3s/config.yaml` inside the guest before starting `k3s server` (and removes the guest copy if you later delete the host file):
+
+```yaml
+disable:
+  - traefik
+kube-apiserver-arg:
+  - "service-node-port-range=30000-32767"
+```
+
+Following standard `k3s` precedence, CLI flags (`k8s_disable`, `k8s_args`, and katamaran's defaults) take precedence over keys in `config.yaml`; use `k3s`'s `+` suffix (such as `kubelet-arg+:`) in `k3s-config.yaml` to append to list flags katamaran already passes.
+
+Changes to `k8s_disable`, `k8s_args`, or `k3s-config.yaml` apply the next time Kubernetes starts (no VM restart is needed). If the cluster is already running, run `kat k8s stop && kat k8s start`, or `kat k8s reset && kat k8s start` if you are disabling a component like Traefik whose CRDs were already installed.
+
 ## Cluster defaults
 
 | Setting | Value |

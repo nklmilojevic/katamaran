@@ -66,15 +66,16 @@ kat k8s mark-version <version>            # Record verified k3s tag for an unmar
 
 ## Configuration
 
-Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`), except `launch_at_login` and `kubernetes`, which apply immediately.
+Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`), except `launch_at_login` and `kubernetes`, which apply immediately, and `k8s_version` / `k8s_disable` / `k8s_args` (plus optional `~/.katamaran/k3s-config.yaml`), which apply when Kubernetes starts.
 
 ```sh
 kat config get
 kat config set cpus=8 memory=12G pause_on_sleep=on
+kat config set k8s_disable=traefik
 kat restart
 ```
 
-Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `nofile` (open-files limit for containers, default `1048576`).
+Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `k8s_disable`, `k8s_args`, `nofile` (open-files limit for containers, default `1048576`).
 
 ## Files in Finder
 

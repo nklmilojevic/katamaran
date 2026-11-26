@@ -48,6 +48,12 @@ pub struct Config {
     /// this katamaran release pins ([`crate::k8s::K3S_VERSION`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub k8s_version: Option<String>,
+    /// Bundled k3s components to disable (for example `["traefik"]`), passed as `--disable=<name>`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_disable: Vec<String>,
+    /// Extra arguments appended to `k3s server`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_args: Vec<String>,
 }
 
 impl Default for Config {
@@ -65,12 +71,14 @@ impl Default for Config {
             kubernetes: false,
             nofile: DEFAULT_NOFILE,
             k8s_version: None,
+            k8s_disable: Vec::new(),
+            k8s_args: Vec::new(),
         }
     }
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 11] = [
+pub const KEYS: [&str; 13] = [
     "cpus",
     "memory_mib",
     "mount",
@@ -82,6 +90,8 @@ pub const KEYS: [&str; 11] = [
     "kubernetes",
     "nofile",
     "k8s_version",
+    "k8s_disable",
+    "k8s_args",
 ];
 
 /// What Docker Desktop, OrbStack and Colima give containers.
@@ -94,6 +104,10 @@ pub const MAX_NOFILE: u32 = 1 << 30;
 fn is_default_nofile(n: &u32) -> bool {
     *n == DEFAULT_NOFILE
 }
+
+/// Upper bound on the total size of extra k3s server arguments so they stay well
+/// within the host-guest protocol frame limit.
+pub const MAX_K8S_ARGS_BYTES: usize = 64 << 10;
 
 /// The smallest guest that still runs dockerd comfortably.
 pub const MIN_MEMORY_MIB: u32 = 1024;
@@ -183,6 +197,8 @@ impl Config {
             "kubernetes" => self.kubernetes.to_string(),
             "nofile" => self.nofile.to_string(),
             "k8s_version" => self.k8s_version.clone().unwrap_or_default(),
+            "k8s_disable" => self.k8s_disable.join(","),
+            "k8s_args" => format_k8s_args(&self.k8s_args),
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         })
     }
@@ -221,6 +237,8 @@ impl Config {
                     v => Some(v.to_string()),
                 }
             }
+            "k8s_disable" => next.k8s_disable = parse_k8s_disable(value)?,
+            "k8s_args" => next.k8s_args = parse_k8s_args(value)?,
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
@@ -228,14 +246,26 @@ impl Config {
         Ok(())
     }
 
-    /// Whether a VM started with `self` has to restart to use `saved`. All
-    /// but `launch_at_login`, `kubernetes` and `k8s_version` (read at each
-    /// Kubernetes start) are read at VM start.
+    /// Extra `k3s server` flags derived from `k8s_disable` and `k8s_args`.
+    pub fn k8s_server_extra_args(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.k8s_disable.len() + self.k8s_args.len());
+        for component in &self.k8s_disable {
+            out.push(format!("--disable={component}"));
+        }
+        out.extend(self.k8s_args.iter().cloned());
+        out
+    }
+
+    /// Whether a VM started with `self` has to restart to use `saved`.
+    /// `launch_at_login` applies to launchd directly, and Kubernetes settings
+    /// (`kubernetes`, `k8s_version`, `k8s_disable`, `k8s_args`) apply when k3s starts.
     pub fn needs_restart_for(&self, saved: &Config) -> bool {
         let applied = Config {
             launch_at_login: saved.launch_at_login,
             kubernetes: saved.kubernetes,
             k8s_version: saved.k8s_version.clone(),
+            k8s_disable: saved.k8s_disable.clone(),
+            k8s_args: saved.k8s_args.clone(),
             ..self.clone()
         };
         applied != *saved
@@ -259,6 +289,23 @@ impl Config {
         }
         if let Some(v) = &self.k8s_version {
             validate_k8s_version(v)?;
+        }
+        let mut total_k8s_bytes = 0usize;
+        for component in &self.k8s_disable {
+            validate_k8s_disable_item(component)?;
+            total_k8s_bytes = total_k8s_bytes.saturating_add("--disable=".len() + component.len());
+        }
+        for arg in &self.k8s_args {
+            if arg.is_empty() {
+                bail!("k8s_args must not contain empty arguments");
+            }
+            if arg.contains('\0') {
+                bail!("k8s_args must not contain NUL bytes");
+            }
+            total_k8s_bytes = total_k8s_bytes.saturating_add(arg.len());
+        }
+        if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
+            bail!("k8s_disable and k8s_args exceed maximum size of {MAX_K8S_ARGS_BYTES} bytes");
         }
         Ok(())
     }
@@ -325,6 +372,133 @@ pub(crate) fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
         bail!("k8s_version must be v1.{MIN_K8S_MINOR} or newer, got {v}");
     }
     Ok(())
+}
+
+fn validate_k8s_disable_item(item: &str) -> anyhow::Result<()> {
+    if item.is_empty() {
+        bail!("k8s_disable must not contain empty component names");
+    }
+    if item.starts_with('-') {
+        bail!(
+            "k8s_disable entry {item:?} must be a component name (for example \"traefik\"), not a flag"
+        );
+    }
+    if !item
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!(
+            "k8s_disable entry {item:?} contains invalid characters; expected letters, digits, '-' or '_'"
+        );
+    }
+    Ok(())
+}
+
+/// Parse a comma-separated list of k3s component names (empty clears the list).
+fn parse_k8s_disable(v: &str) -> anyhow::Result<Vec<String>> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for raw in v.split(',') {
+        let item = raw.trim();
+        validate_k8s_disable_item(item)?;
+        if !out.iter().any(|existing| existing == item) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Split shell-style whitespace-separated arguments (supporting single quotes,
+/// double quotes, and backslash escapes). An empty string clears the list.
+fn parse_k8s_args(v: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = v.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            '\'' => {
+                in_token = true;
+                let mut closed = false;
+                for sc in chars.by_ref() {
+                    if sc == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    cur.push(sc);
+                }
+                if !closed {
+                    bail!("k8s_args: unterminated single quote");
+                }
+            }
+            '"' => {
+                in_token = true;
+                let mut closed = false;
+                while let Some(dc) = chars.next() {
+                    if dc == '"' {
+                        closed = true;
+                        break;
+                    }
+                    if dc == '\\' {
+                        match chars.peek().copied() {
+                            Some(esc @ ('\\' | '"')) => {
+                                chars.next();
+                                cur.push(esc);
+                            }
+                            Some(_) => cur.push('\\'),
+                            None => bail!("k8s_args: unterminated double quote"),
+                        }
+                    } else {
+                        cur.push(dc);
+                    }
+                }
+                if !closed {
+                    bail!("k8s_args: unterminated double quote");
+                }
+            }
+            '\\' => {
+                in_token = true;
+                let Some(esc) = chars.next() else {
+                    bail!("k8s_args: trailing backslash");
+                };
+                cur.push(esc);
+            }
+            other => {
+                in_token = true;
+                cur.push(other);
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+fn format_k8s_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if !arg.is_empty()
+                && !arg
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Accepts `4096`, `4096M`, `4096MiB`, `4G` and `4GiB`.
@@ -625,5 +799,85 @@ mod tests {
         let h = Host::current();
         assert!(h.cpus >= 1);
         assert!(h.memory_mib >= 1024);
+    }
+
+    #[test]
+    fn k8s_disable_and_args_round_trip_and_do_not_require_vm_restart() {
+        let mut cfg = Config::default();
+        assert!(cfg.k8s_disable.is_empty());
+        assert!(cfg.k8s_args.is_empty());
+        assert_eq!(cfg.get("k8s_disable").unwrap(), "");
+        assert_eq!(cfg.get("k8s_args").unwrap(), "");
+
+        // Empty lists are omitted from serialized config.toml.
+        let default_toml = toml::to_string(&cfg).unwrap();
+        assert!(!default_toml.contains("k8s_disable"), "{default_toml}");
+        assert!(!default_toml.contains("k8s_args"), "{default_toml}");
+
+        cfg.set("k8s_disable", "traefik, servicelb, traefik", &HOST)
+            .unwrap();
+        assert_eq!(cfg.k8s_disable, vec!["traefik", "servicelb"]);
+        assert_eq!(cfg.get("k8s_disable").unwrap(), "traefik,servicelb");
+
+        cfg.set(
+            "k8s_args",
+            "--kube-apiserver-arg=feature-gates=Foo=true --node-label='env=my dev' --note=\"a'b\"",
+            &HOST,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.k8s_args,
+            vec![
+                "--kube-apiserver-arg=feature-gates=Foo=true",
+                "--node-label=env=my dev",
+                "--note=a'b",
+            ]
+        );
+        assert_eq!(
+            cfg.k8s_server_extra_args(),
+            vec![
+                "--disable=traefik",
+                "--disable=servicelb",
+                "--kube-apiserver-arg=feature-gates=Foo=true",
+                "--node-label=env=my dev",
+                "--note=a'b",
+            ]
+        );
+
+        // Display format round-trips through set().
+        let formatted = cfg.get("k8s_args").unwrap();
+        let mut reparsed = Config::default();
+        reparsed.set("k8s_args", &formatted, &HOST).unwrap();
+        assert_eq!(reparsed.k8s_args, cfg.k8s_args);
+
+        // TOML round-trips cleanly.
+        let toml_text = toml::to_string(&cfg).unwrap();
+        assert!(toml_text.contains("k8s_disable = ["), "{toml_text}");
+        assert!(toml_text.contains("k8s_args = ["), "{toml_text}");
+        assert_eq!(Config::parse(&toml_text).unwrap(), cfg);
+
+        // Changing k8s_disable or k8s_args does not require restarting the VM.
+        assert!(!Config::default().needs_restart_for(&cfg));
+
+        // Setting empty strings clears both lists.
+        cfg.set("k8s_disable", "", &HOST).unwrap();
+        cfg.set("k8s_args", "", &HOST).unwrap();
+        assert!(cfg.k8s_disable.is_empty());
+        assert!(cfg.k8s_args.is_empty());
+    }
+
+    #[test]
+    fn k8s_disable_and_args_reject_invalid_values() {
+        let mut cfg = Config::default();
+        assert!(cfg.set("k8s_disable", "--traefik", &HOST).is_err());
+        assert!(cfg.set("k8s_disable", "traefik,,servicelb", &HOST).is_err());
+        assert!(cfg.set("k8s_disable", "traefik servicelb", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "--foo='unterminated", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "--foo=\"unterminated", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "--foo\\", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "''", &HOST).is_err());
+        assert!(Config::parse("k8s_args = [\"\"]\n").is_err());
+        assert!(Config::parse("k8s_disable = [\"--traefik\"]\n").is_err());
+        assert_eq!(cfg, Config::default());
     }
 }

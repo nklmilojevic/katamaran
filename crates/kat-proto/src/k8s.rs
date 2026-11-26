@@ -7,7 +7,7 @@
 //! |------------------|--------------------------------------------|---------------------------------------------|
 //! | `Status`         | –                                          | `StatusInfo`, or `Error`                    |
 //! | `Install`        | the `k3s` binary as `Data`..., `DataEnd`   | `Progress`…, then `Done` / `Error`          |
-//! | `Start`          | –                                          | `Progress`…, then `StatusInfo` / `Error`    |
+//! | `Start`          | optional `extra_args`, `config_yaml`       | `Progress`…, then `StatusInfo` / `Error`    |
 //! | `Stop`           | –                                          | `Progress`…, then `Done` / `Error`          |
 //! | `Reset`          | –                                          | `Progress`…, then `Done` / `Error`          |
 //! | `Kubeconfig`     | –                                          | `KubeconfigData`, or `Error`                |
@@ -29,7 +29,12 @@ pub enum K8sMsg {
     Install {
         version: String,
     },
-    Start,
+    Start {
+        /// Extra arguments appended to `k3s server`.
+        extra_args: Vec<String>,
+        /// Optional contents of `/etc/rancher/k3s/config.yaml`.
+        config_yaml: Option<String>,
+    },
     Stop,
     Reset,
     Kubeconfig,
@@ -108,7 +113,25 @@ impl K8sMsg {
                 put_str(b, version);
                 kind::INSTALL
             }
-            K8sMsg::Start => kind::START,
+            K8sMsg::Start {
+                extra_args,
+                config_yaml,
+            } => {
+                if !extra_args.is_empty() || config_yaml.is_some() {
+                    put_u32(b, extra_args.len() as u32);
+                    for arg in extra_args {
+                        put_str(b, arg);
+                    }
+                    match config_yaml {
+                        Some(yaml) => {
+                            b.push(1);
+                            put_str(b, yaml);
+                        }
+                        None => b.push(0),
+                    }
+                }
+                kind::START
+            }
             K8sMsg::Stop => kind::STOP,
             K8sMsg::Reset => kind::RESET,
             K8sMsg::Kubeconfig => kind::KUBECONFIG,
@@ -170,7 +193,32 @@ impl K8sMsg {
             kind::INSTALL => K8sMsg::Install {
                 version: c.string()?,
             },
-            kind::START => K8sMsg::Start,
+            kind::START => {
+                if c.buf.is_empty() {
+                    K8sMsg::Start {
+                        extra_args: Vec::new(),
+                        config_yaml: None,
+                    }
+                } else {
+                    let count = c.u32()? as usize;
+                    if count > c.buf.len() / 4 {
+                        return Err(ProtoError::Truncated);
+                    }
+                    let mut extra_args = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        extra_args.push(c.string()?);
+                    }
+                    let config_yaml = if flag(&mut c, "k8s has_config_yaml")? {
+                        Some(c.string()?)
+                    } else {
+                        None
+                    };
+                    K8sMsg::Start {
+                        extra_args,
+                        config_yaml,
+                    }
+                }
+            }
             kind::STOP => K8sMsg::Stop,
             kind::RESET => K8sMsg::Reset,
             kind::KUBECONFIG => K8sMsg::Kubeconfig,
@@ -245,7 +293,22 @@ mod tests {
             K8sMsg::Install {
                 version: "v1.37.2+k3s1".into(),
             },
-            K8sMsg::Start,
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: None,
+            },
+            K8sMsg::Start {
+                extra_args: vec!["--disable=traefik".into(), "--debug".into()],
+                config_yaml: None,
+            },
+            K8sMsg::Start {
+                extra_args: vec!["--disable=traefik".into()],
+                config_yaml: Some("disable:\n  - servicelb\n".into()),
+            },
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: Some("write-kubeconfig-mode: '0600'\n".into()),
+            },
             K8sMsg::Stop,
             K8sMsg::Reset,
             K8sMsg::Kubeconfig,
@@ -291,7 +354,22 @@ mod tests {
             K8sMsg::Install {
                 version: String::new(),
             },
-            K8sMsg::Start,
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: None,
+            },
+            K8sMsg::Start {
+                extra_args: vec!["--disable=traefik".into(), "--debug".into()],
+                config_yaml: None,
+            },
+            K8sMsg::Start {
+                extra_args: vec!["--disable=traefik".into()],
+                config_yaml: Some("disable:\n  - servicelb\n".into()),
+            },
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: Some("write-kubeconfig-mode: '0600'\n".into()),
+            },
             K8sMsg::Stop,
             K8sMsg::Reset,
             K8sMsg::Kubeconfig,
@@ -330,5 +408,28 @@ mod tests {
         let err = write(&mut out, &K8sMsg::Error("e".repeat(MAX_FRAME))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn empty_start_keeps_minimal_wire_format_and_rejects_bogus_count() {
+        let empty = K8sMsg::Start {
+            extra_args: vec![],
+            config_yaml: None,
+        };
+        let frame = empty.encode();
+        assert_eq!(frame.len(), HEADER);
+        assert_eq!(u32::from_le_bytes(frame[0..4].try_into().unwrap()), 2);
+        assert_eq!(
+            u16::from_le_bytes(frame[4..6].try_into().unwrap()),
+            kind::START
+        );
+        assert_eq!(read(frame.as_slice()).unwrap(), Some(empty));
+
+        // Corrupt count that claims millions of args in a 4-byte payload.
+        let bogus = u32::MAX.to_le_bytes();
+        assert!(matches!(
+            K8sMsg::decode(kind::START, &bogus),
+            Err(ProtoError::Truncated)
+        ));
     }
 }

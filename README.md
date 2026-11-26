@@ -196,6 +196,8 @@ Settings live in `~/.katamaran/config.toml` and take effect at the next VM start
 | `pause_on_sleep` | `false` | Freeze vCPUs while the Mac sleeps |
 | `kubernetes` | `false` | Enable the optional single-node Kubernetes (`k3s`) cluster |
 | `k8s_version` | Pinned build | k3s release to run, e.g. `v1.32.5+k3s1` (applies at the next Kubernetes start) |
+| `k8s_disable` | `[]` | Bundled `k3s` components to disable (for example `k8s_disable=traefik`) |
+| `k8s_args` | `[]` | Extra arguments appended to `k3s server` (or place a `k3s` config at `~/.katamaran/k3s-config.yaml`) |
 | `nofile` | `1048576` | Open-files limit (`ulimit -n`) set at guest boot; containerd, dockerd, and workloads inherit it unless they set their own |
 
 ### Browse Linux files in Finder
