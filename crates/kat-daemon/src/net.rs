@@ -336,6 +336,12 @@ pub trait ForwardApi {
             Err(e) => Err(e),
         }
     }
+    /// Whether a failed `expose` may still own upstream state (for example a
+    /// gvproxy Unix listener whose rollback failed) that must be cleaned up via
+    /// [`Self::unexpose`] when the guest removes the port.
+    fn has_pending_cleanup(&self, _proto: PortProto, _port: u16) -> bool {
+        false
+    }
     /// The Mac addresses `port` is actually listening on (or configured to
     /// listen on when not yet active).
     fn port_addrs(&self, _proto: PortProto, _port: u16) -> Vec<Ipv4Addr> {
@@ -450,7 +456,7 @@ impl AddressesApi {
             listeners: crate::autofwd::AutoForwards::with_limit(
                 crate::autofwd::Upstream::PerPort(sockets.to_path_buf()),
                 addrs,
-                crate::autofwd::ConnLimit::PerPort(crate::autofwd::MAX_CONNS),
+                crate::autofwd::published_conn_limit(),
             ),
             upstream: BTreeMap::new(),
         }
@@ -604,6 +610,10 @@ impl ForwardApi for AddressesApi {
         self.expose(proto, port)
     }
 
+    fn has_pending_cleanup(&self, proto: PortProto, port: u16) -> bool {
+        proto == PortProto::Tcp && self.upstream.contains_key(&port)
+    }
+
     fn port_addrs(&self, proto: PortProto, port: u16) -> Vec<Ipv4Addr> {
         if proto != PortProto::Tcp {
             return vec![Ipv4Addr::LOCALHOST];
@@ -688,6 +698,9 @@ pub struct Forwards<A: ForwardApi> {
     /// Active ports whose last `unexpose` failed ambiguously; a re-add must
     /// verify or recreate the upstream before treating the port as live.
     remove_failed: BTreeSet<(PortProto, u16)>,
+    /// Non-active ports (e.g. refused after a failed rollback, or transient
+    /// expose) that may still own upstream state requiring `unexpose` on remove.
+    cleanup_pending: BTreeSet<(PortProto, u16)>,
     refused: BTreeMap<(PortProto, u16), String>,
 }
 
@@ -707,6 +720,7 @@ impl<A: ForwardApi> Forwards<A> {
             api,
             active: BTreeSet::new(),
             remove_failed: BTreeSet::new(),
+            cleanup_pending: BTreeSet::new(),
             refused: BTreeMap::new(),
         }
     }
@@ -717,12 +731,18 @@ impl<A: ForwardApi> Forwards<A> {
             return match self.api.ensure_exposed(proto, port) {
                 Ok(()) => {
                     self.remove_failed.remove(&key);
+                    self.cleanup_pending.remove(&key);
                     None
                 }
                 Err(ForwardError::Transient(e)) => Some(Event::Transient(proto, port, e)),
                 Err(ForwardError::Refused(e)) => {
                     self.active.remove(&key);
                     self.remove_failed.remove(&key);
+                    if self.api.has_pending_cleanup(proto, port) {
+                        self.cleanup_pending.insert(key);
+                    } else {
+                        self.cleanup_pending.remove(&key);
+                    }
                     self.refused.insert(key, e.clone());
                     Some(Event::Refused(proto, port, e))
                 }
@@ -733,22 +753,51 @@ impl<A: ForwardApi> Forwards<A> {
         }
         match self.api.expose(proto, port) {
             Ok(()) => {
+                self.cleanup_pending.remove(&key);
                 self.active.insert(key);
                 let addrs = self.api.port_addrs(proto, port);
                 Some(Event::Forwarded(proto, port, addrs))
             }
             Err(ForwardError::Refused(e)) => {
+                if self.api.has_pending_cleanup(proto, port) {
+                    self.cleanup_pending.insert(key);
+                } else {
+                    self.cleanup_pending.remove(&key);
+                }
                 self.refused.insert(key, e.clone());
                 Some(Event::Refused(proto, port, e))
             }
-            Err(ForwardError::Transient(e)) => Some(Event::Transient(proto, port, e)),
+            Err(ForwardError::Transient(e)) => {
+                if self.api.has_pending_cleanup(proto, port) {
+                    self.cleanup_pending.insert(key);
+                }
+                Some(Event::Transient(proto, port, e))
+            }
         }
     }
 
     pub fn remove(&mut self, proto: PortProto, port: u16) -> Option<Event> {
         let key = (proto, port);
         if self.refused.remove(&key).is_some() {
-            return Some(Event::RefusedCleared(proto, port));
+            if !self.cleanup_pending.contains(&key) {
+                return Some(Event::RefusedCleared(proto, port));
+            }
+            return Some(match self.api.unexpose(proto, port) {
+                Ok(()) => {
+                    self.cleanup_pending.remove(&key);
+                    Event::RefusedCleared(proto, port)
+                }
+                Err(e) => Event::RemoveFailed(proto, port, e.to_string()),
+            });
+        }
+        if self.cleanup_pending.contains(&key) && !self.active.contains(&key) {
+            return Some(match self.api.unexpose(proto, port) {
+                Ok(()) => {
+                    self.cleanup_pending.remove(&key);
+                    Event::RefusedCleared(proto, port)
+                }
+                Err(e) => Event::RemoveFailed(proto, port, e.to_string()),
+            });
         }
         if !self.active.contains(&key) {
             return None;
@@ -757,6 +806,7 @@ impl<A: ForwardApi> Forwards<A> {
             Ok(()) => {
                 self.active.remove(&key);
                 self.remove_failed.remove(&key);
+                self.cleanup_pending.remove(&key);
                 Event::Removed(proto, port)
             }
             Err(e) => {
@@ -1067,6 +1117,14 @@ pub struct LoopbackTcpListener {
     filter_endpoints: Vec<bool>,
 }
 
+/// Result of a single underlying `accept()` call on [`LoopbackTcpListener`].
+pub enum AcceptOne {
+    /// Accepted a connection whose local and peer addresses passed filtering.
+    Accepted(TcpStream, SocketAddr),
+    /// Accepted and dropped a connection rejected by the loopback endpoint filter.
+    Rejected,
+}
+
 impl LoopbackTcpListener {
     pub fn bind(port: u16) -> io::Result<Self> {
         Self::bind_on(&[Ipv4Addr::LOCALHOST], port)
@@ -1153,6 +1211,20 @@ impl LoopbackTcpListener {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_listeners_filtered_for_test(
+        inner: Vec<TcpListener>,
+        addrs: Vec<Ipv4Addr>,
+        filter_endpoints: Vec<bool>,
+    ) -> Self {
+        assert_eq!(inner.len(), filter_endpoints.len());
+        Self {
+            inner,
+            addrs,
+            filter_endpoints,
+        }
+    }
+
     pub fn addrs(&self) -> &[Ipv4Addr] {
         &self.addrs
     }
@@ -1167,7 +1239,8 @@ impl LoopbackTcpListener {
         self.inner[0].local_addr()
     }
 
-    /// The listening sockets, to poll; accept with [`Self::accept_on`].
+    /// The listening sockets, to poll; accept with [`Self::accept_one_on`] or
+    /// [`Self::accept_on`].
     pub fn raw_fds(&self) -> Vec<RawFd> {
         self.inner.iter().map(AsRawFd::as_raw_fd).collect()
     }
@@ -1176,16 +1249,28 @@ impl LoopbackTcpListener {
         self.accept_on(0)
     }
 
-    /// Accept on the `i`th socket of [`Self::raw_fds`].
+    /// Perform one underlying `accept()` on the `i`th socket of
+    /// [`Self::raw_fds`]. Connections dropped by endpoint filtering return
+    /// [`AcceptOne::Rejected`] rather than looping internally, so callers can
+    /// bound accept batches and observe shutdown flags even under a flood of
+    /// rejected peers.
+    pub fn accept_one_on(&self, i: usize) -> io::Result<AcceptOne> {
+        let (stream, peer) = self.inner[i].accept()?;
+        if !self.filter_endpoints[i] {
+            return Ok(AcceptOne::Accepted(stream, peer));
+        }
+        if let Ok(local) = stream.local_addr()
+            && is_allowed_v4_pair(&self.addrs, local, peer)
+        {
+            return Ok(AcceptOne::Accepted(stream, peer));
+        }
+        Ok(AcceptOne::Rejected)
+    }
+
+    /// Accept on the `i`th socket of [`Self::raw_fds`], skipping rejected peers.
     pub fn accept_on(&self, i: usize) -> io::Result<(TcpStream, SocketAddr)> {
         loop {
-            let (stream, peer) = self.inner[i].accept()?;
-            if !self.filter_endpoints[i] {
-                return Ok((stream, peer));
-            }
-            if let Ok(local) = stream.local_addr()
-                && is_allowed_v4_pair(&self.addrs, local, peer)
-            {
+            if let AcceptOne::Accepted(stream, peer) = self.accept_one_on(i)? {
                 return Ok((stream, peer));
             }
         }
@@ -2252,7 +2337,8 @@ mod tests {
 
         // 2. Rollback failure when Mac port is busy and unexpose fails before
         // gvproxy removes the proxy: live socket is preserved and reconciled
-        // when the Mac port frees up.
+        // when the guest removes the refused port and later re-adds it, OR
+        // cleaned up promptly via unexpose retries when left removed.
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
         let busy_port = busy.local_addr().unwrap().port();
         let busy_sock = crate::autofwd::Upstream::socket(&dir, busy_port);
@@ -2266,10 +2352,25 @@ mod tests {
             busy_sock.exists(),
             "failed rollback must not unlink a live gvproxy socket"
         );
+        // Removing the refused port without re-adding cleans up the leaked
+        // gvproxy Unix socket (even if cleanup itself hits a transient failure
+        // and must be retried).
+        fake.fail_next_unexpose_before_remove
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            fwd.remove(TCP, busy_port),
+            Some(Event::RemoveFailed(TCP, p, _)) if p == busy_port
+        ));
+        assert!(busy_sock.exists(), "socket still live until retry succeeds");
         assert_eq!(
             fwd.remove(TCP, busy_port),
             Some(Event::RefusedCleared(TCP, busy_port))
         );
+        assert!(
+            !busy_sock.exists(),
+            "removing a refused port after rollback failure must clean up its Unix socket"
+        );
+        // After freeing the Mac port and re-adding, forwarding works cleanly.
         drop(busy);
         assert_eq!(
             fwd.add(TCP, busy_port),
@@ -2280,7 +2381,55 @@ mod tests {
             "gv:rollback-ok"
         );
 
+        // 3. Verify the worker thread automatically retries upstream cleanup
+        // for a refused port left removed without ever re-adding it.
         drop(fwd);
+        let busy2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy2_port = busy2.local_addr().unwrap().port();
+        let busy2_sock = crate::autofwd::Upstream::socket(&dir, busy2_port);
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let worker = spawn_forwarder_with(
+            AddressesApi::new(
+                GvproxyApi {
+                    socket: fake.api_sock.clone(),
+                    guest: GUEST,
+                },
+                &dir,
+                &[Ipv4Addr::LOCALHOST],
+            ),
+            Duration::from_millis(10),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+        fake.fail_next_unexpose_before_remove
+            .store(true, Ordering::SeqCst);
+        worker.send(PortChange::Add(TCP, busy2_port)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Refused(TCP, p, _) if p == busy2_port
+        ));
+        assert!(busy2_sock.exists());
+
+        fake.fail_next_unexpose_before_remove
+            .store(true, Ordering::SeqCst);
+        worker.send(PortChange::Remove(TCP, busy2_port)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveFailed(TCP, p, _) if p == busy2_port
+        ));
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RefusedCleared(TCP, busy2_port)
+        );
+        assert!(
+            !busy2_sock.exists(),
+            "worker retry must remove gvproxy Unix socket left by refused forward"
+        );
+
+        drop(busy2);
+        drop(worker);
         drop(fake);
         let _ = fs::remove_dir_all(&dir);
     }
