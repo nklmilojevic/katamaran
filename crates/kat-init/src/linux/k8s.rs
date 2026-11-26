@@ -2727,6 +2727,34 @@ fn configure_k3s_config_env(cmd: &mut Command, managed_config: Option<&Path>) {
 }
 
 const INVALID_ETCD_S3_PROXY_ERR: &str = "invalid etcd-s3-proxy in k3s config YAML: must be \"none\" or a valid URL with scheme and host (for example http://proxy.example.com:8080)";
+const MAX_K3S_DROPIN_BYTES: usize = 256 << 10;
+
+/// Open a drop-in file without blocking on FIFOs, verify it is a regular file,
+/// and perform a bounded UTF-8 read.
+fn read_regular_dropin(path: &Path) -> Result<String, String> {
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{} must be a regular file", path.display()));
+    }
+    let mut bytes = Vec::new();
+    f.take((MAX_K3S_DROPIN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() > MAX_K3S_DROPIN_BYTES {
+        return Err(format!(
+            "{} exceeds maximum size of {MAX_K3S_DROPIN_BYTES} bytes",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{} must be valid UTF-8", path.display()))
+}
 
 /// Validate the effective `etcd-s3-proxy` setting across the managed YAML and
 /// any `.d/*.{yaml,yml}` drop-ins that k3s loads, before launching k3s.
@@ -2758,8 +2786,7 @@ fn validate_k3s_config_yaml(config_path: &Path, config_yaml: &str) -> Result<(),
             }
             dropins.sort_by(|a, b| a.0.cmp(&b.0));
             for (_, path) in dropins {
-                let text = fs::read_to_string(&path)
-                    .map_err(|e| format!("read {}: {e}", path.display()))?;
+                let text = read_regular_dropin(&path)?;
                 if let Some(proxy) = extract_etcd_s3_proxy_from_yaml(&text)
                     .map_err(|()| INVALID_ETCD_S3_PROXY_ERR.to_string())?
                 {
@@ -2786,12 +2813,24 @@ fn is_valid_etcd_s3_proxy(val: &str) -> bool {
     is_valid_go_proxy_url(val)
 }
 
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn has_valid_percent_escapes(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' {
-            if i + 2 >= b.len() || !b[i + 1].is_ascii_hexdigit() || !b[i + 2].is_ascii_hexdigit() {
+            if i + 2 >= b.len()
+                || decode_hex_nibble(b[i + 1]).is_none()
+                || decode_hex_nibble(b[i + 2]).is_none()
+            {
                 return false;
             }
             i += 3;
@@ -2800,6 +2839,34 @@ fn has_valid_percent_escapes(s: &str) -> bool {
         }
     }
     true
+}
+
+/// Mirrors Go's `net/url.shouldEscape(c, encodeHost)`.
+fn go_should_escape_host(b: u8) -> bool {
+    !(b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_'
+                | b'.'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+                | b'<'
+                | b'>'
+                | b'"'
+        ))
 }
 
 fn is_valid_go_userinfo(s: &str) -> bool {
@@ -2830,32 +2897,86 @@ fn is_valid_go_userinfo(s: &str) -> bool {
     })
 }
 
+/// Mirrors Go's `net/url.unescape(host, encodeHost)` on a registered hostname:
+/// percent escapes may only encode non-ASCII bytes (`>= 0x80`) or `%25`.
 fn is_valid_go_reg_name(s: &str) -> bool {
-    if s.is_empty() || !has_valid_percent_escapes(s) {
+    if s.is_empty() {
         return false;
     }
-    s.bytes().all(|b| {
-        !b.is_ascii()
-            || b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-                    | b'+'
-                    | b','
-                    | b';'
-                    | b'='
-                    | b'%'
-            )
-    })
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            let Some(hi) = bytes.get(i + 1).copied().and_then(decode_hex_nibble) else {
+                return false;
+            };
+            let Some(lo) = bytes.get(i + 2).copied().and_then(decode_hex_nibble) else {
+                return false;
+            };
+            let decoded = (hi << 4) | lo;
+            if decoded < 0x80 && decoded != b'%' {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if b < 0x80
+            && !(b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                ))
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Mirrors Go's `net/url.unescape(zone, encodeZone)` for IPv6 zone identifiers.
+fn is_valid_go_zone(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            let Some(hi) = bytes.get(i + 1).copied().and_then(decode_hex_nibble) else {
+                return false;
+            };
+            let Some(lo) = bytes.get(i + 2).copied().and_then(decode_hex_nibble) else {
+                return false;
+            };
+            let decoded = (hi << 4) | lo;
+            if decoded != b'%' && decoded != b' ' && go_should_escape_host(decoded) {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if b < 0x80 && (matches!(b, b'[' | b']') || go_should_escape_host(b)) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn is_valid_port(port: &str) -> bool {
@@ -2920,7 +3041,7 @@ fn is_valid_go_proxy_url(s: &str) -> bool {
             return false;
         }
         if let Some(zone) = zone_opt
-            && !is_valid_go_reg_name(zone)
+            && !is_valid_go_zone(zone)
         {
             return false;
         }
@@ -3149,7 +3270,7 @@ fn parse_yaml_flow_sequence_last(s: &str) -> Result<Option<String>, ()> {
     Ok(items.pop())
 }
 
-fn parse_top_level_yaml_key(line: &str) -> Option<(String, &str)> {
+fn parse_yaml_mapping_key(line: &str) -> Option<(String, &str)> {
     if line.is_empty() || line.starts_with([' ', '\t', '#']) {
         return None;
     }
@@ -3178,6 +3299,23 @@ fn parse_top_level_yaml_key(line: &str) -> Option<(String, &str)> {
         }
     }
     None
+}
+
+/// True when the next non-blank, non-comment line before a document boundary
+/// is indented deeper than `root_indent` (indicating a multiline continuation).
+fn has_indented_continuation(lines: &[&str], start: usize, root_indent: usize) -> bool {
+    for &l in &lines[start..] {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t == "---" || t == "..." {
+            return false;
+        }
+        let indent = l.bytes().take_while(|&b| b == b' ').count();
+        return indent > root_indent || l.starts_with('\t');
+    }
+    false
 }
 
 fn is_yaml_block_scalar_header(s: &str) -> Option<(char, char)> {
@@ -3211,17 +3349,36 @@ fn is_yaml_block_scalar_header(s: &str) -> Option<(char, char)> {
 fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
 
-    // Handle flow-style JSON/YAML top-level mapping documents (`{...}`).
+    // Handle flow-style JSON/YAML top-level mapping documents (`{...}`, including `--- {...}`).
     let first_non_meta = text
         .lines()
         .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#') && *l != "---");
-    if first_non_meta.is_some_and(|l| l.starts_with('{')) {
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('%') && *l != "---");
+    let starts_with_flow_map = first_non_meta.is_some_and(|l| {
+        let l = l
+            .strip_prefix("--- ")
+            .or_else(|| l.strip_prefix("---\t"))
+            .map_or(l, str::trim_start);
+        l.starts_with('{')
+    });
+    if starts_with_flow_map {
         let stripped: String = text
             .lines()
-            .filter(|l| {
+            .filter_map(|l| {
                 let t = l.trim();
-                !t.is_empty() && !t.starts_with('#') && t != "---" && t != "..."
+                if t.is_empty()
+                    || t.starts_with('#')
+                    || t.starts_with('%')
+                    || t == "---"
+                    || t == "..."
+                {
+                    return None;
+                }
+                Some(
+                    t.strip_prefix("--- ")
+                        .or_else(|| t.strip_prefix("---\t"))
+                        .map_or(t, str::trim_start),
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -3246,20 +3403,63 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
 
     let lines: Vec<&str> = text.lines().collect();
     let mut found: Option<String> = None;
+    let mut root_indent: Option<usize> = None;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" || trimmed == "..." {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             i += 1;
             continue;
         }
+        if trimmed == "---" || trimmed == "..." {
+            if root_indent.is_some() {
+                // `yaml.v2.Unmarshal` only reads the first YAML document.
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        if root_indent.is_none() && trimmed.starts_with('%') {
+            i += 1;
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        let after_indent = &line[indent..];
+        if after_indent.starts_with('\t') {
+            if line.contains("etcd-s3-proxy") {
+                return Err(());
+            }
+            i += 1;
+            continue;
+        }
+        let root = match root_indent {
+            Some(r) => {
+                if indent > r {
+                    i += 1;
+                    continue;
+                }
+                if indent < r {
+                    if text.contains("etcd-s3-proxy") {
+                        return Err(());
+                    }
+                    i += 1;
+                    continue;
+                }
+                r
+            }
+            None => {
+                root_indent = Some(indent);
+                indent
+            }
+        };
+
         // Fail closed on explicit YAML complex keys (`? etcd-s3-proxy`) so they
         // cannot bypass validation.
-        if let Some(after_q) = line
+        if let Some(after_q) = after_indent
             .strip_prefix("? ")
-            .or_else(|| line.strip_prefix("?\t"))
-            .or_else(|| (line == "?").then_some(""))
+            .or_else(|| after_indent.strip_prefix("?\t"))
+            .or_else(|| (after_indent == "?").then_some(""))
         {
             let key_text = if after_q.trim().is_empty() {
                 lines.get(i + 1).copied().unwrap_or("")
@@ -3272,7 +3472,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             i += 1;
             continue;
         }
-        let Some((key, after_colon)) = parse_top_level_yaml_key(line) else {
+        let Some((key, after_colon)) = parse_yaml_mapping_key(after_indent) else {
             i += 1;
             continue;
         };
@@ -3290,16 +3490,20 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             let mut min_indent: Option<usize> = None;
             while j < lines.len() {
                 let l = lines[j];
-                if l.trim().is_empty() {
+                let lt = l.trim();
+                if lt.is_empty() {
                     block_lines.push("");
                     j += 1;
                     continue;
                 }
-                let indent = l.bytes().take_while(|&b| b == b' ').count();
-                if indent == 0 {
+                if lt == "---" || lt == "..." {
                     break;
                 }
-                min_indent = Some(min_indent.map_or(indent, |m| m.min(indent)));
+                let l_indent = l.bytes().take_while(|&b| b == b' ').count();
+                if l_indent <= root {
+                    break;
+                }
+                min_indent = Some(min_indent.map_or(l_indent, |m| m.min(l_indent)));
                 block_lines.push(l);
                 j += 1;
             }
@@ -3330,6 +3534,9 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         }
 
         if rest.starts_with('[') {
+            if has_indented_continuation(&lines, i + 1, root) {
+                return Err(());
+            }
             match parse_yaml_flow_sequence_last(rest)? {
                 Some(last) => found = Some(last),
                 None if !is_append => found = Some(String::new()),
@@ -3351,25 +3558,32 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                     j += 1;
                     continue;
                 }
-                let indent = l.bytes().take_while(|&b| matches!(b, b' ' | b'\t')).count();
-                let after_indent = &l[indent..];
-                if let Some(item_rest) = after_indent
-                    .strip_prefix("- ")
-                    .or_else(|| after_indent.strip_prefix("-\t"))
-                    .or_else(|| (after_indent == "-").then_some(""))
+                if t == "---" || t == "..." {
+                    break;
+                }
+                let l_indent = l.bytes().take_while(|&b| b == b' ').count();
+                let l_after = &l[l_indent..];
+                if l_after.starts_with('\t') {
+                    return Err(());
+                }
+                if l_indent >= root
+                    && let Some(item_rest) = l_after
+                        .strip_prefix("- ")
+                        .or_else(|| l_after.strip_prefix("-\t"))
+                        .or_else(|| (l_after == "-").then_some(""))
                 {
                     saw_seq = true;
                     seq_items.push(parse_yaml_inline_scalar(item_rest)?);
                     j += 1;
                     continue;
                 }
-                if indent == 0 {
+                if l_indent <= root {
                     break;
                 }
                 if saw_seq {
                     return Err(());
                 }
-                scalar_lines.push(after_indent);
+                scalar_lines.push(l_after);
                 j += 1;
             }
             if saw_seq {
@@ -3385,6 +3599,9 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             continue;
         }
 
+        if has_indented_continuation(&lines, i + 1, root) {
+            return Err(());
+        }
         found = Some(parse_yaml_inline_scalar(rest)?);
         i += 1;
     }
@@ -9127,7 +9344,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "etcd-s3-proxy: null\n",
             "etcd-s3-proxy: http://proxy.example.com:8080\n",
             "etcd-s3-proxy: https://user:p%40ss@proxy.example.com:8443 # comment\n",
+            "etcd-s3-proxy: http://user:pass@proxy%c3%a9.example.com:8080\n",
             "etcd-s3-proxy: socks5://user:pass@[::1]:1080\n",
+            "etcd-s3-proxy: socks5://user:pass@[fe80::1%25eth0]:1080\n",
+            "etcd-s3-proxy: socks5://user:pass@[fe80::1%25en%200]:1080\n",
+            "  disable:\n    - traefik\n  etcd-s3-proxy: none\n",
+            "  nested:\n    etcd-s3-proxy: not-a-url\n  etcd-s3-proxy: http://proxy.example.com:8080\n",
             "{\"etcd-s3-proxy\": \"none\"}\n",
         ] {
             validate_k3s_config_yaml(&cfg_path, ok_yaml)
@@ -9137,6 +9359,34 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         // Malformed URLs with credentials across YAML forms must fail with a constant error.
         let bad_cases = [
             ("plain invalid port", format!("etcd-s3-proxy: {bad_url}\n")),
+            (
+                "indented top-level YAML",
+                format!("  disable:\n    - traefik\n  etcd-s3-proxy: {bad_url}\n"),
+            ),
+            (
+                "indented top-level sequence",
+                format!("  etcd-s3-proxy:\n  - {bad_url}\n"),
+            ),
+            (
+                "indented top-level block scalar",
+                format!("  etcd-s3-proxy: |-\n    {bad_url}\n"),
+            ),
+            (
+                "indented explicit key",
+                format!("  ? etcd-s3-proxy\n  : {bad_url}\n"),
+            ),
+            (
+                "escaped ASCII letter in host",
+                format!("etcd-s3-proxy: http://user:{secret_pw}@{bad_host}%61:8080\n"),
+            ),
+            (
+                "escaped control char in IPv6 zone",
+                format!("etcd-s3-proxy: socks5://user:{secret_pw}@[fe80::1%25en%0a0]:1080\n"),
+            ),
+            (
+                "multiline plain continuation",
+                format!("etcd-s3-proxy: http://user:{secret_pw}@{bad_host}:8080\n  extra\n"),
+            ),
             (
                 "double-quoted invalid port",
                 format!("etcd-s3-proxy: \"{bad_url}\"\n"),
@@ -9196,17 +9446,34 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         .unwrap();
         validate_k3s_config_yaml(&cfg_path, "etcd-s3-proxy: none\n").unwrap();
 
-        // Malformed drop-in fails validation without leaking its contents.
+        // Malformed indented drop-in fails validation without leaking its contents.
         fs::write(
             dropin_dir.join("10-bad.yaml"),
-            format!("etcd-s3-proxy: {bad_url}\n"),
+            format!("  etcd-s3-proxy: {bad_url}\n"),
         )
         .unwrap();
         assert_safe_reject("etcd-s3-proxy: none\n", "drop-in override to malformed URL");
 
-        // Later lexical drop-in (.YML case-insensitive) overriding back to `none` succeeds.
-        fs::write(dropin_dir.join("20-fix.YML"), "etcd-s3-proxy: none\n").unwrap();
+        // Later lexical drop-in (.YML case-insensitive) via symlink overriding back to `none` succeeds.
+        let linked_fix = base.join("external-fix.yml");
+        fs::write(&linked_fix, "  etcd-s3-proxy: none\n").unwrap();
+        symlink(&linked_fix, dropin_dir.join("20-fix.YML")).unwrap();
         validate_k3s_config_yaml(&cfg_path, &format!("etcd-s3-proxy: {bad_url}\n")).unwrap();
+
+        // A YAML-named FIFO in `<config>.d/` is rejected immediately without blocking.
+        let fifo = dropin_dir.join("30-fifo.yaml");
+        let c_fifo = CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            io::Error::last_os_error()
+        );
+        let err = validate_k3s_config_yaml(&cfg_path, "etcd-s3-proxy: none\n").unwrap_err();
+        assert!(
+            err.contains("regular file"),
+            "expected regular file error: {err}"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
