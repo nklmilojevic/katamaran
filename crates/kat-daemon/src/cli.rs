@@ -155,6 +155,9 @@ fn start_with(args: StartArgs, recycled_stale: bool) -> anyhow::Result<()> {
                     t.elapsed().as_secs_f64(),
                     s.docker.socket.display()
                 );
+                if let Some(err) = &s.error {
+                    eprintln!("katamaran: warning: {err}");
+                }
                 return Ok(());
             }
             (_, DockerState::Failed) => {
@@ -290,7 +293,9 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
             "resources",
             format!(
                 "{} CPUs · {} MiB · {} GiB disk",
-                s.config.cpus, s.config.memory_mib, s.config.disk_gib
+                s.config.cpus,
+                s.config.memory_mib,
+                s.saved_disk_gib()
             ),
         );
     }
@@ -346,16 +351,19 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
             ),
         );
     }
+    let saved_disk = s.saved_disk_gib();
     if let Some(vm) = &s.vm
         && (vm.cpus != s.config.cpus
             || vm.memory_mib != s.config.memory_mib
-            || vm.disk_gib != s.config.disk_gib)
+            || vm.requested_disk_gib() != saved_disk)
     {
         line(
             "pending",
             format!(
                 "{} CPUs · {} MiB · {} GiB disk after a restart",
-                s.config.cpus, s.config.memory_mib, s.config.disk_gib
+                s.config.cpus,
+                s.config.memory_mib,
+                saved_disk.max(vm.disk_gib)
             ),
         );
     }
@@ -408,9 +416,8 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
     match cmd {
         ConfigCmd::Get { key } => {
             let cfg = match daemon {
-                Some(mut c) => {
-                    serde_json::from_value::<ConfigView>(c.call(&Call::ConfigGet)?)?.config
-                }
+                Some(mut c) => serde_json::from_value::<ConfigView>(c.call(&Call::ConfigGet)?)?
+                    .resolved_config(),
                 None => config::Config::load(&crate::state_dir()?)?,
             };
             match key {
@@ -519,7 +526,7 @@ pub fn version() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::api::*;
-    use crate::config::Config;
+    use crate::config::WireConfig;
 
     #[test]
     fn parses_config_pairs() {
@@ -550,14 +557,16 @@ mod tests {
                 protocol: 3,
                 kernel: Some("6.18".into()),
             },
-            config: Config {
+            config: WireConfig {
                 cpus: 2,
-                ..Config::default()
+                ..WireConfig::default()
             },
+            disk_gib: Some(64),
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
                 disk_gib: 64,
+                requested_disk_gib: Some(64),
                 pid: Some(2),
                 boot_ms: Some(100.0),
                 docker_ready_ms: Some(1500.0),
@@ -600,11 +609,39 @@ mod tests {
         let mut disk_pending = s.clone();
         disk_pending.config.cpus = 4;
         disk_pending.config.memory_mib = 4096;
-        disk_pending.config.disk_gib = 500;
+        disk_pending.disk_gib = Some(500);
         let disk_text = summary(&disk_pending);
         assert!(
             disk_text.contains("4 CPUs · 4096 MiB · 500 GiB disk after a restart"),
             "{disk_text}"
+        );
+
+        // Retaining a larger foreground-grown image reports 500 GiB attached
+        // without creating perpetual pending work when config stays at 64 GiB.
+        let mut retained = s.clone();
+        retained.config.cpus = 4;
+        retained.config.memory_mib = 4096;
+        retained.disk_gib = Some(64);
+        retained.vm.as_mut().unwrap().disk_gib = 500;
+        retained.vm.as_mut().unwrap().requested_disk_gib = Some(64);
+        let retained_text = summary(&retained);
+        assert!(
+            retained_text.contains("4 CPUs · 4096 MiB · 500 GiB disk"),
+            "{retained_text}"
+        );
+        assert!(
+            !retained_text.contains("pending"),
+            "retained larger disk must not show pending: {retained_text}"
+        );
+
+        // If another setting changes while retaining a larger disk, pending
+        // reports the effective 500 GiB disk size rather than claiming a shrink.
+        let mut retained_cpu = retained.clone();
+        retained_cpu.config.cpus = 2;
+        let retained_cpu_text = summary(&retained_cpu);
+        assert!(
+            retained_cpu_text.contains("2 CPUs · 4096 MiB · 500 GiB disk after a restart"),
+            "{retained_cpu_text}"
         );
         assert!(
             !text.contains("k8s"),

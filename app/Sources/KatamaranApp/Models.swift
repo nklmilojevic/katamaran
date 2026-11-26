@@ -10,6 +10,7 @@ struct DaemonStatus: Decodable, Equatable {
     var daemon: DaemonInfo
     var versions: Versions
     var config: Config
+    var disk_gib: Int? = nil
     var vm: VmInfo?
     var usage: Sample?
     var docker: DockerInfo
@@ -43,6 +44,7 @@ struct Config: Codable, Equatable {
 
 struct ConfigView: Decodable {
     var config: Config
+    var disk_gib: Int? = nil
     var restart_required: Bool
 }
 
@@ -135,6 +137,13 @@ extension DaemonStatus {
 
     func portURL(proto: String = "tcp", port: UInt16) -> URL? {
         URL(string: "http://\(portHost(proto: proto, port: port)):\(port)")
+    }
+
+    /// Saved config with the enclosing `disk_gib` field merged in.
+    var effectiveConfig: Config {
+        var c = config
+        if let disk_gib { c.disk_gib = disk_gib }
+        return c
     }
 
     func portError(proto: String = "tcp", port: UInt16) -> String? {

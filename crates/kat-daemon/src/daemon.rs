@@ -29,7 +29,7 @@ use crate::api::{
     LogsParams, MountInfo, Port, PortError, Request, Response, RpcError, Sample, StatsResult,
     Status, Versions, VmInfo,
 };
-use crate::config::{Config, Host};
+use crate::config::{Config, Host, WireConfig};
 use crate::power::{self, PowerEvent};
 use crate::run::{self, Control, Event, RunArgs};
 use crate::state::{Transition, Trigger, VmState};
@@ -263,6 +263,12 @@ struct Inner {
 /// What the daemon knows about the current VM run.
 struct Run {
     applied: Config,
+    /// Actual attached size of `data.img` in GiB (may exceed `applied.disk_gib`
+    /// when `data.img` was already grown larger).
+    attached_disk_gib: u32,
+    /// True from [`Daemon::start`] until [`Event::DiskPrepared`] reports that
+    /// `data.img` preparation finished for this run.
+    disk_preparing: bool,
     requested: Instant,
     kernel: Option<String>,
     vm_pid: Option<u32>,
@@ -285,9 +291,11 @@ struct Run {
 }
 
 impl Run {
-    fn new(applied: Config, mount_path: Option<PathBuf>) -> Run {
+    fn new(applied: Config, mount_path: Option<PathBuf>, attached_disk_gib: u32) -> Run {
         Run {
             applied,
+            attached_disk_gib,
+            disk_preparing: false,
             requested: Instant::now(),
             kernel: None,
             vm_pid: None,
@@ -334,6 +342,17 @@ impl Run {
             merged.entry((proto, port)).or_insert_with(|| error.clone());
         }
         merged
+    }
+
+    fn record_problem(&mut self, msg: String) {
+        match &mut self.problem {
+            Some(prev) if !prev.contains(&msg) => {
+                prev.push_str("; ");
+                prev.push_str(&msg);
+            }
+            Some(_) => {}
+            None => self.problem = Some(msg),
+        }
     }
 }
 
@@ -463,6 +482,29 @@ impl Daemon {
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
+        self.start_with(run_args, |d, generation, args, rx| {
+            thread::Builder::new()
+                .name("vm-supervisor".into())
+                .spawn(move || {
+                    let result = run::run_vm(&args, d.relay_budget.clone(), rx, &mut |e| {
+                        d.on_event(generation, e)
+                    });
+                    d.on_exit(generation, result);
+                })
+                .map(|_| ())
+        })
+    }
+
+    fn start_with<B, S>(self: &Arc<Self>, build_args: B, spawn: S) -> Result<(), String>
+    where
+        B: FnOnce(&Config) -> anyhow::Result<RunArgs>,
+        S: FnOnce(Arc<Daemon>, u64, RunArgs, mpsc::Receiver<Control>) -> io::Result<()>,
+    {
+        // Serialize startup's config snapshot and `disk_preparing` flag with
+        // `set_config` so a concurrent disk edit cannot bypass the shrink
+        // check before `run.rs` finishes extending `data.img`.
+        // Lock order: `config_lock` -> `inner`.
+        let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut g = self.lock();
         if g.exiting {
             return Err("the daemon is shutting down".into());
@@ -473,18 +515,26 @@ impl Daemon {
             Transition::To(_) => {}
         }
         let cfg = Config::load(&self.home).map_err(|e| format!("{e:#}"))?;
-        let args = run_args(&cfg).map_err(|e| format!("{e:#}"))?;
+        let args = build_args(&cfg).map_err(|e| format!("{e:#}"))?;
         let mount_path = if args.no_mount {
             None
         } else {
             crate::nfs::mount_point(args.mount.as_deref())
         };
+        let existing_gib = crate::config::data_disk_bytes(&self.home)
+            .ok()
+            .flatten()
+            .map(crate::config::bytes_to_gib)
+            .unwrap_or(0);
+        let initial_disk_gib = existing_gib.max(cfg.disk_gib);
         let prev_state = g.state;
         let prev_error = g.error.clone();
         g.generation += 1;
         let generation = g.generation;
         g.error = None;
-        g.run = Some(Run::new(cfg.clone(), mount_path));
+        let mut run = Run::new(cfg.clone(), mount_path, initial_disk_gib);
+        run.disk_preparing = true;
+        g.run = Some(run);
         g.samples.clear();
         let (tx, rx) = mpsc::channel();
         g.control = Some(tx);
@@ -493,18 +543,9 @@ impl Daemon {
             "starting the VM ({} CPUs, {} MiB, {} GiB disk)",
             cfg.cpus,
             cfg.memory_mib,
-            cfg.disk_gib
+            initial_disk_gib
         );
-        let d = self.clone();
-        if let Err(e) = thread::Builder::new()
-            .name("vm-supervisor".into())
-            .spawn(move || {
-                let result = run::run_vm(&args, d.relay_budget.clone(), rx, &mut |e| {
-                    d.on_event(generation, e)
-                });
-                d.on_exit(generation, result);
-            })
-        {
+        if let Err(e) = spawn(self.clone(), generation, args, rx) {
             g.control = None;
             g.run = None;
             g.error = prev_error;
@@ -598,6 +639,10 @@ impl Daemon {
             let Inner { run, samples, .. } = &mut *g;
             let Some(r) = run.as_mut() else { return };
             match e {
+                Event::DiskPrepared { bytes } => {
+                    r.attached_disk_gib = crate::config::bytes_to_gib(bytes);
+                    r.disk_preparing = false;
+                }
                 Event::Booted {
                     kernel_release,
                     vm_pid,
@@ -628,7 +673,7 @@ impl Daemon {
                     if name == "k8s" {
                         k8s_failed = Some(error);
                     } else {
-                        r.problem = Some(format!("{name}: {error}"));
+                        r.record_problem(format!("{name}: {error}"));
                     }
                     if name == "docker" {
                         r.docker = DockerState::Failed;
@@ -643,7 +688,7 @@ impl Daemon {
                     r.mount_path = Some(path);
                 }
                 Event::MountFailed(error) => {
-                    r.problem = Some(format!("files not mounted: {error}"));
+                    r.record_problem(format!("files not mounted: {error}"));
                     r.mount_error = Some(error);
                 }
                 Event::PortAdd(origin, proto, port, addrs) => {
@@ -663,7 +708,8 @@ impl Daemon {
                 }
                 Event::Restarting { why, delay } => {
                     dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
-                    let mut next = Run::new(r.applied.clone(), r.mount_path.clone());
+                    let mut next =
+                        Run::new(r.applied.clone(), r.mount_path.clone(), r.attached_disk_gib);
                     next.problem = Some(format!("the VM was restarted: {why}"));
                     *r = next;
                     k8s_reset_runtime = true;
@@ -831,7 +877,8 @@ impl Daemon {
             vm: r.map(|r| VmInfo {
                 cpus: r.applied.cpus,
                 memory_mib: r.applied.memory_mib,
-                disk_gib: r.applied.disk_gib,
+                disk_gib: r.attached_disk_gib,
+                requested_disk_gib: Some(r.applied.disk_gib),
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
                 docker_ready_ms: r.docker_ready.map(ms),
@@ -877,7 +924,8 @@ impl Daemon {
                         .collect()
                 })
                 .unwrap_or_default(),
-            config: saved,
+            disk_gib: Some(saved.disk_gib),
+            config: WireConfig::from(saved),
         }
     }
 
@@ -891,14 +939,15 @@ impl Daemon {
                 .is_some_and(|r| r.applied.needs_restart_for(&config)),
             k8s_toggled: false,
             path: Config::path(&self.home),
-            config,
+            disk_gib: Some(config.disk_gib),
+            config: WireConfig::from(config),
         })
     }
 
     fn set_config(
         self: &Arc<Self>,
         values: &std::collections::BTreeMap<String, String>,
-    ) -> anyhow::Result<ConfigView> {
+    ) -> Result<ConfigView, RpcError> {
         self.set_config_with(values, |home| match self.kube_context_name() {
             Ok(ctx) => {
                 if let Err(e) = self.remove_kubeconfig(&ctx) {
@@ -916,19 +965,31 @@ impl Daemon {
         self: &Arc<Self>,
         values: &std::collections::BTreeMap<String, String>,
         cleanup_disabled_kubeconfig: impl FnOnce(&Path),
-    ) -> anyhow::Result<ConfigView> {
+    ) -> Result<ConfigView, RpcError> {
         let (cfg_kubernetes, before_k8s) = {
             let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let mut cfg = Config::load(&self.home)?;
+            if (values.contains_key("disk") || values.contains_key("disk_gib"))
+                && self.lock().run.as_ref().is_some_and(|r| r.disk_preparing)
+            {
+                return Err(RpcError::new(
+                    api::FAILED,
+                    "cannot change disk_gib while the VM is preparing its data disk; retry in a moment",
+                ));
+            }
+            let mut cfg = Config::load(&self.home)
+                .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
             let host = Host::current();
             let before = cfg.launch_at_login;
             let before_k8s = cfg.kubernetes;
-            cfg.apply_values(values, &host, &self.home)?;
-            cfg.save(&self.home)?;
+            cfg.apply_values(values, &host, &self.home)
+                .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
+            cfg.save(&self.home)
+                .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
             let keys: Vec<&str> = values.keys().map(String::as_str).collect();
             dlog!("config saved: {keys:?}");
             if cfg.launch_at_login != before {
-                crate::setup::set_run_at_load(cfg.launch_at_login, self.launchd_label.as_deref())?;
+                crate::setup::set_run_at_load(cfg.launch_at_login, self.launchd_label.as_deref())
+                    .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
             }
             (cfg.kubernetes, before_k8s)
         };
@@ -957,7 +1018,9 @@ impl Daemon {
                 k.kubeconfig = None;
             }
         }
-        let mut view = self.config_view()?;
+        let mut view = self
+            .config_view()
+            .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
         view.k8s_toggled = k8s_toggled;
         Ok(view)
     }
@@ -1175,9 +1238,7 @@ impl Daemon {
                 value(serde_json::to_value(v))
             }
             Call::ConfigSet(values) => {
-                let v = self
-                    .set_config(values)
-                    .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
+                let v = self.set_config(values)?;
                 value(serde_json::to_value(v))
             }
             Call::Stats => value(serde_json::to_value(self.stats())),
@@ -2241,7 +2302,7 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
             p if p.is_file() => p,
             _ => guest.join("data.img.sparse"),
         },
-        disk_gib: cfg.disk_gib,
+        disk_gib: Some(cfg.disk_gib),
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
         cmdline: guest_cmdline(cfg),
@@ -2535,7 +2596,8 @@ mod tests {
         let mut disk = std::collections::BTreeMap::new();
         disk.insert("disk".to_string(), "500G".to_string());
         let v = d.handle(&Call::ConfigSet(disk)).unwrap();
-        assert_eq!(v["config"]["disk_gib"], 500);
+        assert_eq!(v["disk_gib"], 500);
+        assert!(v["config"].get("disk_gib").is_none());
         assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
         fs::create_dir_all(home.join("data")).unwrap();
         fs::File::create(home.join("data/data.img"))
@@ -2574,7 +2636,7 @@ mod tests {
         {
             let mut g = d.lock();
             g.state = VmState::Running;
-            let mut run = Run::new(Config::default(), None);
+            let mut run = Run::new(Config::default(), None, crate::config::DEFAULT_DISK_GIB);
             run.docker = DockerState::Failed;
             run.problem = Some("dockerd crashed".into());
             g.run = Some(run);
@@ -2612,7 +2674,11 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            g.run = Some(Run::new(Config::default(), None));
+            g.run = Some(Run::new(
+                Config::default(),
+                None,
+                crate::config::DEFAULT_DISK_GIB,
+            ));
             let mut k = d.k8s.lock().unwrap();
             k.state = "running".into();
             k.kubeconfig = Some(kc.clone());
@@ -2643,7 +2709,7 @@ mod tests {
         {
             let mut g = d.lock();
             g.state = VmState::Stopping;
-            g.run = Some(Run::new(cfg, None));
+            g.run = Some(Run::new(cfg, None, crate::config::DEFAULT_DISK_GIB));
         }
         d.on_event(1, Event::ServiceReady("docker".into()));
         assert_eq!(d.lock().state, VmState::Stopping);
@@ -4119,7 +4185,11 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            g.run = Some(Run::new(Config::default(), None));
+            g.run = Some(Run::new(
+                Config::default(),
+                None,
+                crate::config::DEFAULT_DISK_GIB,
+            ));
         }
         d.on_event(
             1,
@@ -4227,6 +4297,94 @@ mod tests {
         fs::remove_dir_all(&home).unwrap();
     }
 
+    fn test_run_args(cfg: &Config, template: &Path) -> RunArgs {
+        RunArgs {
+            kernel: PathBuf::from("Image"),
+            initramfs: PathBuf::from("initramfs.cpio"),
+            rootfs: PathBuf::from("rootfs.erofs"),
+            data_template: template.to_path_buf(),
+            disk_gib: Some(cfg.disk_gib),
+            cpus: cfg.cpus,
+            memory_mib: cfg.memory_mib,
+            cmdline: guest_cmdline(cfg),
+            vm_bin: None,
+            no_share: true,
+            permissions: "caller".into(),
+            mount: None,
+            no_mount: true,
+            no_network: true,
+            gvproxy: None,
+            mtu: crate::net::DEFAULT_MTU,
+            pause_on_sleep: cfg.pause_on_sleep,
+            no_auto_forward: true,
+            forward_addresses: cfg.forward_addresses.clone(),
+            amd64: cfg.amd64,
+        }
+    }
+
+    #[test]
+    fn foreground_grown_disk_reports_attached_size_without_perpetual_pending() {
+        let home = temp("attached-disk");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        fs::File::create(&img)
+            .unwrap()
+            .set_len(64u64 << 30)
+            .unwrap();
+        // Simulate a foreground `katamaran run --disk-gib 500` while config.toml stays at default 64 GiB.
+        assert_eq!(
+            run::prepare_data_disk(&img, &img, Some(500)).unwrap(),
+            500u64 << 30
+        );
+
+        let d = Daemon::new(home.clone());
+        let (done_tx, done_rx) = mpsc::channel();
+        let img_for_vm = img.clone();
+        d.start_with(
+            |cfg| Ok(test_run_args(cfg, &img)),
+            move |daemon, generation, args, rx| {
+                thread::spawn(move || {
+                    let bytes =
+                        run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                            .unwrap();
+                    daemon.on_event(generation, Event::DiskPrepared { bytes });
+                    daemon.on_event(
+                        generation,
+                        Event::Booted {
+                            kernel_release: "6.18".into(),
+                            vm_pid: 42,
+                            took: Duration::from_millis(50),
+                        },
+                    );
+                    daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                    let _ = done_tx.send(());
+                    let _ = rx.recv();
+                    daemon.on_exit(generation, Ok(()));
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let status = d.status();
+        let vm = status.vm.as_ref().expect("running VM info");
+        assert_eq!(vm.disk_gib, 500);
+        assert_eq!(vm.requested_disk_gib, Some(crate::config::DEFAULT_DISK_GIB));
+        assert_eq!(status.saved_disk_gib(), crate::config::DEFAULT_DISK_GIB);
+
+        // Retaining the larger image does not cause perpetual pending work.
+        let view = d.config_view().unwrap();
+        assert!(!view.restart_required);
+        let text = crate::cli::summary(&status);
+        assert!(text.contains("500 GiB disk"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
     #[test]
     fn k8s_start_refuses_silent_noop_when_settings_changed_while_running() {
         let home = temp("k8s-run");
@@ -4250,7 +4408,7 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            let mut run = Run::new(cfg.clone(), None);
+            let mut run = Run::new(cfg.clone(), None, cfg.disk_gib);
             run.docker = DockerState::Ready;
             g.run = Some(run);
             let mut k = d.k8s.lock().unwrap();
@@ -4335,6 +4493,86 @@ mod tests {
     }
 
     #[test]
+    fn startup_disk_preparation_blocks_concurrent_shrink_edits() {
+        let home = temp("disk-race");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        fs::File::create(&img)
+            .unwrap()
+            .set_len(64u64 << 30)
+            .unwrap();
+
+        let cfg = Config {
+            disk_gib: 500,
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
+
+        let d = Daemon::new(home.clone());
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let (grown_tx, grown_rx) = mpsc::channel();
+        let img_for_vm = img.clone();
+
+        d.start_with(
+            |cfg| Ok(test_run_args(cfg, &img)),
+            move |daemon, generation, args, rx| {
+                thread::spawn(move || {
+                    // Startup has snapshotted target = 500 GiB, paused before growing data.img.
+                    let _ = paused_tx.send(());
+                    proceed_rx.recv().unwrap();
+                    let bytes =
+                        run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                            .unwrap();
+                    daemon.on_event(generation, Event::DiskPrepared { bytes });
+                    let _ = grown_tx.send(());
+                    let _ = rx.recv();
+                    daemon.on_exit(generation, Ok(()));
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // While startup image preparation is in flight, a smaller concurrent disk edit must fail.
+        let mut shrink = BTreeMap::new();
+        shrink.insert("disk".into(), "200G".into());
+        let err = d.handle(&Call::ConfigSet(shrink.clone())).unwrap_err();
+        assert_eq!(err.code, api::FAILED);
+        assert!(
+            err.message.contains("preparing its data disk"),
+            "{}",
+            err.message
+        );
+        assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
+
+        // Unrelated settings still succeed while disk preparation is in flight.
+        let mut unrelated = BTreeMap::new();
+        unrelated.insert("cpus".into(), "1".into());
+        d.handle(&Call::ConfigSet(unrelated)).unwrap();
+
+        // Resume startup so data.img is extended to 500 GiB.
+        proceed_tx.send(()).unwrap();
+        grown_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(fs::metadata(&img).unwrap().len(), 500u64 << 30);
+
+        // Now shrink is rejected against the grown 500 GiB image, while growing further succeeds.
+        let err = d.handle(&Call::ConfigSet(shrink)).unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+        assert!(err.message.contains("cannot shrink"), "{}", err.message);
+
+        let mut grow = BTreeMap::new();
+        grow.insert("disk".into(), "600G".into());
+        let v = d.handle(&Call::ConfigSet(grow)).unwrap();
+        assert_eq!(v["disk_gib"], 600);
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn published_removal_preserves_live_automatic_forward_on_same_port() {
         let home = temp("port-handoff");
         let d = Daemon::new(home.clone());
@@ -4342,7 +4580,11 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            g.run = Some(Run::new(Config::default(), None));
+            g.run = Some(Run::new(
+                Config::default(),
+                None,
+                crate::config::DEFAULT_DISK_GIB,
+            ));
         }
 
         let alias = std::net::Ipv4Addr::new(172, 16, 1, 200);
@@ -4425,6 +4667,34 @@ mod tests {
             Event::PortRemove(run::PortOrigin::Automatic, PortProto::Tcp, 8080),
         );
         assert!(d.status().ports.is_empty());
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn guest_data_disk_resize_failure_exposes_status_error_without_failing_docker() {
+        let home = temp("disk-resize-err");
+        let d = Daemon::new(home.clone());
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Starting;
+            g.run = Some(Run::new(Config::default(), None, 500));
+        }
+
+        d.on_event(
+            1,
+            Event::ServiceFailed("data-disk".into(), "read-only filesystem".into()),
+        );
+        d.on_event(1, Event::ServiceReady("docker".into()));
+
+        let st = d.status();
+        assert_eq!(st.state, VmState::Running);
+        assert_eq!(st.docker.state, DockerState::Ready);
+        assert_eq!(st.error.as_deref(), Some("data-disk: read-only filesystem"));
+        let text = crate::cli::summary(&st);
+        assert!(text.contains("data-disk: read-only filesystem"), "{text}");
+        assert!(text.contains("docker     ready"), "{text}");
 
         fs::remove_dir_all(&home).unwrap();
     }

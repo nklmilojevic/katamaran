@@ -691,6 +691,20 @@ impl Daemon {
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
+
+    /// Stop the daemon child and wait for its control socket to go away,
+    /// keeping `self.home` intact for offline CLI checks.
+    fn shutdown(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            within(Duration::from_secs(60), "daemon process to exit", || {
+                matches!(self.child.try_wait(), Ok(Some(_)))
+            });
+        }
+        within(Duration::from_secs(10), "daemon socket to go away", || {
+            UnixStream::connect(self.home.join("run/daemon.sock")).is_err()
+        });
+    }
 }
 
 impl Drop for Daemon {
@@ -822,7 +836,7 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn katamaran daemon");
-    let d = Daemon { child, home };
+    let mut d = Daemon { child, home };
     within(Duration::from_secs(10), "the daemon socket", || {
         UnixStream::connect(d.home.join("run/daemon.sock")).is_ok()
     });
@@ -906,7 +920,8 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
     );
     assert_eq!(d.status()["vm"]["disk_gib"], 500);
 
-    let console = std::fs::read_to_string(d.home.join("logs/console.log")).unwrap_or_default();
+    let console = std::fs::read_to_string(d.home.join("logs/console.log"))
+        .expect("read guest console after resize");
     assert!(
         console.contains("resized data disk filesystem (64 GiB -> 500 GiB)"),
         "console log:\n{console}"
@@ -943,7 +958,8 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
 
     // A subsequent restart does not re-run the resize.
     cli(&d.home, &["restart"]);
-    let console2 = std::fs::read_to_string(d.home.join("logs/console.log")).unwrap_or_default();
+    let console2 = std::fs::read_to_string(d.home.join("logs/console.log"))
+        .expect("read guest console after the second restart");
     assert!(
         !console2.contains("resized data disk filesystem"),
         "second boot should skip resize:\n{console2}"
@@ -952,4 +968,20 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
 
     cli(&d.home, &["stop"]);
     assert_eq!(d.status()["state"], "stopped");
+
+    // Shut down the daemon without deleting home to exercise offline CLI
+    // shrink rejection against the 500 GiB data.img.
+    d.shutdown();
+    let offline_shrink = Command::new(root().join("target/release/katamaran"))
+        .args(["config", "set", "disk=200G"])
+        .env("KATAMARAN_HOME", &d.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run katamaran offline");
+    assert!(!offline_shrink.status.success());
+    assert!(
+        String::from_utf8_lossy(&offline_shrink.stderr).contains("cannot shrink"),
+        "{offline_shrink:?}"
+    );
+    assert_eq!(cli(&d.home, &["config", "get", "disk"]).trim(), "500");
 }

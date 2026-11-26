@@ -11,7 +11,6 @@ katamaran stores daemon and VM settings in `~/.katamaran/config.toml` (or `$KATA
 # katamaran settings; applied at the next VM start.
 cpus = 14
 memory_mib = 16384
-disk_gib = 64
 mount = true
 launch_at_login = true
 pause_on_sleep = false
@@ -29,7 +28,7 @@ kat config set nofile=65536
 kat restart
 ```
 
-`nofile` is only written to `config.toml` when it differs from the default. Before downgrading to a katamaran version without `nofile`, remove a custom `nofile` line, since older versions reject unknown keys.
+`nofile` and `disk_gib` are only written to `config.toml` when they differ from their defaults. Before downgrading to a katamaran version without `nofile` or `disk_gib`, remove any custom `nofile` or `disk_gib` line from `config.toml`, since older versions reject unknown keys (removing `disk_gib` leaves `~/.katamaran/data/data.img` intact).
 
 ## Settings keys
 
@@ -37,7 +36,7 @@ kat restart
 |---|---|---|---|
 | `cpus` | integer | All host cores | `1` to the number of host CPU cores |
 | `memory_mib` | integer | Half of host RAM, clamped to `2048` to `16384` | `1024` to `(host RAM - 2048)` MiB. `kat config set` also accepts `memory=8G` or `memory=4096M`. |
-| `disk_gib` | integer | `64` | `64` to `16384` GiB (16 TiB). `kat config set` also accepts `disk=500G` or `disk=1T`. Growing only: cannot be set smaller than the current `data.img`. |
+| `disk_gib` | integer | `64` | `64` to `16384` GiB (16 TiB), checked on `config.toml` load. `kat config set` also accepts `disk=500G` or `disk=1T`. Growing only: `kat config set` and the app reject a target smaller than the current `data.img`; a lower in-range value edited directly in `config.toml` is accepted on load and leaves the larger `data.img` unchanged at startup. Omitted from `config.toml` when default (`64`); remove a non-default `disk_gib` line before downgrading to an older release without touching `data.img`. |
 | `mount` | boolean | `true` | `true`, `false`, `on`, `off`, `yes`, `no`, `1`, `0` |
 | `mount_path` | string (optional) | `~/Katamaran` (unset) | Any absolute path, or empty string to reset to default |
 | `launch_at_login` | boolean | `true` | Boolean |
@@ -53,7 +52,7 @@ kat restart
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
 
-`disk_gib` is also a sparse ceiling on APFS, not a pre-allocated file. Raising it extends `~/.katamaran/data/data.img` before the next VM start and expands the guest btrfs filesystem automatically at boot. Existing data is preserved, and unused space continues to be returned to macOS via `discard=async` and periodic `FITRIM`. Shrinking an existing `data.img` is not supported.
+`disk_gib` is also a sparse ceiling on APFS, not a pre-allocated file. Raising it extends `~/.katamaran/data/data.img` before the next VM start and expands the guest btrfs filesystem automatically at boot. Existing data is preserved, and unused space continues to be returned to macOS via `discard=async` and periodic `FITRIM`. Shrinking an existing `data.img` is not supported: `kat config set` and the app reject targets below the current image size, while a lower in-range value written manually to `config.toml` leaves the larger image unchanged at startup.
 
 ## State directory layout
 

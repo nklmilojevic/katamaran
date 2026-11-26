@@ -185,6 +185,8 @@ final class SettingsWindowController: NSWindowController {
         let diskUnit = NSTextField(labelWithString: "GiB")
         diskUnit.textColor = .secondaryLabelColor
         let disk = NSStackView(views: [diskField, diskStepper, diskUnit])
+        diskField.setAccessibilityLabel("Disk size in GiB")
+        diskStepper.setAccessibilityLabel("Adjust disk size in GiB")
         disk.spacing = 4
 
         let mac = memoryLabel(gib: Int(ProcessInfo.processInfo.physicalMemory >> 30))
@@ -257,7 +259,7 @@ final class SettingsWindowController: NSWindowController {
     /// when they changed elsewhere (the CLI, or a failed save).
     private func sync() {
         let status = model.status
-        let config = status?.config
+        let config = status?.effectiveConfig
         if config != seen && !model.busy {
             seen = config
             if config != shown {
@@ -349,7 +351,7 @@ final class SettingsWindowController: NSWindowController {
             self.seen = nil
             if !self.model.busy {
                 // Show what is actually saved.
-                self.shown = self.model.status?.config
+                self.shown = self.model.status?.effectiveConfig
                 self.showValues()
             }
         }

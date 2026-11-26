@@ -24,7 +24,10 @@ pub struct Config {
     /// macOS, so the default is generous (see [`default_memory_mib`]).
     pub memory_mib: u32,
     /// Data disk size ceiling in GiB (sparse on APFS; grows `data.img` at the
-    /// next VM start, never shrinks).
+    /// next VM start, never shrinks). Not written to `config.toml` when
+    /// default, so older versions (which deny unknown keys) still read saved
+    /// configs after a rollback.
+    #[serde(skip_serializing_if = "is_default_disk_gib")]
     pub disk_gib: u32,
     /// Show the guest's files on the Mac over NFS.
     pub mount: bool,
@@ -85,6 +88,109 @@ impl Default for Config {
             k8s_version: None,
             k8s_disable: Vec::new(),
             k8s_args: Vec::new(),
+        }
+    }
+}
+
+/// Legacy-compatible wire payload of [`Config`] carried inside
+/// [`crate::api::Status`] and [`crate::api::ConfigView`].
+///
+/// Omits `disk_gib` so older CLIs (whose `Config` uses `deny_unknown_fields`)
+/// can still decode `status` and `config.get` replies from a newer daemon.
+/// The saved disk target is exposed instead as an additive top-level
+/// `disk_gib` field on those enclosing RPC responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WireConfig {
+    pub cpus: u8,
+    pub memory_mib: u32,
+    pub mount: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<PathBuf>,
+    pub launch_at_login: bool,
+    pub pause_on_sleep: bool,
+    pub auto_forward: bool,
+    #[serde(skip_serializing_if = "is_default_forward_addresses")]
+    pub forward_addresses: Vec<Ipv4Addr>,
+    pub amd64: Emulation,
+    pub kubernetes: bool,
+    #[serde(skip_serializing_if = "is_default_nofile")]
+    pub nofile: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k8s_version: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_disable: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_args: Vec<String>,
+}
+
+impl Default for WireConfig {
+    fn default() -> Self {
+        WireConfig::from(Config::default())
+    }
+}
+
+impl From<&Config> for WireConfig {
+    fn from(c: &Config) -> Self {
+        WireConfig {
+            cpus: c.cpus,
+            memory_mib: c.memory_mib,
+            mount: c.mount,
+            mount_path: c.mount_path.clone(),
+            launch_at_login: c.launch_at_login,
+            pause_on_sleep: c.pause_on_sleep,
+            auto_forward: c.auto_forward,
+            forward_addresses: c.forward_addresses.clone(),
+            amd64: c.amd64,
+            kubernetes: c.kubernetes,
+            nofile: c.nofile,
+            k8s_version: c.k8s_version.clone(),
+            k8s_disable: c.k8s_disable.clone(),
+            k8s_args: c.k8s_args.clone(),
+        }
+    }
+}
+
+impl From<Config> for WireConfig {
+    fn from(c: Config) -> Self {
+        WireConfig {
+            cpus: c.cpus,
+            memory_mib: c.memory_mib,
+            mount: c.mount,
+            mount_path: c.mount_path,
+            launch_at_login: c.launch_at_login,
+            pause_on_sleep: c.pause_on_sleep,
+            auto_forward: c.auto_forward,
+            forward_addresses: c.forward_addresses,
+            amd64: c.amd64,
+            kubernetes: c.kubernetes,
+            nofile: c.nofile,
+            k8s_version: c.k8s_version,
+            k8s_disable: c.k8s_disable,
+            k8s_args: c.k8s_args,
+        }
+    }
+}
+
+impl WireConfig {
+    /// Recombine this wire config with the enclosing response's `disk_gib`.
+    pub fn into_config(self, disk_gib: Option<u32>) -> Config {
+        Config {
+            cpus: self.cpus,
+            memory_mib: self.memory_mib,
+            disk_gib: disk_gib.unwrap_or(DEFAULT_DISK_GIB),
+            mount: self.mount,
+            mount_path: self.mount_path,
+            launch_at_login: self.launch_at_login,
+            pause_on_sleep: self.pause_on_sleep,
+            auto_forward: self.auto_forward,
+            forward_addresses: self.forward_addresses,
+            amd64: self.amd64,
+            kubernetes: self.kubernetes,
+            nofile: self.nofile,
+            k8s_version: self.k8s_version,
+            k8s_disable: self.k8s_disable,
+            k8s_args: self.k8s_args,
         }
     }
 }
@@ -173,6 +279,10 @@ pub const MAX_DISK_GIB: u32 = 16 * 1024;
 
 pub const fn default_disk_gib() -> u32 {
     DEFAULT_DISK_GIB
+}
+
+fn is_default_disk_gib(n: &u32) -> bool {
+    *n == DEFAULT_DISK_GIB
 }
 
 /// Half of the Mac's memory, between 2 and 16 GiB, and within what
@@ -352,16 +462,19 @@ impl Config {
         for (k, v) in values {
             next.set(k, v, host)?;
         }
-        if (values.contains_key("disk") || values.contains_key("disk_gib"))
-            && let Some(cur_bytes) = data_disk_bytes(home)
-        {
-            let target_bytes = u64::from(next.disk_gib) << 30;
-            if target_bytes < cur_bytes {
-                let cur_gib = cur_bytes.div_ceil(1 << 30);
-                bail!(
-                    "cannot shrink data disk from {cur_gib} GiB to {} GiB (only growing is supported)",
-                    next.disk_gib
-                );
+        if values.contains_key("disk") || values.contains_key("disk_gib") {
+            let img_path = home.join("data/data.img");
+            if let Some(cur_bytes) =
+                data_disk_bytes(home).with_context(|| format!("stat {}", img_path.display()))?
+            {
+                let target_bytes = u64::from(next.disk_gib) << 30;
+                if target_bytes < cur_bytes {
+                    let cur_gib = cur_bytes.div_ceil(1 << 30);
+                    bail!(
+                        "cannot shrink data disk from {cur_gib} GiB to {} GiB (only growing is supported)",
+                        next.disk_gib
+                    );
+                }
             }
         }
         *self = next;
@@ -637,11 +750,19 @@ fn format_k8s_args(args: &[String]) -> String {
         .join(" ")
 }
 
-/// Current apparent size of `<home>/data/data.img` in bytes, if it exists.
-pub fn data_disk_bytes(home: &Path) -> Option<u64> {
-    fs::metadata(home.join("data/data.img"))
-        .ok()
-        .map(|m| m.len())
+/// Current apparent size of `<home>/data/data.img` in bytes, or `Ok(None)`
+/// when the image does not exist yet.
+pub fn data_disk_bytes(home: &Path) -> std::io::Result<Option<u64>> {
+    match fs::metadata(home.join("data/data.img")) {
+        Ok(m) => Ok(Some(m.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Convert a data-disk byte length into whole GiB (rounding up partial GiB).
+pub fn bytes_to_gib(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(1 << 30)).unwrap_or(u32::MAX)
 }
 
 /// Accepts `64`, `500G`, `500GB`, `500GiB`, `1T`, `1TB` and `1TiB`.
@@ -1120,6 +1241,108 @@ mod tests {
             .apply_values(&map(&[("cpus", "2")]), &HOST, &home)
             .unwrap();
         assert_eq!(smaller.cpus, 2);
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn default_disk_gib_is_omitted_on_save_so_rollback_reads_config() {
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct PreDiskConfig {
+            cpus: u8,
+            memory_mib: u32,
+            mount: bool,
+            mount_path: Option<PathBuf>,
+            launch_at_login: bool,
+            pause_on_sleep: bool,
+            auto_forward: bool,
+            amd64: Emulation,
+            kubernetes: bool,
+        }
+        impl Default for PreDiskConfig {
+            fn default() -> Self {
+                Self {
+                    cpus: 1,
+                    memory_mib: 1024,
+                    mount: true,
+                    mount_path: None,
+                    launch_at_login: true,
+                    pause_on_sleep: false,
+                    auto_forward: true,
+                    amd64: Emulation::default(),
+                    kubernetes: false,
+                }
+            }
+        }
+
+        let home = temp_home("disk-default-omit");
+        let mut cfg = Config::default();
+        // Saving an unrelated setting leaves disk_gib out of config.toml.
+        cfg.set("mount", "off", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        let text = fs::read_to_string(Config::path(&home)).unwrap();
+        assert!(!text.contains("disk_gib"), "{text}");
+        let legacy: PreDiskConfig = toml::from_str(&text).unwrap();
+        assert!(!legacy.mount);
+        assert_eq!(Config::load(&home).unwrap(), cfg);
+
+        // Non-default disk_gib IS persisted and round-trips.
+        cfg.set("disk", "500G", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        let text = fs::read_to_string(Config::path(&home)).unwrap();
+        assert!(text.contains("disk_gib = 500"), "{text}");
+        assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn apply_values_rejects_disk_edit_when_image_metadata_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_home("disk-stat-err");
+        fs::create_dir_all(&home).unwrap();
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // 1. `<home>/data` as a regular file triggers NotADirectory (even as root).
+        let data_path = home.join("data");
+        fs::write(&data_path, b"not a directory").unwrap();
+        let mut cfg = Config::default();
+        let before = cfg.clone();
+        let err = cfg
+            .apply_values(&map(&[("disk", "128G")]), &HOST, &home)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("data.img"),
+            "error should mention data.img path: {err:#}"
+        );
+        assert_eq!(cfg, before);
+        fs::remove_file(&data_path).unwrap();
+
+        // 2. Unsearchable `<home>/data` directory triggers PermissionDenied (when non-root).
+        fs::create_dir_all(&data_path).unwrap();
+        fs::File::create(data_path.join("data.img"))
+            .unwrap()
+            .set_len(200u64 << 30)
+            .unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            fs::set_permissions(&data_path, fs::Permissions::from_mode(0o000)).unwrap();
+            let err = cfg
+                .apply_values(&map(&[("disk", "100G")]), &HOST, &home)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("data.img"),
+                "error should mention data.img path: {err:#}"
+            );
+            assert_eq!(cfg, before);
+            fs::set_permissions(&data_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         fs::remove_dir_all(&home).unwrap();
     }

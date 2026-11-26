@@ -37,8 +37,13 @@ pub struct RunArgs {
     #[arg(long, default_value = "guest/out/data.img")]
     pub data_template: PathBuf,
     /// Data disk size ceiling in GiB (grows data.img before boot, never shrinks).
-    #[arg(long, default_value_t = crate::config::DEFAULT_DISK_GIB)]
-    pub disk_gib: u32,
+    /// When omitted, keeps the template or existing image size unchanged.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32)
+            .range(i64::from(crate::config::MIN_DISK_GIB)..=i64::from(crate::config::MAX_DISK_GIB))
+    )]
+    pub disk_gib: Option<u32>,
     #[arg(long, default_value_t = 4)]
     pub cpus: u8,
     /// Guest memory ceiling. Memory the guest frees goes back to macOS, so the
@@ -101,6 +106,11 @@ pub enum PortOrigin {
 /// What [`run_vm`] reports while the VM runs, for the daemon's status.
 #[derive(Debug)]
 pub enum Event {
+    /// The host-side `data.img` has been cloned (if needed) and grown (if
+    /// requested); `bytes` is the final apparent size attached to the VM.
+    DiskPrepared {
+        bytes: u64,
+    },
     Booted {
         kernel_release: String,
         vm_pid: u32,
@@ -594,10 +604,8 @@ fn session(
         .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
 
     let data_img = data_dir.join("data.img");
-    if !data_img.exists() {
-        clone_template(&vm::absolute(&args.data_template)?, &data_img)?;
-    }
-    grow_data_disk(&data_img, args.disk_gib)?;
+    let disk_bytes = prepare_data_disk(&data_img, &args.data_template, args.disk_gib)?;
+    on_event(Event::DiskPrepared { bytes: disk_bytes });
     let docker_sock = run_dir.join("docker.sock");
     // Unpublished container ports, relayed over vsock (see autofwd.rs).
     let auto_forward = !args.no_network && !args.no_auto_forward;
@@ -1132,9 +1140,38 @@ fn clone_template(template: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ensure `data_img` exists (cloning `data_template` if missing) and grow it
+/// to `target_gib` GiB when requested. Validates `target_gib` before cloning
+/// the template so an invalid size never leaves a stray `data.img`. Returns
+/// the final apparent size of `data_img` in bytes.
+pub(crate) fn prepare_data_disk(
+    data_img: &Path,
+    data_template: &Path,
+    target_gib: Option<u32>,
+) -> anyhow::Result<u64> {
+    if let Some(gib) = target_gib
+        && !(crate::config::MIN_DISK_GIB..=crate::config::MAX_DISK_GIB).contains(&gib)
+    {
+        bail!(
+            "disk_gib must be between {} and {}",
+            crate::config::MIN_DISK_GIB,
+            crate::config::MAX_DISK_GIB
+        );
+    }
+    if !data_img.exists() {
+        clone_template(&vm::absolute(data_template)?, data_img)?;
+    }
+    match target_gib {
+        Some(gib) => grow_data_disk(data_img, gib),
+        None => Ok(fs::metadata(data_img)
+            .with_context(|| format!("stat {}", data_img.display()))?
+            .len()),
+    }
+}
+
 /// Extend `data.img` to `target_gib` GiB (sparse on APFS). Never shrinks an
-/// existing image. Returns whether the image was grown.
-fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<bool> {
+/// existing image. Returns the final apparent size in bytes.
+fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<u64> {
     if !(crate::config::MIN_DISK_GIB..=crate::config::MAX_DISK_GIB).contains(&target_gib) {
         bail!(
             "disk_gib must be between {} and {}",
@@ -1147,7 +1184,7 @@ fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<bool> {
         .with_context(|| format!("stat {}", path.display()))?
         .len();
     if target_bytes == current_bytes {
-        return Ok(false);
+        return Ok(current_bytes);
     }
     if target_bytes < current_bytes {
         eprintln!(
@@ -1155,7 +1192,7 @@ fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<bool> {
             path.display(),
             current_bytes.div_ceil(1 << 30)
         );
-        return Ok(false);
+        return Ok(current_bytes);
     }
     let f = OpenOptions::new()
         .write(true)
@@ -1168,7 +1205,7 @@ fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<bool> {
         path.display(),
         current_bytes >> 30
     );
-    Ok(true)
+    Ok(target_bytes)
 }
 
 /// Only one `katamaran run` may own the state directory at a time.
@@ -1894,11 +1931,11 @@ mod tests {
         drop(f);
 
         // Same size is a no-op.
-        assert!(!grow_data_disk(&img, 64).unwrap());
+        assert_eq!(grow_data_disk(&img, 64).unwrap(), 64u64 << 30);
         assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
 
         // Growing extends apparent size sparsely and preserves existing bytes.
-        assert!(grow_data_disk(&img, 200).unwrap());
+        assert_eq!(grow_data_disk(&img, 200).unwrap(), 200u64 << 30);
         let meta = fs::metadata(&img).unwrap();
         assert_eq!(meta.len(), 200u64 << 30);
         assert!(
@@ -1911,12 +1948,84 @@ mod tests {
         assert_eq!(&head, b"btrfs-header");
 
         // Smaller target never truncates.
-        assert!(!grow_data_disk(&img, 128).unwrap());
+        assert_eq!(grow_data_disk(&img, 128).unwrap(), 200u64 << 30);
         assert_eq!(fs::metadata(&img).unwrap().len(), 200u64 << 30);
 
         // Invalid sizes fail.
         assert!(grow_data_disk(&img, 32).is_err());
         assert!(grow_data_disk(&img, crate::config::MAX_DISK_GIB + 1).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn run_args_validate_disk_gib_range_at_parse_time() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+
+        // Omitting --disk-gib leaves it unset so smaller custom templates are not grown.
+        let default_args = Wrapper::try_parse_from(["run"]).unwrap().run;
+        assert_eq!(default_args.disk_gib, None);
+
+        let min_args = Wrapper::try_parse_from(["run", "--disk-gib", "64"])
+            .unwrap()
+            .run;
+        assert_eq!(min_args.disk_gib, Some(64));
+
+        let big_args = Wrapper::try_parse_from(["run", "--disk-gib", "500"])
+            .unwrap()
+            .run;
+        assert_eq!(big_args.disk_gib, Some(500));
+
+        let max_str = crate::config::MAX_DISK_GIB.to_string();
+        let max_args = Wrapper::try_parse_from(["run", "--disk-gib", &max_str])
+            .unwrap()
+            .run;
+        assert_eq!(max_args.disk_gib, Some(crate::config::MAX_DISK_GIB));
+
+        // Out-of-range sizes fail during argument parsing, before session can clone a template.
+        assert!(Wrapper::try_parse_from(["run", "--disk-gib", "0"]).is_err());
+        assert!(Wrapper::try_parse_from(["run", "--disk-gib", "32"]).is_err());
+        let over_str = (crate::config::MAX_DISK_GIB + 1).to_string();
+        assert!(Wrapper::try_parse_from(["run", "--disk-gib", &over_str]).is_err());
+    }
+
+    #[test]
+    fn prepare_data_disk_rejects_bad_size_before_cloning_and_keeps_small_template_when_unset() {
+        let dir = std::env::temp_dir().join(format!("kat-prep-disk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let template = dir.join("small-template.img");
+        let small_bytes = 8u64 << 30;
+        let mut f = File::create(&template).unwrap();
+        f.write_all(b"small-btrfs").unwrap();
+        f.set_len(small_bytes).unwrap();
+        drop(f);
+
+        let dest = dir.join("data.img");
+
+        // Invalid target fails BEFORE cloning the template.
+        assert!(prepare_data_disk(&dest, &template, Some(32)).is_err());
+        assert!(
+            !dest.exists(),
+            "failed range check must not create data.img"
+        );
+
+        // Omitting target keeps an intentionally smaller custom template at its exact size.
+        let prepared = prepare_data_disk(&dest, &template, None).unwrap();
+        assert_eq!(prepared, small_bytes);
+        assert_eq!(fs::metadata(&dest).unwrap().len(), small_bytes);
+
+        // Explicit growth extends the existing image and returns the new size.
+        let grown = prepare_data_disk(&dest, &template, Some(128)).unwrap();
+        assert_eq!(grown, 128u64 << 30);
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 128u64 << 30);
 
         fs::remove_dir_all(&dir).unwrap();
     }

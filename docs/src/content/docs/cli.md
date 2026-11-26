@@ -361,7 +361,7 @@ katamaran run [OPTIONS]
 | `--initramfs <PATH>` | `guest/out/initramfs.cpio` | Path to initramfs archive |
 | `--rootfs <PATH>` | `guest/out/rootfs.erofs` | Path to read-only EROFS system image |
 | `--data-template <PATH>` | `guest/out/data.img` | Path to template btrfs data disk |
-| `--disk-gib <GIB>` | `64` | Sparse data-disk ceiling in GiB (grows `data.img` before boot, never shrinks) |
+| `--disk-gib <GIB>` | unset (template size) | Sparse data-disk ceiling in GiB (`64` to `16384`; grows `data.img` before boot, never shrinks; omitted keeps the template or existing image size) |
 | `--cmdline <ARGS>` | empty | Extra Linux kernel command-line arguments |
 | `--vm-bin <PATH>` | sibling `katamaran-vm` | Explicit path to the `katamaran-vm` binary |
 | `--no-share` | off | Do not share `/Users` into the guest |

@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, WireConfig};
 use crate::state::VmState;
 
 pub const SOCKET_NAME: &str = "daemon.sock";
@@ -429,7 +429,12 @@ pub struct LogChunk {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigView {
-    pub config: Config,
+    pub config: WireConfig,
+    /// Saved data-disk target in GiB. Carried on the enclosing response rather
+    /// than inside `config` so older CLIs (whose `Config` uses
+    /// `deny_unknown_fields`) still decode `config.get` / `config.set` replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
     pub path: PathBuf,
     /// The running VM was started with different settings.
     pub restart_required: bool,
@@ -437,6 +442,13 @@ pub struct ConfigView {
     /// immediate start or stop on a running VM).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub k8s_toggled: bool,
+}
+
+impl ConfigView {
+    /// Reconstruct the full [`Config`], combining `config` with `disk_gib`.
+    pub fn resolved_config(&self) -> Config {
+        self.config.clone().into_config(self.disk_gib)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -461,8 +473,13 @@ pub struct Status {
     pub uptime_s: Option<f64>,
     pub daemon: DaemonInfo,
     pub versions: Versions,
-    /// The saved settings, used at the next start.
-    pub config: Config,
+    /// The saved settings, used at the next start (legacy wire shape without `disk_gib`).
+    pub config: WireConfig,
+    /// Saved data-disk target in GiB. Carried on the enclosing response rather
+    /// than inside `config` so older CLIs (whose `Config` uses
+    /// `deny_unknown_fields`) still decode `status` replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
     /// The running VM's settings and timings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmInfo>,
@@ -476,6 +493,13 @@ pub struct Status {
     /// Ports the guest tried to expose that could not be bound on macOS.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_errors: Vec<PortError>,
+}
+
+impl Status {
+    /// Saved data-disk target in GiB, falling back to the default for older daemons.
+    pub fn saved_disk_gib(&self) -> u32 {
+        self.disk_gib.unwrap_or(crate::config::DEFAULT_DISK_GIB)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -492,8 +516,15 @@ pub struct DaemonInfo {
 pub struct VmInfo {
     pub cpus: u8,
     pub memory_mib: u32,
+    /// Attached data-disk size in GiB (may exceed the saved target if
+    /// `data.img` was already grown larger).
     #[serde(default = "crate::config::default_disk_gib")]
     pub disk_gib: u32,
+    /// Requested `disk_gib` target from config when this VM started, kept
+    /// separate from `disk_gib` so a retained larger image does not appear
+    /// as perpetual pending work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_disk_gib: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// Start request until the guest's hello.
@@ -502,6 +533,14 @@ pub struct VmInfo {
     /// Start request until Docker answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_ready_ms: Option<f64>,
+}
+
+impl VmInfo {
+    /// Requested data-disk target for this VM run, falling back to `disk_gib`
+    /// for older daemons.
+    pub fn requested_disk_gib(&self) -> u32 {
+        self.requested_disk_gib.unwrap_or(self.disk_gib)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -933,11 +972,13 @@ mod tests {
                 protocol: 2,
                 kernel: Some("6.18".into()),
             },
-            config: Config::default(),
+            config: WireConfig::default(),
+            disk_gib: Some(crate::config::DEFAULT_DISK_GIB),
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
                 disk_gib: 64,
+                requested_disk_gib: Some(64),
                 pid: Some(9),
                 boot_ms: Some(120.0),
                 docker_ready_ms: Some(900.0),
@@ -996,5 +1037,119 @@ mod tests {
         let legacy: VmInfo =
             serde_json::from_value(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
         assert_eq!(legacy.disk_gib, crate::config::DEFAULT_DISK_GIB);
+        assert_eq!(legacy.requested_disk_gib(), crate::config::DEFAULT_DISK_GIB);
+    }
+
+    #[test]
+    fn pre_disk_cli_decodes_status_and_config_view_replies() {
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct PreDiskConfig {
+            cpus: u8,
+            memory_mib: u32,
+            mount: bool,
+            mount_path: Option<PathBuf>,
+            launch_at_login: bool,
+            pause_on_sleep: bool,
+            auto_forward: bool,
+            amd64: crate::amd64::Emulation,
+            kubernetes: bool,
+        }
+        impl Default for PreDiskConfig {
+            fn default() -> Self {
+                Self {
+                    cpus: 1,
+                    memory_mib: 1024,
+                    mount: true,
+                    mount_path: None,
+                    launch_at_login: true,
+                    pause_on_sleep: false,
+                    auto_forward: true,
+                    amd64: crate::amd64::Emulation::default(),
+                    kubernetes: false,
+                }
+            }
+        }
+        #[derive(Deserialize)]
+        struct PreDiskStatus {
+            state: VmState,
+            versions: Versions,
+            config: PreDiskConfig,
+        }
+        #[derive(Deserialize)]
+        struct PreDiskConfigView {
+            config: PreDiskConfig,
+            restart_required: bool,
+        }
+
+        for target_gib in [crate::config::DEFAULT_DISK_GIB, 500] {
+            let cfg = Config {
+                disk_gib: target_gib,
+                ..Config::default()
+            };
+            let status = Status {
+                state: VmState::Running,
+                error: None,
+                since_ms: 1,
+                uptime_s: Some(2.5),
+                daemon: DaemonInfo {
+                    pid: 7,
+                    home: "/tmp/h".into(),
+                    started_ms: 0,
+                    launchd_label: None,
+                },
+                versions: Versions {
+                    katamaran: "0.11.0".into(),
+                    protocol: 3,
+                    kernel: Some("6.18".into()),
+                },
+                config: WireConfig::from(&cfg),
+                disk_gib: Some(cfg.disk_gib),
+                vm: Some(VmInfo {
+                    cpus: cfg.cpus,
+                    memory_mib: cfg.memory_mib,
+                    disk_gib: target_gib,
+                    requested_disk_gib: Some(target_gib),
+                    pid: Some(9),
+                    boot_ms: Some(120.0),
+                    docker_ready_ms: Some(900.0),
+                }),
+                usage: None,
+                docker: DockerInfo {
+                    state: DockerState::Ready,
+                    socket: "/tmp/h/run/docker.sock".into(),
+                },
+                k8s: K8sStatus::default(),
+                mount: MountInfo {
+                    enabled: false,
+                    path: None,
+                    mounted: false,
+                    error: None,
+                },
+                ports: vec![],
+                port_errors: vec![],
+            };
+            let status_json = serde_json::to_value(&status).unwrap();
+            assert!(status_json["config"].get("disk_gib").is_none());
+            assert_eq!(status_json["disk_gib"], target_gib);
+            let old_status: PreDiskStatus = serde_json::from_value(status_json).unwrap();
+            assert_eq!(old_status.state, VmState::Running);
+            assert_eq!(old_status.versions.katamaran, "0.11.0");
+            assert_eq!(old_status.config.cpus, cfg.cpus);
+
+            let view = ConfigView {
+                config: WireConfig::from(&cfg),
+                disk_gib: Some(cfg.disk_gib),
+                path: "/tmp/h/config.toml".into(),
+                restart_required: target_gib != crate::config::DEFAULT_DISK_GIB,
+            };
+            let view_json = serde_json::to_value(&view).unwrap();
+            assert!(view_json["config"].get("disk_gib").is_none());
+            assert_eq!(view_json["disk_gib"], target_gib);
+            let old_view: PreDiskConfigView = serde_json::from_value(view_json).unwrap();
+            assert_eq!(old_view.config.cpus, cfg.cpus);
+            assert_eq!(old_view.restart_required, view.restart_required);
+            assert_eq!(view.resolved_config().disk_gib, target_gib);
+        }
     }
 }

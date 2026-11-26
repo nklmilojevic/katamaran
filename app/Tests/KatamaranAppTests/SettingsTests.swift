@@ -337,3 +337,35 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(decoded.portURL(port: 9000)?.absoluteString == "http://localhost:9000")
     #expect(decoded.portHost(port: 9999) == "localhost")
 }
+
+@Test func daemonStatusAndConfigViewDecodeEnclosingDiskGib() throws {
+    let legacy = try status()
+    #expect(legacy.disk_gib == nil)
+    #expect(legacy.effectiveConfig.disk_gib == nil)
+
+    let statusJSON = """
+    {"state": "running", "since_ms": 0,
+     "daemon": {"pid": 1, "home": "/tmp/k"},
+     "versions": {"katamaran": "0.11.0", "protocol": 3},
+     "config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "disk_gib": 500,
+     "vm": {"cpus": 4, "memory_mib": 4096, "disk_gib": 500, "requested_disk_gib": 64},
+     "docker": {"state": "ready", "socket": "/tmp/k/run/docker.sock"},
+     "mount": {"enabled": true, "mounted": true},
+     "ports": []}
+    """
+    let decoded = try JSONDecoder().decode(DaemonStatus.self, from: Data(statusJSON.utf8))
+    #expect(decoded.disk_gib == 500)
+    #expect(decoded.config.disk_gib == nil)
+    #expect(decoded.effectiveConfig.disk_gib == 500)
+    #expect(decoded.vm?.disk_gib == 500)
+
+    let viewJSON = """
+    {"config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "disk_gib": 64,
+     "restart_required": false}
+    """
+    let view = try JSONDecoder().decode(ConfigView.self, from: Data(viewJSON.utf8))
+    #expect(view.disk_gib == 64)
+    #expect(view.config.disk_gib == nil)
+}
