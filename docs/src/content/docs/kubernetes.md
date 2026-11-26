@@ -43,6 +43,19 @@ To wipe all cluster state, workloads, and persistent volumes and start fresh:
 kat k8s reset
 ```
 
+## Choose the k3s version
+
+Each katamaran release pins a tested `k3s` build. To keep the local cluster on the same minor as production, set `k8s_version` to any [k3s release tag](https://github.com/k3s-io/k3s/releases) from `v1.31` on:
+
+```sh
+kat config set k8s_version=v1.32.5+k3s1
+kat config set k8s_version=   # back to the pinned build
+```
+
+katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<version>/` and verifies it against the SHA-256 published in the release's `sha256sum-arm64.txt` (the pinned build is checked against a checksum built into katamaran). The new version is installed at the next Kubernetes start, so restart a running cluster with `kat k8s stop && kat k8s start` or `kat restart`.
+
+Upgrading keeps the cluster's state. Kubernetes does not support downgrades, so run `kat k8s reset` after moving to an older minor.
+
 ## Connect with `kubectl`
 
 When Kubernetes starts, katamaran relays `127.0.0.1:6443` on macOS (falling back to an available local port if `6443` is already in use) to the guest API server over virtio-vsock (`~/.katamaran/run/k8s-api.sock`).

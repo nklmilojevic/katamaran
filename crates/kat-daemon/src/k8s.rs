@@ -1,6 +1,6 @@
 //! Host-side Kubernetes (k3s) manager:
-//! - downloads and SHA-256 verifies the pinned `k3s-arm64` binary into
-//!   `<home>/cache/k3s/<version>/k3s-arm64`,
+//! - downloads and SHA-256 verifies the `k3s-arm64` binary (the pinned build,
+//!   or the `k8s_version` config key) into `<home>/cache/k3s/<version>/k3s-arm64`,
 //! - streams requests to the guest's k8s service over `<home>/run/k8s.sock`,
 //! - relays `127.0.0.1:<api_port>` to `<home>/run/k8s-api.sock` (`K8S_API_PORT`),
 //! - merges/removes the `katamaran` context in `~/.kube/config`,
@@ -47,8 +47,10 @@ impl Drop for ConnGuard {
 pub const K3S_VERSION: &str = "v1.37.2+k3s1";
 pub const K3S_ARM64_SHA256: &str =
     "a779ccf1e5e2e33a62f5a29c2f1c0bbf99431e100579d4c10f0aa0742a6aa84b";
-pub const K3S_ARM64_URL: &str =
-    "https://github.com/k3s-io/k3s/releases/download/v1.37.2%2Bk3s1/k3s-arm64";
+const K3S_RELEASES: &str = "https://github.com/k3s-io/k3s/releases/download";
+/// Release asset listing the SHA-256 of every arm64 artifact.
+const K3S_ARM64_SUMS: &str = "sha256sum-arm64.txt";
+const K3S_ARM64: &str = "k3s-arm64";
 
 pub const SOCKET_NAME: &str = "k8s.sock";
 pub const API_SOCKET_NAME: &str = "k8s-api.sock";
@@ -77,11 +79,27 @@ pub fn kubeconfig_path(home: &Path) -> PathBuf {
     home.join("run").join(KUBECONFIG_NAME)
 }
 
-pub fn cache_binary_path(home: &Path) -> PathBuf {
-    home.join("cache")
-        .join("k3s")
-        .join(K3S_VERSION)
-        .join("k3s-arm64")
+pub fn cache_binary_path(home: &Path, version: &str) -> PathBuf {
+    home.join("cache").join("k3s").join(version).join(K3S_ARM64)
+}
+
+/// The release asset `name` of k3s `version` (`+` is `%2B` in the tag).
+fn release_url(version: &str, name: &str) -> String {
+    format!("{K3S_RELEASES}/{}/{name}", version.replace('+', "%2B"))
+}
+
+/// The SHA-256 of `k3s-arm64` from a release's `sha256sum-arm64.txt`.
+fn parse_arm64_sha256(sums: &str) -> anyhow::Result<String> {
+    sums.lines()
+        .find_map(|line| {
+            let mut it = line.split_whitespace();
+            let (hash, name) = (it.next()?, it.next()?);
+            (name.trim_start_matches('*') == K3S_ARM64
+                && hash.len() == 64
+                && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+        })
+        .with_context(|| format!("{K3S_ARM64_SUMS} has no {K3S_ARM64} checksum"))
 }
 
 pub fn context_name() -> anyhow::Result<String> {
@@ -139,17 +157,18 @@ pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
 /// already cached and verified, then stream it into the guest if the guest
 /// doesn't already have this version installed.
 pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::Result<()> {
+    let version = crate::config::Config::load(home)?.k3s_version().to_string();
     let info = guest_status(home)?;
-    if info.installed && info.version == K3S_VERSION {
+    if info.installed && info.version == version {
         return Ok(());
     }
-    let cached = ensure_cached_binary(home, progress)?;
-    progress(&format!("transferring k3s {K3S_VERSION} to VM"));
+    let cached = ensure_cached_binary(home, &version, progress)?;
+    progress(&format!("transferring k3s {version} to VM"));
     let mut s = connect(home)?;
     k8s::write(
         &mut s,
         &K8sMsg::Install {
-            version: K3S_VERSION.into(),
+            version: version.clone(),
         },
     )?;
     let mut f = File::open(&cached).with_context(|| format!("open {}", cached.display()))?;
@@ -180,26 +199,54 @@ pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
     }
 }
 
-fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::Result<PathBuf> {
-    let path = cache_binary_path(home);
-    if path.is_file() && verify_sha256(&path, K3S_ARM64_SHA256).is_ok() {
-        return Ok(path);
-    }
+/// The pinned build is checked against [`K3S_ARM64_SHA256`]; any other
+/// release against its own `sha256sum-arm64.txt`, whose `k3s-arm64` line is
+/// kept next to the cached binary so a cache hit needs no network.
+fn ensure_cached_binary(
+    home: &Path,
+    version: &str,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<PathBuf> {
+    let path = cache_binary_path(home, version);
     let parent = path
         .parent()
         .with_context(|| format!("missing parent for {}", path.display()))?;
+    let sum_path = parent.join(format!("{K3S_ARM64}.sha256"));
+    let pinned = version == K3S_VERSION;
+    let known = if pinned {
+        Some(K3S_ARM64_SHA256.to_string())
+    } else {
+        fs::read_to_string(&sum_path)
+            .ok()
+            .and_then(|s| parse_arm64_sha256(&s).ok())
+    };
+    if let Some(sum) = &known
+        && path.is_file()
+        && verify_sha256(&path, sum).is_ok()
+    {
+        return Ok(path);
+    }
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let expected = if pinned {
+        K3S_ARM64_SHA256.to_string()
+    } else {
+        progress(&format!("fetching k3s {version} checksums"));
+        let url = release_url(version, K3S_ARM64_SUMS);
+        let sums = crate::machines::curl_text(&url)
+            .with_context(|| format!("k3s release {version} not found (k8s_version)"))?;
+        parse_arm64_sha256(&sums).with_context(|| format!("read {url}"))?
+    };
     let pid = std::process::id();
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!("k3s-arm64.{pid}.{seq}.part"));
+    let tmp = parent.join(format!("{K3S_ARM64}.{pid}.{seq}.part"));
     let _ = fs::remove_file(&tmp);
-    progress(&format!("downloading k3s {K3S_VERSION} (~74 MB)"));
-    if let Err(e) = crate::machines::curl(K3S_ARM64_URL, &tmp) {
+    progress(&format!("downloading k3s {version} (~74 MB)"));
+    if let Err(e) = crate::machines::curl(&release_url(version, K3S_ARM64), &tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     progress("verifying k3s checksum");
-    if let Err(e) = verify_sha256(&tmp, K3S_ARM64_SHA256) {
+    if let Err(e) = verify_sha256(&tmp, &expected) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -210,6 +257,17 @@ fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
     if let Err(e) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("save {}", path.display()));
+    }
+    if !pinned {
+        // Best effort: without it the next start fetches the checksums again.
+        let sum_tmp = parent.join(format!("{K3S_ARM64}.sha256.{pid}.{seq}.part"));
+        let line = format!("{expected}  {K3S_ARM64}\n");
+        if fs::write(&sum_tmp, line)
+            .and_then(|()| fs::rename(&sum_tmp, &sum_path))
+            .is_err()
+        {
+            let _ = fs::remove_file(&sum_tmp);
+        }
     }
     Ok(path)
 }
@@ -1143,6 +1201,34 @@ fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_urls_escape_the_build_suffix() {
+        assert_eq!(
+            release_url(K3S_VERSION, K3S_ARM64),
+            "https://github.com/k3s-io/k3s/releases/download/v1.37.2%2Bk3s1/k3s-arm64"
+        );
+        assert_eq!(
+            release_url("v1.32.5+k3s1", K3S_ARM64_SUMS),
+            "https://github.com/k3s-io/k3s/releases/download/v1.32.5%2Bk3s1/sha256sum-arm64.txt"
+        );
+    }
+
+    #[test]
+    fn finds_the_arm64_binary_checksum() {
+        let sums = "\
+97c5264b988cac6f26294ded8235e116b52faa0169bdd0c4ea1a5412973d2a8d  k3s-airgap-images-arm64.tar
+EB62D8BA346F7C6A0BB5C874EA92335ECAD7CB3FA167508F94888AAEB43E7F22 *k3s-arm64
+";
+        assert_eq!(
+            parse_arm64_sha256(sums).unwrap(),
+            "eb62d8ba346f7c6a0bb5c874ea92335ecad7cb3fa167508f94888aaeb43e7f22"
+        );
+        assert!(parse_arm64_sha256("abc  k3s-arm64\n").is_err());
+        assert!(parse_arm64_sha256("").is_err());
+        let airgap_only = sums.lines().next().unwrap();
+        assert!(parse_arm64_sha256(airgap_only).is_err());
+    }
 
     #[test]
     fn rewrites_kubeconfig_server_and_context() {

@@ -44,6 +44,10 @@ pub struct Config {
     /// unknown keys, still read a saved config.
     #[serde(skip_serializing_if = "is_default_nofile")]
     pub nofile: u32,
+    /// The k3s release to run, e.g. `v1.32.5+k3s1`; unset means the build
+    /// this katamaran release pins ([`crate::k8s::K3S_VERSION`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k8s_version: Option<String>,
 }
 
 impl Default for Config {
@@ -60,12 +64,13 @@ impl Default for Config {
             amd64: Emulation::default(),
             kubernetes: false,
             nofile: DEFAULT_NOFILE,
+            k8s_version: None,
         }
     }
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 10] = [
+pub const KEYS: [&str; 11] = [
     "cpus",
     "memory_mib",
     "mount",
@@ -76,6 +81,7 @@ pub const KEYS: [&str; 10] = [
     "amd64",
     "kubernetes",
     "nofile",
+    "k8s_version",
 ];
 
 /// What Docker Desktop, OrbStack and Colima give containers.
@@ -176,6 +182,7 @@ impl Config {
             "amd64" => self.amd64.to_string(),
             "kubernetes" => self.kubernetes.to_string(),
             "nofile" => self.nofile.to_string(),
+            "k8s_version" => self.k8s_version.clone().unwrap_or_default(),
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         })
     }
@@ -205,6 +212,13 @@ impl Config {
                     .parse()
                     .with_context(|| format!("nofile: {value:?}"))?
             }
+            "k8s_version" => {
+                next.k8s_version = match value {
+                    "" | "default" => None,
+                    v if v.starts_with('v') => Some(v.to_string()),
+                    v => Some(format!("v{v}")),
+                }
+            }
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
@@ -213,11 +227,13 @@ impl Config {
     }
 
     /// Whether a VM started with `self` has to restart to use `saved`. All
-    /// but `launch_at_login` and `kubernetes` are read at VM start.
+    /// but `launch_at_login`, `kubernetes` and `k8s_version` (read at each
+    /// Kubernetes start) are read at VM start.
     pub fn needs_restart_for(&self, saved: &Config) -> bool {
         let applied = Config {
             launch_at_login: saved.launch_at_login,
             kubernetes: saved.kubernetes,
+            k8s_version: saved.k8s_version.clone(),
             ..self.clone()
         };
         applied != *saved
@@ -239,8 +255,63 @@ impl Config {
         if !(MIN_NOFILE..=MAX_NOFILE).contains(&self.nofile) {
             bail!("nofile must be between {MIN_NOFILE} and {MAX_NOFILE}");
         }
+        if let Some(v) = &self.k8s_version {
+            validate_k8s_version(v)?;
+        }
         Ok(())
     }
+
+    /// The k3s release to run: `k8s_version`, or the pinned build.
+    pub fn k3s_version(&self) -> &str {
+        self.k8s_version
+            .as_deref()
+            .unwrap_or(crate::k8s::K3S_VERSION)
+    }
+}
+
+/// The oldest Kubernetes minor the guest's k3s flags work with: kube-proxy's
+/// nftables mode is on by default from 1.31.
+const MIN_K8S_MINOR: u32 = 31;
+
+/// A k3s release tag, `v<major>.<minor>.<patch>[-<pre>]+k3s<n>`, no older
+/// than v1.[`MIN_K8S_MINOR`].
+fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
+    let bad = || {
+        anyhow::anyhow!(
+            "k8s_version {v:?} is not a k3s release tag such as {}",
+            crate::k8s::K3S_VERSION
+        )
+    };
+    let rest = v.strip_prefix('v').ok_or_else(bad)?;
+    let (kube, build) = rest.split_once("+k3s").ok_or_else(bad)?;
+    if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let (core, pre) = match kube.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (kube, None),
+    };
+    if let Some(p) = pre
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'))
+    {
+        return Err(bad());
+    }
+    let parts: Vec<u32> = core
+        .split('.')
+        .map(|n| {
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad());
+            }
+            n.parse().map_err(|_| bad())
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let [major, minor, _patch] = parts[..] else {
+        return Err(bad());
+    };
+    if major != 1 || minor < MIN_K8S_MINOR {
+        bail!("k8s_version must be v1.{MIN_K8S_MINOR} or newer, got {v}");
+    }
+    Ok(())
 }
 
 /// Accepts `4096`, `4096M`, `4096MiB`, `4G` and `4GiB`.
@@ -475,6 +546,54 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         assert!(text.contains("nofile = 65536"), "{text}");
         assert_eq!(Config::parse(&text).unwrap(), cfg);
+    }
+
+    #[test]
+    fn k8s_version_defaults_to_the_pinned_build() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.k8s_version, None);
+        assert_eq!(cfg.k3s_version(), crate::k8s::K3S_VERSION);
+        assert_eq!(cfg.get("k8s_version").unwrap(), "");
+        assert!(!toml::to_string(&cfg).unwrap().contains("k8s_version"));
+
+        let started = cfg.clone();
+        cfg.set("k8s_version", "v1.32.5+k3s1", &HOST).unwrap();
+        assert_eq!(cfg.k3s_version(), "v1.32.5+k3s1");
+        // Read at each Kubernetes start, not at VM start.
+        assert!(!started.needs_restart_for(&cfg));
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("k8s_version = \"v1.32.5+k3s1\""), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+
+        cfg.set("k8s_version", "1.33.1+k3s2", &HOST).unwrap();
+        assert_eq!(cfg.get("k8s_version").unwrap(), "v1.33.1+k3s2");
+        cfg.set("k8s_version", "v1.34.0-rc1+k3s1", &HOST).unwrap();
+        cfg.set("k8s_version", "", &HOST).unwrap();
+        assert_eq!(cfg.k8s_version, None);
+        cfg.set("k8s_version", "v1.32.5+k3s1", &HOST).unwrap();
+        cfg.set("k8s_version", "default", &HOST).unwrap();
+        assert_eq!(cfg.k8s_version, None);
+    }
+
+    #[test]
+    fn rejects_bad_k8s_versions() {
+        let mut cfg = Config::default();
+        for v in [
+            "latest",
+            "v1.32",
+            "v1.32.5",
+            "v1.32.5+k3s",
+            "v1.32.5+k3sx",
+            "v1.32.x+k3s1",
+            "v1.32.5-+k3s1",
+            "v1.32.5/../+k3s1",
+            "v2.0.0+k3s1",
+            "v1.30.9+k3s1",
+        ] {
+            assert!(cfg.set("k8s_version", v, &HOST).is_err(), "{v}");
+        }
+        assert_eq!(cfg, Config::default());
+        assert!(Config::parse("k8s_version = \"v1.28.0+k3s1\"\n").is_err());
     }
 
     #[test]

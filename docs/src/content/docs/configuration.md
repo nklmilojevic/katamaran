@@ -43,6 +43,7 @@ kat restart
 | `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
 | `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
+| `k8s_version` | string (optional) | Pinned build (unset) | A k3s release tag, `v1.31` or newer (for example `"v1.32.5+k3s1"`), or empty string to reset to the pinned build. Applies at the next Kubernetes start. See [Choose the k3s version](/kubernetes/#choose-the-k3s-version). |
 | `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) set at guest boot, like `LimitNOFILE` in Docker Desktop. containerd, dockerd, and containers and pods inherit it unless they set their own (for example `docker run --ulimit nofile=...`). |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
@@ -62,7 +63,7 @@ All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
 | `run/k8s-proxy.sock` | Plain-HTTP Kubernetes API socket relayed to the guest `kubectl proxy` (used by the macOS app) |
 | `run/kubeconfig.yaml` | Generated kubeconfig for the single-node Kubernetes cluster |
 | `run/vm.json` | Generated VM launch configuration passed to `katamaran-vm` |
-| `cache/k3s/` | Cached and SHA-256 verified `k3s-arm64` binary downloaded on first Kubernetes start |
+| `cache/k3s/` | Cached and SHA-256 verified `k3s-arm64` binaries downloaded on first Kubernetes start, one directory per version |
 | `logs/` | Logs for `daemon`, `console`, `vm`, and `gvproxy` |
 | `ssh/` | Managed SSH host key, `known_hosts`, and `config` file |
 
