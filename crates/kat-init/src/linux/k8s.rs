@@ -41,6 +41,7 @@ const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
 const DATA_VERSION_FILE: &str = "/var/lib/katamaran/k3s/data/.katamaran-version";
+const DATA_VERSION_TRACKED_FILE: &str = "/var/lib/katamaran/k3s/.datastore-version-tracked";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
@@ -309,20 +310,43 @@ fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+fn is_datastore_version_tracked(tracked_file: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(tracked_file) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {}: {e}", tracked_file.display())),
+    }
+}
+
+/// Record that this guest tracks datastore versions in `DATA_VERSION_FILE` so
+/// future checks never infer an unmarked restored datastore's version from an
+/// unrelated `VERSION_FILE` already installed in the guest.
+fn mark_datastore_version_tracked(tracked_file: &Path) -> Result<(), String> {
+    if is_datastore_version_tracked(tracked_file)? {
+        return Ok(());
+    }
+    if let Some(parent) = tracked_file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    write_atomic(tracked_file, b"1\n")
+}
+
 fn missing_datastore_version_error(
     data_dir: &Path,
     data_version_file: &Path,
-    bin_version_file: &Path,
+    bin_version_file: Option<&Path>,
 ) -> String {
+    let marker_desc = match bin_version_file {
+        Some(bin) => format!("{} or {}", data_version_file.display(), bin.display()),
+        None => data_version_file.display().to_string(),
+    };
     format!(
-        "existing cluster data under {} has no version marker ({} or {}); \
+        "existing cluster data under {} has no version marker ({marker_desc}); \
          cannot verify minor-version compatibility. While Kubernetes is stopped, \
          either restore the matching {} marker recorded with your verified \
          datastore backup, or back up any state you need and run `kat k8s reset` \
          to delete cluster data and persistent volumes before starting fresh.",
         data_dir.display(),
-        data_version_file.display(),
-        bin_version_file.display(),
         data_version_file.display(),
     )
 }
@@ -330,14 +354,16 @@ fn missing_datastore_version_error(
 /// Return the k3s version associated with an existing datastore under `data_dir`.
 ///
 /// Prefers `data_version_file` inside `data_dir` so `reset` clears it together
-/// with cluster data while leaving `bin_version_file` intact. For datastores
-/// created before `data_version_file` existed, falls back to `bin_version_file`.
-/// Rejects an existing `server/` directory when both version markers are absent
-/// so an older binary cannot silently open an unmarked restored datastore.
+/// with cluster data while leaving `bin_version_file` intact. Only falls back to
+/// `bin_version_file` once for legacy datastores created before `tracked_file`
+/// existed; once this guest has installed, started, or reset Kubernetes with
+/// datastore version tracking enabled, an unmarked `server/` directory is always
+/// rejected rather than inheriting an unrelated `bin_version_file`.
 fn effective_datastore_version(
     data_dir: &Path,
     data_version_file: &Path,
     bin_version_file: &Path,
+    tracked_file: &Path,
 ) -> Result<Option<String>, String> {
     if !datastore_exists(data_dir)? {
         return Ok(None);
@@ -345,13 +371,20 @@ fn effective_datastore_version(
     if let Some(v) = read_trimmed_file(data_version_file)? {
         return Ok(Some(v));
     }
+    if is_datastore_version_tracked(tracked_file)? {
+        return Err(missing_datastore_version_error(
+            data_dir,
+            data_version_file,
+            None,
+        ));
+    }
     if let Some(v) = read_trimmed_file(bin_version_file)? {
         return Ok(Some(v));
     }
     Err(missing_datastore_version_error(
         data_dir,
         data_version_file,
-        bin_version_file,
+        Some(bin_version_file),
     ))
 }
 
@@ -361,10 +394,11 @@ fn check_datastore_compatible(
     data_dir: &Path,
     data_version_file: &Path,
     bin_version_file: &Path,
+    tracked_file: &Path,
     target_version: &str,
 ) -> Result<(), String> {
     let Some(existing) =
-        effective_datastore_version(data_dir, data_version_file, bin_version_file)?
+        effective_datastore_version(data_dir, data_version_file, bin_version_file, tracked_file)?
     else {
         return Ok(());
     };
@@ -395,12 +429,13 @@ fn check_datastore_compatible(
 }
 
 /// Persist the previously installed version into `data_version_file` before
-/// replacing `bin_version_file`, so existing datastores created before
-/// `data_version_file` existed do not lose their recorded minor.
+/// replacing `bin_version_file` or enabling `tracked_file`, so legacy datastores
+/// created before `data_version_file` existed do not lose their recorded minor.
 fn seed_datastore_version_if_missing(
     data_dir: &Path,
     data_version_file: &Path,
     bin_version_file: &Path,
+    tracked_file: &Path,
 ) -> Result<(), String> {
     if !datastore_exists(data_dir)? {
         return Ok(());
@@ -408,11 +443,18 @@ fn seed_datastore_version_if_missing(
     if read_trimmed_file(data_version_file)?.is_some() {
         return Ok(());
     }
+    if is_datastore_version_tracked(tracked_file)? {
+        return Err(missing_datastore_version_error(
+            data_dir,
+            data_version_file,
+            None,
+        ));
+    }
     let Some(prev) = read_trimmed_file(bin_version_file)? else {
         return Err(missing_datastore_version_error(
             data_dir,
             data_version_file,
-            bin_version_file,
+            Some(bin_version_file),
         ));
     };
     write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
@@ -427,7 +469,6 @@ enum DatastoreEntryKind {
         hash_fnv: u64,
     },
     Dir,
-    Symlink(PathBuf),
     Other(u32),
 }
 
@@ -479,6 +520,12 @@ fn collect_datastore_entries(
 ) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(io::Error::other(format!(
+            "cannot safely fingerprint symlinked datastore path {}",
+            path.display()
+        )));
+    }
     let kind = if ft.is_file() {
         let (len, hash_sip, hash_fnv) = hash_file(path)?;
         DatastoreEntryKind::File {
@@ -488,8 +535,6 @@ fn collect_datastore_entries(
         }
     } else if ft.is_dir() {
         DatastoreEntryKind::Dir
-    } else if ft.is_symlink() {
-        DatastoreEntryKind::Symlink(fs::read_link(path)?)
     } else {
         DatastoreEntryKind::Other(meta.mode())
     };
@@ -515,9 +560,16 @@ fn collect_datastore_entries(
 /// Fingerprint `data_dir/server` (structure, metadata, and regular-file contents)
 /// so a failed startup that exited before touching the datastore can safely roll
 /// back `.katamaran-version`, while any modification keeps the updated marker.
+///
+/// Fails closed if `server` or any entry inside it is a symlink so writes to
+/// symlinked SQLite state outside the fingerprinted tree can never be missed.
 fn snapshot_datastore(data_dir: &Path) -> io::Result<DatastoreSnapshot> {
     let server_dir = data_dir.join("server");
     match fs::symlink_metadata(&server_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::other(format!(
+            "cannot safely fingerprint symlinked datastore path {}",
+            server_dir.display()
+        ))),
         Ok(_) => {
             let mut entries = Vec::new();
             collect_datastore_entries(&server_dir, PathBuf::new(), &mut entries)?;
@@ -964,6 +1016,7 @@ impl K8s {
             Path::new(DATA_DIR),
             Path::new(DATA_VERSION_FILE),
             Path::new(VERSION_FILE),
+            Path::new(DATA_VERSION_TRACKED_FILE),
             version,
         )?;
         let _ = k8s::write(
@@ -1008,7 +1061,9 @@ impl K8s {
                 Path::new(DATA_DIR),
                 Path::new(DATA_VERSION_FILE),
                 Path::new(VERSION_FILE),
+                Path::new(DATA_VERSION_TRACKED_FILE),
             )?;
+            mark_datastore_version_tracked(Path::new(DATA_VERSION_TRACKED_FILE))?;
             commit_installed_binary(
                 Path::new(&tmp),
                 Path::new(BIN),
@@ -1052,6 +1107,7 @@ impl K8s {
             Path::new(DATA_DIR),
             Path::new(DATA_VERSION_FILE),
             Path::new(VERSION_FILE),
+            Path::new(DATA_VERSION_TRACKED_FILE),
             &installed_version,
         )?;
         let _ = k8s::write(
@@ -1059,6 +1115,13 @@ impl K8s {
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
+        seed_datastore_version_if_missing(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            Path::new(VERSION_FILE),
+            Path::new(DATA_VERSION_TRACKED_FILE),
+        )?;
+        mark_datastore_version_tracked(Path::new(DATA_VERSION_TRACKED_FILE))?;
         self.activate_containerd_cri(conn)?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
@@ -1500,6 +1563,7 @@ impl K8s {
                 .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
         }
         let _ = fs::remove_file(KUBECONFIG);
+        mark_datastore_version_tracked(Path::new(DATA_VERSION_TRACKED_FILE))?;
         log("k3s cluster data reset");
         Ok(())
     }
@@ -2966,18 +3030,20 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let data_dir = dir.join("data");
         let data_version_file = data_dir.join(".katamaran-version");
         let bin_version_file = dir.join("bin/version");
+        let tracked_file = dir.join(".datastore-version-tracked");
         fs::create_dir_all(data_dir.join("server/db")).unwrap();
         fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
         let db_file = data_dir.join("server/db/state.db");
         fs::write(&db_file, b"v1.37-datastore-bytes").unwrap();
         fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
 
-        // Legacy datastore (no data_version_file yet): falls back to bin_version_file
-        // and rejects downgrade without modifying data_dir.
+        // Legacy datastore (no data_version_file and not tracked yet): falls back to
+        // bin_version_file and rejects downgrade without modifying data_dir.
         let err = check_datastore_compatible(
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap_err();
@@ -2993,6 +3059,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.37.1+k3s1",
         )
         .unwrap();
@@ -3000,13 +3067,19 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.38.0+k3s1",
         )
         .unwrap();
 
         // Seeding preserves the datastore's minor even if bin_version_file is later absent/changed.
-        seed_datastore_version_if_missing(&data_dir, &data_version_file, &bin_version_file)
-            .unwrap();
+        seed_datastore_version_if_missing(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(&data_version_file).unwrap(),
             "v1.37.2+k3s1\n"
@@ -3016,6 +3089,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap_err();
@@ -3023,14 +3097,44 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(err.contains(".katamaran-version"), "{err}");
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
-        // Existing server/ with both version markers absent (e.g. a restored backup
-        // onto a fresh disk without metadata) must be rejected without modifying data_dir.
+        // Once datastore version tracking is enabled (after install/start/reset),
+        // an unmarked restored datastore must NEVER inherit an unrelated older
+        // bin_version_file already installed in the guest.
+        mark_datastore_version_tracked(&tracked_file).unwrap();
         fs::remove_file(&data_version_file).unwrap();
+        fs::write(&bin_version_file, "v1.32.5+k3s1\n").unwrap();
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+        assert!(err.contains(".katamaran-version"), "{err}");
+        assert!(!data_version_file.exists());
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+        assert!(
+            seed_datastore_version_if_missing(
+                &data_dir,
+                &data_version_file,
+                &bin_version_file,
+                &tracked_file,
+            )
+            .is_err()
+        );
+
+        // Existing server/ with both version markers absent on an untracked disk
+        // (e.g. a restored backup onto a fresh disk without metadata) must also
+        // be rejected without modifying data_dir.
+        fs::remove_file(&tracked_file).unwrap();
         fs::remove_file(&bin_version_file).unwrap();
         let err = check_datastore_compatible(
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap_err();
@@ -3040,8 +3144,13 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(!data_version_file.exists());
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
         assert!(
-            seed_datastore_version_if_missing(&data_dir, &data_version_file, &bin_version_file)
-                .is_err()
+            seed_datastore_version_if_missing(
+                &data_dir,
+                &data_version_file,
+                &bin_version_file,
+                &tracked_file,
+            )
+            .is_err()
         );
 
         // Whitespace-only markers are treated the same as missing markers.
@@ -3051,19 +3160,23 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.37.2+k3s1",
         )
         .unwrap_err();
         assert!(err.contains("no version marker"), "{err}");
 
-        // After reset removes data_dir, starting a lower minor is allowed even while
-        // bin_version_file still records the previous installed binary (or is absent).
+        // After reset removes data_dir (and marks tracked), starting a lower minor
+        // is allowed even while bin_version_file still records the previous installed
+        // binary (or is absent).
+        mark_datastore_version_tracked(&tracked_file).unwrap();
         fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
         fs::remove_dir_all(&data_dir).unwrap();
         check_datastore_compatible(
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap();
@@ -3072,6 +3185,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap();
@@ -3083,6 +3197,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap();
@@ -3091,6 +3206,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap();
@@ -3104,12 +3220,14 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let data_dir = dir.join("data");
         let data_version_file = data_dir.join(".katamaran-version");
         let bin_version_file = dir.join("bin/version");
+        let tracked_file = dir.join(".datastore-version-tracked");
         fs::create_dir_all(data_dir.join("server/db")).unwrap();
         fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
         let db_file = data_dir.join("server/db/state.db");
         fs::write(&db_file, b"v1.32-state-0001").unwrap();
         fs::write(&data_version_file, "v1.32.5+k3s1\n").unwrap();
         fs::write(&bin_version_file, "v1.33.0+k3s1\n").unwrap();
+        mark_datastore_version_tracked(&tracked_file).unwrap();
 
         // 1. Process exits during startup without touching server/: version marker
         // rolls back so the operator can return to v1.32.5+k3s1.
@@ -3129,6 +3247,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &data_dir,
             &data_version_file,
             &bin_version_file,
+            &tracked_file,
             "v1.32.5+k3s1",
         )
         .unwrap();
@@ -3153,6 +3272,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 &data_dir,
                 &data_version_file,
                 &bin_version_file,
+                &tracked_file,
                 "v1.32.5+k3s1",
             )
             .is_err()
@@ -3187,7 +3307,64 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "v1.34.0+k3s1\n"
         );
 
-        // 5. Fresh data_dir without server/: removes marker if server/ stays absent,
+        // 5. Symlinked server/db (or server itself, or state.db) fails closed so writes
+        // through the symlink cannot bypass the downgrade guard.
+        let external_db = dir.join("external-db");
+        fs::create_dir_all(&external_db).unwrap();
+        let external_state = external_db.join("state.db");
+        fs::write(&external_state, b"v1.32-external").unwrap();
+        fs::remove_dir_all(data_dir.join("server/db")).unwrap();
+        symlink(&external_db, data_dir.join("server/db")).unwrap();
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+        let symlink_before = snapshot_datastore(&data_dir);
+        assert!(
+            symlink_before.is_err(),
+            "symlinked server/db must fail closed"
+        );
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(&external_state, b"v1.33-external").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            symlink_before.ok().as_ref(),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+        assert!(
+            check_datastore_compatible(
+                &data_dir,
+                &data_version_file,
+                &bin_version_file,
+                &tracked_file,
+                "v1.32.5+k3s1",
+            )
+            .is_err()
+        );
+
+        // Symlinked state.db file inside a real server/db directory also fails closed.
+        fs::remove_file(data_dir.join("server/db")).unwrap();
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        symlink(&external_state, data_dir.join("server/db/state.db")).unwrap();
+        assert!(
+            snapshot_datastore(&data_dir).is_err(),
+            "symlinked state.db must fail closed"
+        );
+
+        // Symlinked server/ itself also fails closed.
+        let external_server = dir.join("external-server");
+        fs::create_dir_all(external_server.join("db")).unwrap();
+        fs::write(external_server.join("db/state.db"), b"v1.32-server").unwrap();
+        fs::remove_dir_all(data_dir.join("server")).unwrap();
+        symlink(&external_server, data_dir.join("server")).unwrap();
+        assert!(
+            snapshot_datastore(&data_dir).is_err(),
+            "symlinked server/ must fail closed"
+        );
+
+        // 6. Fresh data_dir without server/: removes marker if server/ stays absent,
         // keeps marker if k3s created server/ before exiting.
         fs::remove_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&data_dir).unwrap();
