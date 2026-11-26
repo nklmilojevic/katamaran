@@ -246,7 +246,7 @@ kat k8s stop
 kat k8s reset
 ```
 
-### Inspect logs
+### Inspect logs and shell into the VM
 
 ```sh
 kat logs
@@ -254,7 +254,11 @@ kat logs -f
 kat logs --console
 kat logs --source vm
 kat logs --source gvproxy
+kat vm shell
+kat vm exec -- sysctl fs.nr_open
 ```
+
+`kat vm shell` and `kat vm exec` run as `root` directly in the Linux VM's own namespaces (not an LXC machine), which is useful for inspecting `containerd`, `dockerd`, `k3s`, sysctls, rlimits, and `/var/log/*`.
 
 ### Coding-agent skill
 

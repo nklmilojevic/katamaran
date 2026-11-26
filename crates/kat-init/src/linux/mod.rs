@@ -15,6 +15,7 @@ mod shutdown;
 mod stats;
 mod sys;
 mod trim;
+mod vm_exec;
 
 use std::fs::File;
 use std::io;
@@ -243,6 +244,9 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
 
     let docker = if system {
         let reaper = Reaper::start();
+        if let Err(e) = vm_exec::start(reaper.clone()) {
+            notifier.failed("vm-exec", e.to_string());
+        }
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         let containerd_config = if k8s::enabled_in_cmdline(&cmdline) {
             match k8s::ensure_containerd_cri(&reaper) {

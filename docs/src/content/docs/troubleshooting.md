@@ -27,6 +27,19 @@ kat logs --source gvproxy -n 200
 
 Add `-f` to follow any stream live. Inside the guest, containerd, dockerd, and k3s also write to `/var/log/containerd.log`, `/var/log/dockerd.log`, and `/var/log/k3s.log`.
 
+## Open a root shell in the VM
+
+Unlike `kat shell` (which opens a Linux LXC machine), `kat vm shell` and `kat vm exec` run as `root` directly in the VM's own namespaces, even when Kubernetes is disabled:
+
+```sh
+kat vm shell
+kat vm exec -- sysctl fs.nr_open
+kat vm exec -- sh -c 'grep "open files" /proc/$(pidof containerd)/limits'
+kat vm exec -- tail -n 100 /var/log/containerd.log
+```
+
+`kat vm exec` does not allocate a PTY by default, so `stdout`, `stderr`, and exit codes behave cleanly in scripts. Pass `-t` to allocate a PTY for interactive tools such as `top`.
+
 ## Measure boot stages
 
 If the VM starts slowly or fails during boot, run `katamaran debug-boot` to boot a throwaway VM and print per-stage timings:

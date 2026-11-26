@@ -65,6 +65,7 @@ All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
 | `run/k8s.sock` | Kubernetes control socket relayed to the guest |
 | `run/k8s-api.sock` | Kubernetes API server socket relayed from the guest |
 | `run/k8s-proxy.sock` | Plain-HTTP Kubernetes API socket relayed to the guest `kubectl proxy` (used by the macOS app) |
+| `run/vm-exec.sock` | Root shell and exec socket relayed to the Linux VM (`kat vm shell` / `kat vm exec`) |
 | `run/kubeconfig.yaml` | Generated kubeconfig for the single-node Kubernetes cluster |
 | `run/vm.json` | Generated VM launch configuration passed to `katamaran-vm` |
 | `cache/k3s/` | Cached and SHA-256 verified `k3s-arm64` binaries downloaded on first Kubernetes start, one directory per version |

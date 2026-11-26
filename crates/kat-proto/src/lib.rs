@@ -13,6 +13,7 @@ pub mod fscache;
 pub mod k3s_config;
 pub mod k8s;
 pub mod machine;
+pub mod vm_exec;
 
 pub const PROTOCOL_VERSION: u32 = 3;
 /// vsock port the guest dials on the host (CID 2) for the control channel.
@@ -41,6 +42,9 @@ pub const K8S_PORT: u32 = 1051;
 /// Guest vsock port relayed to the k3s Kubernetes API server (`127.0.0.1:6443`).
 /// The host side is a Unix socket libkrun listens on.
 pub const K8S_API_PORT: u32 = 1052;
+/// Guest vsock port of the VM root shell and exec service (see [`vm_exec`]).
+/// The host side is a Unix socket libkrun listens on.
+pub const VM_EXEC_PORT: u32 = 1053;
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub(crate) const HEADER: usize = 6;

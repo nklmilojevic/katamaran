@@ -23,6 +23,7 @@ mod sparse;
 mod ssh;
 mod state;
 mod vm;
+mod vm_cli;
 
 use std::path::PathBuf;
 
@@ -70,6 +71,9 @@ enum Command {
     /// Manage the optional single-node Kubernetes (k3s) cluster.
     #[command(subcommand, visible_alias = "kubernetes")]
     K8s(k8s_cli::K8sCmd),
+    /// Open a root shell or run commands inside the Linux VM itself.
+    #[command(subcommand)]
+    Vm(vm_cli::VmCmd),
     /// Open a shell (or run a command) in a Linux machine.
     Shell(machine_cli::ShellArgs),
     /// SSH into a Linux machine through the katamaran SSH config.
@@ -104,6 +108,7 @@ fn main() -> anyhow::Result<()> {
         Command::Uninstall(args) => setup::uninstall(args),
         Command::Machine(cmd) => machine_cli::machine(cmd),
         Command::K8s(cmd) => k8s_cli::run(cmd),
+        Command::Vm(cmd) => vm_cli::run(cmd),
         Command::Shell(args) => machine_cli::shell(args),
         Command::Ssh(args) => machine_cli::ssh(args),
         Command::SshProxy => ssh::proxy(),

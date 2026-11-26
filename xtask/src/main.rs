@@ -152,6 +152,8 @@ fn main() -> anyhow::Result<()> {
                     "--test",
                     "machines",
                     "--test",
+                    "vm_exec",
+                    "--test",
                     "amd64",
                     "--test",
                     "k8s_config",

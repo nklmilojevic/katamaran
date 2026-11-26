@@ -93,6 +93,10 @@ kat logs -f               # Follow daemon log
 kat logs --console        # Linux guest console log
 kat logs --source vm      # VMM (katamaran-vm) log
 kat logs --source gvproxy # Networking log
+kat vm shell              # Interactive root shell in the VM's own namespaces
+kat vm exec -- <cmd>      # Run a command as root in the VM (separate stdout/stderr)
 ```
+
+`kat vm shell` and `kat vm exec` enter the Linux VM itself (unlike `kat shell`, which enters an LXC machine), so you can inspect `containerd`, `dockerd`, `k3s`, sysctls, rlimits, and `/var/log/*` directly even when Kubernetes is off.
 
 If `docker` cannot reach katamaran, check `kat status`, `docker context ls`, and whether `DOCKER_HOST` is overriding the active context.
