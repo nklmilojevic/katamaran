@@ -11,6 +11,7 @@ struct DaemonStatus: Decodable, Equatable {
     var versions: Versions
     var config: Config
     var disk_gib: Int? = nil
+    var disk_target_gib: Int? = nil
     var vm: VmInfo?
     var usage: Sample?
     var docker: DockerInfo
@@ -45,6 +46,7 @@ struct Config: Codable, Equatable {
 struct ConfigView: Decodable {
     var config: Config
     var disk_gib: Int? = nil
+    var disk_target_gib: Int? = nil
     var restart_required: Bool
 }
 
@@ -139,11 +141,29 @@ extension DaemonStatus {
         URL(string: "http://\(portHost(proto: proto, port: port)):\(port)")
     }
 
-    /// Saved config with the enclosing `disk_gib` field merged in.
+    /// Whether this daemon supports configuring the data disk size.
+    var supportsDiskResize: Bool {
+        disk_gib != nil || disk_target_gib != nil || config.disk_gib != nil
+    }
+
+    /// Saved config with only an explicitly configured disk target merged in.
+    /// Leaving `disk_gib` unset when the daemon reports only the implicit 64 GiB
+    /// default lets the user explicitly commit 64 GiB (e.g., to grow a smaller
+    /// foreground image) while unrelated edits keep omitting `disk_gib`.
     var effectiveConfig: Config {
         var c = config
-        if let disk_gib { c.disk_gib = disk_gib }
+        if let disk_target_gib {
+            c.disk_gib = disk_target_gib
+        } else if let disk_gib, disk_gib != 64 {
+            c.disk_gib = disk_gib
+        }
         return c
+    }
+
+    /// Disk size shown in the Settings control, falling back to the daemon's
+    /// default display value when no explicit target is saved.
+    var displayedDiskGiB: Int? {
+        disk_target_gib ?? disk_gib ?? config.disk_gib
     }
 
     func portError(proto: String = "tcp", port: UInt16) -> String? {

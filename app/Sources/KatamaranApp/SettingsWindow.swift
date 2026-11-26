@@ -268,7 +268,7 @@ final class SettingsWindowController: NSWindowController {
             }
         }
         for control in [login, mount, cpuField, cpuStepper, memSlider] as [NSControl] { control.isEnabled = status != nil }
-        for control in [diskField, diskStepper] as [NSControl] { control.isEnabled = status != nil && config?.disk_gib != nil }
+        for control in [diskField, diskStepper] as [NSControl] { control.isEnabled = status?.supportsDiskResize ?? false }
         let k8s = status?.k8s
         let k8sTransitioning = k8s?.state == "starting" || k8s?.state == "stopping"
         k8sSwitch.isEnabled = status != nil && !model.busy
@@ -319,7 +319,7 @@ final class SettingsWindowController: NSWindowController {
         let gib = limits.memoryGiB(fromMiB: cfg.memory_mib)
         memSlider.integerValue = gib
         memValue.stringValue = memoryLabel(gib: gib)
-        let disk = limits.clampDiskGiB(cfg.disk_gib ?? limits.defaultDiskGiB)
+        let disk = limits.clampDiskGiB(cfg.disk_gib ?? model.status?.displayedDiskGiB ?? limits.defaultDiskGiB)
         diskField.integerValue = disk
         diskStepper.integerValue = disk
     }
