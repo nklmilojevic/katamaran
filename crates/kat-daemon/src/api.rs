@@ -371,6 +371,10 @@ pub struct ConfigView {
     pub path: PathBuf,
     /// The running VM was started with different settings.
     pub restart_required: bool,
+    /// Whether this `config.set` call changed `kubernetes` (triggering an
+    /// immediate start or stop on a running VM).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub k8s_toggled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

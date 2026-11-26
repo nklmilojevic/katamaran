@@ -726,6 +726,7 @@ impl Daemon {
                 .run
                 .as_ref()
                 .is_some_and(|r| r.applied.needs_restart_for(&config)),
+            k8s_toggled: false,
             path: Config::path(&self.home),
             config,
         })
@@ -745,13 +746,15 @@ impl Daemon {
                 cfg.set(k, v, &host)?;
             }
             cfg.save(&self.home)?;
-            dlog!("config saved: {values:?}");
+            let keys: Vec<&str> = values.keys().map(String::as_str).collect();
+            dlog!("config saved: {keys:?}");
             if cfg.launch_at_login != before {
                 crate::setup::set_run_at_load(cfg.launch_at_login, self.launchd_label.as_deref())?;
             }
             (cfg.kubernetes, before_k8s)
         };
-        if cfg_kubernetes != before_k8s {
+        let k8s_toggled = cfg_kubernetes != before_k8s;
+        if k8s_toggled {
             if self.lock().state == VmState::Running {
                 let d = self.clone();
                 let enable = cfg_kubernetes;
@@ -785,7 +788,9 @@ impl Daemon {
                 k.kubeconfig = None;
             }
         }
-        self.config_view()
+        let mut view = self.config_view()?;
+        view.k8s_toggled = k8s_toggled;
+        Ok(view)
     }
 
     fn stats(&self) -> StatsResult {
@@ -1156,6 +1161,7 @@ impl Daemon {
         )> {
             crate::k8s::ensure_installed(&self.home, progress)?;
             let start_msg = crate::k8s::build_start_msg(&self.home)?;
+            crate::k8s::ensure_start_supported(&self.home, &start_msg)?;
             let info = match crate::k8s::request(&self.home, &start_msg, progress)? {
                 kat_proto::k8s::K8sMsg::StatusInfo(info) => info,
                 other => anyhow::bail!("unexpected k8s start reply {other:?}"),
@@ -2333,6 +2339,40 @@ mod tests {
         assert_eq!(d.status().port_errors.len(), 1);
         d.on_event(1, Event::PortErrorClear(PortProto::Tcp, 443));
         assert!(d.status().port_errors.is_empty());
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn set_config_reports_k8s_toggled_only_when_enable_state_changes() {
+        let home = temp("k8s-toggled");
+        let d = Daemon::new(home.clone());
+
+        // Enabling kubernetes transitions false -> true.
+        let mut enable = std::collections::BTreeMap::new();
+        enable.insert("kubernetes".into(), "on".into());
+        let v = d.set_config(&enable).unwrap();
+        assert!(v.k8s_toggled);
+        assert!(v.config.kubernetes);
+
+        // Passing kubernetes=on again with new k8s_disable does NOT toggle kubernetes.
+        let mut unchanged = std::collections::BTreeMap::new();
+        unchanged.insert("kubernetes".into(), "on".into());
+        unchanged.insert("k8s_disable".into(), "traefik".into());
+        let v = d.set_config(&unchanged).unwrap();
+        assert!(!v.k8s_toggled);
+        assert_eq!(v.config.k8s_disable, vec!["traefik"]);
+
+        // Disabling kubernetes transitions true -> false.
+        let mut disable = std::collections::BTreeMap::new();
+        disable.insert("kubernetes".into(), "off".into());
+        let v = d.set_config(&disable).unwrap();
+        assert!(v.k8s_toggled);
+        assert!(!v.config.kubernetes);
+
+        // ConfigGet never reports k8s_toggled and omits it from JSON.
+        let get = d.handle(&Call::ConfigGet).unwrap();
+        assert!(get.get("k8s_toggled").is_none());
 
         fs::remove_dir_all(&home).unwrap();
     }

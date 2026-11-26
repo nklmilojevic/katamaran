@@ -57,7 +57,7 @@ All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
 | Path | Contents |
 |---|---|
 | `config.toml` | Saved configuration |
-| `k3s-config.yaml` | Optional user `k3s` configuration file synced to `/etc/rancher/k3s/config.yaml` when Kubernetes starts |
+| `k3s-config.yaml` | Optional user `k3s` configuration file synced to `/var/lib/katamaran/k3s/config.yaml` (mode `0600`, passed via `K3S_CONFIG_FILE`) when Kubernetes starts |
 | `data/data.img` | Sparse btrfs disk image for Docker, containerd, and LXC machines |
 | `run/docker.sock` | Docker Engine Unix socket relayed from the guest |
 | `run/daemon.sock` | Control socket used by the CLI and macOS app |

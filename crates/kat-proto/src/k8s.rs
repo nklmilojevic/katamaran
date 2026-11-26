@@ -15,6 +15,7 @@
 //! | `SyncImages`     | –                                          | `Done`, or `Error`                          |
 //! | `Proxy`          | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
 //! | `MarkDatastoreVersion` | –                                    | `Done`, or `Error`                          |
+//! | `Capabilities`   | –                                          | `CapabilitiesInfo`, or `Error`              |
 
 use std::io::{self, Read, Write};
 
@@ -22,6 +23,10 @@ use crate::{Cursor, HEADER, MAX_FRAME, ProtoError, put_str, put_u32, read_len};
 
 /// Payload bytes per `Data` frame.
 pub const CHUNK: usize = 64 << 10;
+
+/// Capability bit advertised in [`K8sMsg::CapabilitiesInfo`] when the guest
+/// supports non-empty `extra_args` and `config_yaml` payloads on [`K8sMsg::Start`].
+pub const CAP_START_CONFIG: u32 = 1 << 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K8sMsg {
@@ -32,7 +37,8 @@ pub enum K8sMsg {
     Start {
         /// Extra arguments appended to `k3s server`.
         extra_args: Vec<String>,
-        /// Optional contents of `/etc/rancher/k3s/config.yaml`.
+        /// Optional contents of Katamaran's managed guest k3s YAML config
+        /// (`/var/lib/katamaran/k3s/config.yaml`, passed via `K3S_CONFIG_FILE`).
         config_yaml: Option<String>,
     },
     Stop,
@@ -55,10 +61,13 @@ pub enum K8sMsg {
     MarkDatastoreVersion {
         version: String,
     },
+    /// Query guest Kubernetes service capabilities (see `CAP_*`).
+    Capabilities,
     Data(Vec<u8>),
     DataEnd,
     StatusInfo(K8sInfo),
     KubeconfigData(String),
+    CapabilitiesInfo(u32),
     Done,
     Error(String),
     Progress(String),
@@ -96,6 +105,8 @@ mod kind {
     pub const ERROR: u16 = 0x80f;
     pub const PROGRESS: u16 = 0x810;
     pub const MARK_DATASTORE_VERSION: u16 = 0x811;
+    pub const CAPABILITIES: u16 = 0x812;
+    pub const CAPABILITIES_INFO: u16 = 0x813;
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -104,6 +115,18 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 }
 
 impl K8sMsg {
+    /// True when this is a [`K8sMsg::Start`] carrying non-empty `extra_args` or
+    /// `config_yaml`, which requires guest [`CAP_START_CONFIG`] support.
+    pub fn is_extended_start(&self) -> bool {
+        matches!(
+            self,
+            K8sMsg::Start {
+                extra_args,
+                config_yaml,
+            } if !extra_args.is_empty() || config_yaml.is_some()
+        )
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = vec![0u8; HEADER];
         let b = &mut buf;
@@ -146,6 +169,7 @@ impl K8sMsg {
                 put_str(b, version);
                 kind::MARK_DATASTORE_VERSION
             }
+            K8sMsg::Capabilities => kind::CAPABILITIES,
             K8sMsg::Data(d) => {
                 put_bytes(b, d);
                 kind::DATA
@@ -162,6 +186,10 @@ impl K8sMsg {
             K8sMsg::KubeconfigData(yaml) => {
                 put_str(b, yaml);
                 kind::KUBECONFIG_DATA
+            }
+            K8sMsg::CapabilitiesInfo(flags) => {
+                put_u32(b, *flags);
+                kind::CAPABILITIES_INFO
             }
             K8sMsg::Done => kind::DONE,
             K8sMsg::Error(e) => {
@@ -231,6 +259,7 @@ impl K8sMsg {
             kind::MARK_DATASTORE_VERSION => K8sMsg::MarkDatastoreVersion {
                 version: c.string()?,
             },
+            kind::CAPABILITIES => K8sMsg::Capabilities,
             kind::DATA => {
                 let n = c.u32()? as usize;
                 K8sMsg::Data(c.take(n)?.to_vec())
@@ -244,6 +273,7 @@ impl K8sMsg {
                 error: c.string()?,
             }),
             kind::KUBECONFIG_DATA => K8sMsg::KubeconfigData(c.string()?),
+            kind::CAPABILITIES_INFO => K8sMsg::CapabilitiesInfo(c.u32()?),
             kind::DONE => K8sMsg::Done,
             kind::ERROR => K8sMsg::Error(c.string()?),
             kind::PROGRESS => K8sMsg::Progress(c.string()?),
@@ -321,6 +351,7 @@ mod tests {
             K8sMsg::MarkDatastoreVersion {
                 version: "v1.37.2+k3s1".into(),
             },
+            K8sMsg::Capabilities,
             K8sMsg::Data(vec![1, 2, 3, 4]),
             K8sMsg::DataEnd,
             K8sMsg::StatusInfo(K8sInfo {
@@ -331,6 +362,7 @@ mod tests {
                 error: String::new(),
             }),
             K8sMsg::KubeconfigData("apiVersion: v1\n".into()),
+            K8sMsg::CapabilitiesInfo(CAP_START_CONFIG),
             K8sMsg::Done,
             K8sMsg::Error("failed".into()),
             K8sMsg::Progress("starting k3s".into()),
@@ -382,10 +414,12 @@ mod tests {
             K8sMsg::MarkDatastoreVersion {
                 version: String::new(),
             },
+            K8sMsg::Capabilities,
             K8sMsg::Data(vec![]),
             K8sMsg::DataEnd,
             K8sMsg::StatusInfo(K8sInfo::default()),
             K8sMsg::KubeconfigData(String::new()),
+            K8sMsg::CapabilitiesInfo(CAP_START_CONFIG),
             K8sMsg::Done,
             K8sMsg::Error(String::new()),
             K8sMsg::Progress(String::new()),
@@ -416,6 +450,21 @@ mod tests {
             extra_args: vec![],
             config_yaml: None,
         };
+        assert!(!empty.is_extended_start());
+        assert!(
+            K8sMsg::Start {
+                extra_args: vec!["--debug".into()],
+                config_yaml: None,
+            }
+            .is_extended_start()
+        );
+        assert!(
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: Some("debug: true\n".into()),
+            }
+            .is_extended_start()
+        );
         let frame = empty.encode();
         assert_eq!(frame.len(), HEADER);
         assert_eq!(u32::from_le_bytes(frame[0..4].try_into().unwrap()), 2);

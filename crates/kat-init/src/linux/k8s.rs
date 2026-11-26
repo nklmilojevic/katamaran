@@ -54,10 +54,14 @@ const SERVER_VERSION_STAMP: &str = ".katamaran-k3s-version";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
-const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
+/// Katamaran-owned copy of the host's `~/.katamaran/k3s-config.yaml`, selected
+/// via `K3S_CONFIG_FILE` only when supplied so any manually managed
+/// `/etc/rancher/k3s/config.yaml` inside the guest is left untouched.
+const K3S_CONFIG_PATH: &str = "/var/lib/katamaran/k3s/config.yaml";
 const LOG_FILE: &str = "/var/log/k3s.log";
 const PROXY_DIR: &str = "/run/katamaran/k8s-proxy";
 const PROXY_SOCKET: &str = "/run/katamaran/k8s-proxy/proxy.sock";
+const API_PORT: &str = "6443";
 pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -271,13 +275,24 @@ const CONTAINERD_BASE_CONFIG: &str = "/etc/containerd/config.toml";
 const CONTAINERD_CRI_CONFIG: &str = "/run/katamaran/containerd-cri.toml";
 
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_inner(target, bytes, None)
+}
+
+fn write_atomic_mode(target: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    write_atomic_inner(target, bytes, Some(mode))
+}
+
+fn write_atomic_inner(target: &Path, bytes: &[u8], forced_mode: Option<u32>) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("missing parent for {}", target.display()))?;
-    let target_mode = match fs::metadata(target) {
-        Ok(meta) => meta.permissions().mode() & 0o7777,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
-        Err(e) => return Err(format!("stat {}: {e}", target.display())),
+    let target_mode = match forced_mode {
+        Some(mode) => mode,
+        None => match fs::metadata(target) {
+            Ok(meta) => meta.permissions().mode() & 0o7777,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
+            Err(e) => return Err(format!("stat {}: {e}", target.display())),
+        },
     };
     let name = target
         .file_name()
@@ -292,6 +307,7 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -1985,6 +2001,7 @@ impl K8s {
             K8sMsg::MarkDatastoreVersion { version } => {
                 self.mark_datastore_version(&version).map(|()| K8sMsg::Done)
             }
+            K8sMsg::Capabilities => Ok(K8sMsg::CapabilitiesInfo(k8s::CAP_START_CONFIG)),
             other => Err(format!("unexpected request {other:?}")),
         };
         let msg = match reply {
@@ -2183,9 +2200,9 @@ impl K8s {
                 "starting k3s with {} extra arg(s){}",
                 extra_args.len(),
                 if config_yaml.is_some() {
-                    " and /etc/rancher/k3s/config.yaml"
+                    format!(" and {K3S_CONFIG_PATH}")
                 } else {
-                    ""
+                    String::new()
                 }
             ));
         }
@@ -2204,6 +2221,10 @@ impl K8s {
             .stdin(Stdio::null())
             .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
             .stderr(log_file);
+        configure_k3s_config_env(
+            &mut cmd,
+            config_yaml.is_some().then_some(Path::new(K3S_CONFIG_PATH)),
+        );
 
         let prev_data_version = match read_marker_file(Path::new(DATA_VERSION_FILE))? {
             MarkerFile::Present(v) => Some(v),
@@ -2650,7 +2671,7 @@ impl K8s {
                 .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
         }
         let _ = fs::remove_file(KUBECONFIG);
-        let _ = fs::remove_file(K3S_CONFIG_PATH);
+        sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
         log("k3s cluster data reset");
         Ok(())
     }
@@ -2680,7 +2701,80 @@ impl K8s {
     }
 }
 
+/// Parse a single Go `flag` / `urfave/cli` style flag token (`-flag`, `--flag`,
+/// `-flag=val`, or `--flag=val`) into `(name, Option<inline_value>)`.
+fn parse_k3s_flag(arg: &str) -> Option<(&str, Option<&str>)> {
+    let stripped = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    if stripped.is_empty() || stripped.starts_with('-') {
+        return None;
+    }
+    match stripped.split_once('=') {
+        Some((name, val)) => Some((name, Some(val))),
+        None => Some((stripped, None)),
+    }
+}
+
+fn configure_k3s_config_env(cmd: &mut Command, managed_config: Option<&Path>) {
+    if let Some(path) = managed_config {
+        cmd.env("K3S_CONFIG_FILE", path);
+    } else {
+        cmd.env_remove("K3S_CONFIG_FILE");
+    }
+}
+
 fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
+    for arg in extra_args {
+        if arg.is_empty() {
+            return Err("k8s_args must not contain empty arguments".into());
+        }
+        if arg.contains('\0') {
+            return Err("k8s_args must not contain NUL bytes".into());
+        }
+    }
+    let mut i = 0;
+    while i < extra_args.len() {
+        if let Some((name, inline_val)) = parse_k3s_flag(&extra_args[i]) {
+            let (val, consumed) = match inline_val {
+                Some(v) => (Some(v), 1),
+                None => match extra_args.get(i + 1) {
+                    Some(next) => (Some(next.as_str()), 2),
+                    None => (None, 1),
+                },
+            };
+            match name {
+                "data-dir" | "d" => {
+                    if val != Some(DATA_DIR) {
+                        return Err(format!(
+                            "k8s_args cannot override --data-dir (-d); Katamaran manages cluster data at {DATA_DIR}"
+                        ));
+                    }
+                    i += consumed;
+                    continue;
+                }
+                "write-kubeconfig" | "o" => {
+                    if val != Some(KUBECONFIG) {
+                        return Err(format!(
+                            "k8s_args cannot override --write-kubeconfig (-o); Katamaran reads kubeconfig from {KUBECONFIG}"
+                        ));
+                    }
+                    i += consumed;
+                    continue;
+                }
+                "https-listen-port" => {
+                    if val != Some(API_PORT) {
+                        return Err(format!(
+                            "k8s_args cannot override --https-listen-port; Katamaran relays the Kubernetes API server on {API_ADDR}"
+                        ));
+                    }
+                    i += consumed;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
     let mut args = vec![
         "server".to_string(),
         format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
@@ -2696,20 +2790,12 @@ fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
         "--tls-san=localhost".to_string(),
         "--tls-san=katamaran".to_string(),
         "--tls-san=k8s.kat.local".to_string(),
-        "--https-listen-port=6443".to_string(),
+        format!("--https-listen-port={API_PORT}"),
         "--kubelet-arg=fail-swap-on=false".to_string(),
         format!("--kubelet-arg=root-dir={KUBELET_DIR}"),
         "--kube-proxy-arg=proxy-mode=nftables".to_string(),
     ];
-    for arg in extra_args {
-        if arg.is_empty() {
-            return Err("k8s_args must not contain empty arguments".into());
-        }
-        if arg.contains('\0') {
-            return Err("k8s_args must not contain NUL bytes".into());
-        }
-        args.push(arg.clone());
-    }
+    args.extend(extra_args.iter().cloned());
     Ok(args)
 }
 
@@ -2720,7 +2806,7 @@ fn sync_k3s_config(path: &Path, config_yaml: Option<&str>) -> Result<(), String>
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("create {}: {e}", parent.display()))?;
             }
-            write_atomic(path, yaml.as_bytes())?;
+            write_atomic_mode(path, yaml.as_bytes(), 0o600)?;
         }
         None => match fs::remove_file(path) {
             Ok(()) => {}
@@ -8119,28 +8205,123 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 
         assert!(build_k3s_server_args(&[String::new()]).is_err());
         assert!(build_k3s_server_args(&["--foo=\0bar".to_string()]).is_err());
+
+        // Managed --data-dir (-d) cannot be redirected.
+        for bad in [
+            vec!["--data-dir=/tmp/k3s".to_string()],
+            vec!["-data-dir=/tmp/k3s".to_string()],
+            vec!["--data-dir".to_string(), "/tmp/k3s".to_string()],
+            vec!["-d".to_string(), "/tmp/k3s".to_string()],
+            vec!["-d=/tmp/k3s".to_string()],
+            vec!["--data-dir".to_string()],
+        ] {
+            let err = build_k3s_server_args(&bad).unwrap_err();
+            assert!(err.contains(DATA_DIR), "case {bad:?}: {err}");
+        }
+        build_k3s_server_args(&["--data-dir".to_string(), DATA_DIR.to_string()]).unwrap();
+
+        // Managed --write-kubeconfig (-o) cannot be redirected; sibling flags stay allowed.
+        for bad in [
+            vec!["--write-kubeconfig=/tmp/kc".to_string()],
+            vec!["--write-kubeconfig".to_string(), "/tmp/kc".to_string()],
+            vec!["-o".to_string(), "/tmp/kc".to_string()],
+            vec!["-o=/tmp/kc".to_string()],
+            vec!["-o".to_string()],
+        ] {
+            let err = build_k3s_server_args(&bad).unwrap_err();
+            assert!(err.contains(KUBECONFIG), "case {bad:?}: {err}");
+        }
+        build_k3s_server_args(&["--write-kubeconfig-mode=0644".to_string()]).unwrap();
+        build_k3s_server_args(&["--write-kubeconfig".to_string(), KUBECONFIG.to_string()]).unwrap();
+
+        // Managed --https-listen-port cannot change away from the fixed relay port.
+        for bad in [
+            vec!["--https-listen-port=7443".to_string()],
+            vec!["-https-listen-port=7443".to_string()],
+            vec!["--https-listen-port".to_string(), "7443".to_string()],
+            vec!["--https-listen-port=06443".to_string()],
+            vec!["--https-listen-port".to_string()],
+        ] {
+            let err = build_k3s_server_args(&bad).unwrap_err();
+            assert!(err.contains(API_ADDR), "case {bad:?}: {err}");
+        }
+        build_k3s_server_args(&["--https-listen-port=6443".to_string()]).unwrap();
+        build_k3s_server_args(&["--https-listen-port".to_string(), "6443".to_string()]).unwrap();
     }
 
     #[test]
-    fn sync_k3s_config_writes_updates_and_removes() {
+    fn sync_k3s_config_enforces_0600_and_preserves_unmanaged_default_config() {
+        use std::ffi::OsStr;
+
+        // Managed config lives at a Katamaran-owned path separate from k3s's default.
+        assert_ne!(K3S_CONFIG_PATH, "/etc/rancher/k3s/config.yaml");
+
         let base = temp_dir("k3s-config");
-        let cfg = base.join("etc/rancher/k3s/config.yaml");
+        let managed = base.join("var/lib/katamaran/k3s/config.yaml");
+        let default_cfg = base.join("etc/rancher/k3s/config.yaml");
+        fs::create_dir_all(default_cfg.parent().unwrap()).unwrap();
+        fs::write(&default_cfg, "disable:\n  - servicelb\n").unwrap();
 
-        // Removing when absent is a no-op.
-        sync_k3s_config(&cfg, None).unwrap();
-        assert!(!cfg.exists());
-
-        // Writing creates parent dirs and sets 0600 permissions.
-        sync_k3s_config(&cfg, Some("disable:\n  - traefik\n")).unwrap();
-        assert_eq!(fs::read_to_string(&cfg).unwrap(), "disable:\n  - traefik\n");
+        // Removing when managed file is absent is a no-op and never touches default_cfg.
+        sync_k3s_config(&managed, None).unwrap();
+        assert!(!managed.exists());
         assert_eq!(
-            fs::symlink_metadata(&cfg).unwrap().permissions().mode() & 0o777,
+            fs::read_to_string(&default_cfg).unwrap(),
+            "disable:\n  - servicelb\n"
+        );
+
+        // Replacing an existing 0644 destination forces mode 0600 (unlike write_atomic,
+        // which preserves existing permissions for other callers).
+        let preserved = base.join("preserved.txt");
+        fs::write(&preserved, "v1\n").unwrap();
+        fs::set_permissions(&preserved, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&preserved, b"v2\n").unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&preserved)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "old: true\n").unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o644)).unwrap();
+        sync_k3s_config(&managed, Some("token: secret\n")).unwrap();
+        assert_eq!(fs::read_to_string(&managed).unwrap(), "token: secret\n");
+        assert_eq!(
+            fs::symlink_metadata(&managed).unwrap().permissions().mode() & 0o777,
             0o600
         );
 
-        // Passing None removes a previously synced file.
-        sync_k3s_config(&cfg, None).unwrap();
-        assert!(!cfg.exists());
+        // Passing None (absence or reset) removes only the managed copy.
+        sync_k3s_config(&managed, None).unwrap();
+        assert!(!managed.exists());
+        assert_eq!(
+            fs::read_to_string(&default_cfg).unwrap(),
+            "disable:\n  - servicelb\n"
+        );
+
+        // Non-NotFound removal failures (e.g. a directory/mountpoint at the managed path) are reported.
+        fs::create_dir(&managed).unwrap();
+        assert!(sync_k3s_config(&managed, None).is_err());
+        fs::remove_dir(&managed).unwrap();
+
+        // K3S_CONFIG_FILE is set only when host YAML is supplied.
+        let mut with_cfg = Command::new(BIN);
+        configure_k3s_config_env(&mut with_cfg, Some(&managed));
+        assert!(with_cfg.get_envs().any(|(k, v)| {
+            k == OsStr::new("K3S_CONFIG_FILE") && v == Some(managed.as_os_str())
+        }));
+
+        let mut without_cfg = Command::new(BIN);
+        configure_k3s_config_env(&mut without_cfg, None);
+        assert!(
+            without_cfg
+                .get_envs()
+                .any(|(k, v)| k == OsStr::new("K3S_CONFIG_FILE") && v.is_none())
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

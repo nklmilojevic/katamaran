@@ -54,9 +54,9 @@ pub enum Source {
 pub enum ConfigCmd {
     /// Print one setting, or all of them.
     Get { key: Option<String> },
-    /// Change settings: `set cpus 2`, or `set cpus=2 memory=8G mount=off`.
+    /// Change settings: `set cpus 2`, `set cpus=2 memory=8G mount=off`, or `set k8s_args="--debug"` (use `--` for bare hyphen-leading values: `set -- k8s_args --debug`).
     Set {
-        #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+        #[arg(required = true, num_args = 1..)]
         pairs: Vec<String>,
     },
 }
@@ -405,17 +405,20 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
         }
         ConfigCmd::Set { pairs } => {
             let values = parse_pairs(&pairs)?;
-            let k8s_opts_changed = (values.contains_key("k8s_disable")
-                || values.contains_key("k8s_args"))
-                && !values.contains_key("kubernetes");
+            let k8s_opts_set =
+                values.contains_key("k8s_disable") || values.contains_key("k8s_args");
             let (restart, k8s_restart) = match daemon {
                 Some(mut c) => {
                     let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
-                    let k8s_active = k8s_opts_changed
-                        && c.status().ok().is_some_and(|s| {
-                            matches!(s.k8s.state.as_str(), "running" | "starting")
-                        });
-                    (v.restart_required, k8s_active)
+                    let k8s_state = if k8s_opts_set && !v.k8s_toggled {
+                        c.status().ok().map(|s| s.k8s.state)
+                    } else {
+                        None
+                    };
+                    (
+                        v.restart_required,
+                        should_show_k8s_restart_hint(k8s_opts_set, &v, k8s_state.as_deref()),
+                    )
                 }
                 None => {
                     let home = crate::state_dir()?;
@@ -443,6 +446,14 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn should_show_k8s_restart_hint(
+    k8s_opts_set: bool,
+    view: &ConfigView,
+    k8s_state: Option<&str>,
+) -> bool {
+    k8s_opts_set && !view.k8s_toggled && matches!(k8s_state, Some("running" | "starting"))
 }
 
 /// `["cpus", "2"]` or `["cpus=2", "memory=8G"]`.
@@ -596,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn config_set_cli_accepts_hyphenated_k8s_args() {
+    fn config_set_cli_accepts_hyphenated_k8s_args_and_preserves_help() {
         use clap::Parser;
 
         #[derive(clap::Parser)]
@@ -605,8 +616,9 @@ mod tests {
             cmd: ConfigCmd,
         }
 
-        let w =
-            Wrapper::try_parse_from(["config", "set", "k8s_args", "--disable=traefik"]).unwrap();
+        // Explicit `--` allows bare hyphen-leading values.
+        let w = Wrapper::try_parse_from(["config", "set", "--", "k8s_args", "--disable=traefik"])
+            .unwrap();
         let ConfigCmd::Set { pairs } = w.cmd else {
             panic!("expected ConfigCmd::Set");
         };
@@ -616,6 +628,7 @@ mod tests {
             Some("--disable=traefik")
         );
 
+        // Inline `k8s_args=...` works directly without `--`.
         let w2 = Wrapper::try_parse_from([
             "config",
             "set",
@@ -632,5 +645,34 @@ mod tests {
             Some("--disable=traefik --debug")
         );
         assert_eq!(map2.get("k8s_disable").map(String::as_str), Some("traefik"));
+
+        // `--help` after a setting still triggers Clap's help output.
+        let err = Wrapper::try_parse_from(["config", "set", "cpus=2", "--help"])
+            .err()
+            .expect("expected DisplayHelp");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn k8s_restart_hint_respects_actual_kubernetes_transition() {
+        let mut view = ConfigView {
+            config: Config {
+                kubernetes: true,
+                ..Config::default()
+            },
+            path: "/tmp/config.toml".into(),
+            restart_required: false,
+            k8s_toggled: false,
+        };
+
+        // Running cluster receiving unchanged kubernetes=on + new k8s_disable shows the hint.
+        assert!(should_show_k8s_restart_hint(true, &view, Some("running")));
+        assert!(should_show_k8s_restart_hint(true, &view, Some("starting")));
+        assert!(!should_show_k8s_restart_hint(true, &view, Some("stopped")));
+        assert!(!should_show_k8s_restart_hint(false, &view, Some("running")));
+
+        // When kubernetes actually toggled (daemon starts or stops k3s), suppress the hint.
+        view.k8s_toggled = true;
+        assert!(!should_show_k8s_restart_hint(true, &view, Some("running")));
     }
 }

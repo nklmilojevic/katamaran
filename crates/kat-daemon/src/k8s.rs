@@ -93,11 +93,21 @@ pub fn k3s_config_path(home: &Path) -> PathBuf {
 /// Read `<home>/k3s-config.yaml` if present.
 pub fn read_k3s_config(home: &Path) -> anyhow::Result<Option<String>> {
     let path = k3s_config_path(home);
-    let f = match File::open(&path) {
+    let f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        bail!("{} must be a regular file", path.display());
+    }
     let mut bytes = Vec::new();
     f.take((MAX_K3S_CONFIG_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -196,6 +206,65 @@ pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
         K8sMsg::StatusInfo(info) => Ok(info),
         other => bail!("unexpected status response {other:?}"),
     }
+}
+
+/// Query the guest Kubernetes service's capability bitmask (see `kat_proto::k8s::CAP_*`).
+/// Older guests reject `Capabilities` by closing the connection; when the guest
+/// still responds to `Status`, this returns `Ok(0)`.
+pub fn guest_capabilities(home: &Path) -> anyhow::Result<u32> {
+    let mut s = connect(home)?;
+    if let Err(e) = k8s::write(&mut s, &K8sMsg::Capabilities) {
+        if guest_status(home).is_ok() {
+            return Ok(0);
+        }
+        return Err(e.into());
+    }
+    match k8s::read(&mut s) {
+        Ok(Some(K8sMsg::CapabilitiesInfo(caps))) => Ok(caps),
+        Ok(Some(K8sMsg::Error(e))) => {
+            if guest_status(home).is_ok() {
+                return Ok(0);
+            }
+            bail!("{e}");
+        }
+        Ok(None) => {
+            if guest_status(home).is_ok() {
+                return Ok(0);
+            }
+            bail!("the guest closed the Kubernetes connection");
+        }
+        Ok(Some(other)) => bail!("unexpected capabilities response {other:?}"),
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            ) && guest_status(home).is_ok()
+            {
+                return Ok(0);
+            }
+            Err(e.into())
+        }
+    }
+}
+
+/// Check that the running guest supports extended `Start` payloads before
+/// sending non-empty `extra_args` or `config_yaml`. Empty `Start` frames stay
+/// compatible with older guests without probing.
+pub fn ensure_start_supported(home: &Path, msg: &K8sMsg) -> anyhow::Result<()> {
+    if !msg.is_extended_start() {
+        return Ok(());
+    }
+    let caps = guest_capabilities(home)?;
+    if caps & k8s::CAP_START_CONFIG == 0 {
+        bail!(
+            "the running guest initramfs does not support custom k8s_disable, k8s_args, or \
+             k3s-config.yaml; update or rebuild the guest initramfs (or clear those settings) \
+             and restart the VM"
+        );
+    }
+    Ok(())
 }
 
 /// Download `k3s-arm64` into `<home>/cache/k3s/<version>/k3s-arm64` if not
@@ -1945,6 +2014,126 @@ users:
 
         fs::write(k3s_config_path(&home), vec![b'a'; MAX_K3S_CONFIG_BYTES + 1]).unwrap();
         assert!(build_start_msg(&home).is_err());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn read_k3s_config_rejects_fifo_and_dir_and_follows_regular_symlinks() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let home = std::env::temp_dir().join(format!(
+            "kat-k8s-config-nonreg-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let cfg_path = k3s_config_path(&home);
+
+        // Symlink to a regular file is allowed.
+        let target = home.join("real-k3s.yaml");
+        fs::write(&target, "disable:\n  - traefik\n").unwrap();
+        symlink(&target, &cfg_path).unwrap();
+        assert_eq!(
+            read_k3s_config(&home).unwrap().as_deref(),
+            Some("disable:\n  - traefik\n")
+        );
+        fs::remove_file(&cfg_path).unwrap();
+
+        // Directory is rejected.
+        fs::create_dir(&cfg_path).unwrap();
+        let err = read_k3s_config(&home).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err:#}");
+        fs::remove_dir(&cfg_path).unwrap();
+
+        // FIFO with no writer is rejected immediately without blocking.
+        let c_path = CString::new(cfg_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
+        let err = read_k3s_config(&home).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err:#}");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_start_supported_detects_older_guests_before_extended_start() {
+        use std::os::unix::net::UnixListener;
+
+        let home = std::env::temp_dir().join(format!(
+            "kat-k8s-caps-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sock = socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+
+        let empty = K8sMsg::Start {
+            extra_args: vec![],
+            config_yaml: None,
+        };
+        let extended = K8sMsg::Start {
+            extra_args: vec!["--disable=traefik".into()],
+            config_yaml: None,
+        };
+
+        // Empty Start does not probe or connect at all.
+        ensure_start_supported(&home, &empty).unwrap();
+
+        // 1. Old guest: closes connection on unknown Capabilities, answers Status.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let old_guest = thread::spawn(move || {
+            // First connection: Capabilities -> close immediately (simulating UnknownKind).
+            let (mut c1, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c1).unwrap(), Some(K8sMsg::Capabilities));
+            drop(c1);
+            // Second connection: Status -> StatusInfo.
+            let (mut c2, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c2).unwrap(), Some(K8sMsg::Status));
+            k8s::write(&mut c2, &K8sMsg::StatusInfo(K8sInfo::default())).unwrap();
+        });
+        let err = ensure_start_supported(&home, &extended).unwrap_err();
+        assert!(
+            err.to_string().contains("initramfs"),
+            "expected initramfs update guidance, got: {err:#}"
+        );
+        old_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 2. New guest advertising CAP_START_CONFIG succeeds.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let new_guest = thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c).unwrap(), Some(K8sMsg::Capabilities));
+            k8s::write(&mut c, &K8sMsg::CapabilitiesInfo(k8s::CAP_START_CONFIG)).unwrap();
+        });
+        ensure_start_supported(&home, &extended).unwrap();
+        new_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 3. Guest returning CapabilitiesInfo(0) is also rejected clearly.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let zero_caps_guest = thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c).unwrap(), Some(K8sMsg::Capabilities));
+            k8s::write(&mut c, &K8sMsg::CapabilitiesInfo(0)).unwrap();
+        });
+        let err = ensure_start_supported(&home, &extended).unwrap_err();
+        assert!(
+            err.to_string().contains("initramfs"),
+            "expected initramfs update guidance, got: {err:#}"
+        );
+        zero_caps_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 4. Unreachable guest reports connection failure, not initramfs mismatch.
+        let err = ensure_start_supported(&home, &extended).unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "expected VM not running error, got: {err:#}"
+        );
 
         let _ = fs::remove_dir_all(&home);
     }

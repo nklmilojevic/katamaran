@@ -1,7 +1,9 @@
 //! `<home>/config.toml`: the VM's resources and options. The daemon reads it
 //! at every VM start, so a change applies on the next start.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -168,11 +170,19 @@ impl Config {
             "# katamaran settings; applied at the next VM start.\n{}",
             toml::to_string(self)?
         );
-        let res = fs::write(&tmp, text)
-            .with_context(|| format!("write {}", tmp.display()))
-            .and_then(|()| {
-                fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
-            });
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        let write_res = f
+            .write_all(text.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()));
+        drop(f);
+        let res = write_res.and_then(|()| {
+            fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
+        });
         if let Err(e) = res {
             let _ = fs::remove_file(&tmp);
             return Err(e);
@@ -879,5 +889,30 @@ mod tests {
         assert!(Config::parse("k8s_args = [\"\"]\n").is_err());
         assert!(Config::parse("k8s_disable = [\"--traefik\"]\n").is_err());
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn save_replaces_world_readable_config_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_home("mode-0600");
+        fs::create_dir_all(&home).unwrap();
+        let path = Config::path(&home);
+        fs::write(&path, "cpus = 2\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let mut cfg = Config::default();
+        cfg.set("k8s_args", "--token=secret", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_dir_all(&home).unwrap();
     }
 }
