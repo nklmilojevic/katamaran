@@ -490,9 +490,10 @@ impl Daemon {
         g.control = Some(tx);
         self.set_state(&mut g, VmState::Starting);
         dlog!(
-            "starting the VM ({} CPUs, {} MiB)",
+            "starting the VM ({} CPUs, {} MiB, {} GiB disk)",
             cfg.cpus,
-            cfg.memory_mib
+            cfg.memory_mib,
+            cfg.disk_gib
         );
         let d = self.clone();
         if let Err(e) = thread::Builder::new()
@@ -830,6 +831,7 @@ impl Daemon {
             vm: r.map(|r| VmInfo {
                 cpus: r.applied.cpus,
                 memory_mib: r.applied.memory_mib,
+                disk_gib: r.applied.disk_gib,
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
                 docker_ready_ms: r.docker_ready.map(ms),
@@ -921,9 +923,7 @@ impl Daemon {
             let host = Host::current();
             let before = cfg.launch_at_login;
             let before_k8s = cfg.kubernetes;
-            for (k, v) in values {
-                cfg.set(k, v, &host)?;
-            }
+            cfg.apply_values(values, &host, &self.home)?;
             cfg.save(&self.home)?;
             let keys: Vec<&str> = values.keys().map(String::as_str).collect();
             dlog!("config saved: {keys:?}");
@@ -2241,6 +2241,7 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
             p if p.is_file() => p,
             _ => guest.join("data.img.sparse"),
         },
+        disk_gib: cfg.disk_gib,
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
         cmdline: guest_cmdline(cfg),
@@ -2530,6 +2531,22 @@ mod tests {
             d.handle(&Call::ConfigSet(bad)).unwrap_err().code,
             api::INVALID_PARAMS
         );
+        // Setting disk accepts unit suffixes and refuses shrinking data.img.
+        let mut disk = std::collections::BTreeMap::new();
+        disk.insert("disk".to_string(), "500G".to_string());
+        let v = d.handle(&Call::ConfigSet(disk)).unwrap();
+        assert_eq!(v["config"]["disk_gib"], 500);
+        assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
+        fs::create_dir_all(home.join("data")).unwrap();
+        fs::File::create(home.join("data/data.img"))
+            .unwrap()
+            .set_len(200u64 << 30)
+            .unwrap();
+        let mut shrink = std::collections::BTreeMap::new();
+        shrink.insert("disk".to_string(), "100G".to_string());
+        let err = d.handle(&Call::ConfigSet(shrink)).unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+        assert!(err.message.contains("cannot shrink"), "{}", err.message);
         assert_eq!(
             d.handle(&Call::Version).unwrap()["protocol"],
             json!(PROTOCOL_VERSION)

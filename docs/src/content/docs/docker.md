@@ -60,10 +60,10 @@ docker system prune
 
 ## Tune Docker daemon resources
 
-Docker uses the vCPUs and memory ceiling configured for the katamaran VM. Change them and restart the VM:
+Docker uses the vCPUs, memory ceiling, and sparse data-disk ceiling configured for the katamaran VM (the data disk defaults to 64 GiB and can be grown online at the next boot). Change them and restart the VM:
 
 ```sh
-kat config set cpus=8 memory=12G
+kat config set cpus=8 memory=12G disk=500G
 kat restart
 ```
 

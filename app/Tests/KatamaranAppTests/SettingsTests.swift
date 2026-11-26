@@ -27,6 +27,10 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(l.memoryTickMarks == 0)
     #expect(l.clampCPUs(0) == 1)
     #expect(l.clampCPUs(64) == 10)
+    #expect(l.diskGiB == 64...16384)
+    #expect(l.clampDiskGiB(10) == 64)
+    #expect(l.clampDiskGiB(500) == 500)
+    #expect(l.clampDiskGiB(100_000) == 16384)
 }
 
 @Test func smallMacsGetOneTickPerGiB() {
@@ -60,7 +64,8 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     next.launch_at_login = false
     next.mount = false
     next.kubernetes = true
-    #expect(NSDictionary(dictionary: next.values(changedFrom: base)) == ["launch_at_login": false, "mount": false, "kubernetes": true])
+    next.disk_gib = 500
+    #expect(NSDictionary(dictionary: next.values(changedFrom: base)) == ["launch_at_login": false, "mount": false, "kubernetes": true, "disk_gib": 500])
     // An odd size from the CLI stays as it is unless memory itself changes.
     var odd = base
     odd.memory_mib = 1536

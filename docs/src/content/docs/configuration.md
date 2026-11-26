@@ -11,6 +11,7 @@ katamaran stores daemon and VM settings in `~/.katamaran/config.toml` (or `$KATA
 # katamaran settings; applied at the next VM start.
 cpus = 14
 memory_mib = 16384
+disk_gib = 64
 mount = true
 launch_at_login = true
 pause_on_sleep = false
@@ -36,6 +37,7 @@ kat restart
 |---|---|---|---|
 | `cpus` | integer | All host cores | `1` to the number of host CPU cores |
 | `memory_mib` | integer | Half of host RAM, clamped to `2048` to `16384` | `1024` to `(host RAM - 2048)` MiB. `kat config set` also accepts `memory=8G` or `memory=4096M`. |
+| `disk_gib` | integer | `64` | `64` to `16384` GiB (16 TiB). `kat config set` also accepts `disk=500G` or `disk=1T`. Growing only: cannot be set smaller than the current `data.img`. |
 | `mount` | boolean | `true` | `true`, `false`, `on`, `off`, `yes`, `no`, `1`, `0` |
 | `mount_path` | string (optional) | `~/Katamaran` (unset) | Any absolute path, or empty string to reset to default |
 | `launch_at_login` | boolean | `true` | Boolean |
@@ -50,6 +52,8 @@ kat restart
 | `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) set at guest boot, like `LimitNOFILE` in Docker Desktop. containerd, dockerd, and containers and pods inherit it unless they set their own (for example `docker run --ulimit nofile=...`). |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
+
+`disk_gib` is also a sparse ceiling on APFS, not a pre-allocated file. Raising it extends `~/.katamaran/data/data.img` before the next VM start and expands the guest btrfs filesystem automatically at boot. Existing data is preserved, and unused space continues to be returned to macOS via `discard=async` and periodic `FITRIM`. Shrinking an existing `data.img` is not supported.
 
 ## State directory layout
 

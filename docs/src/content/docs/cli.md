@@ -118,7 +118,7 @@ Update one or more settings and validate them against the Mac's hardware limits.
 
 ```sh
 kat config set cpus 6
-kat config set cpus=6 memory=8G mount=off
+kat config set cpus=6 memory=8G disk=500G mount=off
 ```
 
 See [Configuration reference](/configuration/) for every valid key and value format.
@@ -361,6 +361,7 @@ katamaran run [OPTIONS]
 | `--initramfs <PATH>` | `guest/out/initramfs.cpio` | Path to initramfs archive |
 | `--rootfs <PATH>` | `guest/out/rootfs.erofs` | Path to read-only EROFS system image |
 | `--data-template <PATH>` | `guest/out/data.img` | Path to template btrfs data disk |
+| `--disk-gib <GIB>` | `64` | Sparse data-disk ceiling in GiB (grows `data.img` before boot, never shrinks) |
 | `--cmdline <ARGS>` | empty | Extra Linux kernel command-line arguments |
 | `--vm-bin <PATH>` | sibling `katamaran-vm` | Explicit path to the `katamaran-vm` binary |
 | `--no-share` | off | Do not share `/Users` into the guest |

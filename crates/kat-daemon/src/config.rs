@@ -23,6 +23,9 @@ pub struct Config {
     /// A ceiling, not a reservation: memory the guest frees goes back to
     /// macOS, so the default is generous (see [`default_memory_mib`]).
     pub memory_mib: u32,
+    /// Data disk size ceiling in GiB (sparse on APFS; grows `data.img` at the
+    /// next VM start, never shrinks).
+    pub disk_gib: u32,
     /// Show the guest's files on the Mac over NFS.
     pub mount: bool,
     /// Where the guest's files appear; empty means `~/Katamaran` (nothing
@@ -69,6 +72,7 @@ impl Default for Config {
             // Idle vCPUs cost nothing, so the VM gets every core by default.
             cpus: Host::current().cpus.min(u32::from(u8::MAX)) as u8,
             memory_mib: default_memory_mib(Host::current()),
+            disk_gib: DEFAULT_DISK_GIB,
             mount: true,
             mount_path: None,
             launch_at_login: true,
@@ -86,9 +90,10 @@ impl Default for Config {
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 14] = [
+pub const KEYS: [&str; 15] = [
     "cpus",
     "memory_mib",
+    "disk_gib",
     "mount",
     "mount_path",
     "launch_at_login",
@@ -159,6 +164,16 @@ pub fn validate_forward_addresses(addrs: &[Ipv4Addr]) -> anyhow::Result<()> {
 
 /// The smallest guest that still runs dockerd comfortably.
 pub const MIN_MEMORY_MIB: u32 = 1024;
+
+/// Default and minimum data-disk ceiling in GiB (matches the 64 GiB template).
+pub const DEFAULT_DISK_GIB: u32 = 64;
+pub const MIN_DISK_GIB: u32 = DEFAULT_DISK_GIB;
+/// Upper sanity limit for the sparse data-disk ceiling (16 TiB).
+pub const MAX_DISK_GIB: u32 = 16 * 1024;
+
+pub const fn default_disk_gib() -> u32 {
+    DEFAULT_DISK_GIB
+}
 
 /// Half of the Mac's memory, between 2 and 16 GiB, and within what
 /// [`Config::validate`] accepts.
@@ -242,7 +257,8 @@ impl Config {
     pub fn get(&self, key: &str) -> anyhow::Result<String> {
         Ok(match key {
             "cpus" => self.cpus.to_string(),
-            "memory_mib" => self.memory_mib.to_string(),
+            "memory_mib" | "memory" => self.memory_mib.to_string(),
+            "disk_gib" | "disk" => self.disk_gib.to_string(),
             "mount" => self.mount.to_string(),
             "mount_path" => self
                 .mount_path
@@ -275,6 +291,7 @@ impl Config {
         match key {
             "cpus" => next.cpus = value.parse().with_context(|| format!("cpus: {value:?}"))?,
             "memory_mib" | "memory" => next.memory_mib = parse_mib(value)?,
+            "disk_gib" | "disk" => next.disk_gib = parse_gib(value)?,
             "mount" => next.mount = parse_bool(value)?,
             "mount_path" => {
                 next.mount_path = if value.is_empty() {
@@ -323,6 +340,34 @@ impl Config {
         out
     }
 
+    /// Apply a batch of key-value changes atomically, validating against
+    /// `host` and refusing to shrink an existing `<home>/data/data.img`.
+    pub fn apply_values(
+        &mut self,
+        values: &std::collections::BTreeMap<String, String>,
+        host: &Host,
+        home: &Path,
+    ) -> anyhow::Result<()> {
+        let mut next = self.clone();
+        for (k, v) in values {
+            next.set(k, v, host)?;
+        }
+        if (values.contains_key("disk") || values.contains_key("disk_gib"))
+            && let Some(cur_bytes) = data_disk_bytes(home)
+        {
+            let target_bytes = u64::from(next.disk_gib) << 30;
+            if target_bytes < cur_bytes {
+                let cur_gib = cur_bytes.div_ceil(1 << 30);
+                bail!(
+                    "cannot shrink data disk from {cur_gib} GiB to {} GiB (only growing is supported)",
+                    next.disk_gib
+                );
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// Whether a VM started with `self` has to restart to use `saved`.
     /// `launch_at_login` applies to launchd directly, and Kubernetes settings
     /// (`kubernetes`, `k8s_version`, `k8s_disable`, `k8s_args`) apply when k3s starts.
@@ -345,6 +390,9 @@ impl Config {
         let max = max_memory_mib(*host);
         if self.memory_mib < MIN_MEMORY_MIB || self.memory_mib > max {
             bail!("memory_mib must be between {MIN_MEMORY_MIB} and {max}");
+        }
+        if self.disk_gib < MIN_DISK_GIB || self.disk_gib > MAX_DISK_GIB {
+            bail!("disk_gib must be between {MIN_DISK_GIB} and {MAX_DISK_GIB}");
         }
         if let Some(p) = &self.mount_path
             && !p.is_absolute()
@@ -589,6 +637,36 @@ fn format_k8s_args(args: &[String]) -> String {
         .join(" ")
 }
 
+/// Current apparent size of `<home>/data/data.img` in bytes, if it exists.
+pub fn data_disk_bytes(home: &Path) -> Option<u64> {
+    fs::metadata(home.join("data/data.img"))
+        .ok()
+        .map(|m| m.len())
+}
+
+/// Accepts `64`, `500G`, `500GB`, `500GiB`, `1T`, `1TB` and `1TiB`.
+fn parse_gib(v: &str) -> anyhow::Result<u32> {
+    let lower = v.to_ascii_lowercase();
+    let (num, mult) = if let Some(n) = lower
+        .strip_suffix("tib")
+        .or_else(|| lower.strip_suffix("tb"))
+        .or_else(|| lower.strip_suffix('t'))
+    {
+        (n, 1024u32)
+    } else if let Some(n) = lower
+        .strip_suffix("gib")
+        .or_else(|| lower.strip_suffix("gb"))
+        .or_else(|| lower.strip_suffix('g'))
+    {
+        (n, 1u32)
+    } else {
+        (lower.as_str(), 1u32)
+    };
+    let n: u32 = num.trim().parse().with_context(|| format!("disk: {v:?}"))?;
+    n.checked_mul(mult)
+        .with_context(|| format!("disk: {v:?} is too large"))
+}
+
 /// Accepts `4096`, `4096M`, `4096MiB`, `4G` and `4GiB`.
 fn parse_mib(v: &str) -> anyhow::Result<u32> {
     let lower = v.to_ascii_lowercase();
@@ -716,7 +794,12 @@ mod tests {
         assert!(cfg.set("memory_mib", "40G", &HOST).is_err());
         assert!(cfg.set("mount", "maybe", &HOST).is_err());
         assert!(cfg.set("mount_path", "relative", &HOST).is_err());
-        assert!(cfg.set("disk", "1", &HOST).is_err());
+        assert!(cfg.set("disk", "32G", &HOST).is_err());
+        assert!(cfg.set("disk", "0", &HOST).is_err());
+        assert!(cfg.set("disk", "20T", &HOST).is_err());
+        assert!(cfg.set("disk", "500M", &HOST).is_err());
+        assert!(cfg.set("disk", "lots", &HOST).is_err());
+        assert!(cfg.set("unknown_key", "1", &HOST).is_err());
         // A rejected value leaves the config as it was.
         assert_eq!(cfg, Config::default());
     }
@@ -944,6 +1027,101 @@ mod tests {
         // Only a truly blank input resets to the default.
         cfg.set("forward_addresses", "   ", &HOST).unwrap();
         assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
+    }
+
+    #[test]
+    fn parses_disk_units() {
+        assert_eq!(parse_gib("64").unwrap(), 64);
+        assert_eq!(parse_gib("500G").unwrap(), 500);
+        assert_eq!(parse_gib("500g").unwrap(), 500);
+        assert_eq!(parse_gib("500GB").unwrap(), 500);
+        assert_eq!(parse_gib("500GiB").unwrap(), 500);
+        assert_eq!(parse_gib("1T").unwrap(), 1024);
+        assert_eq!(parse_gib("2TiB").unwrap(), 2048);
+        assert_eq!(parse_gib("2tb").unwrap(), 2048);
+        assert!(parse_gib("lots").is_err());
+        assert!(parse_gib("500M").is_err());
+        assert!(parse_gib("5000000T").is_err());
+    }
+
+    #[test]
+    fn disk_is_a_vm_setting_and_round_trips() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.disk_gib, DEFAULT_DISK_GIB);
+        assert_eq!(cfg.get("disk_gib").unwrap(), "64");
+        assert_eq!(cfg.get("disk").unwrap(), "64");
+
+        let started = cfg.clone();
+        cfg.set("disk", "500G", &HOST).unwrap();
+        assert_eq!(cfg.disk_gib, 500);
+        assert_eq!(cfg.get("disk").unwrap(), "500");
+        assert_eq!(cfg.get("disk_gib").unwrap(), "500");
+        assert!(started.needs_restart_for(&cfg));
+
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("disk_gib = 500"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+
+        cfg.set("disk_gib", "1T", &HOST).unwrap();
+        assert_eq!(cfg.disk_gib, 1024);
+    }
+
+    #[test]
+    fn apply_values_refuses_to_shrink_existing_data_img() {
+        let home = temp_home("disk-shrink");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // Before data.img exists, disk can be set and lowered freely (>= 64 GiB).
+        let mut cfg = Config::default();
+        cfg.apply_values(&map(&[("disk", "500G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, 500);
+        cfg.apply_values(&map(&[("disk", "128G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, 128);
+
+        // Once data.img is 200 GiB on disk, shrinking below 200 GiB is refused
+        // and leaves the config (including other keys in the same batch) intact.
+        let img = data_dir.join("data.img");
+        let f = fs::File::create(&img).unwrap();
+        f.set_len(200u64 << 30).unwrap();
+        drop(f);
+
+        let before = cfg.clone();
+        let err = cfg
+            .apply_values(&map(&[("cpus", "2"), ("disk", "100G")]), &HOST, &home)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot shrink data disk"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cfg, before);
+
+        // Setting equal or larger size succeeds.
+        cfg.apply_values(&map(&[("disk", "200G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, 200);
+        cfg.apply_values(&map(&[("disk", "500G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, 500);
+
+        // Changing unrelated keys still works even if config.toml has a smaller disk_gib.
+        let mut smaller = Config::default();
+        assert_eq!(smaller.disk_gib, 64);
+        smaller
+            .apply_values(&map(&[("cpus", "2")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(smaller.cpus, 2);
+
+        fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

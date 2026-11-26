@@ -1,6 +1,7 @@
 mod amd64;
 mod autofwd;
 mod clock;
+mod disk;
 mod fscache;
 mod fsnotify;
 mod k8s;
@@ -187,6 +188,18 @@ fn mount_system() -> io::Result<()> {
                 libc::MS_NOATIME,
                 Some(&opts),
             )?;
+        }
+        let mount = format!("{NEW_ROOT}{}", DATA_MOUNTS[0].1);
+        match disk::grow_if_needed(DATA_DISK, &mount) {
+            Ok(Some((before, after))) => {
+                log(&format!(
+                    "resized data disk filesystem ({} GiB -> {} GiB)",
+                    before >> 30,
+                    after >> 30
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => log(&format!("data disk resize failed: {e}")),
         }
     } else {
         log("no data disk; Docker data lives in memory");

@@ -803,3 +803,153 @@ fn the_daemon_restarts_its_vm_and_resyncs_the_clock_on_wake() {
     cli(&d.home, &["stop"]);
     assert_eq!(d.status()["state"], "stopped");
 }
+
+#[test]
+#[ignore = "boots the system VM; run with `cargo xtask test-vm`"]
+fn data_disk_grows_and_resizes_btrfs_across_restart() {
+    let home = root().join(format!("target/tld-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    cli(
+        &home,
+        &["config", "set", "cpus=2", "memory=2G", "mount=off"],
+    );
+    let child = Command::new(root().join("target/release/katamaran"))
+        .arg("daemon")
+        .env("KATAMARAN_HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn katamaran daemon");
+    let d = Daemon { child, home };
+    within(Duration::from_secs(10), "the daemon socket", || {
+        UnixStream::connect(d.home.join("run/daemon.sock")).is_ok()
+    });
+    cli(&d.home, &["start"]);
+
+    let saved = image_docker().args(["save", IMAGE]).output().unwrap();
+    if saved.status.success() {
+        let mut load = Command::new("docker")
+            .env(
+                "DOCKER_HOST",
+                format!("unix://{}", d.home.join("run/docker.sock").display()),
+            )
+            .args(["load", "-q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        load.stdin.take().unwrap().write_all(&saved.stdout).unwrap();
+        let out = load.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "docker load: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    } else {
+        d.docker(&["pull", "-q", IMAGE]);
+    }
+
+    let fs_kib = || -> u64 {
+        let out = d.docker(&[
+            "run",
+            "--rm",
+            IMAGE,
+            "sh",
+            "-c",
+            "df -Pk / | awk 'NR==2 { print $2 }'",
+        ]);
+        out.trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("parse df output {out:?}: {e}"))
+    };
+
+    let img = d.home.join("data/data.img");
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 64 * GIB);
+    let before_kib = fs_kib();
+    assert!(
+        (60 << 20..=66 << 20).contains(&before_kib),
+        "expected ~64 GiB filesystem before resize, got {before_kib} KiB"
+    );
+
+    // Write persistent data that must survive the resize.
+    d.docker(&["volume", "create", "persist"]);
+    d.docker(&[
+        "run",
+        "--rm",
+        "-v",
+        "persist:/v",
+        IMAGE,
+        "sh",
+        "-c",
+        "echo keep-me > /v/sentinel && sync",
+    ]);
+
+    let set_out = cli(&d.home, &["config", "set", "disk=500G"]);
+    assert!(set_out.contains("restart"), "{set_out}");
+    let pending = cli(&d.home, &["status"]);
+    assert!(
+        pending.contains("pending") && pending.contains("500 GiB disk"),
+        "{pending}"
+    );
+
+    cli(&d.home, &["restart"]);
+
+    let meta = std::fs::metadata(&img).unwrap();
+    assert_eq!(meta.len(), 500 * GIB);
+    assert!(
+        meta.blocks() * 512 < 512 * MIB,
+        "grown data.img should remain sparse: {} MiB allocated",
+        meta.blocks() * 512 / MIB
+    );
+    assert_eq!(d.status()["vm"]["disk_gib"], 500);
+
+    let console = std::fs::read_to_string(d.home.join("logs/console.log")).unwrap_or_default();
+    assert!(
+        console.contains("resized data disk filesystem (64 GiB -> 500 GiB)"),
+        "console log:\n{console}"
+    );
+
+    let after_kib = fs_kib();
+    assert!(
+        after_kib >= 490 << 20,
+        "expected ~500 GiB filesystem after resize, got {after_kib} KiB"
+    );
+    let sentinel = d.docker(&[
+        "run",
+        "--rm",
+        "-v",
+        "persist:/v",
+        IMAGE,
+        "cat",
+        "/v/sentinel",
+    ]);
+    assert_eq!(sentinel.trim(), "keep-me");
+
+    // Shrinking below the current 500 GiB data.img is refused.
+    let shrink = Command::new(root().join("target/release/katamaran"))
+        .args(["config", "set", "disk=200G"])
+        .env("KATAMARAN_HOME", &d.home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run katamaran");
+    assert!(!shrink.status.success());
+    assert!(
+        String::from_utf8_lossy(&shrink.stderr).contains("cannot shrink"),
+        "{shrink:?}"
+    );
+
+    // A subsequent restart does not re-run the resize.
+    cli(&d.home, &["restart"]);
+    let console2 = std::fs::read_to_string(d.home.join("logs/console.log")).unwrap_or_default();
+    assert!(
+        !console2.contains("resized data disk filesystem"),
+        "second boot should skip resize:\n{console2}"
+    );
+    assert!(fs_kib() >= 490 << 20);
+
+    cli(&d.home, &["stop"]);
+    assert_eq!(d.status()["state"], "stopped");
+}

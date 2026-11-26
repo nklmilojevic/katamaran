@@ -36,6 +36,9 @@ pub struct RunArgs {
     /// Data disk template, cloned to ~/.katamaran/data/data.img on first run.
     #[arg(long, default_value = "guest/out/data.img")]
     pub data_template: PathBuf,
+    /// Data disk size ceiling in GiB (grows data.img before boot, never shrinks).
+    #[arg(long, default_value_t = crate::config::DEFAULT_DISK_GIB)]
+    pub disk_gib: u32,
     #[arg(long, default_value_t = 4)]
     pub cpus: u8,
     /// Guest memory ceiling. Memory the guest frees goes back to macOS, so the
@@ -594,6 +597,7 @@ fn session(
     if !data_img.exists() {
         clone_template(&vm::absolute(&args.data_template)?, &data_img)?;
     }
+    grow_data_disk(&data_img, args.disk_gib)?;
     let docker_sock = run_dir.join("docker.sock");
     // Unpublished container ports, relayed over vsock (see autofwd.rs).
     let auto_forward = !args.no_network && !args.no_auto_forward;
@@ -1128,6 +1132,45 @@ fn clone_template(template: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Extend `data.img` to `target_gib` GiB (sparse on APFS). Never shrinks an
+/// existing image. Returns whether the image was grown.
+fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<bool> {
+    if !(crate::config::MIN_DISK_GIB..=crate::config::MAX_DISK_GIB).contains(&target_gib) {
+        bail!(
+            "disk_gib must be between {} and {}",
+            crate::config::MIN_DISK_GIB,
+            crate::config::MAX_DISK_GIB
+        );
+    }
+    let target_bytes = u64::from(target_gib) << 30;
+    let current_bytes = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if target_bytes == current_bytes {
+        return Ok(false);
+    }
+    if target_bytes < current_bytes {
+        eprintln!(
+            "katamaran: data disk {} is already {} GiB; keeping current size (shrinking is not supported)",
+            path.display(),
+            current_bytes.div_ceil(1 << 30)
+        );
+        return Ok(false);
+    }
+    let f = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    f.set_len(target_bytes)
+        .with_context(|| format!("grow {} to {target_gib} GiB", path.display()))?;
+    println!(
+        "katamaran: grew data disk {} ({} GiB -> {target_gib} GiB)",
+        path.display(),
+        current_bytes >> 30
+    );
+    Ok(true)
+}
+
 /// Only one `katamaran run` may own the state directory at a time.
 pub fn lock(path: &Path) -> anyhow::Result<File> {
     let f = OpenOptions::new()
@@ -1176,6 +1219,8 @@ pub fn block_and_watch_signals() -> anyhow::Result<mpsc::Receiver<i32>> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
 
     #[derive(Parser)]
     struct Wrapper {
@@ -1834,5 +1879,45 @@ mod tests {
         drop(held);
         drop(tracker);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grow_data_disk_extends_sparsely_and_never_shrinks() {
+        let dir = std::env::temp_dir().join(format!("kat-grow-disk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("data.img");
+
+        let mut f = File::create(&img).unwrap();
+        f.write_all(b"btrfs-header").unwrap();
+        f.set_len(64u64 << 30).unwrap();
+        drop(f);
+
+        // Same size is a no-op.
+        assert!(!grow_data_disk(&img, 64).unwrap());
+        assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
+
+        // Growing extends apparent size sparsely and preserves existing bytes.
+        assert!(grow_data_disk(&img, 200).unwrap());
+        let meta = fs::metadata(&img).unwrap();
+        assert_eq!(meta.len(), 200u64 << 30);
+        assert!(
+            meta.blocks() * 512 < (64 << 20),
+            "grown image should remain sparse: {} blocks",
+            meta.blocks()
+        );
+        let mut head = [0u8; 12];
+        File::open(&img).unwrap().read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"btrfs-header");
+
+        // Smaller target never truncates.
+        assert!(!grow_data_disk(&img, 128).unwrap());
+        assert_eq!(fs::metadata(&img).unwrap().len(), 200u64 << 30);
+
+        // Invalid sizes fail.
+        assert!(grow_data_disk(&img, 32).is_err());
+        assert!(grow_data_disk(&img, crate::config::MAX_DISK_GIB + 1).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

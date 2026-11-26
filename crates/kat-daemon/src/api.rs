@@ -492,6 +492,8 @@ pub struct DaemonInfo {
 pub struct VmInfo {
     pub cpus: u8,
     pub memory_mib: u32,
+    #[serde(default = "crate::config::default_disk_gib")]
+    pub disk_gib: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// Start request until the guest's hello.
@@ -935,6 +937,7 @@ mod tests {
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
+                disk_gib: 64,
                 pid: Some(9),
                 boot_ms: Some(120.0),
                 docker_ready_ms: Some(900.0),
@@ -988,5 +991,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!legacy.dns_isolated);
+
+        // Older daemons omit disk_gib on VmInfo; it defaults to 64 GiB.
+        let legacy: VmInfo =
+            serde_json::from_value(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
+        assert_eq!(legacy.disk_gib, crate::config::DEFAULT_DISK_GIB);
     }
 }

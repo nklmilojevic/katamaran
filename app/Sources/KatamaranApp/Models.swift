@@ -38,6 +38,7 @@ struct Config: Codable, Equatable {
     var mount_path: String?
     var launch_at_login: Bool
     var kubernetes: Bool? = nil
+    var disk_gib: Int? = nil
 }
 
 struct ConfigView: Decodable {
@@ -48,6 +49,7 @@ struct ConfigView: Decodable {
 struct VmInfo: Decodable, Equatable {
     var cpus: Int
     var memory_mib: Int
+    var disk_gib: Int? = nil
     var pid: UInt32?
     var boot_ms: Double?
     var docker_ready_ms: Double?

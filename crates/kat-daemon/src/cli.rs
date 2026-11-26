@@ -54,7 +54,7 @@ pub enum Source {
 pub enum ConfigCmd {
     /// Print one setting, or all of them.
     Get { key: Option<String> },
-    /// Change settings: `set cpus 2`, `set cpus=2 memory=8G mount=off`, or `set k8s_args="--debug"` (use `--` for bare hyphen-leading values: `set -- k8s_args --debug`).
+    /// Change settings: `set cpus 2`, `set cpus=2 memory=8G disk=200G mount=off`, or `set k8s_args="--debug"` (use `--` for bare hyphen-leading values: `set -- k8s_args --debug`).
     Set {
         #[arg(required = true, num_args = 1..)]
         pairs: Vec<String>,
@@ -265,7 +265,10 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         line("k8s", k);
     }
     if let Some(vm) = &s.vm {
-        let mut v = format!("{} CPUs · {} MiB", vm.cpus, vm.memory_mib);
+        let mut v = format!(
+            "{} CPUs · {} MiB · {} GiB disk",
+            vm.cpus, vm.memory_mib, vm.disk_gib
+        );
         if let Some(u) = &s.usage {
             v.push_str(&format!(
                 " · guest {:.0}% CPU, {}/{} MiB",
@@ -285,7 +288,10 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
     } else {
         line(
             "resources",
-            format!("{} CPUs · {} MiB", s.config.cpus, s.config.memory_mib),
+            format!(
+                "{} CPUs · {} MiB · {} GiB disk",
+                s.config.cpus, s.config.memory_mib, s.config.disk_gib
+            ),
         );
     }
     let files = match (&s.mount.path, s.mount.mounted, &s.mount.error) {
@@ -341,13 +347,15 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         );
     }
     if let Some(vm) = &s.vm
-        && (vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib)
+        && (vm.cpus != s.config.cpus
+            || vm.memory_mib != s.config.memory_mib
+            || vm.disk_gib != s.config.disk_gib)
     {
         line(
             "pending",
             format!(
-                "{} CPUs · {} MiB after a restart",
-                s.config.cpus, s.config.memory_mib
+                "{} CPUs · {} MiB · {} GiB disk after a restart",
+                s.config.cpus, s.config.memory_mib, s.config.disk_gib
             ),
         );
     }
@@ -437,9 +445,7 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
                     let home = crate::state_dir()?;
                     let mut cfg = config::Config::load(&home)?;
                     let host = config::Host::current();
-                    for (k, v) in &values {
-                        cfg.set(k, v, &host)?;
-                    }
+                    cfg.apply_values(&values, &host, &home)?;
                     cfg.save(&home)?;
                     if values.contains_key("launch_at_login") {
                         crate::setup::set_run_at_load(cfg.launch_at_login, None)?;
@@ -551,6 +557,7 @@ mod tests {
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
+                disk_gib: 64,
                 pid: Some(2),
                 boot_ms: Some(100.0),
                 docker_ready_ms: Some(1500.0),
@@ -585,8 +592,20 @@ mod tests {
         assert!(text.contains("guest 3% CPU, 500/3900 MiB"), "{text}");
         assert!(text.contains("/Users/me/Katamaran (mounted)"), "{text}");
         assert!(text.contains("8080/tcp"), "{text}");
+        assert!(text.contains("4 CPUs · 4096 MiB · 64 GiB disk"), "{text}");
         assert!(!text.contains("port err"), "{text}");
         assert!(text.contains("pending"), "{text}");
+
+        // Pending also triggers when only disk_gib changed.
+        let mut disk_pending = s.clone();
+        disk_pending.config.cpus = 4;
+        disk_pending.config.memory_mib = 4096;
+        disk_pending.config.disk_gib = 500;
+        let disk_text = summary(&disk_pending);
+        assert!(
+            disk_text.contains("4 CPUs · 4096 MiB · 500 GiB disk after a restart"),
+            "{disk_text}"
+        );
         assert!(
             !text.contains("k8s"),
             "default disabled k8s should be omitted: {text}"

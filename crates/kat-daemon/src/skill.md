@@ -70,12 +70,12 @@ Settings live in `~/.katamaran/config.toml` and take effect on the next VM start
 
 ```sh
 kat config get
-kat config set cpus=8 memory=12G pause_on_sleep=on
+kat config set cpus=8 memory=12G disk=500G pause_on_sleep=on
 kat config set k8s_disable=traefik
 kat restart
 ```
 
-Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `forward_addresses` (`127.0.0.1,172.16.1.200`; replaces the `127.0.0.1` default for TCP forwards; aliases must be on `lo0`, empty resets), `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `k8s_disable`, `k8s_args`, `nofile` (open-files limit for containers, default `1048576`).
+Keys: `cpus`, `memory_mib` (`memory=8G`), `disk_gib` (`disk=500G` or `disk=1T`, grow-only), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `forward_addresses` (`127.0.0.1,172.16.1.200`; replaces the `127.0.0.1` default for TCP forwards; aliases must be on `lo0`, empty resets), `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `k8s_disable`, `k8s_args`, `nofile` (open-files limit for containers, default `1048576`).
 
 ## Files in Finder
 

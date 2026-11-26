@@ -178,7 +178,7 @@ Open **Settings** in the app or use `kat config`:
 
 ```sh
 kat config get
-kat config set cpus=8 memory=12G pause_on_sleep=on
+kat config set cpus=8 memory=12G disk=500G pause_on_sleep=on
 kat restart
 ```
 
@@ -188,6 +188,7 @@ Settings live in `~/.katamaran/config.toml` and take effect at the next VM start
 |---|---|---|
 | `cpus` | All host cores | Number of vCPUs assigned to the VM |
 | `memory_mib` | Half of host RAM, clamped to 2 GiB to 16 GiB | Upper memory ceiling (`memory=8G` is accepted by `config set`) |
+| `disk_gib` | `64` | Sparse data-disk ceiling in GiB (`disk=500G` or `disk=1T` is accepted by `config set`; grows at next start, never shrinks) |
 | `amd64` | `auto` | How `linux/amd64` containers run (`auto`, `rosetta`, `qemu`, or `off`) |
 | `auto_forward` | `true` | Forward unpublished container TCP ports to the configured `forward_addresses` |
 | `forward_addresses` | `["127.0.0.1"]` | macOS loopback addresses for forwarded TCP ports; for example, `kat config set forward_addresses=127.0.0.1,172.16.1.200` if the alias is assigned to `lo0` |
