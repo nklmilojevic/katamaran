@@ -2185,6 +2185,9 @@ impl K8s {
             |cmd| self.run_sqlite_cmd(cmd),
         )?;
         let server_args = build_k3s_server_args(extra_args)?;
+        if let Some(yaml) = config_yaml {
+            validate_k3s_config_yaml(Path::new(K3S_CONFIG_PATH), yaml)?;
+        }
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("preparing k3s environment".into()),
@@ -2721,6 +2724,672 @@ fn configure_k3s_config_env(cmd: &mut Command, managed_config: Option<&Path>) {
     } else {
         cmd.env_remove("K3S_CONFIG_FILE");
     }
+}
+
+const INVALID_ETCD_S3_PROXY_ERR: &str = "invalid etcd-s3-proxy in k3s config YAML: must be \"none\" or a valid URL with scheme and host (for example http://proxy.example.com:8080)";
+
+/// Validate the effective `etcd-s3-proxy` setting across the managed YAML and
+/// any `.d/*.{yaml,yml}` drop-ins that k3s loads, before launching k3s.
+///
+/// Rejects malformed proxy URLs with [`INVALID_ETCD_S3_PROXY_ERR`] (never
+/// echoing the configured value or parser diagnostics) so mistyped
+/// credential-bearing URLs cannot be logged by k3s's S3 client.
+fn validate_k3s_config_yaml(config_path: &Path, config_yaml: &str) -> Result<(), String> {
+    let mut effective_proxy = extract_etcd_s3_proxy_from_yaml(config_yaml)
+        .map_err(|()| INVALID_ETCD_S3_PROXY_ERR.to_string())?;
+
+    let dropin_dir = PathBuf::from(format!("{}.d", config_path.display()));
+    match fs::read_dir(&dropin_dir) {
+        Ok(entries) => {
+            let mut dropins = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("read {}: {e}", dropin_dir.display()))?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| format!("stat {}: {e}", entry.path().display()))?;
+                if file_type.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let lower = name.to_string_lossy().to_ascii_lowercase();
+                if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+                    dropins.push((name, entry.path()));
+                }
+            }
+            dropins.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, path) in dropins {
+                let text = fs::read_to_string(&path)
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
+                if let Some(proxy) = extract_etcd_s3_proxy_from_yaml(&text)
+                    .map_err(|()| INVALID_ETCD_S3_PROXY_ERR.to_string())?
+                {
+                    effective_proxy = Some(proxy);
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read {}: {e}", dropin_dir.display())),
+    }
+
+    if let Some(proxy) = effective_proxy.as_deref()
+        && !is_valid_etcd_s3_proxy(proxy)
+    {
+        return Err(INVALID_ETCD_S3_PROXY_ERR.to_string());
+    }
+    Ok(())
+}
+
+fn is_valid_etcd_s3_proxy(val: &str) -> bool {
+    if val.is_empty() || val == "none" {
+        return true;
+    }
+    is_valid_go_proxy_url(val)
+}
+
+fn has_valid_percent_escapes(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() || !b[i + 1].is_ascii_hexdigit() || !b[i + 2].is_ascii_hexdigit() {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+fn is_valid_go_userinfo(s: &str) -> bool {
+    if !has_valid_percent_escapes(s) {
+        return false;
+    }
+    s.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b':'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+            )
+    })
+}
+
+fn is_valid_go_reg_name(s: &str) -> bool {
+    if s.is_empty() || !has_valid_percent_escapes(s) {
+        return false;
+    }
+    s.bytes().all(|b| {
+        !b.is_ascii()
+            || b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+            )
+    })
+}
+
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+/// Validate a proxy URL against Go's `net/url.Parse` and k3s's requirement
+/// that both scheme and host are non-empty.
+fn is_valid_go_proxy_url(s: &str) -> bool {
+    if s.bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return false;
+    };
+    let mut scheme_bytes = scheme.bytes();
+    let Some(first) = scheme_bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic()
+        || !scheme_bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            if !is_valid_go_userinfo(userinfo) {
+                return false;
+            }
+            host
+        }
+        None => authority,
+    };
+    if host.is_empty() {
+        return false;
+    }
+
+    if let Some(after_open) = host.strip_prefix('[') {
+        let Some((inside, after_close)) = after_open.split_once(']') else {
+            return false;
+        };
+        if inside.is_empty() {
+            return false;
+        }
+        let (addr_part, zone_opt) = match inside.split_once("%25") {
+            Some((a, z)) => (a, Some(z)),
+            None => (inside, None),
+        };
+        if addr_part.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        if let Some(zone) = zone_opt
+            && !is_valid_go_reg_name(zone)
+        {
+            return false;
+        }
+        if !after_close.is_empty() {
+            let Some(port) = after_close.strip_prefix(':') else {
+                return false;
+            };
+            if !is_valid_port(port) {
+                return false;
+            }
+        }
+    } else {
+        if host.contains(['[', ']']) {
+            return false;
+        }
+        if let Some((name, port)) = host.split_once(':') {
+            if !is_valid_go_reg_name(name) || !is_valid_port(port) {
+                return false;
+            }
+        } else if !is_valid_go_reg_name(host) {
+            return false;
+        }
+    }
+
+    // Check path, query, and fragment for malformed percent escapes.
+    let (before_frag, frag) = match tail.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (tail, None),
+    };
+    let (path, query) = match before_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (before_frag, None),
+    };
+    if !has_valid_percent_escapes(path) {
+        return false;
+    }
+    if let Some(q) = query
+        && !has_valid_percent_escapes(q)
+    {
+        return false;
+    }
+    if let Some(f) = frag
+        && !has_valid_percent_escapes(f)
+    {
+        return false;
+    }
+    true
+}
+
+fn parse_yaml_single_quoted(s: &str) -> Result<(String, &str), ()> {
+    let rest = s.strip_prefix('\'').ok_or(())?;
+    let mut out = String::new();
+    let mut chars = rest.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if let Some(&(_, '\'')) = chars.peek() {
+                chars.next();
+                out.push('\'');
+            } else {
+                return Ok((out, &rest[idx + 1..]));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Err(())
+}
+
+fn parse_yaml_double_quoted(s: &str) -> Result<(String, &str), ()> {
+    let rest = s.strip_prefix('"').ok_or(())?;
+    let mut out = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '"' => return Ok((out, &rest[idx + 1..])),
+            '\\' => {
+                let (_, esc) = chars.next().ok_or(())?;
+                match esc {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    '0' => out.push('\0'),
+                    'b' => out.push('\x08'),
+                    'f' => out.push('\x0c'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'x' | 'u' | 'U' => {
+                        let digits = match esc {
+                            'x' => 2,
+                            'u' => 4,
+                            _ => 8,
+                        };
+                        let mut hex = String::with_capacity(digits);
+                        for _ in 0..digits {
+                            let (_, d) = chars.next().ok_or(())?;
+                            hex.push(d);
+                        }
+                        let code = u32::from_str_radix(&hex, 16).map_err(|_| ())?;
+                        out.push(char::from_u32(code).ok_or(())?);
+                    }
+                    _ => return Err(()),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Err(())
+}
+
+fn trailing_is_yaml_comment_or_empty(s: &str) -> bool {
+    let trimmed = s.trim_start_matches([' ', '\t']);
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
+fn strip_yaml_inline_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+fn parse_yaml_inline_scalar(raw: &str) -> Result<String, ()> {
+    let s = raw.trim_start_matches([' ', '\t']);
+    if s.is_empty() || s.starts_with('#') {
+        return Ok(String::new());
+    }
+    if s.starts_with('"') {
+        let (val, rem) = parse_yaml_double_quoted(s)?;
+        if !trailing_is_yaml_comment_or_empty(rem) {
+            return Err(());
+        }
+        return Ok(val);
+    }
+    if s.starts_with('\'') {
+        let (val, rem) = parse_yaml_single_quoted(s)?;
+        if !trailing_is_yaml_comment_or_empty(rem) {
+            return Err(());
+        }
+        return Ok(val);
+    }
+    if s.starts_with(['&', '*', '!', '{', '[']) {
+        return Err(());
+    }
+    let plain = strip_yaml_inline_comment(s).trim_end_matches([' ', '\t']);
+    if matches!(plain, "~" | "null" | "Null" | "NULL") {
+        Ok(String::new())
+    } else {
+        Ok(plain.to_string())
+    }
+}
+
+fn json_value_to_proxy_string(v: &serde_json::Value) -> Result<String, ()> {
+    match v {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Array(arr) => match arr.last() {
+            Some(last) => json_value_to_proxy_string(last),
+            None => Ok(String::new()),
+        },
+        serde_json::Value::Object(_) => Err(()),
+    }
+}
+
+fn parse_yaml_flow_sequence_last(s: &str) -> Result<Option<String>, ()> {
+    let inner_and_rest = s.strip_prefix('[').ok_or(())?;
+    let mut items = Vec::new();
+    let mut i = 0;
+    let bytes = inner_and_rest.as_bytes();
+    loop {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err(());
+        }
+        if bytes[i] == b']' {
+            if !trailing_is_yaml_comment_or_empty(&inner_and_rest[i + 1..]) {
+                return Err(());
+            }
+            break;
+        }
+        let rem = &inner_and_rest[i..];
+        let (item, consumed) = if rem.starts_with('"') {
+            let (v, after) = parse_yaml_double_quoted(rem)?;
+            (v, rem.len() - after.len())
+        } else if rem.starts_with('\'') {
+            let (v, after) = parse_yaml_single_quoted(rem)?;
+            (v, rem.len() - after.len())
+        } else if rem.starts_with(['&', '*', '!', '{', '[']) {
+            return Err(());
+        } else {
+            let end = rem.find([',', ']']).ok_or(())?;
+            let raw_item = rem[..end].trim();
+            let v = if matches!(raw_item, "" | "~" | "null" | "Null" | "NULL") {
+                String::new()
+            } else {
+                raw_item.to_string()
+            };
+            (v, end)
+        };
+        items.push(item);
+        i += consumed;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Err(());
+        }
+        if bytes[i] == b',' {
+            i += 1;
+        } else if bytes[i] == b']' {
+            if !trailing_is_yaml_comment_or_empty(&inner_and_rest[i + 1..]) {
+                return Err(());
+            }
+            break;
+        } else {
+            return Err(());
+        }
+    }
+    Ok(items.pop())
+}
+
+fn parse_top_level_yaml_key(line: &str) -> Option<(String, &str)> {
+    if line.is_empty() || line.starts_with([' ', '\t', '#']) {
+        return None;
+    }
+    if line.starts_with('"') {
+        let (key, rem) = parse_yaml_double_quoted(line).ok()?;
+        let after = rem.trim_start_matches([' ', '\t']).strip_prefix(':')?;
+        return Some((key, after));
+    }
+    if line.starts_with('\'') {
+        let (key, rem) = parse_yaml_single_quoted(line).ok()?;
+        let after = rem.trim_start_matches([' ', '\t']).strip_prefix(':')?;
+        return Some((key, after));
+    }
+    let bytes = line.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b':'
+            && bytes
+                .get(idx + 1)
+                .is_none_or(|&n| matches!(n, b' ' | b'\t'))
+        {
+            let key = line[..idx].trim_end_matches([' ', '\t']);
+            if !key.is_empty() {
+                return Some((key.to_string(), &line[idx + 1..]));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn is_yaml_block_scalar_header(s: &str) -> Option<(char, char)> {
+    let mut chars = s.chars();
+    let style = match chars.next()? {
+        c @ ('|' | '>') => c,
+        _ => return None,
+    };
+    let mut chomp = ' ';
+    let mut rest = chars.as_str();
+    while let Some(c) = rest.chars().next() {
+        if matches!(c, '-' | '+') && chomp == ' ' {
+            chomp = c;
+            rest = &rest[c.len_utf8()..];
+        } else if c.is_ascii_digit() && c != '0' {
+            rest = &rest[1..];
+        } else {
+            break;
+        }
+    }
+    if trailing_is_yaml_comment_or_empty(rest) {
+        Some((style, chomp))
+    } else {
+        None
+    }
+}
+
+/// Extract the effective top-level `etcd-s3-proxy` value from one k3s YAML
+/// config file. Returns `Ok(None)` when the key is absent, `Ok(Some(val))`
+/// when present, and `Err(())` when the entry cannot be parsed safely.
+fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
+    // Handle flow-style JSON/YAML top-level mapping documents (`{...}`).
+    let first_non_meta = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#') && *l != "---");
+    if first_non_meta.is_some_and(|l| l.starts_with('{')) {
+        let stripped: String = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#') && t != "---" && t != "..."
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(&stripped)
+        {
+            let mut found = None;
+            for (k, v) in &map {
+                let norm = k.strip_suffix('+').unwrap_or(k);
+                if norm == "etcd-s3-proxy" {
+                    found = Some(json_value_to_proxy_string(v)?);
+                }
+            }
+            return Ok(found);
+        }
+        return if text.contains("etcd-s3-proxy") {
+            Err(())
+        } else {
+            Ok(None)
+        };
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found: Option<String> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" || trimmed == "..." {
+            i += 1;
+            continue;
+        }
+        // Fail closed on explicit YAML complex keys (`? etcd-s3-proxy`) so they
+        // cannot bypass validation.
+        if let Some(after_q) = line
+            .strip_prefix("? ")
+            .or_else(|| line.strip_prefix("?\t"))
+            .or_else(|| (line == "?").then_some(""))
+        {
+            let key_text = if after_q.trim().is_empty() {
+                lines.get(i + 1).copied().unwrap_or("")
+            } else {
+                after_q
+            };
+            if key_text.contains("etcd-s3-proxy") {
+                return Err(());
+            }
+            i += 1;
+            continue;
+        }
+        let Some((key, after_colon)) = parse_top_level_yaml_key(line) else {
+            i += 1;
+            continue;
+        };
+        let is_append = key.ends_with('+');
+        let norm_key = key.strip_suffix('+').unwrap_or(&key);
+        if norm_key != "etcd-s3-proxy" {
+            i += 1;
+            continue;
+        }
+
+        let rest = after_colon.trim_start_matches([' ', '\t']);
+        if let Some((style, chomp)) = is_yaml_block_scalar_header(rest) {
+            let mut block_lines = Vec::new();
+            let mut j = i + 1;
+            let mut min_indent: Option<usize> = None;
+            while j < lines.len() {
+                let l = lines[j];
+                if l.trim().is_empty() {
+                    block_lines.push("");
+                    j += 1;
+                    continue;
+                }
+                let indent = l.bytes().take_while(|&b| b == b' ').count();
+                if indent == 0 {
+                    break;
+                }
+                min_indent = Some(min_indent.map_or(indent, |m| m.min(indent)));
+                block_lines.push(l);
+                j += 1;
+            }
+            let trim_n = min_indent.unwrap_or(0);
+            let mut stripped_lines: Vec<&str> = block_lines
+                .into_iter()
+                .map(|l| if l.len() >= trim_n { &l[trim_n..] } else { "" })
+                .collect();
+            let trailing_empty = stripped_lines
+                .iter()
+                .rev()
+                .take_while(|l| l.is_empty())
+                .count();
+            if chomp != '+' {
+                stripped_lines.truncate(stripped_lines.len() - trailing_empty);
+            }
+            let mut val = if style == '>' {
+                stripped_lines.join(" ")
+            } else {
+                stripped_lines.join("\n")
+            };
+            if chomp != '-' && !val.is_empty() {
+                val.push('\n');
+            }
+            found = Some(val);
+            i = j;
+            continue;
+        }
+
+        if rest.starts_with('[') {
+            match parse_yaml_flow_sequence_last(rest)? {
+                Some(last) => found = Some(last),
+                None if !is_append => found = Some(String::new()),
+                None => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        if rest.is_empty() || rest.starts_with('#') {
+            let mut j = i + 1;
+            let mut seq_items: Vec<String> = Vec::new();
+            let mut scalar_lines: Vec<&str> = Vec::new();
+            let mut saw_seq = false;
+            while j < lines.len() {
+                let l = lines[j];
+                let t = l.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    j += 1;
+                    continue;
+                }
+                let indent = l.bytes().take_while(|&b| matches!(b, b' ' | b'\t')).count();
+                let after_indent = &l[indent..];
+                if let Some(item_rest) = after_indent
+                    .strip_prefix("- ")
+                    .or_else(|| after_indent.strip_prefix("-\t"))
+                    .or_else(|| (after_indent == "-").then_some(""))
+                {
+                    saw_seq = true;
+                    seq_items.push(parse_yaml_inline_scalar(item_rest)?);
+                    j += 1;
+                    continue;
+                }
+                if indent == 0 {
+                    break;
+                }
+                if saw_seq {
+                    return Err(());
+                }
+                scalar_lines.push(after_indent);
+                j += 1;
+            }
+            if saw_seq {
+                found = Some(seq_items.pop().unwrap_or_default());
+            } else if scalar_lines.is_empty() {
+                found = Some(String::new());
+            } else if scalar_lines.len() == 1 {
+                found = Some(parse_yaml_inline_scalar(scalar_lines[0])?);
+            } else {
+                return Err(());
+            }
+            i = j;
+            continue;
+        }
+
+        found = Some(parse_yaml_inline_scalar(rest)?);
+        i += 1;
+    }
+
+    Ok(found)
 }
 
 fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
@@ -8427,6 +9096,117 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 .get_envs()
                 .any(|(k, v)| k == OsStr::new("K3S_CONFIG_FILE") && v.is_none())
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_k3s_config_yaml_checks_etcd_s3_proxy_and_dropins_without_leaking_secrets() {
+        let base = temp_dir("k3s-proxy-validate");
+        let cfg_path = base.join("config.yaml");
+        let dropin_dir = base.join("config.yaml.d");
+        let secret_pw = "placeholder-pw-99182";
+        let bad_host = "proxy.invalid.example";
+        let bad_url = format!("http://user:{secret_pw}@{bad_host}:badport");
+
+        let assert_safe_reject = |yaml: &str, label: &str| {
+            let err = validate_k3s_config_yaml(&cfg_path, yaml)
+                .expect_err(&format!("{label} should be rejected"));
+            assert_eq!(err, INVALID_ETCD_S3_PROXY_ERR, "{label}: {err}");
+            assert!(!err.contains(secret_pw), "{label} leaked password: {err}");
+            assert!(!err.contains(bad_host), "{label} leaked URL host: {err}");
+            assert!(!err.contains("badport"), "{label} leaked bad port: {err}");
+        };
+
+        // Valid values, including literal `none`, empty/null, and valid authenticated/IPv6 URLs.
+        for ok_yaml in [
+            "disable:\n  - traefik\n",
+            "etcd-s3-proxy: none\n",
+            "etcd-s3-proxy: \"none\"\n",
+            "etcd-s3-proxy: ''\n",
+            "etcd-s3-proxy: null\n",
+            "etcd-s3-proxy: http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: https://user:p%40ss@proxy.example.com:8443 # comment\n",
+            "etcd-s3-proxy: socks5://user:pass@[::1]:1080\n",
+            "{\"etcd-s3-proxy\": \"none\"}\n",
+        ] {
+            validate_k3s_config_yaml(&cfg_path, ok_yaml)
+                .unwrap_or_else(|e| panic!("expected {ok_yaml:?} ok, got: {e}"));
+        }
+
+        // Malformed URLs with credentials across YAML forms must fail with a constant error.
+        let bad_cases = [
+            ("plain invalid port", format!("etcd-s3-proxy: {bad_url}\n")),
+            (
+                "double-quoted invalid port",
+                format!("etcd-s3-proxy: \"{bad_url}\"\n"),
+            ),
+            (
+                "single-quoted invalid port",
+                format!("etcd-s3-proxy: '{bad_url}'\n"),
+            ),
+            ("quoted key", format!("\"etcd-s3-proxy\": {bad_url}\n")),
+            ("plus suffix", format!("etcd-s3-proxy+: {bad_url}\n")),
+            (
+                "block sequence",
+                format!("etcd-s3-proxy:\n  - http://proxy.example.com:8080\n  - {bad_url}\n"),
+            ),
+            (
+                "column-0 block sequence",
+                format!("etcd-s3-proxy:\n- {bad_url}\n"),
+            ),
+            (
+                "flow sequence",
+                format!("etcd-s3-proxy: [\"http://proxy.example.com:8080\", \"{bad_url}\"]\n"),
+            ),
+            (
+                "json flow map",
+                format!("{{\"etcd-s3-proxy\": \"{bad_url}\"}}\n"),
+            ),
+            ("block scalar", format!("etcd-s3-proxy: |-\n  {bad_url}\n")),
+            (
+                "raw @ in password",
+                format!("etcd-s3-proxy: http://user:{secret_pw}@extra@{bad_host}:8080\n"),
+            ),
+            (
+                "bad percent escape in password",
+                format!("etcd-s3-proxy: http://user:{secret_pw}%zz@{bad_host}:8080\n"),
+            ),
+            (
+                "missing scheme",
+                format!("etcd-s3-proxy: {bad_host}:8080\n"),
+            ),
+            (
+                "out-of-range port",
+                format!("etcd-s3-proxy: http://user:{secret_pw}@{bad_host}:99999\n"),
+            ),
+            ("unclosed quote", format!("etcd-s3-proxy: \"{bad_url}\n")),
+        ];
+        for (label, yaml) in &bad_cases {
+            assert_safe_reject(yaml, label);
+        }
+
+        // Drop-in files in `<config>.d/*.{yaml,yml}` are applied in lexical order.
+        fs::create_dir_all(&dropin_dir).unwrap();
+        // Ignored non-YAML drop-in has no effect.
+        fs::write(
+            dropin_dir.join("99-ignored.txt"),
+            format!("etcd-s3-proxy: {bad_url}\n"),
+        )
+        .unwrap();
+        validate_k3s_config_yaml(&cfg_path, "etcd-s3-proxy: none\n").unwrap();
+
+        // Malformed drop-in fails validation without leaking its contents.
+        fs::write(
+            dropin_dir.join("10-bad.yaml"),
+            format!("etcd-s3-proxy: {bad_url}\n"),
+        )
+        .unwrap();
+        assert_safe_reject("etcd-s3-proxy: none\n", "drop-in override to malformed URL");
+
+        // Later lexical drop-in (.YML case-insensitive) overriding back to `none` succeeds.
+        fs::write(dropin_dir.join("20-fix.YML"), "etcd-s3-proxy: none\n").unwrap();
+        validate_k3s_config_yaml(&cfg_path, &format!("etcd-s3-proxy: {bad_url}\n")).unwrap();
 
         let _ = fs::remove_dir_all(&base);
     }
