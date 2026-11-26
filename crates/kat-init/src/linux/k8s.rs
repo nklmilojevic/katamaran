@@ -54,6 +54,7 @@ const SERVER_VERSION_STAMP: &str = ".katamaran-k3s-version";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
+const KUBECONFIG_MODE: &str = "0600";
 /// Katamaran-owned copy of the host's `~/.katamaran/k3s-config.yaml`, selected
 /// via `K3S_CONFIG_FILE` only when supplied so any manually managed
 /// `/etc/rancher/k3s/config.yaml` inside the guest is left untouched.
@@ -2722,6 +2723,59 @@ fn configure_k3s_config_env(cmd: &mut Command, managed_config: Option<&Path>) {
     }
 }
 
+/// True when a `--datastore-endpoint` value embeds credentials (URI userinfo
+/// passwords / NATS tokens, query parameters, or libpq key=value passwords).
+fn datastore_endpoint_has_credentials(endpoint: &str) -> bool {
+    for part in endpoint.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (scheme, after_scheme) = match part.split_once("://") {
+            Some((s, rest)) => (Some(s.to_ascii_lowercase()), rest),
+            None => (None, part),
+        };
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some((userinfo, _host)) = authority.rsplit_once('@') {
+            let token_userinfo_scheme = matches!(scheme.as_deref(), Some("nats" | "jetstream"));
+            if token_userinfo_scheme || userinfo.contains(':') {
+                return true;
+            }
+        }
+        if let Some((_, query_and_frag)) = after_scheme.split_once('?') {
+            let query = query_and_frag
+                .split_once('#')
+                .map_or(query_and_frag, |(q, _)| q);
+            for kv in query.split('&') {
+                if let Some((k, v)) = kv.split_once('=')
+                    && !v.is_empty()
+                    && matches!(
+                        k.trim().to_ascii_lowercase().as_str(),
+                        "password" | "passwd" | "pwd" | "token"
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+        for tok in after_scheme.split_whitespace() {
+            if let Some((k, v)) = tok.split_once('=')
+                && !v.is_empty()
+                && matches!(
+                    k.trim().to_ascii_lowercase().as_str(),
+                    "password" | "passwd" | "pwd" | "token"
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
     for arg in extra_args {
         if arg.is_empty() {
@@ -2760,6 +2814,15 @@ fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
                     i += consumed;
                     continue;
                 }
+                "write-kubeconfig-mode" => {
+                    if val != Some(KUBECONFIG_MODE) {
+                        return Err(format!(
+                            "k8s_args cannot override --write-kubeconfig-mode; Katamaran keeps {KUBECONFIG} private ({KUBECONFIG_MODE})"
+                        ));
+                    }
+                    i += consumed;
+                    continue;
+                }
                 "https-listen-port" => {
                     if val != Some(API_PORT) {
                         return Err(format!(
@@ -2768,6 +2831,34 @@ fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
                     }
                     i += consumed;
                     continue;
+                }
+                "token" | "t" | "cluster-secret" => {
+                    return Err(format!(
+                        "k8s_args cannot pass inline cluster tokens (--{name}), which appear in the process command line and {LOG_FILE} with --debug; set `token:` in ~/.katamaran/k3s-config.yaml or use --token-file instead"
+                    ));
+                }
+                "agent-token" => {
+                    return Err(format!(
+                        "k8s_args cannot pass inline agent tokens (--agent-token), which appear in the process command line and {LOG_FILE} with --debug; set `agent-token:` in ~/.katamaran/k3s-config.yaml or use --agent-token-file instead"
+                    ));
+                }
+                "datastore-endpoint" => {
+                    if let Some(ep) = val
+                        && datastore_endpoint_has_credentials(ep)
+                    {
+                        return Err(format!(
+                            "k8s_args cannot pass a credential-bearing --datastore-endpoint, which appears in the process command line and {LOG_FILE} with --debug; set `datastore-endpoint:` in ~/.katamaran/k3s-config.yaml or use certificate/file authentication instead"
+                        ));
+                    }
+                    if inline_val.is_some() || val.is_some_and(|v| !v.starts_with('-')) {
+                        i += consumed;
+                        continue;
+                    }
+                }
+                "etcd-s3-access-key" | "etcd-s3-secret-key" | "etcd-s3-session-token" => {
+                    return Err(format!(
+                        "k8s_args cannot pass inline S3 credentials (--{name}), which appear in the process command line and {LOG_FILE} with --debug; set `{name}:` in ~/.katamaran/k3s-config.yaml instead"
+                    ));
                 }
                 _ => {}
             }
@@ -2780,7 +2871,7 @@ fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
         format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
         format!("--data-dir={DATA_DIR}"),
         format!("--write-kubeconfig={KUBECONFIG}"),
-        "--write-kubeconfig-mode=0600".to_string(),
+        format!("--write-kubeconfig-mode={KUBECONFIG_MODE}"),
         "--node-name=katamaran".to_string(),
         "--flannel-backend=host-gw".to_string(),
         "--cluster-cidr=10.42.0.0/16".to_string(),
@@ -8220,18 +8311,25 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         }
         build_k3s_server_args(&["--data-dir".to_string(), DATA_DIR.to_string()]).unwrap();
 
-        // Managed --write-kubeconfig (-o) cannot be redirected; sibling flags stay allowed.
+        // Managed --write-kubeconfig (-o) and --write-kubeconfig-mode cannot be loosened/redirected.
         for bad in [
             vec!["--write-kubeconfig=/tmp/kc".to_string()],
             vec!["--write-kubeconfig".to_string(), "/tmp/kc".to_string()],
             vec!["-o".to_string(), "/tmp/kc".to_string()],
             vec!["-o=/tmp/kc".to_string()],
             vec!["-o".to_string()],
+            vec!["--write-kubeconfig-mode=0644".to_string()],
+            vec!["-write-kubeconfig-mode=0644".to_string()],
+            vec!["--write-kubeconfig-mode".to_string(), "0644".to_string()],
+            vec!["--write-kubeconfig-mode=0640".to_string()],
+            vec!["--write-kubeconfig-mode".to_string()],
         ] {
             let err = build_k3s_server_args(&bad).unwrap_err();
             assert!(err.contains(KUBECONFIG), "case {bad:?}: {err}");
         }
-        build_k3s_server_args(&["--write-kubeconfig-mode=0644".to_string()]).unwrap();
+        build_k3s_server_args(&["--write-kubeconfig-mode=0600".to_string()]).unwrap();
+        build_k3s_server_args(&["--write-kubeconfig-mode".to_string(), "0600".to_string()])
+            .unwrap();
         build_k3s_server_args(&["--write-kubeconfig".to_string(), KUBECONFIG.to_string()]).unwrap();
 
         // Managed --https-listen-port cannot change away from the fixed relay port.
@@ -8247,6 +8345,69 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         }
         build_k3s_server_args(&["--https-listen-port=6443".to_string()]).unwrap();
         build_k3s_server_args(&["--https-listen-port".to_string(), "6443".to_string()]).unwrap();
+
+        // Inline credentials cannot be passed via k8s_args (would leak to cmdline and /var/log/k3s.log).
+        for bad in [
+            vec!["--token=mysecret".to_string()],
+            vec!["-token=mysecret".to_string()],
+            vec!["--token".to_string(), "mysecret".to_string()],
+            vec!["-t".to_string(), "mysecret".to_string()],
+            vec!["-t=mysecret".to_string()],
+            vec!["--cluster-secret=mysecret".to_string()],
+            vec!["--agent-token=mysecret".to_string()],
+            vec!["--agent-token".to_string(), "mysecret".to_string()],
+            vec!["--datastore-endpoint=postgres://user:pass@db.local:5432/k3s".to_string()],
+            vec![
+                "--datastore-endpoint".to_string(),
+                "postgresql://user:pass@db.local:5432/k3s".to_string(),
+            ],
+            vec!["--datastore-endpoint=mysql://user:pass@tcp(127.0.0.1:3306)/k3s".to_string()],
+            vec![
+                "--datastore-endpoint=https://etcd1:2379,https://user:pass@etcd2:2379".to_string(),
+            ],
+            vec![
+                "--datastore-endpoint=postgres://db.local:5432/k3s?sslmode=require&password=secret"
+                    .to_string(),
+            ],
+            vec![
+                "--datastore-endpoint".to_string(),
+                "postgres://host=db.local user=k3s password=secret dbname=k3s".to_string(),
+            ],
+            vec!["--datastore-endpoint=nats://secret-token@127.0.0.1:4222".to_string()],
+            vec!["--etcd-s3-secret-key=mysecret".to_string()],
+            vec!["--etcd-s3-access-key".to_string(), "mykey".to_string()],
+            vec!["--etcd-s3-session-token=mytok".to_string()],
+        ] {
+            let err = build_k3s_server_args(&bad).unwrap_err();
+            assert!(err.contains("k3s-config.yaml"), "case {bad:?}: {err}");
+        }
+
+        // Token file references and non-credential datastore endpoints stay usable.
+        for ok in [
+            vec!["--token-file=/etc/rancher/k3s/token".to_string()],
+            vec![
+                "--token-file".to_string(),
+                "/etc/rancher/k3s/token".to_string(),
+            ],
+            vec!["--agent-token-file=/etc/rancher/k3s/agent-token".to_string()],
+            vec![
+                "--agent-token-file".to_string(),
+                "/etc/rancher/k3s/agent-token".to_string(),
+            ],
+            vec!["--datastore-endpoint=https://etcd1:2379,https://etcd2:2379".to_string()],
+            vec![
+                "--datastore-endpoint".to_string(),
+                "postgres://k3s@db.local:5432/k3s?sslmode=verify-full".to_string(),
+            ],
+            vec!["--datastore-endpoint=mysql://tcp(127.0.0.1:3306)/k3s".to_string()],
+            vec![
+                "--datastore-endpoint=sqlite:///var/lib/katamaran/k3s/data/server/db/state.db"
+                    .to_string(),
+            ],
+            vec!["--datastore-endpoint=nats://127.0.0.1:4222".to_string()],
+        ] {
+            build_k3s_server_args(&ok).unwrap_or_else(|e| panic!("expected {ok:?} ok, got: {e}"));
+        }
     }
 
     #[test]

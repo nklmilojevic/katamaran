@@ -906,7 +906,7 @@ mod tests {
         );
 
         let mut cfg = Config::default();
-        cfg.set("k8s_args", "--token=secret", &HOST).unwrap();
+        cfg.set("k8s_args", "--debug", &HOST).unwrap();
         cfg.save(&home).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

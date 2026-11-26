@@ -736,6 +736,24 @@ impl Daemon {
         self: &Arc<Self>,
         values: &std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<ConfigView> {
+        self.set_config_with(values, |home| match crate::k8s::context_name() {
+            Ok(ctx) => {
+                if let Err(e) = crate::k8s::remove_kubeconfig(home, &ctx) {
+                    dlog!("k8s disable: remove kubeconfig failed: {e:#}");
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(crate::k8s::kubeconfig_path(home));
+                dlog!("k8s disable: context name failed: {e:#}");
+            }
+        })
+    }
+
+    fn set_config_with(
+        self: &Arc<Self>,
+        values: &std::collections::BTreeMap<String, String>,
+        cleanup_disabled_kubeconfig: impl FnOnce(&Path),
+    ) -> anyhow::Result<ConfigView> {
         let (cfg_kubernetes, before_k8s) = {
             let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
             let mut cfg = Config::load(&self.home)?;
@@ -773,17 +791,7 @@ impl Daemon {
                     })
                     .ok();
             } else if !cfg_kubernetes {
-                match crate::k8s::context_name() {
-                    Ok(ctx) => {
-                        if let Err(e) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
-                            dlog!("k8s disable: remove kubeconfig failed: {e:#}");
-                        }
-                    }
-                    Err(e) => {
-                        let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
-                        dlog!("k8s disable: context name failed: {e:#}");
-                    }
-                }
+                cleanup_disabled_kubeconfig(&self.home);
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
                 k.kubeconfig = None;
             }
@@ -2347,28 +2355,43 @@ mod tests {
     fn set_config_reports_k8s_toggled_only_when_enable_state_changes() {
         let home = temp("k8s-toggled");
         let d = Daemon::new(home.clone());
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "fixture-kubeconfig\n").unwrap();
+        d.k8s.lock().unwrap().kubeconfig = Some(kc.clone());
 
-        // Enabling kubernetes transitions false -> true.
+        // Enabling kubernetes transitions false -> true without invoking disable cleanup.
         let mut enable = std::collections::BTreeMap::new();
         enable.insert("kubernetes".into(), "on".into());
-        let v = d.set_config(&enable).unwrap();
+        let mut cleaned = false;
+        let v = d.set_config_with(&enable, |_| cleaned = true).unwrap();
         assert!(v.k8s_toggled);
         assert!(v.config.kubernetes);
+        assert!(!cleaned);
 
         // Passing kubernetes=on again with new k8s_disable does NOT toggle kubernetes.
         let mut unchanged = std::collections::BTreeMap::new();
         unchanged.insert("kubernetes".into(), "on".into());
         unchanged.insert("k8s_disable".into(), "traefik".into());
-        let v = d.set_config(&unchanged).unwrap();
+        let v = d.set_config_with(&unchanged, |_| cleaned = true).unwrap();
         assert!(!v.k8s_toggled);
         assert_eq!(v.config.k8s_disable, vec!["traefik"]);
+        assert!(!cleaned);
 
-        // Disabling kubernetes transitions true -> false.
+        // Disabling kubernetes transitions true -> false and runs only the injected fixture cleanup.
         let mut disable = std::collections::BTreeMap::new();
         disable.insert("kubernetes".into(), "off".into());
-        let v = d.set_config(&disable).unwrap();
+        let v = d
+            .set_config_with(&disable, |h| {
+                cleaned = true;
+                let _ = fs::remove_file(crate::k8s::kubeconfig_path(h));
+            })
+            .unwrap();
         assert!(v.k8s_toggled);
         assert!(!v.config.kubernetes);
+        assert!(cleaned);
+        assert!(!kc.exists());
+        assert!(d.k8s.lock().unwrap().kubeconfig.is_none());
 
         // ConfigGet never reports k8s_toggled and omits it from JSON.
         let get = d.handle(&Call::ConfigGet).unwrap();

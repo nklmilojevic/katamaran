@@ -253,7 +253,7 @@ kat config set -- k8s_args --debug
 kat config set k8s_args=""
 ```
 
-Flags that Katamaran manages internally (`--data-dir`/`-d`, `--write-kubeconfig`/`-o`, and `--https-listen-port`) cannot be redirected via `k8s_args`. For credential-bearing settings such as tokens or datastore passwords, prefer `~/.katamaran/k3s-config.yaml` over `k8s_args` so secrets are not passed on the `k3s server` process command line inside the guest.
+Flags that Katamaran manages internally (`--data-dir`/`-d`, `--write-kubeconfig`/`-o`, `--write-kubeconfig-mode`, and `--https-listen-port`) cannot be overridden via `k8s_args`. Inline credential flags (`--token`/`-t`, `--cluster-secret`, `--agent-token`, credential-bearing `--datastore-endpoint` URLs, and `--etcd-s3-*` keys) are also rejected in `k8s_args`: besides appearing on the `k3s server` process command line, `k3s --debug` logs the raw CLI argument vector to `/var/log/k3s.log`. Supply secrets through `~/.katamaran/k3s-config.yaml` (synced with mode `0600`) or file/certificate flags such as `--token-file`, `--agent-token-file`, and `--datastore-certfile`/`--datastore-keyfile` instead.
 
 ### Use a `k3s` config file (`~/.katamaran/k3s-config.yaml`)
 
@@ -269,6 +269,8 @@ kube-apiserver-arg:
 For scalar settings, Katamaran's CLI flags take precedence over the synced YAML config. For repeatable flags such as `kubelet-arg`, `k3s` reads the YAML entries first and then appends CLI entries. The `+` suffix is for merging values across YAML files, not for appending to CLI flags.
 
 Changes to `k8s_disable`, `k8s_args`, or `k3s-config.yaml` apply the next time Kubernetes starts (no VM restart is needed). For a running cluster, use `kat k8s stop && kat k8s start`. If disabling Traefik leaves Gateway API CRDs or admission policies behind, inspect and clean up the leftover resources separately. Use `kat k8s reset` only if you intend to wipe **all cluster state, workloads, and persistent volumes**; back up anything you need first.
+
+Before rolling back to an older katamaran release that predates `k8s_disable` and `k8s_args`, clear both keys with `kat config set k8s_disable="" k8s_args=""` (or remove those lines from `~/.katamaran/config.toml`), because older releases reject unknown keys and cannot start the VM until they are removed.
 
 ## Cluster defaults
 
