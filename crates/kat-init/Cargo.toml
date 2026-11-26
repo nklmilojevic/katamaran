@@ -11,3 +11,5 @@ kat-proto.workspace = true
 kat-nfs.workspace = true
 libc.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"
+tar = { version = "0.4", default-features = false }

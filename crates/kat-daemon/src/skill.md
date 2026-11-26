@@ -55,7 +55,7 @@ Manage the optional single-node `k3s` cluster inside the VM (off by default, zer
 ```sh
 kat k8s start                             # Enable and start k3s (downloads on first use)
 kat k8s status [--json]                   # Cluster state, API endpoint, context, DNS
-kat k8s sync-images                       # Mirror local Docker images into k3s
+kat k8s sync-images                       # Mirror local Docker images into k3s (amd64-only ones run under emulation)
 kat k8s kubeconfig [--path]               # Print kubeconfig YAML or file path
 kat k8s dns status|install|uninstall      # Manage *.k8s.kat.local DNS on macOS
 kat k8s forward <ip>:<port> [--local P]   # Forward a local TCP port to a Pod/Service IP

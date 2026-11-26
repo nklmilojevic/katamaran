@@ -8,7 +8,7 @@
 //! `moby` namespace into `k8s.io`.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hash::Hasher;
@@ -34,6 +34,7 @@ use super::service::{
     CONTAINERD_SOCKET, DOCKER_SOCKET, DockerStack, Notifier, Reaper, describe_status,
 };
 use super::sys;
+use crate::oci_rewrite;
 
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const ROOT: &str = "/var/lib/katamaran/k3s";
@@ -3526,21 +3527,61 @@ fn is_docker_image_sync_event(line: &str) -> bool {
     matches!(action, "tag" | "pull" | "load" | "import" | "commit")
 }
 
+/// Label recording which `moby` image a re-platformed `k8s.io` copy was made
+/// from, since the copy's own digest differs (see [`crate::oci_rewrite`]).
+const SOURCE_DIGEST_LABEL: &str = "io.katamaran.k8s.source-digest";
+
+/// The guest's platform architecture, the only one containerd's CRI accepts.
+const NATIVE_ARCH: &str = "arm64";
+
+/// Whether an x86-64 emulator (Rosetta or qemu) is registered, so amd64-only
+/// images can run in pods once re-labelled for the CRI.
+fn amd64_emulation() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fs::read_to_string("/proc/cmdline")
+            .is_ok_and(|c| super::amd64::Emulator::from_cmdline(&c).is_some())
+    })
+}
+
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let moby = list_ctr_images(reaper, "moby")?;
+    if moby.is_empty() {
+        return Ok(());
+    }
     let k8s = list_ctr_images(reaper, "k8s.io")?;
+    let emulation = amd64_emulation();
+    // `ctr images ls` lists every platform declared in an OCI index, even when
+    // only `linux/amd64` was pulled (`docker pull --platform linux/amd64 ...`).
+    // Check which images actually have a complete native platform locally so
+    // amd64-only pulls of multi-arch indexes are rewritten too.
+    let native_complete = emulation
+        .then(|| check_ctr_native_complete(reaper, "moby"))
+        .flatten();
     let mut failures = Vec::new();
-    for (name, digest) in moby {
+    for (name, img) in moby {
         if name.starts_with("sha256:") || name.contains("<none>") {
             continue;
         }
-        if k8s.get(&name).is_some_and(|d| d == &digest) {
+        let has_native_local = native_complete.as_ref().map_or_else(
+            || oci_rewrite::has_native_platform(&img.platforms, NATIVE_ARCH),
+            |complete| complete.contains(&name),
+        );
+        let rewrite =
+            emulation && !has_native_local && oci_rewrite::has_amd64_platform(&img.platforms);
+        if should_skip_mirror(&img, k8s.get(&name), rewrite, NATIVE_ARCH) {
             continue;
         }
-        if let Err(e) = mirror_one_image(reaper, &name) {
-            log(&format!("mirror image {name}: {e}"));
-            failures.push(format!("{name}: {e}"));
+        match mirror_one_image(reaper, &name, rewrite.then_some(img.digest.as_str())) {
+            Ok(()) if rewrite => log(&format!(
+                "mirrored amd64 image {name} as linux/{NATIVE_ARCH} (runs under emulation)"
+            )),
+            Ok(()) => {}
+            Err(e) => {
+                log(&format!("mirror image {name}: {e}"));
+                failures.push(format!("{name}: {e}"));
+            }
         }
     }
     if !failures.is_empty() {
@@ -3549,8 +3590,83 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns `image_ref -> digest` for all images in a containerd namespace.
-fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, String>, String> {
+/// True when `k8s` already holds an up-to-date mirror of `moby` for the
+/// desired mode (`rewrite` vs native).
+fn should_skip_mirror(
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    rewrite: bool,
+    native_arch: &str,
+) -> bool {
+    let Some(k) = k8s else {
+        return false;
+    };
+    if rewrite {
+        k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str())
+            && oci_rewrite::has_native_platform(&k.platforms, native_arch)
+    } else {
+        k.digest == moby.digest
+    }
+}
+
+/// Returns the set of image refs in `ns` whose native-platform content is
+/// locally `complete` according to `ctr images check`, or `None` if `ctr`
+/// could not produce a check table.
+///
+/// Note: `ctr images check` exits non-zero whenever any image in the namespace
+/// lacks a native manifest (its unpack check errors on that image), while still
+/// printing the full status table to stdout, so we key on the stdout table
+/// rather than the exit status.
+fn check_ctr_native_complete(reaper: &Reaper, ns: &str) -> Option<HashSet<String>> {
+    let mut cmd = Command::new("/usr/bin/ctr");
+    cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "check"]);
+    let (_code, stdout, _stderr) =
+        run_reaped_split(reaper, &mut cmd, Duration::from_secs(15)).ok()?;
+    parse_ctr_check(&stdout)
+}
+
+/// Parse `ctr images check` output (`REF TYPE DIGEST STATUS SIZE UNPACKED`)
+/// and return the image refs with `STATUS` starting with `complete`.
+fn parse_ctr_check(stdout: &str) -> Option<HashSet<String>> {
+    let mut lines = stdout.lines();
+    let header = lines.next()?;
+    if !header.starts_with("REF") {
+        return None;
+    }
+    let mut complete = HashSet::new();
+    for line in lines {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(_media_type), Some(_digest), Some(status)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if status == "complete" {
+            complete.insert(name.to_string());
+        }
+    }
+    Some(complete)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtrImage {
+    digest: String,
+    /// Comma-separated `os/arch[/variant]` list, as printed by `ctr images ls`.
+    platforms: String,
+    /// Comma-separated `key=value` list, or `-`.
+    labels: String,
+}
+
+impl CtrImage {
+    fn label(&self, key: &str) -> Option<&str> {
+        self.labels
+            .split(',')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+    }
+}
+
+/// Returns `image_ref -> image` for all images in a containerd namespace.
+fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, CtrImage>, String> {
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "ls"]);
     let (code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
@@ -3563,64 +3679,101 @@ fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, String>,
         };
         return Err(format!("ctr images ls ({ns}) failed: {detail}"));
     }
+    Ok(parse_ctr_images(&stdout))
+}
+
+/// Parse `ctr images ls` output: `REF TYPE DIGEST SIZE PLATFORMS LABELS`,
+/// where SIZE is two words (`12.3 MiB`) and LABELS may contain spaces.
+fn parse_ctr_images(stdout: &str) -> HashMap<String, CtrImage> {
     let mut map = HashMap::new();
     for line in stdout.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let Some(name) = fields.next() else {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
             continue;
+        }
+        let platforms = fields.get(5).copied().unwrap_or("");
+        let labels = if fields.len() >= 7 {
+            fields[6..].join(" ")
+        } else {
+            "-".to_string()
         };
-        let _media_type = fields.next();
-        let Some(digest) = fields.next() else {
-            continue;
-        };
-        map.insert(name.to_string(), digest.to_string());
+        map.insert(
+            fields[0].to_string(),
+            CtrImage {
+                digest: fields[2].to_string(),
+                platforms: platforms.to_string(),
+                labels,
+            },
+        );
     }
-    Ok(map)
+    map
 }
 
 /// Stream an image from `moby` to `k8s.io` via two separate Reaper-managed
-/// `ctr` processes connected by an OS pipe, verifying both exit statuses.
-fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
+/// `ctr` processes connected by OS pipes, verifying both exit statuses.
+///
+/// With `rewrite_from` set (the `moby` digest of an amd64 image), the archive
+/// passes through [`oci_rewrite::rewrite_platform`] on the way so the CRI sees
+/// a native-platform image, and the copy is labelled with its source digest.
+fn mirror_one_image(reaper: &Reaper, name: &str, rewrite_from: Option<&str>) -> Result<(), String> {
     let timeout = Duration::from_secs(120);
     let (pipe_r, pipe_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
     let (exp_err_r, exp_err_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
     let (imp_err_r, imp_err_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+    // In rewrite mode the exporter feeds the rewriter, which feeds the importer.
+    let (rw_in, imp_in) = if rewrite_from.is_some() {
+        let (r, w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+        (Some((pipe_r, w)), r)
+    } else {
+        (None, pipe_r)
+    };
 
-    let mut exp = Command::new("/usr/bin/ctr");
-    exp.args([
+    // `--local` avoids containerd's transfer-API progress handler writing
+    // status lines onto stdout (the archive stream itself) when exporting to `-`.
+    let mut exp_args = vec![
         "-a",
         CONTAINERD_SOCKET,
         "-n",
         "moby",
         "images",
         "export",
-        "-",
-        name,
-    ])
-    .env("PATH", PATH)
-    .stdin(Stdio::null())
-    .stdout(Stdio::from(pipe_w))
-    .stderr(Stdio::from(exp_err_w));
+        "--local",
+    ];
+    if rewrite_from.is_some() {
+        exp_args.extend(["--platform", "linux/amd64", "--skip-manifest-json"]);
+    }
+    exp_args.extend(["-", name]);
+    let mut imp_args = vec![
+        "-a".to_string(),
+        CONTAINERD_SOCKET.to_string(),
+        "-n".into(),
+        "k8s.io".into(),
+        "images".into(),
+        "import".into(),
+        "--digests".into(),
+    ];
+    if let Some(src) = rewrite_from {
+        imp_args.push(format!("--label={SOURCE_DIGEST_LABEL}={src}"));
+    }
+    imp_args.push("-".into());
+
+    let mut exp = Command::new("/usr/bin/ctr");
+    exp.args(&exp_args)
+        .env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(pipe_w))
+        .stderr(Stdio::from(exp_err_w));
     let (exp_pid, exp_rx) = reaper
         .spawn(&mut exp)
         .map_err(|e| format!("spawn ctr export: {e}"))?;
     exp.stdout(Stdio::null()).stderr(Stdio::null());
 
     let mut imp = Command::new("/usr/bin/ctr");
-    imp.args([
-        "-a",
-        CONTAINERD_SOCKET,
-        "-n",
-        "k8s.io",
-        "images",
-        "import",
-        "--digests",
-        "-",
-    ])
-    .env("PATH", PATH)
-    .stdin(Stdio::from(pipe_r))
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(imp_err_w));
+    imp.args(&imp_args)
+        .env("PATH", PATH)
+        .stdin(Stdio::from(imp_in))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(imp_err_w));
     let (imp_pid, imp_rx) = match reaper.spawn(&mut imp) {
         Ok(v) => v,
         Err(e) => {
@@ -3667,6 +3820,22 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
             return Err(format!("spawn ctr import stderr reader: {e}"));
         }
     };
+    let rewriter = match rw_in.map(|(from_exp, to_imp)| {
+        thread::Builder::new()
+            .name("k8s-img-rewrite".into())
+            .spawn(move || {
+                oci_rewrite::rewrite_platform(File::from(from_exp), File::from(to_imp), NATIVE_ARCH)
+            })
+    }) {
+        None => None,
+        Some(Ok(h)) => Some(h),
+        Some(Err(e)) => {
+            kill_both();
+            let _ = exp_err_t.join();
+            let _ = imp_err_t.join();
+            return Err(format!("spawn image rewriter: {e}"));
+        }
+    };
 
     let deadline = Instant::now() + timeout;
     let wait_one = |pid: i32, rx: &Receiver<i32>, label: &str| -> Result<i32, String> {
@@ -3689,7 +3858,24 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
     let imp_res = wait_one(imp_pid, &imp_rx, "ctr import");
     let exp_err = exp_err_t.join().unwrap_or_default();
     let imp_err = imp_err_t.join().unwrap_or_default();
+    // Both ctr processes are gone, so the rewriter's pipes are closed and it
+    // has returned (or is about to, on EPIPE/EOF).
+    let rewrite_res = rewriter.map(|h| {
+        h.join()
+            .unwrap_or_else(|_| Err("image rewriter panicked".into()))
+    });
 
+    // A rewriter failure makes both ctr processes fail on EPIPE/EOF, so lead
+    // with it and add the exporter's error, which may be the real cause.
+    if let Some(Err(e)) = rewrite_res {
+        let mut msg = format!("re-platform amd64 image: {e}");
+        if let Ok(code) = exp_res
+            && code != 0
+        {
+            msg.push_str(&format!("; ctr export exited {code}: {exp_err}"));
+        }
+        return Err(msg);
+    }
     let exp_code = exp_res?;
     let imp_code = imp_res?;
     if exp_code != 0 {
@@ -3715,6 +3901,103 @@ mod tests {
             std::env::temp_dir().join(format!("kat-init-k8s-{name}-{}-{seq}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn parse_ctr_images_reads_platforms_and_labels() {
+        let out = "\
+REF                       TYPE                                                 DIGEST                                                                  SIZE      PLATFORMS                                LABELS
+docker.io/library/app:dev application/vnd.oci.image.index.v1+json              sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 12.3 MiB  linux/amd64                              -
+docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 4.0 KiB   linux/amd64,linux/arm64/v8               desc=hello world,io.cri-containerd.image=managed,io.katamaran.k8s.source-digest=sha256:cc
+";
+        let images = parse_ctr_images(out);
+        let app = &images["docker.io/library/app:dev"];
+        assert_eq!(app.digest, format!("sha256:{}", "a".repeat(64)));
+        assert_eq!(app.platforms, "linux/amd64");
+        assert_eq!(app.label(SOURCE_DIGEST_LABEL), None);
+        let web = &images["docker.io/library/web:1"];
+        assert_eq!(web.platforms, "linux/amd64,linux/arm64/v8");
+        assert_eq!(web.label(SOURCE_DIGEST_LABEL), Some("sha256:cc"));
+        assert_eq!(web.label("io.cri-containerd.image"), Some("managed"));
+        assert_eq!(web.label("io.cri-containerd"), None);
+    }
+
+    #[test]
+    fn parse_ctr_check_identifies_complete_native_images() {
+        let out = "\
+REF                              TYPE                                    DIGEST                                                                  STATUS            SIZE            UNPACKED
+docker.io/amd64/busybox:latest   application/vnd.oci.image.index.v1+json sha256:74f051e325bb26f6a8781ee08fa97a5950aae8af6b9b809ed79eea2749c22f3c unavailable (0/?) 0.0 B/?         false
+docker.io/library/alpine:3.22    application/vnd.oci.image.index.v1+json sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f incomplete (1/2)  627.0 B/3.9 MiB false
+docker.io/library/busybox:latest application/vnd.oci.image.index.v1+json sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 complete (2/2)    1.8 MiB/1.8 MiB true
+";
+        let complete = parse_ctr_check(out).unwrap();
+        assert!(complete.contains("docker.io/library/busybox:latest"));
+        assert!(!complete.contains("docker.io/library/alpine:3.22"));
+        assert!(!complete.contains("docker.io/amd64/busybox:latest"));
+        assert_eq!(parse_ctr_check(""), None);
+        assert_eq!(parse_ctr_check("ctr: connection refused\n"), None);
+    }
+
+    #[test]
+    fn should_skip_mirror_handles_upgrades_and_mode_changes() {
+        let moby = CtrImage {
+            digest: "sha256:src".into(),
+            platforms: "linux/amd64".into(),
+            labels: "-".into(),
+        };
+        let k8s_unrewritten = CtrImage {
+            digest: "sha256:src".into(),
+            platforms: "linux/amd64".into(),
+            labels: "-".into(),
+        };
+        let k8s_rewritten = CtrImage {
+            digest: "sha256:new".into(),
+            platforms: "linux/arm64".into(),
+            labels: format!("io.cri-containerd.image=managed,{SOURCE_DIGEST_LABEL}=sha256:src"),
+        };
+        let k8s_stale_rewritten = CtrImage {
+            digest: "sha256:old".into(),
+            platforms: "linux/arm64".into(),
+            labels: format!("{SOURCE_DIGEST_LABEL}=sha256:older"),
+        };
+
+        // Missing from k8s.io -> never skip.
+        assert!(!should_skip_mirror(&moby, None, true, "arm64"));
+        assert!(!should_skip_mirror(&moby, None, false, "arm64"));
+        // Unrewritten amd64 copy left in k8s.io must be overwritten when rewrite is on.
+        assert!(!should_skip_mirror(
+            &moby,
+            Some(&k8s_unrewritten),
+            true,
+            "arm64"
+        ));
+        // Already rewritten for the current source digest -> skip.
+        assert!(should_skip_mirror(
+            &moby,
+            Some(&k8s_rewritten),
+            true,
+            "arm64"
+        ));
+        // Source digest changed (tag updated) -> re-mirror.
+        assert!(!should_skip_mirror(
+            &moby,
+            Some(&k8s_stale_rewritten),
+            true,
+            "arm64"
+        ));
+        // Native mode: matching digest skips; previously rewritten copy gets replaced.
+        assert!(should_skip_mirror(
+            &moby,
+            Some(&k8s_unrewritten),
+            false,
+            "arm64"
+        ));
+        assert!(!should_skip_mirror(
+            &moby,
+            Some(&k8s_rewritten),
+            false,
+            "arm64"
+        ));
     }
 
     #[test]

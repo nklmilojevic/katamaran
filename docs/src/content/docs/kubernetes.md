@@ -148,6 +148,20 @@ containers:
     imagePullPolicy: IfNotPresent
 ```
 
+### amd64-only images
+
+Docker runs `linux/amd64` images under Rosetta (or qemu), but Kubernetes's image service (containerd's CRI) only accepts images for the node's own platform, `linux/arm64`, with no configuration option to add fallback platforms. An image that only has a `linux/amd64` manifest locally would otherwise be invisible to kubelet, which then tries to pull it and fails with `no match for platform in manifest`.
+
+When x86-64 emulation is on (`amd64 = "auto"`, `"rosetta"`, or `"qemu"`), the image sync handles this automatically: if a Docker image has `linux/amd64` locally and no native `linux/arm64` variant locally (including amd64-only images, `docker build --platform linux/amd64`, or `docker pull --platform linux/amd64`), katamaran mirrors it into `k8s.io` with the image config's `architecture` set to `arm64`, so kubelet accepts it. The layers are not changed, so the binaries stay x86-64 and run under emulation, the same as with `docker run` (`uname -m` in the pod prints `x86_64`):
+
+```sh
+docker pull --platform linux/amd64 my-amd64-only-app:dev
+kat k8s sync-images
+kubectl run app --image=my-amd64-only-app:dev --image-pull-policy=IfNotPresent
+```
+
+Direct registry pulls by kubelet without mirroring from Docker still require a `linux/arm64` manifest because containerd's CRI cannot be configured to pull `linux/amd64` on an `arm64` node. The mirrored copy has a different image ID from the Docker image because its config changed. Images that have a `linux/arm64` variant locally are mirrored unchanged, and kubelet uses the native variant. With `amd64 = "off"`, amd64 images are not rewritten.
+
 ## Services, Ingress DNS, and port forwarding
 
 ### NodePort and LoadBalancer services

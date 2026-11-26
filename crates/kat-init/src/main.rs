@@ -9,6 +9,8 @@ mod autofwd;
 mod linux;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod nofile;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod oci_rewrite;
 
 #[cfg(target_os = "linux")]
 fn main() {
