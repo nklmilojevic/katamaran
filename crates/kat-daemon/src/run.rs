@@ -98,7 +98,7 @@ pub enum Event {
     ServiceFailed(String, String),
     Mounted(PathBuf),
     MountFailed(String),
-    PortAdd(PortProto, u16),
+    PortAdd(PortProto, u16, Vec<std::net::Ipv4Addr>),
     PortRemove(PortProto, u16),
     PortFailed(PortProto, u16, String),
     PortErrorClear(PortProto, u16),
@@ -162,6 +162,7 @@ pub fn simulated_power(sig: i32) -> Option<PowerEvent> {
 
 /// `katamaran run`: the VM in the foreground until SIGINT or SIGTERM.
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
+    crate::config::validate_forward_addresses(&args.forward_addresses)?;
     let run_dir = crate::state_dir()?.join("run");
     fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
     let _lock = lock(&run_dir.join("katamaran.lock"))?;
@@ -196,6 +197,7 @@ pub fn run_vm(
     control: Receiver<Control>,
     on_event: &mut dyn FnMut(Event),
 ) -> anyhow::Result<()> {
+    crate::config::validate_forward_addresses(&args.forward_addresses)?;
     let (tx, rx) = mpsc::channel::<Input>();
     {
         let tx = tx.clone();
@@ -576,8 +578,8 @@ fn session(
                     let _ = f.send(PortChange::Remove(proto, port));
                 }
             }
-            Ok(Input::Forward(_, net::Event::Forwarded(proto, port))) => {
-                on_event(Event::PortAdd(proto, port));
+            Ok(Input::Forward(_, net::Event::Forwarded(proto, port, addrs))) => {
+                on_event(Event::PortAdd(proto, port, addrs));
             }
             Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
                 on_event(Event::PortRemove(proto, port));
@@ -592,12 +594,16 @@ fn session(
             Ok(Input::Guest(_, Some(Msg::AutoForwardAdd { proto, port }))) => {
                 match auto_forwards.add(port) {
                     Ok(true) => {
+                        let addrs = auto_forwards
+                            .bound_addrs(port)
+                            .map(<[std::net::Ipv4Addr]>::to_vec)
+                            .unwrap_or_else(|| vec![std::net::Ipv4Addr::LOCALHOST]);
                         println!(
                             "katamaran: auto-forwarding {}:{port}/{}",
-                            auto_forwards.bound_label(port),
+                            net::addrs_label(&addrs),
                             proto.as_str()
                         );
-                        on_event(Event::PortAdd(proto, port));
+                        on_event(Event::PortAdd(proto, port, addrs));
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -809,4 +815,39 @@ pub fn block_and_watch_signals() -> anyhow::Result<mpsc::Receiver<i32>> {
         }
     });
     Ok(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        args: RunArgs,
+    }
+
+    #[test]
+    fn foreground_run_validates_forward_addresses_before_setup() {
+        for bad in [
+            &[
+                "prog",
+                "--forward-address",
+                "127.0.0.1",
+                "--forward-address",
+                "127.0.0.1",
+            ][..],
+            &["prog", "--forward-address", "0.0.0.0"][..],
+            &["prog", "--forward-address", "224.0.0.1"][..],
+            &["prog", "--forward-address", "255.255.255.255"][..],
+        ] {
+            let parsed = Wrapper::try_parse_from(bad).unwrap();
+            let err = run(parsed.args).unwrap_err();
+            assert!(
+                err.to_string().contains("forward_addresses"),
+                "expected forward_addresses validation error for {bad:?}, got {err:#}"
+            );
+        }
+    }
 }

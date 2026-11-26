@@ -24,7 +24,7 @@ If macOS refuses to bind a port (for example because another macOS service alrea
 
 ### Automatic port forwarding
 
-When `auto_forward` is enabled (the default), katamaran also forwards unpublished TCP ports that containers listen on inside their own network namespaces directly to `127.0.0.1:<port>` on your Mac over virtio-vsock.
+When `auto_forward` is enabled (the default), katamaran also forwards unpublished TCP ports that containers listen on inside their own network namespaces directly to `127.0.0.1:<port>` (or your configured `forward_addresses`) on your Mac over virtio-vsock.
 
 If you later publish the same port with `-p`, the explicit published port takes priority over the automatic forward.
 
@@ -37,7 +37,7 @@ kat restart
 
 ### Listen on lo0 aliases
 
-By default, forwarded ports listen only on `127.0.0.1`. Some setups put a local ingress on a loopback alias instead. For example, `*.dev.example` resolves to `172.16.1.200`, and the ingress controller's Service lists that IP in `externalIPs`. To make published, automatic, and Kubernetes `NodePort` and `LoadBalancer` forwards listen on the alias as well, add the alias to `lo0` and list it in `forward_addresses`:
+By default, forwarded TCP ports listen only on `127.0.0.1`. Some setups put a local ingress on a loopback alias instead. For example, `*.dev.example` resolves to `172.16.1.200`, and the ingress controller's Service lists that IP in `externalIPs`. To make published and automatically forwarded TCP ports, including Kubernetes `NodePort` and `LoadBalancer` ports, listen on the alias as well, add the alias to `lo0` and list it in `forward_addresses` (UDP forwards continue to use `127.0.0.1`):
 
 ```sh
 sudo ifconfig lo0 alias 172.16.1.200
@@ -46,7 +46,7 @@ kat restart
 curl https://app.dev.example/
 ```
 
-Only addresses assigned to a loopback interface are used. katamaran skips any other address and logs a warning, so a typo cannot expose a port to your network. Add the alias before the VM starts, because a port that is already forwarded does not pick up an alias added later. Privileged ports such as `443` also work without root: one `lo0`-scoped wildcard socket serves every listed address. macOS removes `lo0` aliases on reboot, so persist yours with a LaunchDaemon if you need it.
+Only addresses assigned to a loopback interface are used, and alias sockets are scoped to `lo0` (`IP_BOUND_IF`) with loopback-peer checks so traffic from other hosts on your network cannot reach forwarded ports. katamaran skips any address not assigned to `lo0` and logs a warning, so a typo cannot expose a port to your network. If one configured address binds and another is already in use, the forward stays active on the addresses that bound; `kat status` still lists the port as forwarded (showing the bound addresses) rather than as a port-level error, and the skipped address is recorded in the daemon logs (`kat logs`). Add the alias before the VM starts, because a port that is already forwarded does not pick up an alias added later. Privileged ports such as `443` also work without root: one `lo0`-scoped wildcard socket serves every listed address. macOS removes `lo0` aliases on reboot, so persist yours with a LaunchDaemon if you need it.
 
 ## Reach macOS from containers
 

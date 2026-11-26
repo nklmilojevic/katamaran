@@ -181,7 +181,7 @@ kubectl expose deployment web --type=LoadBalancer --port=8080 --target-port=80
 curl http://127.0.0.1:8080/
 ```
 
-To also reach these ports on a `lo0` alias (for example, an ingress IP listed in a Service's `externalIPs`), set `forward_addresses`. See [Listen on lo0 aliases](/networking/#listen-on-lo0-aliases).
+To reach these TCP ports on a `lo0` alias, add the alias to `forward_addresses`. The Mac listener addresses come from that setting, not the Service's `externalIPs` or `loadBalancerIP`. See [Listen on lo0 aliases](/networking/#listen-on-lo0-aliases).
 
 Internal Kubernetes control-plane ports (`6443`, `6444`, `10250`, `10256`, `10257`, `10259`) are excluded from general port forwarding; the API server uses its dedicated relay.
 

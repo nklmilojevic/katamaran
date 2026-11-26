@@ -75,7 +75,7 @@ kat config set k8s_disable=traefik
 kat restart
 ```
 
-Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `forward_addresses` (`127.0.0.1,172.16.1.200`; extra addresses must be `lo0` aliases), `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `k8s_disable`, `k8s_args`, `nofile` (open-files limit for containers, default `1048576`).
+Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `forward_addresses` (`127.0.0.1,172.16.1.200`; replaces the `127.0.0.1` default for TCP forwards; aliases must be on `lo0`, empty resets), `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `k8s_disable`, `k8s_args`, `nofile` (open-files limit for containers, default `1048576`).
 
 ## Files in Finder
 

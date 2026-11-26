@@ -327,14 +327,38 @@ impl std::fmt::Display for ForwardError {
 pub trait ForwardApi {
     fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError>;
     fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError>;
-    /// The Mac addresses ports are forwarded from, for log lines.
-    fn label(&self) -> String {
-        Ipv4Addr::LOCALHOST.to_string()
+    /// Re-verify or recreate an active forward whose previous `unexpose` failed
+    /// ambiguously. Returns `Ok(())` once the forward is confirmed live again.
+    fn ensure_exposed(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
+        match self.expose(proto, port) {
+            Ok(()) => Ok(()),
+            Err(ref e) if is_proxy_already_running(e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    /// The Mac addresses `port` is actually listening on (or configured to
+    /// listen on when not yet active).
+    fn port_addrs(&self, _proto: PortProto, _port: u16) -> Vec<Ipv4Addr> {
+        vec![Ipv4Addr::LOCALHOST]
     }
     /// The Mac addresses `port` is actually listening on, for log lines.
-    fn port_label(&self, _port: u16) -> String {
-        self.label()
+    fn port_label(&self, proto: PortProto, port: u16) -> String {
+        addrs_label(&self.port_addrs(proto, port))
     }
+}
+
+fn is_proxy_already_running(err: &ForwardError) -> bool {
+    matches!(
+        err,
+        ForwardError::Refused(msg) if msg.to_ascii_lowercase().contains("already running")
+    )
+}
+
+fn is_proxy_not_found(err: &ForwardError) -> bool {
+    matches!(
+        err,
+        ForwardError::Refused(msg) if msg.to_ascii_lowercase().contains("proxy not found")
+    )
 }
 
 /// gvproxy's forwarder API over its `-services` Unix socket.
@@ -364,6 +388,8 @@ impl ForwardApi for GvproxyApi {
 
 impl GvproxyApi {
     /// Have gvproxy serve the guest's TCP `port` on the Unix socket `local`.
+    /// Callers must handle stale-socket cleanup separately so retries never
+    /// unlink a live socket whose first expose response was lost.
     fn expose_unix(&self, local: &Path, port: u16) -> Result<(), ForwardError> {
         if local.as_os_str().len() >= SUN_PATH_MAX {
             return Err(ForwardError::Refused(format!(
@@ -371,9 +397,6 @@ impl GvproxyApi {
                 local.display()
             )));
         }
-        // Left by a gvproxy that did not stop cleanly; gvproxy cannot listen
-        // over it.
-        let _ = fs::remove_file(local);
         let body = serde_json::json!({
             "local": local,
             "remote": format!("tcp://{}:{port}", self.guest),
@@ -396,6 +419,15 @@ impl GvproxyApi {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamState {
+    /// gvproxy is confirmed to be serving this port's Unix socket.
+    Exposed,
+    /// A previous expose, unexpose, or rollback returned an ambiguous error,
+    /// so gvproxy may or may not still hold this pathname in its proxy map.
+    Uncertain,
+}
+
 /// Published ports when the forward addresses are not just `127.0.0.1`.
 /// gvproxy listens on one address per expose, and below port 1024 macOS
 /// lets only one wildcard socket own a port, so gvproxy cannot serve
@@ -406,6 +438,7 @@ pub struct AddressesApi {
     gvproxy: GvproxyApi,
     sockets: PathBuf,
     listeners: crate::autofwd::AutoForwards,
+    upstream: BTreeMap<u16, UpstreamState>,
 }
 
 impl AddressesApi {
@@ -414,10 +447,107 @@ impl AddressesApi {
         AddressesApi {
             gvproxy,
             sockets: sockets.to_path_buf(),
-            listeners: crate::autofwd::AutoForwards::with(
+            listeners: crate::autofwd::AutoForwards::with_limit(
                 crate::autofwd::Upstream::PerPort(sockets.to_path_buf()),
                 addrs,
+                crate::autofwd::ConnLimit::PerPort(crate::autofwd::MAX_CONNS),
             ),
+            upstream: BTreeMap::new(),
+        }
+    }
+
+    fn ensure_upstream_exposed(&mut self, port: u16, sock: &Path) -> Result<(), ForwardError> {
+        if self.upstream.get(&port) == Some(&UpstreamState::Exposed) && sock.exists() {
+            return Ok(());
+        }
+        // Only clean up a stale file left by an earlier crashed VM before the
+        // first expose attempt for this port in this session; never unlink a
+        // pathname whose live gvproxy registration may still exist.
+        if !self.upstream.contains_key(&port) {
+            let _ = fs::remove_file(sock);
+        }
+        match self.gvproxy.expose_unix(sock, port) {
+            Ok(()) => {
+                self.upstream.insert(port, UpstreamState::Exposed);
+                Ok(())
+            }
+            Err(e @ ForwardError::Transient(_)) => {
+                self.upstream.insert(port, UpstreamState::Uncertain);
+                Err(e)
+            }
+            Err(ref e) if is_proxy_already_running(e) => {
+                if sock.exists() {
+                    // The previous expose succeeded in gvproxy before its reply
+                    // was lost, and the socket pathname is still intact.
+                    self.upstream.insert(port, UpstreamState::Exposed);
+                    return Ok(());
+                }
+                // gvproxy still tracks the proxy but its pathname is missing;
+                // explicitly remove the registration before recreating it.
+                self.unexpose_upstream(port, sock)?;
+                let _ = fs::remove_file(sock);
+                match self.gvproxy.expose_unix(sock, port) {
+                    Ok(()) => {
+                        self.upstream.insert(port, UpstreamState::Exposed);
+                        Ok(())
+                    }
+                    Err(e2 @ ForwardError::Transient(_)) => {
+                        self.upstream.insert(port, UpstreamState::Uncertain);
+                        Err(e2)
+                    }
+                    Err(e2) => Err(e2),
+                }
+            }
+            Err(e) => {
+                // If an earlier attempt left state uncertain and a dead socket
+                // file is blocking bind, confirm gvproxy does not own it before
+                // removing the file and retrying once.
+                if self.upstream.get(&port) == Some(&UpstreamState::Uncertain) && sock.exists() {
+                    match self.gvproxy.unexpose_unix(sock) {
+                        Ok(()) => {
+                            self.upstream.remove(&port);
+                            let _ = fs::remove_file(sock);
+                        }
+                        Err(ref ue) if is_proxy_not_found(ue) => {
+                            self.upstream.remove(&port);
+                            let _ = fs::remove_file(sock);
+                        }
+                        Err(te @ ForwardError::Transient(_)) => return Err(te),
+                        Err(_) => return Err(e),
+                    }
+                    return match self.gvproxy.expose_unix(sock, port) {
+                        Ok(()) => {
+                            self.upstream.insert(port, UpstreamState::Exposed);
+                            Ok(())
+                        }
+                        Err(e2 @ ForwardError::Transient(_)) => {
+                            self.upstream.insert(port, UpstreamState::Uncertain);
+                            Err(e2)
+                        }
+                        Err(e2) => Err(e2),
+                    };
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn unexpose_upstream(&mut self, port: u16, sock: &Path) -> Result<(), ForwardError> {
+        match self.gvproxy.unexpose_unix(sock) {
+            Ok(()) => {
+                self.upstream.remove(&port);
+                Ok(())
+            }
+            Err(ref e) if is_proxy_not_found(e) => {
+                // Confirmed absent in gvproxy (e.g. a previous unexpose closed
+                // the socket before its HTTP reply was lost).
+                self.upstream.remove(&port);
+                Ok(())
+            }
+            Err(e) => {
+                self.upstream.insert(port, UpstreamState::Uncertain);
+                Err(e)
+            }
         }
     }
 }
@@ -427,20 +557,30 @@ impl ForwardApi for AddressesApi {
         if proto != PortProto::Tcp {
             return self.gvproxy.expose(proto, port);
         }
+        let sock = crate::autofwd::Upstream::socket(&self.sockets, port);
         if self.listeners.contains(port) {
-            return Ok(());
+            // If an earlier unexpose was ambiguous, verify or recreate gvproxy's
+            // Unix socket before reporting the already-bound listener healthy.
+            return match self.ensure_upstream_exposed(port, &sock) {
+                Ok(()) => Ok(()),
+                Err(e @ ForwardError::Transient(_)) => Err(e),
+                Err(e @ ForwardError::Refused(_)) => {
+                    self.listeners.remove(port);
+                    Err(e)
+                }
+            };
         }
         // Have gvproxy listen on the per-port Unix socket before opening the
         // Mac's TCP listeners, so the very first accepted connection never
         // races socket creation and transient gvproxy errors do not churn
         // TCP binds.
-        let sock = crate::autofwd::Upstream::socket(&self.sockets, port);
-        self.gvproxy.expose_unix(&sock, port)?;
+        self.ensure_upstream_exposed(port, &sock)?;
         match self.listeners.add(port) {
             Ok(_) => Ok(()),
             Err(e) => {
-                let _ = self.gvproxy.unexpose_unix(&sock);
-                let _ = fs::remove_file(&sock);
+                if self.unexpose_upstream(port, &sock).is_ok() {
+                    let _ = fs::remove_file(&sock);
+                }
                 Err(ForwardError::Refused(e.to_string()))
             }
         }
@@ -451,24 +591,34 @@ impl ForwardApi for AddressesApi {
             return self.gvproxy.unexpose(proto, port);
         }
         let sock = crate::autofwd::Upstream::socket(&self.sockets, port);
-        self.gvproxy.unexpose_unix(&sock)?;
+        self.unexpose_upstream(port, &sock)?;
         self.listeners.remove(port);
         let _ = fs::remove_file(&sock);
         Ok(())
     }
 
-    fn label(&self) -> String {
-        self.listeners.label()
+    fn ensure_exposed(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
+        if proto != PortProto::Tcp {
+            return self.gvproxy.ensure_exposed(proto, port);
+        }
+        self.expose(proto, port)
     }
 
-    fn port_label(&self, port: u16) -> String {
-        self.listeners.bound_label(port)
+    fn port_addrs(&self, proto: PortProto, port: u16) -> Vec<Ipv4Addr> {
+        if proto != PortProto::Tcp {
+            return vec![Ipv4Addr::LOCALHOST];
+        }
+        self.listeners
+            .bound_addrs(port)
+            .map(<[Ipv4Addr]>::to_vec)
+            .unwrap_or_else(|| self.listeners.addrs().to_vec())
     }
 }
 
 impl Drop for AddressesApi {
     fn drop(&mut self) {
-        let ports = self.listeners.ports();
+        let mut ports: BTreeSet<u16> = self.listeners.ports().into_iter().collect();
+        ports.extend(self.upstream.keys().copied());
         self.listeners.clear();
         for port in ports {
             let _ = fs::remove_file(crate::autofwd::Upstream::socket(&self.sockets, port));
@@ -535,12 +685,15 @@ fn parse_response(resp: &str) -> Result<(), ForwardError> {
 pub struct Forwards<A: ForwardApi> {
     api: A,
     active: BTreeSet<(PortProto, u16)>,
+    /// Active ports whose last `unexpose` failed ambiguously; a re-add must
+    /// verify or recreate the upstream before treating the port as live.
+    remove_failed: BTreeSet<(PortProto, u16)>,
     refused: BTreeMap<(PortProto, u16), String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    Forwarded(PortProto, u16),
+    Forwarded(PortProto, u16, Vec<Ipv4Addr>),
     Refused(PortProto, u16, String),
     RefusedCleared(PortProto, u16),
     Transient(PortProto, u16, String),
@@ -553,19 +706,36 @@ impl<A: ForwardApi> Forwards<A> {
         Forwards {
             api,
             active: BTreeSet::new(),
+            remove_failed: BTreeSet::new(),
             refused: BTreeMap::new(),
         }
     }
 
     pub fn add(&mut self, proto: PortProto, port: u16) -> Option<Event> {
         let key = (proto, port);
+        if self.remove_failed.contains(&key) {
+            return match self.api.ensure_exposed(proto, port) {
+                Ok(()) => {
+                    self.remove_failed.remove(&key);
+                    None
+                }
+                Err(ForwardError::Transient(e)) => Some(Event::Transient(proto, port, e)),
+                Err(ForwardError::Refused(e)) => {
+                    self.active.remove(&key);
+                    self.remove_failed.remove(&key);
+                    self.refused.insert(key, e.clone());
+                    Some(Event::Refused(proto, port, e))
+                }
+            };
+        }
         if self.active.contains(&key) || self.refused.contains_key(&key) {
             return None;
         }
         match self.api.expose(proto, port) {
             Ok(()) => {
                 self.active.insert(key);
-                Some(Event::Forwarded(proto, port))
+                let addrs = self.api.port_addrs(proto, port);
+                Some(Event::Forwarded(proto, port, addrs))
             }
             Err(ForwardError::Refused(e)) => {
                 self.refused.insert(key, e.clone());
@@ -586,14 +756,18 @@ impl<A: ForwardApi> Forwards<A> {
         Some(match self.api.unexpose(proto, port) {
             Ok(()) => {
                 self.active.remove(&key);
+                self.remove_failed.remove(&key);
                 Event::Removed(proto, port)
             }
-            Err(e) => Event::RemoveFailed(proto, port, e.to_string()),
+            Err(e) => {
+                self.remove_failed.insert(key);
+                Event::RemoveFailed(proto, port, e.to_string())
+            }
         })
     }
 
-    fn port_label(&self, port: u16) -> String {
-        self.api.port_label(port)
+    fn port_label(&self, proto: PortProto, port: u16) -> String {
+        self.api.port_label(proto, port)
     }
 
     #[cfg(test)]
@@ -607,10 +781,11 @@ pub enum PortChange {
     Remove(PortProto, u16),
 }
 
-/// Handle to the port-forwarder worker thread. Dropping it closes the command
-/// channel and waits for the thread to release its listeners and sockets
-/// before a restart can bind them again.
+/// Handle to the port-forwarder worker thread. Dropping it signals shutdown,
+/// closes the command channel, and waits for any in-flight operation plus RAII
+/// listener and socket cleanup before a restart can bind them again.
 pub struct Forwarder {
+    shutdown: Arc<AtomicBool>,
     tx: Option<Sender<PortChange>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -626,6 +801,7 @@ impl Forwarder {
 
 impl Drop for Forwarder {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
         self.tx.take();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -658,6 +834,8 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
     mut on_event: impl FnMut(Event) + Send + 'static,
 ) -> anyhow::Result<Forwarder> {
     let (tx, rx) = mpsc::channel::<PortChange>();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = shutdown.clone();
     let thread = thread::Builder::new()
         .name("port-forward".into())
         .spawn(move || {
@@ -666,11 +844,17 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                 BTreeMap::new();
             let retry_max = TRANSIENT_RETRY_MAX.max(retry_base);
             loop {
+                if worker_shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
                 let next_due = pending.values().map(|(_, at, _)| *at).min();
                 let got = match next_due {
                     Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
                     None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
                 };
+                if worker_shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
                 match got {
                     Ok(PortChange::Add(proto, port)) => {
                         let key = (proto, port);
@@ -679,11 +863,11 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e @ Event::Transient(..)) => {
                                 pending
                                     .insert(key, (PendingOp::Add, Instant::now() + retry_base, 1));
-                                report(&e, &fwd.port_label(port));
+                                report(&e, &fwd.port_label(proto, port));
                                 on_event(e);
                             }
                             Some(e) => {
-                                report(&e, &fwd.port_label(port));
+                                report(&e, &fwd.port_label(proto, port));
                                 on_event(e);
                             }
                             None => {}
@@ -692,7 +876,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(PortChange::Remove(proto, port)) => {
                         let key = (proto, port);
                         pending.remove(&key);
-                        let label = fwd.port_label(port);
+                        let label = fwd.port_label(proto, port);
                         match fwd.remove(proto, port) {
                             Some(e @ Event::RemoveFailed(..)) => {
                                 pending.insert(
@@ -720,6 +904,9 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     .map(|(&k, &(op, _, attempts))| (k, op, attempts))
                     .collect();
                 for ((proto, port), op, attempts) in due {
+                    if worker_shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let key = (proto, port);
                     pending.remove(&key);
                     let delay = retry_base
@@ -734,18 +921,18 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                         (PendingOp::Add, Instant::now() + delay, attempts + 1),
                                     );
                                 } else {
-                                    report(&e, &fwd.port_label(port));
+                                    report(&e, &fwd.port_label(proto, port));
                                     on_event(e);
                                 }
                             }
                             Some(e) => {
-                                report(&e, &fwd.port_label(port));
+                                report(&e, &fwd.port_label(proto, port));
                                 on_event(e);
                             }
                             None => {}
                         },
                         PendingOp::Remove => {
-                            let label = fwd.port_label(port);
+                            let label = fwd.port_label(proto, port);
                             match fwd.remove(proto, port) {
                                 Some(e @ Event::RemoveFailed(..)) => {
                                     if attempts < MAX_TRANSIENT_RETRIES {
@@ -774,6 +961,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
             }
         })?;
     Ok(Forwarder {
+        shutdown,
         tx: Some(tx),
         thread: Some(thread),
     })
@@ -781,8 +969,12 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
 
 fn report(e: &Event, addrs: &str) {
     match e {
-        Event::Forwarded(proto, port) => {
-            println!("katamaran: forwarding {addrs}:{port}/{}", proto.as_str())
+        Event::Forwarded(proto, port, bound) => {
+            println!(
+                "katamaran: forwarding {}:{port}/{}",
+                addrs_label(bound),
+                proto.as_str()
+            )
         }
         Event::Refused(proto, port, why) => eprintln!(
             "katamaran: cannot forward {addrs}:{port}/{} ({why}); skipped",
@@ -854,19 +1046,25 @@ pub fn is_loopback_interface_addr(addr: Ipv4Addr) -> bool {
 /// TCP listeners on `<addr>:<port>` for each Mac address forwards use
 /// (`127.0.0.1` by default, see `forward_addresses`).
 ///
-/// On macOS, XNU rejects unprivileged binds below port 1024 on specific
-/// addresses such as `127.0.0.1`, while permitting wildcard (`0.0.0.0`) binds,
-/// and only one wildcard socket can own a port. When binding a low port is
-/// denied, fall back to a single `0.0.0.0:<port>` socket scoped to `lo0` via
-/// `IP_BOUND_IF`, and drop any accepted connection whose local address is not
-/// one of the forward addresses or whose remote address is not loopback.
+/// On macOS, XNU's default receive model (`net.inet.ip.check_interface`) can
+/// accept packets for a non-127/8 `lo0` alias arriving on a physical interface,
+/// so specific-address alias sockets are also scoped to `lo0` via `IP_BOUND_IF`
+/// before binding and validated per accepted peer in [`Self::accept_on`].
+///
+/// Below port 1024, XNU rejects unprivileged binds on specific addresses such
+/// as `127.0.0.1`, while permitting wildcard (`0.0.0.0`) binds, and only one
+/// wildcard socket can own a port. When binding a low port is denied, fall back
+/// to a single `0.0.0.0:<port>` socket scoped to `lo0` via `IP_BOUND_IF`, and
+/// drop any accepted connection whose local address is not one of the forward
+/// addresses or whose remote address is not loopback.
 pub struct LoopbackTcpListener {
     inner: Vec<TcpListener>,
     /// The addresses this listener is bound for.
     addrs: Vec<Ipv4Addr>,
-    /// Whether `inner` is the single `0.0.0.0` wildcard fallback on macOS and
-    /// needs endpoint filtering against `addrs`.
-    filter_wildcard: bool,
+    /// Per-socket flag indicating whether accepted connections must pass
+    /// [`is_allowed_v4_pair`] (true for the macOS `0.0.0.0` wildcard fallback
+    /// and for specific-address alias sockets).
+    filter_endpoints: Vec<bool>,
 }
 
 impl LoopbackTcpListener {
@@ -878,6 +1076,10 @@ impl LoopbackTcpListener {
     /// loopback interface is skipped, so a typo never opens a port to the
     /// network; so is one whose port is taken, as long as one address binds.
     pub fn bind_on(addrs: &[Ipv4Addr], port: u16) -> io::Result<Self> {
+        Self::bind_on_inner(addrs, port, false)
+    }
+
+    fn bind_on_inner(addrs: &[Ipv4Addr], port: u16, force_lo0_scope: bool) -> io::Result<Self> {
         let mut seen = BTreeSet::new();
         let addrs: Vec<Ipv4Addr> = addrs
             .iter()
@@ -892,16 +1094,20 @@ impl LoopbackTcpListener {
         }
         let mut inner = Vec::with_capacity(addrs.len());
         let mut bound = Vec::with_capacity(addrs.len());
+        let mut filter_endpoints = Vec::with_capacity(addrs.len());
         let mut failed = Vec::new();
         let mut bind_port = port;
         for &a in &addrs {
-            match TcpListener::bind((a, bind_port)) {
+            let is_alias = a != Ipv4Addr::LOCALHOST;
+            let scope_lo0 = is_alias || force_lo0_scope;
+            match bind_specific(a, bind_port, scope_lo0) {
                 Ok(l) => {
                     if bind_port == 0 {
                         bind_port = l.local_addr()?.port();
                     }
                     inner.push(l);
                     bound.push(a);
+                    filter_endpoints.push(scope_lo0);
                 }
                 #[cfg(target_os = "macos")]
                 Err(e)
@@ -909,9 +1115,9 @@ impl LoopbackTcpListener {
                 {
                     drop(inner);
                     return Ok(Self {
-                        inner: vec![bind_darwin_low_port(port)?],
+                        inner: vec![bind_darwin_lo0(Ipv4Addr::UNSPECIFIED, port)?],
                         addrs,
-                        filter_wildcard: true,
+                        filter_endpoints: vec![true],
                     });
                 }
                 Err(e) => failed.push((a, e)),
@@ -926,8 +1132,25 @@ impl LoopbackTcpListener {
         Ok(Self {
             inner,
             addrs: bound,
-            filter_wildcard: false,
+            filter_endpoints,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_listeners_for_test(inner: Vec<TcpListener>) -> Self {
+        let addrs = inner
+            .iter()
+            .filter_map(|l| match l.local_addr().ok()? {
+                SocketAddr::V4(v4) => Some(*v4.ip()),
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+        let filter_endpoints = vec![false; inner.len()];
+        Self {
+            inner,
+            addrs,
+            filter_endpoints,
+        }
     }
 
     pub fn addrs(&self) -> &[Ipv4Addr] {
@@ -957,7 +1180,7 @@ impl LoopbackTcpListener {
     pub fn accept_on(&self, i: usize) -> io::Result<(TcpStream, SocketAddr)> {
         loop {
             let (stream, peer) = self.inner[i].accept()?;
-            if !self.filter_wildcard {
+            if !self.filter_endpoints[i] {
                 return Ok((stream, peer));
             }
             if let Ok(local) = stream.local_addr()
@@ -969,9 +1192,18 @@ impl LoopbackTcpListener {
     }
 }
 
-/// A connection the wildcard fallback keeps: to one of `allowed`, from
-/// loopback or from a `lo0` address (a client of an `lo0` alias has that
-/// alias or another `lo0` address as its source).
+fn bind_specific(addr: Ipv4Addr, port: u16, scope_to_lo0: bool) -> io::Result<TcpListener> {
+    #[cfg(target_os = "macos")]
+    if scope_to_lo0 {
+        return bind_darwin_lo0(addr, port);
+    }
+    let _ = scope_to_lo0;
+    TcpListener::bind((addr, port))
+}
+
+/// A connection filtered listeners keep: to one of `allowed`, from loopback or
+/// from a `lo0` address (a client of an `lo0` alias has that alias or another
+/// `lo0` address as its source).
 fn is_allowed_v4_pair(allowed: &[Ipv4Addr], local: SocketAddr, peer: SocketAddr) -> bool {
     is_allowed_v4_pair_with(allowed, local, peer, is_loopback_interface_addr)
 }
@@ -991,13 +1223,14 @@ fn is_allowed_v4_pair_with(
 }
 
 #[cfg(target_os = "macos")]
-fn bind_darwin_low_port(port: u16) -> io::Result<TcpListener> {
-    const IP_BOUND_IF: libc::c_int = 25;
+const IP_BOUND_IF: libc::c_int = 25;
 
+#[cfg(target_os = "macos")]
+fn bind_darwin_lo0(ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
     let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
     if lo0 == 0 {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AddrNotAvailable,
             "lo0 interface not found",
         ));
     }
@@ -1048,7 +1281,9 @@ fn bind_darwin_low_port(port: u16) -> io::Result<TcpListener> {
         sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: port.to_be(),
-        sin_addr: libc::in_addr { s_addr: 0 },
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(ip).to_be(),
+        },
         sin_zero: [0; 8],
     };
     if unsafe {
@@ -1109,11 +1344,15 @@ mod tests {
     fn adds_and_removes_forwards_once() {
         let mut api = FakeApi::default();
         let mut f = Forwards::new(&mut api);
-        assert_eq!(f.add(TCP, 8080), Some(Event::Forwarded(TCP, 8080)));
+        let lo = vec![Ipv4Addr::LOCALHOST];
+        assert_eq!(
+            f.add(TCP, 8080),
+            Some(Event::Forwarded(TCP, 8080, lo.clone()))
+        );
         assert_eq!(f.add(TCP, 8080), None);
         assert_eq!(
             f.add(PortProto::Udp, 8080),
-            Some(Event::Forwarded(PortProto::Udp, 8080))
+            Some(Event::Forwarded(PortProto::Udp, 8080, lo))
         );
         assert_eq!(f.remove(TCP, 8080), Some(Event::Removed(TCP, 8080)));
         assert_eq!(f.remove(TCP, 8080), None);
@@ -1159,7 +1398,10 @@ mod tests {
             Some(Event::Transient(TCP, 8080, _))
         ));
         f.api.transient = false;
-        assert_eq!(f.add(TCP, 8080), Some(Event::Forwarded(TCP, 8080)));
+        assert_eq!(
+            f.add(TCP, 8080),
+            Some(Event::Forwarded(TCP, 8080, vec![Ipv4Addr::LOCALHOST]))
+        );
     }
 
     #[test]
@@ -1180,7 +1422,10 @@ mod tests {
             }
         }
         let mut f = Forwards::new(FailUnexpose { fail: true });
-        assert_eq!(f.add(TCP, 9000), Some(Event::Forwarded(TCP, 9000)));
+        assert_eq!(
+            f.add(TCP, 9000),
+            Some(Event::Forwarded(TCP, 9000, vec![Ipv4Addr::LOCALHOST]))
+        );
         assert!(matches!(
             f.remove(TCP, 9000),
             Some(Event::RemoveFailed(TCP, 9000, _))
@@ -1234,7 +1479,7 @@ mod tests {
         ));
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::Forwarded(TCP, 8080)
+            Event::Forwarded(TCP, 8080, vec![Ipv4Addr::LOCALHOST])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         drop(tx);
@@ -1305,7 +1550,7 @@ mod tests {
         tx.send(PortChange::Add(TCP, 9100)).unwrap();
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::Forwarded(TCP, 9100)
+            Event::Forwarded(TCP, 9100, vec![Ipv4Addr::LOCALHOST])
         );
         tx.send(PortChange::Remove(TCP, 9100)).unwrap();
         assert!(matches!(
@@ -1336,7 +1581,7 @@ mod tests {
         tx.send(PortChange::Add(TCP, 9101)).unwrap();
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::Forwarded(TCP, 9101)
+            Event::Forwarded(TCP, 9101, vec![Ipv4Addr::LOCALHOST])
         );
         tx.send(PortChange::Remove(TCP, 9101)).unwrap();
         assert!(matches!(
@@ -1432,7 +1677,7 @@ mod tests {
         ));
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::Forwarded(TCP, 9200)
+            Event::Forwarded(TCP, 9200, vec![Ipv4Addr::LOCALHOST])
         );
         drop(tx);
         server.join().unwrap();
@@ -1560,7 +1805,7 @@ mod tests {
             Err(ForwardError::Refused(_))
         ));
         assert!(!crate::autofwd::Upstream::socket(&gv_dir, busy_port).exists());
-        assert_eq!(addrs.label(), "127.0.0.1");
+        assert_eq!(addrs.port_label(TCP, port), "127.0.0.1");
 
         // Dropping AddressesApi stops active listeners and removes their sockets.
         addrs.expose(TCP, port).unwrap();
@@ -1664,5 +1909,759 @@ mod tests {
             addrs_label(&[Ipv4Addr::LOCALHOST, nowhere]),
             "{127.0.0.1,192.0.2.1}"
         );
+    }
+
+    #[test]
+    fn dropping_forwarder_cancels_queued_changes_and_retries() {
+        struct BlockingApi {
+            entered: Sender<u16>,
+            release: Arc<Mutex<mpsc::Receiver<()>>>,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl ForwardApi for BlockingApi {
+            fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("expose {port}/{}", proto.as_str()));
+                if port == 8001 {
+                    let _ = self.entered.send(port);
+                    let _ = self.release.lock().unwrap().recv();
+                }
+                Ok(())
+            }
+            fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("unexpose {port}/{}", proto.as_str()));
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fwd = spawn_forwarder_with(
+            BlockingApi {
+                entered: entered_tx,
+                release: Arc::new(Mutex::new(release_rx)),
+                calls: calls.clone(),
+            },
+            Duration::from_millis(10),
+            |_| {},
+        )
+        .unwrap();
+
+        fwd.send(PortChange::Add(TCP, 8001)).unwrap();
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            8001
+        );
+        // Queue additional operations behind the in-flight call.
+        fwd.send(PortChange::Add(TCP, 8002)).unwrap();
+        fwd.send(PortChange::Add(TCP, 8003)).unwrap();
+        fwd.send(PortChange::Remove(TCP, 8001)).unwrap();
+
+        let shutdown_flag = fwd.shutdown.clone();
+        let dropper = thread::spawn(move || drop(fwd));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !shutdown_flag.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "drop did not set shutdown flag");
+            thread::sleep(Duration::from_millis(1));
+        }
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["expose 8001/tcp"]);
+    }
+
+    struct FakeUnixProxy {
+        stop: Arc<AtomicBool>,
+        path: PathBuf,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for FakeUnixProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.path);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn accept_unix_until_stop(
+        listener: &std::os::unix::net::UnixListener,
+        stop: &AtomicBool,
+    ) -> Option<UnixStream> {
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            let mut pfd = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 20) };
+            if rc <= 0 {
+                continue;
+            }
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    return Some(conn);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Minimal fake gvproxy `-services` server implementing `/forwarder/expose`
+    /// and `/forwarder/unexpose` for `protocol: "unix"` with echo sockets and
+    /// configurable lost-response fault injection.
+    struct FakeGvproxy {
+        api_sock: PathBuf,
+        drop_next_expose_reply: Arc<AtomicBool>,
+        drop_next_unexpose_reply: Arc<AtomicBool>,
+        fail_next_unexpose_before_remove: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl FakeGvproxy {
+        fn start(dir: &Path) -> Self {
+            use std::os::unix::net::UnixListener;
+
+            let api_sock = dir.join("gvproxy-api.sock");
+            let _ = fs::remove_file(&api_sock);
+            let listener = UnixListener::bind(&api_sock).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let drop_next_expose_reply = Arc::new(AtomicBool::new(false));
+            let drop_next_unexpose_reply = Arc::new(AtomicBool::new(false));
+            let fail_next_unexpose_before_remove = Arc::new(AtomicBool::new(false));
+
+            let (s_stop, s_drop_exp, s_drop_unexp, s_fail_unexp) = (
+                stop.clone(),
+                drop_next_expose_reply.clone(),
+                drop_next_unexpose_reply.clone(),
+                fail_next_unexpose_before_remove.clone(),
+            );
+            let thread = thread::spawn(move || {
+                let mut proxies: BTreeMap<PathBuf, FakeUnixProxy> = BTreeMap::new();
+                while let Some(mut conn) = accept_unix_until_stop(&listener, &s_stop) {
+                    let mut raw = vec![0u8; 4096];
+                    let n = conn.read(&mut raw).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&raw[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                    let body = req.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+                    let json: serde_json::Value =
+                        serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                    let local = PathBuf::from(json["local"].as_str().unwrap_or(""));
+
+                    let write_resp = |conn: &mut UnixStream, status: &str, msg: &str| {
+                        let r = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}",
+                            msg.len()
+                        );
+                        let _ = conn.write_all(r.as_bytes());
+                    };
+
+                    match path {
+                        "/services/forwarder/expose" => {
+                            if proxies.contains_key(&local) {
+                                write_resp(
+                                    &mut conn,
+                                    "500 Internal Server Error",
+                                    "proxy already running",
+                                );
+                                continue;
+                            }
+                            match UnixListener::bind(&local) {
+                                Ok(ul) => {
+                                    ul.set_nonblocking(true).unwrap();
+                                    let p_stop = Arc::new(AtomicBool::new(false));
+                                    let p_stop2 = p_stop.clone();
+                                    let t = thread::spawn(move || {
+                                        while let Some(mut c) =
+                                            accept_unix_until_stop(&ul, &p_stop2)
+                                        {
+                                            let mut data = Vec::new();
+                                            let _ = c.read_to_end(&mut data);
+                                            let _ = c.write_all(b"gv:");
+                                            let _ = c.write_all(&data);
+                                            let _ = c.shutdown(std::net::Shutdown::Write);
+                                        }
+                                    });
+                                    proxies.insert(
+                                        local.clone(),
+                                        FakeUnixProxy {
+                                            stop: p_stop,
+                                            path: local,
+                                            thread: Some(t),
+                                        },
+                                    );
+                                    if s_drop_exp.swap(false, Ordering::SeqCst) {
+                                        // Simulate lost HTTP response after socket bound.
+                                        continue;
+                                    }
+                                    write_resp(&mut conn, "200 OK", "");
+                                }
+                                Err(e) => {
+                                    write_resp(
+                                        &mut conn,
+                                        "500 Internal Server Error",
+                                        &format!("listen unix: {e}"),
+                                    );
+                                }
+                            }
+                        }
+                        "/services/forwarder/unexpose" => {
+                            if s_fail_unexp.swap(false, Ordering::SeqCst) {
+                                // Drop connection before removing the proxy.
+                                continue;
+                            }
+                            if proxies.remove(&local).is_none() {
+                                write_resp(
+                                    &mut conn,
+                                    "500 Internal Server Error",
+                                    "proxy not found",
+                                );
+                                continue;
+                            }
+                            if s_drop_unexp.swap(false, Ordering::SeqCst) {
+                                // Simulate lost HTTP response after proxy closed.
+                                continue;
+                            }
+                            write_resp(&mut conn, "200 OK", "");
+                        }
+                        _ => write_resp(&mut conn, "404 Not Found", "not found"),
+                    }
+                }
+                drop(proxies);
+            });
+
+            Self {
+                api_sock,
+                drop_next_expose_reply,
+                drop_next_unexpose_reply,
+                fail_next_unexpose_before_remove,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for FakeGvproxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.api_sock);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+            let _ = fs::remove_file(&self.api_sock);
+        }
+    }
+
+    fn tcp_echo(addr: Ipv4Addr, port: u16, msg: &str) -> String {
+        let mut s = TcpStream::connect((addr, port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(msg.as_bytes()).unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    fn free_high_port() -> u16 {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    fn free_low_port() -> u16 {
+        for candidate in (900u16..=1023).rev() {
+            if LoopbackTcpListener::bind(candidate).is_ok() {
+                return candidate;
+            }
+        }
+        panic!("could not find a free privileged port in 900..=1023");
+    }
+
+    #[test]
+    fn addresses_api_reconciles_lost_expose_response_and_failed_rollback() {
+        let dir = std::env::temp_dir().join(format!("kat-addr-retry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+        let api = AddressesApi::new(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &[Ipv4Addr::LOCALHOST],
+        );
+        // UDP reports 127.0.0.1 even when configured with extra addresses.
+        let alias = Ipv4Addr::new(172, 16, 1, 200);
+        let udp_check = AddressesApi::new(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &[Ipv4Addr::LOCALHOST, alias],
+        );
+        assert_eq!(
+            udp_check.port_addrs(PortProto::Udp, 5353),
+            vec![Ipv4Addr::LOCALHOST]
+        );
+        drop(udp_check);
+
+        let mut fwd = Forwards::new(api);
+        let port = free_high_port();
+        let sock = crate::autofwd::Upstream::socket(&dir, port);
+
+        // 1. First expose binds the socket in gvproxy, then loses the response.
+        fake.drop_next_expose_reply.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            fwd.add(TCP, port),
+            Some(Event::Transient(TCP, p, _)) if p == port
+        ));
+        assert!(sock.exists(), "live gvproxy socket must exist after bound");
+
+        // Retry must preserve the live socket, reconcile "already running",
+        // bind the Mac TCP listener, and relay payloads.
+        assert_eq!(
+            fwd.add(TCP, port),
+            Some(Event::Forwarded(TCP, port, vec![Ipv4Addr::LOCALHOST]))
+        );
+        assert_eq!(
+            tcp_echo(Ipv4Addr::LOCALHOST, port, "retry-ok"),
+            "gv:retry-ok"
+        );
+        assert_eq!(fwd.remove(TCP, port), Some(Event::Removed(TCP, port)));
+
+        // 2. Rollback failure when Mac port is busy and unexpose fails before
+        // gvproxy removes the proxy: live socket is preserved and reconciled
+        // when the Mac port frees up.
+        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let busy_sock = crate::autofwd::Upstream::socket(&dir, busy_port);
+        fake.fail_next_unexpose_before_remove
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            fwd.add(TCP, busy_port),
+            Some(Event::Refused(TCP, p, _)) if p == busy_port
+        ));
+        assert!(
+            busy_sock.exists(),
+            "failed rollback must not unlink a live gvproxy socket"
+        );
+        assert_eq!(
+            fwd.remove(TCP, busy_port),
+            Some(Event::RefusedCleared(TCP, busy_port))
+        );
+        drop(busy);
+        assert_eq!(
+            fwd.add(TCP, busy_port),
+            Some(Event::Forwarded(TCP, busy_port, vec![Ipv4Addr::LOCALHOST]))
+        );
+        assert_eq!(
+            tcp_echo(Ipv4Addr::LOCALHOST, busy_port, "rollback-ok"),
+            "gv:rollback-ok"
+        );
+
+        drop(fwd);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addresses_api_makes_unexpose_idempotent_and_reconciles_readd() {
+        let dir = std::env::temp_dir().join(format!("kat-addr-unexp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+        let mut fwd = Forwards::new(AddressesApi::new(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &[Ipv4Addr::LOCALHOST],
+        ));
+
+        // 1. Unexpose closes gvproxy socket, loses response -> retry receives
+        // "proxy not found", treats removal as complete, and closes Mac listener.
+        let p1 = free_high_port();
+        assert_eq!(
+            fwd.add(TCP, p1),
+            Some(Event::Forwarded(TCP, p1, vec![Ipv4Addr::LOCALHOST]))
+        );
+        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p1, "before"), "gv:before");
+        fake.drop_next_unexpose_reply.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            fwd.remove(TCP, p1),
+            Some(Event::RemoveFailed(TCP, p, _)) if p == p1
+        ));
+        assert_eq!(fwd.remove(TCP, p1), Some(Event::Removed(TCP, p1)));
+        assert!(
+            TcpListener::bind(("127.0.0.1", p1)).is_ok(),
+            "Mac listener must be closed after idempotent unexpose"
+        );
+
+        // 2. Guest immediately re-adds after an ambiguous unexpose whose effect
+        // already closed gvproxy's socket: upstream is recreated so the running
+        // Mac listener relays again.
+        let p2 = free_high_port();
+        assert_eq!(
+            fwd.add(TCP, p2),
+            Some(Event::Forwarded(TCP, p2, vec![Ipv4Addr::LOCALHOST]))
+        );
+        fake.drop_next_unexpose_reply.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            fwd.remove(TCP, p2),
+            Some(Event::RemoveFailed(TCP, p, _)) if p == p2
+        ));
+        assert_eq!(fwd.add(TCP, p2), None);
+        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p2, "readded"), "gv:readded");
+
+        drop(fwd);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addresses_api_round_trips_regular_and_low_ports_via_fake_gvproxy() {
+        let dir = std::env::temp_dir().join(format!("kat-addr-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+        let mut api = AddressesApi::new(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &[Ipv4Addr::LOCALHOST],
+        );
+
+        for port in [free_high_port(), free_low_port()] {
+            api.expose(TCP, port).unwrap();
+            assert_eq!(api.port_addrs(TCP, port), vec![Ipv4Addr::LOCALHOST]);
+            assert_eq!(
+                tcp_echo(Ipv4Addr::LOCALHOST, port, &format!("p{port}")),
+                format!("gv:p{port}")
+            );
+            api.unexpose(TCP, port).unwrap();
+            assert!(LoopbackTcpListener::bind(port).is_ok());
+        }
+
+        drop(api);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bound_if_index(fd: RawFd) -> libc::c_uint {
+        let mut idx: libc::c_uint = 0;
+        let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                IP_BOUND_IF,
+                (&mut idx as *mut libc::c_uint).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "getsockopt(IP_BOUND_IF): {}",
+            io::Error::last_os_error()
+        );
+        idx
+    }
+
+    /// Find an active non-loopback IPv4 address on this Mac (e.g. `en0`) to test
+    /// non-loopback peer rejection against filtered loopback listeners.
+    fn first_non_loopback_v4() -> Option<Ipv4Addr> {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if unsafe { libc::getifaddrs(&mut head) } != 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = unsafe { &*cur };
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null()
+                || ifa.ifa_flags & libc::IFF_LOOPBACK as libc::c_uint != 0
+                || ifa.ifa_flags & libc::IFF_UP as libc::c_uint == 0
+                || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
+            {
+                continue;
+            }
+            let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local() {
+                found = Some(ip);
+                break;
+            }
+        }
+        unsafe { libc::freeifaddrs(head) };
+        found
+    }
+
+    /// Connect from a specific local source IPv4 to `(dst, port)` and confirm
+    /// the listener does not echo data (either connect fails or peer is dropped).
+    fn assert_non_loopback_source_rejected(src: Ipv4Addr, dst: Ipv4Addr, port: u16) {
+        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let local = libc::sockaddr_in {
+            #[cfg(target_os = "macos")]
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(src).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        if unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&local as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        } < 0
+        {
+            return;
+        }
+        let remote = libc::sockaddr_in {
+            #[cfg(target_os = "macos")]
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(dst).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        if unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                (&remote as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        } < 0
+        {
+            // Blocked at connect time.
+            return;
+        }
+        let mut s = TcpStream::from(fd);
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let _ = s.write_all(b"lan-probe");
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut resp = Vec::new();
+        let _ = s.read_to_end(&mut resp);
+        assert!(
+            resp.is_empty(),
+            "non-loopback source {src} unexpectedly received {resp:?} from {dst}:{port}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn specific_alias_socket_scopes_to_lo0_and_rejects_non_loopback_peer() {
+        let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+        assert_ne!(lo0, 0);
+
+        // Default localhost path keeps the plain TcpListener without filtering.
+        let plain = LoopbackTcpListener::bind_on(&[Ipv4Addr::LOCALHOST], 0).unwrap();
+        assert_eq!(plain.filter_endpoints, vec![false]);
+        assert_eq!(bound_if_index(plain.raw_fds()[0]), 0);
+
+        // Specific-address alias scope: IP_BOUND_IF == lo0 + local peer filter.
+        let scoped = LoopbackTcpListener::bind_on_inner(&[Ipv4Addr::LOCALHOST], 0, true).unwrap();
+        assert_eq!(scoped.filter_endpoints, vec![true]);
+        assert_eq!(bound_if_index(scoped.raw_fds()[0]), lo0);
+        let port = scoped.local_addr().unwrap().port();
+
+        let server = thread::spawn(move || {
+            let (mut conn, peer) = scoped.accept().unwrap();
+            assert!(
+                peer.ip().is_loopback(),
+                "unexpected non-loopback peer {peer}"
+            );
+            let mut buf = [0u8; 5];
+            conn.read_exact(&mut buf).unwrap();
+            conn.write_all(&buf).unwrap();
+        });
+
+        if let Some(non_lo) = first_non_loopback_v4() {
+            assert_non_loopback_source_rejected(non_lo, Ipv4Addr::LOCALHOST, port);
+        }
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"lo-ok").unwrap();
+        let mut reply = [0u8; 5];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"lo-ok");
+        server.join().unwrap();
+    }
+
+    /// A real `lo0` alias for integration testing: uses `KATAMARAN_TEST_LO0_ALIAS`,
+    /// an already-assigned non-`127.0.0.1` IPv4 on `lo0`, or (when running as root)
+    /// provisions and removes a temporary alias via `ifconfig lo0`.
+    struct TestLo0Alias {
+        addr: Ipv4Addr,
+        provisioned: bool,
+    }
+
+    impl TestLo0Alias {
+        fn acquire() -> Option<Self> {
+            if let Ok(val) = std::env::var("KATAMARAN_TEST_LO0_ALIAS") {
+                let addr: Ipv4Addr = val
+                    .trim()
+                    .parse()
+                    .expect("KATAMARAN_TEST_LO0_ALIAS must be an IPv4 address");
+                assert!(
+                    addr != Ipv4Addr::LOCALHOST && is_loopback_interface_addr(addr),
+                    "KATAMARAN_TEST_LO0_ALIAS={addr} must be an alias assigned to lo0"
+                );
+                return Some(Self {
+                    addr,
+                    provisioned: false,
+                });
+            }
+            // Discover any existing non-127.0.0.1 IPv4 alias on lo0.
+            let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+            if unsafe { libc::getifaddrs(&mut head) } == 0 {
+                let mut found = None;
+                let mut cur = head;
+                while !cur.is_null() {
+                    let ifa = unsafe { &*cur };
+                    cur = ifa.ifa_next;
+                    if ifa.ifa_addr.is_null()
+                        || ifa.ifa_flags & libc::IFF_LOOPBACK as libc::c_uint == 0
+                        || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
+                    {
+                        continue;
+                    }
+                    let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+                    let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    if ip != Ipv4Addr::LOCALHOST {
+                        found = Some(ip);
+                        break;
+                    }
+                }
+                unsafe { libc::freeifaddrs(head) };
+                if let Some(addr) = found {
+                    return Some(Self {
+                        addr,
+                        provisioned: false,
+                    });
+                }
+            }
+            // When running as root, provision a temporary alias and remove it on Drop.
+            if unsafe { libc::geteuid() } == 0 {
+                let candidate = Ipv4Addr::new(172, 16, 254, 200);
+                let ok = Command::new("/sbin/ifconfig")
+                    .args(["lo0", "alias", &candidate.to_string()])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if ok && is_loopback_interface_addr(candidate) {
+                    return Some(Self {
+                        addr: candidate,
+                        provisioned: true,
+                    });
+                }
+            }
+            None
+        }
+    }
+
+    impl Drop for TestLo0Alias {
+        fn drop(&mut self) {
+            if self.provisioned {
+                let _ = Command::new("/sbin/ifconfig")
+                    .args(["lo0", "-alias", &self.addr.to_string()])
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn alias_forwarding_round_trip_on_regular_and_low_ports() {
+        let Some(alias) = TestLo0Alias::acquire() else {
+            eprintln!(
+                "skipped: no lo0 alias configured (set KATAMARAN_TEST_LO0_ALIAS or run \
+                 `sudo ifconfig lo0 alias 172.16.1.200`)"
+            );
+            return;
+        };
+        let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+        let configured = [Ipv4Addr::LOCALHOST, alias.addr];
+
+        // Verify socket scoping directly on a real specific-address alias bind.
+        let direct = LoopbackTcpListener::bind_on(&configured, 0).unwrap();
+        assert_eq!(direct.addrs(), &configured);
+        assert_eq!(direct.raw_fds().len(), 2);
+        assert_eq!(direct.filter_endpoints, vec![false, true]);
+        assert_eq!(bound_if_index(direct.raw_fds()[1]), lo0);
+        drop(direct);
+
+        // End-to-end AddressesApi payload round trips on both configured
+        // addresses for regular (>=1024) and privileged (<1024) ports.
+        let dir = std::env::temp_dir().join(format!("kat-alias-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+        let mut api = AddressesApi::new(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &configured,
+        );
+
+        let non_lo = first_non_loopback_v4();
+        for port in [free_high_port(), free_low_port()] {
+            api.expose(TCP, port).unwrap();
+            assert_eq!(api.port_addrs(TCP, port), configured.to_vec());
+            assert_eq!(
+                tcp_echo(Ipv4Addr::LOCALHOST, port, &format!("lo-{port}")),
+                format!("gv:lo-{port}")
+            );
+            assert_eq!(
+                tcp_echo(alias.addr, port, &format!("alias-{port}")),
+                format!("gv:alias-{port}")
+            );
+            if let Some(src) = non_lo {
+                assert_non_loopback_source_rejected(src, alias.addr, port);
+            }
+            api.unexpose(TCP, port).unwrap();
+        }
+
+        drop(api);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -39,6 +39,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -264,23 +265,29 @@ impl Call {
                         Value::Number(n) => n.to_string(),
                         Value::Bool(b) => b.to_string(),
                         Value::Null => String::new(),
-                        Value::Array(items) => {
+                        Value::Array(items) if k == "forward_addresses" => {
                             if items.is_empty() {
                                 return Err(RpcError::new(
                                     INVALID_PARAMS,
-                                    format!("{k}: expected a non-empty array of strings"),
+                                    format!("{k}: expected a non-empty array of IPv4 addresses"),
                                 ));
                             }
                             let mut parts = Vec::with_capacity(items.len());
                             for item in items {
                                 match item {
-                                    Value::String(s) if !s.trim().is_empty() => {
-                                        parts.push(s.as_str())
+                                    Value::String(s) => {
+                                        let addr: Ipv4Addr = s.trim().parse().map_err(|_| {
+                                            RpcError::new(
+                                                INVALID_PARAMS,
+                                                format!("{k}: {s:?} is not an IPv4 address"),
+                                            )
+                                        })?;
+                                        parts.push(addr.to_string());
                                     }
                                     _ => {
                                         return Err(RpcError::new(
                                             INVALID_PARAMS,
-                                            format!("{k}: expected an array of non-empty strings"),
+                                            format!("{k}: expected an array of IPv4 addresses"),
                                         ));
                                     }
                                 }
@@ -290,7 +297,7 @@ impl Call {
                         _ => {
                             return Err(RpcError::new(
                                 INVALID_PARAMS,
-                                format!("{k}: expected a string, number, bool or string array"),
+                                format!("{k}: expected a string, number or bool"),
                             ));
                         }
                     };
@@ -541,6 +548,9 @@ pub struct MountInfo {
 pub struct Port {
     pub proto: String,
     pub port: u16,
+    /// The Mac IPv4 addresses this port is actively bound to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -696,6 +706,14 @@ mod tests {
             INVALID_PARAMS
         );
         assert_eq!(
+            code(req("config.set", json!({"values": {"cpus": ["2"]}}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("config.set", json!({"values": {"mount": ["false"]}}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
             code(req(
                 "config.set",
                 json!({"values": {"forward_addresses": []}})
@@ -706,6 +724,27 @@ mod tests {
             code(req(
                 "config.set",
                 json!({"values": {"forward_addresses": [""]}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": [","]}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": ["127.0.0.1,172.16.1.200"]}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": ["127.0.0.1 172.16.1.200"]}})
             )),
             INVALID_PARAMS
         );
@@ -795,6 +834,7 @@ mod tests {
             ports: vec![Port {
                 proto: "tcp".into(),
                 port: 8080,
+                addresses: vec![Ipv4Addr::LOCALHOST],
             }],
             port_errors: vec![],
         };

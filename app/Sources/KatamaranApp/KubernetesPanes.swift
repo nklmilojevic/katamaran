@@ -488,13 +488,15 @@ final class ServicesPane: KubernetesPane {
 
     override func reveal(_ key: String) -> URL? {
         guard let localPorts = store.service(key)?.localPorts,
-              let port = K8sGrouping.firstReachableLocalPort(localPorts, status: model.status) else { return nil }
-        return URL(string: "http://localhost:\(port)")
+              let port = K8sGrouping.firstReachableLocalPort(localPorts, status: model.status),
+              let p = UInt16(exactly: port) else { return nil }
+        return model.status?.portURL(proto: "tcp", port: p) ?? URL(string: "http://localhost:\(port)")
     }
 
     private struct ServiceDetailState: Hashable {
         var service: K8sService
         var pods: [String]
+        var ports: [Port]
         var portErrors: [PortError]
     }
 
@@ -503,6 +505,7 @@ final class ServicesPane: KubernetesPane {
         return ServiceDetailState(
             service: s,
             pods: store.pods(for: s).map(\.name).sorted(),
+            ports: model.status?.ports ?? [],
             portErrors: model.status?.port_errors ?? []
         )
     }
@@ -526,8 +529,9 @@ final class ServicesPane: KubernetesPane {
         let localPorts = s.localPorts
         if !localPorts.isEmpty {
             let entries = localPorts.compactMap { port -> (URL, String?)? in
-                guard let url = URL(string: "http://localhost:\(port)") else { return nil }
-                let err = UInt16(exactly: port).flatMap { model.status?.portError(proto: "tcp", port: $0) }
+                guard let p = UInt16(exactly: port),
+                      let url = model.status?.portURL(proto: "tcp", port: p) ?? URL(string: "http://localhost:\(port)") else { return nil }
+                let err = model.status?.portError(proto: "tcp", port: p)
                 return (url, err)
             }
             if !entries.isEmpty {

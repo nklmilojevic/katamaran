@@ -300,7 +300,18 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         let ports: Vec<String> = s
             .ports
             .iter()
-            .map(|p| format!("{}/{}", p.port, p.proto))
+            .map(|p| {
+                if p.addresses.is_empty() || p.addresses == [std::net::Ipv4Addr::LOCALHOST] {
+                    format!("{}/{}", p.port, p.proto)
+                } else {
+                    format!(
+                        "{}:{}/{}",
+                        crate::net::addrs_label(&p.addresses),
+                        p.port,
+                        p.proto
+                    )
+                }
+            })
             .collect();
         line("ports", ports.join(", "));
     }
@@ -564,6 +575,7 @@ mod tests {
             ports: vec![Port {
                 proto: "tcp".into(),
                 port: 8080,
+                addresses: vec![std::net::Ipv4Addr::LOCALHOST],
             }],
             port_errors: vec![],
         };
@@ -581,12 +593,21 @@ mod tests {
         );
 
         let mut with_port_err = s.clone();
+        with_port_err.ports.push(Port {
+            proto: "tcp".into(),
+            port: 8443,
+            addresses: vec![std::net::Ipv4Addr::new(172, 16, 1, 200)],
+        });
         with_port_err.port_errors.push(PortError {
             proto: "tcp".into(),
             port: 80,
             error: "address already in use".into(),
         });
         let err_text = summary(&with_port_err);
+        assert!(
+            err_text.contains("8080/tcp, 172.16.1.200:8443/tcp"),
+            "{err_text}"
+        );
         assert!(
             err_text.contains("port err   80/tcp (address already in use)"),
             "{err_text}"

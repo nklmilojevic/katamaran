@@ -305,3 +305,30 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(unique.count == 2)
     #expect(unique.map(\.proto) == ["udp", "tcp"])
 }
+
+@Test func portLinksPreferLocalhostWhenBoundAndUseAliasOtherwise() throws {
+    let json = """
+    {"state": "running", "since_ms": 0,
+     "daemon": {"pid": 1, "home": "/tmp/k"},
+     "versions": {"katamaran": "0.8.0", "protocol": 3},
+     "config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "docker": {"state": "ready", "socket": "/tmp/k/run/docker.sock"},
+     "mount": {"enabled": true, "mounted": true},
+     "ports": [
+       {"proto": "tcp", "port": 8080, "addresses": ["172.16.1.200"]},
+       {"proto": "tcp", "port": 8443, "addresses": ["172.16.1.200", "127.0.0.1"]},
+       {"proto": "tcp", "port": 9000}
+     ]}
+    """
+    let decoded = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+    // Alias-only port uses the bound alias.
+    #expect(decoded.portHost(port: 8080) == "172.16.1.200")
+    #expect(decoded.portURL(port: 8080)?.absoluteString == "http://172.16.1.200:8080")
+    // Multi-address port prefers localhost whenever 127.0.0.1 is bound.
+    #expect(decoded.portHost(port: 8443) == "localhost")
+    #expect(decoded.portURL(port: 8443)?.absoluteString == "http://localhost:8443")
+    // Port without addresses (older daemon) or not yet listed falls back to localhost.
+    #expect(decoded.portHost(port: 9000) == "localhost")
+    #expect(decoded.portURL(port: 9000)?.absoluteString == "http://localhost:9000")
+    #expect(decoded.portHost(port: 9999) == "localhost")
+}

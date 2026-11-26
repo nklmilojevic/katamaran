@@ -106,6 +106,7 @@ struct MountInfo: Decodable, Equatable {
 struct Port: Decodable, Equatable, Hashable {
     var proto: String
     var port: UInt16
+    var addresses: [String]? = nil
 }
 
 struct PortError: Decodable, Equatable, Hashable {
@@ -115,6 +116,25 @@ struct PortError: Decodable, Equatable, Hashable {
 }
 
 extension DaemonStatus {
+    /// Preferred Mac host for opening a forwarded port in the browser:
+    /// `"localhost"` when `127.0.0.1` is bound (or when no address list is
+    /// reported), otherwise the port's first bound alias address.
+    func portHost(proto: String = "tcp", port: UInt16) -> String {
+        guard let addrs = ports.first(where: {
+            $0.port == port && $0.proto.caseInsensitiveCompare(proto) == .orderedSame
+        })?.addresses, !addrs.isEmpty else {
+            return "localhost"
+        }
+        if addrs.contains("127.0.0.1") {
+            return "localhost"
+        }
+        return addrs[0]
+    }
+
+    func portURL(proto: String = "tcp", port: UInt16) -> URL? {
+        URL(string: "http://\(portHost(proto: proto, port: port)):\(port)")
+    }
+
     func portError(proto: String = "tcp", port: UInt16) -> String? {
         port_errors?.first {
             $0.port == port && $0.proto.caseInsensitiveCompare(proto) == .orderedSame

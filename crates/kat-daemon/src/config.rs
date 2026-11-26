@@ -126,21 +126,35 @@ fn is_default_forward_addresses(v: &[Ipv4Addr]) -> bool {
     v == [Ipv4Addr::LOCALHOST]
 }
 
-/// Accepts `127.0.0.1,172.16.1.200` (commas or spaces); empty is the default.
+/// Accepts `127.0.0.1,172.16.1.200` (commas or spaces); empty resets to the default.
 fn parse_addresses(v: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
-    let addrs = v
-        .split(|c: char| c == ',' || c.is_whitespace())
+    if v.trim().is_empty() {
+        return Ok(default_forward_addresses());
+    }
+    v.split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<Ipv4Addr>()
                 .with_context(|| format!("forward_addresses: {s:?} is not an IPv4 address"))
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(if addrs.is_empty() {
-        default_forward_addresses()
-    } else {
-        addrs
-    })
+        .collect()
+}
+
+/// Check that a list of forward addresses is non-empty and contains distinct
+/// IPv4 host addresses (not wildcard, multicast, or broadcast).
+pub fn validate_forward_addresses(addrs: &[Ipv4Addr]) -> anyhow::Result<()> {
+    if addrs.is_empty() {
+        bail!("forward_addresses must list at least one address");
+    }
+    for (i, a) in addrs.iter().enumerate() {
+        if a.is_unspecified() || a.is_multicast() || a.is_broadcast() {
+            bail!("forward_addresses: {a} is not a host address");
+        }
+        if addrs[..i].contains(a) {
+            bail!("forward_addresses: {a} is listed twice");
+        }
+    }
+    Ok(())
 }
 
 /// The smallest guest that still runs dockerd comfortably.
@@ -380,17 +394,7 @@ impl Config {
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
             bail!("k8s_disable and k8s_args exceed maximum size of {MAX_K8S_ARGS_BYTES} bytes");
         }
-        if self.forward_addresses.is_empty() {
-            bail!("forward_addresses must list at least one address");
-        }
-        for (i, a) in self.forward_addresses.iter().enumerate() {
-            if a.is_unspecified() || a.is_multicast() || a.is_broadcast() {
-                bail!("forward_addresses: {a} is not a host address");
-            }
-            if self.forward_addresses[..i].contains(a) {
-                bail!("forward_addresses: {a} is listed twice");
-            }
-        }
+        validate_forward_addresses(&self.forward_addresses)?;
         Ok(())
     }
 
@@ -925,6 +929,21 @@ mod tests {
         );
         assert!(Config::parse("forward_addresses = []").is_err());
         assert_eq!(cfg, Config::default());
+
+        // Non-empty separator-only input is rejected and must not reset aliases.
+        let alias = Ipv4Addr::new(172, 16, 1, 200);
+        cfg.set("forward_addresses", "127.0.0.1,172.16.1.200", &HOST)
+            .unwrap();
+        for sep_only in [",", ",,", " , , "] {
+            assert!(
+                cfg.set("forward_addresses", sep_only, &HOST).is_err(),
+                "{sep_only:?}"
+            );
+            assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST, alias]);
+        }
+        // Only a truly blank input resets to the default.
+        cfg.set("forward_addresses", "   ", &HOST).unwrap();
+        assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
     }
 
     #[test]

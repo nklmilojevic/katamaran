@@ -23,9 +23,23 @@ use std::time::Duration;
 
 use crate::net::{LoopbackTcpListener, addrs_label};
 
-const MAX_CONNS: usize = 256;
+pub const MAX_CONNS: usize = 256;
+/// Maximum connections accepted from a single listening socket per poll wake,
+/// so a busy address cannot starve another address bound to the same port.
+const MAX_ACCEPT_BATCH: usize = 16;
 const COPY_BUF_SIZE: usize = 64 << 10;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Connection budget policy for forwarded listeners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnLimit {
+    /// One shared cap across all forwarded ports (used for automatic container
+    /// forwards so unpublished containers cannot exhaust daemon resources).
+    Shared(usize),
+    /// An independent cap per forwarded port (used for published ports so one
+    /// busy service cannot starve unrelated ports).
+    PerPort(usize),
+}
 
 /// Where a forwarded connection goes.
 #[derive(Clone, Debug)]
@@ -119,7 +133,7 @@ pub struct AutoForwards {
     addrs: Vec<Ipv4Addr>,
     active: BTreeMap<u16, Forward>,
     active_conns: Arc<AtomicUsize>,
-    max_conns: usize,
+    conn_limit: ConnLimit,
 }
 
 impl AutoForwards {
@@ -135,17 +149,35 @@ impl AutoForwards {
 
     /// Forwards from `addrs` to `upstream`.
     pub fn with(upstream: Upstream, addrs: &[Ipv4Addr]) -> AutoForwards {
-        Self::with_max_conns(upstream, addrs, MAX_CONNS)
+        let limit = match upstream {
+            Upstream::AutoForward(_) => ConnLimit::Shared(MAX_CONNS),
+            Upstream::PerPort(_) => ConnLimit::PerPort(MAX_CONNS),
+        };
+        Self::with_limit(upstream, addrs, limit)
     }
 
-    fn with_max_conns(upstream: Upstream, addrs: &[Ipv4Addr], max_conns: usize) -> AutoForwards {
+    /// Forwards from `addrs` to `upstream` with an explicit connection policy.
+    pub fn with_limit(
+        upstream: Upstream,
+        addrs: &[Ipv4Addr],
+        conn_limit: ConnLimit,
+    ) -> AutoForwards {
         AutoForwards {
             upstream,
             addrs: addrs.to_vec(),
             active: BTreeMap::new(),
             active_conns: Arc::new(AtomicUsize::new(0)),
-            max_conns,
+            conn_limit,
         }
+    }
+
+    pub fn addrs(&self) -> &[Ipv4Addr] {
+        &self.addrs
+    }
+
+    /// The addresses `port` is actually listening on, when active.
+    pub fn bound_addrs(&self, port: u16) -> Option<&[Ipv4Addr]> {
+        self.active.get(&port).map(|f| f.addrs.as_slice())
     }
 
     /// The addresses listened on, for log lines.
@@ -156,9 +188,8 @@ impl AutoForwards {
     /// The addresses `port` is actually listening on, or [`Self::label`] when
     /// it is not active.
     pub fn bound_label(&self, port: u16) -> String {
-        self.active
-            .get(&port)
-            .map(|f| addrs_label(&f.addrs))
+        self.bound_addrs(port)
+            .map(addrs_label)
             .unwrap_or_else(|| self.label())
     }
 
@@ -182,13 +213,18 @@ impl AutoForwards {
         listener.set_nonblocking(true)?;
         let (wake_r, wake_w) = wakeup_pipe()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let (conns, max_conns) = match self.conn_limit {
+            ConnLimit::Shared(max) => (self.active_conns.clone(), max),
+            ConnLimit::PerPort(max) => (Arc::new(AtomicUsize::new(0)), max),
+        };
         let ctx = AcceptCtx {
             upstream: self.upstream.clone(),
             label: addrs_label(&bound),
             port,
             stop: stop.clone(),
-            conns: self.active_conns.clone(),
-            max_conns: self.max_conns,
+            conns,
+            max_conns,
+            accept_batch: MAX_ACCEPT_BATCH,
         };
         let thread = thread::Builder::new()
             .name(format!("autofwd-{port}"))
@@ -241,10 +277,10 @@ struct AcceptCtx {
     stop: Arc<AtomicBool>,
     conns: Arc<AtomicUsize>,
     max_conns: usize,
+    accept_batch: usize,
 }
 
 fn accept_loop(listener: &LoopbackTcpListener, wake_r: &OwnedFd, ctx: &AcceptCtx) {
-    let (port, label) = (ctx.port, &ctx.label);
     let stop = &*ctx.stop;
     // The listening sockets, then the wakeup pipe.
     let mut pfds: Vec<libc::pollfd> = listener
@@ -277,55 +313,65 @@ fn accept_loop(listener: &LoopbackTcpListener, wake_r: &OwnedFd, ctx: &AcceptCtx
         if stop.load(Ordering::SeqCst) || pfds[wake].revents != 0 {
             return;
         }
-        let ready: Vec<(usize, libc::c_short)> =
-            pfds[..wake].iter().map(|p| p.revents).enumerate().collect();
-        for (i, revents) in ready {
+        for (i, pfd) in pfds[..wake].iter().enumerate() {
+            let revents = pfd.revents;
             if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                 return;
             }
             if revents & libc::POLLIN == 0 {
                 continue;
             }
-            loop {
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                match listener.accept_on(i) {
-                    Ok((conn, _)) => {
-                        if conn.set_nonblocking(false).is_err() {
-                            continue;
-                        }
-                        let Some(guard) = ConnGuard::try_acquire(&ctx.conns, ctx.max_conns) else {
-                            eprintln!(
-                                "katamaran: forward {label}:{port}: connection limit ({}) reached",
-                                ctx.max_conns
-                            );
-                            continue;
-                        };
-                        let (upstream, label2) = (ctx.upstream.clone(), label.clone());
-                        if let Err(e) = thread::Builder::new()
-                            .name(format!("autofwd-{port}-conn"))
-                            .spawn(move || {
-                                let _guard = guard;
-                                if let Err(e) = relay(conn, &upstream, port) {
-                                    eprintln!("katamaran: forward {label2}:{port}: {e}");
-                                }
-                            })
-                        {
-                            eprintln!("katamaran: forward {label}:{port}: spawn: {e}");
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        eprintln!("katamaran: forward {label}:{port}: accept: {e}");
-                        thread::sleep(ACCEPT_ERR_BACKOFF);
-                        break;
-                    }
-                }
+            if !accept_ready_batch(listener, i, ctx) {
+                return;
             }
         }
     }
+}
+
+/// Accept at most `ctx.accept_batch` connections from `listener`'s `i`th socket,
+/// returning `false` if shutdown was signalled. Bounding each socket prevents a
+/// busy address from starving another ready address on the same port.
+fn accept_ready_batch(listener: &LoopbackTcpListener, i: usize, ctx: &AcceptCtx) -> bool {
+    let (port, label) = (ctx.port, &ctx.label);
+    for _ in 0..ctx.accept_batch {
+        if ctx.stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        match listener.accept_on(i) {
+            Ok((conn, _)) => {
+                if conn.set_nonblocking(false).is_err() {
+                    continue;
+                }
+                let Some(guard) = ConnGuard::try_acquire(&ctx.conns, ctx.max_conns) else {
+                    eprintln!(
+                        "katamaran: forward {label}:{port}: connection limit ({}) reached",
+                        ctx.max_conns
+                    );
+                    continue;
+                };
+                let (upstream, label2) = (ctx.upstream.clone(), label.clone());
+                if let Err(e) = thread::Builder::new()
+                    .name(format!("autofwd-{port}-conn"))
+                    .spawn(move || {
+                        let _guard = guard;
+                        if let Err(e) = relay(conn, &upstream, port) {
+                            eprintln!("katamaran: forward {label2}:{port}: {e}");
+                        }
+                    })
+                {
+                    eprintln!("katamaran: forward {label}:{port}: spawn: {e}");
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("katamaran: forward {label}:{port}: accept: {e}");
+                thread::sleep(ACCEPT_ERR_BACKOFF);
+                break;
+            }
+        }
+    }
+    true
 }
 
 fn relay(client: TcpStream, upstream: &Upstream, port: u16) -> io::Result<()> {
@@ -480,10 +526,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kat-autofwd-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut fwd = AutoForwards::with_max_conns(
+        let mut fwd = AutoForwards::with_limit(
             Upstream::AutoForward(fake_guest(&dir)),
             &[Ipv4Addr::LOCALHOST],
-            2,
+            ConnLimit::Shared(2),
         );
         let port = add_free_port(&mut fwd);
 
@@ -571,20 +617,153 @@ mod tests {
         let port = add_free_port(&mut fwd);
         // What gvproxy serves for the port: here, an echo with a marker.
         let listener = UnixListener::bind(Upstream::socket(&dir, port)).unwrap();
-        thread::spawn(move || {
-            for conn in listener.incoming() {
-                let mut conn = conn.unwrap();
-                thread::spawn(move || {
-                    conn.write_all(b"gv:").unwrap();
-                    let mut rest = conn.try_clone().unwrap();
-                    copy(&mut rest, &mut conn).unwrap();
-                    conn.shutdown(Shutdown::Write).unwrap();
-                });
-            }
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.write_all(b"gv:").unwrap();
+            let mut rest = conn.try_clone().unwrap();
+            copy(&mut rest, &mut conn).unwrap();
+            conn.shutdown(Shutdown::Write).unwrap();
         });
         assert_eq!(round_trip(port, "hello"), "gv:hello");
+        server.join().unwrap();
         assert_eq!(fwd.label(), "127.0.0.1");
         fwd.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn per_port_limit_isolates_busy_port_from_unrelated_port() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fwd = AutoForwards::with_limit(
+            Upstream::AutoForward(fake_guest(&dir)),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::PerPort(2),
+        );
+        let a = add_free_port(&mut fwd);
+        let b = add_free_port(&mut fwd);
+
+        // Fill port `a`'s full 2-connection budget.
+        let mut hold = Vec::new();
+        for tag in [b"1", b"2"] {
+            let mut s = TcpStream::connect(("127.0.0.1", a)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(tag).unwrap();
+            let mut buf = vec![0u8; format!("{a}:1").len()];
+            s.read_exact(&mut buf).unwrap();
+            hold.push(s);
+        }
+
+        // A third connection on `a` hits `a`'s cap and is closed immediately.
+        let mut rejected = TcpStream::connect(("127.0.0.1", a)).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut one = [0u8; 1];
+        match rejected.read(&mut one) {
+            Ok(0) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("expected cap rejection on busy port {a}, got {other:?}"),
+        }
+
+        // Unrelated port `b` has its own budget and still relays cleanly.
+        assert_eq!(round_trip(b, "isolated"), format!("{b}:isolated"));
+
+        drop(hold);
+        fwd.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accept_batch_is_bounded_and_second_socket_is_not_starved() {
+        // 1. Deterministic batch bound: queue 5 connections on one socket and
+        // confirm accept_ready_batch drains only `accept_batch` (2), leaving 3.
+        let raw = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = raw.local_addr().unwrap().port();
+        raw.set_nonblocking(true).unwrap();
+        let listener = LoopbackTcpListener::from_listeners_for_test(vec![raw]);
+
+        let clients: Vec<TcpStream> = (0..5)
+            .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+            .collect();
+        let ctx = AcceptCtx {
+            upstream: Upstream::AutoForward(PathBuf::from("/nonexistent")),
+            label: "127.0.0.1".into(),
+            port,
+            stop: Arc::new(AtomicBool::new(false)),
+            conns: Arc::new(AtomicUsize::new(0)),
+            max_conns: 0,
+            accept_batch: 2,
+        };
+        assert!(accept_ready_batch(&listener, 0, &ctx));
+        for remaining in 0..3 {
+            assert!(
+                listener.accept_on(0).is_ok(),
+                "expected queued connection #{remaining} to remain after batch of 2"
+            );
+        }
+        assert_eq!(
+            listener.accept_on(0).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(clients);
+
+        // 2. Fairness across two sockets: continuously flood socket 0 while
+        // socket 1 completes round trips through accept_loop.
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-fair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let l0 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p0 = l0.local_addr().unwrap().port();
+        let p1 = l1.local_addr().unwrap().port();
+        let multi = LoopbackTcpListener::from_listeners_for_test(vec![l0, l1]);
+        multi.set_nonblocking(true).unwrap();
+
+        let (wake_r, wake_w) = wakeup_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_ctx = AcceptCtx {
+            upstream: Upstream::AutoForward(fake_guest(&dir)),
+            label: "127.0.0.1".into(),
+            port: p1,
+            stop: stop.clone(),
+            conns: Arc::new(AtomicUsize::new(0)),
+            max_conns: 16,
+            accept_batch: 2,
+        };
+        let worker = thread::spawn(move || accept_loop(&multi, &wake_r, &loop_ctx));
+
+        let flood_stop = Arc::new(AtomicBool::new(false));
+        let flooder = {
+            let flood_stop = flood_stop.clone();
+            thread::spawn(move || {
+                while !flood_stop.load(Ordering::Relaxed) {
+                    if let Ok(s) = TcpStream::connect(("127.0.0.1", p0)) {
+                        let _ = s.shutdown(Shutdown::Both);
+                    }
+                }
+            })
+        };
+
+        for _ in 0..3 {
+            assert_eq!(round_trip(p1, "fair"), format!("{p1}:fair"));
+        }
+
+        flood_stop.store(true, Ordering::SeqCst);
+        flooder.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let b = [1u8; 1];
+        unsafe { libc::write(wake_w.as_raw_fd(), b.as_ptr().cast(), 1) };
+        drop(wake_w);
+        worker.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

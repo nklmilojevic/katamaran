@@ -7,7 +7,7 @@
 //! clients read. SIGTERM (launchd's bootout) and SIGINT stop the VM cleanly
 //! before the daemon exits.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -254,7 +254,7 @@ struct Run {
     mounted: bool,
     mount_error: Option<String>,
     problem: Option<String>,
-    ports: BTreeSet<(PortProto, u16)>,
+    ports: BTreeMap<(PortProto, u16), Vec<std::net::Ipv4Addr>>,
     port_errors: BTreeMap<(PortProto, u16), String>,
     prev_guest: Option<GuestStats>,
     prev_host: Option<(Instant, u64)>,
@@ -277,7 +277,7 @@ impl Run {
             mounted: false,
             mount_error: None,
             problem: None,
-            ports: BTreeSet::new(),
+            ports: BTreeMap::new(),
             port_errors: BTreeMap::new(),
             prev_guest: None,
             prev_host: None,
@@ -491,9 +491,9 @@ impl Daemon {
                     r.problem = Some(format!("files not mounted: {error}"));
                     r.mount_error = Some(error);
                 }
-                Event::PortAdd(proto, port) => {
+                Event::PortAdd(proto, port, addrs) => {
                     r.port_errors.remove(&(proto, port));
-                    r.ports.insert((proto, port));
+                    r.ports.insert((proto, port), addrs);
                 }
                 Event::PortRemove(proto, port) => {
                     r.ports.remove(&(proto, port));
@@ -700,9 +700,10 @@ impl Daemon {
                 .map(|r| {
                     r.ports
                         .iter()
-                        .map(|(p, port)| Port {
+                        .map(|((p, port), addresses)| Port {
                             proto: p.as_str().into(),
                             port: *port,
+                            addresses: addresses.clone(),
                         })
                         .collect()
                 })
@@ -2349,14 +2350,16 @@ mod tests {
             }]
         );
 
-        // Successful bind replaces the error.
-        d.on_event(1, Event::PortAdd(PortProto::Tcp, 80));
+        // Successful bind replaces the error and records bound addresses.
+        let alias = std::net::Ipv4Addr::new(172, 16, 1, 200);
+        d.on_event(1, Event::PortAdd(PortProto::Tcp, 80, vec![alias]));
         let st = d.status();
         assert_eq!(
             st.ports,
             vec![Port {
                 proto: "tcp".into(),
                 port: 80,
+                addresses: vec![alias],
             }]
         );
         assert!(st.port_errors.is_empty());
