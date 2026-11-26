@@ -338,6 +338,8 @@ katamaran run [OPTIONS]
 | `--no-auto-forward` | off | Disable forwarding of unpublished container ports |
 | `--amd64 <MODE>` | `auto` | x86-64 emulation (`auto`, `rosetta`, `qemu`, or `off`) |
 
+By default, guest init sets `quickack 1` on main-table routes inside Docker and Kubernetes pod network namespaces and on local container bridges (`cni0`, `docker0`, `br-*`, `katbr0`), leaving `eth0` untouched. This avoids 40–50 ms Nagle + delayed-ACK stalls on keep-alive traffic between containers with the 65520-byte MTU. To disable it for a foreground VM, pass `--cmdline kat.quickack=0` to `katamaran run` (the daemon-managed VM started by `kat start` does not currently expose this option).
+
 ### `katamaran daemon`
 
 Run the background daemon owned by `launchd`. You do not normally invoke this directly.

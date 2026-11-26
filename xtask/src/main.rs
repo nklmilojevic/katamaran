@@ -127,6 +127,8 @@ fn main() -> anyhow::Result<()> {
                 "--test",
                 "autofwd",
                 "--test",
+                "quickack",
+                "--test",
                 "nfs",
                 "--test",
                 "fsnotify",
