@@ -2727,17 +2727,42 @@ impl K8s {
         unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
         if Path::new(DATA_DIR).exists() {
             // Try btrfs subvolume delete first (instant if it is a subvolume),
-            // falling back to recursive removal.
+            // falling back to recursive removal. Send periodic progress during
+            // both so large cluster-data directories do not trip idle timeouts.
             let mut cmd = Command::new("/sbin/btrfs");
             cmd.args(["subvolume", "delete", DATA_DIR]);
-            let _ = run_reaped(&self.reaper, &mut cmd, Duration::from_secs(30));
+            let mut beat = || {
+                let _ = k8s::write(
+                    &mut *conn,
+                    &K8sMsg::Progress("removing cluster data".into()),
+                );
+            };
+            let _ = run_reaped_split_checked(
+                &self.reaper,
+                &mut cmd,
+                Duration::from_secs(30),
+                64 << 10,
+                false,
+                Some(&mut beat),
+            );
             if Path::new(DATA_DIR).exists() {
-                fs::remove_dir_all(DATA_DIR).map_err(|e| format!("remove {DATA_DIR}: {e}"))?;
+                remove_dir_all_with_progress(
+                    Path::new(DATA_DIR),
+                    PROGRESS_HEARTBEAT_INTERVAL,
+                    &mut |m| {
+                        let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
+                    },
+                )?;
             }
         }
         if Path::new(LEGACY_KUBELET_DIR).exists() {
-            fs::remove_dir_all(LEGACY_KUBELET_DIR)
-                .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
+            remove_dir_all_with_progress(
+                Path::new(LEGACY_KUBELET_DIR),
+                PROGRESS_HEARTBEAT_INTERVAL,
+                &mut |m| {
+                    let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
+                },
+            )?;
         }
         let _ = fs::remove_file(KUBECONFIG);
         if remove_images {
@@ -3393,6 +3418,51 @@ fn run_reaped_split(
     Ok((out.code, out.stdout, out.stderr))
 }
 
+fn remove_dir_all_with_progress(
+    path: &Path,
+    interval: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    run_with_heartbeat(
+        interval,
+        "removing cluster data",
+        progress,
+        || fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display())),
+    )
+}
+
+fn run_with_heartbeat<T, F>(
+    interval: Duration,
+    msg: &str,
+    progress: &mut dyn FnMut(&str),
+    work: F,
+) -> Result<T, String>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, String> + Send,
+{
+    thread::scope(|s| {
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new()
+            .name("k8s-reset-rm".into())
+            .spawn_scoped(s, move || {
+                let _ = tx.send(work());
+            });
+        if spawned.is_err() {
+            return Err(format!("spawn worker thread for {msg}"));
+        }
+        loop {
+            match rx.recv_timeout(interval) {
+                Ok(res) => return res,
+                Err(RecvTimeoutError::Timeout) => progress(msg),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(format!("worker thread terminated while {msg}"));
+                }
+            }
+        }
+    })
+}
+
 fn run_reaped_split_checked(
     reaper: &Reaper,
     cmd: &mut Command,
@@ -3407,7 +3477,7 @@ fn run_reaped_split_checked(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_w))
         .stderr(Stdio::from(err_w));
-    let (pid, exited) = reaper.spawn(cmd)?;
+    let (target, exited) = reaper.spawn_pidfd(cmd)?;
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
     let out_t = match thread::Builder::new()
@@ -3416,7 +3486,7 @@ fn run_reaped_split_checked(
     {
         Ok(h) => h,
         Err(e) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            reaper.signal_target(&target, libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             return Err(e);
         }
@@ -3427,7 +3497,7 @@ fn run_reaped_split_checked(
     {
         Ok(h) => h,
         Err(e) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            reaper.signal_target(&target, libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             let _ = out_t.join();
             return Err(e);
@@ -3439,7 +3509,7 @@ fn run_reaped_split_checked(
     let status = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            reaper.signal_target(&target, libc::SIGKILL);
             let _ = exited.recv_timeout(Duration::from_secs(2));
             let _ = out_t.join();
             let _ = err_t.join();
@@ -3459,7 +3529,7 @@ fn run_reaped_split_checked(
             Ok(s) => break s,
             Err(RecvTimeoutError::Timeout) => {
                 if abort_on_shutdown && SHUTTING_DOWN.load(Ordering::SeqCst) {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    reaper.signal_target(&target, libc::SIGKILL);
                     let _ = exited.recv_timeout(Duration::from_secs(2));
                     let _ = out_t.join();
                     let _ = err_t.join();
@@ -8771,6 +8841,26 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let over = drain_capped_checked(io::Cursor::new(b"abcde"), 4);
         assert_eq!(over.text, "abcd");
         assert!(over.truncated);
+    }
+
+    #[test]
+    fn run_with_heartbeat_emits_periodic_progress_during_slow_work() {
+        let mut beats = Vec::new();
+        let val = run_with_heartbeat(
+            Duration::from_millis(20),
+            "removing cluster data",
+            &mut |m| beats.push(m.to_string()),
+            || {
+                thread::sleep(Duration::from_millis(75));
+                Ok(42usize)
+            },
+        )
+        .unwrap();
+        assert_eq!(val, 42);
+        assert!(
+            beats.len() >= 2 && beats.iter().all(|m| m == "removing cluster data"),
+            "expected periodic heartbeats, got: {beats:?}"
+        );
     }
 
     #[test]

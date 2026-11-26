@@ -40,6 +40,7 @@ pub const STATS_INTERVAL: Duration = Duration::from_secs(2);
 const STATS_HISTORY: usize = 150;
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const PROGRESS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Rotate `daemon.log` at startup beyond this size.
 const LOG_ROTATE_BYTES: u64 = 4 << 20;
 /// Maximum concurrent client connections served by the daemon socket.
@@ -204,6 +205,10 @@ pub struct Daemon {
     test_user_home: Option<PathBuf>,
     #[cfg(test)]
     test_kube_context: Option<String>,
+    #[cfg(test)]
+    test_heartbeat_interval: Option<Duration>,
+    #[cfg(test)]
+    test_progress_write_timeout: Option<Duration>,
 }
 
 struct K8sRuntime {
@@ -354,6 +359,10 @@ impl Daemon {
             test_user_home: None,
             #[cfg(test)]
             test_kube_context: None,
+            #[cfg(test)]
+            test_heartbeat_interval: None,
+            #[cfg(test)]
+            test_progress_write_timeout: None,
         })
     }
 
@@ -379,7 +388,25 @@ impl Daemon {
             launchd_label: None,
             test_user_home: Some(user_home),
             test_kube_context: Some(ctx.into()),
+            test_heartbeat_interval: None,
+            test_progress_write_timeout: None,
         })
+    }
+
+    fn heartbeat_interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.test_heartbeat_interval {
+            return d;
+        }
+        PROGRESS_HEARTBEAT_INTERVAL
+    }
+
+    fn progress_write_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.test_progress_write_timeout {
+            return d;
+        }
+        PROGRESS_WRITE_TIMEOUT
     }
 
     fn kube_context_name(&self) -> anyhow::Result<String> {
@@ -1009,21 +1036,7 @@ impl Daemon {
                 continue;
             }
             if let Call::K8sReset { images: true } = &call {
-                let mut progress = |m: &str| {
-                    let _ = send(
-                        &mut out,
-                        &api::Notification {
-                            jsonrpc: api::VERSION.into(),
-                            method: "k8s.progress".into(),
-                            params: serde_json::json!({ "message": m }),
-                        },
-                    );
-                };
-                let resp = match self.k8s_reset(true, &mut progress) {
-                    Ok(()) => Response::ok(id, Value::Null),
-                    Err(e) => Response::err(id, e),
-                };
-                if send(&mut out, &resp).is_err() {
+                if self.serve_k8s_reset_images(id, &mut out).is_err() {
                     return;
                 }
                 continue;
@@ -1063,6 +1076,49 @@ impl Daemon {
                 return;
             }
         }
+    }
+
+    fn serve_k8s_reset_images(
+        self: &Arc<Self>,
+        id: Value,
+        out: &mut UnixStream,
+    ) -> Result<(), ()> {
+        let prev_write_timeout = out.write_timeout().ok().flatten();
+        let write_timeout = self.progress_write_timeout();
+        let mut write_failed = false;
+        let res = {
+            let mut progress = |m: &str| {
+                if write_failed {
+                    return;
+                }
+                let note = api::Notification {
+                    jsonrpc: api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": m }),
+                };
+                if send_bounded(out, &note, write_timeout).is_err() {
+                    write_failed = true;
+                }
+            };
+            self.k8s_reset(true, &mut progress)
+        };
+        if write_failed {
+            // A progress write failed or timed out (possibly leaving a partial
+            // JSON line on the stream). Do not write the terminal response and
+            // close the connection now that k8s_reset has finished.
+            return Err(());
+        }
+        let resp = match res {
+            Ok(()) => Response::ok(id, Value::Null),
+            Err(e) => Response::err(id, e),
+        };
+        if send_bounded(out, &resp, write_timeout).is_err() {
+            return Err(());
+        }
+        if out.set_write_timeout(prev_write_timeout).is_err() {
+            return Err(());
+        }
+        Ok(())
     }
 
     pub fn handle(self: &Arc<Self>, call: &Call) -> Result<Value, RpcError> {
@@ -1654,6 +1710,12 @@ impl Daemon {
             Ok(())
         };
 
+        let persist_res = if guest_data_deleted {
+            self.persist_k8s_enabled(false)
+        } else {
+            Ok(())
+        };
+
         if guest_reset_attempted {
             {
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
@@ -1665,16 +1727,16 @@ impl Daemon {
                 k.state = "stopped".into();
                 k.error = None;
             }
-            if let Err(e) = self.remove_kubeconfig(&ctx) {
+            let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+            let rm_res = if remove_images {
+                self.remove_kubeconfig_with_progress(&ctx, progress)
+            } else {
+                self.remove_kubeconfig(&ctx)
+            };
+            if let Err(e) = rm_res {
                 dlog!("k8s reset: remove kubeconfig failed: {e:#}");
             }
         }
-
-        let persist_res = if guest_data_deleted {
-            self.persist_k8s_enabled(false)
-        } else {
-            Ok(())
-        };
 
         if let Err(reset_err) = reset_res {
             if guest_data_deleted {
@@ -1788,6 +1850,37 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    fn remove_kubeconfig_with_progress(
+        &self,
+        ctx: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<()> {
+        progress("cleaning up kubeconfig");
+        let interval = self.heartbeat_interval();
+        thread::scope(|s| {
+            let (tx, rx) = mpsc::channel();
+            let spawned = thread::Builder::new()
+                .name("k8s-kubeconfig-rm".into())
+                .spawn_scoped(s, move || {
+                    let _ = tx.send(self.remove_kubeconfig(ctx));
+                });
+            if spawned.is_err() {
+                return self.remove_kubeconfig(ctx);
+            }
+            loop {
+                match rx.recv_timeout(interval) {
+                    Ok(res) => return res,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        progress("waiting for kubeconfig lock");
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("kubeconfig cleanup worker terminated unexpectedly");
+                    }
+                }
+            }
+        })
     }
 
     fn k8s_kubeconfig(&self) -> Result<String, RpcError> {
@@ -1910,6 +2003,39 @@ fn send<T: serde::Serialize>(out: &mut UnixStream, msg: &T) -> io::Result<()> {
     let mut line = serde_json::to_vec(msg)?;
     line.push(b'\n');
     out.write_all(&line)
+}
+
+fn send_bounded<T: serde::Serialize>(
+    out: &mut UnixStream,
+    msg: &T,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut line = serde_json::to_vec(msg)?;
+    line.push(b'\n');
+    let deadline = Instant::now() + timeout;
+    let mut written = 0;
+    while written < line.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client write timed out",
+            ));
+        }
+        out.set_write_timeout(Some(left))?;
+        match out.write(&line[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "client closed connection during write",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Wait up to `timeout` for the client to hang up (or send anything, which
@@ -2851,6 +2977,191 @@ mod tests {
         assert_eq!(resp["id"], 1);
         assert!(resp.get("error").is_none());
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_k8s_reset_images_completes_cleanup_when_client_stops_reading() {
+        let root = temp("k8s-stall");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-stall");
+        Arc::get_mut(&mut d).unwrap().test_progress_write_timeout = Some(Duration::from_millis(100));
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "kc-stall").unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+
+        // Guest sends enough progress frames to overflow the Unix socket buffer
+        // while the client keeps the socket open without reading.
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = guest_listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            let big = "p".repeat(4096);
+            for _ in 0..256 {
+                kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Progress(big.clone()))
+                    .unwrap();
+            }
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let (mut client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut line =
+            serde_json::to_vec(&Request::new(1, &Call::K8sReset { images: true })).unwrap();
+        line.push(b'\n');
+        client_sock.write_all(&line).unwrap();
+        // Keep `client_sock` open without reading until the server finishes.
+
+        let started = Instant::now();
+        srv.join().unwrap();
+        guest.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "serve stalled on unread client socket: {:?}",
+            started.elapsed()
+        );
+        drop(client_sock);
+
+        assert_eq!(d.k8s.lock().unwrap().state, "stopped");
+        assert!(!kc.exists(), "host kubeconfig file must be cleaned up");
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes=false must be persisted even when client stopped reading"
+        );
+        assert!(
+            d.k8s_op.try_lock().is_ok(),
+            "k8s_op lock must be released after reset"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_k8s_reset_images_heartbeats_and_persists_while_kubeconfig_lock_held() {
+        let root = temp("k8s-flock");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        let kube_dir = user_home.join(".kube");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kube_dir).unwrap();
+        fs::write(kube_dir.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        // Hold the shared kubeconfig lock before starting the reset.
+        let lock_path = kube_dir.join(".katamaran-kubeconfig.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let mut held_lock = Some(lock_file);
+
+        let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-flock");
+        Arc::get_mut(&mut d).unwrap().test_heartbeat_interval = Some(Duration::from_millis(50));
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = guest_listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line =
+            serde_json::to_vec(&Request::new(1, &Call::K8sReset { images: true })).unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+
+        let mut reader = BufReader::new(client_sock);
+        let mut lock_heartbeats = 0usize;
+        let mut raw = String::new();
+        let reset_resp = loop {
+            raw.clear();
+            assert!(reader.read_line(&mut raw).unwrap() > 0);
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                assert_eq!(v["method"], "k8s.progress");
+                if v["params"]["message"] == "waiting for kubeconfig lock" {
+                    lock_heartbeats += 1;
+                    if lock_heartbeats == 2 {
+                        // Confirmed cluster deletion must ALREADY be persisted
+                        // before waiting on the shared kubeconfig lock.
+                        assert!(
+                            !Config::load(&home).unwrap().kubernetes,
+                            "kubernetes=false must be persisted before kubeconfig cleanup"
+                        );
+                        held_lock.take();
+                    }
+                }
+            } else {
+                break v;
+            }
+        };
+        assert_eq!(reset_resp["id"], 1);
+        assert!(reset_resp.get("error").is_none());
+        assert!(
+            lock_heartbeats >= 2,
+            "expected periodic kubeconfig lock heartbeats, got {lock_heartbeats}"
+        );
+
+        // Verify the healthy connection can still be reused after restoring write timeout.
+        let mut status_req = serde_json::to_vec(&Request::new(2, &Call::Status)).unwrap();
+        status_req.push(b'\n');
+        writer.write_all(&status_req).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+        raw.clear();
+        assert!(reader.read_line(&mut raw).unwrap() > 0);
+        let status_resp: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(status_resp["id"], 2);
+        assert!(status_resp.get("error").is_none());
+
+        srv.join().unwrap();
+        guest.join().unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 
