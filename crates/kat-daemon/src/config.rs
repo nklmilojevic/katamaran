@@ -270,7 +270,9 @@ impl Config {
 }
 
 /// The oldest Kubernetes minor the guest's k3s flags work with: kube-proxy's
-/// nftables mode is on by default from 1.31.
+/// `NFTablesProxyMode` feature gate is enabled by default from 1.31, and the
+/// guest rootfs ships `nft` (Alpine's `nftables` package) so releases whose
+/// bundled `k3s-root` lacks `nft` (such as v1.31.0–v1.31.5) still work.
 const MIN_K8S_MINOR: u32 = 31;
 
 /// A k3s release tag, `v<major>.<minor>.<patch>[-<pre>]+k3s<n>`, no older

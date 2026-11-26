@@ -38,6 +38,7 @@ const BIN_DIR: &str = "/var/lib/katamaran/k3s/bin";
 const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
+const DATA_VERSION_FILE: &str = "/var/lib/katamaran/k3s/data/.katamaran-version";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
@@ -263,6 +264,160 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
             target.display()
         ));
     }
+    Ok(())
+}
+
+/// Parse `(major, minor)` from a k3s release tag such as `v1.37.2+k3s1`.
+fn parse_k3s_minor(version: &str) -> Option<(u32, u32)> {
+    let rest = version.trim().strip_prefix('v')?;
+    let (kube, build) = rest.split_once("+k3s")?;
+    if build.is_empty() {
+        return None;
+    }
+    let core = kube.split_once('-').map_or(kube, |(c, _)| c);
+    let mut parts = core.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    let _patch: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor))
+}
+
+/// True once k3s has initialized server state under `data_dir`.
+/// `prepare_dirs_and_sysctls` only creates `agent/etc/cni/net.d`, never `server/`.
+fn datastore_exists(data_dir: &Path) -> bool {
+    data_dir.join("server").exists()
+}
+
+fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Return the k3s version associated with an existing datastore under `data_dir`.
+///
+/// Prefers `data_version_file` inside `data_dir` so `reset` clears it together
+/// with cluster data while leaving `bin_version_file` intact. For datastores
+/// created before `data_version_file` existed, falls back to `bin_version_file`.
+fn effective_datastore_version(
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+) -> Result<Option<String>, String> {
+    if !datastore_exists(data_dir) {
+        return Ok(None);
+    }
+    if let Some(v) = read_trimmed_file(data_version_file)? {
+        return Ok(Some(v));
+    }
+    read_trimmed_file(bin_version_file)
+}
+
+/// Refuse to install or start a lower Kubernetes minor against an existing
+/// datastore created by a newer minor without modifying `data_dir`.
+fn check_datastore_compatible(
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+    target_version: &str,
+) -> Result<(), String> {
+    let Some(existing) =
+        effective_datastore_version(data_dir, data_version_file, bin_version_file)?
+    else {
+        return Ok(());
+    };
+    let target_mm = parse_k3s_minor(target_version)
+        .ok_or_else(|| format!("invalid k3s version {target_version:?}"))?;
+    let existing_mm = parse_k3s_minor(&existing).ok_or_else(|| {
+        format!(
+            "cannot determine minor version of existing cluster data ({existing:?}); \
+             back up any state you need and run `kat k8s reset` before starting {target_version}"
+        )
+    })?;
+    if target_mm < existing_mm {
+        return Err(format!(
+            "refusing to use k3s {target_version} with existing {existing} cluster data: \
+             Kubernetes does not support minor-version downgrades. Back up any state you need, \
+             run `kat k8s reset` to delete cluster data and persistent volumes, then run \
+             `kat k8s start` (or restore a matching datastore backup)."
+        ));
+    }
+    Ok(())
+}
+
+/// Persist the previously installed version into `data_version_file` before
+/// replacing `bin_version_file`, so existing datastores created before
+/// `data_version_file` existed do not lose their recorded minor.
+fn seed_datastore_version_if_missing(
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+) -> Result<(), String> {
+    if !datastore_exists(data_dir) {
+        return Ok(());
+    }
+    if read_trimmed_file(data_version_file)?.is_some() {
+        return Ok(());
+    }
+    if let Some(prev) = read_trimmed_file(bin_version_file)? {
+        write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
+fn restore_data_version(path: &Path, prev: Option<&str>) {
+    match prev {
+        Some(v) => {
+            if let Err(e) = write_atomic(path, format!("{v}\n").as_bytes()) {
+                log(&format!("restore {}: {e}", path.display()));
+            }
+        }
+        None => {
+            if let Err(e) = fs::remove_file(path)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                log(&format!("remove {}: {e}", path.display()));
+            }
+        }
+    }
+}
+
+fn commit_installed_binary(
+    tmp: &Path,
+    bin: &Path,
+    version_file: &Path,
+    version: &str,
+) -> Result<(), String> {
+    commit_installed_binary_with(tmp, bin, version_file, version, write_atomic)
+}
+
+/// Invalidate any previous version marker before swapping the executable into
+/// `bin`, so a failed or interrupted marker write cannot leave the previous
+/// version string describing the newly installed binary.
+fn commit_installed_binary_with(
+    tmp: &Path,
+    bin: &Path,
+    version_file: &Path,
+    version: &str,
+    write_version: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    match fs::remove_file(version_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("remove stale {}: {e}", version_file.display()));
+        }
+    }
+    fs::rename(tmp, bin).map_err(|e| format!("install {}: {e}", bin.display()))?;
+    write_version(version_file, format!("{version}\n").as_bytes())?;
     Ok(())
 }
 
@@ -627,6 +782,12 @@ impl K8s {
         if self.state.lock().unwrap().running.is_some() {
             return Err("stop Kubernetes before installing a new k3s binary".into());
         }
+        check_datastore_compatible(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            Path::new(VERSION_FILE),
+            version,
+        )?;
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress(format!("installing k3s {version}")),
@@ -665,8 +826,17 @@ impl K8s {
             drop(f);
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("chmod {tmp}: {e}"))?;
-            fs::rename(&tmp, BIN).map_err(|e| format!("install {BIN}: {e}"))?;
-            write_atomic(Path::new(VERSION_FILE), format!("{version}\n").as_bytes())?;
+            seed_datastore_version_if_missing(
+                Path::new(DATA_DIR),
+                Path::new(DATA_VERSION_FILE),
+                Path::new(VERSION_FILE),
+            )?;
+            commit_installed_binary(
+                Path::new(&tmp),
+                Path::new(BIN),
+                Path::new(VERSION_FILE),
+                version,
+            )?;
             Ok(())
         })();
         let _ = conn.set_read_timeout(None);
@@ -696,6 +866,16 @@ impl K8s {
         if !Path::new(BIN).is_file() {
             return Err("k3s binary is not installed".into());
         }
+        let installed_version = read_trimmed_file(Path::new(VERSION_FILE))?.ok_or_else(|| {
+            "k3s installation is incomplete (missing version marker); restart Kubernetes to reinstall"
+                .to_string()
+        })?;
+        check_datastore_compatible(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            Path::new(VERSION_FILE),
+            &installed_version,
+        )?;
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("preparing k3s environment".into()),
@@ -740,7 +920,23 @@ impl K8s {
         .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
         .stderr(log_file);
 
-        enable_bridge_netfilter()?;
+        let prev_data_version = read_trimmed_file(Path::new(DATA_VERSION_FILE))?;
+        let wrote_data_version = if prev_data_version.as_deref() != Some(installed_version.as_str())
+        {
+            write_atomic(
+                Path::new(DATA_VERSION_FILE),
+                format!("{installed_version}\n").as_bytes(),
+            )?;
+            true
+        } else {
+            false
+        };
+        if let Err(e) = enable_bridge_netfilter() {
+            if wrote_data_version {
+                restore_data_version(Path::new(DATA_VERSION_FILE), prev_data_version.as_deref());
+            }
+            return Err(e);
+        }
         // Mark active before spawning k3s so ports::watch ignores internal
         // control-plane ports (e.g. 6443) from the moment k3s binds them.
         ACTIVE.store(true, Ordering::SeqCst);
@@ -748,6 +944,12 @@ impl K8s {
             Ok(v) => v,
             Err(e) => {
                 ACTIVE.store(false, Ordering::SeqCst);
+                if wrote_data_version {
+                    restore_data_version(
+                        Path::new(DATA_VERSION_FILE),
+                        prev_data_version.as_deref(),
+                    );
+                }
                 restore_bridge_netfilter();
                 return Err(format!("spawn k3s: {e}"));
             }
@@ -2503,5 +2705,124 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         relay.join().unwrap();
         upstream.join().unwrap();
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn commit_installed_binary_invalidates_stale_version_on_write_failure() {
+        let dir = temp_dir("install-version-marker");
+        let bin = dir.join("k3s");
+        let tmp = dir.join("k3s.tmp");
+        let version_file = dir.join("version");
+
+        fs::write(&bin, b"k3s-v1.37").unwrap();
+        fs::write(&version_file, "v1.37.2+k3s1\n").unwrap();
+        fs::write(&tmp, b"k3s-v1.32").unwrap();
+
+        let err =
+            commit_installed_binary_with(&tmp, &bin, &version_file, "v1.32.5+k3s1", |_, _| {
+                Err("simulated write failure".into())
+            })
+            .unwrap_err();
+        assert!(err.contains("simulated write failure"), "{err}");
+        assert_eq!(fs::read(&bin).unwrap(), b"k3s-v1.32");
+        assert!(
+            !version_file.exists(),
+            "stale version marker must not survive after swapping binary"
+        );
+
+        // Retry with a working marker write succeeds cleanly even without an existing marker.
+        fs::write(&tmp, b"k3s-v1.32-retry").unwrap();
+        commit_installed_binary(&tmp, &bin, &version_file, "v1.32.5+k3s1").unwrap();
+        assert_eq!(fs::read(&bin).unwrap(), b"k3s-v1.32-retry");
+        assert_eq!(fs::read_to_string(&version_file).unwrap(), "v1.32.5+k3s1\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn datastore_downgrade_is_blocked_without_modifying_datastore() {
+        let dir = temp_dir("datastore-downgrade");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = dir.join("bin/version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        let db_file = data_dir.join("server/db/state.db");
+        fs::write(&db_file, b"v1.37-datastore-bytes").unwrap();
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+
+        // Legacy datastore (no data_version_file yet): falls back to bin_version_file
+        // and rejects downgrade without modifying data_dir.
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("v1.32.5+k3s1"), "{err}");
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+        assert!(!data_version_file.exists());
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+
+        // Same minor (patch change) and higher minor upgrades are permitted.
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.37.1+k3s1",
+        )
+        .unwrap();
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.38.0+k3s1",
+        )
+        .unwrap();
+
+        // Seeding preserves the datastore's minor even if bin_version_file is later absent/changed.
+        seed_datastore_version_if_missing(&data_dir, &data_version_file, &bin_version_file)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+        fs::write(&bin_version_file, "v1.32.5+k3s1\n").unwrap();
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+
+        // After reset removes data_dir, starting a lower minor is allowed even while
+        // bin_version_file still records the previous installed binary.
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+        fs::remove_dir_all(&data_dir).unwrap();
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap();
+
+        // Empty data_dir without server/ (e.g. failed pre-start) does not block switching.
+        fs::create_dir_all(data_dir.join("agent/etc/cni/net.d")).unwrap();
+        fs::write(&data_version_file, "v1.37.2+k3s1\n").unwrap();
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            "v1.32.5+k3s1",
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

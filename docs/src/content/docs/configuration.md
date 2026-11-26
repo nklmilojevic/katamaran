@@ -19,7 +19,7 @@ amd64 = "auto"
 kubernetes = false
 ```
 
-Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately).
+Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately; `k8s_version` applies at the next Kubernetes start).
 
 Some settings, such as `nofile`, are not in the app's Settings window. Change them with the CLI or by editing `config.toml`:
 
@@ -43,7 +43,7 @@ kat restart
 | `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
 | `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
-| `k8s_version` | string (optional) | Pinned build (unset) | A k3s release tag, `v1.31` or newer (for example `"v1.32.5+k3s1"`), or empty string to reset to the pinned build. Applies at the next Kubernetes start. See [Choose the k3s version](/kubernetes/#choose-the-k3s-version). |
+| `k8s_version` | string (optional) | Pinned build (unset) | A supported k3s release tag, `v1.31` or newer (for example `"v1.32.5+k3s1"`). To reset to the pinned build, remove the key from `config.toml` or run `kat config set k8s_version=default` (or `kat config set k8s_version=`). Applies at the next Kubernetes start. Before rolling back to an older katamaran release without this key, clear it with `kat config set k8s_version=default` — or remove only the `k8s_version` line from `config.toml` afterward — because older releases reject unknown keys and cannot start the VM until it is removed. See [Choose the k3s version](/kubernetes/#choose-the-k3s-version). |
 | `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) set at guest boot, like `LimitNOFILE` in Docker Desktop. containerd, dockerd, and containers and pods inherit it unless they set their own (for example `docker run --ulimit nofile=...`). |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.

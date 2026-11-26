@@ -207,6 +207,26 @@ fn ensure_cached_binary(
     version: &str,
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<PathBuf> {
+    ensure_cached_binary_with(
+        home,
+        version,
+        progress,
+        crate::machines::curl_text,
+        crate::machines::curl,
+    )
+}
+
+fn ensure_cached_binary_with<FText, FBin>(
+    home: &Path,
+    version: &str,
+    progress: &mut dyn FnMut(&str),
+    mut fetch_text: FText,
+    mut fetch_bin: FBin,
+) -> anyhow::Result<PathBuf>
+where
+    FText: FnMut(&str) -> anyhow::Result<String>,
+    FBin: FnMut(&str, &Path) -> anyhow::Result<()>,
+{
     let path = cache_binary_path(home, version);
     let parent = path
         .parent()
@@ -232,8 +252,8 @@ fn ensure_cached_binary(
     } else {
         progress(&format!("fetching k3s {version} checksums"));
         let url = release_url(version, K3S_ARM64_SUMS);
-        let sums = crate::machines::curl_text(&url)
-            .with_context(|| format!("k3s release {version} not found (k8s_version)"))?;
+        let sums =
+            fetch_text(&url).with_context(|| format!("fetch k3s {version} arm64 checksums"))?;
         parse_arm64_sha256(&sums).with_context(|| format!("read {url}"))?
     };
     let pid = std::process::id();
@@ -241,7 +261,7 @@ fn ensure_cached_binary(
     let tmp = parent.join(format!("{K3S_ARM64}.{pid}.{seq}.part"));
     let _ = fs::remove_file(&tmp);
     progress(&format!("downloading k3s {version} (~74 MB)"));
-    if let Err(e) = crate::machines::curl(&release_url(version, K3S_ARM64), &tmp) {
+    if let Err(e) = fetch_bin(&release_url(version, K3S_ARM64), &tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -1228,6 +1248,150 @@ EB62D8BA346F7C6A0BB5C874EA92335ECAD7CB3FA167508F94888AAEB43E7F22 *k3s-arm64
         assert!(parse_arm64_sha256("").is_err());
         let airgap_only = sums.lines().next().unwrap();
         assert!(parse_arm64_sha256(airgap_only).is_err());
+    }
+
+    fn temp_k8s_home(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kat-k8s-{name}-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn non_pinned_cache_verifies_and_reuses_without_network() {
+        let home = temp_k8s_home("cache-reuse");
+        let version = "v1.32.5+k3s1";
+        let payload = b"fake k3s-arm64 binary payload";
+        let probe = home.join("probe.bin");
+        fs::write(&probe, payload).unwrap();
+        let expected_hash = crate::machines::sha256_file(&probe).unwrap();
+        fs::remove_file(&probe).unwrap();
+
+        let mut text_fetches = 0usize;
+        let mut bin_fetches = 0usize;
+        let mut noop = |_: &str| {};
+        let got = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |url| {
+                assert_eq!(url, release_url(version, K3S_ARM64_SUMS));
+                text_fetches += 1;
+                Ok(format!("{expected_hash}  {K3S_ARM64}\n"))
+            },
+            |url, out| {
+                assert_eq!(url, release_url(version, K3S_ARM64));
+                bin_fetches += 1;
+                fs::write(out, payload)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, cache_binary_path(&home, version));
+        assert_eq!(text_fetches, 1);
+        assert_eq!(bin_fetches, 1);
+        assert_eq!(fs::read(&got).unwrap(), payload);
+
+        // Second start with matching cached binary + checksum makes zero network calls.
+        let cached = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |url| panic!("unexpected checksum fetch: {url}"),
+            |url, _| panic!("unexpected binary fetch: {url}"),
+        )
+        .unwrap();
+        assert_eq!(cached, got);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mismatched_download_is_rejected_without_publishing_or_replacing_cache() {
+        let home = temp_k8s_home("cache-mismatch");
+        let version = "v1.32.5+k3s1";
+        let good_payload = b"expected k3s-arm64 payload";
+        let bad_payload = b"tampered k3s-arm64 payload";
+        let probe = home.join("probe.bin");
+        fs::write(&probe, good_payload).unwrap();
+        let expected_hash = crate::machines::sha256_file(&probe).unwrap();
+        fs::remove_file(&probe).unwrap();
+
+        let mut noop = |_: &str| {};
+        let err = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| Ok(format!("{expected_hash}  {K3S_ARM64}\n")),
+            |_, out| {
+                fs::write(out, bad_payload)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+
+        let bin_path = cache_binary_path(&home, version);
+        let cache_dir = bin_path.parent().unwrap();
+        assert!(!bin_path.exists());
+        assert!(!cache_dir.join(format!("{K3S_ARM64}.sha256")).exists());
+        let leftovers: Vec<_> = fs::read_dir(cache_dir).unwrap().collect();
+        assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+
+        // Existing corrupted cache entry is not overwritten by another bad download.
+        fs::write(&bin_path, b"corrupted-prior-cache").unwrap();
+        fs::write(
+            cache_dir.join(format!("{K3S_ARM64}.sha256")),
+            format!("{expected_hash}  {K3S_ARM64}\n"),
+        )
+        .unwrap();
+        let err = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| Ok(format!("{expected_hash}  {K3S_ARM64}\n")),
+            |_, out| {
+                fs::write(out, bad_payload)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"corrupted-prior-cache");
+        for entry in fs::read_dir(cache_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".part"), "leftover part file: {name}");
+        }
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn checksum_fetch_error_keeps_underlying_cause() {
+        let home = temp_k8s_home("checksum-fetch-err");
+        let version = "v1.32.5+k3s1";
+        let mut noop = |_: &str| {};
+        let err = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| bail!("curl: (6) Could not resolve host"),
+            |_, _| panic!("should not download binary when checksum fetch fails"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fetch k3s v1.32.5+k3s1 arm64 checksums"),
+            "{msg}"
+        );
+        assert!(msg.contains("Could not resolve host"), "{msg}");
+        assert!(!msg.contains("not found"), "{msg}");
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

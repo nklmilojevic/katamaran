@@ -13,7 +13,7 @@ Enable and start Kubernetes from the command line:
 kat k8s start
 ```
 
-On the first start, katamaran downloads the pinned `k3s-arm64` binary into `~/.katamaran/cache/k3s/`, verifies its SHA-256 checksum, transfers it into the VM, enables CRI on the shared `containerd` daemon, and waits for the API server to become ready. Starting Kubernetes also sets `kubernetes = true` in `~/.katamaran/config.toml` so the cluster starts automatically on future VM boots.
+On the first start, katamaran downloads the selected `k3s-arm64` release (the pinned build by default; see [Choose the k3s version](#choose-the-k3s-version)) into `~/.katamaran/cache/k3s/`, verifies its SHA-256 checksum, transfers it into the VM, enables CRI on the shared `containerd` daemon, and waits for the API server to become ready. Starting Kubernetes also sets `kubernetes = true` in `~/.katamaran/config.toml` so the cluster starts automatically on future VM boots.
 
 You can also toggle Kubernetes immediately while the VM is running with `kat config set` or in the macOS app (**Settings > Kubernetes > Enable Kubernetes**, or the **Turn On** button in the **Pods** and **Services** views):
 
@@ -49,12 +49,17 @@ Each katamaran release pins a tested `k3s` build. To keep the local cluster on t
 
 ```sh
 kat config set k8s_version=v1.32.5+k3s1
-kat config set k8s_version=   # back to the pinned build
+kat config set k8s_version=default   # back to the pinned build
 ```
 
-katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<version>/` and verifies it against the SHA-256 published in the release's `sha256sum-arm64.txt` (the pinned build is checked against a checksum built into katamaran). The new version is installed at the next Kubernetes start, so restart a running cluster with `kat k8s stop && kat k8s start` or `kat restart`.
+katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<version>/` and verifies it against the SHA-256 published in the release's `sha256sum-arm64.txt` (the pinned build is checked against a checksum built into katamaran). The new version is installed at the next Kubernetes start, so a running cluster picks it up after `kat k8s stop && kat k8s start` or `kat restart`.
 
-Upgrading keeps the cluster's state. Kubernetes does not support downgrades, so run `kat k8s reset` after moving to an older minor.
+- **Upgrading while keeping cluster state:** follow the [K3s manual upgrade guide](https://docs.k3s.io/upgrades/manual) — back up your cluster state first and upgrade one minor version at a time without skipping intermediate minors. Clearing `k8s_version` (`kat config set k8s_version=default`) selects the pinned release immediately on the next Kubernetes start rather than stepping through intermediate minors; if your cluster is more than one minor behind the pinned build, upgrade one minor at a time or reset the cluster first.
+- **Switching to an older minor (or starting fresh):** Kubernetes does not support minor-version downgrades against an existing datastore, and katamaran refuses to start an older minor against newer cluster data. To switch to an older minor with a fresh cluster:
+  1. Back up any cluster state or data you need.
+  2. Set the desired release tag (for example `kat config set k8s_version=v1.32.5+k3s1`).
+  3. Run `kat k8s reset` **before** the first start of that tag — this stops Kubernetes, deletes all cluster data, workloads, and persistent volumes, and disables auto-start.
+  4. Run `kat k8s start` to initialize the cluster on the selected release and re-enable auto-start.
 
 ## Connect with `kubectl`
 

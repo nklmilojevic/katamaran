@@ -6,7 +6,7 @@
 # Usage (from anywhere, on the macOS host):
 #   guest/rootfs/build.sh          build guest/out/rootfs.erofs (+ rootfs.packages.txt), then verify it
 #   guest/rootfs/build.sh verify   verify an existing image: fsck.erofs --extract, then chroot into the tree
-#                                  and run dockerd/containerd/runc/iptables --version and the config checks
+#                                  and run dockerd/containerd/runc/iptables/nft --version and the config checks
 #   guest/rootfs/build.sh smoke [storage-driver]
 #                                  boot-like end-to-end test in a privileged container: loop-mount
 #                                  rootfs.erofs under a tmpfs overlay, mount the subvolumes of a scratch
@@ -47,12 +47,14 @@ EROFS_UUID=9cf133a8-f288-41c0-af85-cfd1d561af5f
 EROFS_LABEL=katamaran-root
 
 # busybox (+ /bin/sh) is the debug shell; iptables ships ip6tables and defaults to the nft backend;
+# nftables provides the nft binary needed by kube-proxy in nftables mode (k3s v1.31.0-v1.31.5 bundle
+# k3s-root v0.14.0 without nft, and stop_k8s_workloads invokes nft directly);
 # mount/umount are util-linux; shadow is for the userns-remap subuid/subgid files later.
 # e2fsprogs is left out: nothing in the guest uses ext4.
 # Linux machines: lxc runs them, dnsmasq is their DHCP server on the machine bridge, and GNU tar
 # unpacks their images with xattrs (file capabilities) intact.
 PACKAGES="alpine-baselayout alpine-release busybox busybox-binsh musl-utils ca-certificates
-  iptables iproute2 btrfs-progs xz pigz procps-ng mount umount shadow lxc dnsmasq tar"
+  iptables nftables iproute2 btrfs-progs xz pigz procps-ng mount umount shadow lxc dnsmasq tar"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=$(cd "$HERE/../.." && pwd)/guest/out
@@ -181,6 +183,7 @@ c containerd --version
 c runc --version | head -1
 c iptables --version
 c ip6tables --version
+c nft --version
 c qemu-x86_64 --version | head -1
 c lxc-start --version
 c dnsmasq --version | head -1

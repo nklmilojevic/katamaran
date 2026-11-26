@@ -228,7 +228,7 @@ kat k8s status [--json]
 
 ### `kat k8s start`
 
-Enable and start the Kubernetes cluster, downloading the pinned `k3s` binary on first use and merging the `katamaran` context into `~/.kube/config`.
+Enable and start the Kubernetes cluster, downloading the selected `k3s` release (the pinned build by default; see [Choose the k3s version](/kubernetes/#choose-the-k3s-version)) on first use and merging the `katamaran` context into `~/.kube/config`.
 
 ```sh
 kat k8s start
