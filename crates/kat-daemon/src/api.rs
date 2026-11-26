@@ -552,6 +552,11 @@ pub struct VmInfo {
     /// as perpetual pending work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_disk_gib: Option<u32>,
+    /// True when the guest reported a `data-disk` resize failure during boot,
+    /// meaning the host image may be larger than the guest Btrfs filesystem
+    /// and a VM restart is still needed to retry growing it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk_resize_failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// Start request until the guest's hello.
@@ -1009,6 +1014,7 @@ mod tests {
                 disk_gib: 64,
                 disk_bytes: Some(64u64 << 30),
                 requested_disk_gib: Some(64),
+                disk_resize_failed: false,
                 pid: Some(9),
                 boot_ms: Some(120.0),
                 docker_ready_ms: Some(900.0),
@@ -1073,6 +1079,7 @@ mod tests {
             u64::from(crate::config::DEFAULT_DISK_GIB) << 30
         );
         assert_eq!(legacy.requested_disk_gib, None);
+        assert!(!legacy.disk_resize_failed);
     }
 
     #[test]
@@ -1159,6 +1166,7 @@ mod tests {
                     disk_gib: display_gib,
                     disk_bytes: Some(u64::from(display_gib) << 30),
                     requested_disk_gib: Some(display_gib),
+                    disk_resize_failed: false,
                     pid: Some(9),
                     boot_ms: Some(120.0),
                     docker_ready_ms: Some(900.0),

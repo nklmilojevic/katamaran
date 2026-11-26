@@ -270,6 +270,9 @@ struct Run {
     /// True from [`Daemon::start`] until [`Event::DiskPrepared`] reports that
     /// `data.img` preparation finished for this run.
     disk_preparing: bool,
+    /// True when the guest reported a `data-disk` resize failure on this boot,
+    /// keeping `restart_required` set so the user is prompted to retry.
+    disk_resize_failed: bool,
     requested: Instant,
     kernel: Option<String>,
     vm_pid: Option<u32>,
@@ -297,6 +300,7 @@ impl Run {
             applied,
             attached_disk_bytes,
             disk_preparing: false,
+            disk_resize_failed: false,
             requested: Instant::now(),
             kernel: None,
             vm_pid: None,
@@ -683,6 +687,9 @@ impl Daemon {
                     if name == "k8s" {
                         k8s_failed = Some(error);
                     } else {
+                        if name == "data-disk" {
+                            r.disk_resize_failed = true;
+                        }
                         r.record_problem(format!("{name}: {error}"));
                     }
                     if name == "docker" {
@@ -893,6 +900,7 @@ impl Daemon {
                 disk_gib: crate::config::bytes_to_gib(r.attached_disk_bytes),
                 disk_bytes: Some(r.attached_disk_bytes),
                 requested_disk_gib: Some(r.applied.disk_gib()),
+                disk_resize_failed: r.disk_resize_failed,
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
                 docker_ready_ms: r.docker_ready.map(ms),
@@ -949,8 +957,9 @@ impl Daemon {
         let g = self.lock();
         Ok(ConfigView {
             restart_required: g.run.as_ref().is_some_and(|r| {
-                r.applied
-                    .needs_restart_for_disk_bytes(&config, r.attached_disk_bytes)
+                r.disk_resize_failed
+                    || r.applied
+                        .needs_restart_for_disk_bytes(&config, r.attached_disk_bytes)
             }),
             k8s_toggled: false,
             path: Config::path(&self.home),
@@ -4707,13 +4716,20 @@ mod tests {
     #[test]
     fn guest_data_disk_resize_failure_exposes_status_error_without_failing_docker() {
         let home = temp("disk-resize-err");
+        let cfg = Config {
+            disk_gib: Some(500),
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
         let d = Daemon::new(home.clone());
         {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Starting;
-            g.run = Some(Run::new(Config::default(), None, 500u64 << 30));
+            g.run = Some(Run::new(cfg, None, 500u64 << 30));
         }
+
+        assert!(!d.config_view().unwrap().restart_required);
 
         d.on_event(
             1,
@@ -4725,9 +4741,39 @@ mod tests {
         assert_eq!(st.state, VmState::Running);
         assert_eq!(st.docker.state, DockerState::Ready);
         assert_eq!(st.error.as_deref(), Some("data-disk: read-only filesystem"));
+        assert!(st.vm.as_ref().unwrap().disk_resize_failed);
+        assert!(d.config_view().unwrap().restart_required);
         let text = crate::cli::summary(&st);
         assert!(text.contains("data-disk: read-only filesystem"), "{text}");
         assert!(text.contains("docker     ready"), "{text}");
+        assert!(
+            text.contains("500 GiB disk (filesystem resize failed)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pending") && text.contains("500 GiB disk after a restart"),
+            "{text}"
+        );
+
+        // Once the VM restarts and boots without a resize error, the pending
+        // restart flag clears.
+        d.on_event(
+            1,
+            Event::Restarting {
+                why: "retry".into(),
+                delay: Duration::from_millis(10),
+            },
+        );
+        d.on_event(1, Event::ServiceReady("docker".into()));
+        let after = d.status();
+        assert!(!after.vm.as_ref().unwrap().disk_resize_failed);
+        assert!(!d.config_view().unwrap().restart_required);
+        let after_text = crate::cli::summary(&after);
+        assert!(
+            !after_text.contains("filesystem resize failed"),
+            "{after_text}"
+        );
+        assert!(!after_text.contains("pending"), "{after_text}");
 
         fs::remove_dir_all(&home).unwrap();
     }

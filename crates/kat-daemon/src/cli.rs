@@ -270,10 +270,15 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
     }
     if let Some(vm) = &s.vm {
         let mut v = format!(
-            "{} CPUs · {} MiB · {} disk",
+            "{} CPUs · {} MiB · {} disk{}",
             vm.cpus,
             vm.memory_mib,
-            format_disk_bytes(vm.attached_disk_bytes())
+            format_disk_bytes(vm.attached_disk_bytes()),
+            if vm.disk_resize_failed {
+                " (filesystem resize failed)"
+            } else {
+                ""
+            }
         );
         if let Some(u) = &s.usage {
             v.push_str(&format!(
@@ -357,8 +362,8 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
     if let Some(vm) = &s.vm {
         let attached_bytes = vm.attached_disk_bytes();
         let explicit_disk = s.explicit_disk_target_gib();
-        let disk_pending =
-            explicit_disk.is_some_and(|target| (u64::from(target) << 30) > attached_bytes);
+        let disk_pending = vm.disk_resize_failed
+            || explicit_disk.is_some_and(|target| (u64::from(target) << 30) > attached_bytes);
         if vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib || disk_pending {
             let next_disk_bytes = explicit_disk.map_or(attached_bytes, |target| {
                 (u64::from(target) << 30).max(attached_bytes)
@@ -666,6 +671,7 @@ mod tests {
                 disk_gib: 64,
                 disk_bytes: None,
                 requested_disk_gib: Some(64),
+                disk_resize_failed: false,
                 pid: Some(2),
                 boot_ms: Some(100.0),
                 docker_ready_ms: Some(1500.0),
@@ -794,6 +800,27 @@ mod tests {
             "{fractional_text}"
         );
         assert_eq!(format_disk_bytes((64u64 << 30) - 4096), "63.9 GiB");
+
+        // A guest resize failure keeps a restart pending even when the host
+        // image already matches the saved target.
+        let mut resize_failed = s.clone();
+        resize_failed.config.cpus = 4;
+        resize_failed.config.memory_mib = 4096;
+        resize_failed.disk_gib = Some(500);
+        resize_failed.disk_target_gib = Some(500);
+        resize_failed.vm.as_mut().unwrap().disk_gib = 500;
+        resize_failed.vm.as_mut().unwrap().disk_bytes = Some(500u64 << 30);
+        resize_failed.vm.as_mut().unwrap().disk_resize_failed = true;
+        let resize_failed_text = summary(&resize_failed);
+        assert!(
+            resize_failed_text
+                .contains("4 CPUs · 4096 MiB · 500 GiB disk (filesystem resize failed)"),
+            "{resize_failed_text}"
+        );
+        assert!(
+            resize_failed_text.contains("4 CPUs · 4096 MiB · 500 GiB disk after a restart"),
+            "{resize_failed_text}"
+        );
 
         assert!(
             !text.contains("k8s"),
