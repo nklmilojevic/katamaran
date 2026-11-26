@@ -188,6 +188,35 @@ fn mount_system() -> io::Result<()> {
     sys::switch_root(NEW_ROOT)
 }
 
+/// Set PID 1's RLIMIT_NOFILE, soft and hard, to `kat.nofile` (see
+/// `crate::nofile`). The kernel starts PID 1 at 1024/4096, too low for
+/// Elasticsearch and other databases. Both limits are set because Go
+/// programs (containerd, dockerd, runc) raise their own soft limit but hand
+/// the original one to the processes they start. `fs.nr_open` is raised
+/// first when the limit is above it, since no rlimit can exceed it.
+fn raise_nofile(cmdline: &str) {
+    const NR_OPEN: &str = "/proc/sys/fs/nr_open";
+    let want = crate::nofile::from_cmdline(cmdline);
+    let nr_open = std::fs::read_to_string(NR_OPEN)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if nr_open.is_some_and(|n| n < want)
+        && let Err(e) = std::fs::write(NR_OPEN, want.to_string())
+    {
+        log(&format!("raise {NR_OPEN} to {want}: {e}"));
+    }
+    let rl = libc::rlimit {
+        rlim_cur: want as libc::rlim_t,
+        rlim_max: want as libc::rlim_t,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+        log(&format!(
+            "setrlimit(RLIMIT_NOFILE, {want}): {}",
+            io::Error::last_os_error()
+        ));
+    }
+}
+
 fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::Result<()> {
     let conn = dial_host(CONTROL_PORT)?;
     let notifier = Notifier(Arc::new(Mutex::new(conn.try_clone()?)));
@@ -205,6 +234,9 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
         });
     }
 
+    // Before any service starts, so containerd, dockerd, their shims and
+    // every container inherit it.
+    raise_nofile(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default());
     start_network(&notifier);
     memory::tune();
     memory::start();

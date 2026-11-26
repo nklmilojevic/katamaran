@@ -73,7 +73,7 @@ kat config set cpus=8 memory=12G pause_on_sleep=on
 kat restart
 ```
 
-Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`.
+Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `nofile` (open-files limit for containers, default `1048576`).
 
 ## Files in Finder
 

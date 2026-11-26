@@ -17,6 +17,7 @@ pause_on_sleep = false
 auto_forward = true
 amd64 = "auto"
 kubernetes = false
+nofile = 1048576
 ```
 
 Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately).
@@ -34,6 +35,7 @@ Edit settings with `kat config set` or the **Settings** window in the app, then 
 | `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
 | `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
+| `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) for containerd, dockerd, and every container and pod, like `LimitNOFILE` in Docker Desktop. |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
 
