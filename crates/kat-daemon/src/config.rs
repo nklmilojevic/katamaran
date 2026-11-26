@@ -491,14 +491,14 @@ impl Config {
     /// (`kubernetes`, `k8s_version`, `k8s_disable`, `k8s_args`) apply when k3s starts.
     #[cfg(test)]
     pub fn needs_restart_for(&self, saved: &Config) -> bool {
-        self.needs_restart_for_disk(saved, self.disk_gib())
+        self.needs_restart_for_disk_bytes(saved, u64::from(self.disk_gib()) << 30)
     }
 
     /// Like [`Self::needs_restart_for`], comparing an explicitly configured
-    /// `saved.disk_gib` against the VM's actual `attached_disk_gib` so an
-    /// explicit `disk=64G` on an 8 GiB image flags a pending restart while an
-    /// untouched default (`None`) does not.
-    pub fn needs_restart_for_disk(&self, saved: &Config, attached_disk_gib: u32) -> bool {
+    /// `saved.disk_gib` against the VM's exact `attached_disk_bytes` so an
+    /// explicit `disk=64G` on an 8 GiB or 63.5 GiB image flags a pending
+    /// restart while an untouched default (`None`) does not.
+    pub fn needs_restart_for_disk_bytes(&self, saved: &Config, attached_disk_bytes: u64) -> bool {
         let applied = Config {
             disk_gib: saved.disk_gib,
             launch_at_login: saved.launch_at_login,
@@ -511,7 +511,7 @@ impl Config {
         applied != *saved
             || saved
                 .disk_gib
-                .is_some_and(|target| target > attached_disk_gib)
+                .is_some_and(|target| (u64::from(target) << 30) > attached_disk_bytes)
     }
 
     pub fn validate(&self, host: &Host) -> anyhow::Result<()> {
@@ -1267,8 +1267,12 @@ mod tests {
         let explicit_text = toml::to_string(&explicit_default).unwrap();
         assert!(explicit_text.contains("disk_gib = 64"), "{explicit_text}");
         assert_eq!(Config::parse(&explicit_text).unwrap(), explicit_default);
-        assert!(Config::default().needs_restart_for_disk(&explicit_default, 8));
-        assert!(!Config::default().needs_restart_for_disk(&explicit_default, 64));
+        assert!(Config::default().needs_restart_for_disk_bytes(&explicit_default, 8u64 << 30));
+        assert!(
+            Config::default()
+                .needs_restart_for_disk_bytes(&explicit_default, (63u64 << 30) + (512u64 << 20),)
+        );
+        assert!(!Config::default().needs_restart_for_disk_bytes(&explicit_default, 64u64 << 30));
 
         let started = cfg.clone();
         cfg.set("disk", "500G", &HOST).unwrap();

@@ -263,9 +263,10 @@ struct Inner {
 /// What the daemon knows about the current VM run.
 struct Run {
     applied: Config,
-    /// Actual attached size of `data.img` in GiB (may exceed `applied.disk_gib`
-    /// when `data.img` was already grown larger).
-    attached_disk_gib: u32,
+    /// Exact attached size of `data.img` in bytes (may exceed `applied.disk_gib`
+    /// when `data.img` was already grown larger, or be fractional GiB for a
+    /// custom foreground template).
+    attached_disk_bytes: u64,
     /// True from [`Daemon::start`] until [`Event::DiskPrepared`] reports that
     /// `data.img` preparation finished for this run.
     disk_preparing: bool,
@@ -291,10 +292,10 @@ struct Run {
 }
 
 impl Run {
-    fn new(applied: Config, mount_path: Option<PathBuf>, attached_disk_gib: u32) -> Run {
+    fn new(applied: Config, mount_path: Option<PathBuf>, attached_disk_bytes: u64) -> Run {
         Run {
             applied,
-            attached_disk_gib,
+            attached_disk_bytes,
             disk_preparing: false,
             requested: Instant::now(),
             kernel: None,
@@ -529,22 +530,19 @@ impl Daemon {
         } else {
             crate::nfs::mount_point(args.mount.as_deref())
         };
-        let existing_gib = crate::config::data_disk_bytes(&self.home)
-            .ok()
-            .flatten()
-            .map(crate::config::bytes_to_gib);
-        let initial_disk_gib = match (existing_gib, args.disk_gib) {
-            (Some(cur), Some(target)) => cur.max(target),
+        let existing_bytes = crate::config::data_disk_bytes(&self.home).ok().flatten();
+        let initial_disk_bytes = match (existing_bytes, args.disk_gib) {
+            (Some(cur), Some(target)) => cur.max(u64::from(target) << 30),
             (Some(cur), None) => cur,
-            (None, Some(target)) => target,
-            (None, None) => cfg.disk_gib(),
+            (None, Some(target)) => u64::from(target) << 30,
+            (None, None) => u64::from(cfg.disk_gib()) << 30,
         };
         let prev_state = g.state;
         let prev_error = g.error.clone();
         g.generation += 1;
         let generation = g.generation;
         g.error = None;
-        let mut run = Run::new(cfg.clone(), mount_path, initial_disk_gib);
+        let mut run = Run::new(cfg.clone(), mount_path, initial_disk_bytes);
         run.disk_preparing = true;
         g.run = Some(run);
         g.samples.clear();
@@ -555,7 +553,7 @@ impl Daemon {
             "starting the VM ({} CPUs, {} MiB, {} GiB disk)",
             cfg.cpus,
             cfg.memory_mib,
-            initial_disk_gib
+            crate::config::bytes_to_gib(initial_disk_bytes)
         );
         if let Err(e) = spawn(self.clone(), generation, args, rx, disk_lock) {
             g.control = None;
@@ -652,7 +650,7 @@ impl Daemon {
             let Some(r) = run.as_mut() else { return };
             match e {
                 Event::DiskPrepared { bytes } => {
-                    r.attached_disk_gib = crate::config::bytes_to_gib(bytes);
+                    r.attached_disk_bytes = bytes;
                     r.disk_preparing = false;
                 }
                 Event::Booted {
@@ -720,8 +718,11 @@ impl Daemon {
                 }
                 Event::Restarting { why, delay } => {
                     dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
-                    let mut next =
-                        Run::new(r.applied.clone(), r.mount_path.clone(), r.attached_disk_gib);
+                    let mut next = Run::new(
+                        r.applied.clone(),
+                        r.mount_path.clone(),
+                        r.attached_disk_bytes,
+                    );
                     next.problem = Some(format!("the VM was restarted: {why}"));
                     *r = next;
                     k8s_reset_runtime = true;
@@ -889,7 +890,8 @@ impl Daemon {
             vm: r.map(|r| VmInfo {
                 cpus: r.applied.cpus,
                 memory_mib: r.applied.memory_mib,
-                disk_gib: r.attached_disk_gib,
+                disk_gib: crate::config::bytes_to_gib(r.attached_disk_bytes),
+                disk_bytes: Some(r.attached_disk_bytes),
                 requested_disk_gib: Some(r.applied.disk_gib()),
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
@@ -948,7 +950,7 @@ impl Daemon {
         Ok(ConfigView {
             restart_required: g.run.as_ref().is_some_and(|r| {
                 r.applied
-                    .needs_restart_for_disk(&config, r.attached_disk_gib)
+                    .needs_restart_for_disk_bytes(&config, r.attached_disk_bytes)
             }),
             k8s_toggled: false,
             path: Config::path(&self.home),
@@ -2657,7 +2659,11 @@ mod tests {
         {
             let mut g = d.lock();
             g.state = VmState::Running;
-            let mut run = Run::new(Config::default(), None, crate::config::DEFAULT_DISK_GIB);
+            let mut run = Run::new(
+                Config::default(),
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            );
             run.docker = DockerState::Failed;
             run.problem = Some("dockerd crashed".into());
             g.run = Some(run);
@@ -2698,7 +2704,7 @@ mod tests {
             g.run = Some(Run::new(
                 Config::default(),
                 None,
-                crate::config::DEFAULT_DISK_GIB,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
             ));
             let mut k = d.k8s.lock().unwrap();
             k.state = "running".into();
@@ -2730,7 +2736,11 @@ mod tests {
         {
             let mut g = d.lock();
             g.state = VmState::Stopping;
-            g.run = Some(Run::new(cfg, None, crate::config::DEFAULT_DISK_GIB));
+            g.run = Some(Run::new(
+                cfg,
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            ));
         }
         d.on_event(1, Event::ServiceReady("docker".into()));
         assert_eq!(d.lock().state, VmState::Stopping);
@@ -4209,7 +4219,7 @@ mod tests {
             g.run = Some(Run::new(
                 Config::default(),
                 None,
-                crate::config::DEFAULT_DISK_GIB,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
             ));
         }
         d.on_event(
@@ -4702,7 +4712,7 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Starting;
-            g.run = Some(Run::new(Config::default(), None, 500));
+            g.run = Some(Run::new(Config::default(), None, 500u64 << 30));
         }
 
         d.on_event(
@@ -4800,6 +4810,69 @@ mod tests {
         let after_text = crate::cli::summary(&after_status);
         assert!(after_text.contains("64 GiB disk"), "{after_text}");
         assert!(!after_text.contains("pending"), "{after_text}");
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn fractional_63_5_gib_image_flags_restart_when_raised_to_64_gib() {
+        let home = temp("fractional-disk");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        let bytes_63_5 = (63u64 << 30) + (512u64 << 20);
+        fs::File::create(&img).unwrap().set_len(bytes_63_5).unwrap();
+
+        let d = Daemon::new(home.clone());
+        let start_sim = |expected_target: Option<u32>| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let img_for_vm = img.clone();
+            d.start_with(
+                |cfg| Ok(test_run_args(cfg, &img)),
+                move |daemon, generation, args, rx, disk_lock| {
+                    assert_eq!(args.disk_gib, expected_target);
+                    thread::spawn(move || {
+                        let bytes =
+                            run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                                .unwrap();
+                        drop(disk_lock);
+                        daemon.on_event(generation, Event::DiskPrepared { bytes });
+                        daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                        let _ = done_tx.send(());
+                        let _ = rx.recv();
+                        daemon.on_exit(generation, Ok(()));
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+
+        start_sim(None);
+        assert_eq!(d.status().vm.as_ref().unwrap().disk_bytes, Some(bytes_63_5));
+        assert!(!d.config_view().unwrap().restart_required);
+        let initial_text = crate::cli::summary(&d.status());
+        assert!(initial_text.contains("63.5 GiB disk"), "{initial_text}");
+        assert!(!initial_text.contains("pending"), "{initial_text}");
+
+        let mut grow_64 = BTreeMap::new();
+        grow_64.insert("disk".into(), "64G".into());
+        let v = d.handle(&Call::ConfigSet(grow_64)).unwrap();
+        assert_eq!(v["restart_required"], true);
+        let pending_text = crate::cli::summary(&d.status());
+        assert!(
+            pending_text.contains("pending")
+                && pending_text.contains("64 GiB disk after a restart"),
+            "{pending_text}"
+        );
+
+        d.stop(true).unwrap();
+        start_sim(Some(64));
+        assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&d.status()).contains("pending"));
 
         d.stop(true).unwrap();
         fs::remove_dir_all(&home).unwrap();

@@ -270,8 +270,10 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
     }
     if let Some(vm) = &s.vm {
         let mut v = format!(
-            "{} CPUs · {} MiB · {} GiB disk",
-            vm.cpus, vm.memory_mib, vm.disk_gib
+            "{} CPUs · {} MiB · {} disk",
+            vm.cpus,
+            vm.memory_mib,
+            format_disk_bytes(vm.attached_disk_bytes())
         );
         if let Some(u) = &s.usage {
             v.push_str(&format!(
@@ -353,21 +355,37 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         );
     }
     if let Some(vm) = &s.vm {
+        let attached_bytes = vm.attached_disk_bytes();
         let explicit_disk = s.explicit_disk_target_gib();
-        let disk_pending = explicit_disk.is_some_and(|target| target > vm.disk_gib);
+        let disk_pending =
+            explicit_disk.is_some_and(|target| (u64::from(target) << 30) > attached_bytes);
         if vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib || disk_pending {
-            let next_disk = explicit_disk.map_or(vm.disk_gib, |target| target.max(vm.disk_gib));
+            let next_disk_bytes = explicit_disk.map_or(attached_bytes, |target| {
+                (u64::from(target) << 30).max(attached_bytes)
+            });
             line(
                 "pending",
                 format!(
-                    "{} CPUs · {} MiB · {} GiB disk after a restart",
-                    s.config.cpus, s.config.memory_mib, next_disk
+                    "{} CPUs · {} MiB · {} disk after a restart",
+                    s.config.cpus,
+                    s.config.memory_mib,
+                    format_disk_bytes(next_disk_bytes)
                 ),
             );
         }
     }
     text.push_str(&out);
     text
+}
+
+fn format_disk_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        let tenths = (u128::from(bytes) * 10 / u128::from(GIB)) as u64;
+        format!("{}.{} GiB", tenths / 10, tenths % 10)
+    }
 }
 
 fn duration(secs: f64) -> String {
@@ -646,6 +664,7 @@ mod tests {
                 cpus: 4,
                 memory_mib: 4096,
                 disk_gib: 64,
+                disk_bytes: None,
                 requested_disk_gib: Some(64),
                 pid: Some(2),
                 boot_ms: Some(100.0),
@@ -755,6 +774,26 @@ mod tests {
             explicit_small_text.contains("4 CPUs · 4096 MiB · 64 GiB disk after a restart"),
             "{explicit_small_text}"
         );
+
+        // A fractional 63.5 GiB image raised explicitly to 64 GiB still shows
+        // pending growth to 64 GiB (not masked by GiB ceil rounding).
+        let mut fractional = s.clone();
+        fractional.config.cpus = 4;
+        fractional.config.memory_mib = 4096;
+        fractional.disk_gib = Some(64);
+        fractional.disk_target_gib = Some(64);
+        fractional.vm.as_mut().unwrap().disk_gib = 64;
+        fractional.vm.as_mut().unwrap().disk_bytes = Some((63u64 << 30) + (512u64 << 20));
+        let fractional_text = summary(&fractional);
+        assert!(
+            fractional_text.contains("4 CPUs · 4096 MiB · 63.5 GiB disk"),
+            "{fractional_text}"
+        );
+        assert!(
+            fractional_text.contains("4 CPUs · 4096 MiB · 64 GiB disk after a restart"),
+            "{fractional_text}"
+        );
+        assert_eq!(format_disk_bytes((64u64 << 30) - 4096), "63.9 GiB");
 
         assert!(
             !text.contains("k8s"),

@@ -538,10 +538,15 @@ pub struct DaemonInfo {
 pub struct VmInfo {
     pub cpus: u8,
     pub memory_mib: u32,
-    /// Attached data-disk size in GiB (may exceed the saved target if
-    /// `data.img` was already grown larger).
+    /// Attached data-disk size in GiB (rounded up for display; may exceed the
+    /// saved target if `data.img` was already grown larger).
     #[serde(default = "crate::config::default_disk_gib")]
     pub disk_gib: u32,
+    /// Exact attached data-disk size in bytes, used for pending-growth checks
+    /// so fractional images (such as 63.5 GiB -> 64 GiB) are not masked by
+    /// GiB rounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
     /// Requested `disk_gib` target from config when this VM started, kept
     /// separate from `disk_gib` so a retained larger image does not appear
     /// as perpetual pending work.
@@ -555,6 +560,15 @@ pub struct VmInfo {
     /// Start request until Docker answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_ready_ms: Option<f64>,
+}
+
+impl VmInfo {
+    /// Exact attached data-disk size in bytes, falling back to `disk_gib` for
+    /// older daemons that omit `disk_bytes`.
+    pub fn attached_disk_bytes(&self) -> u64 {
+        self.disk_bytes
+            .unwrap_or_else(|| u64::from(self.disk_gib) << 30)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -993,6 +1007,7 @@ mod tests {
                 cpus: 4,
                 memory_mib: 4096,
                 disk_gib: 64,
+                disk_bytes: Some(64u64 << 30),
                 requested_disk_gib: Some(64),
                 pid: Some(9),
                 boot_ms: Some(120.0),
@@ -1048,10 +1063,15 @@ mod tests {
         .unwrap();
         assert!(!legacy.dns_isolated);
 
-        // Older daemons omit disk_gib on VmInfo; it defaults to 64 GiB.
+        // Older daemons omit disk_gib and disk_bytes on VmInfo; it defaults to 64 GiB.
         let legacy: VmInfo =
             serde_json::from_value(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
         assert_eq!(legacy.disk_gib, crate::config::DEFAULT_DISK_GIB);
+        assert_eq!(legacy.disk_bytes, None);
+        assert_eq!(
+            legacy.attached_disk_bytes(),
+            u64::from(crate::config::DEFAULT_DISK_GIB) << 30
+        );
         assert_eq!(legacy.requested_disk_gib, None);
     }
 
@@ -1137,6 +1157,7 @@ mod tests {
                     cpus: cfg.cpus,
                     memory_mib: cfg.memory_mib,
                     disk_gib: display_gib,
+                    disk_bytes: Some(u64::from(display_gib) << 30),
                     requested_disk_gib: Some(display_gib),
                     pid: Some(9),
                     boot_ms: Some(120.0),
