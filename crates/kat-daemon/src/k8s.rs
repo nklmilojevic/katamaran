@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
@@ -930,6 +930,15 @@ fn write_private_atomic(target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
+    lock_kubeconfig_dir_with_deadline(kube_dir, None, Duration::from_secs(5), &mut |_| {})
+}
+
+fn lock_kubeconfig_dir_with_deadline(
+    kube_dir: &Path,
+    deadline: Option<Instant>,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<File> {
     fs::create_dir_all(kube_dir).with_context(|| format!("create {}", kube_dir.display()))?;
     let lock_path = kube_dir.join(".katamaran-kubeconfig.lock");
     let f = OpenOptions::new()
@@ -940,15 +949,172 @@ fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
         .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("open {}", lock_path.display()))?;
+    let Some(deadline) = deadline else {
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(f);
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e).with_context(|| format!("flock {}", lock_path.display()));
+            }
+        }
+    };
+    let mut last_beat = Instant::now();
     loop {
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(f);
         }
         let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
+        if e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if e.kind() != io::ErrorKind::WouldBlock {
             return Err(e).with_context(|| format!("flock {}", lock_path.display()));
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!(
+                "timed out waiting for kubeconfig lock {}",
+                lock_path.display()
+            );
+        }
+        if last_beat.elapsed() >= heartbeat {
+            progress("waiting for kubeconfig lock");
+            last_beat = Instant::now();
+        }
+        thread::sleep(left.min(heartbeat).min(Duration::from_millis(50)));
     }
+}
+
+fn set_nonblocking(fd: i32) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_nonblocking<R: Read>(stream: &mut Option<R>, buf: &mut Vec<u8>, cap: usize) {
+    let Some(r) = stream.as_mut() else {
+        return;
+    };
+    let mut chunk = [0u8; 4096];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => {
+                *stream = None;
+                return;
+            }
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+            Err(_) => {
+                *stream = None;
+                return;
+            }
+        }
+    }
+}
+
+fn run_kubectl_with_deadline(
+    cmd: &mut Command,
+    deadline: Option<Instant>,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<std::process::Output> {
+    let Some(deadline) = deadline else {
+        return cmd.output();
+    };
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "kubectl cleanup timed out",
+        ));
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    if let Some(s) = stdout.as_ref()
+        && let Err(e) = set_nonblocking(s.as_raw_fd())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    if let Some(s) = stderr.as_ref()
+        && let Err(e) = set_nonblocking(s.as_raw_fd())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    const MAX_CAPTURE: usize = 256 << 10;
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let mut last_beat = Instant::now();
+
+    let status = loop {
+        drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE);
+        drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE);
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "kubectl cleanup timed out",
+            ));
+        }
+        if last_beat.elapsed() >= heartbeat {
+            progress("cleaning up kubeconfig");
+            last_beat = Instant::now();
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd: stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let step_ms = left
+            .min(heartbeat)
+            .min(Duration::from_millis(50))
+            .as_millis()
+            .max(1) as i32;
+        if pfds[0].fd >= 0 || pfds[1].fd >= 0 {
+            let _ = unsafe { libc::poll(pfds.as_mut_ptr(), 2, step_ms) };
+        } else {
+            thread::sleep(Duration::from_millis(step_ms as u64));
+        }
+    };
+    drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE);
+    drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE);
+    Ok(std::process::Output {
+        status,
+        stdout: out_buf,
+        stderr: err_buf,
+    })
 }
 
 /// Resolve every symlink in a chain (including dangling chains) so atomic
@@ -1158,11 +1324,62 @@ pub fn remove_kubeconfig_for_user_home(
     remove_kubeconfig_in(home, user_home, ctx, &kubectl)
 }
 
+/// Like [`remove_kubeconfig_for_user_home`], enforcing a finite `timeout` across
+/// both shared-lock acquisition and `kubectl` subprocess execution while
+/// invoking `progress` every `heartbeat` interval.
+pub fn remove_kubeconfig_bounded(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+    kubectl_override: Option<&Path>,
+    timeout: Duration,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let resolved;
+    let kubectl = match kubectl_override {
+        Some(p) => p,
+        None => {
+            resolved = resolve_kubectl_bin();
+            resolved.as_path()
+        }
+    };
+    remove_kubeconfig_in_with_deadline(
+        home,
+        user_home,
+        ctx,
+        kubectl,
+        Some(Instant::now() + timeout),
+        heartbeat,
+        progress,
+    )
+}
+
 fn remove_kubeconfig_in(
     home: &Path,
     user_home: Option<&Path>,
     ctx: &str,
     kubectl: &Path,
+) -> anyhow::Result<()> {
+    remove_kubeconfig_in_with_deadline(
+        home,
+        user_home,
+        ctx,
+        kubectl,
+        None,
+        Duration::from_secs(5),
+        &mut |_| {},
+    )
+}
+
+fn remove_kubeconfig_in_with_deadline(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+    kubectl: &Path,
+    deadline: Option<Instant>,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<()> {
     if let Err(e) = fs::remove_file(kubeconfig_path(home))
         && e.kind() != io::ErrorKind::NotFound
@@ -1176,7 +1393,7 @@ fn remove_kubeconfig_in(
     if !kube_dir.is_dir() {
         return Ok(());
     }
-    let _lock = lock_kubeconfig_dir(&kube_dir)?;
+    let _lock = lock_kubeconfig_dir_with_deadline(&kube_dir, deadline, heartbeat, progress)?;
     let user_cfg = kube_dir.join("config");
     let target_cfg = resolve_symlink_target(&user_cfg)?;
     let existing = match fs::read(&target_cfg) {
@@ -1202,12 +1419,12 @@ fn remove_kubeconfig_in(
     }
 
     let result = (|| -> anyhow::Result<()> {
-        let cur = match Command::new(kubectl)
+        let mut cur_cmd = Command::new(kubectl);
+        cur_cmd
             .args(["config", "current-context"])
             .env("KUBECONFIG", &scratch)
-            .stdin(Stdio::null())
-            .output()
-        {
+            .stdin(Stdio::null());
+        let cur = match run_kubectl_with_deadline(&mut cur_cmd, deadline, heartbeat, progress) {
             Ok(o) => Some(o),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 eprintln!(
@@ -1222,11 +1439,12 @@ fn remove_kubeconfig_in(
             && o.status.success()
             && String::from_utf8_lossy(&o.stdout).trim() == ctx
         {
-            let out = Command::new(kubectl)
+            let mut unset_cur = Command::new(kubectl);
+            unset_cur
                 .args(["config", "unset", "current-context"])
                 .env("KUBECONFIG", &scratch)
-                .stdin(Stdio::null())
-                .output()
+                .stdin(Stdio::null());
+            let out = run_kubectl_with_deadline(&mut unset_cur, deadline, heartbeat, progress)
                 .context("run kubectl config unset current-context")?;
             if !out.status.success() {
                 bail!(
@@ -1240,11 +1458,12 @@ fn remove_kubeconfig_in(
             format!("clusters.{ctx}"),
             format!("users.{ctx}"),
         ] {
-            let out = match Command::new(kubectl)
+            let mut unset_cmd = Command::new(kubectl);
+            unset_cmd
                 .args(["config", "unset", &key])
                 .env("KUBECONFIG", &scratch)
-                .stdin(Stdio::null())
-                .output()
+                .stdin(Stdio::null());
+            let out = match run_kubectl_with_deadline(&mut unset_cmd, deadline, heartbeat, progress)
             {
                 Ok(o) => o,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {

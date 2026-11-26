@@ -541,7 +541,8 @@ mod tests {
         let mut client = Client::connect(&sock).unwrap();
         let err = reset_with_client(&mut client, true, &mut |_| {}).unwrap_err();
         assert!(
-            err.to_string().contains("does not support `kat k8s reset --images`"),
+            err.to_string()
+                .contains("does not support `kat k8s reset --images`"),
             "unexpected error: {err:#}"
         );
         drop(client);

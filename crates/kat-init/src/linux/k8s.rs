@@ -3423,12 +3423,9 @@ fn remove_dir_all_with_progress(
     interval: Duration,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
-    run_with_heartbeat(
-        interval,
-        "removing cluster data",
-        progress,
-        || fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display())),
-    )
+    run_with_heartbeat(interval, "removing cluster data", progress, || {
+        fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+    })
 }
 
 fn run_with_heartbeat<T, F>(
@@ -5285,8 +5282,15 @@ fn run_ctr_k8s(
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io"]);
     cmd.args(args);
-    run_reaped_split_checked(reaper, &mut cmd, timeout, IMAGE_LS_STDOUT_LIMIT, true, on_wait)
-        .map_err(|e| format!("ctr {}: {e}", args.first().copied().unwrap_or_default()))
+    run_reaped_split_checked(
+        reaper,
+        &mut cmd,
+        timeout,
+        IMAGE_LS_STDOUT_LIMIT,
+        true,
+        on_wait,
+    )
+    .map_err(|e| format!("ctr {}: {e}", args.first().copied().unwrap_or_default()))
 }
 
 fn ctr_error_detail<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {

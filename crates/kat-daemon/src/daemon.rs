@@ -41,6 +41,7 @@ const STATS_HISTORY: usize = 150;
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const KUBECONFIG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Rotate `daemon.log` at startup beyond this size.
 const LOG_ROTATE_BYTES: u64 = 4 << 20;
 /// Maximum concurrent client connections served by the daemon socket.
@@ -209,6 +210,10 @@ pub struct Daemon {
     test_heartbeat_interval: Option<Duration>,
     #[cfg(test)]
     test_progress_write_timeout: Option<Duration>,
+    #[cfg(test)]
+    test_kubeconfig_timeout: Option<Duration>,
+    #[cfg(test)]
+    test_kubectl_bin: Option<PathBuf>,
 }
 
 struct K8sRuntime {
@@ -363,6 +368,10 @@ impl Daemon {
             test_heartbeat_interval: None,
             #[cfg(test)]
             test_progress_write_timeout: None,
+            #[cfg(test)]
+            test_kubeconfig_timeout: None,
+            #[cfg(test)]
+            test_kubectl_bin: None,
         })
     }
 
@@ -390,6 +399,8 @@ impl Daemon {
             test_kube_context: Some(ctx.into()),
             test_heartbeat_interval: None,
             test_progress_write_timeout: None,
+            test_kubeconfig_timeout: None,
+            test_kubectl_bin: None,
         })
     }
 
@@ -407,6 +418,14 @@ impl Daemon {
             return d;
         }
         PROGRESS_WRITE_TIMEOUT
+    }
+
+    fn kubeconfig_cleanup_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.test_kubeconfig_timeout {
+            return d;
+        }
+        KUBECONFIG_CLEANUP_TIMEOUT
     }
 
     fn kube_context_name(&self) -> anyhow::Result<String> {
@@ -1078,11 +1097,7 @@ impl Daemon {
         }
     }
 
-    fn serve_k8s_reset_images(
-        self: &Arc<Self>,
-        id: Value,
-        out: &mut UnixStream,
-    ) -> Result<(), ()> {
+    fn serve_k8s_reset_images(self: &Arc<Self>, id: Value, out: &mut UnixStream) -> Result<(), ()> {
         let prev_write_timeout = out.write_timeout().ok().flatten();
         let write_timeout = self.progress_write_timeout();
         let mut write_failed = false;
@@ -1322,10 +1337,7 @@ impl Daemon {
         }
     }
 
-    fn lock_k8s_op_with_progress(
-        &self,
-        progress: &mut dyn FnMut(&str),
-    ) -> MutexGuard<'_, ()> {
+    fn lock_k8s_op_with_progress(&self, progress: &mut dyn FnMut(&str)) -> MutexGuard<'_, ()> {
         let mut last_beat: Option<Instant> = None;
         loop {
             match self.k8s_op.try_lock() {
@@ -1716,6 +1728,7 @@ impl Daemon {
             Ok(())
         };
 
+        let mut kubeconfig_err: Option<anyhow::Error> = None;
         if guest_reset_attempted {
             {
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
@@ -1735,6 +1748,9 @@ impl Daemon {
             };
             if let Err(e) = rm_res {
                 dlog!("k8s reset: remove kubeconfig failed: {e:#}");
+                if remove_images {
+                    kubeconfig_err = Some(e);
+                }
             }
         }
 
@@ -1755,6 +1771,9 @@ impl Daemon {
                         e.message
                     ));
                 }
+                if let Some(e) = kubeconfig_err {
+                    msg.push_str(&format!(" (also failed to clean up ~/.kube/config: {e:#})"));
+                }
                 self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
                 return Err(failed(msg));
             }
@@ -1773,12 +1792,30 @@ impl Daemon {
                     se.message
                 ));
             }
+            if let Some(ke) = kubeconfig_err {
+                msg.push_str(&format!(
+                    " (also failed to clean up ~/.kube/config: {ke:#})"
+                ));
+            }
             self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
             return Err(failed(msg));
         }
         if let Err(se) = stop_res {
-            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(se.message.clone());
-            return Err(se);
+            let mut msg = se.message;
+            if let Some(ke) = kubeconfig_err {
+                msg.push_str(&format!(
+                    " (also failed to clean up ~/.kube/config: {ke:#})"
+                ));
+            }
+            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+            return Err(failed(msg));
+        }
+        if let Some(ke) = kubeconfig_err {
+            let msg = format!(
+                "Kubernetes cluster data and cached k8s.io images were reset, but cleaning up ~/.kube/config failed: {ke:#}"
+            );
+            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+            return Err(failed(msg));
         }
         Ok(())
     }
@@ -1858,29 +1895,34 @@ impl Daemon {
         progress: &mut dyn FnMut(&str),
     ) -> anyhow::Result<()> {
         progress("cleaning up kubeconfig");
-        let interval = self.heartbeat_interval();
-        thread::scope(|s| {
-            let (tx, rx) = mpsc::channel();
-            let spawned = thread::Builder::new()
-                .name("k8s-kubeconfig-rm".into())
-                .spawn_scoped(s, move || {
-                    let _ = tx.send(self.remove_kubeconfig(ctx));
-                });
-            if spawned.is_err() {
-                return self.remove_kubeconfig(ctx);
-            }
-            loop {
-                match rx.recv_timeout(interval) {
-                    Ok(res) => return res,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        progress("waiting for kubeconfig lock");
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        bail!("kubeconfig cleanup worker terminated unexpectedly");
-                    }
-                }
-            }
-        })
+        let timeout = self.kubeconfig_cleanup_timeout();
+        let heartbeat = self.heartbeat_interval();
+        #[cfg(test)]
+        let kubectl_override = self.test_kubectl_bin.as_deref();
+        #[cfg(not(test))]
+        let kubectl_override: Option<&Path> = None;
+        #[cfg(test)]
+        if let Some(user_home) = &self.test_user_home {
+            return crate::k8s::remove_kubeconfig_bounded(
+                &self.home,
+                Some(user_home.as_path()),
+                ctx,
+                kubectl_override,
+                timeout,
+                heartbeat,
+                progress,
+            );
+        }
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        crate::k8s::remove_kubeconfig_bounded(
+            &self.home,
+            user_home.as_deref(),
+            ctx,
+            kubectl_override,
+            timeout,
+            heartbeat,
+            progress,
+        )
     }
 
     fn k8s_kubeconfig(&self) -> Result<String, RpcError> {
@@ -2995,7 +3037,8 @@ mod tests {
         .unwrap();
 
         let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-stall");
-        Arc::get_mut(&mut d).unwrap().test_progress_write_timeout = Some(Duration::from_millis(100));
+        Arc::get_mut(&mut d).unwrap().test_progress_write_timeout =
+            Some(Duration::from_millis(100));
         let kc = crate::k8s::kubeconfig_path(&home);
         fs::create_dir_all(kc.parent().unwrap()).unwrap();
         fs::write(&kc, "kc-stall").unwrap();
@@ -3084,7 +3127,10 @@ mod tests {
             .truncate(false)
             .open(&lock_path)
             .unwrap();
-        assert_eq!(unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
         let mut held_lock = Some(lock_file);
 
         let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-flock");
@@ -3163,6 +3209,155 @@ mod tests {
         srv.join().unwrap();
         guest.join().unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_images_bounds_stuck_kubeconfig_lock_and_kubectl_with_partial_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. Stuck shared kubeconfig lock: emits heartbeats within the finite deadline,
+        //    then returns a partial outcome stating the guest reset succeeded while
+        //    ~/.kube/config cleanup timed out.
+        let root1 = temp("k8s-kcto1");
+        let home1 = root1.join("h");
+        let user1 = root1.join("u");
+        let kube1 = user1.join(".kube");
+        fs::create_dir_all(&home1).unwrap();
+        fs::create_dir_all(&kube1).unwrap();
+        fs::write(kube1.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home1)
+        .unwrap();
+
+        let lock1 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(kube1.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock1.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let mut d1 = Daemon::new_for_test(home1.clone(), user1, "katamaran-test-kcto1");
+        {
+            let dm = Arc::get_mut(&mut d1).unwrap();
+            dm.test_heartbeat_interval = Some(Duration::from_millis(40));
+            dm.test_kubeconfig_timeout = Some(Duration::from_millis(180));
+        }
+        let sock1 = crate::k8s::socket_path(&home1);
+        fs::create_dir_all(sock1.parent().unwrap()).unwrap();
+        let listener1 = UnixListener::bind(&sock1).unwrap();
+        {
+            let mut g = d1.lock();
+            g.state = VmState::Running;
+            d1.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest1 = thread::spawn(move || {
+            let (mut conn, _) = listener1.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = d1
+            .k8s_reset(true, &mut |m| beats.push(m.to_string()))
+            .unwrap_err();
+        guest1.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bounded cleanup exceeded deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            beats
+                .iter()
+                .filter(|m| m.as_str() == "waiting for kubeconfig lock")
+                .count()
+                >= 1,
+            "expected lock heartbeat before timeout, got: {beats:?}"
+        );
+        assert!(
+            err.message
+                .contains("were reset, but cleaning up ~/.kube/config failed"),
+            "expected partial outcome error, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("timed out"), "got: {}", err.message);
+        assert!(!Config::load(&home1).unwrap().kubernetes);
+        drop(lock1);
+        fs::remove_dir_all(&root1).unwrap();
+
+        // 2. Stuck kubectl subprocess: killed cleanly at the finite deadline and reports
+        //    partial outcome without leaving a blocked worker thread.
+        let root2 = temp("k8s-kcto2");
+        let home2 = root2.join("h");
+        let user2 = root2.join("u");
+        let kube2 = user2.join(".kube");
+        fs::create_dir_all(&home2).unwrap();
+        fs::create_dir_all(&kube2).unwrap();
+        fs::write(kube2.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        let fake_kubectl = root2.join("kubectl");
+        fs::write(&fake_kubectl, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&fake_kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut d2 = Daemon::new_for_test(home2.clone(), user2, "katamaran-test-kcto2");
+        {
+            let dm = Arc::get_mut(&mut d2).unwrap();
+            dm.test_heartbeat_interval = Some(Duration::from_millis(40));
+            dm.test_kubeconfig_timeout = Some(Duration::from_millis(200));
+            dm.test_kubectl_bin = Some(fake_kubectl);
+        }
+        let sock2 = crate::k8s::socket_path(&home2);
+        fs::create_dir_all(sock2.parent().unwrap()).unwrap();
+        let listener2 = UnixListener::bind(&sock2).unwrap();
+        {
+            let mut g = d2.lock();
+            g.state = VmState::Running;
+            d2.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest2 = thread::spawn(move || {
+            let (mut conn, _) = listener2.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let mut beats2 = Vec::new();
+        let started2 = Instant::now();
+        let err2 = d2
+            .k8s_reset(true, &mut |m| beats2.push(m.to_string()))
+            .unwrap_err();
+        guest2.join().unwrap();
+        assert!(
+            started2.elapsed() < Duration::from_secs(3),
+            "hung kubectl was not killed at deadline: {:?}",
+            started2.elapsed()
+        );
+        assert!(
+            beats2
+                .iter()
+                .filter(|m| m.as_str() == "cleaning up kubeconfig")
+                .count()
+                >= 2,
+            "expected heartbeats during slow kubectl, got: {beats2:?}"
+        );
+        assert!(
+            err2.message
+                .contains("were reset, but cleaning up ~/.kube/config failed"),
+            "got: {}",
+            err2.message
+        );
+        assert!(err2.message.contains("timed out"), "got: {}", err2.message);
+        fs::remove_dir_all(&root2).unwrap();
     }
 
     #[test]
