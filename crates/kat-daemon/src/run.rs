@@ -529,6 +529,19 @@ pub fn run_vm(
     control: Receiver<Control>,
     on_event: &mut dyn FnMut(Event),
 ) -> anyhow::Result<()> {
+    run_vm_with_disk_lock(args, relay_budget, control, None, on_event)
+}
+
+/// Like [`run_vm`], taking an already-acquired `<home>/run/disk.lock` guard
+/// for the first boot's `data.img` preparation (used by the daemon to keep
+/// `Config::load` and `prepare_data_disk` atomic with offline disk edits).
+pub fn run_vm_with_disk_lock(
+    args: &RunArgs,
+    relay_budget: crate::autofwd::RelayBudget,
+    control: Receiver<Control>,
+    mut startup_disk_lock: Option<File>,
+    on_event: &mut dyn FnMut(Event),
+) -> anyhow::Result<()> {
     crate::config::validate_forward_addresses(&args.forward_addresses)?;
     let (tx, rx) = mpsc::channel::<Input>();
     {
@@ -546,7 +559,15 @@ pub fn run_vm(
     loop {
         id += 1;
         let started = Instant::now();
-        let why = match session(args, &relay_budget, &tx, &rx, id, on_event) {
+        let why = match session(
+            args,
+            &relay_budget,
+            &tx,
+            &rx,
+            id,
+            startup_disk_lock.take(),
+            on_event,
+        ) {
             Ok(End::Stopped) => return Ok(()),
             Ok(End::Crashed(why)) => why,
             // A VM that never came up is a setup problem, not a crash.
@@ -589,6 +610,7 @@ fn session(
     tx: &Sender<Input>,
     rx: &Receiver<Input>,
     id: u64,
+    startup_disk_lock: Option<File>,
     on_event: &mut dyn FnMut(Event),
 ) -> anyhow::Result<End> {
     let state = crate::state_dir()?;
@@ -604,7 +626,16 @@ fn session(
         .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
 
     let data_img = data_dir.join("data.img");
-    let disk_bytes = prepare_data_disk(&data_img, &args.data_template, args.disk_gib)?;
+    let disk_bytes = {
+        // Hold the short-lived disk preparation lock only across cloning and
+        // growing `data.img`, then release it before booting the VM so
+        // offline config edits remain unblocked while the VM runs.
+        let _disk_lock = match startup_disk_lock {
+            Some(guard) => guard,
+            None => crate::config::lock_disk(&state)?,
+        };
+        prepare_data_disk(&data_img, &args.data_template, args.disk_gib)?
+    };
     on_event(Event::DiskPrepared { bytes: disk_bytes });
     let docker_sock = run_dir.join("docker.sock");
     // Unpublished container ports, relayed over vsock (see autofwd.rs).
@@ -1209,38 +1240,16 @@ fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<u64> {
 }
 
 /// Only one `katamaran run` or daemon may own the state directory at a time.
-/// Retries briefly on contention so a concurrent sub-millisecond offline
-/// `kat config set` holding the lock does not cause startup to fail.
 pub fn lock(path: &Path) -> anyhow::Result<File> {
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        if let Some(f) = try_lock(path)? {
-            return Ok(f);
-        }
-        if Instant::now() >= deadline {
-            bail!("another katamaran is already running ({})", path.display());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Non-blocking exclusive lock on `path`. Returns `Ok(None)` when another
-/// process holds the lock, and `Err` on I/O errors.
-pub fn try_lock(path: &Path) -> anyhow::Result<Option<File>> {
     let f = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .open(path)?;
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(None);
-        }
-        return Err(err).with_context(|| format!("lock {}", path.display()));
+        bail!("another katamaran is already running ({})", path.display());
     }
-    Ok(Some(f))
+    Ok(f)
 }
 
 /// Block SIGINT, SIGTERM, SIGUSR1 and SIGUSR2 (simulated sleep and wake,

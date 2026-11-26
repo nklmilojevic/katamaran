@@ -1,10 +1,11 @@
 //! `<home>/config.toml`: the VM's resources and options. The daemon reads it
 //! at every VM start, so a change applies on the next start.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,12 +24,14 @@ pub struct Config {
     /// A ceiling, not a reservation: memory the guest frees goes back to
     /// macOS, so the default is generous (see [`default_memory_mib`]).
     pub memory_mib: u32,
-    /// Data disk size ceiling in GiB (sparse on APFS; grows `data.img` at the
-    /// next VM start, never shrinks). Not written to `config.toml` when
-    /// default, so older versions (which deny unknown keys) still read saved
-    /// configs after a rollback.
-    #[serde(skip_serializing_if = "is_default_disk_gib")]
-    pub disk_gib: u32,
+    /// Explicitly configured data disk size ceiling in GiB (sparse on APFS;
+    /// grows `data.img` at the next VM start, never shrinks). `None` uses the
+    /// default (`DEFAULT_DISK_GIB` = 64 GiB) without forcing growth of an
+    /// intentionally smaller `data.img`, and is omitted from `config.toml` so
+    /// older versions (which deny unknown keys) still read saved configs after
+    /// a rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
     /// Show the guest's files on the Mac over NFS.
     pub mount: bool,
     /// Where the guest's files appear; empty means `~/Katamaran` (nothing
@@ -75,7 +78,7 @@ impl Default for Config {
             // Idle vCPUs cost nothing, so the VM gets every core by default.
             cpus: Host::current().cpus.min(u32::from(u8::MAX)) as u8,
             memory_mib: default_memory_mib(Host::current()),
-            disk_gib: DEFAULT_DISK_GIB,
+            disk_gib: None,
             mount: true,
             mount_path: None,
             launch_at_login: true,
@@ -178,7 +181,7 @@ impl WireConfig {
         Config {
             cpus: self.cpus,
             memory_mib: self.memory_mib,
-            disk_gib: disk_gib.unwrap_or(DEFAULT_DISK_GIB),
+            disk_gib,
             mount: self.mount,
             mount_path: self.mount_path,
             launch_at_login: self.launch_at_login,
@@ -281,10 +284,6 @@ pub const fn default_disk_gib() -> u32 {
     DEFAULT_DISK_GIB
 }
 
-fn is_default_disk_gib(n: &u32) -> bool {
-    *n == DEFAULT_DISK_GIB
-}
-
 /// Half of the Mac's memory, between 2 and 16 GiB, and within what
 /// [`Config::validate`] accepts.
 pub const fn default_memory_mib(host: Host) -> u32 {
@@ -364,11 +363,16 @@ impl Config {
         Ok(())
     }
 
+    /// Effective data-disk ceiling in GiB (`DEFAULT_DISK_GIB` when unset).
+    pub fn disk_gib(&self) -> u32 {
+        self.disk_gib.unwrap_or(DEFAULT_DISK_GIB)
+    }
+
     pub fn get(&self, key: &str) -> anyhow::Result<String> {
         Ok(match key {
             "cpus" => self.cpus.to_string(),
             "memory_mib" | "memory" => self.memory_mib.to_string(),
-            "disk_gib" | "disk" => self.disk_gib.to_string(),
+            "disk_gib" | "disk" => self.disk_gib().to_string(),
             "mount" => self.mount.to_string(),
             "mount_path" => self
                 .mount_path
@@ -401,7 +405,7 @@ impl Config {
         match key {
             "cpus" => next.cpus = value.parse().with_context(|| format!("cpus: {value:?}"))?,
             "memory_mib" | "memory" => next.memory_mib = parse_mib(value)?,
-            "disk_gib" | "disk" => next.disk_gib = parse_gib(value)?,
+            "disk_gib" | "disk" => next.disk_gib = Some(parse_gib(value)?),
             "mount" => next.mount = parse_bool(value)?,
             "mount_path" => {
                 next.mount_path = if value.is_empty() {
@@ -462,17 +466,18 @@ impl Config {
         for (k, v) in values {
             next.set(k, v, host)?;
         }
-        if values.contains_key("disk") || values.contains_key("disk_gib") {
+        if (values.contains_key("disk") || values.contains_key("disk_gib"))
+            && let Some(target_gib) = next.disk_gib
+        {
             let img_path = home.join("data/data.img");
             if let Some(cur_bytes) =
                 data_disk_bytes(home).with_context(|| format!("stat {}", img_path.display()))?
             {
-                let target_bytes = u64::from(next.disk_gib) << 30;
+                let target_bytes = u64::from(target_gib) << 30;
                 if target_bytes < cur_bytes {
                     let cur_gib = cur_bytes.div_ceil(1 << 30);
                     bail!(
-                        "cannot shrink data disk from {cur_gib} GiB to {} GiB (only growing is supported)",
-                        next.disk_gib
+                        "cannot shrink data disk from {cur_gib} GiB to {target_gib} GiB (only growing is supported)"
                     );
                 }
             }
@@ -484,8 +489,18 @@ impl Config {
     /// Whether a VM started with `self` has to restart to use `saved`.
     /// `launch_at_login` applies to launchd directly, and Kubernetes settings
     /// (`kubernetes`, `k8s_version`, `k8s_disable`, `k8s_args`) apply when k3s starts.
+    #[cfg(test)]
     pub fn needs_restart_for(&self, saved: &Config) -> bool {
+        self.needs_restart_for_disk(saved, self.disk_gib())
+    }
+
+    /// Like [`Self::needs_restart_for`], comparing an explicitly configured
+    /// `saved.disk_gib` against the VM's actual `attached_disk_gib` so an
+    /// explicit `disk=64G` on an 8 GiB image flags a pending restart while an
+    /// untouched default (`None`) does not.
+    pub fn needs_restart_for_disk(&self, saved: &Config, attached_disk_gib: u32) -> bool {
         let applied = Config {
+            disk_gib: saved.disk_gib,
             launch_at_login: saved.launch_at_login,
             kubernetes: saved.kubernetes,
             k8s_version: saved.k8s_version.clone(),
@@ -494,6 +509,9 @@ impl Config {
             ..self.clone()
         };
         applied != *saved
+            || saved
+                .disk_gib
+                .is_some_and(|target| target > attached_disk_gib)
     }
 
     pub fn validate(&self, host: &Host) -> anyhow::Result<()> {
@@ -504,7 +522,9 @@ impl Config {
         if self.memory_mib < MIN_MEMORY_MIB || self.memory_mib > max {
             bail!("memory_mib must be between {MIN_MEMORY_MIB} and {max}");
         }
-        if self.disk_gib < MIN_DISK_GIB || self.disk_gib > MAX_DISK_GIB {
+        if let Some(gib) = self.disk_gib
+            && !(MIN_DISK_GIB..=MAX_DISK_GIB).contains(&gib)
+        {
             bail!("disk_gib must be between {MIN_DISK_GIB} and {MAX_DISK_GIB}");
         }
         if let Some(p) = &self.mount_path
@@ -748,6 +768,72 @@ fn format_k8s_args(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Short-lived lock file serializing `config.toml` read-modify-write updates
+/// across offline CLI edits and the daemon. Unlike `katamaran.lock`, it is
+/// never held while a VM runs.
+pub const CONFIG_LOCK_NAME: &str = "config.lock";
+
+/// Short-lived lock file serializing host-side `data.img` preparation
+/// (cloning/growing) with offline disk shrink checks. Dropped immediately
+/// after `data.img` is prepared, before the VM boots.
+pub const DISK_LOCK_NAME: &str = "disk.lock";
+
+fn open_lock_file(home: &Path, name: &str) -> anyhow::Result<(PathBuf, File)> {
+    let run_dir = home.join("run");
+    fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
+    let path = run_dir.join(name);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    Ok((path, file))
+}
+
+fn lock_blocking(home: &Path, name: &str) -> anyhow::Result<File> {
+    let (path, file) = open_lock_file(home, name)?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
+    }
+}
+
+fn try_lock_nonblocking(home: &Path, name: &str) -> anyhow::Result<Option<File>> {
+    let (path, file) = open_lock_file(home, name)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(err).with_context(|| format!("lock {}", path.display()))
+}
+
+/// Acquire the cross-process lock protecting `config.toml` updates.
+pub fn lock_config(home: &Path) -> anyhow::Result<File> {
+    lock_blocking(home, CONFIG_LOCK_NAME)
+}
+
+/// Acquire the cross-process lock protecting `data.img` preparation.
+pub fn lock_disk(home: &Path) -> anyhow::Result<File> {
+    lock_blocking(home, DISK_LOCK_NAME)
+}
+
+/// Try to acquire the `data.img` preparation lock without blocking.
+pub fn try_lock_disk(home: &Path) -> anyhow::Result<Option<File>> {
+    try_lock_nonblocking(home, DISK_LOCK_NAME)
 }
 
 /// Current apparent size of `<home>/data/data.img` in bytes, or `Ok(None)`
@@ -1168,13 +1254,25 @@ mod tests {
     #[test]
     fn disk_is_a_vm_setting_and_round_trips() {
         let mut cfg = Config::parse("").unwrap();
-        assert_eq!(cfg.disk_gib, DEFAULT_DISK_GIB);
+        assert_eq!(cfg.disk_gib, None);
+        assert_eq!(cfg.disk_gib(), DEFAULT_DISK_GIB);
         assert_eq!(cfg.get("disk_gib").unwrap(), "64");
         assert_eq!(cfg.get("disk").unwrap(), "64");
 
+        // Explicitly setting 64G distinguishes an explicit target from an omitted default.
+        let mut explicit_default = Config::default();
+        explicit_default.set("disk", "64G", &HOST).unwrap();
+        assert_eq!(explicit_default.disk_gib, Some(64));
+        assert_eq!(explicit_default.get("disk").unwrap(), "64");
+        let explicit_text = toml::to_string(&explicit_default).unwrap();
+        assert!(explicit_text.contains("disk_gib = 64"), "{explicit_text}");
+        assert_eq!(Config::parse(&explicit_text).unwrap(), explicit_default);
+        assert!(Config::default().needs_restart_for_disk(&explicit_default, 8));
+        assert!(!Config::default().needs_restart_for_disk(&explicit_default, 64));
+
         let started = cfg.clone();
         cfg.set("disk", "500G", &HOST).unwrap();
-        assert_eq!(cfg.disk_gib, 500);
+        assert_eq!(cfg.disk_gib, Some(500));
         assert_eq!(cfg.get("disk").unwrap(), "500");
         assert_eq!(cfg.get("disk_gib").unwrap(), "500");
         assert!(started.needs_restart_for(&cfg));
@@ -1184,7 +1282,7 @@ mod tests {
         assert_eq!(Config::parse(&text).unwrap(), cfg);
 
         cfg.set("disk_gib", "1T", &HOST).unwrap();
-        assert_eq!(cfg.disk_gib, 1024);
+        assert_eq!(cfg.disk_gib, Some(1024));
     }
 
     #[test]
@@ -1204,10 +1302,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.apply_values(&map(&[("disk", "500G")]), &HOST, &home)
             .unwrap();
-        assert_eq!(cfg.disk_gib, 500);
+        assert_eq!(cfg.disk_gib, Some(500));
         cfg.apply_values(&map(&[("disk", "128G")]), &HOST, &home)
             .unwrap();
-        assert_eq!(cfg.disk_gib, 128);
+        assert_eq!(cfg.disk_gib, Some(128));
 
         // Once data.img is 200 GiB on disk, shrinking below 200 GiB is refused
         // and leaves the config (including other keys in the same batch) intact.
@@ -1229,25 +1327,26 @@ mod tests {
         // Setting equal or larger size succeeds.
         cfg.apply_values(&map(&[("disk", "200G")]), &HOST, &home)
             .unwrap();
-        assert_eq!(cfg.disk_gib, 200);
+        assert_eq!(cfg.disk_gib, Some(200));
         cfg.apply_values(&map(&[("disk", "500G")]), &HOST, &home)
             .unwrap();
-        assert_eq!(cfg.disk_gib, 500);
+        assert_eq!(cfg.disk_gib, Some(500));
 
-        // Changing unrelated keys still works even if config.toml has a smaller disk_gib.
+        // Changing unrelated keys still works even if config.toml has no disk_gib.
         let mut smaller = Config::default();
-        assert_eq!(smaller.disk_gib, 64);
+        assert_eq!(smaller.disk_gib, None);
         smaller
             .apply_values(&map(&[("cpus", "2")]), &HOST, &home)
             .unwrap();
         assert_eq!(smaller.cpus, 2);
+        assert_eq!(smaller.disk_gib, None);
 
         fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
     fn default_disk_gib_is_omitted_on_save_so_rollback_reads_config() {
-        #[derive(Deserialize)]
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         struct PreDiskConfig {
             cpus: u8,
@@ -1284,15 +1383,34 @@ mod tests {
         let text = fs::read_to_string(Config::path(&home)).unwrap();
         assert!(!text.contains("disk_gib"), "{text}");
         let legacy: PreDiskConfig = toml::from_str(&text).unwrap();
-        assert!(!legacy.mount);
+        assert_eq!(
+            legacy,
+            PreDiskConfig {
+                cpus: cfg.cpus,
+                memory_mib: cfg.memory_mib,
+                mount: false,
+                mount_path: cfg.mount_path.clone(),
+                launch_at_login: cfg.launch_at_login,
+                pause_on_sleep: cfg.pause_on_sleep,
+                auto_forward: cfg.auto_forward,
+                amd64: cfg.amd64,
+                kubernetes: cfg.kubernetes,
+            }
+        );
         assert_eq!(Config::load(&home).unwrap(), cfg);
 
-        // Non-default disk_gib IS persisted and round-trips.
+        // Explicitly setting disk_gib (including 64G or 500G) IS persisted and round-trips.
+        cfg.set("disk", "64G", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        let text = fs::read_to_string(Config::path(&home)).unwrap();
+        assert!(text.contains("disk_gib = 64"), "{text}");
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(64));
+
         cfg.set("disk", "500G", &HOST).unwrap();
         cfg.save(&home).unwrap();
         let text = fs::read_to_string(Config::path(&home)).unwrap();
         assert!(text.contains("disk_gib = 500"), "{text}");
-        assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(500));
 
         fs::remove_dir_all(&home).unwrap();
     }

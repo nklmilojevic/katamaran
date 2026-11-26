@@ -1,7 +1,6 @@
 //! The user-facing commands that talk to the daemon.
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -353,24 +352,19 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
             ),
         );
     }
-    let saved_disk = s.saved_disk_gib();
-    if let Some(vm) = &s.vm
-        && (vm.cpus != s.config.cpus
-            || vm.memory_mib != s.config.memory_mib
-            || vm.requested_disk_gib() != saved_disk)
-    {
-        let next_disk = if saved_disk > config::DEFAULT_DISK_GIB {
-            saved_disk.max(vm.disk_gib)
-        } else {
-            vm.disk_gib
-        };
-        line(
-            "pending",
-            format!(
-                "{} CPUs · {} MiB · {} GiB disk after a restart",
-                s.config.cpus, s.config.memory_mib, next_disk
-            ),
-        );
+    if let Some(vm) = &s.vm {
+        let explicit_disk = s.explicit_disk_target_gib();
+        let disk_pending = explicit_disk.is_some_and(|target| target > vm.disk_gib);
+        if vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib || disk_pending {
+            let next_disk = explicit_disk.map_or(vm.disk_gib, |target| target.max(vm.disk_gib));
+            line(
+                "pending",
+                format!(
+                    "{} CPUs · {} MiB · {} GiB disk after a restart",
+                    s.config.cpus, s.config.memory_mib, next_disk
+                ),
+            );
+        }
     }
     text.push_str(&out);
     text
@@ -415,49 +409,65 @@ pub fn logs(args: LogsArgs) -> anyhow::Result<()> {
     }
 }
 
-const OFFLINE_CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
+const OFFLINE_DISK_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 enum ConfigTarget {
     Daemon(Client),
-    Offline(std::fs::File),
+    Offline {
+        _config_lock: std::fs::File,
+        _disk_lock: Option<std::fs::File>,
+    },
 }
 
-/// Either connect to the running daemon or acquire `<home>/run/katamaran.lock`
-/// exclusively so an offline config edit cannot race with a starting daemon or
-/// foreground `katamaran run` preparing/growing `data.img`.
+/// Either connect to the running daemon or acquire the short-lived per-home
+/// config lock (and, for disk edits, the short-lived disk preparation lock).
+///
+/// Unlike `katamaran.lock` (held for a foreground VM's entire lifetime),
+/// `config.lock` and `disk.lock` are only held during config saves and
+/// host-side `data.img` preparation, so settings remain editable while an
+/// already-started foreground VM runs.
 fn connect_or_lock_offline(
     home: &Path,
     sock: &Path,
+    edits_disk: bool,
     wait: Duration,
 ) -> anyhow::Result<ConfigTarget> {
     if let Ok(c) = Client::connect(sock) {
         return Ok(ConfigTarget::Daemon(c));
     }
-    let run_dir = home.join("run");
-    std::fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
-    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
-    let lock_path = run_dir.join("katamaran.lock");
     let deadline = Instant::now() + wait;
     loop {
+        let config_lock = config::lock_config(home)?;
         if let Ok(c) = Client::connect(sock) {
             return Ok(ConfigTarget::Daemon(c));
         }
-        if let Some(guard) = crate::run::try_lock(&lock_path)? {
-            return Ok(ConfigTarget::Offline(guard));
+        if !edits_disk {
+            return Ok(ConfigTarget::Offline {
+                _config_lock: config_lock,
+                _disk_lock: None,
+            });
         }
+        if let Some(disk_lock) = config::try_lock_disk(home)? {
+            return Ok(ConfigTarget::Offline {
+                _config_lock: config_lock,
+                _disk_lock: Some(disk_lock),
+            });
+        }
+        // Release config.lock before waiting so unrelated config saves and
+        // daemon RPCs stay unblocked while disk preparation finishes.
+        drop(config_lock);
         if Instant::now() >= deadline {
             bail!(
-                "another katamaran instance is running or starting ({}); retry once it is ready or stopped",
-                lock_path.display()
+                "cannot change disk_gib while a VM is preparing its data disk; retry in a moment"
             );
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-/// Apply `values` offline while holding `<home>/run/katamaran.lock`, or via
-/// daemon RPC if a daemon comes up while waiting for the lock.
+/// Apply `values` offline while holding `<home>/run/config.lock` (plus
+/// `<home>/run/disk.lock` when editing disk), or via daemon RPC if a daemon
+/// is listening.
 fn apply_config_set_at(
     home: &Path,
     sock: &Path,
@@ -465,7 +475,8 @@ fn apply_config_set_at(
     k8s_opts_set: bool,
     wait: Duration,
 ) -> anyhow::Result<(bool, bool, Option<bool>)> {
-    match connect_or_lock_offline(home, sock, wait)? {
+    let edits_disk = values.contains_key("disk") || values.contains_key("disk_gib");
+    match connect_or_lock_offline(home, sock, edits_disk, wait)? {
         ConfigTarget::Daemon(mut c) => {
             let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
             let k8s_state = if k8s_opts_set && !v.k8s_toggled {
@@ -476,7 +487,10 @@ fn apply_config_set_at(
             let k8s_active = should_show_k8s_restart_hint(k8s_opts_set, &v, k8s_state.as_deref());
             Ok((v.restart_required, k8s_active, None))
         }
-        ConfigTarget::Offline(_lock) => {
+        ConfigTarget::Offline {
+            _config_lock,
+            _disk_lock,
+        } => {
             let mut cfg = config::Config::load(home)?;
             let host = config::Host::current();
             cfg.apply_values(&values, &host, home)?;
@@ -520,7 +534,7 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
                 &sock,
                 values,
                 k8s_opts_set,
-                OFFLINE_CONFIG_LOCK_WAIT,
+                OFFLINE_DISK_LOCK_WAIT,
             )?;
             if let Some(enabled) = launch_at_login {
                 crate::setup::set_run_at_load(enabled, None)?;
@@ -627,6 +641,7 @@ mod tests {
                 ..WireConfig::default()
             },
             disk_gib: Some(64),
+            disk_target_gib: None,
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
@@ -675,6 +690,7 @@ mod tests {
         disk_pending.config.cpus = 4;
         disk_pending.config.memory_mib = 4096;
         disk_pending.disk_gib = Some(500);
+        disk_pending.disk_target_gib = Some(500);
         let disk_text = summary(&disk_pending);
         assert!(
             disk_text.contains("4 CPUs · 4096 MiB · 500 GiB disk after a restart"),
@@ -687,6 +703,7 @@ mod tests {
         retained.config.cpus = 4;
         retained.config.memory_mib = 4096;
         retained.disk_gib = Some(64);
+        retained.disk_target_gib = None;
         retained.vm.as_mut().unwrap().disk_gib = 500;
         retained.vm.as_mut().unwrap().requested_disk_gib = Some(64);
         let retained_text = summary(&retained);
@@ -708,18 +725,35 @@ mod tests {
             retained_cpu_text.contains("2 CPUs · 4096 MiB · 500 GiB disk after a restart"),
             "{retained_cpu_text}"
         );
+
         // If another setting changes while retaining a smaller custom image
         // under default disk_gib, pending keeps the smaller 8 GiB size.
         let mut retained_small = s.clone();
         retained_small.config.cpus = 2;
         retained_small.config.memory_mib = 4096;
         retained_small.disk_gib = Some(64);
+        retained_small.disk_target_gib = None;
         retained_small.vm.as_mut().unwrap().disk_gib = 8;
         retained_small.vm.as_mut().unwrap().requested_disk_gib = Some(64);
         let retained_small_text = summary(&retained_small);
         assert!(
             retained_small_text.contains("2 CPUs · 4096 MiB · 8 GiB disk after a restart"),
             "{retained_small_text}"
+        );
+
+        // Explicitly configuring disk=64G against an attached 8 GiB image
+        // shows pending growth to 64 GiB after a restart.
+        let mut explicit_small = s.clone();
+        explicit_small.config.cpus = 4;
+        explicit_small.config.memory_mib = 4096;
+        explicit_small.disk_gib = Some(64);
+        explicit_small.disk_target_gib = Some(64);
+        explicit_small.vm.as_mut().unwrap().disk_gib = 8;
+        explicit_small.vm.as_mut().unwrap().requested_disk_gib = Some(64);
+        let explicit_small_text = summary(&explicit_small);
+        assert!(
+            explicit_small_text.contains("4 CPUs · 4096 MiB · 64 GiB disk after a restart"),
+            "{explicit_small_text}"
         );
 
         assert!(
@@ -837,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_config_set_serializes_with_katamaran_lock_and_starting_daemon() {
+    fn offline_config_set_serializes_with_disk_prep_and_allows_edits_during_foreground_vm() {
         use std::os::unix::net::UnixListener;
 
         let home = std::env::temp_dir().join(format!("kat-cli-lock-{}", std::process::id()));
@@ -847,29 +881,28 @@ mod tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
         let sock = run_dir.join(api::SOCKET_NAME);
-        let lock_path = run_dir.join("katamaran.lock");
+        let vm_lock_path = run_dir.join("katamaran.lock");
 
-        // Pre-existing 64 GiB image with saved target = 500 GiB (simulating a VM
-        // startup that has taken katamaran.lock before extending data.img).
+        // Pre-existing 64 GiB image with saved target = 500 GiB.
         std::fs::File::create(data_dir.join("data.img"))
             .unwrap()
             .set_len(64u64 << 30)
             .unwrap();
         let cfg = config::Config {
-            disk_gib: 500,
+            disk_gib: Some(500),
             ..config::Config::default()
         };
         cfg.save(&home).unwrap();
 
-        let held_lock = crate::run::try_lock(&lock_path)
-            .unwrap()
-            .expect("acquire initial katamaran.lock");
+        // Hold katamaran.lock for the entire test to simulate a foreground
+        // `katamaran run` owning the home (no daemon.sock).
+        let _vm_lock = crate::run::lock(&vm_lock_path).expect("acquire katamaran.lock");
 
+        // 1. While startup disk preparation holds disk.lock (before extending
+        //    data.img), an offline disk shrink edit MUST fail.
+        let disk_prep_lock = config::lock_disk(&home).expect("acquire disk.lock");
         let mut shrink = std::collections::BTreeMap::new();
         shrink.insert("disk".into(), "200G".into());
-
-        // While katamaran.lock is held and no daemon socket is listening,
-        // offline config set MUST fail instead of racing the shrink check.
         let err = apply_config_set_at(
             &home,
             &sock,
@@ -879,34 +912,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("katamaran.lock"),
+            err.to_string().contains("preparing its data disk"),
             "unexpected err: {err:#}"
         );
-        assert_eq!(config::Config::load(&home).unwrap().disk_gib, 500);
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, Some(500));
 
-        // If the starting daemon binds daemon.sock while still holding
-        // katamaran.lock, connect_or_lock_offline switches over to Daemon(client).
+        // 2. Unrelated offline config edits STILL succeed even while both
+        //    katamaran.lock and disk.lock are held.
+        let mut cpu_edit = std::collections::BTreeMap::new();
+        cpu_edit.insert("cpus".into(), "1".into());
+        apply_config_set_at(&home, &sock, cpu_edit, false, Duration::from_millis(80)).unwrap();
+        assert_eq!(config::Config::load(&home).unwrap().cpus, 1);
+
+        // 3. If a daemon binds daemon.sock while disk.lock is held,
+        //    connect_or_lock_offline switches over to Daemon(client).
         let sock_for_thread = sock.clone();
         let binder = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(40));
             let listener = UnixListener::bind(&sock_for_thread).unwrap();
             let (_conn, _) = listener.accept().unwrap();
         });
-        let target = connect_or_lock_offline(&home, &sock, Duration::from_secs(2)).unwrap();
+        let target = connect_or_lock_offline(&home, &sock, true, Duration::from_secs(2)).unwrap();
         assert!(matches!(target, ConfigTarget::Daemon(_)));
         drop(target);
         binder.join().unwrap();
         let _ = std::fs::remove_file(&sock);
 
-        // Once katamaran.lock is released and data.img was extended to 500 GiB,
-        // offline config set acquires the lock and enforces the shrink check.
+        // 4. Once disk preparation finishes (extending data.img to 500 GiB and
+        //    releasing disk.lock) while the foreground VM STILL holds
+        //    katamaran.lock: unrelated edits continue working, shrink is
+        //    rejected against the 500 GiB image, and growing succeeds.
         std::fs::OpenOptions::new()
             .write(true)
             .open(data_dir.join("data.img"))
             .unwrap()
             .set_len(500u64 << 30)
             .unwrap();
-        drop(held_lock);
+        drop(disk_prep_lock);
+
+        let mut mount_edit = std::collections::BTreeMap::new();
+        mount_edit.insert("mount".into(), "off".into());
+        apply_config_set_at(&home, &sock, mount_edit, false, Duration::from_millis(80)).unwrap();
+        assert!(!config::Config::load(&home).unwrap().mount);
 
         let err = apply_config_set_at(&home, &sock, shrink, false, Duration::from_millis(80))
             .unwrap_err();
@@ -914,13 +961,12 @@ mod tests {
             err.to_string().contains("cannot shrink"),
             "unexpected err: {err:#}"
         );
-        assert_eq!(config::Config::load(&home).unwrap().disk_gib, 500);
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, Some(500));
 
-        // Growing offline while uncontended succeeds.
         let mut grow = std::collections::BTreeMap::new();
         grow.insert("disk".into(), "600G".into());
         apply_config_set_at(&home, &sock, grow, false, Duration::from_millis(80)).unwrap();
-        assert_eq!(config::Config::load(&home).unwrap().disk_gib, 600);
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, Some(600));
 
         std::fs::remove_dir_all(&home).unwrap();
     }

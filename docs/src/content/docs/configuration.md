@@ -28,7 +28,7 @@ kat config set nofile=65536
 kat restart
 ```
 
-`nofile` and `disk_gib` are only written to `config.toml` when they differ from their defaults. Before downgrading to a katamaran version without `nofile` or `disk_gib`, remove any custom `nofile` or `disk_gib` line from `config.toml`, since older versions reject unknown keys (removing `disk_gib` leaves `~/.katamaran/data/data.img` intact).
+`nofile` is only written to `config.toml` when it differs from the default, and `disk_gib` is only written when explicitly set. Before downgrading to a katamaran version without `nofile` or `disk_gib`, remove any `nofile` or `disk_gib` line from `config.toml`, since older versions reject unknown keys (removing `disk_gib` leaves `~/.katamaran/data/data.img` intact).
 
 ## Settings keys
 
@@ -36,7 +36,7 @@ kat restart
 |---|---|---|---|
 | `cpus` | integer | All host cores | `1` to the number of host CPU cores |
 | `memory_mib` | integer | Half of host RAM, clamped to `2048` to `16384` | `1024` to `(host RAM - 2048)` MiB. `kat config set` also accepts `memory=8G` or `memory=4096M`. |
-| `disk_gib` | integer | `64` | `64` to `16384` GiB (16 TiB), checked on `config.toml` load. `kat config set` also accepts `disk=500G` or `disk=1T`. Growing only: `kat config set` and the app reject a target smaller than the current `data.img`; a lower in-range value edited directly in `config.toml` is accepted on load and leaves the larger `data.img` unchanged at startup. Omitted from `config.toml` when default (`64`); remove a non-default `disk_gib` line before downgrading to an older release without touching `data.img`. |
+| `disk_gib` | integer | `64` | `64` to `16384` GiB (16 TiB), checked on `config.toml` load. `kat config set` also accepts `disk=500G` or `disk=1T`. Growing only: `kat config set` and the app reject a target smaller than the current `data.img`; a lower in-range value edited directly in `config.toml` is accepted on load and leaves the larger `data.img` unchanged at startup. Omitted from `config.toml` unless explicitly set; remove any `disk_gib` line before downgrading to an older release without touching `data.img`. |
 | `mount` | boolean | `true` | `true`, `false`, `on`, `off`, `yes`, `no`, `1`, `0` |
 | `mount_path` | string (optional) | `~/Katamaran` (unset) | Any absolute path, or empty string to reset to default |
 | `launch_at_login` | boolean | `true` | Boolean |

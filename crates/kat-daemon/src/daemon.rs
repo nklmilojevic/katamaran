@@ -482,13 +482,17 @@ impl Daemon {
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
-        self.start_with(run_args, |d, generation, args, rx| {
+        self.start_with(run_args, |d, generation, args, rx, disk_lock| {
             thread::Builder::new()
                 .name("vm-supervisor".into())
                 .spawn(move || {
-                    let result = run::run_vm(&args, d.relay_budget.clone(), rx, &mut |e| {
-                        d.on_event(generation, e)
-                    });
+                    let result = run::run_vm_with_disk_lock(
+                        &args,
+                        d.relay_budget.clone(),
+                        rx,
+                        Some(disk_lock),
+                        &mut |e| d.on_event(generation, e),
+                    );
                     d.on_exit(generation, result);
                 })
                 .map(|_| ())
@@ -498,13 +502,16 @@ impl Daemon {
     fn start_with<B, S>(self: &Arc<Self>, build_args: B, spawn: S) -> Result<(), String>
     where
         B: FnOnce(&Config) -> anyhow::Result<RunArgs>,
-        S: FnOnce(Arc<Daemon>, u64, RunArgs, mpsc::Receiver<Control>) -> io::Result<()>,
+        S: FnOnce(Arc<Daemon>, u64, RunArgs, mpsc::Receiver<Control>, File) -> io::Result<()>,
     {
-        // Serialize startup's config snapshot and `disk_preparing` flag with
-        // `set_config` so a concurrent disk edit cannot bypass the shrink
-        // check before `run.rs` finishes extending `data.img`.
-        // Lock order: `config_lock` -> `inner`.
+        // Serialize startup's config snapshot, `disk_preparing` flag, and
+        // cross-process `disk.lock` with both RPC and offline config edits so
+        // no concurrent disk edit can bypass the shrink check before `run.rs`
+        // finishes extending `data.img`.
+        // Lock order: `config_lock` -> `config.lock` -> `inner` -> `disk.lock`.
         let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg_file_lock =
+            crate::config::lock_config(&self.home).map_err(|e| format!("{e:#}"))?;
         let mut g = self.lock();
         if g.exiting {
             return Err("the daemon is shutting down".into());
@@ -516,6 +523,7 @@ impl Daemon {
         }
         let cfg = Config::load(&self.home).map_err(|e| format!("{e:#}"))?;
         let args = build_args(&cfg).map_err(|e| format!("{e:#}"))?;
+        let disk_lock = crate::config::lock_disk(&self.home).map_err(|e| format!("{e:#}"))?;
         let mount_path = if args.no_mount {
             None
         } else {
@@ -529,7 +537,7 @@ impl Daemon {
             (Some(cur), Some(target)) => cur.max(target),
             (Some(cur), None) => cur,
             (None, Some(target)) => target,
-            (None, None) => cfg.disk_gib,
+            (None, None) => cfg.disk_gib(),
         };
         let prev_state = g.state;
         let prev_error = g.error.clone();
@@ -549,7 +557,7 @@ impl Daemon {
             cfg.memory_mib,
             initial_disk_gib
         );
-        if let Err(e) = spawn(self.clone(), generation, args, rx) {
+        if let Err(e) = spawn(self.clone(), generation, args, rx, disk_lock) {
             g.control = None;
             g.run = None;
             g.error = prev_error;
@@ -882,7 +890,7 @@ impl Daemon {
                 cpus: r.applied.cpus,
                 memory_mib: r.applied.memory_mib,
                 disk_gib: r.attached_disk_gib,
-                requested_disk_gib: Some(r.applied.disk_gib),
+                requested_disk_gib: Some(r.applied.disk_gib()),
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
                 docker_ready_ms: r.docker_ready.map(ms),
@@ -928,7 +936,8 @@ impl Daemon {
                         .collect()
                 })
                 .unwrap_or_default(),
-            disk_gib: Some(saved.disk_gib),
+            disk_gib: Some(saved.disk_gib()),
+            disk_target_gib: saved.disk_gib,
             config: WireConfig::from(saved),
         }
     }
@@ -937,13 +946,14 @@ impl Daemon {
         let config = Config::load(&self.home)?;
         let g = self.lock();
         Ok(ConfigView {
-            restart_required: g
-                .run
-                .as_ref()
-                .is_some_and(|r| r.applied.needs_restart_for(&config)),
+            restart_required: g.run.as_ref().is_some_and(|r| {
+                r.applied
+                    .needs_restart_for_disk(&config, r.attached_disk_gib)
+            }),
             k8s_toggled: false,
             path: Config::path(&self.home),
-            disk_gib: Some(config.disk_gib),
+            disk_gib: Some(config.disk_gib()),
+            disk_target_gib: config.disk_gib,
             config: WireConfig::from(config),
         })
     }
@@ -972,6 +982,8 @@ impl Daemon {
     ) -> Result<ConfigView, RpcError> {
         let (cfg_kubernetes, before_k8s) = {
             let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _cfg_file_lock = crate::config::lock_config(&self.home)
+                .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
             if (values.contains_key("disk") || values.contains_key("disk_gib"))
                 && self.lock().run.as_ref().is_some_and(|r| r.disk_preparing)
             {
@@ -1340,6 +1352,7 @@ impl Daemon {
 
     fn persist_k8s_enabled(&self, enabled: bool) -> anyhow::Result<()> {
         let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg_file_lock = crate::config::lock_config(&self.home)?;
         let mut cfg = Config::load(&self.home)?;
         if cfg.kubernetes != enabled {
             cfg.kubernetes = enabled;
@@ -2294,14 +2307,6 @@ fn tail_lines(buf: &[u8], n: usize) -> &[u8] {
     buf
 }
 
-/// Disk growth target passed to `run::prepare_data_disk` for a daemon-managed
-/// VM. When `disk_gib` is at its default (`64`), omit an explicit growth target
-/// so a normal daemon boot never permanently expands an intentionally smaller
-/// `data.img` created by a foreground `katamaran run --data-template ...`.
-fn disk_growth_target(cfg: &Config) -> Option<u32> {
-    (cfg.disk_gib > crate::config::DEFAULT_DISK_GIB).then_some(cfg.disk_gib)
-}
-
 /// The VM's settings from the saved config, with the guest images found
 /// next to this executable.
 fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
@@ -2314,7 +2319,10 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
             p if p.is_file() => p,
             _ => guest.join("data.img.sparse"),
         },
-        disk_gib: disk_growth_target(cfg),
+        // `None` when omitted in config.toml so a normal daemon boot leaves an
+        // intentionally smaller foreground image untouched; `Some(gib)` passes
+        // every explicitly configured target (including `64G`) through.
+        disk_gib: cfg.disk_gib,
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
         cmdline: guest_cmdline(cfg),
@@ -2609,8 +2617,9 @@ mod tests {
         disk.insert("disk".to_string(), "500G".to_string());
         let v = d.handle(&Call::ConfigSet(disk)).unwrap();
         assert_eq!(v["disk_gib"], 500);
+        assert_eq!(v["disk_target_gib"], 500);
         assert!(v["config"].get("disk_gib").is_none());
-        assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(500));
         fs::create_dir_all(home.join("data")).unwrap();
         fs::File::create(home.join("data/data.img"))
             .unwrap()
@@ -4315,7 +4324,7 @@ mod tests {
             initramfs: PathBuf::from("initramfs.cpio"),
             rootfs: PathBuf::from("rootfs.erofs"),
             data_template: template.to_path_buf(),
-            disk_gib: disk_growth_target(cfg),
+            disk_gib: cfg.disk_gib,
             cpus: cfg.cpus,
             memory_mib: cfg.memory_mib,
             cmdline: guest_cmdline(cfg),
@@ -4355,11 +4364,12 @@ mod tests {
         let img_for_vm = img.clone();
         d.start_with(
             |cfg| Ok(test_run_args(cfg, &img)),
-            move |daemon, generation, args, rx| {
+            move |daemon, generation, args, rx, disk_lock| {
                 thread::spawn(move || {
                     let bytes =
                         run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
                             .unwrap();
+                    drop(disk_lock);
                     daemon.on_event(generation, Event::DiskPrepared { bytes });
                     daemon.on_event(
                         generation,
@@ -4516,7 +4526,7 @@ mod tests {
             .unwrap();
 
         let cfg = Config {
-            disk_gib: 500,
+            disk_gib: Some(500),
             ..Config::default()
         };
         cfg.save(&home).unwrap();
@@ -4529,14 +4539,15 @@ mod tests {
 
         d.start_with(
             |cfg| Ok(test_run_args(cfg, &img)),
-            move |daemon, generation, args, rx| {
+            move |daemon, generation, args, rx, disk_lock| {
                 thread::spawn(move || {
-                    // Startup has snapshotted target = 500 GiB, paused before growing data.img.
+                    // Startup has snapshotted target = 500 GiB and holds disk_lock, paused before growing data.img.
                     let _ = paused_tx.send(());
                     proceed_rx.recv().unwrap();
                     let bytes =
                         run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
                             .unwrap();
+                    drop(disk_lock);
                     daemon.on_event(generation, Event::DiskPrepared { bytes });
                     let _ = grown_tx.send(());
                     let _ = rx.recv();
@@ -4548,7 +4559,7 @@ mod tests {
         .unwrap();
         paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        // While startup image preparation is in flight, a smaller concurrent disk edit must fail.
+        // While startup image preparation is in flight, a smaller concurrent RPC disk edit must fail.
         let mut shrink = BTreeMap::new();
         shrink.insert("disk".into(), "200G".into());
         let err = d.handle(&Call::ConfigSet(shrink.clone())).unwrap_err();
@@ -4558,7 +4569,7 @@ mod tests {
             "{}",
             err.message
         );
-        assert_eq!(Config::load(&home).unwrap().disk_gib, 500);
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(500));
 
         // Unrelated settings still succeed while disk preparation is in flight.
         let mut unrelated = BTreeMap::new();
@@ -4712,7 +4723,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_default_config_does_not_grow_smaller_foreground_image() {
+    fn daemon_preserves_untouched_small_image_and_honors_explicit_64g_growth() {
         let home = temp("small-foreground-disk");
         let data_dir = home.join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -4724,38 +4735,71 @@ mod tests {
             .unwrap();
 
         let d = Daemon::new(home.clone());
-        let (done_tx, done_rx) = mpsc::channel();
-        let img_for_vm = img.clone();
-        d.start_with(
-            |cfg| Ok(test_run_args(cfg, &img)),
-            move |daemon, generation, args, rx| {
-                assert_eq!(args.disk_gib, None);
-                thread::spawn(move || {
-                    let bytes =
-                        run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
-                            .unwrap();
-                    daemon.on_event(generation, Event::DiskPrepared { bytes });
-                    daemon.on_event(generation, Event::ServiceReady("docker".into()));
-                    let _ = done_tx.send(());
-                    let _ = rx.recv();
-                    daemon.on_exit(generation, Ok(()));
-                });
-                Ok(())
-            },
-        )
-        .unwrap();
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start_sim = |expected_target: Option<u32>| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let img_for_vm = img.clone();
+            d.start_with(
+                |cfg| Ok(test_run_args(cfg, &img)),
+                move |daemon, generation, args, rx, disk_lock| {
+                    assert_eq!(args.disk_gib, expected_target);
+                    thread::spawn(move || {
+                        let bytes =
+                            run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                                .unwrap();
+                        drop(disk_lock);
+                        daemon.on_event(generation, Event::DiskPrepared { bytes });
+                        daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                        let _ = done_tx.send(());
+                        let _ = rx.recv();
+                        daemon.on_exit(generation, Ok(()));
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
 
-        // Image remains 8 GiB, status reports 8 GiB attached with no pending restart.
+        // 1. Untouched default config does not grow the 8 GiB image.
+        start_sim(None);
         assert_eq!(fs::metadata(&img).unwrap().len(), small_bytes);
         let status = d.status();
         let vm = status.vm.as_ref().expect("running VM info");
         assert_eq!(vm.disk_gib, 8);
-        assert_eq!(vm.requested_disk_gib, Some(crate::config::DEFAULT_DISK_GIB));
+        assert_eq!(status.disk_target_gib, None);
         assert!(!d.config_view().unwrap().restart_required);
         let text = crate::cli::summary(&status);
         assert!(text.contains("8 GiB disk"), "{text}");
         assert!(!text.contains("pending"), "{text}");
+
+        // 2. Explicitly running `config set disk=64G` persists `disk_gib = 64`
+        //    and flags a pending restart against the attached 8 GiB disk.
+        let mut grow_64 = BTreeMap::new();
+        grow_64.insert("disk".into(), "64G".into());
+        let v = d.handle(&Call::ConfigSet(grow_64)).unwrap();
+        assert_eq!(v["disk_gib"], 64);
+        assert_eq!(v["disk_target_gib"], 64);
+        assert_eq!(v["restart_required"], true);
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(64));
+
+        let pending_status = d.status();
+        let pending_text = crate::cli::summary(&pending_status);
+        assert!(
+            pending_text.contains("pending")
+                && pending_text.contains("64 GiB disk after a restart"),
+            "{pending_text}"
+        );
+
+        // 3. Restarting grows the 8 GiB image to 64 GiB and clears pending.
+        d.stop(true).unwrap();
+        start_sim(Some(64));
+        assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
+        let after_status = d.status();
+        assert_eq!(after_status.vm.as_ref().unwrap().disk_gib, 64);
+        assert!(!d.config_view().unwrap().restart_required);
+        let after_text = crate::cli::summary(&after_status);
+        assert!(after_text.contains("64 GiB disk"), "{after_text}");
+        assert!(!after_text.contains("pending"), "{after_text}");
 
         d.stop(true).unwrap();
         fs::remove_dir_all(&home).unwrap();
