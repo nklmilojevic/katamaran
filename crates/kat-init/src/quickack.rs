@@ -14,9 +14,8 @@
 //!
 //! The `quickack` route metric (`RTAX_QUICKACK`) makes TCP acknowledge at once
 //! on that route while keeping the 65520-byte MTU for bulk throughput. Inside
-//! container namespaces and on local container bridges (`cni0`, `docker0`,
-//! `br-*`, `katbr0`), traffic only crosses veth pairs inside the VM, so the
-//! extra ACKs cost a few cycles and no VM exits.
+//! container and pod network namespaces, traffic only crosses veth pairs inside
+//! the VM, so the extra ACKs cost a few cycles and no VM exits.
 //!
 //! Each unambiguous main-table unicast route without the metric is replaced
 //! (`NLM_F_REPLACE`, never `NLM_F_CREATE`, so a route that went away meanwhile
@@ -24,8 +23,8 @@
 //! `RTAX_QUICKACK=1`. Replacing a route flushes the routing cache, so sockets
 //! opened before the change pick the metric up too. When multiple sibling
 //! routes share the same kernel replacement key (including filtered route
-//! types or routes on other interfaces), all of them are skipped because
-//! `NLM_F_REPLACE` matches by key and could overwrite a different route.
+//! types or skipped routes), all of them are skipped because `NLM_F_REPLACE`
+//! matches by key and could overwrite a different route.
 
 use std::collections::HashMap;
 
@@ -47,6 +46,7 @@ pub const AF_INET6: u8 = 10;
 /// `struct rtmsg`.
 const RTMSG_LEN: usize = 12;
 const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_KERNEL: u8 = 2;
 const RTPROT_RA: u8 = 9;
 const RTN_UNICAST: u8 = 1;
 const RTNH_F_ONLINK: u32 = 4;
@@ -81,12 +81,6 @@ pub fn enabled(cmdline: &str) -> bool {
     !cmdline.split_whitespace().any(|a| a == "kat.quickack=0")
 }
 
-/// Interfaces in the VM's root network namespace that only lead over local
-/// veth bridges (never `eth0` to gvproxy).
-pub fn is_local_bridge_name(name: &[u8]) -> bool {
-    matches!(name, b"cni0" | b"docker0" | b"katbr0") || name.starts_with(b"br-")
-}
-
 /// A dump request for the routes of `family`.
 pub fn dump_request(family: u8, seq: u32) -> Vec<u8> {
     let mut rtm = [0u8; RTMSG_LEN];
@@ -118,18 +112,19 @@ struct RouteKey {
     priority: u32,
 }
 
-/// Outcome of scanning a route dump (possibly across multiple datagrams and
-/// address families).
+/// Outcome of scanning a single-family route dump (possibly across multiple
+/// datagrams).
 #[derive(Debug, Default)]
 pub struct Dump {
     /// Candidate replacements paired with their route key.
     candidates: Vec<(RouteKey, Vec<u8>)>,
-    /// Count of all main-table routes per key (including filtered route types,
-    /// complex attributes and routes outside `allow_oif`), so sibling routes
-    /// sharing a key are never replaced.
+    /// Count of all main-table routes per key (including filtered route types
+    /// and skipped routes), so sibling routes sharing a key are never replaced.
     key_counts: HashMap<RouteKey, usize>,
-    /// Set if any matching dump message carried `NLM_F_DUMP_INTR`.
-    interrupted: bool,
+    /// Set if any matching dump message carried `NLM_F_DUMP_INTR` or if the
+    /// dump ended with an error (e.g. `ENOMEM` after yielding some routes),
+    /// meaning unseen siblings could defeat collision checking.
+    incomplete: bool,
     /// Number of matching main-table unicast routes seen (including ones that
     /// already carry `quickack` or were skipped).
     pub seen: usize,
@@ -137,9 +132,10 @@ pub struct Dump {
 
 impl Dump {
     /// Return the route bodies that are unambiguous (unique key in the dump)
-    /// and need `RTAX_QUICKACK=1`. Returns empty if the dump was interrupted.
+    /// and need `RTAX_QUICKACK=1`. Returns empty if the dump was interrupted
+    /// or ended with an error.
     pub fn into_updates(self) -> Vec<Vec<u8>> {
-        if self.interrupted {
+        if self.incomplete {
             return Vec::new();
         }
         self.candidates
@@ -152,26 +148,16 @@ impl Dump {
 
 /// Parse one netlink datagram of a route dump, recording candidate route
 /// replacements and route-key counts in `out`. Call [`Dump::into_updates`]
-/// after the dump finishes to filter out any ambiguous sibling keys.
-/// Messages whose sequence number is not `expected_seq` are ignored.
-///
-/// When `allow_oif` is `Some(pred)`, only routes whose `RTA_OIF` is accepted
-/// by `pred` are considered for replacement (used in the root namespace so
-/// `eth0` is untouched); sibling key counts still include all main-table
-/// routes so `NLM_F_REPLACE` can never clobber another route.
-pub fn parse_dump(
-    buf: &[u8],
-    expected_seq: u32,
-    allow_oif: Option<&dyn Fn(u32) -> bool>,
-    out: &mut Dump,
-) -> End {
-    let mut interrupted = out.interrupted;
+/// only after the dump finishes with [`End::Done`]. Messages whose sequence
+/// number is not `expected_seq` are ignored.
+pub fn parse_dump(buf: &[u8], expected_seq: u32, out: &mut Dump) -> End {
+    let mut interrupted = false;
     let end = each_msg(buf, expected_seq, |kind, flags, body| {
         if flags & NLM_F_DUMP_INTR != 0 {
             interrupted = true;
         }
         if kind == RTM_NEWROUTE
-            && let Some(route) = inspect_route(body, allow_oif)
+            && let Some(route) = inspect_route(body)
         {
             *out.key_counts.entry(route.key.clone()).or_insert(0) += 1;
             if route.matched_unicast {
@@ -183,9 +169,11 @@ pub fn parse_dump(
         }
         None
     });
-    out.interrupted = interrupted;
+    if interrupted || matches!(end, End::Error(_)) {
+        out.incomplete = true;
+    }
     match end {
-        End::Done if interrupted => End::Error(EINTR),
+        End::Done if out.incomplete => End::Error(EINTR),
         other => other,
     }
 }
@@ -227,7 +215,11 @@ fn each_msg(
                     let err = body
                         .get(0..4)
                         .map_or(0, |b| i32::from_ne_bytes(b.try_into().unwrap()));
-                    return if err < 0 { End::Error(-err) } else { End::Done };
+                    return if err < 0 {
+                        End::Error(err.checked_neg().unwrap_or(EPROTO))
+                    } else {
+                        End::Done
+                    };
                 }
                 NLMSG_ERROR => {
                     let err = body
@@ -236,7 +228,7 @@ fn each_msg(
                     return if err == 0 {
                         End::Done
                     } else {
-                        End::Error(-err)
+                        End::Error(err.checked_neg().unwrap_or(EPROTO))
                     };
                 }
                 _ => {
@@ -248,12 +240,15 @@ fn each_msg(
         }
         rest = rest.get(align(len)..).unwrap_or(&[]);
     }
+    if !rest.is_empty() {
+        return End::Error(EPROTO);
+    }
     End::More
 }
 
 struct InspectedRoute {
     key: RouteKey,
-    /// True if this is a unicast route that passed `allow_oif`.
+    /// True if this is a main-table unicast route.
     matched_unicast: bool,
     /// Rebuilt route body with `RTAX_QUICKACK=1`, if eligible and not set yet.
     rebuilt: Option<Vec<u8>>,
@@ -265,7 +260,7 @@ struct InspectedRoute {
 /// Non-unicast routes (blackhole, unreachable, prohibit, ...) and routes with
 /// unsupported attributes still return `Some` with `rebuilt: None` so their
 /// [`RouteKey`] participates in sibling collision counting.
-fn inspect_route(body: &[u8], allow_oif: Option<&dyn Fn(u32) -> bool>) -> Option<InspectedRoute> {
+fn inspect_route(body: &[u8]) -> Option<InspectedRoute> {
     let rtm: &[u8; RTMSG_LEN] = body.get(..RTMSG_LEN)?.try_into().ok()?;
     let family = rtm[0];
     let dst_len = rtm[1];
@@ -280,7 +275,6 @@ fn inspect_route(body: &[u8], allow_oif: Option<&dyn Fn(u32) -> bool>) -> Option
     let parsed = attrs(&body[RTMSG_LEN..])?;
 
     let mut table = u32::from(rtm[4]);
-    let mut oif: Option<u32> = None;
     let mut dst = [0u8; 16];
     let mut src = [0u8; 16];
     let mut priority = if family == AF_INET6 {
@@ -289,7 +283,14 @@ fn inspect_route(body: &[u8], allow_oif: Option<&dyn Fn(u32) -> bool>) -> Option
         0
     };
     let mut has_quickack = false;
-    let mut skip = rt_type != RTN_UNICAST || (family == AF_INET6 && protocol == RTPROT_RA);
+    // Skip non-unicast routes. For IPv6, also skip RTPROT_RA (router-advertised
+    // default and route-info routes) and RTPROT_KERNEL (kernel-managed prefix
+    // routes, including router-advertised on-link prefixes installed via
+    // addrconf_prefix_route): the kernel hides RTF_ADDRCONF/RTF_PREFIX_RT from
+    // dumps and strips them on netlink replace, breaking later RA updates and
+    // withdrawals even when rta_expires is zero.
+    let mut skip = rt_type != RTN_UNICAST
+        || (family == AF_INET6 && matches!(protocol, RTPROT_KERNEL | RTPROT_RA));
     let mut kept: Vec<(u16, &[u8])> = Vec::new();
     let mut metrics: Vec<(u16, &[u8])> = Vec::new();
     for (kind, data) in parsed {
@@ -298,7 +299,7 @@ fn inspect_route(body: &[u8], allow_oif: Option<&dyn Fn(u32) -> bool>) -> Option
                 table = u32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
             }
             RTA_OIF => {
-                oif = Some(u32::from_ne_bytes(data.get(..4)?.try_into().ok()?));
+                let _ = u32::from_ne_bytes(data.get(..4)?.try_into().ok()?);
                 kept.push((kind, data));
             }
             RTA_DST => {
@@ -359,11 +360,7 @@ fn inspect_route(body: &[u8], allow_oif: Option<&dyn Fn(u32) -> bool>) -> Option
         src: if family == AF_INET6 { src } else { [0; 16] },
         priority,
     };
-    let matched_unicast = rt_type == RTN_UNICAST
-        && match allow_oif {
-            Some(pred) => oif.is_some_and(pred),
-            None => true,
-        };
+    let matched_unicast = rt_type == RTN_UNICAST;
     // Skip IPv6 link-local (fe80::/10): kernel-managed per interface and not
     // used for pod/container TCP traffic.
     let is_v6_link_local =
@@ -521,24 +518,16 @@ mod tests {
 
     fn dump(buf: &[u8], seq: u32) -> (End, usize, Vec<Vec<u8>>) {
         let mut out = Dump::default();
-        let end = parse_dump(buf, seq, None, &mut out);
+        let end = parse_dump(buf, seq, &mut out);
         let seen = out.seen;
         (end, seen, out.into_updates())
     }
 
     #[test]
-    fn enabled_flag_and_bridge_names() {
+    fn enabled_flag() {
         assert!(enabled("console=hvc0 quiet"));
         assert!(!enabled("console=hvc0 kat.quickack=0 quiet"));
         assert!(enabled("kat.quickack=1"));
-
-        assert!(is_local_bridge_name(b"cni0"));
-        assert!(is_local_bridge_name(b"docker0"));
-        assert!(is_local_bridge_name(b"katbr0"));
-        assert!(is_local_bridge_name(b"br-deadbeef1234"));
-        assert!(!is_local_bridge_name(b"eth0"));
-        assert!(!is_local_bridge_name(b"lo"));
-        assert!(!is_local_bridge_name(b"flannel.1"));
     }
 
     #[test]
@@ -622,6 +611,9 @@ mod tests {
         let mut fd03 = [0u8; 16];
         fd03[0] = 0xfd;
         fd03[1] = 0x03;
+        let mut fd04 = [0u8; 16];
+        fd04[0] = 0xfd;
+        fd04[1] = 0x04;
 
         let skipped = [
             // Local table, and a local route.
@@ -659,6 +651,17 @@ mod tests {
                 rtmsg_proto(AF_INET6, 0, RT_TABLE_MAIN, RTPROT_RA, RTN_UNICAST, 0),
                 &[(RTA_CACHEINFO, cacheinfo(0))],
             ),
+            // IPv6 router-advertised on-link prefix route (installed with
+            // RTPROT_KERNEL and hidden RTF_ADDRCONF|RTF_PREFIX_RT, with
+            // rta_expires == 0 for infinite lifetime or sub-tick remainder).
+            route(
+                rtmsg_proto(AF_INET6, 64, RT_TABLE_MAIN, RTPROT_KERNEL, RTN_UNICAST, 0),
+                &[
+                    (RTA_DST, fd04.to_vec()),
+                    (RTA_PRIORITY, 256u32.to_ne_bytes().to_vec()),
+                    (RTA_CACHEINFO, cacheinfo(0)),
+                ],
+            ),
             // Malformed (short) RTA_CACHEINFO.
             route(
                 rtmsg(AF_INET6, 64, RT_TABLE_MAIN, RTN_UNICAST, 0),
@@ -677,21 +680,33 @@ mod tests {
             // Not IP.
             route(rtmsg(7, 0, RT_TABLE_MAIN, RTN_UNICAST, 0), &[]),
         ];
-        let kept = route(
+        // IPv6 static/boot route and IPv4 connected (RTPROT_KERNEL) subnet route
+        // must both still be updated.
+        let kept_v6 = route(
             rtmsg(AF_INET6, 64, RT_TABLE_MAIN, RTN_UNICAST, 0),
             &[(RTA_DST, fd00.to_vec())],
         );
+        let kept_v4_kernel = route(
+            rtmsg_proto(AF_INET, 24, RT_TABLE_MAIN, RTPROT_KERNEL, RTN_UNICAST, 0),
+            &[
+                (RTA_DST, vec![10, 42, 0, 0]),
+                (RTA_OIF, 3u32.to_ne_bytes().to_vec()),
+            ],
+        );
         let mut all = skipped.to_vec();
-        all.push(kept);
+        all.push(kept_v6);
+        all.push(kept_v4_kernel);
         let (_, seen, updates) = dump(&reply(4, &all), 4);
-        assert_eq!(updates.len(), 1);
+        assert_eq!(updates.len(), 2);
         assert_eq!(updates[0][0], AF_INET6);
-        assert_eq!(seen, 8);
+        assert_eq!(updates[1][0], AF_INET);
+        assert_eq!(updates[1][5], RTPROT_KERNEL);
+        assert_eq!(seen, 10);
     }
 
     #[test]
     fn skips_ambiguous_sibling_keys_including_filtered_routes() {
-        // 1) IPv6 unicast routes sharing (dst, priority) across oif filter.
+        // 1) Two IPv6 unicast routes sharing (dst, priority) with different oifs.
         let mut fd00 = [0u8; 16];
         fd00[0] = 0xfd;
         let eth0_v6 = route(
@@ -710,7 +725,28 @@ mod tests {
                 (RTA_OIF, 5u32.to_ne_bytes().to_vec()),
             ],
         );
-        // 2) Eligible IPv4 unicast route sharing its key with a filtered
+        // 2) Eligible IPv6 route sharing its key with a skipped IPv6
+        //    RTPROT_KERNEL prefix route.
+        let mut fd05 = [0u8; 16];
+        fd05[0] = 0xfd;
+        fd05[1] = 0x05;
+        let boot_v6 = route(
+            rtmsg(AF_INET6, 64, RT_TABLE_MAIN, RTN_UNICAST, 0),
+            &[
+                (RTA_DST, fd05.to_vec()),
+                (RTA_PRIORITY, 256u32.to_ne_bytes().to_vec()),
+                (RTA_OIF, 5u32.to_ne_bytes().to_vec()),
+            ],
+        );
+        let kernel_v6 = route(
+            rtmsg_proto(AF_INET6, 64, RT_TABLE_MAIN, RTPROT_KERNEL, RTN_UNICAST, 0),
+            &[
+                (RTA_DST, fd05.to_vec()),
+                (RTA_PRIORITY, 256u32.to_ne_bytes().to_vec()),
+                (RTA_OIF, 2u32.to_ne_bytes().to_vec()),
+            ],
+        );
+        // 3) Eligible IPv4 unicast route sharing its key with a filtered
         //    non-unicast (blackhole) route (missing RTA_PRIORITY -> 0 on both).
         let eligible_v4 = route(
             rtmsg(AF_INET, 24, RT_TABLE_MAIN, RTN_UNICAST, 0),
@@ -723,7 +759,7 @@ mod tests {
             rtmsg(AF_INET, 24, RT_TABLE_MAIN, RTN_BLACKHOLE, 0),
             &[(RTA_DST, vec![10, 42, 1, 0])],
         );
-        // 3) Eligible IPv4 default route (missing RTA_DST -> 0.0.0.0) sharing
+        // 4) Eligible IPv4 default route (missing RTA_DST -> 0.0.0.0) sharing
         //    its key with a filtered multipath default route.
         let default_v4 = route(
             rtmsg(AF_INET, 0, RT_TABLE_MAIN, RTN_UNICAST, 0),
@@ -736,7 +772,7 @@ mod tests {
             rtmsg(AF_INET, 0, RT_TABLE_MAIN, RTN_UNICAST, 0),
             &[(RTA_MULTIPATH, vec![0; 8])],
         );
-        // 4) Unambiguous route on br0 that SHOULD be replaced.
+        // 5) Unambiguous route that SHOULD be replaced.
         let unique_v4 = route(
             rtmsg(AF_INET, 24, RT_TABLE_MAIN, RTN_UNICAST, 0),
             &[
@@ -746,13 +782,14 @@ mod tests {
         );
 
         let mut out = Dump::default();
-        let pred = |oif: u32| oif == 5;
         parse_dump(
             &reply(
                 3,
                 &[
                     eth0_v6,
                     br0_v6,
+                    boot_v6,
+                    kernel_v6,
                     eligible_v4,
                     blackhole_v4,
                     default_v4,
@@ -761,7 +798,6 @@ mod tests {
                 ],
             ),
             3,
-            Some(&pred),
             &mut out,
         );
         let updates = out.into_updates();
@@ -769,30 +805,6 @@ mod tests {
         assert_eq!(updates[0][0], AF_INET);
         assert_eq!(updates[0][1], 24);
         assert!(updates[0].windows(4).any(|w| w == [10, 42, 2, 0]));
-    }
-
-    #[test]
-    fn filters_by_oif_for_root_namespace() {
-        let eth0 = route(
-            rtmsg(AF_INET, 0, RT_TABLE_MAIN, RTN_UNICAST, 0),
-            &[(RTA_OIF, 2u32.to_ne_bytes().to_vec())],
-        );
-        let cni0 = route(
-            rtmsg(AF_INET, 24, RT_TABLE_MAIN, RTN_UNICAST, 0),
-            &[
-                (RTA_DST, vec![10, 42, 0, 0]),
-                (RTA_OIF, 5u32.to_ne_bytes().to_vec()),
-            ],
-        );
-        let no_oif = route(rtmsg(AF_INET, 16, RT_TABLE_MAIN, RTN_UNICAST, 0), &[]);
-
-        let mut out = Dump::default();
-        let pred = |oif: u32| oif == 5;
-        parse_dump(&reply(3, &[eth0, cni0, no_oif]), 3, Some(&pred), &mut out);
-        assert_eq!(out.seen, 1);
-        let updates = out.into_updates();
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0][1], 24);
     }
 
     #[test]
@@ -807,9 +819,37 @@ mod tests {
         let (end, _, updates) = dump(&buf, 6);
         assert_eq!((end, updates.len()), (End::More, 0));
 
-        // Negative status in NLMSG_DONE reports an error, not an empty dump.
+        // Negative status in NLMSG_DONE reports an error and discards any
+        // candidates already parsed in earlier messages (e.g. ENOMEM mid-dump).
+        let mut partial_enomem = Dump::default();
+        assert_eq!(
+            parse_dump(
+                &reply(7, std::slice::from_ref(&one)),
+                7,
+                &mut partial_enomem
+            ),
+            End::More
+        );
         let done_err = nlmsg(NLMSG_DONE, 2, 7, &(-12i32).to_ne_bytes());
-        assert_eq!(dump(&done_err, 7).0, End::Error(12));
+        assert_eq!(
+            parse_dump(&done_err, 7, &mut partial_enomem),
+            End::Error(12)
+        );
+        assert!(partial_enomem.into_updates().is_empty());
+
+        // Same when a dump terminates with NLMSG_ERROR after yielding routes.
+        let mut partial_nlerr = Dump::default();
+        assert_eq!(
+            parse_dump(
+                &reply(11, std::slice::from_ref(&one)),
+                11,
+                &mut partial_nlerr
+            ),
+            End::More
+        );
+        let nlerr = nlmsg(NLMSG_ERROR, 0, 11, &(-12i32).to_ne_bytes());
+        assert_eq!(parse_dump(&nlerr, 11, &mut partial_nlerr), End::Error(12));
+        assert!(partial_nlerr.into_updates().is_empty());
 
         // NLM_F_DUMP_INTR on a dump message or NLMSG_DONE rejects the snapshot.
         let mut intr = nlmsg(RTM_NEWROUTE, 2 | NLM_F_DUMP_INTR, 9, &one);

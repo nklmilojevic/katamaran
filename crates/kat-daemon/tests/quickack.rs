@@ -1,7 +1,8 @@
 //! Guest `quickack` route tuning end to end on real Kubernetes (k3s) pods and
-//! root container bridges. Needs internet access (to pull k3s and alpine) and
-//! the `kubectl` and `docker` CLIs. Ignored by default; `cargo xtask test-vm`
-//! builds everything and runs it.
+//! root-namespace exclusion under host-networked Docker containers. Needs
+//! internet access (to pull k3s and alpine) and the `kubectl` and `docker`
+//! CLIs. Ignored by default; `cargo xtask test-vm` builds everything and runs
+//! it.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -130,7 +131,7 @@ fn seed_k3s_cache(home: &Path) {
 
 #[test]
 #[ignore = "boots the system VM with k3s; run with `cargo xtask test-vm`"]
-fn pod_routes_and_local_bridges_get_quickack() {
+fn pod_routes_get_quickack_and_root_netns_is_untouched() {
     let home = root().join(format!("target/tqa-{}", std::process::id()));
     let user_home = home.join("user-home");
     let _ = std::fs::remove_dir_all(&home);
@@ -243,46 +244,35 @@ fn pod_routes_and_local_bridges_get_quickack() {
     );
     eprintln!("pod route matching {peer_ip}:\n{matched_routes}all pod routes:\n{all_routes}");
 
-    // Verify in the guest root namespace that local container bridges (cni0,
-    // docker0) carry `quickack 1`, while `eth0` routes remain untouched.
+    // Launch a host-networked container (which makes Docker bind-mount the
+    // guest root namespace at /var/run/docker/netns/default), give the watcher
+    // several ticks to observe it, and verify the guest root routing table
+    // stays completely untouched.
     let docker_host = format!("unix://{}", home.join("run/docker.sock").display());
-    let mut root_routes = String::new();
-    wait_until(
-        "quickack 1 on root cni0/docker0 routes",
-        Duration::from_secs(15),
-        || {
-            let out = Command::new("docker")
-                .env("DOCKER_HOST", &docker_host)
-                .env_remove("DOCKER_CONTEXT")
-                .args([
-                    "run",
-                    "--rm",
-                    "--network",
-                    "host",
-                    IMAGE,
-                    "sh",
-                    "-c",
-                    "apk add -q iproute2 >/dev/null && ip -4 route show",
-                ])
-                .output()
-                .expect("run docker");
-            if !out.status.success() {
-                return false;
-            }
-            root_routes = String::from_utf8_lossy(&out.stdout).into_owned();
-            let has_cni = root_routes
-                .lines()
-                .any(|l| l.contains("dev cni0") && l.contains("quickack 1"));
-            let has_docker = root_routes
-                .lines()
-                .any(|l| l.contains("dev docker0") && l.contains("quickack 1"));
-            has_cni && has_docker
-        },
+    let out = Command::new("docker")
+        .env("DOCKER_HOST", &docker_host)
+        .env_remove("DOCKER_CONTEXT")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            IMAGE,
+            "sh",
+            "-c",
+            "apk add -q iproute2 >/dev/null && sleep 1 && ip -4 route show && ip -6 route show",
+        ])
+        .output()
+        .expect("run docker");
+    let root_routes = ok(&out, "inspect root namespace routes");
+    assert!(
+        root_routes.lines().any(|l| l.contains("dev eth0")),
+        "expected eth0 route in root table:\n{root_routes}"
     );
-    for line in root_routes.lines().filter(|l| l.contains("dev eth0")) {
+    for line in root_routes.lines() {
         assert!(
             !line.contains("quickack 1"),
-            "root eth0 route must not get quickack: {line}\nfull table:\n{root_routes}"
+            "root namespace route must not get quickack: {line}\nfull table:\n{root_routes}"
         );
     }
     eprintln!("root routes:\n{root_routes}");

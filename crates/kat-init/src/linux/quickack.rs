@@ -1,5 +1,5 @@
-//! `quickack` on the routes of container network namespaces and local
-//! container bridges (rules in ../quickack.rs).
+//! `quickack` on the routes of container and pod network namespaces (rules in
+//! ../quickack.rs).
 //!
 //! Container namespaces are the ones auto-forwarding watches: Docker's
 //! (/var/run/docker/netns) and CNI's (/run/netns), which covers Kubernetes
@@ -9,15 +9,12 @@
 //! [`SETTLING`], and every [`SETTLED_INTERVAL`] after that; settled checks
 //! only dump the routes.
 //!
-//! The guest root namespace is excluded from container-namespace discovery by
-//! its `(dev, ino)` identity (Docker bind-mounts it as
-//! `/var/run/docker/netns/default`). Instead, the root namespace is handled
-//! separately with an interface filter so only routes on local container
-//! bridges (`cni0`, `docker0`, `br-*`, `katbr0`) are updated and `eth0` (to
-//! gvproxy) stays untouched.
+//! The guest root namespace is excluded by its `(dev, ino)` identity (Docker
+//! bind-mounts it as `/var/run/docker/netns/default` for host-networked
+//! containers), so the watcher never rewrites routes in the guest root routing
+//! table.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -34,7 +31,6 @@ const FAST_SETTLING: Duration = Duration::from_secs(5);
 const SETTLING: Duration = Duration::from_secs(30);
 const SETTLING_INTERVAL: Duration = Duration::from_secs(1);
 const SETTLED_INTERVAL: Duration = Duration::from_secs(10);
-const ROOT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub use crate::quickack::enabled;
 
@@ -73,7 +69,7 @@ impl Netns {
     }
 }
 
-/// Watch container namespaces and local container bridges on a thread of its own.
+/// Watch container and pod namespaces on a thread of its own.
 pub fn start() {
     let root_id = match fs::metadata("/proc/self/ns/net") {
         Ok(m) => ns_id(&m),
@@ -88,9 +84,6 @@ pub fn start() {
             let mut w = Watcher {
                 by_path: BTreeMap::new(),
                 root_id,
-                root_sock: route_socket().ok(),
-                root_checked: None,
-                root_logged: false,
                 seq: 0,
                 buf: vec![0; 32 << 10],
             };
@@ -110,9 +103,6 @@ struct Watcher {
     /// excluded in `refresh()` because Docker bind-mounts it as
     /// `/var/run/docker/netns/default`.
     root_id: NsId,
-    root_sock: Option<OwnedFd>,
-    root_checked: Option<Instant>,
-    root_logged: bool,
     seq: u32,
     buf: Vec<u8>,
 }
@@ -121,13 +111,12 @@ impl Watcher {
     fn tick(&mut self) {
         self.refresh();
         let now = Instant::now();
-        self.tick_root(now);
         for (path, ns) in &mut self.by_path {
             if !ns.due(now) {
                 continue;
             }
             ns.checked = Some(now);
-            match apply(&ns.sock, &mut self.seq, &mut self.buf, None) {
+            match apply(&ns.sock, &mut self.seq, &mut self.buf) {
                 Ok(out) => {
                     if out.seen > 0 {
                         ns.has_routes = true;
@@ -144,43 +133,10 @@ impl Watcher {
                         ns.logged = true;
                         eprintln!("kat-init: quickack on {}: {e}", path.display());
                     }
-                    if let Ok(sock) = open_route_socket(path, self.root_id) {
+                    if let Ok(sock) = open_route_socket(path, self.root_id, ns.id) {
                         ns.sock = sock;
                     }
                 }
-            }
-        }
-    }
-
-    fn tick_root(&mut self, now: Instant) {
-        if self
-            .root_checked
-            .is_some_and(|last| now.duration_since(last) < ROOT_INTERVAL)
-        {
-            return;
-        }
-        self.root_checked = Some(now);
-        if self.root_sock.is_none() {
-            self.root_sock = route_socket().ok();
-        }
-        let Some(sock) = self.root_sock.as_ref() else {
-            return;
-        };
-        match apply(sock, &mut self.seq, &mut self.buf, Some(&is_local_bridge)) {
-            Ok(out) => {
-                if let Some(e) = out.route_err
-                    && !self.root_logged
-                {
-                    self.root_logged = true;
-                    eprintln!("kat-init: quickack on root bridges: {e}");
-                }
-            }
-            Err(e) => {
-                if !self.root_logged {
-                    self.root_logged = true;
-                    eprintln!("kat-init: quickack on root bridges: {e}");
-                }
-                self.root_sock = None;
             }
         }
     }
@@ -231,26 +187,17 @@ impl Watcher {
     }
 }
 
-fn open_route_socket(path: &Path, root_id: NsId) -> io::Result<OwnedFd> {
+fn open_route_socket(path: &Path, root_id: NsId, expected_id: NsId) -> io::Result<OwnedFd> {
     let file = File::open(path)?;
     let meta = file.metadata()?;
-    if !is_nsfs(&file) || ns_id(&meta) == root_id {
+    let id = ns_id(&meta);
+    if !is_nsfs(&file) || id == root_id || id != expected_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a container netns",
         ));
     }
     in_netns(&OwnedFd::from(file), route_socket)
-}
-
-fn is_local_bridge(ifindex: u32) -> bool {
-    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
-    let p = unsafe { libc::if_indextoname(ifindex, buf.as_mut_ptr()) };
-    if p.is_null() {
-        return false;
-    }
-    let name = unsafe { CStr::from_ptr(p) }.to_bytes();
-    quickack::is_local_bridge_name(name)
 }
 
 fn route_socket() -> io::Result<OwnedFd> {
@@ -292,38 +239,40 @@ struct ApplyOutcome {
 ///
 /// Transport errors return `Err` (the caller should recreate `sock`).
 /// Per-route netlink errors are recorded in `ApplyOutcome::route_err` without
-/// skipping the remaining routes. An interrupted dump (`NLM_F_DUMP_INTR`)
-/// aborts the pass cleanly so the next tick retries on a consistent snapshot.
-fn apply(
-    sock: &OwnedFd,
-    seq: &mut u32,
-    buf: &mut [u8],
-    allow_oif: Option<&dyn Fn(u32) -> bool>,
-) -> io::Result<ApplyOutcome> {
-    let mut dump = Dump::default();
+/// skipping the remaining routes. Each address family is dumped into its own
+/// snapshot and only contributes updates when it completes cleanly (`End::Done`);
+/// an interrupted (`NLM_F_DUMP_INTR`) or errored (e.g. `ENOMEM`) dump discards
+/// all partial candidates for that family so an unseen sibling cannot defeat
+/// collision checking.
+fn apply(sock: &OwnedFd, seq: &mut u32, buf: &mut [u8]) -> io::Result<ApplyOutcome> {
+    let mut seen = 0usize;
+    let mut updates = Vec::new();
     let mut route_err = None;
     for family in [quickack::AF_INET, quickack::AF_INET6] {
         *seq = seq.wrapping_add(1);
         let expected = *seq;
         send(sock, &quickack::dump_request(family, expected))?;
+        let mut dump = Dump::default();
         loop {
             let n = recv(sock, buf)?;
-            match quickack::parse_dump(&buf[..n], expected, allow_oif, &mut dump) {
+            match quickack::parse_dump(&buf[..n], expected, &mut dump) {
                 End::More => continue,
-                End::Done => break,
+                End::Done => {
+                    seen += dump.seen;
+                    updates.extend(dump.into_updates());
+                    break;
+                }
                 // No IPv6 in this namespace.
                 End::Error(e) if e == libc::EAFNOSUPPORT => break,
-                // Concurrent route update invalidated the dump snapshot; retry
-                // on the next tick without applying partial updates.
-                End::Error(e) if e == quickack::EINTR => {
-                    return Ok(ApplyOutcome {
-                        seen: 0,
-                        route_err: None,
-                    });
-                }
+                // Concurrent route update invalidated this family's snapshot;
+                // discard it and let the next tick retry cleanly.
+                End::Error(e) if e == quickack::EINTR => break,
                 End::Error(e) if e == quickack::EPROTO => {
                     return Err(io::Error::from_raw_os_error(e));
                 }
+                // Incomplete dump (e.g. ENOMEM after partial routes): discard
+                // this family's candidates so an unseen sibling cannot defeat
+                // collision checking.
                 End::Error(e) => {
                     route_err.get_or_insert_with(|| io::Error::from_raw_os_error(e));
                     break;
@@ -331,8 +280,7 @@ fn apply(
             }
         }
     }
-    let seen = dump.seen;
-    for route in dump.into_updates() {
+    for route in updates {
         *seq = seq.wrapping_add(1);
         let expected = *seq;
         send(sock, &quickack::replace_request(&route, expected))?;
@@ -399,6 +347,28 @@ fn recv(sock: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
 mod tests {
     use super::*;
 
+    fn nlmsg(kind: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
+        let len = quickack::NLMSG_HDR + body.len();
+        let mut m = Vec::with_capacity(len);
+        m.extend_from_slice(&(len as u32).to_ne_bytes());
+        m.extend_from_slice(&kind.to_ne_bytes());
+        m.extend_from_slice(&flags.to_ne_bytes());
+        m.extend_from_slice(&seq.to_ne_bytes());
+        m.extend_from_slice(&[0; 4]);
+        m.extend_from_slice(body);
+        m.resize((m.len() + 3) & !3, 0);
+        m
+    }
+
+    fn dgram_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
     #[test]
     fn skips_root_namespace_alias_by_dev_and_ino() {
         let root_meta = fs::metadata("/proc/self/ns/net").expect("stat /proc/self/ns/net");
@@ -410,12 +380,75 @@ mod tests {
         let alias_path = format!("/proc/{}/ns/net", std::process::id());
         let alias_meta = fs::metadata(&alias_path).expect("stat own /proc/<pid>/ns/net");
         assert!(should_skip_ns(ns_id(&alias_meta), root_id, []));
-        assert!(open_route_socket(Path::new(&alias_path), root_id).is_err());
+        assert!(open_route_socket(Path::new(&alias_path), root_id, root_id).is_err());
 
         // Distinct container namespace identities are accepted once and
         // deduplicated thereafter.
         let container_id = (root_id.0, root_id.1.wrapping_add(1));
         assert!(!should_skip_ns(container_id, root_id, []));
         assert!(should_skip_ns(container_id, root_id, [container_id]));
+    }
+
+    #[test]
+    fn apply_discards_partial_candidates_when_dump_errors_with_enomem() {
+        const RTM_NEWROUTE: u16 = 24;
+        const NLMSG_ERROR: u16 = 2;
+        const NLMSG_DONE: u16 = 3;
+        const NLM_F_MULTI: u16 = 2;
+
+        let (client, peer) = dgram_pair();
+        let server = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            // 1) IPv4 dump request: return one valid main-table unicast route
+            //    followed by NLMSG_DONE(-ENOMEM).
+            let n = recv(&peer, &mut buf).unwrap();
+            assert!(n >= quickack::NLMSG_HDR);
+            let seq4 = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+            let rtm4 = [quickack::AF_INET, 24, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+            send(&peer, &nlmsg(RTM_NEWROUTE, NLM_F_MULTI, seq4, &rtm4)).unwrap();
+            send(
+                &peer,
+                &nlmsg(
+                    NLMSG_DONE,
+                    NLM_F_MULTI,
+                    seq4,
+                    &(-libc::ENOMEM).to_ne_bytes(),
+                ),
+            )
+            .unwrap();
+
+            // 2) IPv6 dump request: return one valid main-table unicast route
+            //    followed by clean NLMSG_DONE(0).
+            let n = recv(&peer, &mut buf).unwrap();
+            assert!(n >= quickack::NLMSG_HDR);
+            let seq6 = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+            let rtm6 = [quickack::AF_INET6, 64, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+            send(&peer, &nlmsg(RTM_NEWROUTE, NLM_F_MULTI, seq6, &rtm6)).unwrap();
+            send(
+                &peer,
+                &nlmsg(NLMSG_DONE, NLM_F_MULTI, seq6, &0i32.to_ne_bytes()),
+            )
+            .unwrap();
+
+            // 3) Only the complete IPv6 route must be replaced; the ENOMEM-aborted
+            //    IPv4 candidate must never be sent.
+            let n = recv(&peer, &mut buf).unwrap();
+            let kind = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+            let seq_rep = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+            assert_eq!(kind, RTM_NEWROUTE);
+            assert_eq!(buf[quickack::NLMSG_HDR], quickack::AF_INET6);
+            send(&peer, &nlmsg(NLMSG_ERROR, 0, seq_rep, &0i32.to_ne_bytes())).unwrap();
+            n
+        });
+
+        let mut seq = 0;
+        let mut buf = vec![0u8; 4096];
+        let out = apply(&client, &mut seq, &mut buf).expect("apply succeeds");
+        assert_eq!(out.seen, 1);
+        assert_eq!(
+            out.route_err.as_ref().and_then(io::Error::raw_os_error),
+            Some(libc::ENOMEM)
+        );
+        assert!(server.join().unwrap() > quickack::NLMSG_HDR);
     }
 }
