@@ -1,7 +1,9 @@
 //! The user-facing commands that talk to the daemon.
 
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -357,13 +359,16 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
             || vm.memory_mib != s.config.memory_mib
             || vm.requested_disk_gib() != saved_disk)
     {
+        let next_disk = if saved_disk > config::DEFAULT_DISK_GIB {
+            saved_disk.max(vm.disk_gib)
+        } else {
+            vm.disk_gib
+        };
         line(
             "pending",
             format!(
                 "{} CPUs · {} MiB · {} GiB disk after a restart",
-                s.config.cpus,
-                s.config.memory_mib,
-                saved_disk.max(vm.disk_gib)
+                s.config.cpus, s.config.memory_mib, next_disk
             ),
         );
     }
@@ -410,15 +415,90 @@ pub fn logs(args: LogsArgs) -> anyhow::Result<()> {
     }
 }
 
+const OFFLINE_CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+enum ConfigTarget {
+    Daemon(Client),
+    Offline(std::fs::File),
+}
+
+/// Either connect to the running daemon or acquire `<home>/run/katamaran.lock`
+/// exclusively so an offline config edit cannot race with a starting daemon or
+/// foreground `katamaran run` preparing/growing `data.img`.
+fn connect_or_lock_offline(
+    home: &Path,
+    sock: &Path,
+    wait: Duration,
+) -> anyhow::Result<ConfigTarget> {
+    if let Ok(c) = Client::connect(sock) {
+        return Ok(ConfigTarget::Daemon(c));
+    }
+    let run_dir = home.join("run");
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
+    let lock_path = run_dir.join("katamaran.lock");
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Ok(c) = Client::connect(sock) {
+            return Ok(ConfigTarget::Daemon(c));
+        }
+        if let Some(guard) = crate::run::try_lock(&lock_path)? {
+            return Ok(ConfigTarget::Offline(guard));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "another katamaran instance is running or starting ({}); retry once it is ready or stopped",
+                lock_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Apply `values` offline while holding `<home>/run/katamaran.lock`, or via
+/// daemon RPC if a daemon comes up while waiting for the lock.
+fn apply_config_set_at(
+    home: &Path,
+    sock: &Path,
+    values: std::collections::BTreeMap<String, String>,
+    k8s_opts_set: bool,
+    wait: Duration,
+) -> anyhow::Result<(bool, bool, Option<bool>)> {
+    match connect_or_lock_offline(home, sock, wait)? {
+        ConfigTarget::Daemon(mut c) => {
+            let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
+            let k8s_state = if k8s_opts_set && !v.k8s_toggled {
+                c.status().ok().map(|s| s.k8s.state)
+            } else {
+                None
+            };
+            let k8s_active = should_show_k8s_restart_hint(k8s_opts_set, &v, k8s_state.as_deref());
+            Ok((v.restart_required, k8s_active, None))
+        }
+        ConfigTarget::Offline(_lock) => {
+            let mut cfg = config::Config::load(home)?;
+            let host = config::Host::current();
+            cfg.apply_values(&values, &host, home)?;
+            cfg.save(home)?;
+            let launch_at_login = values
+                .contains_key("launch_at_login")
+                .then_some(cfg.launch_at_login);
+            Ok((false, false, launch_at_login))
+        }
+    }
+}
+
 pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
     // Settings work without a daemon too; the file is the source of truth.
-    let daemon = Client::connect(&client::socket_path()?).ok();
+    let home = crate::state_dir()?;
+    let sock = client::socket_path()?;
     match cmd {
         ConfigCmd::Get { key } => {
-            let cfg = match daemon {
+            let cfg = match Client::connect(&sock).ok() {
                 Some(mut c) => serde_json::from_value::<ConfigView>(c.call(&Call::ConfigGet)?)?
                     .resolved_config(),
-                None => config::Config::load(&crate::state_dir()?)?,
+                None => config::Config::load(&home)?,
             };
             match key {
                 Some(k) => println!("{}", cfg.get(&k)?),
@@ -435,31 +515,16 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
             let k8s_opts_set = ["k8s_disable", "k8s_args", "k8s_version"]
                 .iter()
                 .any(|k| values.contains_key(*k));
-            let (restart, k8s_restart) = match daemon {
-                Some(mut c) => {
-                    let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
-                    let k8s_state = if k8s_opts_set && !v.k8s_toggled {
-                        c.status().ok().map(|s| s.k8s.state)
-                    } else {
-                        None
-                    };
-                    (
-                        v.restart_required,
-                        should_show_k8s_restart_hint(k8s_opts_set, &v, k8s_state.as_deref()),
-                    )
-                }
-                None => {
-                    let home = crate::state_dir()?;
-                    let mut cfg = config::Config::load(&home)?;
-                    let host = config::Host::current();
-                    cfg.apply_values(&values, &host, &home)?;
-                    cfg.save(&home)?;
-                    if values.contains_key("launch_at_login") {
-                        crate::setup::set_run_at_load(cfg.launch_at_login, None)?;
-                    }
-                    (false, false)
-                }
-            };
+            let (restart, k8s_restart, launch_at_login) = apply_config_set_at(
+                &home,
+                &sock,
+                values,
+                k8s_opts_set,
+                OFFLINE_CONFIG_LOCK_WAIT,
+            )?;
+            if let Some(enabled) = launch_at_login {
+                crate::setup::set_run_at_load(enabled, None)?;
+            }
             println!("saved");
             if restart {
                 println!("`katamaran restart` applies it to the running VM");
@@ -643,6 +708,20 @@ mod tests {
             retained_cpu_text.contains("2 CPUs · 4096 MiB · 500 GiB disk after a restart"),
             "{retained_cpu_text}"
         );
+        // If another setting changes while retaining a smaller custom image
+        // under default disk_gib, pending keeps the smaller 8 GiB size.
+        let mut retained_small = s.clone();
+        retained_small.config.cpus = 2;
+        retained_small.config.memory_mib = 4096;
+        retained_small.disk_gib = Some(64);
+        retained_small.vm.as_mut().unwrap().disk_gib = 8;
+        retained_small.vm.as_mut().unwrap().requested_disk_gib = Some(64);
+        let retained_small_text = summary(&retained_small);
+        assert!(
+            retained_small_text.contains("2 CPUs · 4096 MiB · 8 GiB disk after a restart"),
+            "{retained_small_text}"
+        );
+
         assert!(
             !text.contains("k8s"),
             "default disabled k8s should be omitted: {text}"
@@ -755,5 +834,94 @@ mod tests {
         // When kubernetes actually toggled (daemon starts or stops k3s), suppress the hint.
         view.k8s_toggled = true;
         assert!(!should_show_k8s_restart_hint(true, &view, Some("running")));
+    }
+
+    #[test]
+    fn offline_config_set_serializes_with_katamaran_lock_and_starting_daemon() {
+        use std::os::unix::net::UnixListener;
+
+        let home = std::env::temp_dir().join(format!("kat-cli-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let run_dir = home.join("run");
+        let data_dir = home.join("data");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let sock = run_dir.join(api::SOCKET_NAME);
+        let lock_path = run_dir.join("katamaran.lock");
+
+        // Pre-existing 64 GiB image with saved target = 500 GiB (simulating a VM
+        // startup that has taken katamaran.lock before extending data.img).
+        std::fs::File::create(data_dir.join("data.img"))
+            .unwrap()
+            .set_len(64u64 << 30)
+            .unwrap();
+        let cfg = config::Config {
+            disk_gib: 500,
+            ..config::Config::default()
+        };
+        cfg.save(&home).unwrap();
+
+        let held_lock = crate::run::try_lock(&lock_path)
+            .unwrap()
+            .expect("acquire initial katamaran.lock");
+
+        let mut shrink = std::collections::BTreeMap::new();
+        shrink.insert("disk".into(), "200G".into());
+
+        // While katamaran.lock is held and no daemon socket is listening,
+        // offline config set MUST fail instead of racing the shrink check.
+        let err = apply_config_set_at(
+            &home,
+            &sock,
+            shrink.clone(),
+            false,
+            Duration::from_millis(80),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("katamaran.lock"),
+            "unexpected err: {err:#}"
+        );
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, 500);
+
+        // If the starting daemon binds daemon.sock while still holding
+        // katamaran.lock, connect_or_lock_offline switches over to Daemon(client).
+        let sock_for_thread = sock.clone();
+        let binder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let listener = UnixListener::bind(&sock_for_thread).unwrap();
+            let (_conn, _) = listener.accept().unwrap();
+        });
+        let target = connect_or_lock_offline(&home, &sock, Duration::from_secs(2)).unwrap();
+        assert!(matches!(target, ConfigTarget::Daemon(_)));
+        drop(target);
+        binder.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+
+        // Once katamaran.lock is released and data.img was extended to 500 GiB,
+        // offline config set acquires the lock and enforces the shrink check.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(data_dir.join("data.img"))
+            .unwrap()
+            .set_len(500u64 << 30)
+            .unwrap();
+        drop(held_lock);
+
+        let err = apply_config_set_at(&home, &sock, shrink, false, Duration::from_millis(80))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot shrink"),
+            "unexpected err: {err:#}"
+        );
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, 500);
+
+        // Growing offline while uncontended succeeds.
+        let mut grow = std::collections::BTreeMap::new();
+        grow.insert("disk".into(), "600G".into());
+        apply_config_set_at(&home, &sock, grow, false, Duration::from_millis(80)).unwrap();
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, 600);
+
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

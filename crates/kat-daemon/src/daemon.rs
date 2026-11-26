@@ -524,9 +524,13 @@ impl Daemon {
         let existing_gib = crate::config::data_disk_bytes(&self.home)
             .ok()
             .flatten()
-            .map(crate::config::bytes_to_gib)
-            .unwrap_or(0);
-        let initial_disk_gib = existing_gib.max(cfg.disk_gib);
+            .map(crate::config::bytes_to_gib);
+        let initial_disk_gib = match (existing_gib, args.disk_gib) {
+            (Some(cur), Some(target)) => cur.max(target),
+            (Some(cur), None) => cur,
+            (None, Some(target)) => target,
+            (None, None) => cfg.disk_gib,
+        };
         let prev_state = g.state;
         let prev_error = g.error.clone();
         g.generation += 1;
@@ -2290,6 +2294,14 @@ fn tail_lines(buf: &[u8], n: usize) -> &[u8] {
     buf
 }
 
+/// Disk growth target passed to `run::prepare_data_disk` for a daemon-managed
+/// VM. When `disk_gib` is at its default (`64`), omit an explicit growth target
+/// so a normal daemon boot never permanently expands an intentionally smaller
+/// `data.img` created by a foreground `katamaran run --data-template ...`.
+fn disk_growth_target(cfg: &Config) -> Option<u32> {
+    (cfg.disk_gib > crate::config::DEFAULT_DISK_GIB).then_some(cfg.disk_gib)
+}
+
 /// The VM's settings from the saved config, with the guest images found
 /// next to this executable.
 fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
@@ -2302,7 +2314,7 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
             p if p.is_file() => p,
             _ => guest.join("data.img.sparse"),
         },
-        disk_gib: Some(cfg.disk_gib),
+        disk_gib: disk_growth_target(cfg),
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
         cmdline: guest_cmdline(cfg),
@@ -4303,7 +4315,7 @@ mod tests {
             initramfs: PathBuf::from("initramfs.cpio"),
             rootfs: PathBuf::from("rootfs.erofs"),
             data_template: template.to_path_buf(),
-            disk_gib: Some(cfg.disk_gib),
+            disk_gib: disk_growth_target(cfg),
             cpus: cfg.cpus,
             memory_mib: cfg.memory_mib,
             cmdline: guest_cmdline(cfg),
@@ -4696,6 +4708,56 @@ mod tests {
         assert!(text.contains("data-disk: read-only filesystem"), "{text}");
         assert!(text.contains("docker     ready"), "{text}");
 
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn daemon_default_config_does_not_grow_smaller_foreground_image() {
+        let home = temp("small-foreground-disk");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        let small_bytes = 8u64 << 30;
+        fs::File::create(&img)
+            .unwrap()
+            .set_len(small_bytes)
+            .unwrap();
+
+        let d = Daemon::new(home.clone());
+        let (done_tx, done_rx) = mpsc::channel();
+        let img_for_vm = img.clone();
+        d.start_with(
+            |cfg| Ok(test_run_args(cfg, &img)),
+            move |daemon, generation, args, rx| {
+                assert_eq!(args.disk_gib, None);
+                thread::spawn(move || {
+                    let bytes =
+                        run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                            .unwrap();
+                    daemon.on_event(generation, Event::DiskPrepared { bytes });
+                    daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                    let _ = done_tx.send(());
+                    let _ = rx.recv();
+                    daemon.on_exit(generation, Ok(()));
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Image remains 8 GiB, status reports 8 GiB attached with no pending restart.
+        assert_eq!(fs::metadata(&img).unwrap().len(), small_bytes);
+        let status = d.status();
+        let vm = status.vm.as_ref().expect("running VM info");
+        assert_eq!(vm.disk_gib, 8);
+        assert_eq!(vm.requested_disk_gib, Some(crate::config::DEFAULT_DISK_GIB));
+        assert!(!d.config_view().unwrap().restart_required);
+        let text = crate::cli::summary(&status);
+        assert!(text.contains("8 GiB disk"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+
+        d.stop(true).unwrap();
         fs::remove_dir_all(&home).unwrap();
     }
 }

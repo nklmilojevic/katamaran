@@ -1208,17 +1208,39 @@ fn grow_data_disk(path: &Path, target_gib: u32) -> anyhow::Result<u64> {
     Ok(target_bytes)
 }
 
-/// Only one `katamaran run` may own the state directory at a time.
+/// Only one `katamaran run` or daemon may own the state directory at a time.
+/// Retries briefly on contention so a concurrent sub-millisecond offline
+/// `kat config set` holding the lock does not cause startup to fail.
 pub fn lock(path: &Path) -> anyhow::Result<File> {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        if let Some(f) = try_lock(path)? {
+            return Ok(f);
+        }
+        if Instant::now() >= deadline {
+            bail!("another katamaran is already running ({})", path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Non-blocking exclusive lock on `path`. Returns `Ok(None)` when another
+/// process holds the lock, and `Err` on I/O errors.
+pub fn try_lock(path: &Path) -> anyhow::Result<Option<File>> {
     let f = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path)?;
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another katamaran is already running ({})", path.display());
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
     }
-    Ok(f)
+    Ok(Some(f))
 }
 
 /// Block SIGINT, SIGTERM, SIGUSR1 and SIGUSR2 (simulated sleep and wake,
