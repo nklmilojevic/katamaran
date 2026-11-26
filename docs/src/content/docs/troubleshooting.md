@@ -143,8 +143,8 @@ kat logs --source console -n 200
 
 ```sh
 kat k8s reset
-# Or also clear cached k8s.io images:
-kat k8s reset --images
+# To also clear cached Kubernetes images, replace the preceding command with:
+# kat k8s reset --images
 kat k8s start
 ```
 

@@ -3,20 +3,19 @@
 //! The host opens one connection per request and sends one request frame
 //! (same framing as [`crate::Msg`], kinds 0x801–0x81f):
 //!
-//! | request          | then                                       | guest answers                               |
-//! |------------------|--------------------------------------------|---------------------------------------------|
-//! | `Status`         | –                                          | `StatusInfo`, or `Error`                    |
-//! | `Install`        | the `k3s` binary as `Data`..., `DataEnd`   | `Progress`…, then `Done` / `Error`          |
-//! | `Start`          | optional `extra_args`, `config_yaml`       | `Progress`…, then `StatusInfo` / `Error`    |
-//! | `Stop`           | –                                          | `Progress`…, then `Done` / `Error`          |
-//! | `Reset`          | –                                          | `Progress`…, then `Done` / `Error`          |
-//! |                  | (optional `images: u8` flag, 0 or 1)       |                                             |
-//! | `Kubeconfig`     | –                                          | `KubeconfigData`, or `Error`                |
-//! | `Connect`        | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
-//! | `SyncImages`     | –                                          | `Done`, or `Error`                          |
-//! | `Proxy`          | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
-//! | `MarkDatastoreVersion` | –                                    | `Done`, or `Error`                          |
-//! | `Capabilities`   | –                                          | `CapabilitiesInfo`, or `Error`              |
+//! | request                | then                                                                        | guest answers                                                                                                                   |
+//! |------------------------|-----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
+//! | `Status`               | –                                                                           | `StatusInfo`, or `Error`                                                                                                        |
+//! | `Install`              | the `k3s` binary as `Data`..., `DataEnd`                                    | `Progress`…, then `Done` / `Error`                                                                                              |
+//! | `Start`                | optional `extra_args`, `config_yaml`                                        | `Progress`…, then `StatusInfo` / `Error`                                                                                        |
+//! | `Stop`                 | –                                                                           | `Progress`…, then `Done` / `Error`                                                                                              |
+//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | `Progress`…, then `Done` / `Error` (with `images` = `1`: `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error`) |
+//! | `Kubeconfig`           | –                                                                           | `KubeconfigData`, or `Error`                                                                                                    |
+//! | `Connect`              | `Data`… (`DataEnd` closes the write side)                                   | `Done` then `Data`…, `DataEnd`; or `Error`                                                                                      |
+//! | `SyncImages`           | –                                                                           | `Done`, or `Error`                                                                                                              |
+//! | `Proxy`                | `Data`… (`DataEnd` closes the write side)                                   | `Done` then `Data`…, `DataEnd`; or `Error`                                                                                      |
+//! | `MarkDatastoreVersion` | –                                                                           | `Done`, or `Error`                                                                                                              |
+//! | `Capabilities`         | –                                                                           | `CapabilitiesInfo`, or `Error`                                                                                                  |
 
 use std::io::{self, Read, Write};
 
@@ -75,6 +74,14 @@ pub enum K8sMsg {
     Done,
     Error(String),
     Progress(String),
+    /// Emitted by compatible guests before mutating state on `Reset { images: true }`
+    /// so the host can distinguish an accepted reset from an older guest closing
+    /// the connection after rejecting the flag byte.
+    ResetAccepted,
+    /// Emitted by compatible guests after cluster data has been removed and before
+    /// image cleanup begins on `Reset { images: true }`, so the host can still
+    /// disable Kubernetes auto-start and report a partial outcome if image cleanup fails.
+    ResetDataCleared,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,6 +118,8 @@ mod kind {
     pub const MARK_DATASTORE_VERSION: u16 = 0x811;
     pub const CAPABILITIES: u16 = 0x812;
     pub const CAPABILITIES_INFO: u16 = 0x813;
+    pub const RESET_ACCEPTED: u16 = 0x814;
+    pub const RESET_DATA_CLEARED: u16 = 0x815;
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -211,6 +220,8 @@ impl K8sMsg {
                 put_str(b, p);
                 kind::PROGRESS
             }
+            K8sMsg::ResetAccepted => kind::RESET_ACCEPTED,
+            K8sMsg::ResetDataCleared => kind::RESET_DATA_CLEARED,
         };
         let len = (buf.len() - 4) as u32;
         buf[0..4].copy_from_slice(&len.to_le_bytes());
@@ -294,6 +305,8 @@ impl K8sMsg {
             kind::DONE => K8sMsg::Done,
             kind::ERROR => K8sMsg::Error(c.string()?),
             kind::PROGRESS => K8sMsg::Progress(c.string()?),
+            kind::RESET_ACCEPTED => K8sMsg::ResetAccepted,
+            kind::RESET_DATA_CLEARED => K8sMsg::ResetDataCleared,
             other => return Err(ProtoError::UnknownKind(other)),
         };
         if !c.buf.is_empty() {
@@ -1051,6 +1064,8 @@ mod tests {
             K8sMsg::Done,
             K8sMsg::Error("failed".into()),
             K8sMsg::Progress("starting k3s".into()),
+            K8sMsg::ResetAccepted,
+            K8sMsg::ResetDataCleared,
         ];
         let mut wire = Vec::new();
         for m in &msgs {
@@ -1109,6 +1124,8 @@ mod tests {
             K8sMsg::Done,
             K8sMsg::Error(String::new()),
             K8sMsg::Progress(String::new()),
+            K8sMsg::ResetAccepted,
+            K8sMsg::ResetDataCleared,
         ] {
             let f = m.encode();
             let k = u16::from_le_bytes([f[4], f[5]]);

@@ -238,6 +238,69 @@ pub fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow
     }
 }
 
+/// Read the guest's reply sequence for `K8sMsg::Reset`.
+///
+/// For `remove_images == true`, requires explicit `ResetAccepted` before
+/// marking `accepted = true` (so an older guest closing the connection after
+/// rejecting the trailing flag byte never triggers host teardown) and tracks
+/// `ResetDataCleared` separately from `Done` / `Error` (so the host can still
+/// disable Kubernetes auto-start if image cleanup fails after cluster data was
+/// erased).
+pub fn read_reset_answer(
+    s: &mut UnixStream,
+    remove_images: bool,
+    accepted: &mut bool,
+    data_deleted: &mut bool,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    loop {
+        match k8s::read(&mut *s)? {
+            Some(K8sMsg::ResetAccepted) if remove_images => {
+                *accepted = true;
+                progress("starting Kubernetes cluster reset");
+            }
+            Some(K8sMsg::ResetDataCleared) if remove_images => {
+                if !*accepted {
+                    bail!("unexpected ResetDataCleared before ResetAccepted");
+                }
+                *data_deleted = true;
+                progress("cluster data deleted");
+            }
+            Some(K8sMsg::Progress(p)) => {
+                if remove_images && !*accepted {
+                    bail!("unexpected Progress before ResetAccepted");
+                }
+                progress(&p);
+            }
+            Some(K8sMsg::Done) => {
+                if remove_images {
+                    if !*accepted {
+                        bail!("guest completed image reset without accepting it");
+                    }
+                    if !*data_deleted {
+                        bail!(
+                            "guest completed image reset without confirming cluster data deletion"
+                        );
+                    }
+                } else {
+                    *data_deleted = true;
+                }
+                return Ok(());
+            }
+            Some(K8sMsg::Error(e)) => bail!("{e}"),
+            Some(other) => bail!("unexpected k8s reset reply {other:?}"),
+            None => {
+                if remove_images && !*accepted {
+                    bail!(
+                        "the guest closed the Kubernetes connection before accepting the image reset (restart the VM to update the guest)"
+                    );
+                }
+                bail!("the guest closed the Kubernetes connection");
+            }
+        }
+    }
+}
+
 pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
     let mut noop = |_: &str| {};
     match request(home, &K8sMsg::Status, &mut noop)? {
@@ -1082,8 +1145,17 @@ fn merge_into_user_kubeconfig(
 /// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
 pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    remove_kubeconfig_for_user_home(home, user_home.as_deref(), ctx)
+}
+
+/// Like [`remove_kubeconfig`], using an explicit `user_home` instead of `$HOME`.
+pub fn remove_kubeconfig_for_user_home(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+) -> anyhow::Result<()> {
     let kubectl = resolve_kubectl_bin();
-    remove_kubeconfig_in(home, user_home.as_deref(), ctx, &kubectl)
+    remove_kubeconfig_in(home, user_home, ctx, &kubectl)
 }
 
 fn remove_kubeconfig_in(

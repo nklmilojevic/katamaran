@@ -201,7 +201,8 @@ impl Call {
             Call::MachineDefault { .. } => "machine.default",
             Call::K8sStart => "k8s.start",
             Call::K8sStop => "k8s.stop",
-            Call::K8sReset { .. } => "k8s.reset",
+            Call::K8sReset { images: false } => "k8s.reset",
+            Call::K8sReset { images: true } => "k8s.reset_images",
             Call::K8sKubeconfig => "k8s.kubeconfig",
             Call::K8sSyncImages => "k8s.sync_images",
             Call::K8sMarkVersion { .. } => "k8s.mark_version",
@@ -220,7 +221,6 @@ impl Call {
             | Call::MachineDelete { name }
             | Call::MachineDefault { name } => serde_json::json!({ "name": name }),
             Call::K8sMarkVersion { version } => serde_json::json!({ "version": version }),
-            Call::K8sReset { images } => serde_json::json!({ "images": images }),
             _ => Value::Null,
         }
     }
@@ -338,18 +338,16 @@ impl Call {
             }
             "k8s.start" => Call::K8sStart,
             "k8s.stop" => Call::K8sStop,
-            "k8s.reset" => {
+            m @ ("k8s.reset" | "k8s.reset_images") => {
                 #[derive(Deserialize, Default)]
                 #[serde(default, deny_unknown_fields)]
-                struct P {
-                    images: bool,
+                struct Empty {}
+                if !p.is_null() {
+                    let _: Empty = serde_json::from_value(p.clone()).map_err(bad)?;
                 }
-                let P { images } = if p.is_null() {
-                    P::default()
-                } else {
-                    serde_json::from_value(p.clone()).map_err(bad)?
-                };
-                Call::K8sReset { images }
+                Call::K8sReset {
+                    images: m == "k8s.reset_images",
+                }
             }
             "k8s.kubeconfig" => Call::K8sKubeconfig,
             "k8s.sync_images" => Call::K8sSyncImages,
@@ -707,8 +705,20 @@ mod tests {
             Call::K8sReset { images: false }
         );
         assert_eq!(
-            Call::parse(&req("k8s.reset", json!({"images": true}))).unwrap(),
+            Call::parse(&req("k8s.reset_images", Value::Null)).unwrap(),
             Call::K8sReset { images: true }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset_images", json!({}))).unwrap(),
+            Call::K8sReset { images: true }
+        );
+        assert_eq!(
+            Request::new(1, &Call::K8sReset { images: false }).method,
+            "k8s.reset"
+        );
+        assert_eq!(
+            Request::new(1, &Call::K8sReset { images: true }).method,
+            "k8s.reset_images"
         );
     }
 
@@ -719,11 +729,15 @@ mod tests {
         assert_eq!(code(req("stop", json!({"wait": "yes"}))), INVALID_PARAMS);
         assert_eq!(code(req("stop", json!({"force": true}))), INVALID_PARAMS);
         assert_eq!(
-            code(req("k8s.reset", json!({"images": "yes"}))),
+            code(req("k8s.reset", json!({"images": true}))),
             INVALID_PARAMS
         );
         assert_eq!(
             code(req("k8s.reset", json!({"force": true}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("k8s.reset_images", json!({"force": true}))),
             INVALID_PARAMS
         );
         assert_eq!(

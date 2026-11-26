@@ -276,7 +276,7 @@ kat k8s stop
 
 ### `kat k8s reset`
 
-Stop Kubernetes and delete all cluster state, workloads, and persistent volumes. Cached images in containerd's `k8s.io` namespace are kept by default so restarting Kubernetes does not re-pull them.
+Stop Kubernetes and delete all cluster state, workloads, and persistent volumes. Cached images in containerd's `k8s.io` namespace are kept by default so they remain available for reuse (subject to each workload's `imagePullPolicy`).
 
 ```sh
 kat k8s reset [--images]

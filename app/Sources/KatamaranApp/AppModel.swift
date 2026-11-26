@@ -19,7 +19,7 @@ final class AppModel {
     func observe(_ f: @escaping () -> Void) { observers.append(f) }
     private func changed() { observers.forEach { $0() } }
 
-    let daemon = DaemonClient(socketPath: DaemonClient.defaultSocket())
+    let daemon: DaemonClient
     var phase: Phase { Phase(status) }
     private var timer: Timer?
     /// Called once, after the first successful status (for the smoke test).
@@ -31,7 +31,9 @@ final class AppModel {
 
     static let shared = AppModel()
 
-    init() {
+    init(daemon: DaemonClient = DaemonClient(socketPath: DaemonClient.defaultSocket()), startPolling: Bool = true) {
+        self.daemon = daemon
+        guard startPolling else { return }
         refresh()
         // .common, so it keeps firing while the menu is tracking.
         let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
@@ -153,10 +155,15 @@ final class AppModel {
         perform("kubernetes") { _ = try d.call("k8s.start", timeout: 300) }
     }
 
-    func k8sReset(images: Bool = false) {
+    func k8sReset(images: Bool = false, idleTimeout: TimeInterval = 90, done: ((Bool) -> Void)? = nil) {
         let d = daemon
-        let params: [String: Any]? = images ? ["images": true] : nil
-        perform("kubernetes") { _ = try d.call("k8s.reset", params, timeout: 300) }
+        perform("kubernetes", done: done) {
+            if images {
+                _ = try d.callNotified("k8s.reset_images", idleTimeout: idleTimeout)
+            } else {
+                _ = try d.call("k8s.reset", timeout: 300)
+            }
+        }
     }
 
     func k8sSyncImages() {

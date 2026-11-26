@@ -26,8 +26,9 @@ pub enum K8sCmd {
     /// Stop Kubernetes and wipe all cluster state and persistent volumes.
     ///
     /// Cached images in containerd's `k8s.io` namespace are kept by default so
-    /// restarting Kubernetes does not re-pull them. Pass `--images` to also
-    /// clear all images in `k8s.io` (Docker's `moby` namespace is untouched).
+    /// they remain available for reuse (subject to each workload's
+    /// `imagePullPolicy`). Pass `--images` to also clear all images in `k8s.io`
+    /// (Docker's `moby` namespace is untouched).
     Reset {
         /// Also remove all images in containerd's `k8s.io` namespace.
         #[arg(long)]
@@ -175,7 +176,7 @@ fn stop() -> anyhow::Result<()> {
 
 fn reset(images: bool) -> anyhow::Result<()> {
     let mut c = Client::connect_default()?;
-    c.call(&Call::K8sReset { images })?;
+    reset_with_client(&mut c, images, &mut |msg| eprintln!("katamaran: {msg}"))?;
     if images {
         println!("katamaran: Kubernetes cluster reset (k8s.io images cleared)");
     } else {
@@ -202,6 +203,42 @@ fn mark_version(version: &str) -> anyhow::Result<()> {
     })?;
     println!("katamaran: recorded cluster datastore version {version}");
     Ok(())
+}
+
+fn reset_with_client(
+    client: &mut Client,
+    images: bool,
+    on_progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let mut last = String::new();
+    let mut on_note = |method: &str, params: &Value| {
+        if method == "k8s.progress"
+            && let Some(msg) = params.get("message").and_then(Value::as_str)
+            && last != msg
+        {
+            last.clear();
+            last.push_str(msg);
+            on_progress(msg);
+        }
+    };
+    let res = if images {
+        client.call_notified(&Call::K8sReset { images: true }, &mut on_note)
+    } else {
+        client.call(&Call::K8sReset { images: false })
+    };
+    match res {
+        Ok(_) => Ok(()),
+        Err(e)
+            if images
+                && e.downcast_ref::<crate::api::RpcError>()
+                    .is_some_and(|r| r.code == crate::api::METHOD_NOT_FOUND) =>
+        {
+            bail!(
+                "the running daemon does not support `kat k8s reset --images`; restart the daemon to upgrade"
+            )
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn kubeconfig(path_only: bool) -> anyhow::Result<()> {
@@ -457,5 +494,118 @@ mod tests {
 
         let with_images = Wrapper::try_parse_from(["k8s", "reset", "--images"]).unwrap();
         assert!(matches!(with_images.cmd, K8sCmd::Reset { images: true }));
+    }
+
+    #[test]
+    fn reset_images_fails_on_pre_feature_daemon_without_falling_back() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!("kat-cli-rc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_srv = seen.clone();
+
+        let srv = thread::spawn(move || {
+            // Simulate a pre-feature daemon that only implements `k8s.reset`.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+                seen_srv.lock().unwrap().push(req.method.clone());
+                let id = req.id.unwrap_or(Value::Null);
+                let resp = if req.method == "k8s.reset" {
+                    crate::api::Response::ok(id, Value::Null)
+                } else {
+                    crate::api::Response::err(
+                        id,
+                        crate::api::RpcError::new(
+                            crate::api::METHOD_NOT_FOUND,
+                            format!("unknown method {}", req.method),
+                        ),
+                    )
+                };
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+                line.clear();
+            }
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let err = reset_with_client(&mut client, true, &mut |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("does not support `kat k8s reset --images`"),
+            "unexpected error: {err:#}"
+        );
+        drop(client);
+        srv.join().unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec!["k8s.reset_images".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_images_consumes_and_deduplicates_progress_notifications() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!("kat-cli-rp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let srv = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "k8s.reset_images");
+            assert!(req.params.is_null());
+            let id = req.id.unwrap();
+            for msg in [
+                "removing cluster data",
+                "waiting for containerd garbage collection",
+                "waiting for containerd garbage collection",
+                "stopping temporary VM",
+            ] {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": msg }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let mut progress = Vec::new();
+        reset_with_client(&mut client, true, &mut |m| progress.push(m.to_string())).unwrap();
+        srv.join().unwrap();
+
+        assert_eq!(
+            progress,
+            vec![
+                "removing cluster data",
+                "waiting for containerd garbage collection",
+                "stopping temporary VM",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

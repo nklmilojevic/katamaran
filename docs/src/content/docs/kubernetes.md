@@ -43,7 +43,7 @@ To wipe all cluster state, workloads, and persistent volumes and start fresh:
 kat k8s reset
 ```
 
-By default, `kat k8s reset` keeps cached images in containerd's `k8s.io` namespace so restarting the cluster does not need to re-pull them. To also clear all images in `k8s.io` (for example, to benchmark cold starts or reproduce first-run image pulls) without touching Docker images in the `moby` namespace:
+By default, `kat k8s reset` keeps cached images in containerd's `k8s.io` namespace so they remain available for reuse on the next cluster start (subject to each workload's `imagePullPolicy`). To also clear all images in `k8s.io` (for example, to benchmark cold starts or reproduce first-run image pulls) without touching Docker images in the `moby` namespace:
 
 ```sh
 kat k8s reset --images

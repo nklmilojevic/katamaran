@@ -135,6 +135,78 @@ struct DaemonClient {
         return try JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])
     }
 
+    /// Like `call`, but consumes JSON-RPC notifications (such as `k8s.progress`)
+    /// until the terminal response for this request arrives, refreshing `idleTimeout`
+    /// on every received notification so healthy long-running operations do not time out.
+    func callNotified(
+        _ method: String,
+        _ params: [String: Any]? = nil,
+        idleTimeout: TimeInterval = 90,
+        onNotification: ((String, Any?) -> Void)? = nil
+    ) throws -> Data {
+        let requestId = 1
+        let maxLineBytes = 1 << 20
+        let sock = try UnixSocket(path: socketPath, timeout: idleTimeout)
+        var req: [String: Any] = ["jsonrpc": "2.0", "id": requestId, "method": method]
+        if let params { req["params"] = params }
+        var line = try JSONSerialization.data(withJSONObject: req)
+        line.append(0x0A)
+        try sock.write(line)
+
+        var buf = Data()
+        while true {
+            let lineData: Data
+            if let nl = buf.firstIndex(of: 0x0A) {
+                lineData = Data(buf[..<nl])
+                buf.removeSubrange(...nl)
+            } else {
+                let deadline = Date().addingTimeInterval(idleTimeout)
+                while true {
+                    let remaining = deadline.timeIntervalSinceNow
+                    if remaining <= 0 {
+                        throw SocketError.io(ETIMEDOUT)
+                    }
+                    sock.setTimeout(remaining)
+                    let chunk: Data
+                    do {
+                        chunk = try sock.read()
+                    } catch SocketError.io(let code) where code == EAGAIN || code == EWOULDBLOCK {
+                        throw SocketError.io(ETIMEDOUT)
+                    }
+                    if chunk.isEmpty { throw SocketError.closed }
+                    buf.append(chunk)
+                    if let nl = buf.firstIndex(of: 0x0A) {
+                        lineData = Data(buf[..<nl])
+                        buf.removeSubrange(...nl)
+                        break
+                    }
+                    if buf.count > maxLineBytes {
+                        throw SocketError.protocolError("response line too long")
+                    }
+                }
+            }
+            if lineData.allSatisfy({ $0 == 0x20 || $0 == 0x09 || $0 == 0x0D }) {
+                continue
+            }
+            guard let obj = try JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                throw SocketError.protocolError("bad response")
+            }
+            if obj["id"] == nil, let noteMethod = obj["method"] as? String {
+                onNotification?(noteMethod, obj["params"])
+                continue
+            }
+            if let err = obj["error"] as? [String: Any] {
+                throw SocketError.rpc(err["code"] as? Int ?? 0, err["message"] as? String ?? "error")
+            }
+            guard let respId = obj["id"] as? Int, respId == requestId else {
+                throw SocketError.protocolError("mismatched response id")
+            }
+            let result = obj["result"] ?? NSNull()
+            if result is NSNull { return Data("null".utf8) }
+            return try JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed])
+        }
+    }
+
     func decode<T: Decodable>(_ method: String, _ params: [String: Any]? = nil, timeout: TimeInterval = 10) throws -> T {
         try JSONDecoder().decode(T.self, from: call(method, params, timeout: timeout))
     }
