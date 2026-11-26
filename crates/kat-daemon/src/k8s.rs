@@ -998,16 +998,28 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn drain_nonblocking<R: Read>(stream: &mut Option<R>, buf: &mut Vec<u8>, cap: usize) {
+/// Attempt at most `max_reads` non-blocking reads from `stream`, capturing up
+/// to `cap` total bytes in `buf` while discarding excess output so a noisy
+/// child cannot block on a full pipe.
+///
+/// Returns `true` when the per-pass read budget is exhausted before hitting
+/// `WouldBlock` or EOF, signaling the caller to re-check deadlines/heartbeats
+/// and alternate with the other pipe before draining again.
+fn drain_nonblocking<R: Read>(
+    stream: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    cap: usize,
+    max_reads: usize,
+) -> bool {
     let Some(r) = stream.as_mut() else {
-        return;
+        return false;
     };
     let mut chunk = [0u8; 4096];
-    loop {
+    for _ in 0..max_reads {
         match r.read(&mut chunk) {
             Ok(0) => {
                 *stream = None;
-                return;
+                return false;
             }
             Ok(n) => {
                 let room = cap.saturating_sub(buf.len());
@@ -1016,13 +1028,14 @@ fn drain_nonblocking<R: Read>(stream: &mut Option<R>, buf: &mut Vec<u8>, cap: us
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
             Err(_) => {
                 *stream = None;
-                return;
+                return false;
             }
         }
     }
+    true
 }
 
 fn run_kubectl_with_deadline(
@@ -1062,13 +1075,16 @@ fn run_kubectl_with_deadline(
         return Err(e);
     }
     const MAX_CAPTURE: usize = 256 << 10;
+    const MAX_READS_PER_PASS: usize = 16;
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
     let mut last_beat = Instant::now();
 
     let status = loop {
-        drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE);
-        drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE);
+        let more_out =
+            drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        let more_err =
+            drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -1084,6 +1100,9 @@ fn run_kubectl_with_deadline(
         if last_beat.elapsed() >= heartbeat {
             progress("cleaning up kubeconfig");
             last_beat = Instant::now();
+        }
+        if more_out || more_err {
+            continue;
         }
         let mut pfds = [
             libc::pollfd {
@@ -1108,8 +1127,27 @@ fn run_kubectl_with_deadline(
             thread::sleep(Duration::from_millis(step_ms as u64));
         }
     };
-    drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE);
-    drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE);
+    // Collect any remaining already-buffered output produced before the direct
+    // child exited, bounded by both `MAX_CAPTURE` and `deadline` so a
+    // descendant holding an inherited pipe open cannot hold cleanup open.
+    loop {
+        let drain_out = stdout.is_some() && out_buf.len() < MAX_CAPTURE;
+        let drain_err = stderr.is_some() && err_buf.len() < MAX_CAPTURE;
+        if !drain_out && !drain_err {
+            break;
+        }
+        let more_out = drain_out
+            && drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        let more_err = drain_err
+            && drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        if (!more_out && !more_err) || Instant::now() >= deadline {
+            break;
+        }
+        if last_beat.elapsed() >= heartbeat {
+            progress("cleaning up kubeconfig");
+            last_beat = Instant::now();
+        }
+    }
     Ok(std::process::Output {
         status,
         stdout: out_buf,
@@ -2522,5 +2560,135 @@ users:
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remove_kubeconfig_bounded_enforces_deadline_on_noisy_kubectl_and_inherited_pipes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "kat-k8s-noisy-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = base.join("h");
+        let user = base.join("u");
+        let kube = user.join(".kube");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kube).unwrap();
+        let cfg = kube.join("config");
+        fs::write(&cfg, "apiVersion: v1\nkind: Config\n").unwrap();
+
+        // 1. Continuous stdout flood well beyond MAX_CAPTURE: must still hit the
+        //    deadline, emit heartbeats, return a timeout, and release the shared lock.
+        let flood_stdout = base.join("kubectl-flood-out");
+        fs::write(
+            &flood_stdout,
+            "#!/bin/sh\nexec yes \"noisy kubectl stdout line 0123456789abcdef0123456789abcdef\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&flood_stdout, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = remove_kubeconfig_bounded(
+            &home,
+            Some(&user),
+            "katamaran",
+            Some(&flood_stdout),
+            Duration::from_millis(200),
+            Duration::from_millis(40),
+            &mut |m| beats.push(m.to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "noisy stdout bypassed cleanup deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected timeout error, got: {err:#}"
+        );
+        assert!(
+            beats
+                .iter()
+                .filter(|m| m.as_str() == "cleaning up kubeconfig")
+                .count()
+                >= 1,
+            "expected heartbeat during continuous output, got: {beats:?}"
+        );
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(kube.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "kubeconfig lock must be released after noisy kubectl timeout"
+        );
+        drop(lock_file);
+
+        // 2. Continuous stderr flood well beyond MAX_CAPTURE: also hits deadline and
+        //    releases the lock.
+        let flood_stderr = base.join("kubectl-flood-err");
+        fs::write(
+            &flood_stderr,
+            "#!/bin/sh\nexec 1>&2\nexec yes \"noisy kubectl stderr line 0123456789abcdef0123456789abcdef\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&flood_stderr, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let err = remove_kubeconfig_bounded(
+            &home,
+            Some(&user),
+            "katamaran",
+            Some(&flood_stderr),
+            Duration::from_millis(200),
+            Duration::from_millis(40),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "noisy stderr bypassed cleanup deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected timeout error, got: {err:#}"
+        );
+
+        // 3. Direct kubectl child exits cleanly while leaving a descendant holding
+        //    inherited stdout/stderr open and flooding output: post-exit drain must
+        //    stay bounded and complete promptly without waiting for the descendant.
+        let leaked_pipe = base.join("kubectl-leaked-pipe");
+        fs::write(
+            &leaked_pipe,
+            "#!/bin/sh\nif [ \"$2\" = \"current-context\" ]; then\n  printf 'other\\n'\nfi\n(yes \"descendant pipe flood 0123456789abcdef\" 2>&1) &\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&leaked_pipe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        remove_kubeconfig_bounded(
+            &home,
+            Some(&user),
+            "katamaran",
+            Some(&leaked_pipe),
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "inherited pipe descendant held cleanup open: {:?}",
+            started.elapsed()
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

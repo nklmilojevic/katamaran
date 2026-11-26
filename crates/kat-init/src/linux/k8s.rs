@@ -2725,46 +2725,29 @@ impl K8s {
             &K8sMsg::Progress("removing cluster data".into()),
         );
         unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
-        if Path::new(DATA_DIR).exists() {
-            // Try btrfs subvolume delete first (instant if it is a subvolume),
-            // falling back to recursive removal. Send periodic progress during
-            // both so large cluster-data directories do not trip idle timeouts.
-            let mut cmd = Command::new("/sbin/btrfs");
-            cmd.args(["subvolume", "delete", DATA_DIR]);
-            let mut beat = || {
-                let _ = k8s::write(
-                    &mut *conn,
-                    &K8sMsg::Progress("removing cluster data".into()),
+        remove_cluster_data_dirs(
+            Path::new(DATA_DIR),
+            Path::new(LEGACY_KUBELET_DIR),
+            Path::new(KUBECONFIG),
+            Path::new(K3S_CONFIG_PATH),
+            |data_dir, beat| {
+                let mut cmd = Command::new("/sbin/btrfs");
+                cmd.args(["subvolume", "delete"]);
+                cmd.arg(data_dir);
+                let _ = run_reaped_split_checked(
+                    &self.reaper,
+                    &mut cmd,
+                    Duration::from_secs(30),
+                    64 << 10,
+                    false,
+                    Some(beat),
                 );
-            };
-            let _ = run_reaped_split_checked(
-                &self.reaper,
-                &mut cmd,
-                Duration::from_secs(30),
-                64 << 10,
-                false,
-                Some(&mut beat),
-            );
-            if Path::new(DATA_DIR).exists() {
-                remove_dir_all_with_progress(
-                    Path::new(DATA_DIR),
-                    PROGRESS_HEARTBEAT_INTERVAL,
-                    &mut |m| {
-                        let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
-                    },
-                )?;
-            }
-        }
-        if Path::new(LEGACY_KUBELET_DIR).exists() {
-            remove_dir_all_with_progress(
-                Path::new(LEGACY_KUBELET_DIR),
-                PROGRESS_HEARTBEAT_INTERVAL,
-                &mut |m| {
-                    let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
-                },
-            )?;
-        }
-        let _ = fs::remove_file(KUBECONFIG);
+            },
+            PROGRESS_HEARTBEAT_INTERVAL,
+            &mut |m| {
+                let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
+            },
+        )?;
         if remove_images {
             k8s::write(&mut *conn, &K8sMsg::ResetDataCleared)
                 .map_err(|e| format!("send reset data-cleared ack: {e}"))?;
@@ -3416,6 +3399,36 @@ fn run_reaped_split(
 ) -> io::Result<(i32, String, String)> {
     let out = run_reaped_split_checked(reaper, cmd, timeout, 1 << 20, false, None)?;
     Ok((out.code, out.stdout, out.stderr))
+}
+
+fn remove_cluster_data_dirs(
+    data_dir: &Path,
+    legacy_kubelet_dir: &Path,
+    kubeconfig: &Path,
+    k3s_config: &Path,
+    mut try_btrfs_delete: impl FnMut(&Path, &mut dyn FnMut()),
+    heartbeat_interval: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    // Remove the legacy pre-migration kubelet directory before deleting
+    // `data_dir` so a failure here leaves active cluster state untouched
+    // and cannot occur after `data_dir` is deleted but before `ResetDataCleared`.
+    if legacy_kubelet_dir.exists() {
+        remove_dir_all_with_progress(legacy_kubelet_dir, heartbeat_interval, progress)?;
+    }
+    if data_dir.exists() {
+        // Try btrfs subvolume delete first (instant if it is a subvolume),
+        // falling back to recursive removal. Send periodic progress during
+        // both so large cluster-data directories do not trip idle timeouts.
+        let mut beat = || progress("removing cluster data");
+        try_btrfs_delete(data_dir, &mut beat);
+        if data_dir.exists() {
+            remove_dir_all_with_progress(data_dir, heartbeat_interval, progress)?;
+        }
+    }
+    let _ = fs::remove_file(kubeconfig);
+    let _ = fs::remove_file(k3s_config);
+    Ok(())
 }
 
 fn remove_dir_all_with_progress(
@@ -9192,5 +9205,71 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             err.contains("ctr leases delete --sync (k8s.io) failed: gc timed out"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn remove_cluster_data_dirs_clears_legacy_kubelet_before_data_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "kat-init-reset-order-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let data_dir = base.join("data");
+        let legacy_dir = base.join("legacy-kubelet");
+        let kubeconfig = base.join("kubeconfig.yaml");
+        let k3s_cfg = base.join("config.yaml");
+        fs::create_dir_all(data_dir.join("server")).unwrap();
+        fs::write(data_dir.join("server/state.db"), b"state").unwrap();
+        fs::write(&kubeconfig, b"kubeconfig").unwrap();
+        fs::write(&k3s_cfg, b"config").unwrap();
+
+        // When legacy kubelet cleanup fails (a regular file triggers ENOTDIR even
+        // under uid 0), active `data_dir` and config files must stay untouched.
+        fs::write(&legacy_dir, b"not-a-directory").unwrap();
+        let mut btrfs_called = false;
+        let err = remove_cluster_data_dirs(
+            &data_dir,
+            &legacy_dir,
+            &kubeconfig,
+            &k3s_cfg,
+            |_, _| btrfs_called = true,
+            Duration::from_millis(50),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("remove"), "{err}");
+        assert!(
+            !btrfs_called,
+            "must not touch data_dir after legacy failure"
+        );
+        assert!(data_dir.join("server/state.db").is_file());
+        assert!(kubeconfig.is_file());
+        assert!(k3s_cfg.is_file());
+
+        // Replace with a normal legacy directory: legacy cleanup completes BEFORE
+        // `data_dir` deletion starts, then all paths are cleared.
+        fs::remove_file(&legacy_dir).unwrap();
+        fs::create_dir_all(legacy_dir.join("pods")).unwrap();
+        let mut saw_legacy_gone_before_data_delete = false;
+        remove_cluster_data_dirs(
+            &data_dir,
+            &legacy_dir,
+            &kubeconfig,
+            &k3s_cfg,
+            |dir, _| {
+                assert_eq!(dir, data_dir.as_path());
+                saw_legacy_gone_before_data_delete = !legacy_dir.exists();
+            },
+            Duration::from_millis(50),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(saw_legacy_gone_before_data_delete);
+        assert!(!legacy_dir.exists());
+        assert!(!data_dir.exists());
+        assert!(!kubeconfig.exists());
+        assert!(!k3s_cfg.exists());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

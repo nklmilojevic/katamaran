@@ -3357,6 +3357,22 @@ mod tests {
             err2.message
         );
         assert!(err2.message.contains("timed out"), "got: {}", err2.message);
+        // Verify both the shared kubeconfig lock and the daemon's k8s_op lock were released.
+        let lock2 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(kube2.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "kubeconfig lock must be released after kubectl timeout"
+        );
+        drop(lock2);
+        assert!(
+            d2.k8s_op.try_lock().is_ok(),
+            "k8s_op lock must be released after kubectl timeout"
+        );
         fs::remove_dir_all(&root2).unwrap();
     }
 
