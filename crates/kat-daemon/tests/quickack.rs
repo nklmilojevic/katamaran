@@ -58,14 +58,15 @@ while True:
     threading.Thread(target=handle, args=(c,), daemon=True).start()
 "#;
 
-/// Keep-alive client that issues `count` consecutive requests on a single TCP
-/// connection to `host:8080`, verifies each 10 KiB body, and prints
-/// `<p50_ms> <total_ms>` to stdout.
+/// Keep-alive client that opens ONE persistent TCP connection to `host:8080`,
+/// reads burst counts from stdin (one integer per line), runs that many
+/// consecutive split-write requests on the SAME established socket, and prints
+/// `<p50_ms> <total_ms>` flushed after each burst. Passing an optional count
+/// on argv runs a single burst and exits.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
 import socket, sys, time
 
 host = sys.argv[1]
-count = int(sys.argv[2])
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
 def recv_exact(sock, n, buf):
@@ -79,26 +80,38 @@ def recv_exact(sock, n, buf):
 sock = socket.create_connection((host, 8080), timeout=10)
 sock.settimeout(10)
 buf = b""
-times_ms = []
-t_all = time.monotonic()
-for _ in range(count):
-    t0 = time.monotonic()
-    sock.sendall(req)
-    while b"\r\n\r\n" not in buf:
-        chunk = sock.recv(65536)
-        if not chunk:
-            raise RuntimeError("unexpected EOF in headers")
-        buf += chunk
-    hdr, buf = buf.split(b"\r\n\r\n", 1)
-    assert b"200 OK" in hdr, hdr
-    body, buf = recv_exact(sock, 10240, buf)
-    assert len(body) == 10240
-    times_ms.append((time.monotonic() - t0) * 1000.0)
-total_ms = (time.monotonic() - t_all) * 1000.0
+
+def run_burst(count):
+    global buf
+    times_ms = []
+    t_all = time.monotonic()
+    for _ in range(count):
+        t0 = time.monotonic()
+        sock.sendall(req)
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("unexpected EOF in headers")
+            buf += chunk
+        hdr, buf = buf.split(b"\r\n\r\n", 1)
+        assert b"200 OK" in hdr, hdr
+        body, buf = recv_exact(sock, 10240, buf)
+        assert len(body) == 10240
+        times_ms.append((time.monotonic() - t0) * 1000.0)
+    total_ms = (time.monotonic() - t_all) * 1000.0
+    times_ms.sort()
+    p50 = times_ms[len(times_ms) // 2]
+    print(f"{p50:.3f} {total_ms:.3f}", flush=True)
+
+if len(sys.argv) > 2:
+    run_burst(int(sys.argv[2]))
+else:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        run_burst(int(line))
 sock.close()
-times_ms.sort()
-p50 = times_ms[len(times_ms) // 2]
-print(f"{p50:.3f} {total_ms:.3f}")
 "#;
 
 fn root() -> PathBuf {
@@ -464,35 +477,51 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         .success()
     });
 
-    // 1) Pod-to-pod split-write keep-alive (25 requests on one connection).
-    //    With quickack active, each request completes in < 1 ms; without it,
-    //    delayed ACK stalls each request for ~40–50 ms (~1000–1250 ms total).
-    let pod_out = ok(
-        &kubectl(
-            &kubeconfig,
-            &[
+    // 1) Open ONE persistent keep-alive TCP connection from qa-probe to qa-peer
+    //    and exercise three bursts on that exact established socket:
+    //    - quickack=Y (default): fast (< 1 ms/req, no delayed-ACK stall)
+    //    - toggle kat.quickack=0 at runtime: ALREADY-ESTABLISHED socket
+    //      immediately hits the ~40–50 ms delayed-ACK stall
+    //    - toggle kat.quickack=1 at runtime: SAME established socket
+    //      immediately returns to < 1 ms/req
+    let mut client = ChildGuard(
+        Command::new("kubectl")
+            .arg("--kubeconfig")
+            .arg(&kubeconfig)
+            .args([
                 "exec",
+                "-i",
                 "qa-probe",
                 "--",
                 "python3",
                 "-c",
                 KEEP_ALIVE_CLIENT_PY,
                 &peer_ip,
-                "25",
-            ],
-        ),
-        "pod-to-pod split-write keep-alive",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("start persistent keep-alive client in qa-probe"),
     );
-    let (pod_p50, pod_total) = parse_latencies(&pod_out, "pod-to-pod keep-alive");
+    let mut client_in = client.0.stdin.take().unwrap();
+    let mut client_out = BufReader::new(client.0.stdout.take().unwrap());
+    let mut burst = |count: usize, what: &str| -> (f64, f64) {
+        writeln!(client_in, "{count}").expect("write burst count");
+        client_in.flush().expect("flush burst count");
+        let mut line = String::new();
+        let n = client_out.read_line(&mut line).expect("read burst result");
+        assert!(n > 0, "{what}: persistent client closed early");
+        parse_latencies(&line, what)
+    };
+
+    let (pod_p50, pod_total) = burst(25, "pod-to-pod keep-alive (quickack=Y)");
     eprintln!("pod-to-pod keep-alive (quickack=Y): p50={pod_p50:.2}ms total={pod_total:.2}ms");
     assert!(
         pod_p50 < 15.0 && pod_total < 400.0,
         "pod-to-pod keep-alive stalled (p50={pod_p50:.2}ms total={pod_total:.2}ms)"
     );
 
-    // 2) Verify toggling kat.quickack=0 reproduces the 40–50 ms stall on the
-    //    same fixture (confirming the test is non-vacuous) and restoring 1
-    //    eliminates it again.
     {
         let restore = QuickackRestoreGuard {
             docker_host: docker_host.clone(),
@@ -513,30 +542,29 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             ),
             "disable kat.quickack",
         );
-        let off_out = ok(
-            &kubectl(
-                &kubeconfig,
-                &[
-                    "exec",
-                    "qa-probe",
-                    "--",
-                    "python3",
-                    "-c",
-                    KEEP_ALIVE_CLIENT_PY,
-                    &peer_ip,
-                    "8",
-                ],
-            ),
-            "pod-to-pod keep-alive with quickack=0",
+        // Same already-established socket immediately observes quickack=0.
+        let (off_p50, off_total) = burst(8, "established pod keep-alive (quickack=N)");
+        eprintln!(
+            "pod-to-pod established keep-alive (quickack=N): p50={off_p50:.2}ms total={off_total:.2}ms"
         );
-        restore.restore();
-        let (off_p50, off_total) = parse_latencies(&off_out, "quickack=0 keep-alive");
-        eprintln!("pod-to-pod keep-alive (quickack=N): p50={off_p50:.2}ms total={off_total:.2}ms");
         assert!(
             off_p50 >= 25.0,
-            "expected delayed-ACK stall with quickack=0 (got p50={off_p50:.2}ms total={off_total:.2}ms)"
+            "expected delayed-ACK stall on established socket with quickack=0 (got p50={off_p50:.2}ms total={off_total:.2}ms)"
+        );
+
+        restore.restore();
+        // Same already-established socket immediately observes quickack=1 again.
+        let (on_p50, on_total) = burst(15, "established pod keep-alive restored (quickack=Y)");
+        eprintln!(
+            "pod-to-pod established keep-alive restored (quickack=Y): p50={on_p50:.2}ms total={on_total:.2}ms"
+        );
+        assert!(
+            on_p50 < 15.0 && on_total < 300.0,
+            "established socket stayed stalled after restoring quickack=1 (p50={on_p50:.2}ms total={on_total:.2}ms)"
         );
     }
+    drop(client_in);
+    drop(client);
 
     // 3) Root namespace (`--network host`) to bridged Docker container over
     //    `docker0`: verifies root bridge dsts get quickack without mutating

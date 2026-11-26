@@ -10,18 +10,45 @@ ACK while the peer in pingpong mode delays it.
 Setting RTAX_QUICKACK=1 by rewriting live routes from userspace has
 inherent TOCTOU races with Docker/CNI gateway updates and root route
 switches, and drops hidden IPv6 kernel flags and expiry state on replace.
-Instead, set icsk->icsk_ack.dst_quick_ack in sk_setup_caps() when the
-socket's resolved dst uses a non-init network namespace (Docker
-containers, Kubernetes pods, LXC machines) or a local bridge/veth device
-in init_net (cni0, docker0, br-*, katbr0), leaving the virtio-net uplink
-(eth0) and all routing tables untouched.
+Instead, record dst eligibility in a spare bit of icsk_ack
+(kat_quick_ack) inside sk_setup_caps() when a TCP socket's resolved dst
+uses a non-init network namespace (Docker containers, Kubernetes pods,
+LXC machines) or a local bridge/veth device in init_net (cni0, docker0,
+br-*, katbr0), leaving the virtio-net uplink (eth0) and all routing
+tables untouched.
 
-Explicit locked route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected.
-Disable at boot with kat.quickack=0 or at runtime via
-/sys/module/kat/parameters/quickack.
+tcp_in_quickack_mode() checks (icsk_ack.kat_quick_ack &&
+READ_ONCE(kat_quickack_enabled)) alongside dst_quick_ack, so toggling
+/sys/module/kat/parameters/quickack at runtime takes effect immediately
+for already-established sockets as well as new ones without affecting
+routes that explicitly set RTAX_QUICKACK=1. Explicit locked route
+metrics (RTAX_LOCK on RTAX_QUICKACK) are respected. Disable at boot with
+kat.quickack=0.
 
 SPDX-License-Identifier: GPL-2.0
 ---
+diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -119,7 +119,8 @@
+ 		__u32		  ato:ATO_BITS,	 /* Predicted tick of soft clock	   */
+ 				  lrcv_flowlabel:20, /* last received ipv6 flowlabel	   */
+ 				  dst_quick_ack:1, /* cache dst RTAX_QUICKACK		   */
+-				  unused:3;
++				  kat_quick_ack:1, /* eligible local container/bridge dst  */
++				  unused:2;
+ 		__u32		  lrcvtime;	 /* timestamp of last received data packet */
+ 		__u16		  last_seg_size; /* Size of last incoming segment	   */
+ 		__u16		  rcv_mss;	 /* MSS used for delayed ACK decisions	   */
+@@ -273,6 +274,8 @@
+ struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
+ 				      struct request_sock *req,
+ 				      struct sock *child);
++extern bool kat_quickack_enabled;
++
+ bool inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
+ 				   unsigned long timeout);
+ struct sock *inet_csk_complete_hashdance(struct sock *sk, struct sock *child,
 diff -ruN a/net/core/sock.c b/net/core/sock.c
 --- a/net/core/sock.c
 +++ b/net/core/sock.c
@@ -33,18 +60,17 @@ diff -ruN a/net/core/sock.c b/net/core/sock.c
  #include <net/request_sock.h>
  #include <net/sock.h>
  #include <net/proto_memory.h>
-@@ -2608,6 +2609,22 @@
+@@ -2608,6 +2609,21 @@
  	return max_size - (MAX_TCP_HEADER + 1);
  }
  
-+static bool kat_quickack_enabled = true;
++bool kat_quickack_enabled __read_mostly = true;
++EXPORT_SYMBOL_GPL(kat_quickack_enabled);
 +__module_param_call("kat.", quickack, &param_ops_bool,
 +		    &kat_quickack_enabled, 0644, -1, 0);
 +
 +static bool kat_dev_wants_quickack(const struct net_device *dev)
 +{
-+	if (!READ_ONCE(kat_quickack_enabled))
-+		return false;
 +	if (!net_eq(dev_net(dev), &init_net))
 +		return true;
 +	if (netif_is_bridge_master(dev))
@@ -56,18 +82,25 @@ diff -ruN a/net/core/sock.c b/net/core/sock.c
  void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
  {
  	const struct net_device *dev;
-@@ -2618,9 +2635,13 @@
- 	sk->sk_route_caps = dev->features;
- 	if (sk_is_tcp(sk)) {
- 		struct inet_connection_sock *icsk = inet_csk(sk);
-+		bool quick_ack = dst_metric(dst, RTAX_QUICKACK);
+@@ -2621,6 +2637,9 @@
  
  		sk->sk_route_caps |= NETIF_F_GSO;
--		icsk->icsk_ack.dst_quick_ack = dst_metric(dst, RTAX_QUICKACK);
-+		if (!quick_ack && !dst_metric_locked(dst, RTAX_QUICKACK) &&
-+		    kat_dev_wants_quickack(dev))
-+			quick_ack = true;
-+		icsk->icsk_ack.dst_quick_ack = quick_ack;
+ 		icsk->icsk_ack.dst_quick_ack = dst_metric(dst, RTAX_QUICKACK);
++		icsk->icsk_ack.kat_quick_ack =
++			!dst_metric_locked(dst, RTAX_QUICKACK) &&
++			kat_dev_wants_quickack(dev);
  	}
  	if (sk->sk_route_caps & NETIF_F_GSO)
  		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
+diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -338,6 +338,8 @@
+ 	const struct inet_connection_sock *icsk = inet_csk(sk);
+ 
+ 	return icsk->icsk_ack.dst_quick_ack ||
++		(icsk->icsk_ack.kat_quick_ack &&
++		 READ_ONCE(kat_quickack_enabled)) ||
+ 		(icsk->icsk_ack.quick && !inet_csk_in_pingpong_mode(sk));
+ }
+ 
