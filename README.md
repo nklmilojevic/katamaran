@@ -182,7 +182,7 @@ kat config set cpus=8 memory=12G pause_on_sleep=on
 kat restart
 ```
 
-Settings live in `~/.katamaran/config.toml` and take effect at the next VM start, except `launch_at_login` and `kubernetes` (which apply immediately) and `k8s_version`, `k8s_disable`, and `k8s_args` (which apply at the next Kubernetes start, without a VM restart).
+Settings live in `~/.katamaran/config.toml` and take effect at the next VM start, except `launch_at_login` and `kubernetes` (which apply immediately) and `k8s_version`, `k8s_disable`, and `k8s_args` (which apply at the next Kubernetes start without a VM restart once the VM is running a current guest image).
 
 | Key | Default | Description |
 |---|---|---|
