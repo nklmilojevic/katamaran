@@ -10,6 +10,8 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use super::sys;
 
@@ -17,6 +19,9 @@ const BINFMT_MISC: &str = "/proc/sys/fs/binfmt_misc";
 const ROSETTA_TAG: &str = "rosetta";
 const ROSETTA_DIR: &str = "/run/rosetta";
 const QEMU: &str = "/usr/bin/qemu-x86_64";
+
+/// Set once [`setup`] has successfully registered an x86-64 binfmt_misc handler.
+static REGISTERED: OnceLock<Emulator> = OnceLock::new();
 
 /// An x86-64 ELF executable: class 64-bit, little endian, `e_type` EXEC or
 /// DYN, `e_machine` 0x3e. The mask ignores the OS ABI and padding bytes.
@@ -80,7 +85,23 @@ pub fn setup(cmdline: &str) -> io::Result<()> {
     fs::write(
         format!("{BINFMT_MISC}/register"),
         registration(emulator.name(), &interpreter),
-    )
+    )?;
+    let _ = REGISTERED.set(emulator);
+    Ok(())
+}
+
+/// Whether an x86-64 emulator was successfully registered at boot and its
+/// `binfmt_misc` handler is currently enabled.
+pub fn is_registered() -> bool {
+    REGISTERED
+        .get()
+        .is_some_and(|emu| binfmt_handler_enabled(Path::new(BINFMT_MISC), emu.name()))
+}
+
+fn binfmt_handler_enabled(binfmt_dir: &Path, name: &str) -> bool {
+    fs::read_to_string(binfmt_dir.join("status")).is_ok_and(|s| s.trim() == "enabled")
+        && fs::read_to_string(binfmt_dir.join(name))
+            .is_ok_and(|s| s.lines().next().map(str::trim) == Some("enabled"))
 }
 
 /// `:name:M:offset:magic:mask:interpreter:flags`, with magic and mask
@@ -126,5 +147,47 @@ mod tests {
         assert_eq!(fields[5].len(), 20 * 4);
         assert_eq!(MAGIC.len(), MASK.len());
         assert!(MAGIC.iter().zip(MASK).all(|(m, k)| m & k == *m));
+    }
+
+    #[test]
+    fn checks_binfmt_handler_and_global_status() {
+        let dir = std::env::temp_dir().join(format!("kat-amd64-binfmt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Missing status and handler files -> disabled.
+        assert!(!binfmt_handler_enabled(&dir, "rosetta"));
+
+        // Enabled global status and handler -> enabled.
+        fs::write(dir.join("status"), "enabled\n").unwrap();
+        fs::write(
+            dir.join("rosetta"),
+            "enabled\ninterpreter /run/rosetta/rosetta\nflags: POCF\n",
+        )
+        .unwrap();
+        assert!(binfmt_handler_enabled(&dir, "rosetta"));
+        assert!(!binfmt_handler_enabled(&dir, "qemu-x86_64"));
+
+        // Handler disabled -> disabled.
+        fs::write(
+            dir.join("rosetta"),
+            "disabled\ninterpreter /run/rosetta/rosetta\n",
+        )
+        .unwrap();
+        assert!(!binfmt_handler_enabled(&dir, "rosetta"));
+
+        // Global binfmt_misc disabled -> disabled even if handler says enabled.
+        fs::write(dir.join("status"), "disabled\n").unwrap();
+        fs::write(
+            dir.join("rosetta"),
+            "enabled\ninterpreter /run/rosetta/rosetta\n",
+        )
+        .unwrap();
+        assert!(!binfmt_handler_enabled(&dir, "rosetta"));
+
+        // Nothing registered in this test process -> is_registered is false.
+        assert!(!is_registered());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -160,7 +160,7 @@ kat k8s sync-images
 kubectl run app --image=my-amd64-only-app:dev --image-pull-policy=IfNotPresent
 ```
 
-Direct registry pulls by kubelet without mirroring from Docker still require a `linux/arm64` manifest because containerd's CRI cannot be configured to pull `linux/amd64` on an `arm64` node. The mirrored copy has a different image ID from the Docker image because its config changed. Images that have a `linux/arm64` variant locally are mirrored unchanged, and kubelet uses the native variant. With `amd64 = "off"`, amd64 images are not rewritten.
+Direct registry pulls by kubelet without mirroring from Docker still require a `linux/arm64` manifest because containerd's CRI cannot be configured to pull `linux/amd64` on an `arm64` node. Only tagged local Docker images (`repo:tag`) are rewritten: digest-pinned references (`repo@sha256:...`) are never rewritten under their original digest because rewriting changes the manifest digest. To run a digest-pinned amd64 image in a pod, tag it locally first (`docker tag my-amd64-app@sha256:... my-amd64-app:dev`), sync, and reference the local tag in your pod spec with `imagePullPolicy: IfNotPresent` (or `Never`). The mirrored copy has a different image ID from the Docker image because its config changed. Images that have a `linux/arm64` variant locally are mirrored unchanged, and kubelet uses the native variant. With `amd64 = "off"`, amd64 images are not rewritten, and previously rewritten Katamaran mirrors without a local native variant are retired from `k8s.io`.
 
 ## Services, Ingress DNS, and port forwarding
 
