@@ -185,7 +185,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     if let Err(e) = power::watch(move |event| forward_power(&tx, event)) {
         eprintln!("katamaran: no sleep/wake notifications: {e:#}");
     }
-    run_vm(&args, rx, &mut |_| {})
+    let relay_budget = crate::autofwd::RelayBudget::from_process_limits();
+    run_vm(&args, relay_budget, rx, &mut |_| {})
 }
 
 /// Boot the VM and serve it until [`Control::Shutdown`]. A VM that dies is
@@ -194,6 +195,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
 /// lock and has blocked SIGINT and SIGTERM.
 pub fn run_vm(
     args: &RunArgs,
+    relay_budget: crate::autofwd::RelayBudget,
     control: Receiver<Control>,
     on_event: &mut dyn FnMut(Event),
 ) -> anyhow::Result<()> {
@@ -214,7 +216,7 @@ pub fn run_vm(
     loop {
         id += 1;
         let started = Instant::now();
-        let why = match session(args, &tx, &rx, id, on_event) {
+        let why = match session(args, &relay_budget, &tx, &rx, id, on_event) {
             Ok(End::Stopped) => return Ok(()),
             Ok(End::Crashed(why)) => why,
             // A VM that never came up is a setup problem, not a crash.
@@ -253,6 +255,7 @@ fn wait_for_stop(rx: &Receiver<Input>, delay: Duration) -> bool {
 /// returns, and the VM process has exited.
 fn session(
     args: &RunArgs,
+    relay_budget: &crate::autofwd::RelayBudget,
     tx: &Sender<Input>,
     rx: &Receiver<Input>,
     id: u64,
@@ -435,7 +438,8 @@ fn session(
             );
         }
     }
-    let relay_budget = crate::autofwd::RelayBudget::from_process_limits();
+    let uses_published_relays =
+        gvproxy.is_some() && args.forward_addresses != [std::net::Ipv4Addr::LOCALHOST];
     let forwarder = match &gvproxy {
         Some(g) => {
             let fwd_tx = tx.clone();
@@ -446,24 +450,22 @@ fn session(
                 socket: g.api_socket.clone(),
                 guest: g.network().guest_ip,
             };
-            Some(
-                if args.forward_addresses == [std::net::Ipv4Addr::LOCALHOST] {
-                    net::spawn_forwarder(api, on_event)?
-                } else {
-                    // gvproxy's per-port sockets go next to its API socket, in
-                    // the private run directory.
-                    let sockets = g.api_socket.parent().unwrap_or(&run_dir).to_path_buf();
-                    net::spawn_forwarder(
-                        net::AddressesApi::with_budget(
-                            api,
-                            &sockets,
-                            &args.forward_addresses,
-                            relay_budget.clone(),
-                        ),
-                        on_event,
-                    )?
-                },
-            )
+            Some(if !uses_published_relays {
+                net::spawn_forwarder(api, on_event)?
+            } else {
+                // gvproxy's per-port sockets go next to its API socket, in
+                // the private run directory.
+                let sockets = g.api_socket.parent().unwrap_or(&run_dir).to_path_buf();
+                net::spawn_forwarder(
+                    net::AddressesApi::with_budget(
+                        api,
+                        &sockets,
+                        &args.forward_addresses,
+                        relay_budget.clone(),
+                    ),
+                    on_event,
+                )?
+            })
         }
         None => None,
     };
@@ -502,10 +504,13 @@ fn session(
         });
     }
 
-    let mut auto_forwards = crate::autofwd::AutoForwards::with_budget(
+    let auto_limit =
+        crate::autofwd::auto_conn_limit_for_budget(relay_budget.max(), uses_published_relays);
+    let mut auto_forwards = crate::autofwd::AutoForwards::with_limit_and_budget(
         crate::autofwd::Upstream::AutoForward(autofwd_sock.clone()),
         &args.forward_addresses,
-        relay_budget,
+        auto_limit,
+        relay_budget.clone(),
     );
     let mut mounted = false;
     let mut paused = false;

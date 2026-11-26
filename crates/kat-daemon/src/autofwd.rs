@@ -13,13 +13,13 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::net::{AcceptOne, LoopbackTcpListener, addrs_label};
 
@@ -94,6 +94,20 @@ pub fn published_conn_limit_for_budget(budget_max: usize) -> ConnLimit {
     let total = PUBLISHED_MAX_CONNS_TOTAL.min(budget_max.max(1));
     let per_port = PUBLISHED_MAX_CONNS_PER_PORT.min((total / 2).max(1));
     ConnLimit::PerPort { per_port, total }
+}
+
+/// Default connection policy for automatic container forwards given a process
+/// relay budget. When published TCP ports also share daemon relays (i.e. custom
+/// `forward_addresses`), cap automatic forwards to at most half the shared
+/// budget so unpublished containers cannot starve published Docker or
+/// Kubernetes services.
+pub fn auto_conn_limit_for_budget(budget_max: usize, uses_published_relays: bool) -> ConnLimit {
+    let cap = if uses_published_relays {
+        MAX_CONNS.min((budget_max / 2).max(1))
+    } else {
+        MAX_CONNS.min(budget_max.max(1))
+    };
+    ConnLimit::Shared(cap)
 }
 
 fn current_nofile_limit() -> Option<u64> {
@@ -216,6 +230,112 @@ fn wakeup_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((r, w))
 }
 
+const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct LiveRelaysState {
+    closed: bool,
+    active_relays: usize,
+    next_id: u64,
+    /// Open descriptors of live relay sockets, removed before each socket
+    /// closes so teardown's `shutdown(fd, SHUT_RDWR)` never touches a reused fd.
+    sockets: BTreeMap<u64, RawFd>,
+}
+
+/// Tracks live relay tasks and their open sockets for a VM session so tearing
+/// down the session can shut down lingering clients (e.g. a client that left
+/// its write side open across a VM restart) and drain their permits promptly.
+/// Ordinary single-port removals leave established relays running.
+#[derive(Clone, Default)]
+struct LiveRelays {
+    inner: Arc<(Mutex<LiveRelaysState>, Condvar)>,
+}
+
+impl LiveRelays {
+    fn enter(&self) -> Option<RelayScope> {
+        let mut st = self.inner.0.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed {
+            return None;
+        }
+        st.active_relays += 1;
+        Some(RelayScope {
+            relays: self.clone(),
+        })
+    }
+
+    fn track_socket<S: AsRawFd>(&self, socket: S) -> Option<TrackedFd<S>> {
+        let mut st = self.inner.0.lock().unwrap_or_else(|e| e.into_inner());
+        if st.closed {
+            unsafe { libc::shutdown(socket.as_raw_fd(), libc::SHUT_RDWR) };
+            return None;
+        }
+        st.next_id += 1;
+        let id = st.next_id;
+        st.sockets.insert(id, socket.as_raw_fd());
+        Some(TrackedFd {
+            id,
+            relays: self.clone(),
+            socket,
+        })
+    }
+
+    fn unregister(&self, id: u64) {
+        let mut st = self.inner.0.lock().unwrap_or_else(|e| e.into_inner());
+        st.sockets.remove(&id);
+    }
+
+    /// Shut down every active relay socket and wait for the relay threads to
+    /// unwind and return their [`RelayBudget`] permits.
+    fn shutdown_and_drain(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.closed = true;
+        for &fd in st.sockets.values() {
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+        let deadline = Instant::now() + RELAY_DRAIN_TIMEOUT;
+        while st.active_relays > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let (next, _) = cvar
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner());
+            st = next;
+        }
+    }
+}
+
+struct RelayScope {
+    relays: LiveRelays,
+}
+
+impl Drop for RelayScope {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.relays.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.active_relays = st.active_relays.saturating_sub(1);
+        if st.active_relays == 0 {
+            cvar.notify_all();
+        }
+    }
+}
+
+/// Registers `socket`'s fd in [`LiveRelays`] and unregisters it inside
+/// `Drop::drop` BEFORE `socket` itself is dropped and closed.
+struct TrackedFd<S: AsRawFd> {
+    id: u64,
+    relays: LiveRelays,
+    socket: S,
+}
+
+impl<S: AsRawFd> Drop for TrackedFd<S> {
+    fn drop(&mut self) {
+        self.relays.unregister(self.id);
+    }
+}
+
 /// The forwards in place.
 pub struct AutoForwards {
     upstream: Upstream,
@@ -224,6 +344,7 @@ pub struct AutoForwards {
     active_conns: Arc<AtomicUsize>,
     conn_limit: ConnLimit,
     budget: RelayBudget,
+    relays: LiveRelays,
 }
 
 impl AutoForwards {
@@ -251,7 +372,9 @@ impl AutoForwards {
         budget: RelayBudget,
     ) -> AutoForwards {
         let limit = match upstream {
-            Upstream::AutoForward(_) => ConnLimit::Shared(MAX_CONNS),
+            Upstream::AutoForward(_) => {
+                auto_conn_limit_for_budget(budget.max(), addrs != [Ipv4Addr::LOCALHOST])
+            }
             Upstream::PerPort(_) => published_conn_limit_for_budget(budget.max()),
         };
         Self::with_limit_and_budget(upstream, addrs, limit, budget)
@@ -288,6 +411,7 @@ impl AutoForwards {
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_limit,
             budget,
+            relays: LiveRelays::default(),
         }
     }
 
@@ -350,6 +474,7 @@ impl AutoForwards {
             port_conns,
             max_port_conns,
             accept_batch: MAX_ACCEPT_BATCH,
+            relays: self.relays.clone(),
         };
         let thread = thread::Builder::new()
             .name(format!("autofwd-{port}"))
@@ -392,6 +517,7 @@ impl AutoForwards {
 impl Drop for AutoForwards {
     fn drop(&mut self) {
         self.clear();
+        self.relays.shutdown_and_drain();
     }
 }
 
@@ -437,6 +563,7 @@ struct AcceptCtx {
     port_conns: Option<Arc<AtomicUsize>>,
     max_port_conns: Option<usize>,
     accept_batch: usize,
+    relays: LiveRelays,
 }
 
 fn accept_loop(listener: &LoopbackTcpListener, wake_r: &OwnedFd, ctx: &AcceptCtx) {
@@ -512,12 +639,20 @@ fn accept_ready_batch(listener: &LoopbackTcpListener, i: usize, ctx: &AcceptCtx)
                         continue;
                     }
                 };
-                let (upstream, label2) = (ctx.upstream.clone(), label.clone());
+                let Some(scope) = ctx.relays.enter() else {
+                    return false;
+                };
+                let (upstream, label2, relays) =
+                    (ctx.upstream.clone(), label.clone(), ctx.relays.clone());
                 if let Err(e) = thread::Builder::new()
                     .name(format!("autofwd-{port}-conn"))
                     .spawn(move || {
+                        // Drop order: `_permit` releases budget slots BEFORE
+                        // `_scope` notifies `shutdown_and_drain` that this
+                        // relay has fully unwound.
+                        let _scope = scope;
                         let _permit = permit;
-                        if let Err(e) = relay(conn, &upstream, port) {
+                        if let Err(e) = relay(conn, &upstream, port, &relays) {
                             eprintln!("katamaran: forward {label2}:{port}: {e}");
                         }
                     })
@@ -538,19 +673,23 @@ fn accept_ready_batch(listener: &LoopbackTcpListener, i: usize, ctx: &AcceptCtx)
     true
 }
 
-fn relay(client: TcpStream, upstream: &Upstream, port: u16) -> io::Result<()> {
+fn relay(client: TcpStream, upstream: &Upstream, port: u16, relays: &LiveRelays) -> io::Result<()> {
     let _ = client.set_nodelay(true);
-    let mut upstream = upstream.connect(port)?;
-    let (mut c_read, mut u_write) = (client.try_clone()?, upstream.try_clone()?);
+    let Some(mut client) = relays.track_socket(client) else {
+        return Ok(());
+    };
+    let Some(mut upstream) = relays.track_socket(upstream.connect(port)?) else {
+        return Ok(());
+    };
+    let (mut c_read, mut u_write) = (client.socket.try_clone()?, upstream.socket.try_clone()?);
     let up = thread::Builder::new()
         .name(format!("autofwd-{port}-up"))
         .spawn(move || {
             let _ = copy(&mut c_read, &mut u_write);
             let _ = u_write.shutdown(Shutdown::Write);
         })?;
-    let mut client = client;
-    let _ = copy(&mut upstream, &mut client);
-    let _ = client.shutdown(Shutdown::Write);
+    let _ = copy(&mut upstream.socket, &mut client.socket);
+    let _ = client.socket.shutdown(Shutdown::Write);
     let _ = up.join();
     Ok(())
 }
@@ -830,6 +969,145 @@ mod tests {
             }
         );
         assert_eq!(process_relay_ceiling(None), PROCESS_MAX_RELAY_CONNS);
+
+        // Automatic forwards reserve half the shared budget when published TCP
+        // also uses daemon relays, and can use the full budget (up to MAX_CONNS)
+        // when published ports go straight through gvproxy.
+        assert_eq!(auto_conn_limit_for_budget(32, true), ConnLimit::Shared(16));
+        assert_eq!(auto_conn_limit_for_budget(32, false), ConnLimit::Shared(32));
+        assert_eq!(auto_conn_limit_for_budget(128, true), ConnLimit::Shared(64));
+        assert_eq!(
+            auto_conn_limit_for_budget(512, true),
+            ConnLimit::Shared(MAX_CONNS)
+        );
+    }
+
+    #[test]
+    fn automatic_cap_reserves_shared_capacity_for_published_ports() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Shared budget of 4 with published relays enabled: automatic forwards
+        // are capped at 2, leaving 2 slots reserved for published services.
+        let shared = RelayBudget::new(4);
+        let guest_sock = fake_guest(&dir);
+        let mut auto = AutoForwards::with_limit_and_budget(
+            Upstream::AutoForward(guest_sock),
+            &[Ipv4Addr::LOCALHOST],
+            auto_conn_limit_for_budget(shared.max(), true),
+            shared.clone(),
+        );
+        let mut published = AutoForwards::with_limit_and_budget(
+            Upstream::PerPort(dir.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            published_conn_limit_for_budget(shared.max()),
+            shared.clone(),
+        );
+        let auto_port = add_free_port(&mut auto);
+        let pub_port = add_free_port(&mut published);
+
+        let pub_listener = UnixListener::bind(Upstream::socket(&dir, pub_port)).unwrap();
+        let pub_server = thread::spawn(move || {
+            let (mut c, _) = pub_listener.accept().unwrap();
+            c.write_all(b"gv:").unwrap();
+            let mut rest = c.try_clone().unwrap();
+            let _ = copy(&mut rest, &mut c);
+            let _ = c.shutdown(Shutdown::Write);
+        });
+
+        let open_auto = |tag: &[u8]| -> TcpStream {
+            let mut s = TcpStream::connect(("127.0.0.1", auto_port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(tag).unwrap();
+            let mut buf = vec![0u8; format!("{auto_port}:").len() + tag.len()];
+            s.read_exact(&mut buf).unwrap();
+            s
+        };
+
+        // Saturate the automatic forwarder's entire subordinate ceiling (2/2).
+        let a1 = open_auto(b"1");
+        let a2 = open_auto(b"2");
+        assert_conn_rejected(auto_port);
+        assert_eq!(shared.active(), 2);
+
+        // Published port still succeeds using the reserved shared capacity.
+        assert_eq!(round_trip(pub_port, "reserved"), "gv:reserved");
+
+        pub_server.join().unwrap();
+        drop(a1);
+        drop(a2);
+        drop(auto);
+        drop(published);
+        assert_eq!(shared.active(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_teardown_drains_lingering_client_and_returns_shared_budget() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let shared = RelayBudget::new(2);
+        let guest_sock = fake_guest(&dir);
+
+        // Session 1: a Mac client connects and keeps its write half open.
+        let mut session1 = AutoForwards::with_limit_and_budget(
+            Upstream::AutoForward(guest_sock.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::Shared(2),
+            shared.clone(),
+        );
+        let port1 = add_free_port(&mut session1);
+        let mut lingering = TcpStream::connect(("127.0.0.1", port1)).unwrap();
+        lingering
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        lingering.write_all(b"hi").unwrap();
+        let mut head = vec![0u8; format!("{port1}:hi").len()];
+        lingering.read_exact(&mut head).unwrap();
+        assert_eq!(shared.active(), 1);
+
+        // Simulate VM restart: drop session 1 while `lingering` stays open on
+        // the client side (write half NOT closed). Teardown must shut down the
+        // relay sockets and reclaim the shared budget slot immediately.
+        drop(session1);
+        assert_eq!(
+            shared.active(),
+            0,
+            "session teardown must drain lingering relays and return budget permits"
+        );
+        // The lingering client observes EOF / reset rather than hanging forever.
+        let mut one = [0u8; 1];
+        match lingering.read(&mut one) {
+            Ok(0) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => {
+                panic!("expected EOF/reset for lingering client after teardown, got {other:?}")
+            }
+        }
+
+        // Session 2 reuses the same daemon-lifetime budget with full capacity.
+        let mut session2 = AutoForwards::with_limit_and_budget(
+            Upstream::AutoForward(guest_sock),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::Shared(2),
+            shared.clone(),
+        );
+        let port2 = add_free_port(&mut session2);
+        assert_eq!(round_trip(port2, "restarted"), format!("{port2}:restarted"));
+        drop(session2);
+        assert_eq!(shared.active(), 0);
+        drop(lingering);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1043,6 +1321,7 @@ mod tests {
             port_conns: None,
             max_port_conns: None,
             accept_batch: 2,
+            relays: LiveRelays::default(),
         };
         assert!(accept_ready_batch(&listener, 0, &ctx));
         for remaining in 0..3 {
@@ -1084,6 +1363,7 @@ mod tests {
             port_conns: None,
             max_port_conns: None,
             accept_batch: 2,
+            relays: LiveRelays::default(),
         };
         assert!(accept_ready_batch(&filtered, 0, &rej_ctx));
         for remaining in 0..3 {
@@ -1136,6 +1416,7 @@ mod tests {
             port_conns: None,
             max_port_conns: None,
             accept_batch: 2,
+            relays: LiveRelays::default(),
         };
         let worker = thread::spawn(move || accept_loop(&multi, &wake_r, &loop_ctx));
 

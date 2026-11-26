@@ -194,6 +194,8 @@ pub struct Daemon {
     changed: Condvar,
     started: SystemTime,
     launchd_label: Option<String>,
+    /// Shared process-wide relay descriptor budget preserved across VM restarts.
+    relay_budget: crate::autofwd::RelayBudget,
 }
 
 struct K8sRuntime {
@@ -309,6 +311,7 @@ impl Daemon {
             launchd_label: std::env::var("XPC_SERVICE_NAME")
                 .ok()
                 .filter(|l| l.starts_with(crate::setup::LABEL_PREFIX)),
+            relay_budget: crate::autofwd::RelayBudget::from_process_limits(),
         })
     }
 
@@ -361,7 +364,9 @@ impl Daemon {
         if let Err(e) = thread::Builder::new()
             .name("vm-supervisor".into())
             .spawn(move || {
-                let result = run::run_vm(&args, rx, &mut |e| d.on_event(generation, e));
+                let result = run::run_vm(&args, d.relay_budget.clone(), rx, &mut |e| {
+                    d.on_event(generation, e)
+                });
                 d.on_exit(generation, result);
             })
         {
