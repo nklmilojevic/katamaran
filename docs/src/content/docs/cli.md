@@ -250,6 +250,14 @@ Stop Kubernetes and delete all cluster state, workloads, and persistent volumes.
 kat k8s reset
 ```
 
+### `kat k8s mark-version`
+
+Record an independently verified `k3s` release tag in `/var/lib/katamaran/k3s/data/.katamaran-version` for an existing unmarked cluster datastore (for example when upgrading a cluster created by an older katamaran release before `.katamaran-version` existed). Requires Kubernetes to be stopped, validates the release tag, and refuses to overwrite an existing marker. See [Migrating an unmarked cluster from an older katamaran release](/kubernetes/#migrating-an-unmarked-cluster-from-an-older-katamaran-release).
+
+```sh
+kat k8s mark-version <VERSION>
+```
+
 ### `kat k8s kubeconfig`
 
 Print the cluster kubeconfig YAML, or print the path to `~/.katamaran/run/kubeconfig.yaml`.

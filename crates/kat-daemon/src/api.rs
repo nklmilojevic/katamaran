@@ -164,6 +164,7 @@ pub enum Call {
     K8sReset,
     K8sKubeconfig,
     K8sSyncImages,
+    K8sMarkVersion { version: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +203,7 @@ impl Call {
             Call::K8sReset => "k8s.reset",
             Call::K8sKubeconfig => "k8s.kubeconfig",
             Call::K8sSyncImages => "k8s.sync_images",
+            Call::K8sMarkVersion { .. } => "k8s.mark_version",
         }
     }
 
@@ -216,6 +218,7 @@ impl Call {
             | Call::MachineStop { name }
             | Call::MachineDelete { name }
             | Call::MachineDefault { name } => serde_json::json!({ "name": name }),
+            Call::K8sMarkVersion { version } => serde_json::json!({ "version": version }),
             _ => Value::Null,
         }
     }
@@ -307,6 +310,15 @@ impl Call {
             "k8s.reset" => Call::K8sReset,
             "k8s.kubeconfig" => Call::K8sKubeconfig,
             "k8s.sync_images" => Call::K8sSyncImages,
+            "k8s.mark_version" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct P {
+                    version: String,
+                }
+                let P { version } = serde_json::from_value(p.clone()).map_err(bad)?;
+                Call::K8sMarkVersion { version }
+            }
             other => {
                 return Err(RpcError::new(
                     METHOD_NOT_FOUND,
@@ -584,6 +596,9 @@ mod tests {
             Call::K8sReset,
             Call::K8sKubeconfig,
             Call::K8sSyncImages,
+            Call::K8sMarkVersion {
+                version: "v1.37.2+k3s1".into(),
+            },
         ];
         for (i, call) in calls.iter().enumerate() {
             let line = serde_json::to_string(&Request::new(i as u64, call)).unwrap();
@@ -660,6 +675,14 @@ mod tests {
         assert_eq!(
             Call::parse(&req("machine.info", Value::Null)).unwrap(),
             Call::MachineInfo { name: "".into() }
+        );
+        assert_eq!(code(req("k8s.mark_version", Value::Null)), INVALID_PARAMS);
+        assert_eq!(
+            code(req(
+                "k8s.mark_version",
+                json!({"version": "v1.37.2+k3s1", "extra": true})
+            )),
+            INVALID_PARAMS
         );
         let mut r = req("status", Value::Null);
         r.jsonrpc = "1.0".into();

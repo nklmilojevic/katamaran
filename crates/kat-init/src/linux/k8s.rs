@@ -309,19 +309,135 @@ fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+const MIN_K8S_MINOR: u32 = 31;
+
+/// Validate a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>` with
+/// `major == 1` and `minor >= MIN_K8S_MINOR`), matching the host daemon's config check.
+fn validate_k3s_release_tag(v: &str) -> Result<(), String> {
+    let bad = || format!("k3s version {v:?} is not a valid release tag such as v1.37.2+k3s1");
+    let rest = v.strip_prefix('v').ok_or_else(bad)?;
+    let (kube, build) = rest.split_once("+k3s").ok_or_else(bad)?;
+    if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let (core, pre) = match kube.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (kube, None),
+    };
+    if let Some(p) = pre
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'))
+    {
+        return Err(bad());
+    }
+    let parts: Vec<u32> = core
+        .split('.')
+        .map(|n| {
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad());
+            }
+            n.parse().map_err(|_| bad())
+        })
+        .collect::<Result<_, _>>()?;
+    let [major, minor, _patch] = parts[..] else {
+        return Err(bad());
+    };
+    if major != 1 || minor < MIN_K8S_MINOR {
+        return Err(format!(
+            "k3s version must be v1.{MIN_K8S_MINOR} or newer, got {v}"
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically create a new mode-0600 file at `target` without ever overwriting
+/// an existing file or following a symlink at `target`.
+fn write_atomic_new(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", target.display()))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".into());
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.katamaran.{pid}.{seq}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let write_res = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    let link_res = fs::hard_link(&tmp, target);
+    let _ = fs::remove_file(&tmp);
+    match link_res {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(format!(
+            "datastore version marker {} already exists; refusing to overwrite an existing marker",
+            target.display()
+        )),
+        Err(e) => Err(format!("create {}: {e}", target.display())),
+    }
+}
+
 fn missing_datastore_version_error(data_dir: &Path, data_version_file: &Path) -> String {
     format!(
         "existing cluster data under {} has no version marker ({}); \
          cannot verify minor-version compatibility. While Kubernetes is stopped, \
-         either restore the matching {} marker recorded with your verified \
-         datastore backup, follow the unmarked-cluster migration steps in the \
-         Kubernetes guide if this datastore was initialized by an older \
-         katamaran release, or back up any state you need and run `kat k8s reset` \
-         to delete cluster data and persistent volumes before starting fresh.",
+         if you have independently verified the k3s release tag that last opened \
+         this datastore (for example from a backup or an older katamaran release), \
+         run `kat k8s mark-version <version>` to record it (see the Kubernetes \
+         guide's unmarked-cluster migration steps). Otherwise, back up any state \
+         you need and run `kat k8s reset` to delete cluster data and persistent \
+         volumes before starting fresh.",
         data_dir.display(),
         data_version_file.display(),
-        data_version_file.display(),
     )
+}
+
+/// Record an independently verified k3s release tag in `data_version_file` for
+/// an existing unmarked datastore under `data_dir`. Refuses to run when no
+/// datastore exists and refuses to overwrite any existing marker.
+fn mark_datastore_version_at(
+    data_dir: &Path,
+    data_version_file: &Path,
+    version: &str,
+) -> Result<(), String> {
+    validate_k3s_release_tag(version)?;
+    if !datastore_exists(data_dir)? {
+        return Err(format!(
+            "no existing cluster datastore found under {}; start Kubernetes normally with `kat k8s start`",
+            data_dir.display()
+        ));
+    }
+    match fs::symlink_metadata(data_version_file) {
+        Ok(_) => {
+            let detail = match read_trimmed_file(data_version_file) {
+                Ok(Some(existing)) => format!(" ({existing})"),
+                _ => String::new(),
+            };
+            return Err(format!(
+                "datastore version marker {} already exists{detail}; \
+                 refusing to overwrite an existing marker",
+                data_version_file.display()
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("stat {}: {e}", data_version_file.display()));
+        }
+    }
+    write_atomic_new(data_version_file, format!("{version}\n").as_bytes())
 }
 
 /// Return the k3s version associated with an existing datastore under `data_dir`.
@@ -399,6 +515,10 @@ enum DatastoreEntryKind {
         hash_fnv: u64,
     },
     Dir,
+    /// A symlink whose resolved target stays strictly inside `data_dir/server`
+    /// (such as k3s's normal `server/agent-token -> token` link), so its target
+    /// is fingerprinted by the directory walk itself.
+    InternalSymlink(PathBuf),
     Other(u32),
 }
 
@@ -445,18 +565,30 @@ fn hash_file(path: &Path) -> io::Result<(u64, u64, u64)> {
 
 fn collect_datastore_entries(
     path: &Path,
+    canonical_root: &Path,
     rel_path: PathBuf,
     out: &mut Vec<DatastoreEntry>,
 ) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     let ft = meta.file_type();
-    if ft.is_symlink() {
-        return Err(io::Error::other(format!(
-            "cannot safely fingerprint symlinked datastore path {}",
-            path.display()
-        )));
-    }
-    let kind = if ft.is_file() {
+    let kind = if ft.is_symlink() {
+        let target = fs::read_link(path)?;
+        let resolved = fs::canonicalize(path).map_err(|e| {
+            io::Error::other(format!(
+                "cannot resolve symlinked datastore path {} (-> {}): {e}",
+                path.display(),
+                target.display()
+            ))
+        })?;
+        if !resolved.starts_with(canonical_root) {
+            return Err(io::Error::other(format!(
+                "cannot safely fingerprint symlinked datastore path {} resolving outside {}",
+                path.display(),
+                canonical_root.display()
+            )));
+        }
+        DatastoreEntryKind::InternalSymlink(target)
+    } else if ft.is_file() {
         let (len, hash_sip, hash_fnv) = hash_file(path)?;
         DatastoreEntryKind::File {
             len,
@@ -481,7 +613,7 @@ fn collect_datastore_entries(
         children.sort_by_key(|e| e.file_name());
         for entry in children {
             let child_rel = rel_path.join(entry.file_name());
-            collect_datastore_entries(&entry.path(), child_rel, out)?;
+            collect_datastore_entries(&entry.path(), canonical_root, child_rel, out)?;
         }
     }
     Ok(())
@@ -491,8 +623,10 @@ fn collect_datastore_entries(
 /// so a failed startup that exited before touching the datastore can safely roll
 /// back `.katamaran-version`, while any modification keeps the updated marker.
 ///
-/// Fails closed if `server` or any entry inside it is a symlink so writes to
-/// symlinked SQLite state outside the fingerprinted tree can never be missed.
+/// Permits internal symlinks whose resolved target stays inside `data_dir/server`
+/// (such as k3s's normal `agent-token -> token` link), but fails closed if
+/// `server` itself is a symlink or if any symlink inside it is dangling or
+/// resolves outside `data_dir/server`.
 fn snapshot_datastore(data_dir: &Path) -> io::Result<DatastoreSnapshot> {
     let server_dir = data_dir.join("server");
     match fs::symlink_metadata(&server_dir) {
@@ -501,8 +635,9 @@ fn snapshot_datastore(data_dir: &Path) -> io::Result<DatastoreSnapshot> {
             server_dir.display()
         ))),
         Ok(_) => {
+            let canonical_root = fs::canonicalize(&server_dir)?;
             let mut entries = Vec::new();
-            collect_datastore_entries(&server_dir, PathBuf::new(), &mut entries)?;
+            collect_datastore_entries(&server_dir, &canonical_root, PathBuf::new(), &mut entries)?;
             Ok(DatastoreSnapshot::Present(entries))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DatastoreSnapshot::Absent),
@@ -906,6 +1041,9 @@ impl K8s {
                 relay_unix_proxy(conn, Path::new(PROXY_SOCKET));
                 return;
             }
+            K8sMsg::MarkDatastoreVersion { version } => {
+                self.mark_datastore_version(&version).map(|()| K8sMsg::Done)
+            }
             other => Err(format!("unexpected request {other:?}")),
         };
         let msg = match reply {
@@ -929,6 +1067,30 @@ impl K8s {
             api_ready: st.api_ready,
             error: st.error.clone(),
         }
+    }
+
+    fn mark_datastore_version(&self, version: &str) -> Result<(), String> {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
+        let _guard = self.op_lock.lock().unwrap();
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
+        {
+            let st = self.state.lock().unwrap();
+            if st.running.is_some()
+                || matches!(st.phase.as_str(), "starting" | "running" | "stopping")
+            {
+                return Err(
+                    "stop Kubernetes (`kat k8s stop`) before recording the datastore version"
+                        .into(),
+                );
+            }
+        }
+        mark_datastore_version_at(Path::new(DATA_DIR), Path::new(DATA_VERSION_FILE), version)?;
+        log(&format!("recorded datastore version {version}"));
+        Ok(())
     }
 
     fn install(&self, conn: &mut UnixStream, version: &str) -> Result<(), String> {
@@ -2949,6 +3111,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
         assert!(err.contains("no version marker"), "{err}");
         assert!(err.contains(".katamaran-version"), "{err}");
+        assert!(err.contains("kat k8s mark-version"), "{err}");
         assert!(err.contains("unmarked-cluster migration"), "{err}");
         assert!(err.contains("kat k8s reset"), "{err}");
         assert!(!data_version_file.exists());
@@ -3015,10 +3178,16 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let data_version_file = data_dir.join(".katamaran-version");
         fs::create_dir_all(data_dir.join("server/db")).unwrap();
         let db_file = data_dir.join("server/db/state.db");
+        let token_file = data_dir.join("server/token");
         fs::write(&db_file, b"v1.32-state-0001").unwrap();
+        fs::write(&token_file, b"cluster-token-v1").unwrap();
+        // Normal k3s creates relative internal symlinks inside server/ (e.g. agent-token -> token).
+        symlink("token", data_dir.join("server/agent-token")).unwrap();
+        symlink("token", data_dir.join("server/node-token")).unwrap();
         fs::write(&data_version_file, "v1.32.5+k3s1\n").unwrap();
 
-        // 1. Process exits during startup without touching server/: version marker
+        // 1. Process exits during startup without touching server/ (even with k3s's
+        // normal internal agent-token/node-token symlinks present): version marker
         // rolls back so the operator can return to v1.32.5+k3s1.
         let before = snapshot_datastore(&data_dir).unwrap();
         write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
@@ -3033,6 +3202,22 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "v1.32.5+k3s1\n"
         );
         check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap();
+
+        // Modifying the internal symlink's target file (server/token) IS detected.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(&token_file, b"cluster-token-v2").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
 
         // 2. Process modifies state.db in place (even with identical length) before
         // exiting: version marker stays bumped and blocks returning to v1.32.5+k3s1.
@@ -3117,6 +3302,18 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "symlinked state.db must fail closed"
         );
 
+        // Dangling symlink inside server/ also fails closed.
+        fs::remove_file(data_dir.join("server/db/state.db")).unwrap();
+        symlink(
+            dir.join("does-not-exist"),
+            data_dir.join("server/db/state.db"),
+        )
+        .unwrap();
+        assert!(
+            snapshot_datastore(&data_dir).is_err(),
+            "dangling symlink inside server/ must fail closed"
+        );
+
         // Symlinked server/ itself also fails closed.
         let external_server = dir.join("external-server");
         fs::create_dir_all(external_server.join("db")).unwrap();
@@ -3145,6 +3342,86 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             fs::read_to_string(&data_version_file).unwrap(),
             "v1.37.2+k3s1\n"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_datastore_version_migrates_pre_tracking_datastore_for_pinned_upgrade() {
+        let dir = temp_dir("mark-datastore-version");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = dir.join("bin/version");
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+
+        // 1. Fails when no datastore exists yet.
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("no existing cluster datastore"), "{err}");
+
+        // 2. Pre-tracking datastore (server/ exists, no .katamaran-version, same pinned
+        // v1.37.2+k3s1 in bin/version) is initially rejected without inference.
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(data_dir.join("server/db/state.db"), b"pre-tracking-v1.37").unwrap();
+        assert!(check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").is_err());
+        assert!(!data_version_file.exists());
+
+        // 3. Invalid or unsupported release tags are rejected without writing a marker.
+        for bad in [
+            "",
+            "latest",
+            "v1.30.9+k3s1",
+            "v1.37.2+k3s1\n",
+            " v1.37.2+k3s1",
+            "v2.0.0+k3s1",
+        ] {
+            assert!(
+                mark_datastore_version_at(&data_dir, &data_version_file, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(!data_version_file.exists());
+
+        // 4. Explicit migration writes the verified pinned tag with mode 0600 and
+        // unblocks starting the same pinned release while still blocking downgrades.
+        mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap();
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&data_version_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap();
+        assert!(check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").is_err());
+
+        // 5. Refuses to overwrite an existing marker (populated, empty, or symlinked).
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+
+        fs::write(&data_version_file, "").unwrap();
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+
+        fs::remove_file(&data_version_file).unwrap();
+        let target = dir.join("other-file");
+        symlink(&target, &data_version_file).unwrap();
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(!target.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

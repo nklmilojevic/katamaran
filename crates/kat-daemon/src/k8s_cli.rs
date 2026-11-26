@@ -25,6 +25,11 @@ pub enum K8sCmd {
     Stop,
     /// Stop Kubernetes and wipe all cluster state and persistent volumes.
     Reset,
+    /// Record the verified k3s version tag of an existing unmarked cluster datastore.
+    MarkVersion {
+        /// Independently verified k3s release tag (for example `v1.37.2+k3s1`).
+        version: String,
+    },
     /// Print the kubeconfig YAML (or its file path with --path).
     Kubeconfig {
         /// Print the path to `<home>/run/kubeconfig.yaml` instead of its contents.
@@ -62,6 +67,7 @@ pub fn run(cmd: K8sCmd) -> anyhow::Result<()> {
         K8sCmd::Start => start(),
         K8sCmd::Stop => stop(),
         K8sCmd::Reset => reset(),
+        K8sCmd::MarkVersion { version } => mark_version(&version),
         K8sCmd::Kubeconfig { path } => kubeconfig(path),
         K8sCmd::SyncImages => sync_images(),
         K8sCmd::Dns(d) => dns(d),
@@ -150,6 +156,16 @@ fn reset() -> anyhow::Result<()> {
     let mut c = Client::connect_default()?;
     c.call(&Call::K8sReset)?;
     println!("katamaran: Kubernetes cluster reset");
+    Ok(())
+}
+
+fn mark_version(version: &str) -> anyhow::Result<()> {
+    crate::config::validate_k8s_version(version)?;
+    let mut c = cli::ensure_daemon()?;
+    c.call(&Call::K8sMarkVersion {
+        version: version.to_string(),
+    })?;
+    println!("katamaran: recorded cluster datastore version {version}");
     Ok(())
 }
 

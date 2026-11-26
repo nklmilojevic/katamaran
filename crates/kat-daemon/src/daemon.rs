@@ -1012,6 +1012,10 @@ impl Daemon {
                     .map_err(|e| failed(format!("{e:#}")))?;
                 Ok(Value::Null)
             }
+            Call::K8sMarkVersion { version } => {
+                self.k8s_mark_version(version)?;
+                Ok(Value::Null)
+            }
         }
     }
 
@@ -1433,6 +1437,77 @@ impl Daemon {
             let msg = format!("{e:#}");
             self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
             return Err(failed(msg));
+        }
+        Ok(())
+    }
+
+    fn k8s_mark_version(self: &Arc<Self>, version: &str) -> Result<(), RpcError> {
+        crate::config::validate_k8s_version(version)
+            .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        {
+            let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(k.state.as_str(), "starting" | "running" | "stopping") {
+                return Err(failed(
+                    "stop Kubernetes (`kat k8s stop`) before recording the datastore version"
+                        .into(),
+                ));
+            }
+        }
+        let initial_state = self.lock().state;
+        let was_stopped = !initial_state.is_active();
+        let needs_wait_docker = was_stopped || initial_state == VmState::Starting;
+        if needs_wait_docker {
+            self.k8s
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_autostart = true;
+        }
+        let mark_res = (|| -> Result<(), RpcError> {
+            if needs_wait_docker {
+                self.wait_for_docker_ready(was_stopped)?;
+            }
+            let mut noop = |_: &str| {};
+            match crate::k8s::request(
+                &self.home,
+                &kat_proto::k8s::K8sMsg::MarkDatastoreVersion {
+                    version: version.to_string(),
+                },
+                &mut noop,
+            )
+            .map_err(|e| failed(format!("{e:#}")))?
+            {
+                kat_proto::k8s::K8sMsg::Done => Ok(()),
+                other => Err(failed(format!("unexpected mark-version reply {other:?}"))),
+            }
+        })();
+
+        let stop_res = if was_stopped {
+            let res = self.stop(true).map_err(failed);
+            self.k8s
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .suppress_autostart = false;
+            res
+        } else {
+            if needs_wait_docker {
+                self.k8s
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .suppress_autostart = false;
+            }
+            Ok(())
+        };
+
+        mark_res?;
+        stop_res?;
+        {
+            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            if k.state == "failed" {
+                k.state = "stopped".into();
+            }
+            k.error = None;
         }
         Ok(())
     }
@@ -2137,6 +2212,59 @@ mod tests {
         }
         assert!(!kc.exists());
         guest.join().unwrap();
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn k8s_mark_version_validates_state_and_forwards_tag() {
+        let home = temp("k8s-mark-version");
+        let d = Daemon::new(home.clone());
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+
+        // 1. Invalid version tag is rejected with INVALID_PARAMS before touching the guest.
+        let err = d.k8s_mark_version("latest").unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+        let err = d.k8s_mark_version("v1.30.9+k3s1").unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+
+        // 2. Running Kubernetes cluster is rejected before contacting the guest.
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+        }
+        let err = d.k8s_mark_version("v1.37.2+k3s1").unwrap_err();
+        assert_eq!(err.code, api::FAILED);
+        assert!(err.message.contains("kat k8s stop"), "{}", err.message);
+
+        // 3. Stopped/failed cluster forwards MarkDatastoreVersion and clears stale error.
+        {
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "failed".into();
+            k.error = Some("existing cluster data has no version marker".into());
+        }
+        let listener = UnixListener::bind(&sock).unwrap();
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(
+                req,
+                kat_proto::k8s::K8sMsg::MarkDatastoreVersion {
+                    version: "v1.37.2+k3s1".into(),
+                }
+            );
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+        d.k8s_mark_version("v1.37.2+k3s1").unwrap();
+        guest.join().unwrap();
+        {
+            let k = d.k8s.lock().unwrap();
+            assert_eq!(k.state, "stopped");
+            assert!(k.error.is_none());
+        }
 
         fs::remove_dir_all(&home).unwrap();
     }

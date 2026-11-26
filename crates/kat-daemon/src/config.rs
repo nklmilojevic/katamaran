@@ -277,7 +277,7 @@ const MIN_K8S_MINOR: u32 = 31;
 
 /// A k3s release tag, `v<major>.<minor>.<patch>[-<pre>]+k3s<n>`, no older
 /// than v1.[`MIN_K8S_MINOR`].
-fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
     let bad = || {
         anyhow::anyhow!(
             "k8s_version {v:?} is not a k3s release tag such as {}",

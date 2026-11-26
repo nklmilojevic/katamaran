@@ -67,7 +67,7 @@ katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<ver
      - `/var/lib/katamaran/k3s/data/storage/` (where k3s's default `local-path` StorageClass stores volume files) and any custom persistent-volume or `hostPath` directories used by your workloads.
   2. **To restore**, keep Kubernetes stopped (`kat k8s stop`) and restore from the same backup set:
      - Restore `/var/lib/katamaran/k3s/data/server/` (removing any newer `state.db-wal` or `state.db-shm` files left by the newer release).
-     - Restore the matching `/var/lib/katamaran/k3s/data/.katamaran-version` file (from the backed-up `.katamaran-version`, or from the verified legacy `/var/lib/katamaran/k3s/bin/version` tag). Katamaran never infers a datastore's version from `/var/lib/katamaran/k3s/bin/version`, and refuses to start if `server/` exists without a valid `.katamaran-version` marker or if `.katamaran-version` records a newer minor or skips minors.
+     - Restore the matching `/var/lib/katamaran/k3s/data/.katamaran-version` file (from the backed-up `.katamaran-version`, or from the verified legacy `/var/lib/katamaran/k3s/bin/version` tag — if you restored `server/` without `.katamaran-version`, you can record that verified tag from macOS with `kat k8s mark-version <version>` while Kubernetes is stopped). Katamaran never infers a datastore's version from `/var/lib/katamaran/k3s/bin/version`, and refuses to start if `server/` exists without a valid `.katamaran-version` marker or if `.katamaran-version` records a newer minor or skips minors.
      - Restore the matching `/var/lib/katamaran/k3s/data/storage/` contents and any custom PV directories so volume files match the restored PV/PVC records.
   3. Set `k8s_version` to the release tag from that backup (for example `kat config set k8s_version=v1.32.5+k3s1`) and run `kat k8s start`.
 
@@ -82,9 +82,15 @@ If you have a healthy cluster initialized by an older katamaran release that did
 To migrate a datastore you **know** was initialized by an older katamaran release (do not use this for an unknown backup restore, and never guess the version from whichever `k3s` binary is currently installed):
 
 1. Stop Kubernetes (`kat k8s stop`) so nothing is accessing the datastore.
-2. Independently verify the exact `k3s` release tag that last opened the datastore — for example, confirm the pinned `k3s` release shipped by that older katamaran version (or verify from your cluster logs/records from before stopping).
-3. Write that exact release tag (for example `v1.37.2+k3s1`) followed by a newline to `/var/lib/katamaran/k3s/data/.katamaran-version` inside the guest.
-4. Start Kubernetes with a compatible `k8s_version` (same minor or one minor newer), or run `kat k8s reset` if you prefer to start fresh instead of migrating.
+2. Independently verify the exact `k3s` release tag that last opened the datastore — for example, confirm the pinned `k3s` release shipped by that older katamaran version (such as `v1.37.2+k3s1` in katamaran v0.10.0) or verify from your cluster logs/records from before stopping.
+3. Record that exact verified tag from macOS using `kat k8s mark-version`:
+
+   ```sh
+   kat k8s mark-version v1.37.2+k3s1
+   ```
+
+   `kat k8s mark-version` validates the release tag, requires Kubernetes to be stopped and an existing unmarked datastore to be present, writes `/var/lib/katamaran/k3s/data/.katamaran-version` inside the VM, refuses to overwrite any existing marker, and never infers the version from `/var/lib/katamaran/k3s/bin/version`.
+4. Start Kubernetes (`kat k8s start`) with a compatible `k8s_version` (same minor or one minor newer), or run `kat k8s reset` if you prefer to start fresh instead of migrating.
 
 ## Connect with `kubectl`
 

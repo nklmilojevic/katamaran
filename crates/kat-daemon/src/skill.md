@@ -61,6 +61,7 @@ kat k8s dns status|install|uninstall      # Manage *.k8s.kat.local DNS on macOS
 kat k8s forward <ip>:<port> [--local P]   # Forward a local TCP port to a Pod/Service IP
 kat k8s stop                              # Stop k3s and disable auto-start
 kat k8s reset                             # Stop k3s and wipe cluster state and volumes
+kat k8s mark-version <version>            # Record verified k3s tag for an unmarked datastore
 ```
 
 ## Configuration

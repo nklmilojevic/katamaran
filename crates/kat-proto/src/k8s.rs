@@ -14,6 +14,7 @@
 //! | `Connect`        | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
 //! | `SyncImages`     | –                                          | `Done`, or `Error`                          |
 //! | `Proxy`          | `Data`… (`DataEnd` closes the write side)  | `Done` then `Data`…, `DataEnd`; or `Error`  |
+//! | `MarkDatastoreVersion` | –                                    | `Done`, or `Error`                          |
 
 use std::io::{self, Read, Write};
 
@@ -43,6 +44,12 @@ pub enum K8sMsg {
     /// Connect to the guest's root-only `kubectl proxy` Unix socket for
     /// authenticated plain-HTTP Kubernetes API access from the host app.
     Proxy,
+    /// Record an independently verified k3s release tag for an existing
+    /// unmarked datastore while Kubernetes is stopped. Refuses to overwrite
+    /// an existing marker.
+    MarkDatastoreVersion {
+        version: String,
+    },
     Data(Vec<u8>),
     DataEnd,
     StatusInfo(K8sInfo),
@@ -83,6 +90,7 @@ mod kind {
     pub const DONE: u16 = 0x80e;
     pub const ERROR: u16 = 0x80f;
     pub const PROGRESS: u16 = 0x810;
+    pub const MARK_DATASTORE_VERSION: u16 = 0x811;
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -111,6 +119,10 @@ impl K8sMsg {
             }
             K8sMsg::SyncImages => kind::SYNC_IMAGES,
             K8sMsg::Proxy => kind::PROXY,
+            K8sMsg::MarkDatastoreVersion { version } => {
+                put_str(b, version);
+                kind::MARK_DATASTORE_VERSION
+            }
             K8sMsg::Data(d) => {
                 put_bytes(b, d);
                 kind::DATA
@@ -168,6 +180,9 @@ impl K8sMsg {
             },
             kind::SYNC_IMAGES => K8sMsg::SyncImages,
             kind::PROXY => K8sMsg::Proxy,
+            kind::MARK_DATASTORE_VERSION => K8sMsg::MarkDatastoreVersion {
+                version: c.string()?,
+            },
             kind::DATA => {
                 let n = c.u32()? as usize;
                 K8sMsg::Data(c.take(n)?.to_vec())
@@ -240,6 +255,9 @@ mod tests {
             },
             K8sMsg::SyncImages,
             K8sMsg::Proxy,
+            K8sMsg::MarkDatastoreVersion {
+                version: "v1.37.2+k3s1".into(),
+            },
             K8sMsg::Data(vec![1, 2, 3, 4]),
             K8sMsg::DataEnd,
             K8sMsg::StatusInfo(K8sInfo {
@@ -283,6 +301,9 @@ mod tests {
             },
             K8sMsg::SyncImages,
             K8sMsg::Proxy,
+            K8sMsg::MarkDatastoreVersion {
+                version: String::new(),
+            },
             K8sMsg::Data(vec![]),
             K8sMsg::DataEnd,
             K8sMsg::StatusInfo(K8sInfo::default()),
