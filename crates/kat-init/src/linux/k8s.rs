@@ -5292,8 +5292,26 @@ fn run_ctr_k8s(
     timeout: Duration,
     on_wait: Option<&mut dyn FnMut()>,
 ) -> Result<ReapedOutput, String> {
-    let mut cmd = Command::new("/usr/bin/ctr");
-    cmd.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io"]);
+    run_ctr_k8s_at(
+        reaper,
+        "/usr/bin/ctr",
+        CONTAINERD_SOCKET,
+        args,
+        timeout,
+        on_wait,
+    )
+}
+
+fn run_ctr_k8s_at(
+    reaper: &Reaper,
+    ctr_bin: &str,
+    socket: &str,
+    args: &[&str],
+    timeout: Duration,
+    on_wait: Option<&mut dyn FnMut()>,
+) -> Result<ReapedOutput, String> {
+    let mut cmd = Command::new(ctr_bin);
+    cmd.args(["-a", socket, "-n", "k8s.io"]);
     cmd.args(args);
     run_reaped_split_checked(
         reaper,
@@ -9271,5 +9289,104 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(!k3s_cfg.exists());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[ignore = "requires live containerd + ctr via KAT_TEST_CTR_BIN and KAT_TEST_CONTAINERD_SOCK"]
+    fn clear_k8s_images_against_live_containerd() {
+        let ctr_bin = std::env::var("KAT_TEST_CTR_BIN")
+            .expect("set KAT_TEST_CTR_BIN to the bundled ctr binary");
+        let socket = std::env::var("KAT_TEST_CONTAINERD_SOCK")
+            .expect("set KAT_TEST_CONTAINERD_SOCK to a live containerd socket");
+        let reaper = Reaper::start();
+
+        let count_lines = |ns: &str, args: &[&str]| -> usize {
+            let mut cmd = Command::new(&ctr_bin);
+            cmd.args(["-a", &socket, "-n", ns]);
+            cmd.args(args);
+            let out = run_reaped_split_checked(
+                &reaper,
+                &mut cmd,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_STDOUT_LIMIT,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(out.code, 0, "ctr {ns} {args:?} failed: {}", out.stderr);
+            parse_ctr_image_refs(&out.stdout).len()
+        };
+
+        let k8s_images_before = count_lines("k8s.io", &["images", "ls", "-q"]);
+        let k8s_content_before = count_lines("k8s.io", &["content", "ls", "-q"]);
+        let moby_images_before = count_lines("moby", &["images", "ls", "-q"]);
+        let moby_content_before = count_lines("moby", &["content", "ls", "-q"]);
+        assert!(
+            k8s_images_before > IMAGE_RM_BATCH_SIZE,
+            "expected multi-batch k8s.io fixture (> {IMAGE_RM_BATCH_SIZE} refs), got {k8s_images_before}"
+        );
+        assert!(k8s_content_before > 0, "expected k8s.io content blobs");
+        assert!(moby_images_before > 0, "expected moby image to preserve");
+        assert!(moby_content_before > 0, "expected moby content to preserve");
+
+        let mut progress = Vec::new();
+        let lease1 = next_gc_lease_id();
+        clear_k8s_images_with(
+            || false,
+            &lease1,
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &socket, args, timeout, on_wait)
+            },
+            |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "removing k8s.io images (batch 1/2)"),
+            "expected batch 1/2 progress, got {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "removing k8s.io images (batch 2/2)"),
+            "expected batch 2/2 progress, got {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "waiting for containerd garbage collection"),
+            "expected GC barrier progress, got {progress:?}"
+        );
+
+        assert_eq!(count_lines("k8s.io", &["images", "ls", "-q"]), 0);
+        assert_eq!(count_lines("k8s.io", &["content", "ls", "-q"]), 0);
+        assert_eq!(count_lines("k8s.io", &["leases", "ls", "-q"]), 0);
+        assert_eq!(
+            count_lines("moby", &["images", "ls", "-q"]),
+            moby_images_before
+        );
+        assert_eq!(
+            count_lines("moby", &["content", "ls", "-q"]),
+            moby_content_before
+        );
+
+        // Retry on an already-empty `k8s.io` namespace also runs the lease GC barrier cleanly.
+        let lease2 = next_gc_lease_id();
+        clear_k8s_images_with(
+            || false,
+            &lease2,
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &socket, args, timeout, on_wait)
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(count_lines("k8s.io", &["leases", "ls", "-q"]), 0);
+        assert_eq!(
+            count_lines("moby", &["images", "ls", "-q"]),
+            moby_images_before
+        );
     }
 }
