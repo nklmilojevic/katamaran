@@ -9,6 +9,7 @@ mod memory;
 mod net;
 pub mod nfs;
 mod ports;
+mod quickack;
 mod relay;
 mod service;
 mod shutdown;
@@ -296,6 +297,9 @@ fn start_network(notifier: &Notifier) {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     match net::setup(&cmdline) {
         Ok(Some(_)) => {
+            if quickack::enabled(&cmdline) {
+                quickack::start();
+            }
             let auto = autofwd::enabled(&cmdline)
                 .then(autofwd::AutoForward::start)
                 .and_then(|r| {
