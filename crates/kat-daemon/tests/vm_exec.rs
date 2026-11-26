@@ -281,10 +281,12 @@ fn verify_host_pty_shell_and_resize(home: &Path) {
     let deadline = Instant::now() + CMD_TIMEOUT;
     let mut output = String::new();
 
-    // 1. Confirm auto-PTY allocation inside the guest.
+    // 1. Confirm auto-PTY allocation inside the guest. Split the marker across
+    // printf arguments so terminal echo of the command line cannot satisfy the
+    // check before the guest actually runs `test -t 0 && test -t 1`.
     write_all_fd(
         master.as_raw_fd(),
-        b"test -t 0 && test -t 1 && echo HOST_PTY_OK\n",
+        b"test -t 0 && test -t 1 && printf '%s%s\\n' HOST_PTY _OK\n",
     );
     read_fd_until(master.as_raw_fd(), &mut output, "HOST_PTY_OK", deadline);
 

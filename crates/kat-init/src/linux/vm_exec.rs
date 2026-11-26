@@ -6,7 +6,8 @@
 //! rlimits, and guest logs without needing Kubernetes or an LXC machine.
 //! Idle overhead is a single vsock listener thread.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -15,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,16 +39,23 @@ const MAX_ERROR_BYTES: usize = 64 << 10;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// Grace period after `SIGHUP` on host disconnect before escalating to `SIGKILL`.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
+/// Probe interval while guest stdin is backpressured so host disconnect is
+/// still detected even when the host vsock proxy is in `WaitingCreditUpdate`
+/// with a full guest receive window.
+const BACKPRESSURE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// Idle window after the main child exits before cancelling pumps held open by
-/// a quiet background descendant.
+/// a surviving background descendant.
 const POST_EXIT_IDLE: Duration = Duration::from_millis(200);
-/// Maximum bytes accepted from a noisy surviving descendant after the main
-/// child exits and `POST_EXIT_IDLE` has elapsed (never applies when all write
-/// ends have closed and buffered main-child output is draining).
-const MAX_POST_EXIT_DESCENDANT_BYTES: usize = 2 << 20;
+/// Maximum chunks drained per outer poll cycle when writers remain open so
+/// `wake_r` (child exit) is always observed promptly during continuous output.
+const PUMP_DRAIN_BATCH: usize = 4;
 /// Maximum buffered stdin bytes held in user space while guest stdin is
 /// backpressured, keeping memory bounded while still monitoring disconnect.
 const STDIN_BUF_CAP: usize = 128 << 10;
+const CGROUP_PARENT: &str = "/sys/fs/cgroup/kat-vm-exec";
+
+static NEXT_CGROUP_ID: AtomicUsize = AtomicUsize::new(1);
+static LIVE_CGROUPS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 struct ConnGuard(Arc<AtomicUsize>);
 
@@ -215,6 +223,77 @@ fn send_final(w: &Writer, m: &VmExecMsg) -> io::Result<()> {
     vm_exec::write(&mut guard.stream, m)
 }
 
+/// Send a 6-byte `Pong` keepalive probe without blocking indefinitely.
+///
+/// When guest stdin is backpressured and `stdin_worker` stops draining `reader`,
+/// the host vsock proxy can enter `WaitingCreditUpdate` and stop observing host
+/// `HANG_UP` until the guest writes a packet. Sending `Pong` triggers an
+/// immediate `EPIPE` / `VSOCK_SHUTDOWN_RCV` if the host closed its socket.
+///
+/// Returns `Ok(true)` if the probe succeeded or was deferred (socket busy),
+/// `Ok(false)` if the writer is already closed, or `Err(e)` if the peer closed.
+fn try_send_probe(w: &Writer) -> io::Result<bool> {
+    let Ok(mut guard) = w.try_lock() else {
+        return Ok(true);
+    };
+    if guard.closed {
+        return Ok(false);
+    }
+    let fd = guard.stream.as_raw_fd();
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if rc < 0 {
+        return Ok(true);
+    }
+    if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+        && (pfd.revents & libc::POLLOUT) == 0
+    {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer closed"));
+    }
+    if (pfd.revents & libc::POLLOUT) == 0 {
+        return Ok(true);
+    }
+    let frame = VmExecMsg::Pong.encode();
+    let sent = unsafe {
+        libc::send(
+            fd,
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent < 0 {
+        let e = io::Error::last_os_error();
+        if matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            return Ok(true);
+        }
+        return Err(e);
+    }
+    if sent == 0 {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer closed"));
+    }
+    let sent = sent as usize;
+    if sent < frame.len() {
+        // Complete any partial 6-byte frame write so framing stays intact.
+        let mut ds = DeadlineStream {
+            conn: &mut guard.stream,
+            deadline: Instant::now() + Duration::from_millis(500),
+        };
+        if let Err(e) = ds.write_all(&frame[sent..]) {
+            guard.closed = true;
+            return Err(e);
+        }
+    }
+    Ok(true)
+}
+
 enum ChildHandle {
     /// PTY session leader spawned with `setsid`, guarded by both `pidfd` and
     /// a token-pinned [`PgrpTarget`] so PID reuse can never be signaled.
@@ -247,6 +326,206 @@ fn signal_handle(reaper: &Reaper, handle: &Mutex<Option<ChildHandle>>, sig: i32)
     let guard = handle.lock().unwrap();
     if let Some(h) = guard.as_ref() {
         h.signal(reaper, sig);
+    }
+}
+
+fn cgroup_events_populated(text: &str) -> bool {
+    text.lines().any(|line| line.trim() == "populated 1")
+}
+
+/// Optional per-session cgroup v2 leaf under `/sys/fs/cgroup/kat-vm-exec/<n>`.
+///
+/// On host disconnect, allows finishing `SIGKILL` escalation for surviving
+/// descendants even after the process-group leader has exited and been reaped,
+/// with zero PID/PGID reuse risk.
+struct SessionCgroup {
+    id: usize,
+    path: PathBuf,
+    kill_fd: OwnedFd,
+    events_fd: OwnedFd,
+}
+
+impl SessionCgroup {
+    fn create() -> Option<(Self, OwnedFd)> {
+        if fs::create_dir_all(CGROUP_PARENT).is_err() {
+            return None;
+        }
+        let id = NEXT_CGROUP_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut live = LIVE_CGROUPS.lock().unwrap_or_else(|e| e.into_inner());
+            live.insert(id);
+            // Best-effort sweep of empty leftover directories from prior
+            // sessions whose detached background processes have since exited,
+            // never touching any cgroup currently owned by an active session.
+            if let Ok(entries) = fs::read_dir(CGROUP_PARENT) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let is_live = name
+                        .to_str()
+                        .and_then(|s| s.strip_prefix("s-"))
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .is_some_and(|n| live.contains(&n));
+                    if !is_live {
+                        let _ = fs::remove_dir(entry.path());
+                    }
+                }
+            }
+        }
+        let release_id = || {
+            LIVE_CGROUPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        };
+        let path = PathBuf::from(CGROUP_PARENT).join(format!("s-{id}"));
+        if fs::create_dir(&path).is_err() {
+            release_id();
+            return None;
+        }
+        let open_cloexec = |name: &str, flags: libc::c_int| -> Option<OwnedFd> {
+            let p = path.join(name);
+            let c = CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+            let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
+            if fd < 0 {
+                None
+            } else {
+                Some(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+        };
+        let Some(procs_fd) = open_cloexec("cgroup.procs", libc::O_WRONLY) else {
+            let _ = fs::remove_dir(&path);
+            release_id();
+            return None;
+        };
+        let Some(kill_fd) = open_cloexec("cgroup.kill", libc::O_WRONLY) else {
+            let _ = fs::remove_dir(&path);
+            release_id();
+            return None;
+        };
+        let Some(events_fd) = open_cloexec("cgroup.events", libc::O_RDONLY) else {
+            let _ = fs::remove_dir(&path);
+            release_id();
+            return None;
+        };
+        Some((
+            SessionCgroup {
+                id,
+                path,
+                kill_fd,
+                events_fd,
+            },
+            procs_fd,
+        ))
+    }
+
+    fn is_populated(&self) -> bool {
+        let mut buf = [0u8; 128];
+        let n = unsafe {
+            libc::pread(
+                self.events_fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+            )
+        };
+        if n <= 0 {
+            return false;
+        }
+        let text = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+        cgroup_events_populated(text)
+    }
+
+    fn kill(&self) {
+        unsafe {
+            let _ = libc::pwrite(self.kill_fd.as_raw_fd(), b"1\n".as_ptr().cast(), 2, 0);
+        }
+    }
+
+    fn wait_empty(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.is_populated() {
+                return true;
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return false;
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.events_fd.as_raw_fd(),
+                events: libc::POLLPRI,
+                revents: 0,
+            };
+            let timeout_ms = rem.as_millis().clamp(1, 50) as i32;
+            let _ = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        }
+    }
+
+    /// Wait up to `grace` after `SIGHUP` for both leader exit (`cancel_r`) and
+    /// all session processes in this cgroup to exit; escalate to `SIGKILL` and
+    /// `cgroup.kill` if either the leader or any descendant survives past
+    /// `grace` (even if the process-group leader itself already exited).
+    fn cleanup_after_disconnect(
+        &self,
+        cancel_r: &OwnedFd,
+        grace: Duration,
+        reaper: &Reaper,
+        handle: &Mutex<Option<ChildHandle>>,
+    ) {
+        let deadline = Instant::now() + grace;
+        let mut leader_exited = false;
+        loop {
+            if leader_exited && !self.is_populated() {
+                return;
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let timeout_ms = rem.as_millis().clamp(1, 50) as i32;
+            if !leader_exited {
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: cancel_r.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: self.events_fd.as_raw_fd(),
+                        events: libc::POLLPRI,
+                        revents: 0,
+                    },
+                ];
+                let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
+                if rc > 0 && pfds[0].revents != 0 {
+                    leader_exited = true;
+                }
+            } else {
+                let mut pfd = libc::pollfd {
+                    fd: self.events_fd.as_raw_fd(),
+                    events: libc::POLLPRI,
+                    revents: 0,
+                };
+                let _ = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            }
+        }
+        if !leader_exited {
+            signal_handle(reaper, handle, libc::SIGKILL);
+        }
+        if self.is_populated() {
+            self.kill();
+            let _ = self.wait_empty(Duration::from_millis(500));
+        }
+    }
+}
+
+impl Drop for SessionCgroup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+        LIVE_CGROUPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -326,41 +605,99 @@ fn peer_is_host(addr: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
         && addr.svm_cid == libc::VMADDR_CID_HOST
 }
 
-/// Compute the byte sequence to write to a PTY master on `DataEnd`.
-///
-/// In canonical mode (`ICANON`), returns the terminal's configured `VEOF`:
-/// twice if the previous byte did not terminate a line (the first flushes the
-/// partial line, the second delivers EOF on the following read), or once if
-/// the canonical buffer is already at a line boundary.
-///
-/// In noncanonical/raw mode (or when `VEOF` is disabled), returns 0 bytes so
-/// literal control bytes are never injected into raw-mode sessions; raw PTY
-/// readers have no in-band EOF mechanism.
-fn pty_eof_bytes(termios: &libc::termios, last_byte: Option<u8>) -> ([u8; 2], usize) {
-    if (termios.c_lflag & libc::ICANON) == 0 {
-        return ([0, 0], 0);
-    }
-    let veof = termios.c_cc[libc::VEOF];
-    if veof == 0 {
-        return ([0, 0], 0);
-    }
-    let veol = termios.c_cc[libc::VEOL];
-    let veol2 = termios.c_cc[libc::VEOL2];
-    let icrnl = (termios.c_iflag & libc::ICRNL) != 0;
-    let at_line_boundary = match last_byte {
-        None => true,
-        Some(b) => {
-            b == b'\n'
-                || b == veof
-                || (veol != 0 && b == veol)
-                || (veol2 != 0 && b == veol2)
-                || (icrnl && b == b'\r')
+/// Tracks whether the Linux `n_tty` canonical input buffer holds an uncommitted
+/// partial line after applying `termios` input translation (`ISTRIP`, `IGNCR`,
+/// `ICRNL`, `INLCR`, `IEXTEN`/`VLNEXT`, `VERASE`, `VKILL`, `VEOF`, `VEOL`,
+/// `VEOL2`).
+#[derive(Default)]
+struct PtyCanonTracker {
+    partial_len: usize,
+    lnext_pending: bool,
+}
+
+impl PtyCanonTracker {
+    fn feed(&mut self, termios: &libc::termios, bytes: &[u8]) {
+        let istrip = (termios.c_iflag & libc::ISTRIP) != 0;
+        let igncr = (termios.c_iflag & libc::IGNCR) != 0;
+        let icrnl = (termios.c_iflag & libc::ICRNL) != 0;
+        let inlcr = (termios.c_iflag & libc::INLCR) != 0;
+        let icanon = (termios.c_lflag & libc::ICANON) != 0;
+        let iexten = (termios.c_lflag & libc::IEXTEN) != 0;
+
+        let veof = termios.c_cc[libc::VEOF];
+        let veol = termios.c_cc[libc::VEOL];
+        let veol2 = termios.c_cc[libc::VEOL2];
+        let verase = termios.c_cc[libc::VERASE];
+        let vkill = termios.c_cc[libc::VKILL];
+        let vlnext = termios.c_cc[libc::VLNEXT];
+
+        for &raw in bytes {
+            let mut c = if istrip { raw & 0x7f } else { raw };
+
+            if self.lnext_pending {
+                self.lnext_pending = false;
+                if icanon {
+                    self.partial_len = self.partial_len.saturating_add(1);
+                }
+                continue;
+            }
+
+            if c == b'\r' {
+                if igncr {
+                    continue;
+                }
+                if icrnl {
+                    c = b'\n';
+                }
+            } else if c == b'\n' && inlcr {
+                c = b'\r';
+            }
+
+            if !icanon {
+                self.partial_len = 0;
+                continue;
+            }
+
+            if iexten && vlnext != 0 && c == vlnext {
+                self.lnext_pending = true;
+                continue;
+            }
+
+            if c == b'\n'
+                || (veof != 0 && c == veof)
+                || (veol != 0 && c == veol)
+                || (iexten && veol2 != 0 && c == veol2)
+                || (vkill != 0 && c == vkill)
+            {
+                self.partial_len = 0;
+            } else if verase != 0 && c == verase {
+                self.partial_len = self.partial_len.saturating_sub(1);
+            } else {
+                self.partial_len = self.partial_len.saturating_add(1);
+            }
         }
-    };
-    if at_line_boundary {
-        ([veof, 0], 1)
-    } else {
-        ([veof, veof], 2)
+    }
+
+    /// Compute the `VEOF` sequence to write to a PTY master on `DataEnd`.
+    ///
+    /// In noncanonical/raw mode (or when `VEOF` is disabled), returns 0 bytes
+    /// so literal control bytes are never injected into raw-mode sessions; raw
+    /// PTY readers have no in-band EOF mechanism.
+    fn eof_bytes(&self, termios: &libc::termios) -> ([u8; 3], usize) {
+        if (termios.c_lflag & libc::ICANON) == 0 {
+            return ([0; 3], 0);
+        }
+        let veof = termios.c_cc[libc::VEOF];
+        if veof == 0 {
+            return ([0; 3], 0);
+        }
+        if self.lnext_pending {
+            ([veof, veof, veof], 3)
+        } else if self.partial_len > 0 {
+            ([veof, veof, 0], 2)
+        } else {
+            ([veof, 0, 0], 1)
+        }
     }
 }
 
@@ -448,7 +785,7 @@ fn flush_stdin(
     eof_pending: &mut bool,
     master: &Option<OwnedFd>,
     tty: bool,
-    last_byte: &mut Option<u8>,
+    canon: &mut PtyCanonTracker,
 ) {
     loop {
         while let Some(fd) = stdin.as_ref() {
@@ -456,9 +793,20 @@ fn flush_stdin(
             if slice.is_empty() {
                 break;
             }
+            let mut tio: Option<libc::termios> = None;
+            if tty && let Some(m) = master.as_ref() {
+                let mut cur: libc::termios = unsafe { std::mem::zeroed() };
+                if unsafe { libc::tcgetattr(m.as_raw_fd(), &mut cur) } == 0 {
+                    tio = Some(cur);
+                }
+            }
             let rc = unsafe { libc::write(fd.as_raw_fd(), slice.as_ptr().cast(), slice.len()) };
             if rc > 0 {
-                pending.drain(..rc as usize);
+                let n = rc as usize;
+                if let Some(cur) = &tio {
+                    canon.feed(cur, &slice[..n]);
+                }
+                pending.drain(..n);
             } else if rc == 0 {
                 break;
             } else {
@@ -493,11 +841,10 @@ fn flush_stdin(
         if unsafe { libc::tcgetattr(m.as_raw_fd(), &mut tio) } < 0 {
             return;
         }
-        let (bytes, n) = pty_eof_bytes(&tio, *last_byte);
+        let (bytes, n) = canon.eof_bytes(&tio);
         if n == 0 {
             return;
         }
-        *last_byte = Some(bytes[0]);
         pending.extend(&bytes[..n]);
     }
 }
@@ -533,23 +880,57 @@ fn wait_for_cancel(cancel_r: &OwnedFd, timeout: Duration) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn stdin_worker(
     reader: UnixStream,
+    writer: Writer,
     cancel_r: OwnedFd,
     mut stdin: Option<OwnedFd>,
     master: Option<OwnedFd>,
     tty: bool,
     reaper: Reaper,
     handle: Arc<Mutex<Option<ChildHandle>>>,
+    cgroup: Option<Arc<SessionCgroup>>,
     host_disconnected: Arc<AtomicBool>,
     disconnect_grace: Duration,
+    backpressure_probe: Duration,
 ) {
     let mut frames = FrameReader::default();
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut eof_pending = false;
-    let mut last_byte: Option<u8> = None;
+    let mut canon = PtyCanonTracker::default();
     let mut disconnected = false;
+    let mut last_probe: Option<Instant> = None;
 
     'outer: loop {
         let can_read = pending.len() < STDIN_BUF_CAP;
+        let poll_timeout_ms = if can_read {
+            last_probe = None;
+            -1
+        } else {
+            let now = Instant::now();
+            let next_probe = match last_probe {
+                Some(t) => t + backpressure_probe,
+                None => {
+                    last_probe = Some(now);
+                    now + backpressure_probe
+                }
+            };
+            let rem = next_probe.saturating_duration_since(now);
+            if rem.is_zero() {
+                match try_send_probe(&writer) {
+                    Ok(true) => {
+                        last_probe = Some(now);
+                        backpressure_probe.as_millis().clamp(1, i32::MAX as u128) as i32
+                    }
+                    Ok(false) => break 'outer,
+                    Err(_) => {
+                        disconnected = true;
+                        break 'outer;
+                    }
+                }
+            } else {
+                rem.as_millis().clamp(1, i32::MAX as u128) as i32
+            }
+        };
+
         let mut pfds = [
             libc::pollfd {
                 fd: cancel_r.as_raw_fd(),
@@ -576,12 +957,26 @@ fn stdin_worker(
         } else {
             2
         };
-        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, poll_timeout_ms) };
         if rc < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             break;
+        }
+        if rc == 0 {
+            // Backpressure probe interval fired: probe the peer via a 6-byte
+            // Pong write to detect host close even when the host vsock proxy
+            // is in WaitingCreditUpdate with a full guest receive window.
+            match try_send_probe(&writer) {
+                Ok(true) => last_probe = Some(Instant::now()),
+                Ok(false) => break 'outer,
+                Err(_) => {
+                    disconnected = true;
+                    break 'outer;
+                }
+            }
+            continue;
         }
         // Normal child exit wakes cancel_r: exit cleanly without signaling.
         if pfds[0].revents != 0 {
@@ -601,7 +996,7 @@ fn stdin_worker(
                     &mut eof_pending,
                     &master,
                     tty,
-                    &mut last_byte,
+                    &mut canon,
                 );
             }
         }
@@ -612,7 +1007,6 @@ fn stdin_worker(
                         Ok(PollFrame::Msg(m)) => match m {
                             VmExecMsg::Data(d) => {
                                 if !eof_pending && stdin.is_some() && !d.is_empty() {
-                                    last_byte = d.last().copied();
                                     pending.extend(&d);
                                     flush_stdin(
                                         &mut stdin,
@@ -620,7 +1014,7 @@ fn stdin_worker(
                                         &mut eof_pending,
                                         &master,
                                         tty,
-                                        &mut last_byte,
+                                        &mut canon,
                                     );
                                 }
                             }
@@ -632,7 +1026,7 @@ fn stdin_worker(
                                     &mut eof_pending,
                                     &master,
                                     tty,
-                                    &mut last_byte,
+                                    &mut canon,
                                 );
                             }
                             VmExecMsg::Resize { rows, cols } => {
@@ -667,12 +1061,16 @@ fn stdin_worker(
     if disconnected {
         host_disconnected.store(true, Ordering::Release);
         // The host went away: hang up the session or process group, then
-        // escalate to SIGKILL after a bounded grace period if still live.
+        // escalate to SIGKILL after a bounded grace period if the leader or
+        // any surviving session descendant remains live.
         signal_handle(&reaper, &handle, libc::SIGHUP);
-        if !wait_for_cancel(&cancel_r, disconnect_grace) {
+        if let Some(cg) = &cgroup {
+            cg.cleanup_after_disconnect(&cancel_r, disconnect_grace, &reaper, &handle);
+        } else if !wait_for_cancel(&cancel_r, disconnect_grace) {
             signal_handle(&reaper, &handle, libc::SIGKILL);
         }
     }
+    drop(cgroup);
 }
 
 /// Relay output from `from` (nonblocking pipe or PTY master) until EOF/EIO.
@@ -681,8 +1079,9 @@ fn stdin_worker(
 /// - If all write ends have closed (`POLLHUP`), drains every buffered byte
 ///   across arbitrary host backpressure without discarding output.
 /// - If a surviving background descendant still holds the write end open,
-///   bounds the post-exit idle wait to `post_exit_idle` (and caps noisy
-///   descendant writes) so the worker always exits and can be joined cleanly.
+///   bounds the post-exit window to `post_exit_idle` and bounds each read
+///   batch so `wake_r` is always observed promptly even under continuous
+///   descendant output.
 fn pump(
     from: OwnedFd,
     wake_r: OwnedFd,
@@ -695,7 +1094,6 @@ fn pump(
     let mut child_exited = false;
     let mut idle_deadline: Option<Instant> = None;
     let mut all_writers_closed = false;
-    let mut post_exit_descendant_bytes: usize = 0;
 
     loop {
         if host_disconnected.load(Ordering::Acquire) {
@@ -748,22 +1146,21 @@ fn pump(
             all_writers_closed = true;
         }
         if pfds[0].revents != 0 || child_exited {
+            let mut chunks = 0usize;
             loop {
                 if host_disconnected.load(Ordering::Acquire) {
                     return Ok(());
                 }
+                if !all_writers_closed && chunks >= PUMP_DRAIN_BATCH {
+                    // Return to the outer poll so `wake_r` (child exit) and
+                    // `idle_deadline` are always observed during continuous
+                    // output from a surviving descendant.
+                    break;
+                }
                 let n = unsafe { libc::read(from.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
-                    let n = n as usize;
-                    send(&w, &kind(buf[..n].to_vec()))?;
-                    if child_exited && !all_writers_closed {
-                        post_exit_descendant_bytes = post_exit_descendant_bytes.saturating_add(n);
-                        if post_exit_descendant_bytes >= MAX_POST_EXIT_DESCENDANT_BYTES
-                            && idle_deadline.is_some_and(|dl| Instant::now() >= dl)
-                        {
-                            return Ok(());
-                        }
-                    }
+                    chunks += 1;
+                    send(&w, &kind(buf[..n as usize].to_vec()))?;
                 } else if n == 0 {
                     return Ok(());
                 } else {
@@ -838,6 +1235,7 @@ fn serve(reaper: &Reaper, conn: UnixStream) {
         FIRST_FRAME_TIMEOUT,
         DISCONNECT_GRACE,
         POST_EXIT_IDLE,
+        BACKPRESSURE_PROBE_INTERVAL,
     );
 }
 
@@ -847,6 +1245,7 @@ fn serve_with_timeouts(
     first_frame_timeout: Duration,
     disconnect_grace: Duration,
     post_exit_idle: Duration,
+    backpressure_probe: Duration,
 ) {
     let deadline = Instant::now() + first_frame_timeout;
     let spec = {
@@ -882,14 +1281,9 @@ fn serve_with_timeouts(
         }
     };
 
-    // Clear handshake timeouts so interactive sessions stay untimed.
-    if let Err(e) = conn
-        .set_read_timeout(None)
-        .and_then(|()| conn.set_write_timeout(None))
-    {
-        log(&format!("clear socket timeouts: {e}"));
-        return;
-    }
+    // Ensure no socket timeouts remain on the connection for interactive sessions.
+    let _ = conn.set_read_timeout(None);
+    let _ = conn.set_write_timeout(None);
 
     if let Err(e) = exec_with_timeouts(
         reaper,
@@ -897,6 +1291,7 @@ fn serve_with_timeouts(
         &spec,
         disconnect_grace,
         post_exit_idle,
+        backpressure_probe,
     ) {
         let mut ds = DeadlineStream {
             conn: &mut conn,
@@ -1000,6 +1395,7 @@ fn exec_with_timeouts(
     spec: &ExecSpec,
     disconnect_grace: Duration,
     post_exit_idle: Duration,
+    backpressure_probe: Duration,
 ) -> Result<(), String> {
     let conn = conn.map_err(|e| format!("clone stream: {e}"))?;
     let (mut c, program) = build_command(spec)?;
@@ -1010,9 +1406,15 @@ fn exec_with_timeouts(
     }));
     let reader = conn;
 
-    // Allocate all control pipes and PTY/pipe descriptors BEFORE spawning the
-    // child so no fallible descriptor allocation can occur after spawn.
+    // Allocate all control pipes, cgroup descriptors, and PTY/pipe descriptors
+    // BEFORE spawning the child so no fallible descriptor allocation can occur
+    // after spawn.
     let (stdin_cancel_r, stdin_cancel_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
+    let (cgroup, procs_fd) = match SessionCgroup::create() {
+        Some((cg, pfd)) => (Some(Arc::new(cg)), Some(pfd)),
+        None => (None, None),
+    };
+    let procs_raw = procs_fd.as_ref().map(AsRawFd::as_raw_fd);
 
     let (handle, exited, stdin, master, out_specs) = match &spec.tty {
         Some(t) => {
@@ -1032,9 +1434,12 @@ fn exec_with_timeouts(
                 slave.try_clone().map_err(|e| format!("pty stdout: {e}"))?,
             ))
             .stderr(Stdio::from(slave));
-            // SAFETY: setsid and ioctl(TIOCSCTTY) are async-signal-safe.
+            // SAFETY: write, setsid, and ioctl(TIOCSCTTY) are async-signal-safe.
             unsafe {
-                c.pre_exec(|| {
+                c.pre_exec(move || {
+                    if let Some(pfd) = procs_raw {
+                        let _ = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                    }
                     if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -1045,6 +1450,7 @@ fn exec_with_timeouts(
                 .spawn_pidfd_pgrp(&mut c)
                 .map_err(|e| format!("exec {program:?}: {e}"))?;
             drop(c);
+            drop(procs_fd);
             (
                 ChildHandle::Pty { target, pgrp },
                 exited,
@@ -1072,9 +1478,12 @@ fn exec_with_timeouts(
                 .stderr(Stdio::from(err_w));
             // Put non-PTY commands in their own process group so host
             // disconnect or signals reach descendant processes too.
-            // SAFETY: setpgid is async-signal-safe.
+            // SAFETY: write and setpgid are async-signal-safe.
             unsafe {
-                c.pre_exec(|| {
+                c.pre_exec(move || {
+                    if let Some(pfd) = procs_raw {
+                        let _ = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                    }
                     if libc::setpgid(0, 0) < 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -1085,6 +1494,7 @@ fn exec_with_timeouts(
                 .spawn_pgrp(&mut c)
                 .map_err(|e| format!("exec {program:?}: {e}"))?;
             drop(c);
+            drop(procs_fd);
             (
                 ChildHandle::Pipe(pgrp),
                 exited,
@@ -1108,6 +1518,9 @@ fn exec_with_timeouts(
 
     if send(&w, &VmExecMsg::Started).is_err() {
         signal_handle(reaper, &handle, libc::SIGKILL);
+        if let Some(cg) = &cgroup {
+            cg.kill();
+        }
         *handle.lock().unwrap() = None;
         let _ = exited.recv_timeout(Duration::from_secs(2));
         return Ok(());
@@ -1117,24 +1530,32 @@ fn exec_with_timeouts(
     let handle_in = handle.clone();
     let reaper_in = reaper.clone();
     let disc_in = host_disconnected.clone();
+    let w_in = w.clone();
+    let cg_in = cgroup.clone();
     let stdin_thread = match thread::Builder::new()
         .name("vm-exec-in".into())
         .spawn(move || {
             stdin_worker(
                 reader,
+                w_in,
                 stdin_cancel_r,
                 stdin,
                 master,
                 tty,
                 reaper_in,
                 handle_in,
+                cg_in,
                 disc_in,
                 disconnect_grace,
+                backpressure_probe,
             );
         }) {
         Ok(h) => h,
         Err(e) => {
             signal_handle(reaper, &handle, libc::SIGKILL);
+            if let Some(cg) = &cgroup {
+                cg.kill();
+            }
             *handle.lock().unwrap() = None;
             let _ = send_final(
                 &w,
@@ -1160,6 +1581,9 @@ fn exec_with_timeouts(
             }
             Err(e) => {
                 signal_handle(reaper, &handle, libc::SIGKILL);
+                if let Some(cg) = &cgroup {
+                    cg.kill();
+                }
                 *handle.lock().unwrap() = None;
                 let _ = send_final(
                     &w,
@@ -1187,7 +1611,7 @@ fn exec_with_timeouts(
 
     // Signal output pumps that the main child has exited, then join every
     // pump so buffered output is preserved across host backpressure while
-    // quiet background descendants cannot leak worker threads or descriptors.
+    // surviving background descendants cannot leak worker threads or descriptors.
     drop(out_wakes);
     let mut output_err: Option<io::Error> = None;
     for o in outputs {
@@ -1227,6 +1651,8 @@ fn exec_with_timeouts(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Shutdown;
+
     use super::*;
 
     #[test]
@@ -1366,6 +1792,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_cgroup_events_populated() {
+        assert!(cgroup_events_populated("populated 1\nfrozen 0\n"));
+        assert!(!cgroup_events_populated("populated 0\nfrozen 0\n"));
+        assert!(!cgroup_events_populated(""));
+    }
+
+    #[test]
     fn accepts_only_host_vsock_peer() {
         let len = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
         let make = |family: i32, cid: u32| {
@@ -1378,7 +1811,6 @@ mod tests {
             &make(libc::AF_VSOCK, libc::VMADDR_CID_HOST),
             len
         ));
-        // Loopback, guest, hypervisor, and wildcard CIDs must be refused.
         assert!(!peer_is_host(
             &make(libc::AF_VSOCK, libc::VMADDR_CID_LOCAL),
             len
@@ -1392,7 +1824,6 @@ mod tests {
             &make(libc::AF_VSOCK, libc::VMADDR_CID_ANY),
             len
         ));
-        // Wrong family or truncated/oversized length must be refused.
         assert!(!peer_is_host(
             &make(libc::AF_UNIX, libc::VMADDR_CID_HOST),
             len
@@ -1413,37 +1844,83 @@ mod tests {
     }
 
     #[test]
-    fn pty_eof_bytes_handles_canonical_partial_and_noncanonical() {
-        let mut tio: libc::termios = unsafe { std::mem::zeroed() };
-        tio.c_lflag = libc::ICANON;
-        tio.c_iflag = libc::ICRNL;
-        tio.c_cc[libc::VEOF] = 0x04;
+    fn pty_canon_tracker_respects_input_translation_flags() {
+        let base_tio = || {
+            let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+            tio.c_lflag = libc::ICANON | libc::IEXTEN;
+            tio.c_iflag = libc::ICRNL;
+            tio.c_cc[libc::VEOF] = 0x04;
+            tio.c_cc[libc::VERASE] = 0x7f;
+            tio.c_cc[libc::VKILL] = 0x15;
+            tio.c_cc[libc::VLNEXT] = 0x16;
+            tio.c_cc[libc::VEOL] = 0;
+            tio.c_cc[libc::VEOL2] = 0x05;
+            tio
+        };
 
-        // Empty or line-terminated input needs a single VEOF.
-        assert_eq!(pty_eof_bytes(&tio, None), ([0x04, 0], 1));
-        assert_eq!(pty_eof_bytes(&tio, Some(b'\n')), ([0x04, 0], 1));
-        assert_eq!(pty_eof_bytes(&tio, Some(b'\r')), ([0x04, 0], 1));
-        assert_eq!(pty_eof_bytes(&tio, Some(0x04)), ([0x04, 0], 1));
+        // Empty or newline-terminated input needs a single VEOF.
+        let tio = base_tio();
+        let mut tr = PtyCanonTracker::default();
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0, 0], 1));
+        tr.feed(&tio, b"hello\n");
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0, 0], 1));
 
-        // Partial line needs two VEOF bytes: flush line, then deliver EOF.
-        assert_eq!(pty_eof_bytes(&tio, Some(b'x')), ([0x04, 0x04], 2));
+        // Partial line needs two VEOF bytes.
+        tr.feed(&tio, b"part");
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0x04, 0], 2));
 
-        // Without ICRNL, '\r' is a partial line character.
-        tio.c_iflag = 0;
-        assert_eq!(pty_eof_bytes(&tio, Some(b'\r')), ([0x04, 0x04], 2));
+        // ICRNL maps CR -> NL (ends line).
+        tr.feed(&tio, b"\r");
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0, 0], 1));
 
-        // Custom VEOF is respected.
-        tio.c_cc[libc::VEOF] = 0x1a;
-        assert_eq!(pty_eof_bytes(&tio, Some(b'a')), ([0x1a, 0x1a], 2));
+        // IGNCR discards CR even when ICRNL is also set, preserving partial line.
+        let mut igncr_tio = base_tio();
+        igncr_tio.c_iflag = libc::IGNCR | libc::ICRNL;
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&igncr_tio, b"hello\r");
+        assert_eq!(tr.eof_bytes(&igncr_tio), ([0x04, 0x04, 0], 2));
 
-        // Disabled VEOF (0) injects nothing.
-        tio.c_cc[libc::VEOF] = 0;
-        assert_eq!(pty_eof_bytes(&tio, Some(b'a')), ([0, 0], 0));
+        // INLCR maps NL -> CR (does NOT terminate the line).
+        let mut inlcr_tio = base_tio();
+        inlcr_tio.c_iflag = libc::INLCR;
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&inlcr_tio, b"hello\n");
+        assert_eq!(tr.eof_bytes(&inlcr_tio), ([0x04, 0x04, 0], 2));
 
-        // Noncanonical / raw mode injects nothing.
-        tio.c_lflag = 0;
-        tio.c_cc[libc::VEOF] = 0x04;
-        assert_eq!(pty_eof_bytes(&tio, Some(b'a')), ([0, 0], 0));
+        // ISTRIP strips bit 7 before checking newline.
+        let mut strip_tio = base_tio();
+        strip_tio.c_iflag = libc::ISTRIP;
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&strip_tio, &[b'a', b'\n' | 0x80]);
+        assert_eq!(tr.eof_bytes(&strip_tio), ([0x04, 0, 0], 1));
+
+        // VLNEXT escapes newline so line remains partial.
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&tio, &[b'a', 0x16, b'\n']);
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0x04, 0], 2));
+
+        // VEOL2 terminates only when IEXTEN is enabled.
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&tio, &[b'a', 0x05]);
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0, 0], 1));
+        let mut no_exten = base_tio();
+        no_exten.c_lflag = libc::ICANON;
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&no_exten, &[b'a', 0x05]);
+        assert_eq!(tr.eof_bytes(&no_exten), ([0x04, 0x04, 0], 2));
+
+        // VERASE backspacing the only char returns to line boundary.
+        let mut tr = PtyCanonTracker::default();
+        tr.feed(&tio, &[b'a', 0x7f]);
+        assert_eq!(tr.eof_bytes(&tio), ([0x04, 0, 0], 1));
+
+        // Noncanonical / disabled VEOF injects nothing.
+        let mut raw = base_tio();
+        raw.c_lflag = 0;
+        assert_eq!(tr.eof_bytes(&raw), ([0, 0, 0], 0));
+        let mut no_eof = base_tio();
+        no_eof.c_cc[libc::VEOF] = 0;
+        assert_eq!(tr.eof_bytes(&no_eof), ([0, 0, 0], 0));
     }
 
     #[test]
@@ -1463,6 +1940,7 @@ mod tests {
                 Duration::from_millis(120),
                 Duration::from_millis(100),
                 Duration::from_millis(50),
+                Duration::from_millis(50),
             );
         });
         handle.join().unwrap();
@@ -1477,6 +1955,25 @@ mod tests {
         set_nonblocking(&r).unwrap();
         let (wake_r, wake_w) = cmd::pipe().unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();
+        // Shrink socket buffers so `send` experiences real backpressure while
+        // the host pauses reading.
+        let small: libc::c_int = 8192;
+        unsafe {
+            let _ = libc::setsockopt(
+                guest.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&small as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            let _ = libc::setsockopt(
+                host.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&small as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
         let writer: Writer = Arc::new(Mutex::new(ExecWriter {
             stream: guest,
             closed: false,
@@ -1484,11 +1981,9 @@ mod tests {
         let disc = Arc::new(AtomicBool::new(false));
 
         let payload = vec![b'A'; 48 << 10];
-        let mut wf = std::fs::File::from(w_pipe);
-        wf.write_all(&payload).unwrap();
-        drop(wf); // Child closed pipe and exited.
-        drop(wake_w);
-
+        let payload_w = payload.clone();
+        // Start pump first and write on a worker thread so this test can never
+        // deadlock regardless of kernel pipe capacity.
         let writer_clone = writer.clone();
         let pump_handle = thread::spawn(move || {
             pump(
@@ -1500,23 +1995,31 @@ mod tests {
                 disc,
             )
         });
+        let producer = thread::spawn(move || {
+            let mut wf = std::fs::File::from(w_pipe);
+            wf.write_all(&payload_w).unwrap();
+            drop(wf);
+            drop(wake_w);
+        });
 
         // Pause longer than post_exit_idle before draining so any fixed-window
         // cutoff would truncate buffered bytes.
         thread::sleep(Duration::from_millis(200));
 
-        let mut received = Vec::new();
         let drain = thread::spawn(move || {
+            let mut received = Vec::new();
             while let Ok(Some(msg)) = vm_exec::read(&mut host) {
                 match msg {
                     VmExecMsg::Stdout(d) => received.extend_from_slice(&d),
                     VmExecMsg::Exit { code } => return (received, code),
+                    VmExecMsg::Pong => {}
                     other => panic!("unexpected frame {other:?}"),
                 }
             }
             panic!("EOF before Exit");
         });
 
+        producer.join().unwrap();
         pump_handle.join().unwrap().unwrap();
         send_final(&writer, &VmExecMsg::Exit { code: 0 }).unwrap();
         let (received, code) = drain.join().unwrap();
@@ -1539,7 +2042,6 @@ mod tests {
 
         let mut wf = std::fs::File::from(w_pipe);
         wf.write_all(b"hi\n").unwrap();
-        // Keep `wf` open to simulate a quiet background descendant retaining stdout.
         drop(wake_w);
 
         let t = Instant::now();
@@ -1564,7 +2066,71 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_under_stdin_backpressure_terminates_child() {
+    fn pump_terminates_when_descendant_writes_continuously_after_leader_exits() {
+        let (r, w_pipe) = cmd::pipe().unwrap();
+        set_nonblocking(&r).unwrap();
+        let (wake_r, wake_w) = cmd::pipe().unwrap();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let writer: Writer = Arc::new(Mutex::new(ExecWriter {
+            stream: guest,
+            closed: false,
+        }));
+        let disc = Arc::new(AtomicBool::new(false));
+        let stop_spam = Arc::new(AtomicBool::new(false));
+        let stop_spam_w = stop_spam.clone();
+
+        // Continuously write so the pipe stays readable without hitting EAGAIN.
+        let spammer = thread::spawn(move || {
+            let mut wf = std::fs::File::from(w_pipe);
+            let chunk = vec![b'Z'; 4096];
+            while !stop_spam_w.load(Ordering::Relaxed) {
+                if wf.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let writer_clone = writer.clone();
+        let pump_handle = thread::spawn(move || {
+            pump(
+                r,
+                wake_r,
+                writer_clone,
+                VmExecMsg::Stdout,
+                Duration::from_millis(80),
+                disc,
+            )
+        });
+
+        let drain = thread::spawn(move || {
+            while let Ok(Some(msg)) = vm_exec::read(&mut host) {
+                if let VmExecMsg::Exit { code } = msg {
+                    return code;
+                }
+            }
+            panic!("EOF before Exit");
+        });
+
+        // Let continuous output start, then signal main child exit.
+        thread::sleep(Duration::from_millis(30));
+        let t = Instant::now();
+        drop(wake_w);
+
+        pump_handle.join().unwrap().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "pump did not observe wake_r under continuous output ({:?})",
+            t.elapsed()
+        );
+        send_final(&writer, &VmExecMsg::Exit { code: 42 }).unwrap();
+        assert_eq!(drain.join().unwrap(), 42);
+
+        stop_spam.store(true, Ordering::Relaxed);
+        let _ = spammer.join();
+    }
+
+    #[test]
+    fn disconnect_under_stdin_backpressure_detected_even_without_rdhup() {
         let reaper = Reaper::start();
         let (mut host, guest) = UnixStream::pair().unwrap();
 
@@ -1575,10 +2141,10 @@ mod tests {
                 Duration::from_secs(2),
                 Duration::from_millis(150),
                 Duration::from_millis(50),
+                Duration::from_millis(50),
             );
         });
 
-        // Probe readiness, then run a command that ignores SIGHUP and never reads stdin.
         vm_exec::write(&mut host, &VmExecMsg::Ping).unwrap();
         assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Pong));
         vm_exec::write(
@@ -1597,21 +2163,26 @@ mod tests {
         .unwrap();
         assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Started));
 
-        // Fill guest stdin pipe + user-space buffer, then disconnect.
+        // Fill guest stdin pipe + user-space buffer.
         let chunk = vec![b'x'; CHUNK];
         for _ in 0..6 {
             if vm_exec::write(&mut host, &VmExecMsg::Data(chunk.clone())).is_err() {
                 break;
             }
         }
+        // Shut down ONLY the host read half so the guest does NOT get POLLRDHUP
+        // on `reader` (simulating libkrun's WaitingCreditUpdate when the vsock
+        // receive window is full); the guest must still detect disconnect via
+        // its backpressure keepalive probe and terminate the child.
         let t = Instant::now();
-        drop(host);
+        host.shutdown(Shutdown::Read).unwrap();
         server.join().unwrap();
         assert!(
             t.elapsed() < Duration::from_secs(3),
-            "disconnect cleanup under backpressure took {:?}",
+            "disconnect cleanup under full rx window took {:?}",
             t.elapsed()
         );
+        drop(host);
     }
 
     #[test]
@@ -1621,7 +2192,6 @@ mod tests {
             rows: 24,
             cols: 80,
         }) else {
-            // Skip if /dev/ptmx is unavailable in a minimal test container.
             return;
         };
         let mf = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFD) };

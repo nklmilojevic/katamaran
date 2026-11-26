@@ -45,7 +45,9 @@ pub enum VmExecMsg {
     Error(String),
     /// Side-effect-free readiness probe sent before [`VmExecMsg::Exec`].
     Ping,
-    /// Readiness reply to [`VmExecMsg::Ping`].
+    /// Readiness reply to [`VmExecMsg::Ping`], and also used by the guest as a
+    /// no-op keepalive probe during backpressured sessions (ignored by the host
+    /// output relay).
     Pong,
 }
 

@@ -67,21 +67,32 @@ pub fn start(cfg: &VmConfig, vm_bin: &Path, timeout: Duration) -> anyhow::Result
 }
 
 /// Enforces a single wall-clock `deadline` across every `read`/`write` syscall
-/// during a handshake using `poll` + `MSG_DONTWAIT`, so an idle or trickling
-/// peer cannot extend the timeout and no persistent socket timeouts are left
-/// on the descriptor (avoiding macOS `EINVAL` on `setsockopt` after peer close).
+/// during a handshake using `poll` + nonblocking `recv`/`send`, so an idle or
+/// trickling peer cannot extend the timeout and no persistent socket timeouts
+/// are left on the descriptor (avoiding macOS `EINVAL` on `setsockopt` after
+/// peer close). Sets `O_NONBLOCK` for the guard's lifetime because macOS XNU
+/// ignores `MSG_DONTWAIT` on `AF_UNIX` `SOCK_STREAM` sends.
 pub(crate) struct DeadlineStream<'a> {
     conn: &'a mut UnixStream,
     deadline: Instant,
     timeout_msg: String,
+    restore_blocking: bool,
 }
 
 impl<'a> DeadlineStream<'a> {
     pub(crate) fn new(conn: &'a mut UnixStream, deadline: Instant, timeout_msg: String) -> Self {
+        let fd = conn.as_raw_fd();
+        let orig = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let restore_blocking = if orig >= 0 && (orig & libc::O_NONBLOCK) == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, orig | libc::O_NONBLOCK) == 0 }
+        } else {
+            false
+        };
         Self {
             conn,
             deadline,
             timeout_msg,
+            restore_blocking,
         }
     }
 
@@ -194,6 +205,20 @@ impl io::Write for DeadlineStream<'_> {
     }
 }
 
+impl Drop for DeadlineStream<'_> {
+    fn drop(&mut self) {
+        if self.restore_blocking {
+            let fd = self.conn.as_raw_fd();
+            unsafe {
+                let cur = libc::fcntl(fd, libc::F_GETFL);
+                if cur >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                }
+            }
+        }
+    }
+}
+
 fn handshake(
     listener: &UnixListener,
     child: &mut Child,
@@ -233,6 +258,7 @@ fn handshake_io(
             unix_ns: unix_now_ns(),
         },
     )?;
+    drop(ds);
     conn.set_read_timeout(None)?;
     conn.set_write_timeout(None)?;
     Ok(hello)
