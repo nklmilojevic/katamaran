@@ -344,8 +344,11 @@ fn missing_datastore_version_error(
         "existing cluster data under {} has no version marker ({marker_desc}); \
          cannot verify minor-version compatibility. While Kubernetes is stopped, \
          either restore the matching {} marker recorded with your verified \
-         datastore backup, or back up any state you need and run `kat k8s reset` \
-         to delete cluster data and persistent volumes before starting fresh.",
+         datastore backup, follow the pre-tracking cluster migration steps in \
+         the Kubernetes guide if this datastore was initialized by an older \
+         katamaran release after a reset, or back up any state you need and run \
+         `kat k8s reset` to delete cluster data and persistent volumes before \
+         starting fresh.",
         data_dir.display(),
         data_version_file.display(),
     )
@@ -388,8 +391,8 @@ fn effective_datastore_version(
     ))
 }
 
-/// Refuse to install or start a lower Kubernetes minor against an existing
-/// datastore created by a newer minor without modifying `data_dir`.
+/// Refuse to install or start a lower Kubernetes minor or skip one or more
+/// intermediate minors against an existing datastore without modifying `data_dir`.
 fn check_datastore_compatible(
     data_dir: &Path,
     data_version_file: &Path,
@@ -425,7 +428,62 @@ fn check_datastore_compatible(
             data_version_file.display()
         ));
     }
+    if target_mm.0 != existing_mm.0 || target_mm.1 > existing_mm.1.saturating_add(1) {
+        let next_minor = existing_mm.1.saturating_add(1);
+        return Err(format!(
+            "refusing to upgrade existing {existing} cluster data directly to k3s \
+             {target_version}: Kubernetes does not support skipping minor versions. \
+             To preserve cluster state, back up first and upgrade one minor at a time \
+             (starting with a v{}.{next_minor}.x+k3s1 release). Or, to start fresh on \
+             {target_version}, back up any state you need, run `kat k8s reset` to delete \
+             cluster data and persistent volumes, then run `kat k8s start`.",
+            existing_mm.0
+        ));
+    }
     Ok(())
+}
+
+/// Seed any legacy datastore version marker (only while untracked and only if
+/// `bin_version_file` is present) and persist `tracked_file` before `reset`
+/// unmounts or deletes cluster data. Never blocks resetting an unmarked datastore.
+fn prepare_reset_tracking_with(
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+    tracked_file: &Path,
+    write_marker: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    if is_datastore_version_tracked(tracked_file)? {
+        return Ok(());
+    }
+    if datastore_exists(data_dir)?
+        && read_trimmed_file(data_version_file)?.is_none()
+        && let Some(prev) = read_trimmed_file(bin_version_file)?
+    {
+        write_atomic(data_version_file, format!("{prev}\n").as_bytes())?;
+    }
+    if let Some(parent) = tracked_file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    write_marker(tracked_file, b"1\n")
+}
+
+fn reset_with_tracking(
+    data_dir: &Path,
+    data_version_file: &Path,
+    bin_version_file: &Path,
+    tracked_file: &Path,
+    write_marker: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+    delete_data: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    prepare_reset_tracking_with(
+        data_dir,
+        data_version_file,
+        bin_version_file,
+        tracked_file,
+        write_marker,
+    )?;
+    delete_data()
 }
 
 /// Persist the previously installed version into `data_version_file` before
@@ -1546,24 +1604,34 @@ impl K8s {
             return Err("aborted: VM is shutting down".into());
         }
         self.stop_locked(Some(&mut *conn))?;
-        let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
-        unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
-        if Path::new(DATA_DIR).exists() {
-            // Try btrfs subvolume delete first (instant if it is a subvolume),
-            // falling back to recursive removal.
-            let mut cmd = Command::new("/sbin/btrfs");
-            cmd.args(["subvolume", "delete", DATA_DIR]);
-            let _ = run_reaped(&self.reaper, &mut cmd, Duration::from_secs(30));
-            if Path::new(DATA_DIR).exists() {
-                fs::remove_dir_all(DATA_DIR).map_err(|e| format!("remove {DATA_DIR}: {e}"))?;
-            }
-        }
-        if Path::new(LEGACY_KUBELET_DIR).exists() {
-            fs::remove_dir_all(LEGACY_KUBELET_DIR)
-                .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
-        }
-        let _ = fs::remove_file(KUBECONFIG);
-        mark_datastore_version_tracked(Path::new(DATA_VERSION_TRACKED_FILE))?;
+        reset_with_tracking(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            Path::new(VERSION_FILE),
+            Path::new(DATA_VERSION_TRACKED_FILE),
+            write_atomic,
+            || {
+                let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
+                unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
+                if Path::new(DATA_DIR).exists() {
+                    // Try btrfs subvolume delete first (instant if it is a subvolume),
+                    // falling back to recursive removal.
+                    let mut cmd = Command::new("/sbin/btrfs");
+                    cmd.args(["subvolume", "delete", DATA_DIR]);
+                    let _ = run_reaped(&self.reaper, &mut cmd, Duration::from_secs(30));
+                    if Path::new(DATA_DIR).exists() {
+                        fs::remove_dir_all(DATA_DIR)
+                            .map_err(|e| format!("remove {DATA_DIR}: {e}"))?;
+                    }
+                }
+                if Path::new(LEGACY_KUBELET_DIR).exists() {
+                    fs::remove_dir_all(LEGACY_KUBELET_DIR)
+                        .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
+                }
+                let _ = fs::remove_file(KUBECONFIG);
+                Ok(())
+            },
+        )?;
         log("k3s cluster data reset");
         Ok(())
     }
@@ -3054,7 +3122,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(!data_version_file.exists());
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
-        // Same minor (patch change) and higher minor upgrades are permitted.
+        // Same minor (patch change) and next-minor upgrades are permitted.
         check_datastore_compatible(
             &data_dir,
             &data_version_file,
@@ -3071,6 +3139,23 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "v1.38.0+k3s1",
         )
         .unwrap();
+
+        // Multi-minor upgrades (skipping intermediate minors) are blocked without
+        // modifying data_dir, including jumping from a custom older minor to a much
+        // newer pinned release.
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.39.0+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("skipping minor versions"), "{err}");
+        assert!(err.contains("v1.38.x+k3s1"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+        assert!(!data_version_file.exists());
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
         // Seeding preserves the datastore's minor even if bin_version_file is later absent/changed.
         seed_datastore_version_if_missing(
@@ -3097,6 +3182,28 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(err.contains(".katamaran-version"), "{err}");
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
+        // Clearing k8s_version from v1.32 to pinned v1.37 is also rejected as a skipped-minor jump.
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+        let err = check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.37.2+k3s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("skipping minor versions"), "{err}");
+        assert!(err.contains("v1.33.x+k3s1"), "{err}");
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.33.0+k3s1",
+        )
+        .unwrap();
+        write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
+
         // Once datastore version tracking is enabled (after install/start/reset),
         // an unmarked restored datastore must NEVER inherit an unrelated older
         // bin_version_file already installed in the guest.
@@ -3113,6 +3220,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         .unwrap_err();
         assert!(err.contains("no version marker"), "{err}");
         assert!(err.contains(".katamaran-version"), "{err}");
+        assert!(err.contains("pre-tracking cluster migration"), "{err}");
         assert!(!data_version_file.exists());
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
         assert!(
@@ -3381,6 +3489,131 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             fs::read_to_string(&data_version_file).unwrap(),
             "v1.37.2+k3s1\n"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_writes_tracking_marker_before_deleting_cluster_data() {
+        let dir = temp_dir("reset-tracking");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = dir.join("bin/version");
+        let tracked_file = dir.join(".datastore-version-tracked");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        let db_file = data_dir.join("server/db/state.db");
+        fs::write(&db_file, b"legacy-v1.37-data").unwrap();
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+
+        // 1. If writing the tracking marker fails on a legacy cluster, cluster data
+        // is NOT deleted and remains readable.
+        let mut deleted = false;
+        let err = reset_with_tracking(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            |_, _| Err("simulated marker write failure".into()),
+            || {
+                deleted = true;
+                fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("simulated marker write failure"), "{err}");
+        assert!(
+            !deleted,
+            "cluster data must not be deleted on marker write failure"
+        );
+        assert!(!tracked_file.exists());
+        assert_eq!(fs::read(&db_file).unwrap(), b"legacy-v1.37-data");
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.37.2+k3s1",
+        )
+        .unwrap();
+
+        // 2. If marker write succeeds on a legacy cluster but later data deletion fails,
+        // the legacy version was seeded first so retained data stays readable and still
+        // blocks downgrades.
+        fs::remove_file(&data_version_file).unwrap();
+        let err = reset_with_tracking(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            write_atomic,
+            || Err("simulated unmount failure".into()),
+        )
+        .unwrap_err();
+        assert!(err.contains("simulated unmount failure"), "{err}");
+        assert!(tracked_file.exists());
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+        check_datastore_compatible(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            "v1.37.2+k3s1",
+        )
+        .unwrap();
+        assert!(
+            check_datastore_compatible(
+                &data_dir,
+                &data_version_file,
+                &bin_version_file,
+                &tracked_file,
+                "v1.32.5+k3s1",
+            )
+            .is_err()
+        );
+
+        // 3. Resetting a tracked, unmarked datastore succeeds without requiring version recovery.
+        fs::remove_file(&data_version_file).unwrap();
+        let mut deleted = false;
+        reset_with_tracking(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            write_atomic,
+            || {
+                deleted = true;
+                fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(deleted);
+        assert!(!data_dir.exists());
+
+        // 4. Resetting an untracked, unmarked datastore (both markers absent) also succeeds
+        // and enables tracking without requiring version recovery.
+        fs::remove_file(&tracked_file).unwrap();
+        fs::remove_file(&bin_version_file).unwrap();
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        let mut deleted = false;
+        reset_with_tracking(
+            &data_dir,
+            &data_version_file,
+            &bin_version_file,
+            &tracked_file,
+            write_atomic,
+            || {
+                deleted = true;
+                fs::remove_dir_all(&data_dir).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(deleted);
+        assert!(tracked_file.exists());
+        assert!(!data_dir.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

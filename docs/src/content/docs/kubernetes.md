@@ -54,7 +54,7 @@ kat config set k8s_version=default   # back to the pinned build
 
 katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<version>/` and verifies it against the SHA-256 published in the release's `sha256sum-arm64.txt` (the pinned build is checked against a checksum built into katamaran). The new version is installed at the next Kubernetes start, so a running cluster picks it up after `kat k8s stop && kat k8s start` or `kat restart`.
 
-- **Upgrading while keeping cluster state:** follow the [K3s manual upgrade guide](https://docs.k3s.io/upgrades/manual) — back up your cluster state first and upgrade one minor version at a time without skipping intermediate minors. Clearing `k8s_version` (`kat config set k8s_version=default`) selects the pinned release immediately on the next Kubernetes start rather than stepping through intermediate minors; if your cluster is more than one minor behind the pinned build, upgrade one minor at a time or reset the cluster first.
+- **Upgrading while keeping cluster state:** follow the [K3s manual upgrade guide](https://docs.k3s.io/upgrades/manual) — back up your cluster state first and upgrade one minor version at a time without skipping intermediate minors. Katamaran refuses to start a release that skips one or more minor versions against an existing datastore. Clearing `k8s_version` (`kat config set k8s_version=default`) selects the pinned release immediately on the next Kubernetes start rather than stepping through intermediate minors; if your cluster is more than one minor behind the pinned build, upgrade one minor at a time or reset the cluster first.
 - **Switching to an older minor (fresh cluster):** Kubernetes does not support minor-version downgrades against an existing datastore, and katamaran refuses to start an older minor against newer cluster data. To switch to an older minor with a fresh cluster:
   1. Back up any cluster state or data you need.
   2. Set the desired release tag (for example `kat config set k8s_version=v1.32.5+k3s1`).
@@ -72,6 +72,19 @@ katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<ver
   3. Set `k8s_version` to the release tag from that backup (for example `kat config set k8s_version=v1.32.5+k3s1`) and run `kat k8s start`.
 
   Do not change `/var/lib/katamaran/k3s/data/.katamaran-version` without restoring matching cluster data — mismatched metadata allows an older `k3s` binary to open a newer datastore and can corrupt cluster state.
+
+### Migrating an unmarked cluster from an older katamaran release
+
+Once a VM has installed, started, or reset Kubernetes on a katamaran release with `k8s_version` support, katamaran creates a tracking sentinel (`/var/lib/katamaran/k3s/.datastore-version-tracked`) beside `bin/` so an unmarked datastore restore cannot inherit an unrelated installed binary's version.
+
+If you later roll back to an older katamaran release without `k8s_version`, run `kat k8s reset` there, and initialize a new cluster on that older release, the older `reset` removes `/var/lib/katamaran/k3s/data/` while leaving the tracking sentinel intact, and the older release recreates `data/` without `.katamaran-version`. When you upgrade katamaran again, katamaran refuses to start that unmarked datastore until its version is recorded.
+
+To migrate a datastore you **know** was initialized by an older katamaran release (do not use this for an unknown backup restore, and never guess the version from whichever `k3s` binary is currently installed):
+
+1. Stop Kubernetes (`kat k8s stop`) so nothing is accessing the datastore.
+2. Independently verify the exact `k3s` release tag that last opened the datastore — for example, confirm the pinned `k3s` release shipped by that older katamaran version (or verify from your cluster logs/records from before stopping).
+3. Write that exact release tag (for example `v1.37.2+k3s1`) followed by a newline to `/var/lib/katamaran/k3s/data/.katamaran-version` inside the guest.
+4. Upgrade katamaran and start Kubernetes with a compatible `k8s_version` (same minor or one minor newer), or run `kat k8s reset` if you prefer to start fresh instead of migrating.
 
 ## Connect with `kubectl`
 
