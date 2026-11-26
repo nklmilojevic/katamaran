@@ -264,10 +264,33 @@ impl Call {
                         Value::Number(n) => n.to_string(),
                         Value::Bool(b) => b.to_string(),
                         Value::Null => String::new(),
+                        Value::Array(items) => {
+                            if items.is_empty() {
+                                return Err(RpcError::new(
+                                    INVALID_PARAMS,
+                                    format!("{k}: expected a non-empty array of strings"),
+                                ));
+                            }
+                            let mut parts = Vec::with_capacity(items.len());
+                            for item in items {
+                                match item {
+                                    Value::String(s) if !s.trim().is_empty() => {
+                                        parts.push(s.as_str())
+                                    }
+                                    _ => {
+                                        return Err(RpcError::new(
+                                            INVALID_PARAMS,
+                                            format!("{k}: expected an array of non-empty strings"),
+                                        ));
+                                    }
+                                }
+                            }
+                            parts.join(",")
+                        }
                         _ => {
                             return Err(RpcError::new(
                                 INVALID_PARAMS,
-                                format!("{k}: expected a string, number or bool"),
+                                format!("{k}: expected a string, number, bool or string array"),
                             ));
                         }
                     };
@@ -633,7 +656,12 @@ mod tests {
         );
         let r = req(
             "config.set",
-            json!({"values": {"cpus": 2, "mount": false, "mount_path": "/tmp/x"}}),
+            json!({"values": {
+                "cpus": 2,
+                "mount": false,
+                "mount_path": "/tmp/x",
+                "forward_addresses": ["127.0.0.1", "172.16.1.200"],
+            }}),
         );
         let Call::ConfigSet(v) = Call::parse(&r).unwrap() else {
             panic!()
@@ -641,6 +669,7 @@ mod tests {
         assert_eq!(v["cpus"], "2");
         assert_eq!(v["mount"], "false");
         assert_eq!(v["mount_path"], "/tmp/x");
+        assert_eq!(v["forward_addresses"], "127.0.0.1,172.16.1.200");
         assert_eq!(
             Call::parse(&req("stop", Value::Null)).unwrap(),
             Call::Stop { wait: false }
@@ -664,6 +693,20 @@ mod tests {
         );
         assert_eq!(
             code(req("config.set", json!({"values": {"cpus": [1]}}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": []}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": [""]}})
+            )),
             INVALID_PARAMS
         );
         assert_eq!(code(req("machine.create", Value::Null)), INVALID_PARAMS);

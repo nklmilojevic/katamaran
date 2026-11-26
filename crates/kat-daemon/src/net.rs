@@ -327,6 +327,14 @@ impl std::fmt::Display for ForwardError {
 pub trait ForwardApi {
     fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError>;
     fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError>;
+    /// The Mac addresses ports are forwarded from, for log lines.
+    fn label(&self) -> String {
+        Ipv4Addr::LOCALHOST.to_string()
+    }
+    /// The Mac addresses `port` is actually listening on, for log lines.
+    fn port_label(&self, _port: u16) -> String {
+        self.label()
+    }
 }
 
 /// gvproxy's forwarder API over its `-services` Unix socket.
@@ -351,6 +359,120 @@ impl ForwardApi for GvproxyApi {
             proto.as_str()
         );
         post(&self.socket, "/services/forwarder/unexpose", &body)
+    }
+}
+
+impl GvproxyApi {
+    /// Have gvproxy serve the guest's TCP `port` on the Unix socket `local`.
+    fn expose_unix(&self, local: &Path, port: u16) -> Result<(), ForwardError> {
+        if local.as_os_str().len() >= SUN_PATH_MAX {
+            return Err(ForwardError::Refused(format!(
+                "socket path {} is too long for macOS",
+                local.display()
+            )));
+        }
+        // Left by a gvproxy that did not stop cleanly; gvproxy cannot listen
+        // over it.
+        let _ = fs::remove_file(local);
+        let body = serde_json::json!({
+            "local": local,
+            "remote": format!("tcp://{}:{port}", self.guest),
+            "protocol": "unix",
+        });
+        post(
+            &self.socket,
+            "/services/forwarder/expose",
+            &body.to_string(),
+        )
+    }
+
+    fn unexpose_unix(&self, local: &Path) -> Result<(), ForwardError> {
+        let body = serde_json::json!({ "local": local, "protocol": "unix" });
+        post(
+            &self.socket,
+            "/services/forwarder/unexpose",
+            &body.to_string(),
+        )
+    }
+}
+
+/// Published ports when the forward addresses are not just `127.0.0.1`.
+/// gvproxy listens on one address per expose, and below port 1024 macOS
+/// lets only one wildcard socket own a port, so gvproxy cannot serve
+/// `127.0.0.1:443` and `172.16.1.200:443` at once. Instead gvproxy serves
+/// the guest port on a Unix socket, and the daemon listens on every forward
+/// address and relays to it.
+pub struct AddressesApi {
+    gvproxy: GvproxyApi,
+    sockets: PathBuf,
+    listeners: crate::autofwd::AutoForwards,
+}
+
+impl AddressesApi {
+    /// `sockets` is the (private) directory for gvproxy's per-port sockets.
+    pub fn new(gvproxy: GvproxyApi, sockets: &Path, addrs: &[Ipv4Addr]) -> Self {
+        AddressesApi {
+            gvproxy,
+            sockets: sockets.to_path_buf(),
+            listeners: crate::autofwd::AutoForwards::with(
+                crate::autofwd::Upstream::PerPort(sockets.to_path_buf()),
+                addrs,
+            ),
+        }
+    }
+}
+
+impl ForwardApi for AddressesApi {
+    fn expose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
+        if proto != PortProto::Tcp {
+            return self.gvproxy.expose(proto, port);
+        }
+        if self.listeners.contains(port) {
+            return Ok(());
+        }
+        // Have gvproxy listen on the per-port Unix socket before opening the
+        // Mac's TCP listeners, so the very first accepted connection never
+        // races socket creation and transient gvproxy errors do not churn
+        // TCP binds.
+        let sock = crate::autofwd::Upstream::socket(&self.sockets, port);
+        self.gvproxy.expose_unix(&sock, port)?;
+        match self.listeners.add(port) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = self.gvproxy.unexpose_unix(&sock);
+                let _ = fs::remove_file(&sock);
+                Err(ForwardError::Refused(e.to_string()))
+            }
+        }
+    }
+
+    fn unexpose(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
+        if proto != PortProto::Tcp {
+            return self.gvproxy.unexpose(proto, port);
+        }
+        let sock = crate::autofwd::Upstream::socket(&self.sockets, port);
+        self.gvproxy.unexpose_unix(&sock)?;
+        self.listeners.remove(port);
+        let _ = fs::remove_file(&sock);
+        Ok(())
+    }
+
+    fn label(&self) -> String {
+        self.listeners.label()
+    }
+
+    fn port_label(&self, port: u16) -> String {
+        self.listeners.bound_label(port)
+    }
+}
+
+impl Drop for AddressesApi {
+    fn drop(&mut self) {
+        let ports = self.listeners.ports();
+        self.listeners.clear();
+        for port in ports {
+            let _ = fs::remove_file(crate::autofwd::Upstream::socket(&self.sockets, port));
+        }
     }
 }
 
@@ -470,6 +592,10 @@ impl<A: ForwardApi> Forwards<A> {
         })
     }
 
+    fn port_label(&self, port: u16) -> String {
+        self.api.port_label(port)
+    }
+
     #[cfg(test)]
     fn active(&self) -> impl Iterator<Item = &(PortProto, u16)> {
         self.active.iter()
@@ -479,6 +605,32 @@ impl<A: ForwardApi> Forwards<A> {
 pub enum PortChange {
     Add(PortProto, u16),
     Remove(PortProto, u16),
+}
+
+/// Handle to the port-forwarder worker thread. Dropping it closes the command
+/// channel and waits for the thread to release its listeners and sockets
+/// before a restart can bind them again.
+pub struct Forwarder {
+    tx: Option<Sender<PortChange>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Forwarder {
+    pub fn send(&self, change: PortChange) -> Result<(), mpsc::SendError<PortChange>> {
+        match &self.tx {
+            Some(tx) => tx.send(change),
+            None => Err(mpsc::SendError(change)),
+        }
+    }
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 const TRANSIENT_RETRY_BASE: Duration = Duration::from_millis(200);
@@ -494,9 +646,9 @@ enum PendingOp {
 /// Apply guest port changes on a worker thread, so a slow gvproxy call never
 /// holds up the control loop. Reports each resulting [`Event`] to `on_event`.
 pub fn spawn_forwarder(
-    api: GvproxyApi,
+    api: impl ForwardApi + Send + 'static,
     on_event: impl FnMut(Event) + Send + 'static,
-) -> anyhow::Result<Sender<PortChange>> {
+) -> anyhow::Result<Forwarder> {
     spawn_forwarder_with(api, TRANSIENT_RETRY_BASE, on_event)
 }
 
@@ -504,9 +656,9 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
     api: A,
     retry_base: Duration,
     mut on_event: impl FnMut(Event) + Send + 'static,
-) -> anyhow::Result<Sender<PortChange>> {
+) -> anyhow::Result<Forwarder> {
     let (tx, rx) = mpsc::channel::<PortChange>();
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("port-forward".into())
         .spawn(move || {
             let mut fwd = Forwards::new(api);
@@ -527,11 +679,11 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e @ Event::Transient(..)) => {
                                 pending
                                     .insert(key, (PendingOp::Add, Instant::now() + retry_base, 1));
-                                report(&e);
+                                report(&e, &fwd.port_label(port));
                                 on_event(e);
                             }
                             Some(e) => {
-                                report(&e);
+                                report(&e, &fwd.port_label(port));
                                 on_event(e);
                             }
                             None => {}
@@ -540,17 +692,18 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(PortChange::Remove(proto, port)) => {
                         let key = (proto, port);
                         pending.remove(&key);
+                        let label = fwd.port_label(port);
                         match fwd.remove(proto, port) {
                             Some(e @ Event::RemoveFailed(..)) => {
                                 pending.insert(
                                     key,
                                     (PendingOp::Remove, Instant::now() + retry_base, 1),
                                 );
-                                report(&e);
+                                report(&e, &label);
                                 on_event(e);
                             }
                             Some(e) => {
-                                report(&e);
+                                report(&e, &label);
                                 on_event(e);
                             }
                             None => {}
@@ -581,115 +734,234 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                         (PendingOp::Add, Instant::now() + delay, attempts + 1),
                                     );
                                 } else {
-                                    report(&e);
+                                    report(&e, &fwd.port_label(port));
                                     on_event(e);
                                 }
                             }
                             Some(e) => {
-                                report(&e);
+                                report(&e, &fwd.port_label(port));
                                 on_event(e);
                             }
                             None => {}
                         },
-                        PendingOp::Remove => match fwd.remove(proto, port) {
-                            Some(e @ Event::RemoveFailed(..)) => {
-                                if attempts < MAX_TRANSIENT_RETRIES {
-                                    pending.insert(
-                                        key,
-                                        (PendingOp::Remove, Instant::now() + delay, attempts + 1),
-                                    );
-                                } else {
-                                    report(&e);
+                        PendingOp::Remove => {
+                            let label = fwd.port_label(port);
+                            match fwd.remove(proto, port) {
+                                Some(e @ Event::RemoveFailed(..)) => {
+                                    if attempts < MAX_TRANSIENT_RETRIES {
+                                        pending.insert(
+                                            key,
+                                            (
+                                                PendingOp::Remove,
+                                                Instant::now() + delay,
+                                                attempts + 1,
+                                            ),
+                                        );
+                                    } else {
+                                        report(&e, &label);
+                                        on_event(e);
+                                    }
+                                }
+                                Some(e) => {
+                                    report(&e, &label);
                                     on_event(e);
                                 }
+                                None => {}
                             }
-                            Some(e) => {
-                                report(&e);
-                                on_event(e);
-                            }
-                            None => {}
-                        },
+                        }
                     }
                 }
             }
         })?;
-    Ok(tx)
+    Ok(Forwarder {
+        tx: Some(tx),
+        thread: Some(thread),
+    })
 }
 
-fn report(e: &Event) {
+fn report(e: &Event, addrs: &str) {
     match e {
         Event::Forwarded(proto, port) => {
-            println!("katamaran: forwarding 127.0.0.1:{port}/{}", proto.as_str())
+            println!("katamaran: forwarding {addrs}:{port}/{}", proto.as_str())
         }
         Event::Refused(proto, port, why) => eprintln!(
-            "katamaran: cannot forward 127.0.0.1:{port}/{} ({why}); skipped",
+            "katamaran: cannot forward {addrs}:{port}/{} ({why}); skipped",
             proto.as_str()
         ),
         Event::RefusedCleared(..) => {}
         Event::Transient(proto, port, why) => eprintln!(
-            "katamaran: transient error forwarding 127.0.0.1:{port}/{} ({why})",
+            "katamaran: transient error forwarding {addrs}:{port}/{} ({why})",
             proto.as_str()
         ),
         Event::Removed(proto, port) => {
             println!(
-                "katamaran: stopped forwarding 127.0.0.1:{port}/{}",
+                "katamaran: stopped forwarding {addrs}:{port}/{}",
                 proto.as_str()
             )
         }
         Event::RemoveFailed(proto, port, why) => eprintln!(
-            "katamaran: cannot remove forward 127.0.0.1:{port}/{} ({why})",
+            "katamaran: cannot remove forward {addrs}:{port}/{} ({why})",
             proto.as_str()
         ),
     }
 }
 
-/// A TCP listener bound to `127.0.0.1:<port>`.
+/// The Mac addresses forwards listen on, for log lines: `127.0.0.1`, or
+/// `{127.0.0.1,172.16.1.200}`.
+pub fn addrs_label(addrs: &[Ipv4Addr]) -> String {
+    match addrs {
+        [one] => one.to_string(),
+        many => format!(
+            "{{{}}}",
+            many.iter()
+                .map(Ipv4Addr::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+/// Whether `addr` is assigned to a loopback interface (`lo0`), so listening
+/// on it cannot expose a port to the network.
+pub fn is_loopback_interface_addr(addr: Ipv4Addr) -> bool {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return addr.is_loopback();
+    }
+    let mut found = false;
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` walks the list `getifaddrs` returned, freed below.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null()
+            || ifa.ifa_flags & libc::IFF_LOOPBACK as libc::c_uint == 0
+            || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
+        {
+            continue;
+        }
+        // SAFETY: an AF_INET `ifa_addr` points at a `sockaddr_in`.
+        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+        if Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)) == addr {
+            found = true;
+            break;
+        }
+    }
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+/// TCP listeners on `<addr>:<port>` for each Mac address forwards use
+/// (`127.0.0.1` by default, see `forward_addresses`).
 ///
 /// On macOS, XNU rejects unprivileged binds below port 1024 on specific
-/// addresses such as `127.0.0.1`, while permitting wildcard (`0.0.0.0`) binds.
-/// When binding a low port on `127.0.0.1` fails with `PermissionDenied`, fall
-/// back to `0.0.0.0:<port>` scoped to `lo0` via `IP_BOUND_IF` and drop any
-/// accepted connection whose local or remote address is not IPv4 loopback.
+/// addresses such as `127.0.0.1`, while permitting wildcard (`0.0.0.0`) binds,
+/// and only one wildcard socket can own a port. When binding a low port is
+/// denied, fall back to a single `0.0.0.0:<port>` socket scoped to `lo0` via
+/// `IP_BOUND_IF`, and drop any accepted connection whose local address is not
+/// one of the forward addresses or whose remote address is not loopback.
 pub struct LoopbackTcpListener {
-    inner: TcpListener,
-    filter_loopback: bool,
+    inner: Vec<TcpListener>,
+    /// The addresses this listener is bound for.
+    addrs: Vec<Ipv4Addr>,
+    /// Whether `inner` is the single `0.0.0.0` wildcard fallback on macOS and
+    /// needs endpoint filtering against `addrs`.
+    filter_wildcard: bool,
 }
 
 impl LoopbackTcpListener {
     pub fn bind(port: u16) -> io::Result<Self> {
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(inner) => Ok(Self {
-                inner,
-                filter_loopback: false,
-            }),
-            #[cfg(target_os = "macos")]
-            Err(e) if port > 0 && port < 1024 && e.kind() == io::ErrorKind::PermissionDenied => {
-                let inner = bind_darwin_low_port(port)?;
-                Ok(Self {
-                    inner,
-                    filter_loopback: true,
-                })
-            }
-            Err(e) => Err(e),
+        Self::bind_on(&[Ipv4Addr::LOCALHOST], port)
+    }
+
+    /// Listen on `port` of each of `addrs`. An address not assigned to a
+    /// loopback interface is skipped, so a typo never opens a port to the
+    /// network; so is one whose port is taken, as long as one address binds.
+    pub fn bind_on(addrs: &[Ipv4Addr], port: u16) -> io::Result<Self> {
+        let mut seen = BTreeSet::new();
+        let addrs: Vec<Ipv4Addr> = addrs
+            .iter()
+            .copied()
+            .filter(|a| seen.insert(*a) && is_loopback_interface_addr(*a))
+            .collect();
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no forward address is assigned to lo0",
+            ));
         }
+        let mut inner = Vec::with_capacity(addrs.len());
+        let mut bound = Vec::with_capacity(addrs.len());
+        let mut failed = Vec::new();
+        let mut bind_port = port;
+        for &a in &addrs {
+            match TcpListener::bind((a, bind_port)) {
+                Ok(l) => {
+                    if bind_port == 0 {
+                        bind_port = l.local_addr()?.port();
+                    }
+                    inner.push(l);
+                    bound.push(a);
+                }
+                #[cfg(target_os = "macos")]
+                Err(e)
+                    if port > 0 && port < 1024 && e.kind() == io::ErrorKind::PermissionDenied =>
+                {
+                    drop(inner);
+                    return Ok(Self {
+                        inner: vec![bind_darwin_low_port(port)?],
+                        addrs,
+                        filter_wildcard: true,
+                    });
+                }
+                Err(e) => failed.push((a, e)),
+            }
+        }
+        if inner.is_empty() {
+            return Err(failed.swap_remove(0).1);
+        }
+        for (a, e) in failed {
+            eprintln!("katamaran: cannot listen on {a}:{port} ({e}); skipped");
+        }
+        Ok(Self {
+            inner,
+            addrs: bound,
+            filter_wildcard: false,
+        })
+    }
+
+    pub fn addrs(&self) -> &[Ipv4Addr] {
+        &self.addrs
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.inner.set_nonblocking(nonblocking)
+        self.inner
+            .iter()
+            .try_for_each(|l| l.set_nonblocking(nonblocking))
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        self.inner[0].local_addr()
+    }
+
+    /// The listening sockets, to poll; accept with [`Self::accept_on`].
+    pub fn raw_fds(&self) -> Vec<RawFd> {
+        self.inner.iter().map(AsRawFd::as_raw_fd).collect()
     }
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        self.accept_on(0)
+    }
+
+    /// Accept on the `i`th socket of [`Self::raw_fds`].
+    pub fn accept_on(&self, i: usize) -> io::Result<(TcpStream, SocketAddr)> {
         loop {
-            let (stream, peer) = self.inner.accept()?;
-            if !self.filter_loopback {
+            let (stream, peer) = self.inner[i].accept()?;
+            if !self.filter_wildcard {
                 return Ok((stream, peer));
             }
             if let Ok(local) = stream.local_addr()
-                && is_loopback_v4_pair(local, peer)
+                && is_allowed_v4_pair(&self.addrs, local, peer)
             {
                 return Ok((stream, peer));
             }
@@ -697,16 +969,24 @@ impl LoopbackTcpListener {
     }
 }
 
-impl AsRawFd for LoopbackTcpListener {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
-    }
+/// A connection the wildcard fallback keeps: to one of `allowed`, from
+/// loopback or from a `lo0` address (a client of an `lo0` alias has that
+/// alias or another `lo0` address as its source).
+fn is_allowed_v4_pair(allowed: &[Ipv4Addr], local: SocketAddr, peer: SocketAddr) -> bool {
+    is_allowed_v4_pair_with(allowed, local, peer, is_loopback_interface_addr)
 }
 
-fn is_loopback_v4_pair(local: SocketAddr, peer: SocketAddr) -> bool {
+fn is_allowed_v4_pair_with(
+    allowed: &[Ipv4Addr],
+    local: SocketAddr,
+    peer: SocketAddr,
+    is_lo_addr: impl FnOnce(Ipv4Addr) -> bool,
+) -> bool {
     matches!(
         (local, peer),
-        (SocketAddr::V4(l), SocketAddr::V4(p)) if l.ip().is_loopback() && p.ip().is_loopback()
+        (SocketAddr::V4(l), SocketAddr::V4(p))
+            if allowed.contains(l.ip())
+                && (p.ip().is_loopback() || allowed.contains(p.ip()) || is_lo_addr(*p.ip()))
     )
 }
 
@@ -1245,6 +1525,51 @@ mod tests {
         api.unexpose(TCP, low).unwrap();
         assert!(LoopbackTcpListener::bind(low).is_ok());
 
+        // Forward addresses beyond 127.0.0.1: gvproxy serves the guest port
+        // on a Unix socket and the daemon listens on the Mac's addresses,
+        // privileged ports included.
+        let gv_dir = gv.api_socket.parent().unwrap().to_path_buf();
+        let mut addrs = AddressesApi::new(
+            GvproxyApi {
+                socket: gv.api_socket.clone(),
+                guest: GUEST,
+            },
+            &gv_dir,
+            &[Ipv4Addr::LOCALHOST],
+        );
+        for p in [port, low] {
+            let sock = crate::autofwd::Upstream::socket(&gv_dir, p);
+            addrs.expose(TCP, p).unwrap();
+            assert!(sock.exists(), "gvproxy did not serve {}", sock.display());
+            assert!(
+                LoopbackTcpListener::bind(p).is_err(),
+                "not listening on {p}"
+            );
+            addrs.unexpose(TCP, p).unwrap();
+            assert!(!sock.exists());
+            assert!(
+                LoopbackTcpListener::bind(p).is_ok(),
+                "still listening on {p}"
+            );
+        }
+        // A port the Mac already uses is refused, and nothing is left behind.
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        assert!(matches!(
+            addrs.expose(TCP, busy_port),
+            Err(ForwardError::Refused(_))
+        ));
+        assert!(!crate::autofwd::Upstream::socket(&gv_dir, busy_port).exists());
+        assert_eq!(addrs.label(), "127.0.0.1");
+
+        // Dropping AddressesApi stops active listeners and removes their sockets.
+        addrs.expose(TCP, port).unwrap();
+        let sock = crate::autofwd::Upstream::socket(&gv_dir, port);
+        assert!(sock.exists());
+        drop(addrs);
+        assert!(!sock.exists());
+        assert!(LoopbackTcpListener::bind(port).is_ok());
+
         gv.stop();
         assert!(!gv.api_socket.exists(), "gvproxy left its socket behind");
         fs::remove_dir_all(&dir).unwrap();
@@ -1284,9 +1609,60 @@ mod tests {
         let lo_peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
         let lan: SocketAddr = "192.168.1.5:80".parse().unwrap();
         let v6: SocketAddr = "[::1]:80".parse().unwrap();
-        assert!(is_loopback_v4_pair(lo, lo_peer));
-        assert!(!is_loopback_v4_pair(lan, lo_peer));
-        assert!(!is_loopback_v4_pair(lo, lan));
-        assert!(!is_loopback_v4_pair(v6, v6));
+        let only_lo = [Ipv4Addr::LOCALHOST];
+        assert!(is_allowed_v4_pair(&only_lo, lo, lo_peer));
+        assert!(!is_allowed_v4_pair(&only_lo, lan, lo_peer));
+        assert!(!is_allowed_v4_pair(&only_lo, lo, lan));
+        assert!(!is_allowed_v4_pair(&only_lo, v6, v6));
+
+        // An lo0 alias: reachable when listed, from itself, loopback, or
+        // another lo0 alias, never from a LAN peer.
+        let alias: SocketAddr = "172.16.1.200:443".parse().unwrap();
+        let alias_peer: SocketAddr = "172.16.1.200:50000".parse().unwrap();
+        let other_alias_peer: SocketAddr = "172.16.1.201:50000".parse().unwrap();
+        let with_alias = [Ipv4Addr::LOCALHOST, Ipv4Addr::new(172, 16, 1, 200)];
+        assert!(!is_allowed_v4_pair(&only_lo, alias, alias_peer));
+        assert!(is_allowed_v4_pair(&with_alias, alias, alias_peer));
+        assert!(is_allowed_v4_pair(&with_alias, alias, lo_peer));
+        assert!(is_allowed_v4_pair(&with_alias, lo, alias_peer));
+        assert!(!is_allowed_v4_pair(&with_alias, alias, lan));
+        assert!(is_allowed_v4_pair_with(
+            &with_alias,
+            alias,
+            other_alias_peer,
+            |ip| ip == Ipv4Addr::new(172, 16, 1, 201),
+        ));
+        assert!(!is_allowed_v4_pair_with(
+            &with_alias,
+            alias,
+            other_alias_peer,
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn forward_addresses_must_be_on_loopback() {
+        assert!(is_loopback_interface_addr(Ipv4Addr::LOCALHOST));
+        // TEST-NET-1: assigned to no interface.
+        let nowhere = Ipv4Addr::new(192, 0, 2, 1);
+        assert!(!is_loopback_interface_addr(nowhere));
+        assert_eq!(
+            LoopbackTcpListener::bind_on(&[nowhere], 0)
+                .err()
+                .map(|e| e.kind()),
+            Some(io::ErrorKind::AddrNotAvailable)
+        );
+        // Skipped and deduplicated, while the loopback address still binds.
+        let l =
+            LoopbackTcpListener::bind_on(&[nowhere, Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST], 0)
+                .unwrap();
+        assert_eq!(l.raw_fds().len(), 1);
+        assert_eq!(l.addrs(), &[Ipv4Addr::LOCALHOST]);
+        assert_eq!(l.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(addrs_label(&[Ipv4Addr::LOCALHOST]), "127.0.0.1");
+        assert_eq!(
+            addrs_label(&[Ipv4Addr::LOCALHOST, nowhere]),
+            "{127.0.0.1,192.0.2.1}"
+        );
     }
 }

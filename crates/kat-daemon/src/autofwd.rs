@@ -1,14 +1,18 @@
-//! The Mac side of auto-forwarded container ports: a listener on
-//! 127.0.0.1:<port> whose connections go over vsock (a Unix socket libkrun
-//! connects to the guest's `AUTO_FORWARD_PORT`), each prefixed with the port
-//! so the guest agent knows which container to dial.
+//! The Mac side of forwarded ports that the daemon listens for itself: a
+//! listener on `<addr>:<port>` for each forward address (`127.0.0.1` by
+//! default) whose connections go to an [`Upstream`]:
 //!
-//! This path uses no IP routes at all, so a VPN that takes over the Mac's
-//! routes cannot break it.
+//! - auto-forwarded container ports go over vsock (a Unix socket libkrun
+//!   connects to the guest's `AUTO_FORWARD_PORT`), each prefixed with the port
+//!   so the guest agent knows which container to dial. This path uses no IP
+//!   routes at all, so a VPN that takes over the Mac's routes cannot break it.
+//! - published ports, when forward addresses other than `127.0.0.1` are set,
+//!   go to a Unix socket gvproxy exposes for the guest's port (gvproxy alone
+//!   cannot serve several addresses on one privileged port).
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -17,11 +21,43 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::net::{LoopbackTcpListener, addrs_label};
+
 const MAX_CONNS: usize = 256;
 const COPY_BUF_SIZE: usize = 64 << 10;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// Where a forwarded connection goes.
+#[derive(Clone, Debug)]
+pub enum Upstream {
+    /// libkrun's Unix socket for the guest's `AUTO_FORWARD_PORT`; each
+    /// connection starts with the guest port.
+    AutoForward(PathBuf),
+    /// A Unix socket per port in this directory, `fwd-<port>.sock`, which
+    /// gvproxy serves (see [`Upstream::socket`]).
+    PerPort(PathBuf),
+}
+
+impl Upstream {
+    /// The socket gvproxy listens on for `port`, for [`Upstream::PerPort`].
+    pub fn socket(dir: &Path, port: u16) -> PathBuf {
+        dir.join(format!("fwd-{port}.sock"))
+    }
+
+    fn connect(&self, port: u16) -> io::Result<UnixStream> {
+        match self {
+            Upstream::AutoForward(sock) => {
+                let mut s = UnixStream::connect(sock)?;
+                s.write_all(&port.to_le_bytes())?;
+                Ok(s)
+            }
+            Upstream::PerPort(dir) => UnixStream::connect(Upstream::socket(dir, port)),
+        }
+    }
+}
+
 struct Forward {
+    addrs: Vec<Ipv4Addr>,
     stop: Arc<AtomicBool>,
     wake_w: OwnedFd,
     thread: JoinHandle<()>,
@@ -77,9 +113,10 @@ fn wakeup_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((r, w))
 }
 
-/// The auto-forwards in place.
+/// The forwards in place.
 pub struct AutoForwards {
-    guest: PathBuf,
+    upstream: Upstream,
+    addrs: Vec<Ipv4Addr>,
     active: BTreeMap<u16, Forward>,
     active_conns: Arc<AtomicUsize>,
     max_conns: usize,
@@ -88,41 +125,78 @@ pub struct AutoForwards {
 impl AutoForwards {
     /// `guest` is the Unix socket libkrun relays to the guest's
     /// `AUTO_FORWARD_PORT`.
-    pub fn new(guest: &Path) -> AutoForwards {
-        Self::with_max_conns(guest, MAX_CONNS)
+    #[cfg(test)]
+    fn new(guest: &Path) -> AutoForwards {
+        Self::with(
+            Upstream::AutoForward(guest.to_path_buf()),
+            &[Ipv4Addr::LOCALHOST],
+        )
     }
 
-    fn with_max_conns(guest: &Path, max_conns: usize) -> AutoForwards {
+    /// Forwards from `addrs` to `upstream`.
+    pub fn with(upstream: Upstream, addrs: &[Ipv4Addr]) -> AutoForwards {
+        Self::with_max_conns(upstream, addrs, MAX_CONNS)
+    }
+
+    fn with_max_conns(upstream: Upstream, addrs: &[Ipv4Addr], max_conns: usize) -> AutoForwards {
         AutoForwards {
-            guest: guest.to_path_buf(),
+            upstream,
+            addrs: addrs.to_vec(),
             active: BTreeMap::new(),
             active_conns: Arc::new(AtomicUsize::new(0)),
             max_conns,
         }
     }
 
-    /// Listen on 127.0.0.1:`port`. Fails if the Mac already uses it; the
-    /// guest reports the port again only after it stops and starts again.
+    /// The addresses listened on, for log lines.
+    pub fn label(&self) -> String {
+        addrs_label(&self.addrs)
+    }
+
+    /// The addresses `port` is actually listening on, or [`Self::label`] when
+    /// it is not active.
+    pub fn bound_label(&self, port: u16) -> String {
+        self.active
+            .get(&port)
+            .map(|f| addrs_label(&f.addrs))
+            .unwrap_or_else(|| self.label())
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        self.active.contains_key(&port)
+    }
+
+    pub fn ports(&self) -> Vec<u16> {
+        self.active.keys().copied().collect()
+    }
+
+    /// Listen on `port` of each forward address. Fails if the Mac already
+    /// uses it; the guest reports the port again only after it stops and
+    /// starts again.
     pub fn add(&mut self, port: u16) -> io::Result<bool> {
         if self.active.contains_key(&port) {
             return Ok(false);
         }
-        let listener = crate::net::LoopbackTcpListener::bind(port)?;
+        let listener = LoopbackTcpListener::bind_on(&self.addrs, port)?;
+        let bound = listener.addrs().to_vec();
         listener.set_nonblocking(true)?;
         let (wake_r, wake_w) = wakeup_pipe()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (guest, flag, conns, max_conns) = (
-            self.guest.clone(),
-            stop.clone(),
-            self.active_conns.clone(),
-            self.max_conns,
-        );
+        let ctx = AcceptCtx {
+            upstream: self.upstream.clone(),
+            label: addrs_label(&bound),
+            port,
+            stop: stop.clone(),
+            conns: self.active_conns.clone(),
+            max_conns: self.max_conns,
+        };
         let thread = thread::Builder::new()
             .name(format!("autofwd-{port}"))
-            .spawn(move || accept_loop(listener, wake_r, &guest, port, &flag, &conns, max_conns))?;
+            .spawn(move || accept_loop(&listener, &wake_r, &ctx))?;
         self.active.insert(
             port,
             Forward {
+                addrs: bound,
                 stop,
                 wake_w,
                 thread,
@@ -160,33 +234,37 @@ impl Drop for AutoForwards {
     }
 }
 
-fn accept_loop(
-    listener: crate::net::LoopbackTcpListener,
-    wake_r: OwnedFd,
-    guest: &Path,
+struct AcceptCtx {
+    upstream: Upstream,
+    label: String,
     port: u16,
-    stop: &AtomicBool,
-    active_conns: &Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    conns: Arc<AtomicUsize>,
     max_conns: usize,
-) {
-    let mut pfds = [
-        libc::pollfd {
-            fd: listener.as_raw_fd(),
+}
+
+fn accept_loop(listener: &LoopbackTcpListener, wake_r: &OwnedFd, ctx: &AcceptCtx) {
+    let (port, label) = (ctx.port, &ctx.label);
+    let stop = &*ctx.stop;
+    // The listening sockets, then the wakeup pipe.
+    let mut pfds: Vec<libc::pollfd> = listener
+        .raw_fds()
+        .into_iter()
+        .chain(std::iter::once(wake_r.as_raw_fd()))
+        .map(|fd| libc::pollfd {
+            fd,
             events: libc::POLLIN,
             revents: 0,
-        },
-        libc::pollfd {
-            fd: wake_r.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
+        })
+        .collect();
+    let wake = pfds.len() - 1;
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        pfds[0].revents = 0;
-        pfds[1].revents = 0;
+        for p in &mut pfds {
+            p.revents = 0;
+        }
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
         if rc < 0 {
             let err = io::Error::last_os_error();
@@ -196,45 +274,51 @@ fn accept_loop(
             thread::sleep(ACCEPT_ERR_BACKOFF);
             continue;
         }
-        if stop.load(Ordering::SeqCst) || pfds[1].revents != 0 {
+        if stop.load(Ordering::SeqCst) || pfds[wake].revents != 0 {
             return;
         }
-        if pfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            return;
-        }
-        if pfds[0].revents & libc::POLLIN != 0 {
+        let ready: Vec<(usize, libc::c_short)> =
+            pfds[..wake].iter().map(|p| p.revents).enumerate().collect();
+        for (i, revents) in ready {
+            if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return;
+            }
+            if revents & libc::POLLIN == 0 {
+                continue;
+            }
             loop {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                match listener.accept() {
+                match listener.accept_on(i) {
                     Ok((conn, _)) => {
                         if conn.set_nonblocking(false).is_err() {
                             continue;
                         }
-                        let Some(guard) = ConnGuard::try_acquire(active_conns, max_conns) else {
+                        let Some(guard) = ConnGuard::try_acquire(&ctx.conns, ctx.max_conns) else {
                             eprintln!(
-                                "katamaran: auto-forward 127.0.0.1:{port}: connection limit ({max_conns}) reached"
+                                "katamaran: forward {label}:{port}: connection limit ({}) reached",
+                                ctx.max_conns
                             );
                             continue;
                         };
-                        let guest = guest.to_path_buf();
+                        let (upstream, label2) = (ctx.upstream.clone(), label.clone());
                         if let Err(e) = thread::Builder::new()
                             .name(format!("autofwd-{port}-conn"))
                             .spawn(move || {
                                 let _guard = guard;
-                                if let Err(e) = relay(conn, &guest, port) {
-                                    eprintln!("katamaran: auto-forward 127.0.0.1:{port}: {e}");
+                                if let Err(e) = relay(conn, &upstream, port) {
+                                    eprintln!("katamaran: forward {label2}:{port}: {e}");
                                 }
                             })
                         {
-                            eprintln!("katamaran: auto-forward 127.0.0.1:{port}: spawn: {e}");
+                            eprintln!("katamaran: forward {label}:{port}: spawn: {e}");
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        eprintln!("katamaran: auto-forward 127.0.0.1:{port}: accept: {e}");
+                        eprintln!("katamaran: forward {label}:{port}: accept: {e}");
                         thread::sleep(ACCEPT_ERR_BACKOFF);
                         break;
                     }
@@ -244,10 +328,9 @@ fn accept_loop(
     }
 }
 
-fn relay(client: TcpStream, guest: &Path, port: u16) -> io::Result<()> {
+fn relay(client: TcpStream, upstream: &Upstream, port: u16) -> io::Result<()> {
     let _ = client.set_nodelay(true);
-    let mut upstream = UnixStream::connect(guest)?;
-    upstream.write_all(&port.to_le_bytes())?;
+    let mut upstream = upstream.connect(port)?;
     let (mut c_read, mut u_write) = (client.try_clone()?, upstream.try_clone()?);
     let up = thread::Builder::new()
         .name(format!("autofwd-{port}-up"))
@@ -363,10 +446,19 @@ mod tests {
         assert_eq!(head, format!("{a}:x").as_bytes());
         assert!(fwd.remove(a));
         assert!(!fwd.remove(a));
-        assert!(
-            TcpStream::connect(("127.0.0.1", a)).is_err(),
-            "still listening"
-        );
+        // Poll briefly in case a parallel test subprocess (gvproxy) inherited
+        // the listener during macOS's non-atomic socket()+FIOCLEX window.
+        let assert_closed = |port: u16| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "still listening on {port}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert_closed(a);
         open.write_all(b"y").unwrap();
         let mut tail = [0u8; 1];
         open.read_exact(&mut tail).unwrap();
@@ -379,7 +471,7 @@ mod tests {
         assert!(!fwd.remove(busy_port));
 
         fwd.clear();
-        assert!(TcpStream::connect(("127.0.0.1", b)).is_err());
+        assert_closed(b);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -388,7 +480,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kat-autofwd-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut fwd = AutoForwards::with_max_conns(&fake_guest(&dir), 2);
+        let mut fwd = AutoForwards::with_max_conns(
+            Upstream::AutoForward(fake_guest(&dir)),
+            &[Ipv4Addr::LOCALHOST],
+            2,
+        );
         let port = add_free_port(&mut fwd);
 
         // Hold two open relayed connections (fills the cap of 2).
@@ -462,6 +558,32 @@ mod tests {
         assert_eq!(fwd.active_conns.load(Ordering::Acquire), 0);
         assert!(fwd.add(port).unwrap());
         assert_eq!(round_trip(port, "ok"), format!("{port}:ok"));
+        fwd.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn per_port_upstream_relays_to_the_ports_socket() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-pp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fwd = AutoForwards::with(Upstream::PerPort(dir.clone()), &[Ipv4Addr::LOCALHOST]);
+        let port = add_free_port(&mut fwd);
+        // What gvproxy serves for the port: here, an echo with a marker.
+        let listener = UnixListener::bind(Upstream::socket(&dir, port)).unwrap();
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                thread::spawn(move || {
+                    conn.write_all(b"gv:").unwrap();
+                    let mut rest = conn.try_clone().unwrap();
+                    copy(&mut rest, &mut conn).unwrap();
+                    conn.shutdown(Shutdown::Write).unwrap();
+                });
+            }
+        });
+        assert_eq!(round_trip(port, "hello"), "gv:hello");
+        assert_eq!(fwd.label(), "127.0.0.1");
         fwd.clear();
         std::fs::remove_dir_all(&dir).unwrap();
     }

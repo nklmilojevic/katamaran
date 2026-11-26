@@ -76,6 +76,10 @@ pub struct RunArgs {
     /// Do not forward unpublished container ports to the Mac's 127.0.0.1.
     #[arg(long)]
     pub no_auto_forward: bool,
+    /// A Mac address forwarded ports listen on: 127.0.0.1, or an alias added
+    /// to lo0 (`sudo ifconfig lo0 alias 172.16.1.200`). Repeat for several.
+    #[arg(long = "forward-address", default_value = "127.0.0.1")]
+    pub forward_addresses: Vec<std::net::Ipv4Addr>,
     /// How x86-64 (amd64) programs run: Rosetta, qemu-user, or not at all;
     /// auto uses Rosetta when it is installed.
     #[arg(long, value_enum, default_value_t)]
@@ -421,18 +425,37 @@ fn session(
     let pid_file = run_dir.join("vm.pid");
     fs::write(&pid_file, format!("{vm_pid}\n"))?;
 
+    for a in &args.forward_addresses {
+        if !net::is_loopback_interface_addr(*a) {
+            eprintln!(
+                "katamaran: forward address {a} is not assigned to lo0 \
+                 (sudo ifconfig lo0 alias {a}); ports will not listen on it"
+            );
+        }
+    }
     let forwarder = match &gvproxy {
         Some(g) => {
             let fwd_tx = tx.clone();
-            Some(net::spawn_forwarder(
-                GvproxyApi {
-                    socket: g.api_socket.clone(),
-                    guest: g.network().guest_ip,
+            let on_event = move |e| {
+                let _ = fwd_tx.send(Input::Forward(id, e));
+            };
+            let api = GvproxyApi {
+                socket: g.api_socket.clone(),
+                guest: g.network().guest_ip,
+            };
+            Some(
+                if args.forward_addresses == [std::net::Ipv4Addr::LOCALHOST] {
+                    net::spawn_forwarder(api, on_event)?
+                } else {
+                    // gvproxy's per-port sockets go next to its API socket, in
+                    // the private run directory.
+                    let sockets = g.api_socket.parent().unwrap_or(&run_dir).to_path_buf();
+                    net::spawn_forwarder(
+                        net::AddressesApi::new(api, &sockets, &args.forward_addresses),
+                        on_event,
+                    )?
                 },
-                move |e| {
-                    let _ = fwd_tx.send(Input::Forward(id, e));
-                },
-            )?)
+            )
         }
         None => None,
     };
@@ -471,7 +494,10 @@ fn session(
         });
     }
 
-    let mut auto_forwards = crate::autofwd::AutoForwards::new(&autofwd_sock);
+    let mut auto_forwards = crate::autofwd::AutoForwards::with(
+        crate::autofwd::Upstream::AutoForward(autofwd_sock.clone()),
+        &args.forward_addresses,
+    );
     let mut mounted = false;
     let mut paused = false;
     let mount_cancel = Arc::new(AtomicBool::new(false));
@@ -567,7 +593,8 @@ fn session(
                 match auto_forwards.add(port) {
                     Ok(true) => {
                         println!(
-                            "katamaran: auto-forwarding 127.0.0.1:{port}/{}",
+                            "katamaran: auto-forwarding {}:{port}/{}",
+                            auto_forwards.bound_label(port),
                             proto.as_str()
                         );
                         on_event(Event::PortAdd(proto, port));
@@ -575,7 +602,8 @@ fn session(
                     Ok(false) => {}
                     Err(e) => {
                         eprintln!(
-                            "katamaran: cannot auto-forward 127.0.0.1:{port}/{} ({e}); skipped",
+                            "katamaran: cannot auto-forward {}:{port}/{} ({e}); skipped",
+                            auto_forwards.label(),
                             proto.as_str()
                         );
                         on_event(Event::PortFailed(proto, port, e.to_string()));
@@ -583,9 +611,10 @@ fn session(
                 }
             }
             Ok(Input::Guest(_, Some(Msg::AutoForwardRemove { proto, port }))) => {
+                let label = auto_forwards.bound_label(port);
                 if auto_forwards.remove(port) {
                     println!(
-                        "katamaran: stopped auto-forwarding 127.0.0.1:{port}/{}",
+                        "katamaran: stopped auto-forwarding {label}:{port}/{}",
                         proto.as_str()
                     );
                     on_event(Event::PortRemove(proto, port));

@@ -3,6 +3,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,10 @@ pub struct Config {
     /// Forward the Mac's 127.0.0.1:<port> to container ports that were not
     /// published with `-p`.
     pub auto_forward: bool,
+    /// The Mac addresses forwarded ports listen on: `127.0.0.1`, and any
+    /// alias added to `lo0` (e.g. `sudo ifconfig lo0 alias 172.16.1.200`).
+    #[serde(skip_serializing_if = "is_default_forward_addresses")]
+    pub forward_addresses: Vec<Ipv4Addr>,
     /// How x86-64 (amd64) programs run in the guest.
     pub amd64: Emulation,
     /// Run an optional single-node Kubernetes (k3s) cluster inside the VM.
@@ -69,6 +74,7 @@ impl Default for Config {
             launch_at_login: true,
             pause_on_sleep: false,
             auto_forward: true,
+            forward_addresses: default_forward_addresses(),
             amd64: Emulation::default(),
             kubernetes: false,
             nofile: DEFAULT_NOFILE,
@@ -80,7 +86,7 @@ impl Default for Config {
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 13] = [
+pub const KEYS: [&str; 14] = [
     "cpus",
     "memory_mib",
     "mount",
@@ -88,6 +94,7 @@ pub const KEYS: [&str; 13] = [
     "launch_at_login",
     "pause_on_sleep",
     "auto_forward",
+    "forward_addresses",
     "amd64",
     "kubernetes",
     "nofile",
@@ -110,6 +117,31 @@ fn is_default_nofile(n: &u32) -> bool {
 /// Upper bound on the total size of extra k3s server arguments so they stay well
 /// within the host-guest protocol frame limit.
 pub const MAX_K8S_ARGS_BYTES: usize = 64 << 10;
+
+pub fn default_forward_addresses() -> Vec<Ipv4Addr> {
+    vec![Ipv4Addr::LOCALHOST]
+}
+
+fn is_default_forward_addresses(v: &[Ipv4Addr]) -> bool {
+    v == [Ipv4Addr::LOCALHOST]
+}
+
+/// Accepts `127.0.0.1,172.16.1.200` (commas or spaces); empty is the default.
+fn parse_addresses(v: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
+    let addrs = v
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<Ipv4Addr>()
+                .with_context(|| format!("forward_addresses: {s:?} is not an IPv4 address"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(if addrs.is_empty() {
+        default_forward_addresses()
+    } else {
+        addrs
+    })
+}
 
 /// The smallest guest that still runs dockerd comfortably.
 pub const MIN_MEMORY_MIB: u32 = 1024;
@@ -206,6 +238,12 @@ impl Config {
             "launch_at_login" => self.launch_at_login.to_string(),
             "pause_on_sleep" => self.pause_on_sleep.to_string(),
             "auto_forward" => self.auto_forward.to_string(),
+            "forward_addresses" => self
+                .forward_addresses
+                .iter()
+                .map(Ipv4Addr::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
             "amd64" => self.amd64.to_string(),
             "kubernetes" => self.kubernetes.to_string(),
             "nofile" => self.nofile.to_string(),
@@ -234,6 +272,7 @@ impl Config {
             "launch_at_login" => next.launch_at_login = parse_bool(value)?,
             "pause_on_sleep" => next.pause_on_sleep = parse_bool(value)?,
             "auto_forward" => next.auto_forward = parse_bool(value)?,
+            "forward_addresses" => next.forward_addresses = parse_addresses(value)?,
             "amd64" => next.amd64 = value.parse()?,
             "kubernetes" => next.kubernetes = parse_bool(value)?,
             "nofile" => {
@@ -340,6 +379,17 @@ impl Config {
             .fold(0usize, usize::saturating_add);
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
             bail!("k8s_disable and k8s_args exceed maximum size of {MAX_K8S_ARGS_BYTES} bytes");
+        }
+        if self.forward_addresses.is_empty() {
+            bail!("forward_addresses must list at least one address");
+        }
+        for (i, a) in self.forward_addresses.iter().enumerate() {
+            if a.is_unspecified() || a.is_multicast() || a.is_broadcast() {
+                bail!("forward_addresses: {a} is not a host address");
+            }
+            if self.forward_addresses[..i].contains(a) {
+                bail!("forward_addresses: {a} is listed twice");
+            }
         }
         Ok(())
     }
@@ -826,6 +876,55 @@ mod tests {
         assert!(cfg.set("k8s_version", "v1.37.0+k3s1", &HOST).is_ok());
         let err = cfg.set("k8s_version", "V1.32.5+k3s1", &HOST).unwrap_err();
         assert!(format!("{err:#}").contains("\"V1.32.5+k3s1\""), "{err:#}");
+    }
+
+    #[test]
+    fn forward_addresses_default_to_localhost_and_are_a_vm_setting() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
+        assert_eq!(cfg.get("forward_addresses").unwrap(), "127.0.0.1");
+        // The default stays out of the file, so older versions still read it.
+        assert!(!toml::to_string(&cfg).unwrap().contains("forward_addresses"));
+        let started = cfg.clone();
+        cfg.set("forward_addresses", "127.0.0.1, 172.16.1.200", &HOST)
+            .unwrap();
+        assert_eq!(
+            cfg.forward_addresses,
+            [Ipv4Addr::LOCALHOST, Ipv4Addr::new(172, 16, 1, 200)]
+        );
+        assert_eq!(
+            cfg.get("forward_addresses").unwrap(),
+            "127.0.0.1,172.16.1.200"
+        );
+        assert!(started.needs_restart_for(&cfg));
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            text.contains(r#"forward_addresses = ["127.0.0.1", "172.16.1.200"]"#),
+            "{text}"
+        );
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+        cfg.set("forward_addresses", "", &HOST).unwrap();
+        assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
+    }
+
+    #[test]
+    fn rejects_bad_forward_addresses() {
+        let mut cfg = Config::default();
+        for bad in [
+            "localhost",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+        ] {
+            assert!(cfg.set("forward_addresses", bad, &HOST).is_err(), "{bad}");
+        }
+        assert!(
+            cfg.set("forward_addresses", "127.0.0.1,127.0.0.1", &HOST)
+                .is_err()
+        );
+        assert!(Config::parse("forward_addresses = []").is_err());
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]

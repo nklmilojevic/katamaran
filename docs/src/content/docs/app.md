@@ -61,4 +61,4 @@ Open **Settings** from the menu bar or press `Cmd+,`. Settings are organized int
 - **Resources**: Adjust **CPUs** (`cpus`) and **Memory** (`memory_mib`).
 - **Kubernetes**: Toggle **Enable Kubernetes** (`kubernetes`), inspect live **Cluster status** (state, k3s version, API address, and kubeconfig context), and run **Sync Images** (mirrors locally built Docker images into Kubernetes) or **Reset Cluster** (stops Kubernetes and wipes all cluster state, workloads, and persistent volumes after confirmation).
 
-Additional settings (`amd64`, `auto_forward`, `mount_path`, `nofile`, and `pause_on_sleep`) can be changed with `kat config set` or in `~/.katamaran/config.toml`. Changes write atomically to `~/.katamaran/config.toml` and display a notice with a **Restart** button when a VM restart is required.
+Additional settings (`amd64`, `auto_forward`, `forward_addresses`, `mount_path`, `nofile`, and `pause_on_sleep`) can be changed with `kat config set` or in `~/.katamaran/config.toml`. Changes write atomically to `~/.katamaran/config.toml` and display a notice with a **Restart** button when a VM restart is required.

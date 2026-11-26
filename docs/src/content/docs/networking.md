@@ -35,6 +35,19 @@ kat config set auto_forward=off
 kat restart
 ```
 
+### Listen on lo0 aliases
+
+By default, forwarded ports listen only on `127.0.0.1`. Some setups put a local ingress on a loopback alias instead. For example, `*.dev.example` resolves to `172.16.1.200`, and the ingress controller's Service lists that IP in `externalIPs`. To make published, automatic, and Kubernetes `NodePort` and `LoadBalancer` forwards listen on the alias as well, add the alias to `lo0` and list it in `forward_addresses`:
+
+```sh
+sudo ifconfig lo0 alias 172.16.1.200
+kat config set forward_addresses=127.0.0.1,172.16.1.200
+kat restart
+curl https://app.dev.example/
+```
+
+Only addresses assigned to a loopback interface are used. katamaran skips any other address and logs a warning, so a typo cannot expose a port to your network. Add the alias before the VM starts, because a port that is already forwarded does not pick up an alias added later. Privileged ports such as `443` also work without root: one `lo0`-scoped wildcard socket serves every listed address. macOS removes `lo0` aliases on reboot, so persist yours with a LaunchDaemon if you need it.
+
 ## Reach macOS from containers
 
 Containers reach services listening on `127.0.0.1` on your Mac through `host.docker.internal` (or `host.internal`). Both resolve to `192.168.127.254`, which gvproxy maps to `127.0.0.1` on macOS:

@@ -1757,6 +1757,7 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
         mtu: crate::net::DEFAULT_MTU,
         pause_on_sleep: cfg.pause_on_sleep,
         no_auto_forward: !cfg.auto_forward,
+        forward_addresses: cfg.forward_addresses.clone(),
         amd64: cfg.amd64,
     })
 }

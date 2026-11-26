@@ -190,6 +190,7 @@ Settings live in `~/.katamaran/config.toml` and take effect at the next VM start
 | `memory_mib` | Half of host RAM, clamped to 2 GiB to 16 GiB | Upper memory ceiling (`memory=8G` is accepted by `config set`) |
 | `amd64` | `auto` | How `linux/amd64` containers run (`auto`, `rosetta`, `qemu`, or `off`) |
 | `auto_forward` | `true` | Forward unpublished container ports to `127.0.0.1` on macOS |
+| `forward_addresses` | `127.0.0.1` | Addresses on macOS that forwarded ports listen on, such as `127.0.0.1,172.16.1.200` for a `lo0` alias |
 | `mount` | `true` | Mount Linux files on macOS over NFS |
 | `mount_path` | `~/Katamaran` | Absolute path for the macOS NFS mount |
 | `launch_at_login` | `true` | Start the daemon and VM when you log in |
