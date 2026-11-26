@@ -110,6 +110,7 @@ fn main() -> anyhow::Result<()> {
             host(&root)
         }
         Task::TestVm => {
+            require_tool("kubectl", "running `cargo xtask test-vm`")?;
             initramfs(&root)?;
             host(&root)?;
             require_guest_images(&root)?;
@@ -211,6 +212,25 @@ fn require_guest_images(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn require_tool(bin: &str, why: &str) -> anyhow::Result<()> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    require_tool_in(bin, why, &path)
+}
+
+fn require_tool_in(bin: &str, why: &str, path: &std::ffi::OsStr) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let found = std::env::split_paths(path).any(|dir| {
+        let candidate = dir.join(bin);
+        std::fs::metadata(&candidate)
+            .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+    });
+    if !found {
+        bail!("{bin} is not on PATH; install {bin} before {why}");
+    }
+    Ok(())
+}
+
 fn host(root: &Path) -> anyhow::Result<()> {
     gvproxy::build(root)?;
     run(Command::new(cargo()).args([
@@ -245,4 +265,28 @@ fn workspace_root() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_tool_in;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn require_tool_reports_missing_binary() {
+        let err = require_tool_in(
+            "katamaran-nonexistent-tool-xyz",
+            "running `cargo xtask test-vm`",
+            OsStr::new("/usr/bin:/bin"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("katamaran-nonexistent-tool-xyz"), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
+    }
+
+    #[test]
+    fn require_tool_finds_existing_executable() {
+        require_tool_in("sh", "testing", OsStr::new("/bin:/usr/bin")).unwrap();
+    }
 }

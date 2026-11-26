@@ -28,7 +28,7 @@ use kat_proto::{AUTO_FORWARD_PORT, Msg, PortProto};
 use super::sys;
 use crate::autofwd::{self, DiagEnd, Listener, Namespace, Route};
 
-pub(super) const NETNS_DIRS: [&str; 2] = ["/var/run/docker/netns", "/run/netns"];
+const NETNS_DIRS: [&str; 2] = ["/var/run/docker/netns", "/run/netns"];
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNS: usize = 256;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
@@ -212,7 +212,7 @@ impl AutoForward {
     }
 }
 
-pub(super) fn is_nsfs(file: &File) -> bool {
+fn is_nsfs(file: &File) -> bool {
     const NSFS_MAGIC: i64 = 0x6e73_6673;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) == 0 && st.f_type as i64 == NSFS_MAGIC }
@@ -220,10 +220,7 @@ pub(super) fn is_nsfs(file: &File) -> bool {
 
 /// Run `f` on a short-lived thread that joined `netns`, so no long-lived
 /// thread is ever left in the wrong namespace.
-pub(super) fn in_netns<T: Send>(
-    netns: &OwnedFd,
-    f: impl FnOnce() -> io::Result<T> + Send,
-) -> io::Result<T> {
+fn in_netns<T: Send>(netns: &OwnedFd, f: impl FnOnce() -> io::Result<T> + Send) -> io::Result<T> {
     thread::scope(|s| {
         thread::Builder::new()
             .name("autofwd-netns".into())

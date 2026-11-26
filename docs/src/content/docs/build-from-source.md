@@ -93,7 +93,7 @@ Run fast host unit tests:
 cargo test --lib -p kat-proto -p kat-vmm -p kat-daemon -p xtask
 ```
 
-Run the full VM integration test suite (boots real VMs):
+Run the full VM integration test suite (boots real VMs; requires `docker` and `kubectl` on `PATH`, plus internet access):
 
 ```sh
 cargo xtask test-vm

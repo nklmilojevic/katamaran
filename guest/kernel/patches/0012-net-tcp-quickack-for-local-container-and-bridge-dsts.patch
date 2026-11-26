@@ -1,0 +1,73 @@
+Subject: [PATCH] net: enable TCP quickack on container namespace and local bridge dsts
+
+Keep-alive request/response traffic inside the guest can stall for a
+delayed-ACK timeout (~40-50 ms at HZ=100) when a server writes response
+headers and body separately without TCP_NODELAY: katamaran gives eth0 a
+65520-byte MTU for gvproxy throughput and local bridges/veths inherit it,
+putting response bodies up to ~64 KiB below one MSS so Nagle waits for an
+ACK while the peer in pingpong mode delays it.
+
+Setting RTAX_QUICKACK=1 by rewriting live routes from userspace has
+inherent TOCTOU races with Docker/CNI gateway updates and root route
+switches, and drops hidden IPv6 kernel flags and expiry state on replace.
+Instead, set icsk->icsk_ack.dst_quick_ack in sk_setup_caps() when the
+socket's resolved dst uses a non-init network namespace (Docker
+containers, Kubernetes pods, LXC machines) or a local bridge/veth device
+in init_net (cni0, docker0, br-*, katbr0), leaving the virtio-net uplink
+(eth0) and all routing tables untouched.
+
+Explicit locked route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected.
+Disable at boot with kat.quickack=0 or at runtime via
+/sys/module/kat/parameters/quickack.
+
+SPDX-License-Identifier: GPL-2.0
+---
+diff -ruN a/net/core/sock.c b/net/core/sock.c
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -126,6 +126,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/skbuff_ref.h>
+ #include <net/net_namespace.h>
++#include <net/rtnetlink.h>
+ #include <net/request_sock.h>
+ #include <net/sock.h>
+ #include <net/proto_memory.h>
+@@ -2608,6 +2609,22 @@
+ 	return max_size - (MAX_TCP_HEADER + 1);
+ }
+ 
++static bool kat_quickack_enabled = true;
++__module_param_call("kat.", quickack, &param_ops_bool,
++		    &kat_quickack_enabled, 0644, -1, 0);
++
++static bool kat_dev_wants_quickack(const struct net_device *dev)
++{
++	if (!READ_ONCE(kat_quickack_enabled))
++		return false;
++	if (!net_eq(dev_net(dev), &init_net))
++		return true;
++	if (netif_is_bridge_master(dev))
++		return true;
++	return dev->rtnl_link_ops && dev->rtnl_link_ops->kind &&
++	       strcmp(dev->rtnl_link_ops->kind, "veth") == 0;
++}
++
+ void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
+ {
+ 	const struct net_device *dev;
+@@ -2618,9 +2635,13 @@
+ 	sk->sk_route_caps = dev->features;
+ 	if (sk_is_tcp(sk)) {
+ 		struct inet_connection_sock *icsk = inet_csk(sk);
++		bool quick_ack = dst_metric(dst, RTAX_QUICKACK);
+ 
+ 		sk->sk_route_caps |= NETIF_F_GSO;
+-		icsk->icsk_ack.dst_quick_ack = dst_metric(dst, RTAX_QUICKACK);
++		if (!quick_ack && !dst_metric_locked(dst, RTAX_QUICKACK) &&
++		    kat_dev_wants_quickack(dev))
++			quick_ack = true;
++		icsk->icsk_ack.dst_quick_ack = quick_ack;
+ 	}
+ 	if (sk->sk_route_caps & NETIF_F_GSO)
+ 		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
