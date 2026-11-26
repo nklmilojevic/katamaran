@@ -34,6 +34,7 @@ use super::service::{
     CONTAINERD_SOCKET, DOCKER_SOCKET, DockerStack, Notifier, Reaper, describe_status,
 };
 use super::sys;
+use crate::containerd_grpc;
 use crate::oci_rewrite;
 
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -3607,15 +3608,22 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 SyncAction::Relist => {
                     retry_refs.insert(name);
                 }
-                SyncAction::RetireRewritten => match retire_rewritten_image(reaper, &name) {
-                    Ok(()) => log(&format!(
-                        "retired Katamaran amd64 mirror {name} from k8s.io"
-                    )),
-                    Err(e) => {
-                        log(&format!("retire amd64 mirror {name}: {e}"));
-                        failures.push(format!("{name}: {e}"));
+                SyncAction::RetireRewritten => {
+                    if let Some(k) = k8s_img {
+                        match retire_rewritten_image(&name, &k.digest) {
+                            Ok(containerd_grpc::DeleteOutcome::Deleted) => log(&format!(
+                                "retired Katamaran amd64 mirror {name} from k8s.io"
+                            )),
+                            Ok(containerd_grpc::DeleteOutcome::NotFoundOrChanged) => log(&format!(
+                                "skipped retiring {name}: k8s.io target already removed or replaced"
+                            )),
+                            Err(e) => {
+                                log(&format!("retire amd64 mirror {name}: {e}"));
+                                failures.push(format!("{name}: {e}"));
+                            }
+                        }
                     }
-                },
+                }
                 SyncAction::MirrorNative { clear_source_label } => {
                     match mirror_one_image(reaper, &name, None) {
                         Ok(()) => {
@@ -3648,35 +3656,43 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             continue;
                         }
                     };
-                    let platform =
-                        match oci_rewrite::resolve_local_amd64_platform(&img.digest, store) {
-                            Ok(oci_rewrite::LocalAmd64::Found { platform }) => platform,
-                            Ok(oci_rewrite::LocalAmd64::RootMissing) => {
-                                retry_refs.insert(name);
-                                continue;
-                            }
-                            Ok(oci_rewrite::LocalAmd64::NotAvailable) => {
-                                if k8s_img.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some())
-                                    && let Err(e) = retire_rewritten_image(reaper, &name)
-                                {
-                                    log(&format!("retire amd64 mirror {name}: {e}"));
-                                    failures.push(format!("{name}: {e}"));
+                    let plan = match oci_rewrite::prepare_rewrite_from_store(
+                        &img.digest,
+                        NATIVE_ARCH,
+                        store,
+                    ) {
+                        Ok(oci_rewrite::PrepareRewrite::Ready(plan)) => *plan,
+                        Ok(oci_rewrite::PrepareRewrite::RootMissing) => {
+                            retry_refs.insert(name);
+                            continue;
+                        }
+                        Ok(oci_rewrite::PrepareRewrite::NotAvailable) => {
+                            if let Some(k) = k8s_img
+                                && k.label(SOURCE_DIGEST_LABEL).is_some()
+                            {
+                                match retire_rewritten_image(&name, &k.digest) {
+                                    Ok(containerd_grpc::DeleteOutcome::Deleted) => log(&format!(
+                                        "retired Katamaran amd64 mirror {name} from k8s.io"
+                                    )),
+                                    Ok(containerd_grpc::DeleteOutcome::NotFoundOrChanged) => {}
+                                    Err(e) => {
+                                        log(&format!("retire amd64 mirror {name}: {e}"));
+                                        failures.push(format!("{name}: {e}"));
+                                    }
                                 }
-                                continue;
                             }
-                            Err(e) => {
-                                log(&format!("resolve amd64 platform for {name}: {e}"));
-                                failures.push(format!("{name}: {e}"));
-                                continue;
-                            }
-                        };
-                    let spec = RewriteSpec {
-                        source_digest: &img.digest,
-                        platform: &platform,
+                            continue;
+                        }
+                        Err(e) => {
+                            log(&format!("prepare amd64 rewrite for {name}: {e}"));
+                            failures.push(format!("{name}: {e}"));
+                            continue;
+                        }
                     };
-                    match mirror_one_image(reaper, &name, Some(spec)) {
+                    let export_platform = plan.export_platform.clone();
+                    match mirror_one_image(reaper, &name, Some(plan)) {
                         Ok(()) => log(&format!(
-                            "mirrored amd64 image {name} ({platform}) as linux/{NATIVE_ARCH} (runs under emulation)"
+                            "mirrored amd64 image {name} ({export_platform}) as linux/{NATIVE_ARCH} (runs under emulation)"
                         )),
                         Err(MirrorError::SourceChanged { .. }) => {
                             retry_refs.insert(name);
@@ -3705,9 +3721,12 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     && !moby.contains_key(name)
                     && k8s_img.label(SOURCE_DIGEST_LABEL).is_some()
                 {
-                    match retire_rewritten_image(reaper, name) {
-                        Ok(()) => log(&format!(
+                    match retire_rewritten_image(name, &k8s_img.digest) {
+                        Ok(containerd_grpc::DeleteOutcome::Deleted) => log(&format!(
                             "retired orphaned Katamaran amd64 mirror {name} from k8s.io"
+                        )),
+                        Ok(containerd_grpc::DeleteOutcome::NotFoundOrChanged) => log(&format!(
+                            "skipped retiring orphaned {name}: k8s.io target already removed or replaced"
                         )),
                         Err(e) => {
                             log(&format!("retire orphaned amd64 mirror {name}: {e}"));
@@ -3875,8 +3894,15 @@ struct CtrCheck {
     complete: bool,
 }
 
+/// Bounded stdout cap for `ctr images ls`, `ctr images check`, and
+/// `ctr content ls -q`. Exceeding this cap returns an explicit error instead of
+/// silently truncating the inventory (which could otherwise misclassify images
+/// past the cutoff as orphaned).
+const IMAGE_LIST_LIMIT: usize = 16 << 20;
+
 /// Returns `REF -> CtrCheck { digest, complete }` from `ctr images check`, or
-/// an error if `ctr` failed/timed out or produced no status table.
+/// an error if `ctr` failed/timed out, exceeded `IMAGE_LIST_LIMIT`, or produced
+/// no status table.
 ///
 /// Note: `ctr images check` exits non-zero whenever any image in the namespace
 /// lacks a native manifest (its unpack check errors on that image), while still
@@ -3888,8 +3914,10 @@ fn check_ctr_native_complete(
 ) -> Result<HashMap<String, CtrCheck>, String> {
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "check"]);
-    let (_code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
-        .map_err(|e| format!("ctr images check ({ns}): {e}"))?;
+    let (_code, stdout_bytes, stderr) =
+        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), IMAGE_LIST_LIMIT)
+            .map_err(|e| format!("ctr images check ({ns}): {e}"))?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     parse_ctr_check(&stdout).ok_or_else(|| {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -3927,31 +3955,21 @@ fn parse_ctr_check(stdout: &str) -> Option<HashMap<String, CtrCheck>> {
     Some(rows)
 }
 
-fn retire_rewritten_image(reaper: &Reaper, name: &str) -> Result<(), String> {
-    let mut cmd = Command::new("/usr/bin/ctr");
-    cmd.args([
-        "-a",
-        CONTAINERD_SOCKET,
-        "-n",
+/// Atomically retire a Katamaran-rewritten `k8s.io` image only if it still
+/// points to `expected_target_digest`, via containerd's `Images.Delete` RPC
+/// (`DeleteImageRequest.target`). If a concurrent kubelet pull replaced the tag
+/// with a native image, containerd returns `NOT_FOUND` and preserves it.
+fn retire_rewritten_image(
+    name: &str,
+    expected_target_digest: &str,
+) -> Result<containerd_grpc::DeleteOutcome, String> {
+    containerd_grpc::delete_image_if_target_matches(
+        Path::new(CONTAINERD_SOCKET),
         "k8s.io",
-        "images",
-        "rm",
         name,
-    ]);
-    let (code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
-        .map_err(|e| format!("ctr images rm {name}: {e}"))?;
-    if code == 0 {
-        return Ok(());
-    }
-    let detail = if stderr.trim().is_empty() {
-        stdout.trim()
-    } else {
-        stderr.trim()
-    };
-    if detail.to_ascii_lowercase().contains("not found") {
-        return Ok(());
-    }
-    Err(format!("ctr images rm {name} exited {code}: {detail}"))
+        expected_target_digest,
+        Duration::from_secs(15),
+    )
 }
 
 fn clear_source_digest_label(reaper: &Reaper, name: &str) -> Result<(), String> {
@@ -3989,8 +4007,8 @@ impl oci_rewrite::BlobStore for MobyContentStore<'_> {
         self.digests.contains(digest)
     }
 
-    fn read_json_blob(&mut self, digest: &str) -> Result<Vec<u8>, String> {
-        get_ctr_content_blob(self.reaper, "moby", digest)
+    fn read_json_blob(&mut self, digest: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        get_ctr_content_blob(self.reaper, "moby", digest, max_bytes)
     }
 }
 
@@ -3998,7 +4016,7 @@ fn list_ctr_content_digests(reaper: &Reaper, ns: &str) -> Result<HashSet<String>
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "content", "ls", "-q"]);
     let (code, stdout, stderr) =
-        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), 16 << 20)
+        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), IMAGE_LIST_LIMIT)
             .map_err(|e| format!("ctr content ls ({ns}): {e}"))?;
     if code != 0 {
         return Err(format!(
@@ -4015,16 +4033,17 @@ fn list_ctr_content_digests(reaper: &Reaper, ns: &str) -> Result<HashSet<String>
         .collect())
 }
 
-fn get_ctr_content_blob(reaper: &Reaper, ns: &str, digest: &str) -> Result<Vec<u8>, String> {
+fn get_ctr_content_blob(
+    reaper: &Reaper,
+    ns: &str,
+    digest: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "content", "get", digest]);
-    let (code, stdout, stderr) = run_reaped_bytes(
-        reaper,
-        &mut cmd,
-        Duration::from_secs(15),
-        oci_rewrite::MAX_JSON_BLOB as usize,
-    )
-    .map_err(|e| format!("ctr content get {digest}: {e}"))?;
+    let (code, stdout, stderr) =
+        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), max_bytes)
+            .map_err(|e| format!("ctr content get {digest}: {e}"))?;
     if code != 0 {
         return Err(format!(
             "ctr content get {digest} exited {code}: {}",
@@ -4144,11 +4163,15 @@ impl CtrImage {
 }
 
 /// Returns `image_ref -> image` for all images in a containerd namespace.
+/// Fails explicitly if `ctr images ls` output exceeds [`IMAGE_LIST_LIMIT`] so
+/// sync never infers orphaned mirrors from a silently truncated inventory.
 fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, CtrImage>, String> {
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "ls"]);
-    let (code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
-        .map_err(|e| format!("ctr images ls ({ns}): {e}"))?;
+    let (code, stdout_bytes, stderr) =
+        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), IMAGE_LIST_LIMIT)
+            .map_err(|e| format!("ctr images ls ({ns}): {e}"))?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     if code != 0 {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -4158,6 +4181,17 @@ fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, CtrImage
         return Err(format!("ctr images ls ({ns}) failed: {detail}"));
     }
     Ok(parse_ctr_images(&stdout))
+}
+
+/// Read and parse a `ctr images ls` stream up to `limit` bytes, failing instead
+/// of returning a partial inventory when stdout exceeds `limit`.
+#[cfg(test)]
+fn parse_checked_ctr_images(
+    r: impl Read,
+    limit: usize,
+) -> Result<HashMap<String, CtrImage>, String> {
+    let bytes = drain_bytes_checked(r, limit)?;
+    Ok(parse_ctr_images(&String::from_utf8_lossy(&bytes)))
 }
 
 /// Parse `ctr images ls` output: `REF TYPE DIGEST SIZE PLATFORMS LABELS`,
@@ -4187,11 +4221,6 @@ fn parse_ctr_images(stdout: &str) -> HashMap<String, CtrImage> {
     map
 }
 
-struct RewriteSpec<'a> {
-    source_digest: &'a str,
-    platform: &'a str,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MirrorError {
     SourceChanged { expected: String, actual: String },
@@ -4201,14 +4230,15 @@ enum MirrorError {
 /// Stream an image from `moby` to `k8s.io` via two separate Reaper-managed
 /// `ctr` processes connected by OS pipes, verifying both exit statuses.
 ///
-/// With `rewrite` set (the `moby` digest and resolved amd64 platform variant),
-/// the archive passes through [`oci_rewrite::rewrite_platform_with_options`]
-/// on the way so the CRI sees a native-platform image, and the copy is
-/// labelled with its verified source digest.
+/// With `rewrite` set (a metadata-only [`oci_rewrite::RewritePlan`] resolved
+/// from `moby`'s content store), [`oci_rewrite::stream_rewritten_archive`]
+/// streams referenced layers straight through in O(1) memory and zero extra
+/// disk space, validates the exported source digest, emits the rewritten
+/// config/manifest, and labels the `k8s.io` copy with its verified source digest.
 fn mirror_one_image(
     reaper: &Reaper,
     name: &str,
-    rewrite: Option<RewriteSpec<'_>>,
+    rewrite: Option<oci_rewrite::RewritePlan>,
 ) -> Result<(), MirrorError> {
     let timeout = Duration::from_secs(120);
     let (pipe_r, pipe_w) = pipe().map_err(|e| MirrorError::Failed(format!("pipe: {e}")))?;
@@ -4225,18 +4255,22 @@ fn mirror_one_image(
     // `--local` avoids containerd's transfer-API progress handler writing
     // status lines onto stdout (the archive stream itself) when exporting to `-`.
     let mut exp_args = vec![
-        "-a",
-        CONTAINERD_SOCKET,
-        "-n",
-        "moby",
-        "images",
-        "export",
-        "--local",
+        "-a".to_string(),
+        CONTAINERD_SOCKET.to_string(),
+        "-n".into(),
+        "moby".into(),
+        "images".into(),
+        "export".into(),
+        "--local".into(),
     ];
-    if let Some(spec) = &rewrite {
-        exp_args.extend(["--platform", spec.platform, "--skip-manifest-json"]);
+    if let Some(plan) = &rewrite {
+        exp_args.extend([
+            "--platform".into(),
+            plan.export_platform.clone(),
+            "--skip-manifest-json".into(),
+        ]);
     }
-    exp_args.extend(["-", name]);
+    exp_args.extend(["-".into(), name.to_string()]);
     let mut imp_args = vec![
         "-a".to_string(),
         CONTAINERD_SOCKET.to_string(),
@@ -4246,10 +4280,10 @@ fn mirror_one_image(
         "import".into(),
         "--digests".into(),
     ];
-    if let Some(spec) = &rewrite {
+    if let Some(plan) = &rewrite {
         imp_args.push(format!(
             "--label={SOURCE_DIGEST_LABEL}={}",
-            spec.source_digest
+            plan.source_digest
         ));
     }
     imp_args.push("-".into());
@@ -4321,24 +4355,14 @@ fn mirror_one_image(
             )));
         }
     };
-    let expected_digest = rewrite.as_ref().map(|s| s.source_digest.to_string());
-    if expected_digest.is_some() {
-        let _ = fs::create_dir_all(ROOT);
-    }
-    let rewriter = match rw_in.map(|(from_exp, to_imp)| {
+    let rewriter = match rw_in.zip(rewrite).map(|((from_exp, to_imp), plan)| {
         thread::Builder::new()
             .name("k8s-img-rewrite".into())
             .spawn(move || {
-                // Spool under ROOT (btrfs data disk), not `/tmp` (`tmpfs`), so
-                // large images never exhaust guest RAM.
-                oci_rewrite::rewrite_platform_with_options(
+                oci_rewrite::stream_rewritten_archive(
                     File::from(from_exp),
                     File::from(to_imp),
-                    NATIVE_ARCH,
-                    oci_rewrite::RewriteOptions {
-                        expected_source_digest: expected_digest.as_deref(),
-                        spool_dir: Some(Path::new(ROOT)),
-                    },
+                    &plan,
                 )
             })
     }) {
@@ -4847,6 +4871,34 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         let big = [b'a'; 64];
         let err = drain_bytes_checked(&big[..], 32).unwrap_err();
         assert!(err.contains("exceeded 32-byte limit"), "{err}");
+    }
+
+    #[test]
+    fn oversized_moby_listing_errors_instead_of_orphaning_labelled_mirror() {
+        // Construct a `moby` listing whose tail contains a native replacement
+        // for a labelled `k8s.io` tag past the byte limit: checked parsing must
+        // fail explicitly rather than returning a partial map that omits the
+        // tail entry and triggers orphan retirement.
+        let mut listing = String::from("REF TYPE DIGEST SIZE PLATFORMS LABELS\n");
+        for i in 0..20 {
+            listing.push_str(&format!(
+                "docker.io/library/filler-{i:02}:latest application/vnd.oci.image.manifest.v1+json sha256:{:0>64} 4.0 MiB linux/arm64 -\n",
+                i
+            ));
+        }
+        let cutoff = listing.len() - 16;
+        listing.push_str(&format!(
+            "docker.io/library/app:dev application/vnd.oci.image.manifest.v1+json sha256:{} 4.0 MiB linux/arm64 -\n",
+            "f".repeat(64)
+        ));
+
+        let err = parse_checked_ctr_images(listing.as_bytes(), cutoff).unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
+
+        // Within the limit, the full listing (including the final native entry)
+        // parses cleanly so `app:dev` is NOT treated as an orphan.
+        let parsed = parse_checked_ctr_images(listing.as_bytes(), listing.len() + 64).unwrap();
+        assert!(parsed.contains_key("docker.io/library/app:dev"));
     }
 
     #[test]

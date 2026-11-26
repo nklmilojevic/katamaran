@@ -1,4 +1,4 @@
-//! Re-label an amd64-only OCI image archive as the guest's native platform so
+//! Re-label an amd64-only OCI image as the guest's native platform so
 //! Kubernetes can run it under the registered x86-64 emulator.
 //!
 //! containerd's CRI image service (through at least v2.4) resolves every
@@ -8,37 +8,44 @@
 //! the binfmt-registered emulator (Rosetta or qemu) runs its binaries fine, as
 //! `docker run` does.
 //!
-//! [`rewrite_platform_with_options`] spools the incoming `ctr images export`
-//! OCI tar archive to an unlinked temporary file on disk (keeping guest PID 1
-//! memory usage O(1) with respect to layer count and payload bytes), resolves
-//! the `linux/amd64` manifest purely from the OCI descriptor graph, rewrites
-//! only the config's `architecture` (dropping `variant` and any stale inline
-//! descriptor `data`), recomputes the config and manifest digests, and streams
-//! only the referenced layer blobs plus the rewritten metadata into a
-//! single-manifest archive for `ctr images import`. Layer blobs pass through
-//! unchanged, so they stay deduplicated in the shared content store and the
-//! binaries remain x86-64 (`uname -m` in the pod reports `x86_64`).
+//! Rewriting runs in two metadata-driven stages so neither guest PID 1 memory
+//! nor the shared guest data disk ever holds a second copy of image layers:
+//!
+//! 1. [`prepare_rewrite_from_store`] traverses the OCI descriptor graph in
+//!    `moby`'s content store within a strict aggregate metadata byte budget
+//!    (reading only JSON metadata blobs, never layer payloads, and dropping
+//!    parsed JSON trees before recursing), selects a locally complete
+//!    `linux/amd64` variant, records the root index's export platform selector,
+//!    and computes the rewritten `linux/<native_arch>` config and manifest.
+//! 2. [`stream_rewritten_archive`] streams `ctr images export`'s tar directly
+//!    into `ctr images import`: only layer blobs belonging to the planned
+//!    manifest pass straight through in O(1) memory and zero temporary disk
+//!    space (deduplicated in containerd's shared content store). Before
+//!    emitting the rewritten metadata and `index.json`, it verifies that the
+//!    exported `index.json` still targets the planned source digest, rejects
+//!    digest-qualified name annotations, and confirms all expected layers were
+//!    streamed.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{self, Read, Write};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-/// Maximum size of a single JSON metadata blob (`index.json`, OCI index,
-/// manifest, or image config) read into memory when traversing the descriptor
-/// graph. Generously above 4 MiB so large real-world configs/indexes succeed,
-/// while still bounding PID 1 heap against corrupt or hostile blobs.
-pub const MAX_JSON_BLOB: u64 = 64 << 20;
+/// Aggregate cap on raw JSON metadata bytes read across the entire descriptor
+/// graph walk and rewrite of one image. Generously above 4 MiB so large
+/// configs/indexes succeed, while strictly bounding guest PID 1 heap even
+/// across nested indexes.
+pub const MAX_TOTAL_METADATA_BYTES: usize = 16 << 20;
 
-/// Cap on the number of `blobs/sha256/*` tar entries indexed per archive so a
-/// pathologically fragmented tar cannot exhaust PID 1 memory.
-const MAX_ARCHIVE_BLOBS: usize = 65_536;
+/// Cap on the number of metadata blobs inspected during a single image walk so
+/// pathological indexes cannot spin or exhaust PID 1 memory.
+const MAX_METADATA_BLOBS: usize = 64;
+
+/// Maximum OCI index nesting depth traversed per branch. Hitting this cap fails
+/// only the overly deep branch so shallower sibling manifests remain usable.
+const MAX_INDEX_DEPTH: usize = 4;
 
 /// Maximum regular file size representable in a standard POSIX ustar header
 /// (8 GiB - 1); larger layers use a GNU tar header.
@@ -51,17 +58,14 @@ const MT_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const ANN_CONTAINERD_IMAGE_NAME: &str = "io.containerd.image.name";
 const ANN_OCI_REF_NAME: &str = "org.opencontainers.image.ref.name";
 
-static SPOOL_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Read-only content-addressed blob lookup used by the OCI descriptor-graph
-/// resolver, implemented both by the disk-backed archive spool and by
-/// containerd's `moby` content store.
+/// Read-only content-addressed blob lookup backed by containerd's `moby`
+/// content store (or an in-memory map in tests).
 pub trait BlobStore {
     /// True if `digest` (`sha256:<hex>`) exists locally.
     fn has_blob(&self, digest: &str) -> bool;
 
-    /// Read a JSON metadata blob (up to [`MAX_JSON_BLOB`] bytes).
-    fn read_json_blob(&mut self, digest: &str) -> Result<Vec<u8>, String>;
+    /// Read a JSON metadata blob, failing without allocating past `max_bytes`.
+    fn read_json_blob(&mut self, digest: &str, max_bytes: usize) -> Result<Vec<u8>, String>;
 }
 
 /// True when `name` is pinned to a content digest (e.g. `repo@sha256:...`,
@@ -148,14 +152,34 @@ fn amd64_platform_rank(platform: &str) -> (u8, &str) {
     }
 }
 
-/// Result of resolving a locally complete `linux/amd64` variant from a content
-/// store prior to exporting.
+/// Pre-resolved metadata plan built purely from the source content store before
+/// streaming layer blobs between `ctr export` and `ctr import`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalAmd64 {
-    /// A complete `linux/amd64` manifest is locally present; `platform` is the
-    /// normalized `--platform` value (e.g. `"linux/amd64"` or `"linux/amd64/v3"`)
-    /// matching containerd's `platforms.Ordered`.
-    Found { platform: String },
+pub struct RewritePlan {
+    /// Expected target digest of the top-level descriptor in `index.json`.
+    pub source_digest: String,
+    /// Platform selector to pass to `ctr images export --platform` so
+    /// containerd's root-index filter selects the winning branch (e.g.
+    /// `"linux/amd64"` or `"linux/amd64/v3"`).
+    pub export_platform: String,
+    /// Set of `sha256` hex layer digests belonging to the selected manifest.
+    pub layer_hexes: BTreeSet<String>,
+    /// Rewritten `linux/<native_arch>` config blob hex digest and bytes.
+    pub new_config_hex: String,
+    pub new_config_bytes: Vec<u8>,
+    /// Rewritten single-platform manifest blob hex digest, bytes, and media type.
+    pub new_manifest_hex: String,
+    pub new_manifest_bytes: Vec<u8>,
+    pub manifest_media_type: String,
+    /// Target native architecture (e.g. `"arm64"`).
+    pub native_arch: String,
+}
+
+/// Result of [`prepare_rewrite_from_store`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareRewrite {
+    /// A locally complete `linux/amd64` manifest was found and rewritten.
+    Ready(Box<RewritePlan>),
     /// The root blob exists, but no complete `linux/amd64` manifest is locally
     /// present in the content store.
     NotAvailable,
@@ -164,26 +188,7 @@ pub enum LocalAmd64 {
     RootMissing,
 }
 
-/// Inspect `root_digest` in `store` and return the normalized platform string
-/// of a locally complete `linux/amd64` manifest (including any non-baseline
-/// variant such as `v3`), so `ctr images export --platform` selects the exact
-/// variant that is present locally.
-pub fn resolve_local_amd64_platform(
-    root_digest: &str,
-    store: &mut impl BlobStore,
-) -> Result<LocalAmd64, String> {
-    if !store.has_blob(root_digest) {
-        return Ok(LocalAmd64::RootMissing);
-    }
-    match walk_amd64_manifest(root_digest, None, None, store, 0, false)? {
-        Some(found) => Ok(LocalAmd64::Found {
-            platform: found.platform,
-        }),
-        None => Ok(LocalAmd64::NotAvailable),
-    }
-}
-
-/// Outcome of a successful [`rewrite_platform_with_options`].
+/// Outcome of a successful [`stream_rewritten_archive`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewritten {
     /// Digest of the new single-platform manifest.
@@ -192,26 +197,12 @@ pub struct Rewritten {
     pub config: String,
 }
 
-/// Options controlling [`rewrite_platform_with_options`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RewriteOptions<'a> {
-    /// Expected target digest of the top-level descriptor in `index.json`. When
-    /// set, rewriting aborts with [`RewriteError::SourceChanged`] before
-    /// writing any bytes to `output` if the archive was exported from a
-    /// different target.
-    pub expected_source_digest: Option<&'a str>,
-    /// Directory for the unlinked disk-backed blob spool. Defaults to
-    /// `std::env::temp_dir()`. In the guest, callers should pass a directory on
-    /// the persistent data disk (not `/tmp`, which is `tmpfs`).
-    pub spool_dir: Option<&'a Path>,
-}
-
-/// Error returned by [`rewrite_platform_with_options`].
+/// Error returned by [`stream_rewritten_archive`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewriteError {
     /// The exported archive's top-level digest differed from
-    /// [`RewriteOptions::expected_source_digest`], indicating Docker retagged
-    /// the image concurrently. No output archive was written.
+    /// [`RewritePlan::source_digest`], indicating Docker retagged the image
+    /// concurrently. No `index.json` or rewritten metadata was written.
     SourceChanged { expected: String, actual: String },
     /// Any other archive, manifest, or I/O error.
     Other(String),
@@ -231,35 +222,164 @@ impl fmt::Display for RewriteError {
     }
 }
 
-/// Copy the OCI archive `input` to `output`, presenting its `linux/amd64`
-/// image as `linux/<native_arch>`, using default [`RewriteOptions`].
-#[cfg(test)]
-pub fn rewrite_platform(
-    input: impl Read,
-    output: impl Write,
+/// Resolve a locally complete `linux/amd64` manifest from `store` starting at
+/// `root_digest`, rewrite its config and manifest for `linux/<native_arch>`,
+/// and return a metadata-only [`RewritePlan`] without reading or copying any
+/// layer payloads.
+pub fn prepare_rewrite_from_store(
+    root_digest: &str,
     native_arch: &str,
-) -> Result<Rewritten, String> {
-    rewrite_platform_with_options(input, output, native_arch, RewriteOptions::default())
-        .map_err(|e| e.to_string())
+    store: &mut impl BlobStore,
+) -> Result<PrepareRewrite, String> {
+    if !store.has_blob(root_digest) {
+        return Ok(PrepareRewrite::RootMissing);
+    }
+    let mut budget = BudgetedStore::new(store, MAX_TOTAL_METADATA_BYTES, MAX_METADATA_BLOBS);
+    let mut depth_err: Option<String> = None;
+    let candidate = walk_amd64_manifest(root_digest, None, None, &mut budget, 0, &mut depth_err)?;
+    let Some(cand) = candidate else {
+        if let Some(err) = depth_err {
+            return Err(err);
+        }
+        return Ok(PrepareRewrite::NotAvailable);
+    };
+
+    let plan = build_rewrite_plan(root_digest, native_arch, cand)?;
+    Ok(PrepareRewrite::Ready(Box::new(plan)))
 }
 
-/// Copy the OCI archive `input` to `output`, presenting its `linux/amd64`
-/// image as `linux/<native_arch>`.
+fn build_rewrite_plan(
+    root_digest: &str,
+    native_arch: &str,
+    cand: Candidate,
+) -> Result<RewritePlan, String> {
+    // Parse and rewrite config first, then drop the Value immediately before
+    // parsing the manifest so peak parsed JSON stays at one document.
+    let (new_config_hex, new_config_bytes) = {
+        let mut config: Value = serde_json::from_slice(&cand.config_bytes)
+            .map_err(|e| format!("parse image config: {e}"))?;
+        let config_obj = config
+            .as_object_mut()
+            .ok_or("image config is not an object")?;
+        config_obj.insert("architecture".into(), json!(native_arch));
+        config_obj.remove("variant");
+        let bytes = serde_json::to_vec(&config).map_err(|e| e.to_string())?;
+        let hex = sha256(&bytes);
+        (hex, bytes)
+    };
+
+    let (new_manifest_hex, new_manifest_bytes, manifest_media_type, layer_hexes) = {
+        let mut manifest: Value = serde_json::from_slice(&cand.manifest_bytes)
+            .map_err(|e| format!("parse manifest: {e}"))?;
+        let config_desc = manifest
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+            .ok_or("manifest config is not an object")?;
+        config_desc.insert("digest".into(), json!(format!("sha256:{new_config_hex}")));
+        config_desc.insert("size".into(), json!(new_config_bytes.len()));
+        // Drop any OCI inline `data` bytes so the rewritten descriptor cannot
+        // carry the original amd64 config bytes alongside the new digest/size.
+        config_desc.remove("data");
+
+        let mut layer_hexes = BTreeSet::new();
+        if let Some(layers) = manifest.get("layers").and_then(Value::as_array) {
+            for layer in layers {
+                let digest = layer
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .ok_or("layer descriptor has no digest")?;
+                let hex = digest
+                    .strip_prefix("sha256:")
+                    .ok_or_else(|| format!("unsupported digest {digest}"))?;
+                layer_hexes.insert(hex.to_string());
+            }
+        }
+        let media_type = manifest
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(cand.desc_media_type)
+            .unwrap_or_else(|| MT_OCI_MANIFEST.to_string());
+        let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+        let hex = sha256(&bytes);
+        (hex, bytes, media_type, layer_hexes)
+    };
+
+    Ok(RewritePlan {
+        source_digest: root_digest.to_string(),
+        export_platform: cand.export_platform,
+        layer_hexes,
+        new_config_hex,
+        new_config_bytes,
+        new_manifest_hex,
+        new_manifest_bytes,
+        manifest_media_type,
+        native_arch: native_arch.to_string(),
+    })
+}
+
+/// Writer wrapper that suppresses `tar::Builder`'s automatic zero-block EOF
+/// trailer on drop when [`stream_rewritten_archive`] aborts with an error, so
+/// an aborted stream never finishes a tar archive.
+struct GuardedWriter<W: Write> {
+    inner: W,
+    suppress_writes: bool,
+}
+
+impl<W: Write> Write for GuardedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.suppress_writes {
+            return Err(io::Error::other("archive stream aborted"));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.suppress_writes {
+            return Ok(());
+        }
+        self.inner.flush()
+    }
+}
+
+/// Stream an OCI tar archive from `input` (`ctr images export`) to `output`
+/// (`ctr images import`) using a pre-resolved [`RewritePlan`].
 ///
-/// Incoming `blobs/sha256/*` entries are spooled straight to an unlinked
-/// temporary file on disk using a fixed-size copy buffer so PID 1 heap stays
-/// bounded regardless of layer count or content. `index.json`, the expected
-/// source digest, name annotations, and the descriptor graph are validated
-/// completely before any bytes are written to `output`.
-pub fn rewrite_platform_with_options(
+/// Only layer blobs in `plan.layer_hexes` are copied straight from `input` to
+/// `output` in O(1) memory and zero temporary disk space. Old metadata blobs
+/// and `manifest.json` are skipped. Before emitting the rewritten config,
+/// manifest, `oci-layout`, and `index.json`, the stream's `index.json` is
+/// verified against `plan.source_digest` and checked for digest-qualified
+/// image name annotations; on any mismatch or error, `index.json` and the tar
+/// EOF trailer are never written so `ctr images import` cannot publish a broken
+/// or mislabelled tag.
+pub fn stream_rewritten_archive(
     input: impl Read,
     output: impl Write,
-    native_arch: &str,
-    opts: RewriteOptions<'_>,
+    plan: &RewritePlan,
 ) -> Result<Rewritten, RewriteError> {
-    let mut spool = create_spool(opts.spool_dir).map_err(RewriteError::Other)?;
-    let mut spool_pos: u64 = 0;
-    let mut blob_locs: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut out = tar::Builder::new(GuardedWriter {
+        inner: output,
+        suppress_writes: false,
+    });
+    out.mode(tar::HeaderMode::Deterministic);
+    let res = stream_rewritten_archive_inner(input, &mut out, plan);
+    if res.is_err() {
+        out.get_mut().suppress_writes = true;
+        return res;
+    }
+    out.into_inner()
+        .and_then(|mut w| w.inner.flush())
+        .map_err(|e| RewriteError::Other(format!("finish archive: {e}")))?;
+    res
+}
+
+fn stream_rewritten_archive_inner<W: Write>(
+    input: impl Read,
+    out: &mut tar::Builder<W>,
+    plan: &RewritePlan,
+) -> Result<Rewritten, RewriteError> {
+    let mut seen_layers: BTreeSet<String> = BTreeSet::new();
     let mut index_bytes: Option<Vec<u8>> = None;
 
     let mut archive = tar::Archive::new(input);
@@ -280,27 +400,19 @@ pub fn rewrite_platform_with_options(
         let path = path.trim_start_matches("./");
         if path == "index.json" {
             index_bytes = Some(
-                read_bounded(&mut entry, MAX_JSON_BLOB, "index.json")
+                read_bounded(&mut entry, MAX_TOTAL_METADATA_BYTES as u64, "index.json")
                     .map_err(RewriteError::Other)?,
             );
-        } else if let Some(hex) = path.strip_prefix("blobs/sha256/") {
-            if hex.is_empty() || hex.contains('/') {
-                continue;
-            }
-            if !blob_locs.contains_key(hex) && blob_locs.len() >= MAX_ARCHIVE_BLOBS {
-                return Err(RewriteError::Other(format!(
-                    "export archive exceeds {MAX_ARCHIVE_BLOBS} blobs"
-                )));
-            }
-            let copied = io::copy(&mut entry, &mut spool)
-                .map_err(|e| RewriteError::Other(format!("spool {path}: {e}")))?;
-            blob_locs.insert(hex.to_string(), (spool_pos, copied));
-            spool_pos = spool_pos
-                .checked_add(copied)
-                .ok_or_else(|| RewriteError::Other("spool offset overflow".into()))?;
+        } else if let Some(hex) = path.strip_prefix("blobs/sha256/")
+            && plan.layer_hexes.contains(hex)
+            && seen_layers.insert(hex.to_string())
+        {
+            let size = entry.size();
+            append_stream(out, &format!("blobs/sha256/{hex}"), size, &mut entry)
+                .map_err(RewriteError::Other)?;
         }
-        // `oci-layout` is regenerated below; Docker's `manifest.json` would
-        // still name the old config, so it is dropped.
+        // Superseded amd64 index/manifest/config blobs and unreferenced
+        // entries are skipped directly without buffering or disk spooling.
     }
 
     let index_bytes = index_bytes
@@ -316,72 +428,26 @@ pub fn rewrite_platform_with_options(
         .get("digest")
         .and_then(Value::as_str)
         .ok_or_else(|| RewriteError::Other("descriptor has no digest".into()))?;
-    if let Some(expected) = opts.expected_source_digest
-        && top_digest != expected
-    {
+    if top_digest != plan.source_digest {
         return Err(RewriteError::SourceChanged {
-            expected: expected.to_string(),
+            expected: plan.source_digest.clone(),
             actual: top_digest.to_string(),
         });
     }
     let sanitized_annotations =
         validate_top_annotations(top.get("annotations")).map_err(RewriteError::Other)?;
 
-    let top_media_type = top.get("mediaType").and_then(Value::as_str);
-    let mut store = SpoolStore {
-        file: &mut spool,
-        locs: &blob_locs,
-    };
-    let resolved = walk_amd64_manifest(
-        top_digest,
-        top_media_type,
-        top.get("platform"),
-        &mut store,
-        0,
-        true,
-    )
-    .map_err(RewriteError::Other)?
-    .ok_or_else(|| {
-        RewriteError::Other(format!(
-            "{top_digest} has no linux/amd64 manifest in the archive"
-        ))
-    })?;
+    if let Some(missing) = plan.layer_hexes.difference(&seen_layers).next() {
+        return Err(RewriteError::Other(format!(
+            "layer blob sha256:{missing} missing from export archive"
+        )));
+    }
 
-    let mut config = resolved.config;
-    let config_obj = config
-        .as_object_mut()
-        .ok_or_else(|| RewriteError::Other("image config is not an object".into()))?;
-    config_obj.insert("architecture".into(), json!(native_arch));
-    config_obj.remove("variant");
-    let config_bytes =
-        serde_json::to_vec(&config).map_err(|e| RewriteError::Other(e.to_string()))?;
-    let new_config = sha256(&config_bytes);
-
-    let mut manifest = resolved.manifest;
-    let config_desc = manifest
-        .get_mut("config")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| RewriteError::Other("manifest config is not an object".into()))?;
-    config_desc.insert("digest".into(), json!(format!("sha256:{new_config}")));
-    config_desc.insert("size".into(), json!(config_bytes.len()));
-    // Drop any OCI inline `data` bytes so the rewritten descriptor cannot carry
-    // the original amd64 config bytes alongside the new digest and size.
-    config_desc.remove("data");
-    let manifest_bytes =
-        serde_json::to_vec(&manifest).map_err(|e| RewriteError::Other(e.to_string()))?;
-    let new_manifest = sha256(&manifest_bytes);
-
-    let media_type = manifest
-        .get("mediaType")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or(resolved.desc_media_type)
-        .unwrap_or_else(|| MT_OCI_MANIFEST.to_string());
     let mut desc = json!({
-        "mediaType": media_type,
-        "digest": format!("sha256:{new_manifest}"),
-        "size": manifest_bytes.len(),
-        "platform": {"architecture": native_arch, "os": "linux"},
+        "mediaType": plan.manifest_media_type,
+        "digest": format!("sha256:{}", plan.new_manifest_hex),
+        "size": plan.new_manifest_bytes.len(),
+        "platform": {"architecture": plan.native_arch, "os": "linux"},
     });
     if let Some(annotations) = sanitized_annotations {
         desc["annotations"] = annotations;
@@ -394,58 +460,24 @@ pub fn rewrite_platform_with_options(
     let new_index_bytes =
         serde_json::to_vec(&new_index).map_err(|e| RewriteError::Other(e.to_string()))?;
 
-    let mut layer_hexes: BTreeSet<&str> = BTreeSet::new();
-    if let Some(layers) = manifest.get("layers").and_then(Value::as_array) {
-        for layer in layers {
-            let digest = layer
-                .get("digest")
-                .and_then(Value::as_str)
-                .ok_or_else(|| RewriteError::Other("layer descriptor has no digest".into()))?;
-            let hex = digest
-                .strip_prefix("sha256:")
-                .ok_or_else(|| RewriteError::Other(format!("unsupported digest {digest}")))?;
-            if !blob_locs.contains_key(hex) {
-                return Err(RewriteError::Other(format!(
-                    "layer blob {digest} missing from export archive"
-                )));
-            }
-            layer_hexes.insert(hex);
-        }
-    }
-
-    let mut out = tar::Builder::new(output);
-    out.mode(tar::HeaderMode::Deterministic);
-    for hex in layer_hexes {
-        let (offset, size) = blob_locs[hex];
-        spool
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| RewriteError::Other(format!("seek layer sha256:{hex}: {e}")))?;
-        let mut slice = (&mut spool).take(size);
-        append_stream(&mut out, &format!("blobs/sha256/{hex}"), size, &mut slice)
-            .map_err(RewriteError::Other)?;
-    }
     append(
-        &mut out,
-        &format!("blobs/sha256/{new_config}"),
-        &config_bytes,
+        out,
+        &format!("blobs/sha256/{}", plan.new_config_hex),
+        &plan.new_config_bytes,
     )
     .map_err(RewriteError::Other)?;
     append(
-        &mut out,
-        &format!("blobs/sha256/{new_manifest}"),
-        &manifest_bytes,
+        out,
+        &format!("blobs/sha256/{}", plan.new_manifest_hex),
+        &plan.new_manifest_bytes,
     )
     .map_err(RewriteError::Other)?;
-    append(&mut out, "oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#)
-        .map_err(RewriteError::Other)?;
-    append(&mut out, "index.json", &new_index_bytes).map_err(RewriteError::Other)?;
-    out.into_inner()
-        .and_then(|mut w| w.flush())
-        .map_err(|e| RewriteError::Other(format!("finish archive: {e}")))?;
+    append(out, "oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#).map_err(RewriteError::Other)?;
+    append(out, "index.json", &new_index_bytes).map_err(RewriteError::Other)?;
 
     Ok(Rewritten {
-        manifest: format!("sha256:{new_manifest}"),
-        config: format!("sha256:{new_config}"),
+        manifest: format!("sha256:{}", plan.new_manifest_hex),
+        config: format!("sha256:{}", plan.new_config_hex),
     })
 }
 
@@ -470,83 +502,141 @@ fn validate_top_annotations(annotations: Option<&Value>) -> Result<Option<Value>
     Ok(Some(Value::Object(obj.clone())))
 }
 
-struct SpoolStore<'a> {
-    file: &'a mut File,
-    locs: &'a HashMap<String, (u64, u64)>,
+/// Wrapper enforcing an aggregate byte and blob-count cap across every metadata
+/// read performed while traversing an image's descriptor graph.
+struct BudgetedStore<'a, S: BlobStore> {
+    inner: &'a mut S,
+    remaining_bytes: usize,
+    remaining_blobs: usize,
+    total_limit: usize,
 }
 
-impl BlobStore for SpoolStore<'_> {
+impl<'a, S: BlobStore> BudgetedStore<'a, S> {
+    fn new(inner: &'a mut S, byte_limit: usize, blob_limit: usize) -> Self {
+        Self {
+            inner,
+            remaining_bytes: byte_limit,
+            remaining_blobs: blob_limit,
+            total_limit: byte_limit,
+        }
+    }
+
     fn has_blob(&self, digest: &str) -> bool {
-        digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| self.locs.contains_key(hex))
+        self.inner.has_blob(digest)
     }
 
     fn read_json_blob(&mut self, digest: &str) -> Result<Vec<u8>, String> {
-        let hex = digest
-            .strip_prefix("sha256:")
-            .ok_or_else(|| format!("unsupported digest {digest}"))?;
-        let &(offset, size) = self
-            .locs
-            .get(hex)
-            .ok_or_else(|| format!("blob {digest} missing from export archive"))?;
-        if size > MAX_JSON_BLOB {
+        if self.remaining_blobs == 0 {
             return Err(format!(
-                "metadata blob {digest} ({size} bytes) exceeds {MAX_JSON_BLOB}-byte limit"
+                "metadata walk exceeded {MAX_METADATA_BLOBS}-blob limit while reading {digest}"
             ));
         }
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("seek {digest}: {e}"))?;
-        let mut buf = vec![0u8; size as usize];
-        self.file
-            .read_exact(&mut buf)
-            .map_err(|e| format!("read {digest}: {e}"))?;
-        Ok(buf)
-    }
-}
-
-struct ResolvedAmd64 {
-    desc_media_type: Option<String>,
-    manifest: Value,
-    config: Value,
-    platform: String,
-}
-
-/// Walk `digest` (a manifest, or an OCI index / Docker manifest list, including
-/// nested and platform-less descriptors) to find a locally complete
-/// `linux/amd64` image manifest.
-///
-/// When `strict_root` is true (during archive rewrite), a non-amd64 single
-/// manifest or missing root blob returns a descriptive error; when false
-/// (during pre-export content-store probing), non-matching roots return
-/// `Ok(None)`.
-fn walk_amd64_manifest(
-    digest: &str,
-    desc_media_type: Option<&str>,
-    desc_platform: Option<&Value>,
-    store: &mut impl BlobStore,
-    depth: usize,
-    strict_root: bool,
-) -> Result<Option<ResolvedAmd64>, String> {
-    if !store.has_blob(digest) {
-        return if depth == 0 && strict_root {
-            Err(format!("blob {digest} missing from export archive"))
-        } else {
-            Ok(None)
-        };
-    }
-    let raw = store.read_json_blob(digest)?;
-    let parsed: Value = match serde_json::from_slice(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            return if depth == 0 && strict_root {
-                Err(format!("parse {digest}: {e}"))
-            } else {
-                Ok(None)
-            };
+        if self.remaining_bytes == 0 {
+            return Err(format!(
+                "metadata walk exceeded {}-byte aggregate limit while reading {digest}",
+                self.total_limit
+            ));
         }
-    };
+        self.remaining_blobs -= 1;
+        let data = self
+            .inner
+            .read_json_blob(digest, self.remaining_bytes)
+            .map_err(|e| {
+                if e.contains("exceeded") {
+                    format!(
+                        "metadata walk exceeded {}-byte aggregate limit while reading {digest}: {e}",
+                        self.total_limit
+                    )
+                } else {
+                    e
+                }
+            })?;
+        if data.len() > self.remaining_bytes {
+            return Err(format!(
+                "metadata walk exceeded {}-byte aggregate limit while reading {digest}",
+                self.total_limit
+            ));
+        }
+        self.remaining_bytes -= data.len();
+        Ok(data)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlatformDesc {
+    os: Option<String>,
+    architecture: Option<String>,
+    variant: Option<String>,
+}
+
+impl PlatformDesc {
+    fn from_value(v: &Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        Some(Self {
+            os: obj.get("os").and_then(Value::as_str).map(str::to_string),
+            architecture: obj
+                .get("architecture")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            variant: obj
+                .get("variant")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    fn allows_amd64(&self) -> bool {
+        if let Some(os) = &self.os
+            && !os.eq_ignore_ascii_case("linux")
+        {
+            return false;
+        }
+        if let Some(arch) = &self.architecture
+            && normalize_arch_variant(arch, None).0 != "amd64"
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Explicit normalized `linux/amd64[/variant]` selector when this
+    /// descriptor declares an architecture; `None` when omitted.
+    fn explicit_amd64_selector(&self) -> Option<String> {
+        self.architecture.as_ref()?;
+        Some(format_amd64_platform(self.variant.as_deref()))
+    }
+}
+
+struct ChildDescriptor {
+    digest: String,
+    media_type: Option<String>,
+    platform: Option<PlatformDesc>,
+}
+
+enum ParsedBlob {
+    Index(Vec<ChildDescriptor>),
+    Manifest {
+        config_digest: Option<String>,
+        layers: Vec<Option<String>>,
+    },
+}
+
+struct Candidate {
+    desc_media_type: Option<String>,
+    manifest_bytes: Vec<u8>,
+    config_bytes: Vec<u8>,
+    /// Leaf platform used to prefer baseline `linux/amd64` over microarch variants.
+    leaf_platform: String,
+    /// Platform selector passed to `ctr images export --platform`: preserves
+    /// the root index's immediate descriptor platform when explicit.
+    export_platform: String,
+}
+
+/// Parse a JSON blob into a compact [`ParsedBlob`] and immediately drop the
+/// intermediate `serde_json::Value` so parent JSON trees are never held across
+/// recursive calls.
+fn classify_blob(raw: &[u8], desc_media_type: Option<&str>) -> Option<ParsedBlob> {
+    let parsed: Value = serde_json::from_slice(raw).ok()?;
     let media_type = desc_media_type
         .or_else(|| parsed.get("mediaType").and_then(Value::as_str))
         .unwrap_or("");
@@ -554,211 +644,207 @@ fn walk_amd64_manifest(
         || media_type == MT_DOCKER_LIST
         || (media_type.is_empty() && parsed.get("manifests").is_some());
 
-    if !is_index {
-        return resolve_leaf_manifest(
-            parsed,
+    if is_index {
+        let children = parsed
+            .get("manifests")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|child| {
+                        let digest = child.get("digest")?.as_str()?.to_string();
+                        let media_type = child
+                            .get("mediaType")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let platform = child.get("platform").and_then(PlatformDesc::from_value);
+                        Some(ChildDescriptor {
+                            digest,
+                            media_type,
+                            platform,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Some(ParsedBlob::Index(children));
+    }
+
+    let config_digest = parsed
+        .pointer("/config/digest")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let layers = parsed
+        .get("layers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|l| l.get("digest").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ParsedBlob::Manifest {
+        config_digest,
+        layers,
+    })
+}
+
+/// Parse only `(os, architecture, variant)` from a config blob and immediately
+/// drop the `serde_json::Value`.
+fn inspect_config_platform(raw: &[u8]) -> Option<(String, String, Option<String>)> {
+    let parsed: Value = serde_json::from_slice(raw).ok()?;
+    let os = parsed.get("os")?.as_str()?.to_string();
+    let arch = parsed.get("architecture")?.as_str()?.to_string();
+    let variant = parsed
+        .get("variant")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((os, arch, variant))
+}
+
+/// Walk `digest` (a manifest, or an OCI index / Docker manifest list, including
+/// nested and platform-less descriptors) to find a locally complete
+/// `linux/amd64` image manifest.
+///
+/// Hitting [`MAX_INDEX_DEPTH`] fails only the current branch (recording the
+/// first depth error in `depth_err`) so shallower sibling manifests are still
+/// inspected. At `depth == 0`, the winning branch's `export_platform` preserves
+/// the root index's immediate child platform when declared so containerd's
+/// top-level `--platform` export filter matches it.
+fn walk_amd64_manifest<S: BlobStore>(
+    digest: &str,
+    desc_media_type: Option<&str>,
+    desc_platform: Option<&PlatformDesc>,
+    store: &mut BudgetedStore<'_, S>,
+    depth: usize,
+    depth_err: &mut Option<String>,
+) -> Result<Option<Candidate>, String> {
+    if !store.has_blob(digest) {
+        return Ok(None);
+    }
+    let raw = store.read_json_blob(digest)?;
+    let Some(parsed) = classify_blob(&raw, desc_media_type) else {
+        return Ok(None);
+    };
+
+    match parsed {
+        ParsedBlob::Manifest {
+            config_digest,
+            layers,
+        } => resolve_leaf_manifest(
+            raw,
+            config_digest,
+            layers,
             desc_media_type,
             desc_platform,
             store,
-            depth,
-            strict_root,
-        );
-    }
-
-    if depth >= 4 {
-        return Err(format!("{digest}: image indexes nested too deeply"));
-    }
-    let children = parsed
-        .get("manifests")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-
-    let mut best: Option<ResolvedAmd64> = None;
-    for child in children {
-        let Some(child_digest) = child.get("digest").and_then(Value::as_str) else {
-            continue;
-        };
-        if !store.has_blob(child_digest) {
-            continue;
-        }
-        // Skip children whose descriptor explicitly declares a non-linux or
-        // non-amd64 platform (including `unknown/unknown` attestations), while
-        // still traversing children that omit `platform` (such as nested
-        // indexes or platform-less leaf manifests).
-        let child_platform = child.get("platform");
-        if !descriptor_platform_allows_amd64(child_platform) {
-            continue;
-        }
-        let child_mt = child.get("mediaType").and_then(Value::as_str);
-        if let Some(found) = walk_amd64_manifest(
-            child_digest,
-            child_mt,
-            child_platform,
-            store,
-            depth + 1,
-            false,
-        )? {
-            let better = best.as_ref().is_none_or(|cur| {
-                amd64_platform_rank(&found.platform) < amd64_platform_rank(&cur.platform)
-            });
-            if better {
-                let is_baseline = found.platform == "linux/amd64";
-                best = Some(found);
-                if is_baseline {
-                    break;
+        ),
+        ParsedBlob::Index(children) => {
+            // Drop `raw` immediately before recursing so ancestor index bytes
+            // are never retained on the stack.
+            drop(raw);
+            if depth >= MAX_INDEX_DEPTH {
+                if depth_err.is_none() {
+                    *depth_err = Some(format!("{digest}: image indexes nested too deeply"));
+                }
+                return Ok(None);
+            }
+            let mut best: Option<Candidate> = None;
+            for child in children {
+                if !store.has_blob(&child.digest) {
+                    continue;
+                }
+                if child.platform.as_ref().is_some_and(|p| !p.allows_amd64()) {
+                    continue;
+                }
+                let outer_selector = if depth == 0 {
+                    child
+                        .platform
+                        .as_ref()
+                        .and_then(PlatformDesc::explicit_amd64_selector)
+                } else {
+                    None
+                };
+                let Some(mut found) = walk_amd64_manifest(
+                    &child.digest,
+                    child.media_type.as_deref(),
+                    child.platform.as_ref(),
+                    store,
+                    depth + 1,
+                    depth_err,
+                )?
+                else {
+                    continue;
+                };
+                if let Some(outer) = outer_selector {
+                    found.export_platform = outer;
+                }
+                let better = best.as_ref().is_none_or(|cur| {
+                    (
+                        amd64_platform_rank(&found.leaf_platform),
+                        amd64_platform_rank(&found.export_platform),
+                    ) < (
+                        amd64_platform_rank(&cur.leaf_platform),
+                        amd64_platform_rank(&cur.export_platform),
+                    )
+                });
+                if better {
+                    let is_ideal = found.leaf_platform == "linux/amd64"
+                        && found.export_platform == "linux/amd64";
+                    best = Some(found);
+                    if is_ideal {
+                        break;
+                    }
                 }
             }
+            Ok(best)
         }
     }
-    Ok(best)
 }
 
-fn descriptor_platform_allows_amd64(platform: Option<&Value>) -> bool {
-    let Some(p) = platform.and_then(Value::as_object) else {
-        return true;
-    };
-    if let Some(os) = p.get("os").and_then(Value::as_str)
-        && !os.eq_ignore_ascii_case("linux")
-    {
-        return false;
-    }
-    if let Some(arch) = p.get("architecture").and_then(Value::as_str)
-        && normalize_arch_variant(arch, None).0 != "amd64"
-    {
-        return false;
-    }
-    true
-}
-
-fn resolve_leaf_manifest(
-    manifest: Value,
+fn resolve_leaf_manifest<S: BlobStore>(
+    manifest_bytes: Vec<u8>,
+    config_digest: Option<String>,
+    layers: Vec<Option<String>>,
     desc_media_type: Option<&str>,
-    desc_platform: Option<&Value>,
-    store: &mut impl BlobStore,
-    depth: usize,
-    strict_root: bool,
-) -> Result<Option<ResolvedAmd64>, String> {
-    let strict = depth == 0 && strict_root;
-    let Some(config_digest) = manifest.pointer("/config/digest").and_then(Value::as_str) else {
-        return if strict {
-            Err("manifest has no config digest".into())
-        } else {
-            Ok(None)
-        };
+    desc_platform: Option<&PlatformDesc>,
+    store: &mut BudgetedStore<'_, S>,
+) -> Result<Option<Candidate>, String> {
+    let Some(config_digest) = config_digest else {
+        return Ok(None);
     };
-    if !store.has_blob(config_digest) {
-        return if strict {
-            Err(format!("blob {config_digest} missing from export archive"))
-        } else {
-            Ok(None)
-        };
+    if !store.has_blob(&config_digest) {
+        return Ok(None);
     }
-    let config_raw = store.read_json_blob(config_digest)?;
-    let config: Value = match serde_json::from_slice(&config_raw) {
-        Ok(v) => v,
-        Err(e) => {
-            return if strict {
-                Err(format!("parse image config: {e}"))
-            } else {
-                Ok(None)
-            };
-        }
-    };
-    let cfg_os = config.get("os").and_then(Value::as_str);
-    let cfg_arch = config.get("architecture").and_then(Value::as_str);
-    let cfg_variant = config.get("variant").and_then(Value::as_str);
-    let os_ok = cfg_os.is_some_and(|os| os.eq_ignore_ascii_case("linux"));
-    let arch_ok = cfg_arch.is_some_and(|a| normalize_arch_variant(a, None).0 == "amd64");
-    if !os_ok || !arch_ok {
-        return if strict {
-            Err(format!(
-                "expected linux/amd64 image config, got {}/{}",
-                cfg_os.unwrap_or("?"),
-                cfg_arch.unwrap_or("?"),
-            ))
-        } else {
-            Ok(None)
+    for layer in &layers {
+        let Some(layer_digest) = layer.as_deref() else {
+            return Ok(None);
         };
-    }
-
-    // Require every layer blob referenced by the manifest to be present locally
-    // so an index with a partial baseline amd64 manifest falls through to a
-    // complete variant (e.g. linux/amd64/v3).
-    if let Some(layers) = manifest.get("layers").and_then(Value::as_array) {
-        for layer in layers {
-            let Some(layer_digest) = layer.get("digest").and_then(Value::as_str) else {
-                return if strict {
-                    Err("layer descriptor has no digest".into())
-                } else {
-                    Ok(None)
-                };
-            };
-            if !store.has_blob(layer_digest) {
-                return if strict {
-                    Err(format!(
-                        "layer blob {layer_digest} missing from export archive"
-                    ))
-                } else {
-                    Ok(None)
-                };
-            }
+        if !layer_digest.starts_with("sha256:") || !store.has_blob(layer_digest) {
+            return Ok(None);
         }
     }
 
-    // `ctr images export --platform` filters index descriptors by the
-    // descriptor's own `platform` (not the config), so when the index
-    // descriptor specifies an architecture we use its variant; when the
-    // descriptor omits `platform` (or at the root single manifest) we fall back
-    // to the config's variant.
-    let desc_has_arch = desc_platform
-        .and_then(|p| p.get("architecture"))
-        .and_then(Value::as_str)
-        .is_some();
-    let variant = if desc_has_arch {
-        desc_platform
-            .and_then(|p| p.get("variant"))
-            .and_then(Value::as_str)
-    } else {
-        cfg_variant
+    let config_bytes = store.read_json_blob(&config_digest)?;
+    let Some((cfg_os, cfg_arch, cfg_variant)) = inspect_config_platform(&config_bytes) else {
+        return Ok(None);
     };
-    let platform = format_amd64_platform(variant);
+    if !cfg_os.eq_ignore_ascii_case("linux") || normalize_arch_variant(&cfg_arch, None).0 != "amd64"
+    {
+        return Ok(None);
+    }
 
-    Ok(Some(ResolvedAmd64 {
+    let leaf_platform = match desc_platform.and_then(PlatformDesc::explicit_amd64_selector) {
+        Some(sel) => sel,
+        None => format_amd64_platform(cfg_variant.as_deref()),
+    };
+
+    Ok(Some(Candidate {
         desc_media_type: desc_media_type.map(str::to_string),
-        manifest,
-        config,
-        platform,
+        manifest_bytes,
+        config_bytes,
+        export_platform: leaf_platform.clone(),
+        leaf_platform,
     }))
-}
-
-fn create_spool(dir: Option<&Path>) -> Result<File, String> {
-    let dir = dir.map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let pid = std::process::id();
-    for attempt in 0..64u32 {
-        let seq = SPOOL_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(".kat-oci-rewrite-{pid}-{seq}-{attempt}.tmp"));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => {
-                // Unlink immediately so disk space is reclaimed automatically
-                // when `file` drops (or if the process exits unexpectedly).
-                let _ = fs::remove_file(&path);
-                return Ok(file);
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("create rewrite spool in {}: {e}", dir.display())),
-        }
-    }
-    Err(format!(
-        "create rewrite spool in {}: too many temporary file collisions",
-        dir.display()
-    ))
 }
 
 fn read_bounded(r: &mut impl Read, limit: u64, what: &str) -> Result<Vec<u8>, String> {
@@ -805,6 +891,8 @@ fn sha256(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     const MT_DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
 
@@ -812,10 +900,12 @@ mod tests {
         append(b, path, data).unwrap();
     }
 
-    fn add_blob(b: &mut tar::Builder<Vec<u8>>, data: &[u8]) -> String {
+    fn add_blob(b: &mut tar::Builder<Vec<u8>>, store: &mut MemStore, data: &[u8]) -> String {
         let hex = sha256(data);
         add(b, &format!("blobs/sha256/{hex}"), data);
-        format!("sha256:{hex}")
+        let digest = format!("sha256:{hex}");
+        store.0.insert(digest.clone(), data.to_vec());
+        digest
     }
 
     struct MemStore(HashMap<String, Vec<u8>>);
@@ -837,25 +927,32 @@ mod tests {
             self.0.contains_key(digest)
         }
 
-        fn read_json_blob(&mut self, digest: &str) -> Result<Vec<u8>, String> {
-            self.0
+        fn read_json_blob(&mut self, digest: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+            let data = self
+                .0
                 .get(digest)
-                .cloned()
-                .ok_or_else(|| format!("missing {digest}"))
+                .ok_or_else(|| format!("missing {digest}"))?;
+            if data.len() > max_bytes {
+                return Err(format!(
+                    "blob {digest} ({} bytes) exceeded {max_bytes}-byte limit",
+                    data.len()
+                ));
+            }
+            Ok(data.clone())
         }
     }
 
-    /// An archive shaped like `ctr images export --local --platform linux/amd64`
-    /// of an amd64 image: index.json -> (optional index ->) manifest -> config,
-    /// with a small non-JSON layer, a `{`-prefixed layer, and a >4 MiB layer.
-    fn amd64_archive(with_index: bool) -> (Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>) {
+    /// Build both the `moby` content store and the corresponding `ctr export`
+    /// archive for an amd64 image (with or without an outer OCI index).
+    fn amd64_fixture(with_index: bool) -> (MemStore, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut store = MemStore::new();
         let mut b = tar::Builder::new(Vec::new());
         let small = b"\x1f\x8bsmall gzip layer".to_vec();
         let json_like = b"{json-looking small layer}".to_vec();
         let large = vec![7u8; (4 << 20) + 1];
-        let small_d = add_blob(&mut b, &small);
-        let json_like_d = add_blob(&mut b, &json_like);
-        let large_d = add_blob(&mut b, &large);
+        let small_d = add_blob(&mut b, &mut store, &small);
+        let json_like_d = add_blob(&mut b, &mut store, &json_like);
+        let large_d = add_blob(&mut b, &mut store, &large);
         let config = serde_json::to_vec(&json!({
             "architecture": "amd64",
             "variant": "v3",
@@ -864,7 +961,7 @@ mod tests {
             "rootfs": {"type": "layers", "diff_ids": ["sha256:00"]},
         }))
         .unwrap();
-        let config_d = add_blob(&mut b, &config);
+        let config_d = add_blob(&mut b, &mut store, &config);
         let manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": MT_DOCKER_MANIFEST,
@@ -880,17 +977,15 @@ mod tests {
             ],
         }))
         .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
+        let manifest_d = add_blob(&mut b, &mut store, &manifest);
         let annotations = json!({"io.containerd.image.name": "docker.io/library/app:dev"});
         let (top, top_digest) = if with_index {
             let idx = serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "mediaType": MT_OCI_INDEX,
                 "manifests": [
-                    // Listed but not exported: must be skipped.
                     {"mediaType": MT_DOCKER_MANIFEST, "digest": format!("sha256:{}", "e".repeat(64)),
                      "size": 1, "platform": {"architecture": "amd64", "os": "linux"}},
-                    // Attestation descriptor: must be skipped.
                     {"mediaType": MT_OCI_MANIFEST, "digest": format!("sha256:{}", "d".repeat(64)),
                      "size": 1, "platform": {"architecture": "unknown", "os": "unknown"}},
                     {"mediaType": MT_DOCKER_MANIFEST, "digest": manifest_d, "size": manifest.len(),
@@ -898,7 +993,7 @@ mod tests {
                 ],
             }))
             .unwrap();
-            let idx_d = add_blob(&mut b, &idx);
+            let idx_d = add_blob(&mut b, &mut store, &idx);
             (
                 json!({"mediaType": MT_OCI_INDEX, "digest": idx_d, "size": idx.len(),
                        "annotations": annotations}),
@@ -915,7 +1010,14 @@ mod tests {
         add(&mut b, "oci-layout", br#"{"imageLayoutVersion":"1.0.0"}"#);
         let index = serde_json::to_vec(&json!({"schemaVersion": 2, "manifests": [top]})).unwrap();
         add(&mut b, "index.json", &index);
-        (b.into_inner().unwrap(), top_digest, small, json_like, large)
+        (
+            store,
+            b.into_inner().unwrap(),
+            top_digest,
+            small,
+            json_like,
+            large,
+        )
     }
 
     fn read_archive(data: &[u8]) -> HashMap<String, Vec<u8>> {
@@ -933,18 +1035,14 @@ mod tests {
     }
 
     fn check(with_index: bool) {
-        let (input, top_digest, small, json_like, large) = amd64_archive(with_index);
+        let (mut store, input, top_digest, small, json_like, large) = amd64_fixture(with_index);
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&top_digest, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected PrepareRewrite::Ready");
+        };
         let mut output = Vec::new();
-        let r = rewrite_platform_with_options(
-            input.as_slice(),
-            &mut output,
-            "arm64",
-            RewriteOptions {
-                expected_source_digest: Some(&top_digest),
-                spool_dir: None,
-            },
-        )
-        .unwrap();
+        let r = stream_rewritten_archive(input.as_slice(), &mut output, &plan).unwrap();
         let files = read_archive(&output);
 
         assert!(!files.contains_key("manifest.json"));
@@ -954,7 +1052,6 @@ mod tests {
                 assert_eq!(sha256(data), hex, "{path} content does not match its name");
             }
         }
-        // Only the 3 layers + new config + new manifest should be in blobs/ (no superseded metadata).
         let blob_count = files
             .keys()
             .filter(|k| k.starts_with("blobs/sha256/"))
@@ -989,11 +1086,6 @@ mod tests {
         assert!(config.get("variant").is_none());
         assert_eq!(config["config"]["Entrypoint"], json!(["/app"]));
 
-        // Layers are untouched and present, including json-like and large ones.
-        for layer in manifest["layers"].as_array().unwrap() {
-            let d = layer["digest"].as_str().unwrap();
-            assert_eq!(blob_of(d).len() as u64, layer["size"].as_u64().unwrap());
-        }
         assert_eq!(blob_of(&format!("sha256:{}", sha256(&small))), &small);
         assert_eq!(
             blob_of(&format!("sha256:{}", sha256(&json_like))),
@@ -1012,45 +1104,168 @@ mod tests {
         check(false);
     }
 
+    /// Regression test: layer payloads must stream straight to `output` with
+    /// zero temporary disk copy and without buffering until `index.json`
+    /// arrives (so an image larger than remaining disk headroom still mirrors).
     #[test]
-    fn rejects_stale_expected_source_digest_without_emitting_output() {
-        let (input, top_digest, _, _, _) = amd64_archive(true);
-        let mut output = Vec::new();
-        let err = rewrite_platform_with_options(
-            input.as_slice(),
-            &mut output,
-            "arm64",
-            RewriteOptions {
-                expected_source_digest: Some(
-                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                ),
-                spool_dir: None,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            RewriteError::SourceChanged {
-                expected: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .into(),
-                actual: top_digest,
+    fn streams_large_layers_without_disk_copy_or_buffering() {
+        let mut store = MemStore::new();
+        let mut b = tar::Builder::new(Vec::new());
+        // A 12 MiB `{`-prefixed layer (representing an image whose layers exceed
+        // temporary disk headroom, while metadata is only a few hundred bytes).
+        let mut huge_layer = vec![b'{'; 12 << 20];
+        huge_layer[1] = b'z';
+        let layer_d = add_blob(&mut b, &mut store, &huge_layer);
+        let cfg = serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap();
+        let cfg_d = add_blob(&mut b, &mut store, &cfg);
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": cfg_d, "size": cfg.len()},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": layer_d, "size": huge_layer.len()}],
+        }))
+        .unwrap();
+        let manifest_d = add_blob(&mut b, &mut store, &manifest);
+        let index = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": MT_OCI_MANIFEST,
+                "digest": manifest_d,
+                "size": manifest.len(),
+                "annotations": {"io.containerd.image.name": "docker.io/library/huge:dev"},
+            }]
+        }))
+        .unwrap();
+        // Record the byte offset in the tar stream right before `index.json`.
+        let before_index_pos = b.get_ref().len();
+        add(&mut b, "index.json", &index);
+        let input = b.into_inner().unwrap();
+
+        // Store that panics if `prepare_rewrite_from_store` ever tries to read
+        // layer bytes (metadata-only lookup must only inspect `has_blob`).
+        struct MetadataOnlyStore {
+            inner: MemStore,
+            layer_digest: String,
+        }
+        impl BlobStore for MetadataOnlyStore {
+            fn has_blob(&self, digest: &str) -> bool {
+                self.inner.has_blob(digest)
             }
-        );
+            fn read_json_blob(
+                &mut self,
+                digest: &str,
+                max_bytes: usize,
+            ) -> Result<Vec<u8>, String> {
+                assert_ne!(digest, self.layer_digest, "must never read layer payload");
+                self.inner.read_json_blob(digest, max_bytes)
+            }
+        }
+        let mut meta_store = MetadataOnlyStore {
+            inner: store,
+            layer_digest: layer_d.clone(),
+        };
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&manifest_d, "arm64", &mut meta_store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+
+        // Observe written bytes at the moment `input` crosses `before_index_pos`:
+        // the full 12 MiB layer must ALREADY have been streamed to `output`
+        // (proving neither RAM buffering nor disk spooling held the layer).
+        let bytes_written = Arc::new(Mutex::new(0usize));
+        let observed_before_index = Arc::new(Mutex::new(None::<usize>));
+
+        struct CountingWriter {
+            written: Arc<Mutex<usize>>,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                *self.written.lock().unwrap() += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct ObservingReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            mark: usize,
+            written: Arc<Mutex<usize>>,
+            observed: Arc<Mutex<Option<usize>>>,
+        }
+        impl Read for ObservingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.mark && self.observed.lock().unwrap().is_none() {
+                    *self.observed.lock().unwrap() = Some(*self.written.lock().unwrap());
+                }
+                let avail = &self.data[self.pos..];
+                let n = avail.len().min(buf.len());
+                buf[..n].copy_from_slice(&avail[..n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let reader = ObservingReader {
+            data: &input,
+            pos: 0,
+            mark: before_index_pos,
+            written: Arc::clone(&bytes_written),
+            observed: Arc::clone(&observed_before_index),
+        };
+        let writer = CountingWriter {
+            written: Arc::clone(&bytes_written),
+        };
+
+        let r = stream_rewritten_archive(reader, writer, &plan).unwrap();
+        assert!(r.manifest.starts_with("sha256:"));
+        let streamed_before_index = observed_before_index.lock().unwrap().unwrap();
         assert!(
-            output.is_empty(),
-            "stale digest must not emit any output bytes"
+            streamed_before_index >= huge_layer.len(),
+            "layer ({} bytes) must stream straight through before index.json (only {streamed_before_index} bytes written)",
+            huge_layer.len()
         );
     }
 
     #[test]
+    fn rejects_stale_expected_source_digest_without_emitting_valid_index() {
+        let (mut store, input, top_digest, _, _, _) = amd64_fixture(true);
+        let PrepareRewrite::Ready(mut plan) =
+            prepare_rewrite_from_store(&top_digest, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        plan.source_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".into();
+
+        let mut output = Vec::new();
+        let err = stream_rewritten_archive(input.as_slice(), &mut output, &plan).unwrap_err();
+        assert_eq!(
+            err,
+            RewriteError::SourceChanged {
+                expected: plan.source_digest.clone(),
+                actual: top_digest,
+            }
+        );
+        // Output must NOT contain index.json or rewritten metadata.
+        let mut a = tar::Archive::new(output.as_slice());
+        for entry in a.entries().unwrap().flatten() {
+            let p = entry.path().unwrap().to_string_lossy().into_owned();
+            assert_ne!(p, "index.json", "stale digest must never emit index.json");
+            assert_ne!(p, format!("blobs/sha256/{}", plan.new_manifest_hex));
+        }
+    }
+
+    #[test]
     fn strips_stale_inline_config_data_from_rewritten_manifest() {
-        let mut b = tar::Builder::new(Vec::new());
-        let config = serde_json::to_vec(&json!({
-            "architecture": "amd64",
-            "os": "linux",
-        }))
-        .unwrap();
-        let config_d = add_blob(&mut b, &config);
+        let mut store = MemStore::new();
+        let config = serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap();
+        let config_d = store.insert(config.clone());
         let manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": MT_OCI_MANIFEST,
@@ -1063,25 +1278,18 @@ mod tests {
             "layers": [],
         }))
         .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
-        let index = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "manifests": [{
-                "mediaType": MT_OCI_MANIFEST,
-                "digest": manifest_d,
-                "size": manifest.len(),
-                "annotations": {"io.containerd.image.name": "docker.io/library/inline:dev"},
-            }]
-        }))
-        .unwrap();
-        add(&mut b, "index.json", &index);
+        let manifest_d = store.insert(manifest);
 
-        let mut output = Vec::new();
-        let r = rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64").unwrap();
-        let files = read_archive(&output);
-        let new_manifest: Value =
-            serde_json::from_slice(&files[&format!("blobs/sha256/{}", &r.manifest[7..])]).unwrap();
-        assert_eq!(new_manifest["config"]["digest"], r.config);
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&manifest_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        let new_manifest: Value = serde_json::from_slice(&plan.new_manifest_bytes).unwrap();
+        assert_eq!(
+            new_manifest["config"]["digest"],
+            format!("sha256:{}", plan.new_config_hex)
+        );
         assert!(
             new_manifest["config"].get("data").is_none(),
             "rewritten config descriptor must omit stale inline data: {new_manifest}"
@@ -1089,51 +1297,19 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_config_with_long_leading_whitespace() {
-        let mut b = tar::Builder::new(Vec::new());
-        // Over 64 leading JSON whitespace bytes before `{`.
+    fn rewrites_config_with_long_leading_whitespace_and_over_4_mib() {
+        let mut store = MemStore::new();
         let mut config = vec![b' '; 256];
-        config.extend_from_slice(br#"{"architecture":"amd64","os":"linux"}"#);
-        let config_d = add_blob(&mut b, &config);
-        let manifest = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_MANIFEST,
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": config_d,
-                "size": config.len(),
-            },
-            "layers": [],
-        }))
-        .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
-        let index = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "manifests": [{"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": manifest.len()}]
-        }))
-        .unwrap();
-        add(&mut b, "index.json", &index);
-
-        let mut output = Vec::new();
-        let r = rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64").unwrap();
-        let files = read_archive(&output);
-        let new_cfg: Value =
-            serde_json::from_slice(&files[&format!("blobs/sha256/{}", &r.config[7..])]).unwrap();
-        assert_eq!(new_cfg["architecture"], "arm64");
-    }
-
-    #[test]
-    fn rewrites_config_larger_than_4_mib() {
-        let mut b = tar::Builder::new(Vec::new());
         let big_label = "x".repeat((4 << 20) + 16_384);
-        let config = serde_json::to_vec(&json!({
+        let body = serde_json::to_vec(&json!({
             "architecture": "amd64",
             "os": "linux",
             "config": {"Labels": {"big": big_label}},
         }))
         .unwrap();
+        config.extend_from_slice(&body);
         assert!(config.len() > (4 << 20));
-        let config_d = add_blob(&mut b, &config);
+        let config_d = store.insert(config.clone());
         let manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": MT_OCI_MANIFEST,
@@ -1145,20 +1321,15 @@ mod tests {
             "layers": [],
         }))
         .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
-        let index = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "manifests": [{"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": manifest.len()}]
-        }))
-        .unwrap();
-        add(&mut b, "index.json", &index);
+        let manifest_d = store.insert(manifest);
 
-        let mut output = Vec::new();
-        let r = rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64").unwrap();
-        let files = read_archive(&output);
-        let new_cfg_bytes = &files[&format!("blobs/sha256/{}", &r.config[7..])];
-        assert_eq!(sha256(new_cfg_bytes), &r.config[7..]);
-        let new_cfg: Value = serde_json::from_slice(new_cfg_bytes).unwrap();
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&manifest_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(sha256(&plan.new_config_bytes), plan.new_config_hex);
+        let new_cfg: Value = serde_json::from_slice(&plan.new_config_bytes).unwrap();
         assert_eq!(new_cfg["architecture"], "arm64");
         assert_eq!(
             new_cfg["config"]["Labels"]["big"].as_str().unwrap().len(),
@@ -1167,57 +1338,34 @@ mod tests {
     }
 
     #[test]
-    fn spools_many_json_looking_layers_without_in_memory_blob_map() {
-        // 16 distinct 512 KiB `{`-prefixed layers (8 MiB aggregate, well above
-        // the old 4 MiB threshold): all spool to disk and stream back intact.
-        let mut b = tar::Builder::new(Vec::new());
-        let mut layer_descs = Vec::new();
-        let mut expected = Vec::new();
-        for i in 0..16u8 {
-            let mut layer = vec![b'{'; 512 << 10];
-            layer[1] = b'0' + (i % 10);
-            layer[2] = i;
-            let d = add_blob(&mut b, &layer);
-            layer_descs.push(json!({
-                "mediaType": "application/vnd.oci.image.layer.v1.tar",
-                "digest": d,
-                "size": layer.len(),
-            }));
-            expected.push((d, layer));
+    fn enforces_aggregate_metadata_byte_budget_across_recursive_walk() {
+        // Five 4 MiB JSON blobs (20 MiB total) exceed MAX_TOTAL_METADATA_BYTES (16 MiB)
+        // even though each individual blob is well below the limit.
+        let mut store = MemStore::new();
+        let pad = "a".repeat(4 << 20);
+        let mut children = Vec::new();
+        for i in 0..5u8 {
+            let child = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [],
+                "annotations": {"pad": format!("{i}{pad}")},
+            }))
+            .unwrap();
+            let d = store.insert(child);
+            children.push(json!({"mediaType": MT_OCI_INDEX, "digest": d, "size": 1}));
         }
-        // Plus an unreferenced `{`-prefixed blob that must NOT appear in output.
-        let _orphan = add_blob(&mut b, &vec![b'{'; 256 << 10]);
+        let root_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": children,
+            }))
+            .unwrap(),
+        );
 
-        let config = serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap();
-        let config_d = add_blob(&mut b, &config);
-        let manifest = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_MANIFEST,
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": config_d, "size": config.len()},
-            "layers": layer_descs,
-        }))
-        .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
-        let index = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "manifests": [{"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": manifest.len()}]
-        }))
-        .unwrap();
-        add(&mut b, "index.json", &index);
-
-        let mut output = Vec::new();
-        let _r =
-            rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64").unwrap();
-        let files = read_archive(&output);
-        let blob_count = files
-            .keys()
-            .filter(|k| k.starts_with("blobs/sha256/"))
-            .count();
-        assert_eq!(blob_count, 16 + 2);
-        for (d, bytes) in expected {
-            assert_eq!(files[&format!("blobs/sha256/{}", &d[7..])], bytes);
-        }
+        let err = prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap_err();
+        assert!(err.contains("aggregate limit"), "{err}");
     }
 
     #[test]
@@ -1236,10 +1384,11 @@ mod tests {
                 "docker.io/library/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
         ] {
+            let mut store = MemStore::new();
             let mut b = tar::Builder::new(Vec::new());
             let config =
                 serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap();
-            let config_d = add_blob(&mut b, &config);
+            let config_d = add_blob(&mut b, &mut store, &config);
             let manifest = serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "mediaType": MT_OCI_MANIFEST,
@@ -1248,7 +1397,7 @@ mod tests {
                 "layers": [],
             }))
             .unwrap();
-            let manifest_d = add_blob(&mut b, &manifest);
+            let manifest_d = add_blob(&mut b, &mut store, &manifest);
             let index = serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "manifests": [{
@@ -1261,10 +1410,16 @@ mod tests {
             .unwrap();
             add(&mut b, "index.json", &index);
 
+            let PrepareRewrite::Ready(plan) =
+                prepare_rewrite_from_store(&manifest_d, "arm64", &mut store).unwrap()
+            else {
+                panic!("expected Ready");
+            };
             let mut output = Vec::new();
-            let err = rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64")
-                .unwrap_err();
-            assert!(err.contains("digest-qualified"), "{err}");
+            let err =
+                stream_rewritten_archive(b.into_inner().unwrap().as_slice(), &mut output, &plan)
+                    .unwrap_err();
+            assert!(err.to_string().contains("digest-qualified"), "{err}");
             assert!(
                 output.is_empty(),
                 "digest-qualified reference must not emit output"
@@ -1274,79 +1429,181 @@ mod tests {
 
     #[test]
     fn resolves_nested_platformless_index_and_platformless_leaf() {
-        let mut b = tar::Builder::new(Vec::new());
-        let layer = b"amd64-layer-bytes".to_vec();
-        let layer_d = add_blob(&mut b, &layer);
+        let mut store = MemStore::new();
+        let layer_d = store.insert(b"amd64-layer-bytes".to_vec());
 
-        // An earlier platform-less leaf for s390x must be skipped rather than aborting.
-        let s390x_cfg =
-            serde_json::to_vec(&json!({"architecture": "s390x", "os": "linux"})).unwrap();
-        let s390x_cfg_d = add_blob(&mut b, &s390x_cfg);
-        let s390x_manifest = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_MANIFEST,
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": s390x_cfg_d, "size": s390x_cfg.len()},
-            "layers": [],
-        }))
-        .unwrap();
-        let s390x_m_d = add_blob(&mut b, &s390x_manifest);
+        let s390x_cfg_d = store
+            .insert(serde_json::to_vec(&json!({"architecture": "s390x", "os": "linux"})).unwrap());
+        let s390x_m_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": s390x_cfg_d, "size": 1},
+                "layers": [],
+            }))
+            .unwrap(),
+        );
 
-        let amd64_cfg =
-            serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap();
-        let amd64_cfg_d = add_blob(&mut b, &amd64_cfg);
-        let amd64_manifest = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_MANIFEST,
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": amd64_cfg_d, "size": amd64_cfg.len()},
-            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
-                        "digest": layer_d, "size": layer.len()}],
-        }))
-        .unwrap();
-        let amd64_m_d = add_blob(&mut b, &amd64_manifest);
+        let amd64_cfg_d = store
+            .insert(serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap());
+        let amd64_m_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": amd64_cfg_d, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": layer_d, "size": 17}],
+            }))
+            .unwrap(),
+        );
 
-        // Inner index has no `platform` on either leaf descriptor.
-        let inner_idx = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_INDEX,
-            "manifests": [
-                {"mediaType": MT_OCI_MANIFEST, "digest": s390x_m_d, "size": s390x_manifest.len()},
-                {"mediaType": MT_OCI_MANIFEST, "digest": amd64_m_d, "size": amd64_manifest.len()},
-            ],
-        }))
-        .unwrap();
-        let inner_idx_d = add_blob(&mut b, &inner_idx);
+        let inner_idx_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": s390x_m_d, "size": 1},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": amd64_m_d, "size": 1},
+                ],
+            }))
+            .unwrap(),
+        );
+        let outer_idx_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_INDEX, "digest": inner_idx_d, "size": 1},
+                ],
+            }))
+            .unwrap(),
+        );
 
-        // Outer index has no `platform` on the nested index descriptor.
-        let outer_idx = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_INDEX,
-            "manifests": [
-                {"mediaType": MT_OCI_INDEX, "digest": inner_idx_d, "size": inner_idx.len()},
-            ],
-        }))
-        .unwrap();
-        let outer_idx_d = add_blob(&mut b, &outer_idx);
-
-        let index = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "manifests": [{"mediaType": MT_OCI_INDEX, "digest": outer_idx_d, "size": outer_idx.len()}]
-        }))
-        .unwrap();
-        add(&mut b, "index.json", &index);
-
-        let mut output = Vec::new();
-        let r = rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64").unwrap();
-        let files = read_archive(&output);
-        let new_cfg: Value =
-            serde_json::from_slice(&files[&format!("blobs/sha256/{}", &r.config[7..])]).unwrap();
-        assert_eq!(new_cfg["architecture"], "arm64");
-        assert_eq!(files[&format!("blobs/sha256/{}", &layer_d[7..])], layer);
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&outer_idx_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(plan.export_platform, "linux/amd64");
+        assert!(plan.layer_hexes.contains(&layer_d[7..]));
     }
 
     #[test]
-    fn resolves_local_amd64_variant_from_index() {
+    fn deep_platformless_sibling_does_not_block_usable_amd64_sibling() {
+        let mut store = MemStore::new();
+        // Build an over-limit platformless chain (depth > MAX_INDEX_DEPTH).
+        let mut deep_d = store.insert(
+            serde_json::to_vec(
+                &json!({"schemaVersion": 2, "mediaType": MT_OCI_INDEX, "manifests": []}),
+            )
+            .unwrap(),
+        );
+        for _ in 0..=MAX_INDEX_DEPTH {
+            deep_d = store.insert(
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 2,
+                    "mediaType": MT_OCI_INDEX,
+                    "manifests": [{"mediaType": MT_OCI_INDEX, "digest": deep_d, "size": 1}],
+                }))
+                .unwrap(),
+            );
+        }
+
+        // Shallow, complete explicit amd64 sibling listed AFTER the deep branch.
+        let layer_d = store.insert(b"good-amd64".to_vec());
+        let cfg_d = store
+            .insert(serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap());
+        let manifest_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": cfg_d, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": layer_d, "size": 10}],
+            }))
+            .unwrap(),
+        );
+
+        let root_with_good_sibling = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_INDEX, "digest": deep_d, "size": 1},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": 1,
+                     "platform": {"os": "linux", "architecture": "amd64"}},
+                ],
+            }))
+            .unwrap(),
+        );
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&root_with_good_sibling, "arm64", &mut store).unwrap()
+        else {
+            panic!("usable sibling after over-limit branch must still be selected");
+        };
+        assert_eq!(plan.export_platform, "linux/amd64");
+        assert!(plan.layer_hexes.contains(&layer_d[7..]));
+
+        // When ONLY the over-limit branch exists, preserve the descriptive depth error.
+        let err = prepare_rewrite_from_store(&deep_d, "arm64", &mut store).unwrap_err();
+        assert!(err.contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn preserves_outer_index_platform_for_nested_platformless_leaf() {
+        let mut store = MemStore::new();
+        let layer_d = store.insert(b"v3-payload".to_vec());
+        // Leaf config omits optional `variant`, and nested descriptor omits `platform`.
+        let cfg_d = store
+            .insert(serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap());
+        let leaf_m_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": cfg_d, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": layer_d, "size": 10}],
+            }))
+            .unwrap(),
+        );
+        let inner_idx_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [{"mediaType": MT_OCI_MANIFEST, "digest": leaf_m_d, "size": 1}],
+            }))
+            .unwrap(),
+        );
+        // Root index advertises the nested index as `linux/amd64/v3`; containerd's
+        // exporter filters immediate children, so export must use `linux/amd64/v3`.
+        let root_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [{
+                    "mediaType": MT_OCI_INDEX,
+                    "digest": inner_idx_d,
+                    "size": 1,
+                    "platform": {"os": "linux", "architecture": "amd64", "variant": "v3"},
+                }],
+            }))
+            .unwrap(),
+        );
+
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(plan.export_platform, "linux/amd64/v3");
+    }
+
+    #[test]
+    fn resolves_indexed_amd64_v3_and_prefers_baseline_when_both_local() {
         let mut store = MemStore::new();
         let layer_d = store.insert(b"v3-layer".to_vec());
         let v3_cfg_d = store.insert(
@@ -1368,8 +1625,6 @@ mod tests {
             }))
             .unwrap(),
         );
-        // Index lists baseline amd64 (not present), arm64 (not present), and
-        // locally complete linux/amd64/v3.
         let idx_d = store.insert(
             serde_json::to_vec(&json!({
                 "schemaVersion": 2,
@@ -1386,21 +1641,20 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(
-            resolve_local_amd64_platform(&idx_d, &mut store).unwrap(),
-            LocalAmd64::Found {
-                platform: "linux/amd64/v3".into()
-            }
-        );
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&idx_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(plan.export_platform, "linux/amd64/v3");
 
-        // Missing root -> RootMissing.
         assert_eq!(
-            resolve_local_amd64_platform(&format!("sha256:{}", "c".repeat(64)), &mut store)
+            prepare_rewrite_from_store(&format!("sha256:{}", "c".repeat(64)), "arm64", &mut store)
                 .unwrap(),
-            LocalAmd64::RootMissing
+            PrepareRewrite::RootMissing
         );
 
-        // If baseline amd64 is ALSO complete locally, prefer baseline over v3.
+        // When baseline amd64 is ALSO complete locally, prefer baseline over v3.
         let base_cfg_d = store
             .insert(serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap());
         let base_m_d = store.insert(
@@ -1427,112 +1681,33 @@ mod tests {
             }))
             .unwrap(),
         );
-        assert_eq!(
-            resolve_local_amd64_platform(&idx_both_d, &mut store).unwrap(),
-            LocalAmd64::Found {
-                platform: "linux/amd64".into()
-            }
+        let PrepareRewrite::Ready(plan_both) =
+            prepare_rewrite_from_store(&idx_both_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(plan_both.export_platform, "linux/amd64");
+    }
+
+    #[test]
+    fn returns_not_available_for_non_amd64_images() {
+        let mut store = MemStore::new();
+        let cfg_d = store
+            .insert(serde_json::to_vec(&json!({"architecture": "s390x", "os": "linux"})).unwrap());
+        let m_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": cfg_d, "size": 1},
+                "layers": [],
+            }))
+            .unwrap(),
         );
-    }
-
-    #[test]
-    fn rewrites_indexed_amd64_v3_without_baseline_or_native_manifest() {
-        let mut b = tar::Builder::new(Vec::new());
-        let layer = b"v3-binary-layer".to_vec();
-        let layer_d = add_blob(&mut b, &layer);
-        let cfg = serde_json::to_vec(&json!({
-            "architecture": "amd64",
-            "variant": "v3",
-            "os": "linux",
-        }))
-        .unwrap();
-        let cfg_d = add_blob(&mut b, &cfg);
-        let manifest = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_MANIFEST,
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": cfg_d, "size": cfg.len()},
-            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
-                        "digest": layer_d, "size": layer.len()}],
-        }))
-        .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
-        let idx = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_INDEX,
-            "manifests": [
-                {"mediaType": MT_OCI_MANIFEST, "digest": format!("sha256:{}", "e".repeat(64)),
-                 "size": 1, "platform": {"architecture": "amd64", "os": "linux"}},
-                {"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": manifest.len(),
-                 "platform": {"architecture": "amd64", "variant": "v3", "os": "linux"}},
-            ],
-        }))
-        .unwrap();
-        let idx_d = add_blob(&mut b, &idx);
-        let index = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "manifests": [{
-                "mediaType": MT_OCI_INDEX,
-                "digest": idx_d,
-                "size": idx.len(),
-                "annotations": {"io.containerd.image.name": "docker.io/library/v3app:dev"},
-            }]
-        }))
-        .unwrap();
-        add(&mut b, "index.json", &index);
-
-        let mut output = Vec::new();
-        let r = rewrite_platform(b.into_inner().unwrap().as_slice(), &mut output, "arm64").unwrap();
-        let files = read_archive(&output);
-        let new_cfg: Value =
-            serde_json::from_slice(&files[&format!("blobs/sha256/{}", &r.config[7..])]).unwrap();
-        assert_eq!(new_cfg["architecture"], "arm64");
-        assert!(new_cfg.get("variant").is_none());
-        assert_eq!(files[&format!("blobs/sha256/{}", &layer_d[7..])], layer);
-    }
-
-    #[test]
-    fn rejects_archive_without_amd64_manifest() {
-        let mut b = tar::Builder::new(Vec::new());
-        let idx = serde_json::to_vec(&json!({"schemaVersion": 2, "mediaType": MT_OCI_INDEX,
-            "manifests": [{"digest": format!("sha256:{}", "f".repeat(64)), "size": 1,
-                           "platform": {"architecture": "s390x", "os": "linux"}}]}))
-        .unwrap();
-        let idx_d = add_blob(&mut b, &idx);
-        let index = serde_json::to_vec(&json!({"schemaVersion": 2, "manifests": [
-            {"mediaType": MT_OCI_INDEX, "digest": idx_d, "size": idx.len()}]}))
-        .unwrap();
-        add(&mut b, "index.json", &index);
-        let input = b.into_inner().unwrap();
-        let err = rewrite_platform(input.as_slice(), Vec::new(), "arm64").unwrap_err();
-        assert!(err.contains("no linux/amd64 manifest"), "{err}");
-    }
-
-    #[test]
-    fn rejects_non_amd64_single_manifest_config() {
-        let mut b = tar::Builder::new(Vec::new());
-        let config = serde_json::to_vec(&json!({
-            "architecture": "s390x",
-            "os": "linux",
-        }))
-        .unwrap();
-        let config_d = add_blob(&mut b, &config);
-        let manifest = serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": MT_OCI_MANIFEST,
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": config_d, "size": config.len()},
-            "layers": [],
-        }))
-        .unwrap();
-        let manifest_d = add_blob(&mut b, &manifest);
-        let index = serde_json::to_vec(&json!({"schemaVersion": 2, "manifests": [
-            {"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": manifest.len()}]}))
-        .unwrap();
-        add(&mut b, "index.json", &index);
-        let input = b.into_inner().unwrap();
-        let err = rewrite_platform(input.as_slice(), Vec::new(), "arm64").unwrap_err();
-        assert!(err.contains("expected linux/amd64 image config"), "{err}");
+        assert_eq!(
+            prepare_rewrite_from_store(&m_d, "arm64", &mut store).unwrap(),
+            PrepareRewrite::NotAvailable
+        );
     }
 
     #[test]
