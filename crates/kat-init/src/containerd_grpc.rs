@@ -1,18 +1,30 @@
-//! Minimal HTTP/2 (h2c) unary gRPC client over containerd's Unix domain
-//! socket for operations that `ctr` does not expose directly.
+//! Minimal HTTP/2 (h2c) gRPC client over containerd's Unix domain socket for
+//! operations that `ctr` either does not expose or cannot perform without
+//! duplicating layer payloads or losing structured metadata:
 //!
-//! Specifically, `ctr images rm` only deletes by image name, which can race
-//! with a concurrent kubelet registry pull that replaces a Katamaran-rewritten
-//! tag with a native image. Containerd v2.4.2's `Images.Delete` RPC accepts
-//! `DeleteImageRequest.target` and performs an atomic compare-and-delete inside
-//! its BoltDB write transaction, returning gRPC `NOT_FOUND` (code 5) without
-//! touching the image if its target digest has changed.
+//! - `Images.List`: returns structured `map<string, string>` labels and target
+//!   descriptors so label values containing commas can never spoof ownership
+//!   markers.
+//! - `Images.Delete` with `DeleteImageRequest.target`: performs an atomic
+//!   compare-and-delete inside containerd's BoltDB write transaction, leaving
+//!   any concurrent replacement image untouched.
+//! - Zero-copy rewritten image publication (`Leases.Create`/`Delete`,
+//!   `Content.Info`/`Write`/`Update`, `Images.Get`/`Create`/`Update`): links
+//!   existing `moby` layer blobs into `k8s.io` through containerd's shared
+//!   content commit path without reading, transmitting, or copying layer bytes
+//!   to disk, writes only the rewritten config and manifest blobs with GC child
+//!   labels, re-checks the `moby` source digest, and publishes the tag.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::oci_rewrite::{RewritePlan, Rewritten, is_digest_reference};
+use crate::unix_connect::connect_unix_until;
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -31,10 +43,53 @@ const FLAG_END_HEADERS: u8 = 0x04;
 const FLAG_PADDED: u8 = 0x08;
 const FLAG_PRIORITY: u8 = 0x20;
 
-const MAX_DATA_CHUNK: usize = 16_384;
+const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x01;
+const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x04;
+const SETTINGS_MAX_FRAME_SIZE: u16 = 0x05;
+
+const DEFAULT_H2_WINDOW: i64 = 65_535;
+const CLIENT_RECV_WINDOW: u32 = 1 << 20;
+const DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
 const MAX_SERVER_FRAME: usize = 1 << 20;
 const MAX_HEADER_BLOCK: usize = 256 << 10;
 const DEFAULT_DYNAMIC_TABLE_SIZE: usize = 4096;
+const DEFAULT_UNARY_RESPONSE_LIMIT: usize = 1 << 20;
+/// Chunk size for streaming metadata blobs over `Content.Write` (fits well
+/// inside HTTP/2's default 65,535-byte window so each chunk round-trips cleanly).
+const CONTENT_WRITE_CHUNK: usize = 32_768;
+
+const GRPC_OK: &str = "0";
+const GRPC_NOT_FOUND: &str = "5";
+const GRPC_ALREADY_EXISTS: &str = "6";
+
+const LEASE_HEADER: &str = "containerd-lease";
+const LEASE_EXPIRE_LABEL: &str = "containerd.io/gc.expire";
+const LEASE_TTL_SECS: u64 = 600;
+
+static LEASE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// OCI content descriptor (`containerd.types.Descriptor`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Descriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: i64,
+}
+
+/// Structured image record (`containerd.services.images.v1.Image`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerdImage {
+    pub name: String,
+    pub labels: HashMap<String, String>,
+    pub target: Descriptor,
+}
+
+/// Content blob metadata (`containerd.services.content.v1.Info`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentInfo {
+    pub digest: String,
+    pub size: i64,
+}
 
 /// Outcome of a conditional [`delete_image_if_target_matches`] RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +99,68 @@ pub enum DeleteOutcome {
     /// Image was already absent, or its target digest changed (for example,
     /// replaced by a concurrent native kubelet pull) and was left untouched.
     NotFoundOrChanged,
+}
+
+/// Error returned by [`publish_rewritten_image`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    /// The `moby` source image was deleted or retagged before publication
+    /// completed; no `k8s.io` image record was modified.
+    SourceChanged { expected: String, actual: String },
+    /// Any other containerd gRPC, content, or I/O error.
+    Failed(String),
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceChanged { expected, actual } => write!(
+                f,
+                "source image digest changed before publish (expected {expected}, got {actual})"
+            ),
+            Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    Committed,
+    AlreadyExists,
+}
+
+struct GrpcResponse {
+    grpc_status: String,
+    grpc_message: String,
+    messages: Vec<Vec<u8>>,
+}
+
+/// List all images in `namespace` via `/containerd.services.images.v1.Images/List`,
+/// returning authoritative target digests and structured label maps without
+/// text splitting. Fails explicitly if the response exceeds `max_response_bytes`.
+pub fn list_images(
+    socket_path: &Path,
+    namespace: &str,
+    max_response_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<ContainerdImage>, String> {
+    let deadline = Instant::now() + timeout;
+    let mut conn = GrpcConn::connect(socket_path, deadline)?;
+    let resp = conn.unary_rpc(
+        "/containerd.services.images.v1.Images/List",
+        namespace,
+        None,
+        &[],
+        max_response_bytes,
+    )?;
+    if resp.grpc_status != GRPC_OK {
+        return Err(format!(
+            "containerd Images.List ({namespace}) failed (grpc-status {}): {}",
+            resp.grpc_status, resp.grpc_message
+        ));
+    }
+    let body = resp.messages.first().map(Vec::as_slice).unwrap_or(&[]);
+    decode_list_images_response(body)
 }
 
 /// Call containerd's `/containerd.services.images.v1.Images/Delete` RPC in
@@ -68,95 +185,513 @@ pub fn delete_image_if_target_matches(
         ));
     }
 
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| format!("set read timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|e| format!("set write timeout: {e}"))?;
-
-    // 1. Client preface + initial SETTINGS (request header table size 0).
-    stream
-        .write_all(CLIENT_PREFACE)
-        .map_err(|e| format!("write h2 preface: {e}"))?;
-    let settings = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-    write_frame(&mut stream, FRAME_SETTINGS, 0, 0, &settings)
-        .map_err(|e| format!("write h2 settings: {e}"))?;
-
-    // 2. Request HEADERS on stream 1.
-    let timeout_hdr = format!("{}S", timeout.as_secs().max(1));
-    let req_headers = encode_request_headers(&[
-        (":method", "POST"),
-        (":scheme", "http"),
-        (":path", "/containerd.services.images.v1.Images/Delete"),
-        (":authority", "localhost"),
-        ("content-type", "application/grpc"),
-        ("te", "trailers"),
-        ("containerd-namespace", namespace),
-        ("grpc-timeout", &timeout_hdr),
-    ]);
-    write_frame(
-        &mut stream,
-        FRAME_HEADERS,
-        FLAG_END_HEADERS,
-        1,
-        &req_headers,
-    )
-    .map_err(|e| format!("write h2 headers: {e}"))?;
-
-    // 3. Request DATA on stream 1 with gRPC length-prefixed DeleteImageRequest.
-    let proto = encode_delete_image_request(name, target_digest);
-    let grpc_body = frame_grpc_message(&proto)?;
-    for (idx, chunk) in grpc_body.chunks(MAX_DATA_CHUNK).enumerate() {
-        let is_last = (idx + 1) * MAX_DATA_CHUNK >= grpc_body.len();
-        let flags = if is_last { FLAG_END_STREAM } else { 0 };
-        write_frame(&mut stream, FRAME_DATA, flags, 1, chunk)
-            .map_err(|e| format!("write h2 data: {e}"))?;
-    }
-    stream
-        .flush()
-        .map_err(|e| format!("flush h2 request: {e}"))?;
-
-    // 4. Read server frames until stream 1 terminates (bounded by overall deadline).
     let deadline = Instant::now() + timeout;
-    let mut decoder = HpackDecoder::new(DEFAULT_DYNAMIC_TABLE_SIZE);
-    let mut http_status: Option<String> = None;
-    let mut grpc_status: Option<String> = None;
-    let mut grpc_message = String::new();
+    let mut conn = GrpcConn::connect(socket_path, deadline)?;
+    let proto = encode_delete_image_request(name, target_digest);
+    let resp = conn.unary_rpc(
+        "/containerd.services.images.v1.Images/Delete",
+        namespace,
+        None,
+        &proto,
+        DEFAULT_UNARY_RESPONSE_LIMIT,
+    )?;
+    match resp.grpc_status.as_str() {
+        GRPC_OK => Ok(DeleteOutcome::Deleted),
+        // gRPC status 5 = NOT_FOUND: returned both when the image does not
+        // exist and when DeleteImageRequest.target.digest does not match.
+        GRPC_NOT_FOUND => Ok(DeleteOutcome::NotFoundOrChanged),
+        code => Err(format!(
+            "containerd Images.Delete failed (grpc-status {code}): {}",
+            resp.grpc_message
+        )),
+    }
+}
 
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err("containerd Images.Delete timed out".into());
+/// Publish a metadata-only [`RewritePlan`] into `k8s.io` without reading,
+/// transmitting, or writing a second copy of any layer blobs.
+///
+/// Existing layer blobs from `moby` are linked into `k8s.io` via containerd's
+/// shared-content `Content.Write` commit (`offset == size`, empty `data`), only
+/// the rewritten config and manifest blobs are written (with containerd GC
+/// child labels on the manifest), the `moby` source image digest is verified
+/// both before and immediately prior to image publication, and a temporary
+/// lease protects in-flight metadata from GC until `Images.Create`/`Update`
+/// completes.
+pub fn publish_rewritten_image(
+    socket_path: &Path,
+    name: &str,
+    source_digest_label: &str,
+    plan: &RewritePlan,
+    timeout: Duration,
+) -> Result<Rewritten, PublishError> {
+    if name.is_empty() {
+        return Err(PublishError::Failed(
+            "refusing to publish rewritten image with empty name".into(),
+        ));
+    }
+    if is_digest_reference(name) {
+        return Err(PublishError::Failed(format!(
+            "refusing to rewrite digest-qualified image reference {name}; tag it locally first"
+        )));
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut conn = GrpcConn::connect(socket_path, deadline).map_err(PublishError::Failed)?;
+
+    // 1. Verify `moby` still maps `name` to `plan.source_digest`.
+    verify_moby_source_digest(&mut conn, name, &plan.source_digest)?;
+
+    // 2. Look up authoritative stored sizes for each unique layer in `moby`.
+    let mut unique_layers: Vec<(&str, i64)> = Vec::new();
+    let mut seen_layers: HashSet<&str> = HashSet::new();
+    for digest in &plan.layer_digests {
+        if !seen_layers.insert(digest.as_str()) {
+            continue;
         }
-        let _ = stream.set_read_timeout(Some(left));
-        let (frame_type, flags, stream_id, payload) = read_frame(&mut stream)?;
+        let info = conn
+            .content_info("moby", digest)
+            .map_err(PublishError::Failed)?;
+        let Some(info) = info else {
+            // Re-check whether `moby` retagged or removed the source image.
+            verify_moby_source_digest(&mut conn, name, &plan.source_digest)?;
+            return Err(PublishError::Failed(format!(
+                "layer blob {digest} missing from moby content store"
+            )));
+        };
+        if info.size < 0 {
+            return Err(PublishError::Failed(format!(
+                "invalid negative size {} for layer {digest}",
+                info.size
+            )));
+        }
+        unique_layers.push((digest.as_str(), info.size));
+    }
+
+    // 3. Create a temporary GC lease in `k8s.io` with a fallback expiration
+    //    timestamp and guaranteed deletion before returning.
+    let seq = LEASE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let lease_id = format!("katamaran-rewrite-{}-{seq}", std::process::id());
+    let expire = rfc3339_utc_after(LEASE_TTL_SECS);
+    conn.create_lease("k8s.io", &lease_id, &[(LEASE_EXPIRE_LABEL, &expire)])
+        .map_err(PublishError::Failed)?;
+
+    let publish_res = publish_under_lease(
+        &mut conn,
+        name,
+        source_digest_label,
+        plan,
+        &unique_layers,
+        &lease_id,
+    );
+
+    // Best-effort lease cleanup: try on the active connection first, falling
+    // back to a fresh bounded dial if the connection broke mid-publish.
+    if conn.delete_lease("k8s.io", &lease_id).is_err()
+        && let Ok(mut cleanup_conn) =
+            GrpcConn::connect(socket_path, Instant::now() + Duration::from_secs(2))
+    {
+        let _ = cleanup_conn.delete_lease("k8s.io", &lease_id);
+    }
+
+    publish_res
+}
+
+fn publish_under_lease(
+    conn: &mut GrpcConn,
+    name: &str,
+    source_digest_label: &str,
+    plan: &RewritePlan,
+    unique_layers: &[(&str, i64)],
+    lease_id: &str,
+) -> Result<Rewritten, PublishError> {
+    // 4. Zero-copy link every existing layer blob into `k8s.io`.
+    for (idx, &(digest, size)) in unique_layers.iter().enumerate() {
+        let write_ref = format!("kat-link-{lease_id}-{idx}");
+        if let Err(e) = conn.link_shared_content("k8s.io", lease_id, &write_ref, digest, size) {
+            let _ = conn.abort_content("k8s.io", lease_id, &write_ref);
+            return Err(PublishError::Failed(format!(
+                "zero-copy link layer {digest} into k8s.io: {e}"
+            )));
+        }
+    }
+
+    // 5. Write the rewritten config blob into `k8s.io`.
+    let config_digest = format!("sha256:{}", plan.new_config_hex);
+    let cfg_ref = format!("kat-cfg-{lease_id}");
+    if let Err(e) = conn.write_content_blob(
+        "k8s.io",
+        lease_id,
+        &cfg_ref,
+        &config_digest,
+        &plan.new_config_bytes,
+        &[],
+    ) {
+        let _ = conn.abort_content("k8s.io", lease_id, &cfg_ref);
+        return Err(PublishError::Failed(format!(
+            "write rewritten config {config_digest}: {e}"
+        )));
+    }
+
+    // 6. Write the rewritten manifest blob with containerd GC child labels so
+    //    `k8s.io` GC keeps the rewritten config and every linked layer alive.
+    let manifest_digest = format!("sha256:{}", plan.new_manifest_hex);
+    let mut gc_labels: Vec<(String, String)> = Vec::with_capacity(1 + plan.layer_digests.len());
+    gc_labels.push((
+        "containerd.io/gc.ref.content.config".into(),
+        config_digest.clone(),
+    ));
+    for (idx, layer_digest) in plan.layer_digests.iter().enumerate() {
+        gc_labels.push((
+            format!("containerd.io/gc.ref.content.l.{idx}"),
+            layer_digest.clone(),
+        ));
+    }
+    let manifest_ref = format!("kat-manifest-{lease_id}");
+    match conn.write_content_blob(
+        "k8s.io",
+        lease_id,
+        &manifest_ref,
+        &manifest_digest,
+        &plan.new_manifest_bytes,
+        &gc_labels,
+    ) {
+        Ok(WriteOutcome::Committed) => {}
+        Ok(WriteOutcome::AlreadyExists) => {
+            conn.update_content_labels("k8s.io", Some(lease_id), &manifest_digest, &gc_labels)
+                .map_err(|e| {
+                    PublishError::Failed(format!(
+                        "ensure GC labels on manifest {manifest_digest}: {e}"
+                    ))
+                })?;
+        }
+        Err(e) => {
+            let _ = conn.abort_content("k8s.io", lease_id, &manifest_ref);
+            return Err(PublishError::Failed(format!(
+                "write rewritten manifest {manifest_digest}: {e}"
+            )));
+        }
+    }
+
+    // 7. Source-digest guard immediately prior to publishing the `k8s.io` tag:
+    //    if Docker concurrently retagged or deleted the source image, abort
+    //    without touching `k8s.io` so the lease cleanup releases any unused
+    //    rewritten metadata.
+    verify_moby_source_digest(conn, name, &plan.source_digest)?;
+
+    // 8. Create or update the `k8s.io` image record.
+    let manifest_size = i64::try_from(plan.new_manifest_bytes.len())
+        .map_err(|_| PublishError::Failed("rewritten manifest size overflows i64".into()))?;
+    let image = ContainerdImage {
+        name: name.to_string(),
+        labels: HashMap::from([(source_digest_label.to_string(), plan.source_digest.clone())]),
+        target: Descriptor {
+            media_type: plan.manifest_media_type.clone(),
+            digest: manifest_digest.clone(),
+            size: manifest_size,
+        },
+    };
+    conn.upsert_image("k8s.io", Some(lease_id), &image)
+        .map_err(PublishError::Failed)?;
+
+    Ok(Rewritten {
+        manifest: manifest_digest,
+        config: config_digest,
+    })
+}
+
+fn verify_moby_source_digest(
+    conn: &mut GrpcConn,
+    name: &str,
+    expected_digest: &str,
+) -> Result<(), PublishError> {
+    let current = conn.get_image("moby", name).map_err(PublishError::Failed)?;
+    match current {
+        Some(img) if img.target.digest == expected_digest => Ok(()),
+        Some(img) => Err(PublishError::SourceChanged {
+            expected: expected_digest.to_string(),
+            actual: img.target.digest,
+        }),
+        None => Err(PublishError::SourceChanged {
+            expected: expected_digest.to_string(),
+            actual: "<deleted>".to_string(),
+        }),
+    }
+}
+
+/// Stateful HTTP/2 (h2c) client connection over a Unix domain socket bounded
+/// by a single shared deadline across connect, write, and read operations.
+struct GrpcConn {
+    stream: UnixStream,
+    deadline: Instant,
+    next_stream_id: u32,
+    decoder: HpackDecoder,
+    peer_conn_window: i64,
+    peer_initial_stream_window: i64,
+    peer_max_frame_size: usize,
+}
+
+impl GrpcConn {
+    fn connect(socket_path: &Path, deadline: Instant) -> Result<Self, String> {
+        let mut stream = connect_unix_until(socket_path, deadline)
+            .map_err(|e| format!("connect {}: {e}", socket_path.display()))?;
+        let left = remaining_or_timeout(deadline, "connect containerd")?;
+        stream
+            .set_read_timeout(Some(left))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(left))
+            .map_err(|e| format!("set write timeout: {e}"))?;
+
+        // Client connection preface + initial SETTINGS:
+        // - HEADER_TABLE_SIZE = 0 (we still decode server dynamic entries if sent)
+        // - INITIAL_WINDOW_SIZE = 1 MiB for large responses like Images.List
+        stream
+            .write_all(CLIENT_PREFACE)
+            .map_err(|e| format!("write h2 preface: {e}"))?;
+        let mut settings = Vec::with_capacity(12);
+        settings.extend_from_slice(&SETTINGS_HEADER_TABLE_SIZE.to_be_bytes());
+        settings.extend_from_slice(&0u32.to_be_bytes());
+        settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW_SIZE.to_be_bytes());
+        settings.extend_from_slice(&CLIENT_RECV_WINDOW.to_be_bytes());
+        write_frame(&mut stream, FRAME_SETTINGS, 0, 0, &settings)
+            .map_err(|e| format!("write h2 settings: {e}"))?;
+        let conn_inc = CLIENT_RECV_WINDOW - (DEFAULT_H2_WINDOW as u32);
+        write_frame(
+            &mut stream,
+            FRAME_WINDOW_UPDATE,
+            0,
+            0,
+            &conn_inc.to_be_bytes(),
+        )
+        .map_err(|e| format!("write h2 window update: {e}"))?;
+        stream
+            .flush()
+            .map_err(|e| format!("flush h2 preface: {e}"))?;
+
+        Ok(Self {
+            stream,
+            deadline,
+            next_stream_id: 1,
+            decoder: HpackDecoder::new(DEFAULT_DYNAMIC_TABLE_SIZE),
+            peer_conn_window: DEFAULT_H2_WINDOW,
+            peer_initial_stream_window: DEFAULT_H2_WINDOW,
+            peer_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        })
+    }
+
+    fn alloc_stream_id(&mut self) -> u32 {
+        let sid = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.wrapping_add(2);
+        sid
+    }
+
+    fn apply_write_timeout(&self, op: &str) -> Result<Duration, String> {
+        let left = remaining_or_timeout(self.deadline, op)?;
+        let _ = self.stream.set_write_timeout(Some(left));
+        Ok(left)
+    }
+
+    fn apply_read_timeout(&self, op: &str) -> Result<Duration, String> {
+        let left = remaining_or_timeout(self.deadline, op)?;
+        // Best-effort refresh: on macOS/BSD, setsockopt(SO_RCVTIMEO) returns
+        // EINVAL once the peer closes its half of a Unix socket even while
+        // response frames remain buffered in the kernel receive queue.
+        let _ = self.stream.set_read_timeout(Some(left));
+        Ok(left)
+    }
+
+    fn send_request_headers(
+        &mut self,
+        sid: u32,
+        path: &str,
+        namespace: &str,
+        lease: Option<&str>,
+    ) -> Result<(), String> {
+        let left = self.apply_write_timeout(path)?;
+        let timeout_hdr = format!("{}S", left.as_secs().max(1));
+        let mut hdrs = vec![
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", path),
+            (":authority", "localhost"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+            ("containerd-namespace", namespace),
+            ("grpc-timeout", timeout_hdr.as_str()),
+        ];
+        if let Some(lid) = lease {
+            hdrs.push((LEASE_HEADER, lid));
+        }
+        let encoded = encode_request_headers(&hdrs);
+        write_frame(
+            &mut self.stream,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS,
+            sid,
+            &encoded,
+        )
+        .map_err(|e| format!("write h2 headers for {path}: {e}"))?;
+        Ok(())
+    }
+
+    fn unary_rpc(
+        &mut self,
+        path: &str,
+        namespace: &str,
+        lease: Option<&str>,
+        req_proto: &[u8],
+        max_response_bytes: usize,
+    ) -> Result<GrpcResponse, String> {
+        let sid = self.alloc_stream_id();
+        self.send_request_headers(sid, path, namespace, lease)?;
+        let framed = frame_grpc_message(req_proto)?;
+        let mut state = StreamState::new(sid, self.peer_initial_stream_window, max_response_bytes);
+        self.send_stream_data(&mut state, &framed, true, path)?;
+        self.stream
+            .flush()
+            .map_err(|e| format!("flush h2 request for {path}: {e}"))?;
+        self.finish_stream(&mut state, path)
+    }
+
+    /// Send `bytes` as HTTP/2 DATA frames on `state.sid`, respecting peer
+    /// connection and stream flow-control windows. If the peer closes `sid`
+    /// early (for example, `AlreadyExists` trailers-only), stops sending cleanly.
+    fn send_stream_data(
+        &mut self,
+        state: &mut StreamState,
+        bytes: &[u8],
+        end_stream: bool,
+        op: &str,
+    ) -> Result<(), String> {
+        let mut offset = 0usize;
+        while offset < bytes.len() && !state.ended {
+            while (self.peer_conn_window <= 0 || state.peer_window <= 0) && !state.ended {
+                self.read_one_frame(state, op)?;
+            }
+            if state.ended {
+                return Ok(());
+            }
+            let avail_win = self.peer_conn_window.min(state.peer_window) as usize;
+            let chunk_len = (bytes.len() - offset)
+                .min(self.peer_max_frame_size)
+                .min(avail_win);
+            let is_last = offset + chunk_len == bytes.len();
+            let flags = if is_last && end_stream {
+                FLAG_END_STREAM
+            } else {
+                0
+            };
+            self.apply_write_timeout(op)?;
+            write_frame(
+                &mut self.stream,
+                FRAME_DATA,
+                flags,
+                state.sid,
+                &bytes[offset..offset + chunk_len],
+            )
+            .map_err(|e| format!("write h2 data for {op}: {e}"))?;
+            self.peer_conn_window -= chunk_len as i64;
+            state.peer_window -= chunk_len as i64;
+            offset += chunk_len;
+        }
+        if bytes.is_empty() && end_stream && !state.ended {
+            self.apply_write_timeout(op)?;
+            write_frame(
+                &mut self.stream,
+                FRAME_DATA,
+                FLAG_END_STREAM,
+                state.sid,
+                &[],
+            )
+            .map_err(|e| format!("write h2 end-stream for {op}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn finish_stream(&mut self, state: &mut StreamState, op: &str) -> Result<GrpcResponse, String> {
+        while !state.ended {
+            self.read_one_frame(state, op)?;
+        }
+        if let Some(status) = &state.http_status
+            && status != "200"
+        {
+            return Err(format!(
+                "containerd {op} returned HTTP {status} ({})",
+                state.grpc_message
+            ));
+        }
+        let Some(grpc_status) = state.grpc_status.take() else {
+            return Err(format!(
+                "containerd {op} response missing grpc-status trailer"
+            ));
+        };
+        if !state.raw_data.is_empty() && grpc_status == GRPC_OK {
+            return Err(format!("containerd {op} returned truncated gRPC message"));
+        }
+        Ok(GrpcResponse {
+            grpc_status,
+            grpc_message: std::mem::take(&mut state.grpc_message),
+            messages: std::mem::take(&mut state.messages),
+        })
+    }
+
+    fn read_one_frame(&mut self, state: &mut StreamState, op: &str) -> Result<(), String> {
+        self.apply_read_timeout(op)?;
+        let (frame_type, flags, stream_id, payload) = read_frame(&mut self.stream)?;
         match frame_type {
             FRAME_SETTINGS => {
                 if flags & FLAG_ACK == 0 {
+                    let (chunks, rem) = payload.as_chunks::<6>();
+                    if !rem.is_empty() {
+                        return Err("invalid HTTP/2 SETTINGS payload length".into());
+                    }
+                    for chunk in chunks {
+                        let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+                        let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+                        match id {
+                            SETTINGS_INITIAL_WINDOW_SIZE => {
+                                let new_win = val as i64;
+                                let delta = new_win - self.peer_initial_stream_window;
+                                self.peer_initial_stream_window = new_win;
+                                state.peer_window += delta;
+                            }
+                            SETTINGS_MAX_FRAME_SIZE if (16_384..=16_777_215).contains(&val) => {
+                                self.peer_max_frame_size = val as usize;
+                            }
+                            _ => {}
+                        }
+                    }
                     // Best-effort ACK: a peer that already sent the full
                     // response and closed its socket may return EPIPE while
                     // response frames remain buffered for us to read.
-                    let _ = write_frame(&mut stream, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
-                    let _ = stream.flush();
+                    let _ = write_frame(&mut self.stream, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
+                    let _ = self.stream.flush();
                 }
             }
             FRAME_PING => {
                 if flags & FLAG_ACK == 0 && payload.len() == 8 {
-                    let _ = write_frame(&mut stream, FRAME_PING, FLAG_ACK, 0, &payload);
-                    let _ = stream.flush();
+                    let _ = write_frame(&mut self.stream, FRAME_PING, FLAG_ACK, 0, &payload);
+                    let _ = self.stream.flush();
                 }
             }
-            FRAME_WINDOW_UPDATE => {}
+            FRAME_WINDOW_UPDATE => {
+                if payload.len() == 4 {
+                    let inc = (u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                        & 0x7fff_ffff) as i64;
+                    if stream_id == 0 {
+                        self.peer_conn_window += inc;
+                    } else if stream_id == state.sid {
+                        state.peer_window += inc;
+                    }
+                }
+            }
             FRAME_GOAWAY => {
                 let last_stream_id = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]])
                 } else {
                     0
                 };
-                if last_stream_id < 1 {
+                if last_stream_id < state.sid {
                     let code = if payload.len() >= 8 {
                         u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]])
                     } else {
@@ -172,28 +707,56 @@ pub fn delete_image_if_target_matches(
                     ));
                 }
             }
-            FRAME_RST_STREAM if stream_id == 1 => {
+            FRAME_RST_STREAM if stream_id == state.sid => {
                 let code = if payload.len() >= 4 {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
                 } else {
                     0
                 };
-                return Err(format!("containerd reset HTTP/2 stream 1 (code {code})"));
+                return Err(format!(
+                    "containerd reset HTTP/2 stream {} (code {code})",
+                    state.sid
+                ));
             }
-            FRAME_DATA if stream_id == 1 => {
-                if flags & FLAG_END_STREAM != 0 {
-                    break;
+            FRAME_DATA if stream_id == state.sid => {
+                let flow_len = payload.len() as u32;
+                let data = strip_data_padding(&payload, flags)?;
+                let end_stream = flags & FLAG_END_STREAM != 0;
+                if flow_len > 0 {
+                    let _ = write_frame(
+                        &mut self.stream,
+                        FRAME_WINDOW_UPDATE,
+                        0,
+                        0,
+                        &flow_len.to_be_bytes(),
+                    );
+                    if !end_stream {
+                        let _ = write_frame(
+                            &mut self.stream,
+                            FRAME_WINDOW_UPDATE,
+                            0,
+                            state.sid,
+                            &flow_len.to_be_bytes(),
+                        );
+                    }
+                    let _ = self.stream.flush();
+                }
+                state.push_data(data, op)?;
+                if end_stream {
+                    state.ended = true;
                 }
             }
-            FRAME_HEADERS if stream_id == 1 => {
+            FRAME_HEADERS if stream_id == state.sid => {
                 let end_stream = flags & FLAG_END_STREAM != 0;
                 let mut block = strip_headers_framing(&payload, flags)?;
                 let mut cur_flags = flags;
                 while cur_flags & FLAG_END_HEADERS == 0 {
-                    let (ct, cf, cs, cp) = read_frame(&mut stream)?;
-                    if ct != FRAME_CONTINUATION || cs != 1 {
+                    self.apply_read_timeout(op)?;
+                    let (ct, cf, cs, cp) = read_frame(&mut self.stream)?;
+                    if ct != FRAME_CONTINUATION || cs != state.sid {
                         return Err(format!(
-                            "expected CONTINUATION on stream 1, got type {ct} on stream {cs}"
+                            "expected CONTINUATION on stream {}, got type {ct} on stream {cs}",
+                            state.sid
                         ));
                     }
                     if block.len() + cp.len() > MAX_HEADER_BLOCK {
@@ -202,40 +765,506 @@ pub fn delete_image_if_target_matches(
                     block.extend_from_slice(&cp);
                     cur_flags = cf;
                 }
-                for (k, v) in decoder.decode(&block)? {
+                for (k, v) in self.decoder.decode(&block)? {
                     match k.as_str() {
-                        ":status" => http_status = Some(v),
-                        "grpc-status" => grpc_status = Some(v),
-                        "grpc-message" => grpc_message = percent_decode(&v),
+                        ":status" => state.http_status = Some(v),
+                        "grpc-status" => state.grpc_status = Some(v),
+                        "grpc-message" => state.grpc_message = percent_decode(&v),
                         _ => {}
                     }
                 }
                 if end_stream {
-                    break;
+                    state.ended = true;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
-    if let Some(status) = &http_status
-        && status != "200"
-    {
-        return Err(format!(
-            "containerd Images.Delete returned HTTP {status} ({grpc_message})"
-        ));
+    fn get_image(
+        &mut self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<ContainerdImage>, String> {
+        let mut req = Vec::with_capacity(name.len() + 4);
+        encode_proto_bytes(&mut req, 1, name.as_bytes());
+        let resp = self.unary_rpc(
+            "/containerd.services.images.v1.Images/Get",
+            namespace,
+            None,
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => {
+                let body = resp.messages.first().map(Vec::as_slice).unwrap_or(&[]);
+                decode_get_image_response(body)
+            }
+            GRPC_NOT_FOUND => Ok(None),
+            code => Err(format!(
+                "containerd Images.Get {name} ({namespace}) failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
     }
-    match grpc_status.as_deref() {
-        Some("0") => Ok(DeleteOutcome::Deleted),
-        // gRPC status 5 = NOT_FOUND: returned both when the image does not
-        // exist and when DeleteImageRequest.target.digest does not match.
-        Some("5") => Ok(DeleteOutcome::NotFoundOrChanged),
-        Some(code) => Err(format!(
-            "containerd Images.Delete failed (grpc-status {code}): {grpc_message}"
-        )),
-        None => Err("containerd Images.Delete response missing grpc-status trailer".into()),
+
+    fn upsert_image(
+        &mut self,
+        namespace: &str,
+        lease: Option<&str>,
+        image: &ContainerdImage,
+    ) -> Result<(), String> {
+        let create_req = encode_create_image_request(image);
+        let resp = self.unary_rpc(
+            "/containerd.services.images.v1.Images/Create",
+            namespace,
+            lease,
+            &create_req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => return Ok(()),
+            GRPC_ALREADY_EXISTS => {}
+            code => {
+                return Err(format!(
+                    "containerd Images.Create {} ({namespace}) failed (grpc-status {code}): {}",
+                    image.name, resp.grpc_message
+                ));
+            }
+        }
+
+        let update_req = encode_update_image_request(image, &["target", "labels"]);
+        let resp = self.unary_rpc(
+            "/containerd.services.images.v1.Images/Update",
+            namespace,
+            lease,
+            &update_req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => Ok(()),
+            GRPC_NOT_FOUND => {
+                // Concurrently deleted between Create and Update; retry Create once.
+                let retry = self.unary_rpc(
+                    "/containerd.services.images.v1.Images/Create",
+                    namespace,
+                    lease,
+                    &create_req,
+                    DEFAULT_UNARY_RESPONSE_LIMIT,
+                )?;
+                if retry.grpc_status == GRPC_OK {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "containerd Images.Create retry {} ({namespace}) failed (grpc-status {}): {}",
+                        image.name, retry.grpc_status, retry.grpc_message
+                    ))
+                }
+            }
+            code => Err(format!(
+                "containerd Images.Update {} ({namespace}) failed (grpc-status {code}): {}",
+                image.name, resp.grpc_message
+            )),
+        }
+    }
+
+    fn create_lease(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let req = encode_create_lease_request(id, labels);
+        let resp = self.unary_rpc(
+            "/containerd.services.leases.v1.Leases/Create",
+            namespace,
+            None,
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => Ok(()),
+            code => Err(format!(
+                "containerd Leases.Create {id} ({namespace}) failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
+    }
+
+    fn delete_lease(&mut self, namespace: &str, id: &str) -> Result<(), String> {
+        let mut req = Vec::with_capacity(id.len() + 4);
+        encode_proto_bytes(&mut req, 1, id.as_bytes());
+        let resp = self.unary_rpc(
+            "/containerd.services.leases.v1.Leases/Delete",
+            namespace,
+            None,
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK | GRPC_NOT_FOUND => Ok(()),
+            code => Err(format!(
+                "containerd Leases.Delete {id} ({namespace}) failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
+    }
+
+    fn content_info(
+        &mut self,
+        namespace: &str,
+        digest: &str,
+    ) -> Result<Option<ContentInfo>, String> {
+        let mut req = Vec::with_capacity(digest.len() + 4);
+        encode_proto_bytes(&mut req, 1, digest.as_bytes());
+        let resp = self.unary_rpc(
+            "/containerd.services.content.v1.Content/Info",
+            namespace,
+            None,
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => {
+                let body = resp.messages.first().map(Vec::as_slice).unwrap_or(&[]);
+                decode_content_info_response(body)
+            }
+            GRPC_NOT_FOUND => Ok(None),
+            code => Err(format!(
+                "containerd Content.Info {digest} ({namespace}) failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
+    }
+
+    fn update_content_labels(
+        &mut self,
+        namespace: &str,
+        lease: Option<&str>,
+        digest: &str,
+        labels: &[(String, String)],
+    ) -> Result<(), String> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let req = encode_update_content_labels_request(digest, labels);
+        let resp = self.unary_rpc(
+            "/containerd.services.content.v1.Content/Update",
+            namespace,
+            lease,
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        if resp.grpc_status == GRPC_OK {
+            Ok(())
+        } else {
+            Err(format!(
+                "containerd Content.Update {digest} ({namespace}) failed (grpc-status {}): {}",
+                resp.grpc_status, resp.grpc_message
+            ))
+        }
+    }
+
+    fn abort_content(
+        &mut self,
+        namespace: &str,
+        lease: &str,
+        write_ref: &str,
+    ) -> Result<(), String> {
+        let mut req = Vec::with_capacity(write_ref.len() + 4);
+        encode_proto_bytes(&mut req, 1, write_ref.as_bytes());
+        let resp = self.unary_rpc(
+            "/containerd.services.content.v1.Content/Abort",
+            namespace,
+            Some(lease),
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK | GRPC_NOT_FOUND => Ok(()),
+            code => Err(format!(
+                "containerd Content.Abort {write_ref} failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
+    }
+
+    /// Link an already-committed shared content blob (from `moby`) into
+    /// `namespace` (`k8s.io`) with zero disk writes and zero payload bytes.
+    ///
+    /// In containerd's shared content store (`core/metadata/content.go`),
+    /// passing `expected = digest` and `total = size` causes `Writer` to open a
+    /// shared `namespacedWriter` (`nw.w == nil`, `ws.Offset == size`) without
+    /// creating any ingest file. Sending `action = COMMIT`, `offset = size`,
+    /// `data = &[]` matches `ws.Offset`, skips `Truncate`/`createAndCopy`, and
+    /// commits the BoltDB reference directly.
+    fn link_shared_content(
+        &mut self,
+        namespace: &str,
+        lease: &str,
+        write_ref: &str,
+        digest: &str,
+        size: i64,
+    ) -> Result<WriteOutcome, String> {
+        let req = encode_write_content_request(
+            WRITE_ACTION_COMMIT,
+            write_ref,
+            size,
+            digest,
+            size,
+            &[],
+            &[],
+        );
+        let resp = self.unary_rpc(
+            "/containerd.services.content.v1.Content/Write",
+            namespace,
+            Some(lease),
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => Ok(WriteOutcome::Committed),
+            GRPC_ALREADY_EXISTS => Ok(WriteOutcome::AlreadyExists),
+            code => Err(format!(
+                "containerd Content.Write link {digest} failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
+    }
+
+    /// Write a metadata blob (`new_config` or `new_manifest`) into `namespace`
+    /// over bidirectional-streaming `/containerd.services.content.v1.Content/Write`,
+    /// chunking at [`CONTENT_WRITE_CHUNK`] bytes so multi-megabyte configs
+    /// respect HTTP/2 flow control without deadlock.
+    fn write_content_blob(
+        &mut self,
+        namespace: &str,
+        lease: &str,
+        write_ref: &str,
+        expected_digest: &str,
+        data: &[u8],
+        labels: &[(String, String)],
+    ) -> Result<WriteOutcome, String> {
+        let total = i64::try_from(data.len()).map_err(|_| "blob size overflows i64".to_string())?;
+        let op = "/containerd.services.content.v1.Content/Write";
+
+        if data.len() <= CONTENT_WRITE_CHUNK {
+            let req = encode_write_content_request(
+                WRITE_ACTION_COMMIT,
+                write_ref,
+                total,
+                expected_digest,
+                0,
+                data,
+                labels,
+            );
+            let resp = self.unary_rpc(
+                op,
+                namespace,
+                Some(lease),
+                &req,
+                DEFAULT_UNARY_RESPONSE_LIMIT,
+            )?;
+            return match resp.grpc_status.as_str() {
+                GRPC_OK => Ok(WriteOutcome::Committed),
+                GRPC_ALREADY_EXISTS => Ok(WriteOutcome::AlreadyExists),
+                code => Err(format!(
+                    "containerd Content.Write {expected_digest} failed (grpc-status {code}): {}",
+                    resp.grpc_message
+                )),
+            };
+        }
+
+        let sid = self.alloc_stream_id();
+        self.send_request_headers(sid, op, namespace, Some(lease))?;
+        let mut state = StreamState::new(
+            sid,
+            self.peer_initial_stream_window,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        );
+
+        let mut offset = 0usize;
+        while offset < data.len() && !state.ended {
+            let end = (offset + CONTENT_WRITE_CHUNK).min(data.len());
+            let is_last = end == data.len();
+            let action = if is_last {
+                WRITE_ACTION_COMMIT
+            } else {
+                WRITE_ACTION_WRITE
+            };
+            let req = encode_write_content_request(
+                action,
+                if offset == 0 { write_ref } else { "" },
+                total,
+                if offset == 0 { expected_digest } else { "" },
+                offset as i64,
+                &data[offset..end],
+                if is_last { labels } else { &[] },
+            );
+            let framed = frame_grpc_message(&req)?;
+            self.send_stream_data(&mut state, &framed, is_last, op)?;
+            self.stream
+                .flush()
+                .map_err(|e| format!("flush h2 Content.Write chunk: {e}"))?;
+
+            if !is_last {
+                // Wait for the server's per-chunk WriteContentResponse (or
+                // early stream termination such as ALREADY_EXISTS) so both
+                // sides stay synchronized under HTTP/2 flow control.
+                let target_msgs = state.messages.len() + 1;
+                while state.messages.len() < target_msgs && !state.ended {
+                    self.read_one_frame(&mut state, op)?;
+                }
+            }
+            offset = end;
+        }
+
+        let resp = self.finish_stream(&mut state, op)?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => Ok(WriteOutcome::Committed),
+            GRPC_ALREADY_EXISTS => Ok(WriteOutcome::AlreadyExists),
+            code => Err(format!(
+                "containerd Content.Write {expected_digest} failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
     }
 }
+
+struct StreamState {
+    sid: u32,
+    peer_window: i64,
+    max_response_bytes: usize,
+    total_response_bytes: usize,
+    http_status: Option<String>,
+    grpc_status: Option<String>,
+    grpc_message: String,
+    raw_data: Vec<u8>,
+    messages: Vec<Vec<u8>>,
+    ended: bool,
+}
+
+impl StreamState {
+    fn new(sid: u32, peer_window: i64, max_response_bytes: usize) -> Self {
+        Self {
+            sid,
+            peer_window,
+            max_response_bytes,
+            total_response_bytes: 0,
+            http_status: None,
+            grpc_status: None,
+            grpc_message: String::new(),
+            raw_data: Vec::new(),
+            messages: Vec::new(),
+            ended: false,
+        }
+    }
+
+    fn push_data(&mut self, chunk: &[u8], op: &str) -> Result<(), String> {
+        self.total_response_bytes = self.total_response_bytes.saturating_add(chunk.len());
+        if self.total_response_bytes > self.max_response_bytes {
+            return Err(format!(
+                "containerd {op} response exceeded {}-byte limit",
+                self.max_response_bytes
+            ));
+        }
+        self.raw_data.extend_from_slice(chunk);
+        loop {
+            if self.raw_data.len() < 5 {
+                break;
+            }
+            let compressed = self.raw_data[0];
+            if compressed != 0 {
+                return Err(format!(
+                    "containerd {op} sent unexpected compressed gRPC message"
+                ));
+            }
+            let msg_len = u32::from_be_bytes([
+                self.raw_data[1],
+                self.raw_data[2],
+                self.raw_data[3],
+                self.raw_data[4],
+            ]) as usize;
+            if msg_len > self.max_response_bytes {
+                return Err(format!(
+                    "containerd {op} message ({msg_len} bytes) exceeded {}-byte limit",
+                    self.max_response_bytes
+                ));
+            }
+            if self.raw_data.len() < 5 + msg_len {
+                break;
+            }
+            let msg = self.raw_data[5..5 + msg_len].to_vec();
+            self.raw_data.drain(..5 + msg_len);
+            self.messages.push(msg);
+        }
+        Ok(())
+    }
+}
+
+fn remaining_or_timeout(deadline: Instant, op: &str) -> Result<Duration, String> {
+    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(format!("containerd {op} timed out"));
+    };
+    if left.is_zero() {
+        return Err(format!("containerd {op} timed out"));
+    }
+    Ok(left)
+}
+
+fn strip_data_padding(payload: &[u8], flags: u8) -> Result<&[u8], String> {
+    if flags & FLAG_PADDED == 0 {
+        return Ok(payload);
+    }
+    let Some((&pad_len, rest)) = payload.split_first() else {
+        return Err("truncated padded DATA frame".into());
+    };
+    let pad_len = pad_len as usize;
+    if pad_len > rest.len() {
+        return Err("invalid DATA padding length".into());
+    }
+    Ok(&rest[..rest.len() - pad_len])
+}
+
+/// Format `now + delta_secs` as UTC RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`) for
+/// containerd's `containerd.io/gc.expire` lease label.
+fn rfc3339_utc_after(delta_secs: u64) -> String {
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(delta_secs);
+    format_rfc3339_utc(unix_secs)
+}
+
+fn format_rfc3339_utc(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let rem = unix_secs % 86_400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+// ---------------------------------------------------------------------------
+// Proto3 encoders and decoders for containerd v2.4.2 gRPC services
+// ---------------------------------------------------------------------------
+
+const WRITE_ACTION_WRITE: u64 = 1;
+const WRITE_ACTION_COMMIT: u64 = 2;
 
 /// Encode `containerd.services.images.v1.DeleteImageRequest`:
 /// - field 1 (string): `name`
@@ -251,10 +1280,157 @@ fn encode_delete_image_request(name: &str, target_digest: &str) -> Vec<u8> {
     req
 }
 
+fn encode_descriptor(desc: &Descriptor) -> Vec<u8> {
+    let mut out = Vec::new();
+    if !desc.media_type.is_empty() {
+        encode_proto_bytes(&mut out, 1, desc.media_type.as_bytes());
+    }
+    if !desc.digest.is_empty() {
+        encode_proto_bytes(&mut out, 2, desc.digest.as_bytes());
+    }
+    if desc.size != 0 {
+        encode_proto_varint(&mut out, 3, desc.size as u64);
+    }
+    out
+}
+
+fn encode_image(img: &ContainerdImage) -> Vec<u8> {
+    let mut out = Vec::new();
+    if !img.name.is_empty() {
+        encode_proto_bytes(&mut out, 1, img.name.as_bytes());
+    }
+    let mut labels: Vec<(&String, &String)> = img.labels.iter().collect();
+    labels.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in labels {
+        encode_proto_map_entry(&mut out, 2, k, v);
+    }
+    let target = encode_descriptor(&img.target);
+    if !target.is_empty() {
+        encode_proto_bytes(&mut out, 3, &target);
+    }
+    out
+}
+
+fn encode_field_mask(paths: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for path in paths {
+        encode_proto_bytes(&mut out, 1, path.as_bytes());
+    }
+    out
+}
+
+fn encode_create_image_request(img: &ContainerdImage) -> Vec<u8> {
+    let mut out = Vec::new();
+    let encoded_img = encode_image(img);
+    encode_proto_bytes(&mut out, 1, &encoded_img);
+    out
+}
+
+fn encode_update_image_request(img: &ContainerdImage, mask_paths: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let encoded_img = encode_image(img);
+    encode_proto_bytes(&mut out, 1, &encoded_img);
+    if !mask_paths.is_empty() {
+        let mask = encode_field_mask(mask_paths);
+        encode_proto_bytes(&mut out, 2, &mask);
+    }
+    out
+}
+
+/// `containerd.services.leases.v1.CreateRequest`:
+/// - field 1 (string): `id`
+/// - field 3 (map<string, string>): `labels`
+fn encode_create_lease_request(id: &str, labels: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if !id.is_empty() {
+        encode_proto_bytes(&mut out, 1, id.as_bytes());
+    }
+    for &(k, v) in labels {
+        encode_proto_map_entry(&mut out, 3, k, v);
+    }
+    out
+}
+
+/// `containerd.services.content.v1.UpdateRequest`:
+/// - field 1 (message `Info`): `digest = 1`, `labels = 5`
+/// - field 2 (message `FieldMask`): `paths = 1`
+fn encode_update_content_labels_request(digest: &str, labels: &[(String, String)]) -> Vec<u8> {
+    let mut info = Vec::new();
+    encode_proto_bytes(&mut info, 1, digest.as_bytes());
+    let mut mask = Vec::new();
+    for (k, v) in labels {
+        encode_proto_map_entry(&mut info, 5, k, v);
+        let path = format!("labels.{k}");
+        encode_proto_bytes(&mut mask, 1, path.as_bytes());
+    }
+    let mut out = Vec::new();
+    encode_proto_bytes(&mut out, 1, &info);
+    encode_proto_bytes(&mut out, 2, &mask);
+    out
+}
+
+/// `containerd.services.content.v1.WriteContentRequest`:
+/// - field 1 (enum): `action`
+/// - field 2 (string): `ref`
+/// - field 3 (int64): `total`
+/// - field 4 (string): `expected`
+/// - field 5 (int64): `offset`
+/// - field 6 (bytes): `data`
+/// - field 7 (map<string, string>): `labels`
+fn encode_write_content_request(
+    action: u64,
+    write_ref: &str,
+    total: i64,
+    expected: &str,
+    offset: i64,
+    data: &[u8],
+    labels: &[(String, String)],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + data.len());
+    if action != 0 {
+        encode_proto_varint(&mut out, 1, action);
+    }
+    if !write_ref.is_empty() {
+        encode_proto_bytes(&mut out, 2, write_ref.as_bytes());
+    }
+    if total != 0 {
+        encode_proto_varint(&mut out, 3, total as u64);
+    }
+    if !expected.is_empty() {
+        encode_proto_bytes(&mut out, 4, expected.as_bytes());
+    }
+    if offset != 0 {
+        encode_proto_varint(&mut out, 5, offset as u64);
+    }
+    if !data.is_empty() {
+        encode_proto_bytes(&mut out, 6, data);
+    }
+    for (k, v) in labels {
+        encode_proto_map_entry(&mut out, 7, k, v);
+    }
+    out
+}
+
+fn encode_proto_varint(out: &mut Vec<u8>, field_num: u32, val: u64) {
+    encode_varint(out, (field_num as u64) << 3);
+    encode_varint(out, val);
+}
+
 fn encode_proto_bytes(out: &mut Vec<u8>, field_num: u32, data: &[u8]) {
     encode_varint(out, ((field_num as u64) << 3) | 2);
     encode_varint(out, data.len() as u64);
     out.extend_from_slice(data);
+}
+
+fn encode_proto_map_entry(out: &mut Vec<u8>, field_num: u32, key: &str, val: &str) {
+    let mut entry = Vec::with_capacity(key.len() + val.len() + 8);
+    if !key.is_empty() {
+        encode_proto_bytes(&mut entry, 1, key.as_bytes());
+    }
+    if !val.is_empty() {
+        encode_proto_bytes(&mut entry, 2, val.as_bytes());
+    }
+    encode_proto_bytes(out, field_num, &entry);
 }
 
 fn encode_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -268,6 +1444,210 @@ fn encode_varint(out: &mut Vec<u8>, mut v: u64) {
         out.push(byte | 0x80);
     }
 }
+
+fn decode_varint(mut data: &[u8]) -> Result<(u64, &[u8]), String> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let Some((&b, rest)) = data.split_first() else {
+            return Err("truncated protobuf varint".into());
+        };
+        data = rest;
+        if shift >= 64 || (shift == 63 && (b & 0x7e) != 0) {
+            return Err("protobuf varint overflow".into());
+        }
+        val |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Ok((val, data));
+        }
+        shift += 7;
+    }
+}
+
+fn decode_len_delimited(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    let (len, rest) = decode_varint(data)?;
+    let len = usize::try_from(len).map_err(|_| "protobuf length overflow".to_string())?;
+    if len > rest.len() {
+        return Err("truncated protobuf length-delimited field".into());
+    }
+    Ok(rest.split_at(len))
+}
+
+fn skip_proto_field(wt: u64, data: &[u8]) -> Result<&[u8], String> {
+    match wt {
+        0 => Ok(decode_varint(data)?.1),
+        1 => data
+            .get(8..)
+            .ok_or_else(|| "truncated protobuf 64-bit field".into()),
+        2 => Ok(decode_len_delimited(data)?.1),
+        5 => data
+            .get(4..)
+            .ok_or_else(|| "truncated protobuf 32-bit field".into()),
+        other => Err(format!("unsupported protobuf wire type {other}")),
+    }
+}
+
+fn decode_string_map_entry(mut data: &[u8]) -> Result<(String, String), String> {
+    let mut key = String::new();
+    let mut val = String::new();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                key = String::from_utf8_lossy(bytes).into_owned();
+                data = next;
+            }
+            (2, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                val = String::from_utf8_lossy(bytes).into_owned();
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok((key, val))
+}
+
+fn decode_descriptor(mut data: &[u8]) -> Result<Descriptor, String> {
+    let mut desc = Descriptor::default();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                desc.media_type = String::from_utf8_lossy(bytes).into_owned();
+                data = next;
+            }
+            (2, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                desc.digest = String::from_utf8_lossy(bytes).into_owned();
+                data = next;
+            }
+            (3, 0) => {
+                let (v, next) = decode_varint(rest)?;
+                desc.size = v as i64;
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(desc)
+}
+
+fn decode_image(mut data: &[u8]) -> Result<ContainerdImage, String> {
+    let mut img = ContainerdImage::default();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                img.name = String::from_utf8_lossy(bytes).into_owned();
+                data = next;
+            }
+            (2, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                let (k, v) = decode_string_map_entry(bytes)?;
+                img.labels.insert(k, v);
+                data = next;
+            }
+            (3, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                img.target = decode_descriptor(bytes)?;
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(img)
+}
+
+fn decode_list_images_response(mut data: &[u8]) -> Result<Vec<ContainerdImage>, String> {
+    let mut images = Vec::new();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                images.push(decode_image(bytes)?);
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(images)
+}
+
+fn decode_get_image_response(mut data: &[u8]) -> Result<Option<ContainerdImage>, String> {
+    let mut image = None;
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                image = Some(decode_image(bytes)?);
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(image)
+}
+
+fn decode_content_info(mut data: &[u8]) -> Result<ContentInfo, String> {
+    let mut info = ContentInfo::default();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                info.digest = String::from_utf8_lossy(bytes).into_owned();
+                data = next;
+            }
+            (2, 0) => {
+                let (v, next) = decode_varint(rest)?;
+                info.size = v as i64;
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(info)
+}
+
+fn decode_content_info_response(mut data: &[u8]) -> Result<Option<ContentInfo>, String> {
+    let mut info = None;
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                info = Some(decode_content_info(bytes)?);
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(info)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 framing & RFC 7541 HPACK
+// ---------------------------------------------------------------------------
 
 fn frame_grpc_message(payload: &[u8]) -> Result<Vec<u8>, String> {
     let len = u32::try_from(payload.len()).map_err(|_| "gRPC message too large".to_string())?;
@@ -725,11 +2105,31 @@ const HUFFMAN_CODE_LEN: [u8; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_sock(name: &str) -> (PathBuf, PathBuf) {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("kat-grpc-test-{name}-{}-{seq}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("containerd.sock");
+        (dir, sock)
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 
     fn huffman_encode(s: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -763,50 +2163,291 @@ mod tests {
         out.extend_from_slice(&v);
     }
 
-    fn decode_varint(mut data: &[u8]) -> (u64, &[u8]) {
-        let mut val = 0u64;
-        let mut shift = 0u32;
-        loop {
-            let b = data[0];
-            data = &data[1..];
-            val |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                return (val, data);
-            }
-            shift += 7;
+    fn send_grpc_ok(conn: &mut UnixStream, sid: u32, resp_proto: &[u8]) {
+        let mut hdr = vec![0x88]; // :status 200
+        encode_hpack_huffman_header(&mut hdr, "content-type", "application/grpc", false);
+        write_frame(conn, FRAME_HEADERS, FLAG_END_HEADERS, sid, &hdr).unwrap();
+        let framed = frame_grpc_message(resp_proto).unwrap();
+        for chunk in framed.chunks(DEFAULT_MAX_FRAME_SIZE) {
+            write_frame(conn, FRAME_DATA, 0, sid, chunk).unwrap();
         }
+        let mut trl = Vec::new();
+        encode_hpack_huffman_header(&mut trl, "grpc-status", "0", false);
+        write_frame(
+            conn,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            sid,
+            &trl,
+        )
+        .unwrap();
+        conn.flush().unwrap();
+    }
+
+    fn send_grpc_err(conn: &mut UnixStream, sid: u32, status: &str, msg: &str) {
+        let mut trl = vec![0x88]; // :status 200
+        encode_hpack_huffman_header(&mut trl, "content-type", "application/grpc", false);
+        encode_hpack_huffman_header(&mut trl, "grpc-status", status, false);
+        encode_hpack_huffman_header(&mut trl, "grpc-message", msg, false);
+        write_frame(
+            conn,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            sid,
+            &trl,
+        )
+        .unwrap();
+        conn.flush().unwrap();
     }
 
     fn decode_delete_request(mut data: &[u8]) -> (String, Option<String>) {
         let mut name = String::new();
         let mut target_digest = None;
         while !data.is_empty() {
-            let (tag, rest) = decode_varint(data);
+            let (tag, rest) = decode_varint(data).unwrap();
             let field = tag >> 3;
-            let wt = tag & 0x7;
-            assert_eq!(wt, 2);
-            let (len, rest) = decode_varint(rest);
-            let (val, next) = rest.split_at(len as usize);
+            let (val, next) = decode_len_delimited(rest).unwrap();
             data = next;
             match field {
                 1 => name = String::from_utf8(val.to_vec()).unwrap(),
                 3 => {
-                    let mut inner = val;
-                    while !inner.is_empty() {
-                        let (itag, irest) = decode_varint(inner);
-                        let ifield = itag >> 3;
-                        let (ilen, irest) = decode_varint(irest);
-                        let (ival, inext) = irest.split_at(ilen as usize);
-                        inner = inext;
-                        if ifield == 2 {
-                            target_digest = Some(String::from_utf8(ival.to_vec()).unwrap());
-                        }
+                    let desc = decode_descriptor(val).unwrap();
+                    if !desc.digest.is_empty() {
+                        target_digest = Some(desc.digest);
                     }
                 }
                 _ => {}
             }
         }
         (name, target_digest)
+    }
+
+    #[derive(Default)]
+    struct DecodedWriteReq {
+        action: u64,
+        write_ref: String,
+        total: i64,
+        expected: String,
+        offset: i64,
+        data: Vec<u8>,
+        labels: HashMap<String, String>,
+    }
+
+    fn decode_write_content_request(mut data: &[u8]) -> DecodedWriteReq {
+        let mut req = DecodedWriteReq::default();
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            match (field, wt) {
+                (1, 0) => {
+                    let (v, next) = decode_varint(rest).unwrap();
+                    req.action = v;
+                    data = next;
+                }
+                (2, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    req.write_ref = String::from_utf8(v.to_vec()).unwrap();
+                    data = next;
+                }
+                (3, 0) => {
+                    let (v, next) = decode_varint(rest).unwrap();
+                    req.total = v as i64;
+                    data = next;
+                }
+                (4, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    req.expected = String::from_utf8(v.to_vec()).unwrap();
+                    data = next;
+                }
+                (5, 0) => {
+                    let (v, next) = decode_varint(rest).unwrap();
+                    req.offset = v as i64;
+                    data = next;
+                }
+                (6, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    req.data = v.to_vec();
+                    data = next;
+                }
+                (7, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    let (k, val) = decode_string_map_entry(v).unwrap();
+                    req.labels.insert(k, val);
+                    data = next;
+                }
+                _ => data = skip_proto_field(wt, rest).unwrap(),
+            }
+        }
+        req
+    }
+
+    fn decode_first_string(mut data: &[u8]) -> String {
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            if field == 1 && wt == 2 {
+                let (v, _) = decode_len_delimited(rest).unwrap();
+                return String::from_utf8(v.to_vec()).unwrap();
+            }
+            data = skip_proto_field(wt, rest).unwrap();
+        }
+        String::new()
+    }
+
+    fn decode_create_lease_req(mut data: &[u8]) -> (String, HashMap<String, String>) {
+        let mut id = String::new();
+        let mut labels = HashMap::new();
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            match (field, wt) {
+                (1, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    id = String::from_utf8(v.to_vec()).unwrap();
+                    data = next;
+                }
+                (3, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    let (k, val) = decode_string_map_entry(v).unwrap();
+                    labels.insert(k, val);
+                    data = next;
+                }
+                _ => data = skip_proto_field(wt, rest).unwrap(),
+            }
+        }
+        (id, labels)
+    }
+
+    fn decode_image_and_mask(mut data: &[u8]) -> (ContainerdImage, Vec<String>) {
+        let mut img = ContainerdImage::default();
+        let mut mask = Vec::new();
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            match (field, wt) {
+                (1, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    img = decode_image(v).unwrap();
+                    data = next;
+                }
+                (2, 2) => {
+                    let (mut m, next) = decode_len_delimited(rest).unwrap();
+                    while !m.is_empty() {
+                        let (mt, mr) = decode_varint(m).unwrap();
+                        if (mt >> 3) == 1 && (mt & 0x7) == 2 {
+                            let (p, mn) = decode_len_delimited(mr).unwrap();
+                            mask.push(String::from_utf8(p.to_vec()).unwrap());
+                            m = mn;
+                        } else {
+                            m = skip_proto_field(mt & 0x7, mr).unwrap();
+                        }
+                    }
+                    data = next;
+                }
+                _ => data = skip_proto_field(wt, rest).unwrap(),
+            }
+        }
+        (img, mask)
+    }
+
+    fn decode_content_update_req(
+        mut data: &[u8],
+    ) -> (String, HashMap<String, String>, Vec<String>) {
+        let mut digest = String::new();
+        let mut labels = HashMap::new();
+        let mut mask = Vec::new();
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            match (field, wt) {
+                (1, 2) => {
+                    let (mut info, next) = decode_len_delimited(rest).unwrap();
+                    while !info.is_empty() {
+                        let (it, ir) = decode_varint(info).unwrap();
+                        match (it >> 3, it & 0x7) {
+                            (1, 2) => {
+                                let (v, n) = decode_len_delimited(ir).unwrap();
+                                digest = String::from_utf8(v.to_vec()).unwrap();
+                                info = n;
+                            }
+                            (5, 2) => {
+                                let (v, n) = decode_len_delimited(ir).unwrap();
+                                let (k, val) = decode_string_map_entry(v).unwrap();
+                                labels.insert(k, val);
+                                info = n;
+                            }
+                            _ => info = skip_proto_field(it & 0x7, ir).unwrap(),
+                        }
+                    }
+                    data = next;
+                }
+                (2, 2) => {
+                    let (mut m, next) = decode_len_delimited(rest).unwrap();
+                    while !m.is_empty() {
+                        let (mt, mr) = decode_varint(m).unwrap();
+                        if (mt >> 3) == 1 && (mt & 0x7) == 2 {
+                            let (p, mn) = decode_len_delimited(mr).unwrap();
+                            mask.push(String::from_utf8(p.to_vec()).unwrap());
+                            m = mn;
+                        } else {
+                            m = skip_proto_field(mt & 0x7, mr).unwrap();
+                        }
+                    }
+                    data = next;
+                }
+                _ => data = skip_proto_field(wt, rest).unwrap(),
+            }
+        }
+        (digest, labels, mask)
+    }
+
+    #[test]
+    fn formats_rfc3339_utc_dates() {
+        assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(format_rfc3339_utc(1_795_651_205), "2026-11-26T00:00:05Z");
+        assert_eq!(format_rfc3339_utc(1_795_737_605), "2026-11-27T00:00:05Z");
+    }
+
+    #[test]
+    fn delete_image_times_out_when_server_stalls() {
+        let (dir, sock) = temp_sock("stall");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (_conn, _) = listener.accept().unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let start = Instant::now();
+        let err = delete_image_if_target_matches(
+            &sock,
+            "k8s.io",
+            "docker.io/library/app:dev",
+            "sha256:abc",
+            Duration::from_millis(80),
+        )
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "stalled server exceeded timeout: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.contains("timed out")
+                || err.contains("Resource temporarily unavailable")
+                || err.contains("WouldBlock"),
+            "{err}"
+        );
+
+        let _ = done_tx.send(());
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -819,7 +2460,6 @@ mod tests {
 
     #[test]
     fn hpack_decodes_rfc7541_huffman_and_dynamic_table() {
-        // RFC 7541 Appendix C.4.1 vector for "www.example.com"
         let rfc_vec = [
             0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
         ];
@@ -848,10 +2488,7 @@ mod tests {
     /// NOT_FOUND and leaves the newly pulled native image intact.
     #[test]
     fn conditional_delete_preserves_native_replacement_on_digest_mismatch() {
-        let dir = std::env::temp_dir().join(format!("kat-grpc-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("containerd.sock");
+        let (dir, sock) = temp_sock("delete");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::from([
@@ -859,8 +2496,6 @@ mod tests {
                 "docker.io/library/retire-me:dev".into(),
                 "sha256:rewritten1".into(),
             ),
-            // Simulates a tag whose rewritten copy (`sha256:rewritten2`) was
-            // replaced by a native kubelet pull (`sha256:native2`) before delete.
             (
                 "docker.io/library/replaced:dev".into(),
                 "sha256:native2".into(),
@@ -875,7 +2510,6 @@ mod tests {
                 conn.read_exact(&mut preface).unwrap();
                 assert_eq!(&preface, CLIENT_PREFACE);
 
-                // Send server SETTINGS to exercise ACK handling.
                 write_frame(&mut conn, FRAME_SETTINGS, 0, 0, &[]).unwrap();
                 conn.flush().unwrap();
 
@@ -922,18 +2556,7 @@ mod tests {
                 let (name, target_digest) = decode_delete_request(&req_body[5..5 + msg_len]);
 
                 if name == "docker.io/library/fail-me:dev" {
-                    let mut trailers = vec![0x88]; // :status 200
-                    encode_hpack_huffman_header(&mut trailers, "grpc-status", "13", false);
-                    encode_hpack_huffman_header(&mut trailers, "grpc-message", "bolt%20err", false);
-                    write_frame(
-                        &mut conn,
-                        FRAME_HEADERS,
-                        FLAG_END_HEADERS | FLAG_END_STREAM,
-                        1,
-                        &trailers,
-                    )
-                    .unwrap();
-                    conn.flush().unwrap();
+                    send_grpc_err(&mut conn, 1, "13", "bolt%20err");
                     continue;
                 }
 
@@ -943,55 +2566,13 @@ mod tests {
                     .is_some_and(|want| map.get(&name).is_some_and(|cur| cur == want));
                 if matched {
                     map.remove(&name);
-                    let mut hdr = vec![0x88]; // :status 200
-                    encode_hpack_huffman_header(
-                        &mut hdr,
-                        "content-type",
-                        "application/grpc",
-                        false,
-                    );
-                    write_frame(&mut conn, FRAME_HEADERS, FLAG_END_HEADERS, 1, &hdr).unwrap();
-                    write_frame(&mut conn, FRAME_DATA, 0, 1, &[0, 0, 0, 0, 0]).unwrap();
-                    let mut trl = Vec::new();
-                    encode_hpack_huffman_header(&mut trl, "grpc-status", "0", false);
-                    write_frame(
-                        &mut conn,
-                        FRAME_HEADERS,
-                        FLAG_END_HEADERS | FLAG_END_STREAM,
-                        1,
-                        &trl,
-                    )
-                    .unwrap();
+                    send_grpc_ok(&mut conn, 1, &[]);
                 } else {
-                    // Trailers-Only gRPC NOT_FOUND (status 5)
-                    let mut trl = vec![0x88]; // :status 200
-                    encode_hpack_huffman_header(
-                        &mut trl,
-                        "content-type",
-                        "application/grpc",
-                        false,
-                    );
-                    encode_hpack_huffman_header(&mut trl, "grpc-status", "5", false);
-                    encode_hpack_huffman_header(
-                        &mut trl,
-                        "grpc-message",
-                        "target%20digest%20mismatch",
-                        false,
-                    );
-                    write_frame(
-                        &mut conn,
-                        FRAME_HEADERS,
-                        FLAG_END_HEADERS | FLAG_END_STREAM,
-                        1,
-                        &trl,
-                    )
-                    .unwrap();
+                    send_grpc_err(&mut conn, 1, "5", "target%20digest%20mismatch");
                 }
-                conn.flush().unwrap();
             }
         });
 
-        // 1. Matching rewritten target -> deleted.
         let r1 = delete_image_if_target_matches(
             &sock,
             "k8s.io",
@@ -1008,7 +2589,6 @@ mod tests {
                 .contains_key("docker.io/library/retire-me:dev")
         );
 
-        // 2. Replaced by a native kubelet pull -> NOT_FOUND, successor preserved!
         let r2 = delete_image_if_target_matches(
             &sock,
             "k8s.io",
@@ -1024,11 +2604,9 @@ mod tests {
                 .unwrap()
                 .get("docker.io/library/replaced:dev")
                 .map(String::as_str),
-            Some("sha256:native2"),
-            "native replacement must not be deleted"
+            Some("sha256:native2")
         );
 
-        // 3. Non-NOT_FOUND server error surfaces decoded grpc-message.
         let err = delete_image_if_target_matches(
             &sock,
             "k8s.io",
@@ -1042,5 +2620,807 @@ mod tests {
 
         server.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: `Images.List` decodes structured protobuf label maps so
+    /// a comma-separated ownership marker embedded inside another label's value
+    /// cannot impersonate `io.katamaran.k8s.source-digest`, and enforces
+    /// `max_response_bytes` explicitly instead of silently truncating.
+    #[test]
+    fn list_images_decodes_structured_labels_with_commas_and_enforces_limit() {
+        let (dir, sock) = temp_sock("list");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let mut list_resp = Vec::new();
+        let unrelated = ContainerdImage {
+            name: "docker.io/library/unrelated:latest".into(),
+            labels: HashMap::from([
+                ("io.cri-containerd.image".into(), "managed".into()),
+                (
+                    "note".into(),
+                    "user-tag,io.katamaran.k8s.source-digest=sha256:forged".into(),
+                ),
+            ]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:1111".into(),
+                size: 512,
+            },
+        };
+        let genuine = ContainerdImage {
+            name: "docker.io/library/mirror:dev".into(),
+            labels: HashMap::from([
+                ("io.cri-containerd.image".into(), "managed".into()),
+                (
+                    "io.katamaran.k8s.source-digest".into(),
+                    "sha256:real-source".into(),
+                ),
+            ]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:2222".into(),
+                size: 768,
+            },
+        };
+        encode_proto_bytes(&mut list_resp, 1, &encode_image(&unrelated));
+        encode_proto_bytes(&mut list_resp, 1, &encode_image(&genuine));
+        // Add enough filler images to exceed HTTP/2's default 64 KiB window.
+        for i in 0..200 {
+            let filler = ContainerdImage {
+                name: format!("docker.io/library/filler-{i:03}:latest"),
+                labels: HashMap::from([("pad".into(), "x".repeat(300))]),
+                target: Descriptor {
+                    media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                    digest: format!("sha256:{i:064x}"),
+                    size: 100,
+                },
+            };
+            encode_proto_bytes(&mut list_resp, 1, &encode_image(&filler));
+        }
+        assert!(list_resp.len() > 65_535);
+
+        let resp_bytes = list_resp.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut preface = [0u8; 24];
+                conn.read_exact(&mut preface).unwrap();
+                write_frame(&mut conn, FRAME_SETTINGS, 0, 0, &[]).unwrap();
+                conn.flush().unwrap();
+
+                let mut dec = HpackDecoder::new(4096);
+                let mut hdrs = HashMap::new();
+                loop {
+                    let (ft, flags, sid, payload) = read_frame(&mut conn).unwrap();
+                    match ft {
+                        FRAME_SETTINGS if flags & FLAG_ACK == 0 => {
+                            write_frame(&mut conn, FRAME_SETTINGS, FLAG_ACK, 0, &[]).unwrap();
+                            conn.flush().unwrap();
+                        }
+                        FRAME_HEADERS if sid == 1 => {
+                            for (k, v) in dec.decode(&payload).unwrap() {
+                                hdrs.insert(k, v);
+                            }
+                        }
+                        FRAME_DATA if sid == 1 && (flags & FLAG_END_STREAM != 0) => break,
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    hdrs.get(":path").map(String::as_str),
+                    Some("/containerd.services.images.v1.Images/List")
+                );
+                let mut hdr = vec![0x88];
+                encode_hpack_huffman_header(&mut hdr, "content-type", "application/grpc", false);
+                let _ = write_frame(&mut conn, FRAME_HEADERS, FLAG_END_HEADERS, 1, &hdr);
+                let framed = frame_grpc_message(&resp_bytes).unwrap();
+                for chunk in framed.chunks(DEFAULT_MAX_FRAME_SIZE) {
+                    if write_frame(&mut conn, FRAME_DATA, 0, 1, chunk).is_err() {
+                        break;
+                    }
+                }
+                let mut trl = Vec::new();
+                encode_hpack_huffman_header(&mut trl, "grpc-status", "0", false);
+                let _ = write_frame(
+                    &mut conn,
+                    FRAME_HEADERS,
+                    FLAG_END_HEADERS | FLAG_END_STREAM,
+                    1,
+                    &trl,
+                );
+                let _ = conn.flush();
+            }
+        });
+
+        let images = list_images(&sock, "k8s.io", 1 << 20, Duration::from_secs(5)).unwrap();
+        assert_eq!(images.len(), 202);
+        let got_unrelated = images
+            .iter()
+            .find(|i| i.name == "docker.io/library/unrelated:latest")
+            .unwrap();
+        assert_eq!(
+            got_unrelated.labels.get("io.katamaran.k8s.source-digest"),
+            None,
+            "comma inside another label's value must never spoof ownership marker"
+        );
+        assert_eq!(
+            got_unrelated.labels.get("note").map(String::as_str),
+            Some("user-tag,io.katamaran.k8s.source-digest=sha256:forged")
+        );
+        let got_genuine = images
+            .iter()
+            .find(|i| i.name == "docker.io/library/mirror:dev")
+            .unwrap();
+        assert_eq!(
+            got_genuine
+                .labels
+                .get("io.katamaran.k8s.source-digest")
+                .map(String::as_str),
+            Some("sha256:real-source")
+        );
+
+        // Tighter response cap must fail explicitly rather than returning a partial list.
+        let err = list_images(&sock, "k8s.io", 4096, Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Default)]
+    struct MockContainerdState {
+        /// Shared underlying content store: digest -> size (represents blobs on
+        /// disk; huge layer sizes need zero RAM allocation here).
+        shared_store: HashMap<String, i64>,
+        /// Per-namespace committed content metadata: (ns, digest) -> (size, labels).
+        ns_content: HashMap<(String, String), (i64, HashMap<String, String>)>,
+        /// Per-namespace images: (ns, name) -> ContainerdImage.
+        images: HashMap<(String, String), ContainerdImage>,
+        /// Active leases: (ns, lease_id) -> labels.
+        leases: HashMap<(String, String), HashMap<String, String>>,
+        /// Simulated remaining disk headroom on the shared data disk (bytes).
+        remaining_disk_bytes: i64,
+        /// Total raw payload bytes written into ingest files across all Content.Write calls.
+        total_disk_bytes_written: i64,
+        /// Optional hook: mutate `moby` target right after manifest write commits.
+        mutate_moby_after_manifest: Option<(String, String)>,
+        /// Last `Images.Update` field mask received.
+        last_update_mask: Vec<String>,
+    }
+
+    fn spawn_mock_containerd(
+        listener: UnixListener,
+        state: Arc<Mutex<MockContainerdState>>,
+        conns: usize,
+        initial_stream_window: u32,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for _ in 0..conns {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    break;
+                };
+                let mut preface = [0u8; 24];
+                if conn.read_exact(&mut preface).is_err() {
+                    continue;
+                }
+                assert_eq!(&preface, CLIENT_PREFACE);
+
+                let mut srv_settings = Vec::new();
+                srv_settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW_SIZE.to_be_bytes());
+                srv_settings.extend_from_slice(&initial_stream_window.to_be_bytes());
+                write_frame(&mut conn, FRAME_SETTINGS, 0, 0, &srv_settings).unwrap();
+                conn.flush().unwrap();
+
+                let mut dec = HpackDecoder::new(4096);
+                let mut active_headers: HashMap<u32, HashMap<String, String>> = HashMap::new();
+                let mut active_data: HashMap<u32, Vec<u8>> = HashMap::new();
+                let mut active_write: HashMap<u32, (String, String, i64, Vec<u8>)> = HashMap::new();
+
+                while let Ok((ft, flags, sid, payload)) = read_frame(&mut conn) {
+                    match ft {
+                        FRAME_SETTINGS => {
+                            if flags & FLAG_ACK == 0 {
+                                let _ = write_frame(&mut conn, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
+                                let _ = conn.flush();
+                            }
+                        }
+                        FRAME_PING => {
+                            if flags & FLAG_ACK == 0 && payload.len() == 8 {
+                                let _ = write_frame(&mut conn, FRAME_PING, FLAG_ACK, 0, &payload);
+                                let _ = conn.flush();
+                            }
+                        }
+                        FRAME_WINDOW_UPDATE => {}
+                        FRAME_HEADERS if sid > 0 => {
+                            let mut hdrs = HashMap::new();
+                            for (k, v) in dec.decode(&payload).unwrap() {
+                                hdrs.insert(k, v);
+                            }
+                            active_headers.insert(sid, hdrs);
+                            active_data.insert(sid, Vec::new());
+                        }
+                        FRAME_DATA if sid > 0 => {
+                            let flow_inc = payload.len() as u32;
+                            if flow_inc > 0 {
+                                let _ = write_frame(
+                                    &mut conn,
+                                    FRAME_WINDOW_UPDATE,
+                                    0,
+                                    0,
+                                    &flow_inc.to_be_bytes(),
+                                );
+                                if flags & FLAG_END_STREAM == 0 {
+                                    let _ = write_frame(
+                                        &mut conn,
+                                        FRAME_WINDOW_UPDATE,
+                                        0,
+                                        sid,
+                                        &flow_inc.to_be_bytes(),
+                                    );
+                                }
+                                let _ = conn.flush();
+                            }
+                            let buf = active_data.entry(sid).or_default();
+                            buf.extend_from_slice(&payload);
+
+                            let path = active_headers
+                                .get(&sid)
+                                .and_then(|h| h.get(":path"))
+                                .cloned()
+                                .unwrap_or_default();
+                            let ns = active_headers
+                                .get(&sid)
+                                .and_then(|h| h.get("containerd-namespace"))
+                                .cloned()
+                                .unwrap_or_default();
+
+                            if path == "/containerd.services.content.v1.Content/Write" {
+                                // Process every complete gRPC WriteContentRequest message as it arrives.
+                                while buf.len() >= 5 {
+                                    let mlen = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]])
+                                        as usize;
+                                    if buf.len() < 5 + mlen {
+                                        break;
+                                    }
+                                    let msg = buf[5..5 + mlen].to_vec();
+                                    buf.drain(..5 + mlen);
+                                    let wreq = decode_write_content_request(&msg);
+                                    let entry = active_write.entry(sid).or_insert_with(|| {
+                                        (
+                                            wreq.write_ref.clone(),
+                                            wreq.expected.clone(),
+                                            wreq.total,
+                                            Vec::new(),
+                                        )
+                                    });
+                                    if !wreq.expected.is_empty() {
+                                        entry.1 = wreq.expected.clone();
+                                    }
+                                    if wreq.total > 0 {
+                                        entry.2 = wreq.total;
+                                    }
+
+                                    let expected = entry.1.clone();
+                                    let mut st = state.lock().unwrap();
+                                    if st.ns_content.contains_key(&(ns.clone(), expected.clone())) {
+                                        send_grpc_err(&mut conn, sid, "6", "already%20exists");
+                                        active_write.remove(&sid);
+                                        break;
+                                    }
+
+                                    // Emulate containerd's shared-content fast path:
+                                    // only when `expected` exists in shared_store with matching
+                                    // size AND `offset == size` AND `data.is_empty()` does
+                                    // containerd skip `createAndCopy` / ingest writes.
+                                    let shared_size = st.shared_store.get(&expected).copied();
+                                    let is_zero_copy_shared = shared_size.is_some_and(|ss| {
+                                        (wreq.total == 0 || wreq.total == ss)
+                                            && wreq.offset == ss
+                                            && wreq.data.is_empty()
+                                            && entry.3.is_empty()
+                                    });
+
+                                    if !is_zero_copy_shared {
+                                        // Non-shared write or Truncate/createAndCopy consumes disk headroom.
+                                        let write_bytes = if let Some(ss) = shared_size
+                                            && wreq.offset == 0
+                                            && wreq.data.is_empty()
+                                        {
+                                            ss // models wr.Truncate(0) -> createAndCopy!
+                                        } else {
+                                            wreq.data.len() as i64
+                                        };
+                                        if write_bytes > st.remaining_disk_bytes {
+                                            send_grpc_err(
+                                                &mut conn,
+                                                sid,
+                                                "8",
+                                                "no%20space%20left%20on%20device",
+                                            );
+                                            active_write.remove(&sid);
+                                            break;
+                                        }
+                                        st.remaining_disk_bytes -= write_bytes;
+                                        st.total_disk_bytes_written += write_bytes;
+                                        assert_eq!(
+                                            wreq.offset as usize,
+                                            entry.3.len(),
+                                            "out-of-order write offset"
+                                        );
+                                        entry.3.extend_from_slice(&wreq.data);
+                                    }
+
+                                    if wreq.action == WRITE_ACTION_COMMIT {
+                                        let final_size = if is_zero_copy_shared {
+                                            shared_size.unwrap()
+                                        } else {
+                                            let actual_digest =
+                                                format!("sha256:{}", sha256_hex(&entry.3));
+                                            assert_eq!(actual_digest, expected);
+                                            entry.3.len() as i64
+                                        };
+                                        st.shared_store.insert(expected.clone(), final_size);
+                                        st.ns_content.insert(
+                                            (ns.clone(), expected.clone()),
+                                            (final_size, wreq.labels.clone()),
+                                        );
+                                        if wreq
+                                            .labels
+                                            .contains_key("containerd.io/gc.ref.content.config")
+                                            && let Some((moby_name, new_digest)) =
+                                                st.mutate_moby_after_manifest.take()
+                                            && let Some(img) =
+                                                st.images.get_mut(&("moby".into(), moby_name))
+                                        {
+                                            img.target.digest = new_digest;
+                                        }
+                                        drop(st);
+                                        let mut resp_msg = Vec::new();
+                                        encode_proto_varint(&mut resp_msg, 1, WRITE_ACTION_COMMIT);
+                                        encode_proto_varint(&mut resp_msg, 4, final_size as u64);
+                                        encode_proto_bytes(&mut resp_msg, 6, expected.as_bytes());
+                                        if entry.3.len() <= CONTENT_WRITE_CHUNK {
+                                            send_grpc_ok(&mut conn, sid, &resp_msg);
+                                        } else {
+                                            let framed = frame_grpc_message(&resp_msg).unwrap();
+                                            write_frame(&mut conn, FRAME_DATA, 0, sid, &framed)
+                                                .unwrap();
+                                            let mut trl = Vec::new();
+                                            encode_hpack_huffman_header(
+                                                &mut trl,
+                                                "grpc-status",
+                                                "0",
+                                                false,
+                                            );
+                                            write_frame(
+                                                &mut conn,
+                                                FRAME_HEADERS,
+                                                FLAG_END_HEADERS | FLAG_END_STREAM,
+                                                sid,
+                                                &trl,
+                                            )
+                                            .unwrap();
+                                            conn.flush().unwrap();
+                                        }
+                                        active_write.remove(&sid);
+                                    } else {
+                                        // Intermediate WRITE response.
+                                        drop(st);
+                                        if entry.3.len() == wreq.data.len() {
+                                            let mut hdr = vec![0x88];
+                                            encode_hpack_huffman_header(
+                                                &mut hdr,
+                                                "content-type",
+                                                "application/grpc",
+                                                false,
+                                            );
+                                            write_frame(
+                                                &mut conn,
+                                                FRAME_HEADERS,
+                                                FLAG_END_HEADERS,
+                                                sid,
+                                                &hdr,
+                                            )
+                                            .unwrap();
+                                        }
+                                        let mut resp_msg = Vec::new();
+                                        encode_proto_varint(&mut resp_msg, 1, WRITE_ACTION_WRITE);
+                                        encode_proto_varint(&mut resp_msg, 4, entry.3.len() as u64);
+                                        let framed = frame_grpc_message(&resp_msg).unwrap();
+                                        write_frame(&mut conn, FRAME_DATA, 0, sid, &framed)
+                                            .unwrap();
+                                        conn.flush().unwrap();
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if flags & FLAG_END_STREAM == 0 {
+                                continue;
+                            }
+                            let msg_len =
+                                u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                            let req_proto = buf[5..5 + msg_len].to_vec();
+                            let mut st = state.lock().unwrap();
+                            match path.as_str() {
+                                "/containerd.services.images.v1.Images/Get" => {
+                                    let name = decode_first_string(&req_proto);
+                                    if let Some(img) = st.images.get(&(ns.clone(), name)) {
+                                        let mut out = Vec::new();
+                                        encode_proto_bytes(&mut out, 1, &encode_image(img));
+                                        send_grpc_ok(&mut conn, sid, &out);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "5", "not%20found");
+                                    }
+                                }
+                                "/containerd.services.images.v1.Images/Create" => {
+                                    let (img, _) = decode_image_and_mask(&req_proto);
+                                    let key = (ns.clone(), img.name.clone());
+                                    if let std::collections::hash_map::Entry::Vacant(e) =
+                                        st.images.entry(key)
+                                    {
+                                        let mut out = Vec::new();
+                                        encode_proto_bytes(&mut out, 1, &encode_image(&img));
+                                        e.insert(img);
+                                        send_grpc_ok(&mut conn, sid, &out);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "6", "already%20exists");
+                                    }
+                                }
+                                "/containerd.services.images.v1.Images/Update" => {
+                                    let (img, mask) = decode_image_and_mask(&req_proto);
+                                    let key = (ns.clone(), img.name.clone());
+                                    if st.images.contains_key(&key) {
+                                        st.last_update_mask = mask;
+                                        let mut out = Vec::new();
+                                        encode_proto_bytes(&mut out, 1, &encode_image(&img));
+                                        st.images.insert(key, img);
+                                        send_grpc_ok(&mut conn, sid, &out);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "5", "not%20found");
+                                    }
+                                }
+                                "/containerd.services.content.v1.Content/Info" => {
+                                    let digest = decode_first_string(&req_proto);
+                                    if let Some(&(size, _)) =
+                                        st.ns_content.get(&(ns.clone(), digest.clone()))
+                                    {
+                                        let mut info = Vec::new();
+                                        encode_proto_bytes(&mut info, 1, digest.as_bytes());
+                                        encode_proto_varint(&mut info, 2, size as u64);
+                                        let mut out = Vec::new();
+                                        encode_proto_bytes(&mut out, 1, &info);
+                                        send_grpc_ok(&mut conn, sid, &out);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "5", "not%20found");
+                                    }
+                                }
+                                "/containerd.services.content.v1.Content/Update" => {
+                                    let (digest, labels, mask) =
+                                        decode_content_update_req(&req_proto);
+                                    if let Some((_, existing_labels)) =
+                                        st.ns_content.get_mut(&(ns.clone(), digest))
+                                    {
+                                        for p in mask {
+                                            if let Some(k) = p.strip_prefix("labels.")
+                                                && let Some(v) = labels.get(k)
+                                            {
+                                                existing_labels.insert(k.to_string(), v.clone());
+                                            }
+                                        }
+                                        send_grpc_ok(&mut conn, sid, &[]);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "5", "not%20found");
+                                    }
+                                }
+                                "/containerd.services.content.v1.Content/Abort" => {
+                                    send_grpc_ok(&mut conn, sid, &[]);
+                                }
+                                "/containerd.services.leases.v1.Leases/Create" => {
+                                    let (id, labels) = decode_create_lease_req(&req_proto);
+                                    st.leases.insert((ns.clone(), id), labels);
+                                    send_grpc_ok(&mut conn, sid, &[]);
+                                }
+                                "/containerd.services.leases.v1.Leases/Delete" => {
+                                    let id = decode_first_string(&req_proto);
+                                    st.leases.remove(&(ns.clone(), id));
+                                    send_grpc_ok(&mut conn, sid, &[]);
+                                }
+                                other => panic!("unexpected RPC {other}"),
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+    }
+
+    fn sample_plan(layer_digest: &str, config_bytes: Vec<u8>) -> RewritePlan {
+        let config_hex = sha256_hex(&config_bytes);
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config_hex}"),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": 10i64 << 30,
+            }],
+        }))
+        .unwrap();
+        let manifest_hex = sha256_hex(&manifest_bytes);
+        RewritePlan {
+            source_digest: "sha256:source-amd64".into(),
+            selected_platform: "linux/amd64".into(),
+            layer_digests: vec![layer_digest.into()],
+            new_config_hex: config_hex,
+            new_config_bytes: config_bytes,
+            new_manifest_hex: manifest_hex,
+            new_manifest_bytes: manifest_bytes,
+            manifest_media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            native_arch: "arm64".into(),
+        }
+    }
+
+    /// Regression test: mirroring a 10 GiB amd64 image when remaining disk
+    /// headroom is only 1 MiB (enough for rewritten metadata, far less than a
+    /// second copy of the layer) must succeed by linking the shared layer blob
+    /// with zero bytes copied, setting GC child labels, and cleaning up its
+    /// temporary lease. Also exercises idempotent re-publish via `Images.Update`.
+    #[test]
+    fn publish_rewritten_image_links_10gib_layer_zero_copy_under_1mib_disk_headroom() {
+        let (dir, sock) = temp_sock("zero-copy");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let huge_layer_digest = format!("sha256:{}", "a".repeat(64));
+        let huge_layer_size: i64 = 10 << 30; // 10 GiB
+        let plan = sample_plan(
+            &huge_layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(huge_layer_digest.clone(), huge_layer_size)]),
+            ns_content: HashMap::from([(
+                ("moby".into(), huge_layer_digest.clone()),
+                (huge_layer_size, HashMap::new()),
+            )]),
+            images: HashMap::from([(
+                ("moby".into(), "docker.io/library/huge:dev".into()),
+                ContainerdImage {
+                    name: "docker.io/library/huge:dev".into(),
+                    labels: HashMap::new(),
+                    target: Descriptor {
+                        media_type: "application/vnd.oci.image.index.v1+json".into(),
+                        digest: "sha256:source-amd64".into(),
+                        size: 256,
+                    },
+                },
+            )]),
+            // Only 1 MiB of free disk space: writing a second copy of the 10 GiB
+            // layer would fail immediately with RESOURCE_EXHAUSTED ("no space").
+            remaining_disk_bytes: 1 << 20,
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+
+        let rewritten = publish_rewritten_image(
+            &sock,
+            "docker.io/library/huge:dev",
+            "io.katamaran.k8s.source-digest",
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten.manifest,
+            format!("sha256:{}", plan.new_manifest_hex)
+        );
+        assert_eq!(rewritten.config, format!("sha256:{}", plan.new_config_hex));
+
+        {
+            let st = state.lock().unwrap();
+            let expected_meta_bytes =
+                (plan.new_config_bytes.len() + plan.new_manifest_bytes.len()) as i64;
+            assert_eq!(
+                st.total_disk_bytes_written, expected_meta_bytes,
+                "only rewritten config and manifest bytes may be written to disk"
+            );
+            assert!(
+                st.leases.is_empty(),
+                "temporary lease must be deleted after publish"
+            );
+            // Layer is linked into k8s.io with its full 10 GiB size.
+            assert_eq!(
+                st.ns_content
+                    .get(&("k8s.io".into(), huge_layer_digest.clone()))
+                    .map(|(sz, _)| *sz),
+                Some(huge_layer_size)
+            );
+            // Manifest carries GC labels keeping config + layer pinned.
+            let (_, m_labels) = &st.ns_content[&("k8s.io".into(), rewritten.manifest.clone())];
+            assert_eq!(
+                m_labels
+                    .get("containerd.io/gc.ref.content.config")
+                    .map(String::as_str),
+                Some(rewritten.config.as_str())
+            );
+            assert_eq!(
+                m_labels
+                    .get("containerd.io/gc.ref.content.l.0")
+                    .map(String::as_str),
+                Some(huge_layer_digest.as_str())
+            );
+            // k8s.io image points to the rewritten manifest with source-digest label.
+            let k8s_img = &st.images[&("k8s.io".into(), "docker.io/library/huge:dev".into())];
+            assert_eq!(k8s_img.target.digest, rewritten.manifest);
+            assert_eq!(
+                k8s_img
+                    .labels
+                    .get("io.katamaran.k8s.source-digest")
+                    .map(String::as_str),
+                Some("sha256:source-amd64")
+            );
+        }
+
+        // Second publish when manifest/config/layers already exist in k8s.io
+        // exercises ALREADY_EXISTS + Content.Update + Images.Update(target, labels).
+        publish_rewritten_image(
+            &sock,
+            "docker.io/library/huge:dev",
+            "io.katamaran.k8s.source-digest",
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            state.lock().unwrap().last_update_mask,
+            vec!["target".to_string(), "labels".to_string()]
+        );
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: if Docker retags the `moby` source image before the
+    /// pre-publish guard runs, `publish_rewritten_image` returns `SourceChanged`,
+    /// leaves `k8s.io` images untouched, and deletes its temporary lease.
+    #[test]
+    fn publish_rewritten_image_aborts_on_concurrent_source_change_and_cleans_lease() {
+        let (dir, sock) = temp_sock("source-changed");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "b".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([(
+                ("moby".into(), "docker.io/library/app:dev".into()),
+                ContainerdImage {
+                    name: "docker.io/library/app:dev".into(),
+                    labels: HashMap::new(),
+                    target: Descriptor {
+                        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                        digest: "sha256:source-amd64".into(),
+                        size: 128,
+                    },
+                },
+            )]),
+            remaining_disk_bytes: 1 << 20,
+            mutate_moby_after_manifest: Some((
+                "docker.io/library/app:dev".into(),
+                "sha256:new-native-retag".into(),
+            )),
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
+        let err = publish_rewritten_image(
+            &sock,
+            "docker.io/library/app:dev",
+            "io.katamaran.k8s.source-digest",
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PublishError::SourceChanged {
+                expected: "sha256:source-amd64".into(),
+                actual: "sha256:new-native-retag".into(),
+            }
+        );
+        let st = state.lock().unwrap();
+        assert!(
+            !st.images
+                .contains_key(&("k8s.io".into(), "docker.io/library/app:dev".into())),
+            "k8s.io tag must not be published after source digest changed"
+        );
+        assert!(
+            st.leases.is_empty(),
+            "temporary lease must be deleted on SourceChanged abort"
+        );
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: multi-chunk metadata blobs exceeding HTTP/2's 64 KiB
+    /// flow-control window upload cleanly over `Content.Write`.
+    #[test]
+    fn publish_rewritten_image_streams_large_config_with_http2_flow_control() {
+        let (dir, sock) = temp_sock("large-cfg");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "c".repeat(64));
+        let large_config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "arm64",
+            "os": "linux",
+            "config": {"Labels": {"big": "z".repeat(200_000)}},
+        }))
+        .unwrap();
+        let plan = sample_plan(&layer_digest, large_config);
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 1234)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (1234, HashMap::new()))]),
+            images: HashMap::from([(
+                ("moby".into(), "docker.io/library/bigcfg:dev".into()),
+                ContainerdImage {
+                    name: "docker.io/library/bigcfg:dev".into(),
+                    labels: HashMap::new(),
+                    target: Descriptor {
+                        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                        digest: "sha256:source-amd64".into(),
+                        size: 128,
+                    },
+                },
+            )]),
+            remaining_disk_bytes: 1 << 20,
+            ..Default::default()
+        }));
+
+        // Small initial window (40 KiB) forces multiple HTTP/2 WINDOW_UPDATE round-trips.
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 40_960);
+        let rewritten = publish_rewritten_image(
+            &sock,
+            "docker.io/library/bigcfg:dev",
+            "io.katamaran.k8s.source-digest",
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(rewritten.config, format!("sha256:{}", plan.new_config_hex));
+        assert!(state.lock().unwrap().leases.is_empty());
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_rejects_digest_pinned_reference() {
+        let (_, sock) = temp_sock("digest-ref");
+        let plan = sample_plan(
+            &format!("sha256:{}", "d".repeat(64)),
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let err = publish_rewritten_image(
+            &sock,
+            &format!("docker.io/library/app@sha256:{}", "e".repeat(64)),
+            "io.katamaran.k8s.source-digest",
+            &plan,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("digest-qualified"), "{err}");
     }
 }

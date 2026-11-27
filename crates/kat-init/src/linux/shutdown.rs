@@ -11,8 +11,9 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -155,106 +156,7 @@ fn stop_containers(timeout: Duration) -> usize {
 
 /// Connect to a Unix domain stream socket without blocking past `deadline`.
 fn connect_unix_until(path: &str, deadline: Instant) -> Option<UnixStream> {
-    let bytes = path.as_bytes();
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() {
-        return None;
-    }
-    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
-        *dst = src as libc::c_char;
-    }
-    let addr_len =
-        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
-
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-
-    loop {
-        let rem = deadline.checked_duration_since(Instant::now())?;
-        if rem.is_zero() {
-            return None;
-        }
-        let rc = unsafe {
-            libc::connect(
-                fd.as_raw_fd(),
-                (&addr as *const libc::sockaddr_un).cast(),
-                addr_len,
-            )
-        };
-        if rc == 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EAGAIN) => {
-                // On Linux, non-blocking AF_UNIX connect returns EAGAIN when
-                // the listener backlog is full; retry until deadline.
-                thread::sleep(rem.min(Duration::from_millis(10)));
-            }
-            Some(libc::EINPROGRESS) => {
-                loop {
-                    let rem = deadline.checked_duration_since(Instant::now())?;
-                    if rem.is_zero() {
-                        return None;
-                    }
-                    let mut pfd = libc::pollfd {
-                        fd: fd.as_raw_fd(),
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    let timeout_ms = rem.as_millis().min(i32::MAX as u128) as i32;
-                    let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-                    if prc < 0 {
-                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                        {
-                            continue;
-                        }
-                        return None;
-                    }
-                    if prc == 0 {
-                        return None;
-                    }
-                    break;
-                }
-                let mut so_err: libc::c_int = 0;
-                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                let grc = unsafe {
-                    libc::getsockopt(
-                        fd.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        (&mut so_err as *mut libc::c_int).cast(),
-                        &mut len,
-                    )
-                };
-                if grc < 0 || so_err != 0 {
-                    return None;
-                }
-                break;
-            }
-            _ => return None,
-        }
-    }
-
-    // Clear O_NONBLOCK so subsequent write/read calls honor SO_SNDTIMEO/SO_RCVTIMEO.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
-    {
-        return None;
-    }
-    Some(UnixStream::from(fd))
+    crate::unix_connect::connect_unix_until(Path::new(path), deadline).ok()
 }
 
 /// Send an HTTP/1.0 request without a body over the Docker socket, bounded by

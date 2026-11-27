@@ -13,6 +13,8 @@ mod linux;
 mod nofile;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod oci_rewrite;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod unix_connect;
 
 #[cfg(target_os = "linux")]
 fn main() {
