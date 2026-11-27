@@ -3629,6 +3629,11 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 SyncAction::Relist => {
                     retry_refs.insert(name);
                 }
+                SyncAction::ReportUnownedDestination => {
+                    let msg = unowned_destination_message(&name);
+                    log(&msg);
+                    failures.push(msg);
+                }
                 SyncAction::RetireRewritten => {
                     if let Some(k) = k8s_img {
                         match retire_rewritten_image(&name, Some(&img.digest), &k.digest) {
@@ -3736,9 +3741,12 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         }
                     };
                     let selected_platform = plan.selected_platform.clone();
+                    // `plan_sync_action` only chooses `MirrorRewrite` over an
+                    // existing `k8s.io` tag when it is a Katamaran mirror;
+                    // `publish_rewritten_image` re-verifies that ownership
+                    // before deleting anything.
                     let expected_k8s = k8s_img.map(|k| containerd_grpc::ExpectedK8sTarget {
                         digest: k.digest.as_str(),
-                        is_katamaran_mirror: k.label(SOURCE_DIGEST_LABEL).is_some(),
                         is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
                     });
                     match containerd_grpc::publish_rewritten_image(
@@ -3748,9 +3756,6 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         expected_k8s,
                         &plan,
                         Duration::from_secs(120),
-                        |digest| {
-                            probe_content_native_complete(reaper, "k8s.io", digest, NATIVE_ARCH)
-                        },
                     ) {
                         Ok(_) => log(&format!(
                             "mirrored amd64 image {name} ({selected_platform}) as linux/{NATIVE_ARCH} (runs under emulation)"
@@ -3842,11 +3847,29 @@ enum NativeAvailability {
 enum SyncAction {
     Skip,
     SkipDigestAmd64,
-    MirrorNative { clear_source_label: bool },
+    MirrorNative {
+        clear_source_label: bool,
+    },
     MirrorRewrite,
     RetireRewritten,
     Relist,
     ReportProbeError,
+    /// `k8s.io` already has an unlabelled tag (not a Katamaran mirror) under
+    /// this name without complete local native content. It is never replaced
+    /// (a Delete→Create swap cannot be made atomic, and an interrupted swap
+    /// could lose a tag Katamaran cannot rebuild); the user is told how to
+    /// resolve the conflict instead.
+    ReportUnownedDestination,
+}
+
+fn unowned_destination_message(name: &str) -> String {
+    format!(
+        "{name}: not mirroring amd64 image under emulation because Kubernetes already has \
+         an image with this name that katamaran did not create and that has no local \
+         linux/{NATIVE_ARCH} content; katamaran never replaces it. Tag the Docker image \
+         under a different local name (`docker tag {name} <new-name>`) and use that name \
+         in the pod spec"
+    )
 }
 
 /// True when a strict native-content probe is needed to tell whether `moby`
@@ -4004,12 +4027,14 @@ fn plan_sync_action(
                         // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
                         SyncAction::MirrorRewrite
                     } else {
-                        // Unlabelled `k8s.io` image (e.g. pulled natively by kubelet):
-                        // only preserve it when local native arm64 content is verified
-                        // complete (not merely advertised in `ctr images ls`).
+                        // Unlabelled `k8s.io` image (e.g. pulled natively by kubelet
+                        // or `ctr`, or a native mirror): never replaced. Stay quiet
+                        // when its local native arm64 content is verified complete
+                        // (not merely advertised in `ctr images ls`); otherwise tell
+                        // the user how to resolve the name conflict.
                         match dest_native {
                             NativeAvailability::Present => SyncAction::Skip,
-                            NativeAvailability::Absent => SyncAction::MirrorRewrite,
+                            NativeAvailability::Absent => SyncAction::ReportUnownedDestination,
                             NativeAvailability::Stale => SyncAction::Relist,
                             NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
                         }
@@ -4075,39 +4100,6 @@ fn probe_native_complete(
         oci_rewrite::NativeManifestCheck::Complete => Ok(NativeAvailability::Present),
         oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
         oci_rewrite::NativeManifestCheck::RootMissing => Ok(NativeAvailability::Stale),
-    }
-}
-
-/// Directly check whether `digest` in `namespace`'s content store has a
-/// locally complete native `linux/<native_arch>` manifest (used by
-/// `publish_rewritten_image` before and immediately after deleting an
-/// unlabelled `k8s.io` tag while `digest` is pinned under the publish lease).
-fn probe_content_native_complete(
-    reaper: &Reaper,
-    namespace: &str,
-    digest: &str,
-    native_arch: &str,
-) -> Result<bool, String> {
-    let mut client = containerd_grpc::ContentInfoClient::connect(
-        Path::new(CONTAINERD_SOCKET),
-        Duration::from_secs(30),
-    )?;
-    let mut store = MobyContentStore::new(
-        GrpcNamespaceMeta {
-            client: &mut client,
-            namespace,
-        },
-        |d: &str, max_bytes: usize| get_ctr_content_blob(reaper, namespace, d, max_bytes),
-        |d: &str| inspect_ctr_config_platform(reaper, namespace, d),
-    );
-    match oci_rewrite::has_complete_native_manifest(
-        digest,
-        oci_rewrite::NativePlatform::linux(native_arch, None),
-        &mut store,
-    )? {
-        oci_rewrite::NativeManifestCheck::Complete => Ok(true),
-        oci_rewrite::NativeManifestCheck::Incomplete
-        | oci_rewrite::NativeManifestCheck::RootMissing => Ok(false),
     }
 }
 
@@ -5047,12 +5039,11 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         );
     }
 
-    /// Regression test: an unlabelled `k8s.io` multi-platform index advertising
-    /// `linux/arm64` in `ctr images ls` MUST NOT suppress an amd64 rewrite
-    /// unless local `linux/arm64` content is verified complete in `k8s.io`.
-    /// Distinguishes incomplete arm64 (allows guarded rewrite), verified arm64
-    /// (preserves destination), probe error (preserves destination and reports
-    /// error), and stale digest (requests relist).
+    /// Regression test: an unlabelled `k8s.io` tag is never replaced by an
+    /// amd64 rewrite. Its native completeness only decides how it is reported:
+    /// incomplete arm64 (conflict reported to the user), verified arm64
+    /// (silently preserved), probe error (preserved, error reported), and
+    /// stale digest (relist).
     #[test]
     fn unlabelled_destination_index_requires_verified_local_arm64_content() {
         let moby_amd64 = ctr_img("sha256:moby-amd64", "linux/amd64", &[]);
@@ -5067,7 +5058,8 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             "arm64"
         ));
 
-        // 1. Only amd64 blobs cached under k8s.io's multi-arch index -> Absent -> MirrorRewrite!
+        // 1. Only amd64 blobs cached under k8s.io's multi-arch index -> Absent ->
+        //    conflict reported, tag never replaced.
         let incomplete_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Absent);
         let dest_incomplete = classify_dest_native_availability(
             Some(&k8s_multi_index),
@@ -5085,7 +5077,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Enabled,
                 "arm64"
             ),
-            SyncAction::MirrorRewrite
+            SyncAction::ReportUnownedDestination
         );
 
         // 2. Verified complete local arm64 content in k8s.io -> Present -> Skip (preserve!).
@@ -5211,7 +5203,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
 
         // Emulation on: preserve an existing unlabelled native Kubernetes image
         // when its local arm64 content is verified complete, re-list if drifted,
-        // and rewrite an unlabelled amd64-only tag in k8s.io.
+        // and report (never replace) an unlabelled amd64-only tag in k8s.io.
         assert_eq!(
             plan_sync_action(
                 "app:dev",
@@ -5260,7 +5252,11 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Enabled,
                 "arm64"
             ),
-            SyncAction::MirrorRewrite
+            SyncAction::ReportUnownedDestination
+        );
+        assert!(
+            unowned_destination_message("app:dev").contains("docker tag app:dev"),
+            "conflict message must tell the user how to resolve it"
         );
 
         // Emulation disabled for an amd64-only index: retire Katamaran's rewritten
