@@ -126,6 +126,9 @@ pub fn read_k3s_config(home: &Path) -> anyhow::Result<Option<String>> {
 /// Build the guest `K8sMsg::Start` request from `config.toml` and optional `<home>/k3s-config.yaml`.
 pub fn build_start_msg(home: &Path) -> anyhow::Result<K8sMsg> {
     let cfg = crate::config::Config::load(home)?;
+    // config.toml may have been edited by hand: report reserved or
+    // credential-bearing k8s_args here, before anything reaches the guest.
+    k8s::validate_k3s_extra_args(&cfg.k8s_args).map_err(anyhow::Error::msg)?;
     let extra_args = cfg.k8s_server_extra_args();
     let config_yaml = read_k3s_config(home)?;
     Ok(K8sMsg::Start {
@@ -209,24 +212,16 @@ pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
 }
 
 /// Query the guest Kubernetes service's capability bitmask (see `kat_proto::k8s::CAP_*`).
-/// Older guests reject `Capabilities` by closing the connection; when the guest
-/// still responds to `Status`, this returns `Ok(0)`.
+/// Older guests fail to decode `Capabilities` and close the connection without
+/// replying; only that signal (clean close, EOF or reset after the request),
+/// confirmed by a working `Status` call, maps to `Ok(0)`. Write failures and
+/// `Error` replies are real errors.
 pub fn guest_capabilities(home: &Path) -> anyhow::Result<u32> {
     let mut s = connect(home)?;
-    if let Err(e) = k8s::write(&mut s, &K8sMsg::Capabilities) {
-        if guest_status(home).is_ok() {
-            return Ok(0);
-        }
-        return Err(e.into());
-    }
+    k8s::write(&mut s, &K8sMsg::Capabilities)?;
     match k8s::read(&mut s) {
         Ok(Some(K8sMsg::CapabilitiesInfo(caps))) => Ok(caps),
-        Ok(Some(K8sMsg::Error(e))) => {
-            if guest_status(home).is_ok() {
-                return Ok(0);
-            }
-            bail!("{e}");
-        }
+        Ok(Some(K8sMsg::Error(e))) => bail!("{e}"),
         Ok(None) => {
             if guest_status(home).is_ok() {
                 return Ok(0);

@@ -1167,9 +1167,11 @@ impl Daemon {
             crate::k8s::DnsServer,
             PathBuf,
         )> {
-            crate::k8s::ensure_installed(&self.home, progress)?;
+            // Validate config.toml / k3s-config.yaml and guest support before
+            // spending time downloading and installing k3s.
             let start_msg = crate::k8s::build_start_msg(&self.home)?;
             crate::k8s::ensure_start_supported(&self.home, &start_msg)?;
+            crate::k8s::ensure_installed(&self.home, progress)?;
             let info = match crate::k8s::request(&self.home, &start_msg, progress)? {
                 kat_proto::k8s::K8sMsg::StatusInfo(info) => info,
                 other => anyhow::bail!("unexpected k8s start reply {other:?}"),

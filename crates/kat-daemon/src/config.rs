@@ -166,6 +166,9 @@ impl Config {
         let path = Config::path(home);
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = home.join(format!("{FILE_NAME}.tmp.{}.{n}", std::process::id()));
+        // A crash mid-save can leave this name behind for a later process
+        // with the same PID; `create_new` below would then always fail.
+        let _ = fs::remove_file(&tmp);
         let text = format!(
             "# katamaran settings; applied at the next VM start.\n{}",
             toml::to_string(self)?
@@ -248,7 +251,13 @@ impl Config {
                 }
             }
             "k8s_disable" => next.k8s_disable = parse_k8s_disable(value)?,
-            "k8s_args" => next.k8s_args = parse_k8s_args(value)?,
+            "k8s_args" => {
+                next.k8s_args = parse_k8s_args(value)?;
+                // Same check the guest applies before starting k3s, so `kat
+                // config set` refuses (and never saves) arguments it would reject.
+                kat_proto::k8s::validate_k3s_extra_args(&next.k8s_args)
+                    .map_err(anyhow::Error::msg)?;
+            }
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
@@ -305,10 +314,16 @@ impl Config {
             validate_k8s_disable_item(component)?;
             total_k8s_bytes = total_k8s_bytes.saturating_add("--disable=".len() + component.len());
         }
-        // Same check the guest applies before starting k3s, so `kat config
-        // set` refuses (and never saves) arguments the guest would reject.
-        kat_proto::k8s::validate_k3s_extra_args(&self.k8s_args).map_err(anyhow::Error::msg)?;
+        // Only structural checks here: this also runs when loading
+        // config.toml, and a reserved flag must not stop the whole VM from
+        // starting. `set` and Kubernetes start apply the full check.
         for arg in &self.k8s_args {
+            if arg.is_empty() {
+                bail!("k8s_args must not contain empty arguments");
+            }
+            if arg.contains('\0') {
+                bail!("k8s_args must not contain NUL bytes");
+            }
             total_k8s_bytes = total_k8s_bytes.saturating_add(arg.len());
         }
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
@@ -886,6 +901,47 @@ mod tests {
         assert!(Config::parse("k8s_args = [\"\"]\n").is_err());
         assert!(Config::parse("k8s_disable = [\"--traefik\"]\n").is_err());
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn save_ignores_stale_temp_file_from_a_crashed_save() {
+        let home = std::env::temp_dir().join(format!("kat-cfg-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        // Every name this process can pick for its next few saves.
+        let n = TMP_COUNTER.load(Ordering::Relaxed);
+        for i in n..n + 4 {
+            fs::write(
+                home.join(format!("{FILE_NAME}.tmp.{}.{i}", std::process::id())),
+                "stale",
+            )
+            .unwrap();
+        }
+        Config::default().save(&home).unwrap();
+        assert!(Config::path(&home).is_file());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn reserved_k8s_args_are_rejected_by_set_but_do_not_break_loading() {
+        let host = HOST;
+        let mut cfg = Config::default();
+        for bad in [
+            "--token=x",
+            "--data-dir=/tmp/k3s",
+            "--kubelet-arg=root_dir=/x",
+        ] {
+            let err = cfg.set("k8s_args", bad, &host).unwrap_err();
+            assert!(err.to_string().starts_with("k8s_args"), "{bad}: {err:#}");
+            assert!(cfg.k8s_args.is_empty(), "{bad} must not be saved");
+        }
+        cfg.set("k8s_args", "--disable=traefik", &host).unwrap();
+
+        // A hand-edited config.toml with a reserved flag still loads (so the
+        // VM and Docker start) and can be repaired with `config set`.
+        let mut loaded = Config::parse("k8s_args = [\"--token=x\"]\n").unwrap();
+        loaded.set("k8s_args", "", &host).unwrap();
+        assert!(loaded.k8s_args.is_empty());
     }
 
     #[test]

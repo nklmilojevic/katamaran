@@ -325,9 +325,10 @@ fn parse_k3s_flag(arg: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
-/// `k3s server` flags the guest sets itself. `k8s_args` are appended after
-/// them, so for single-value flags the user's value would win; katamaran's
-/// relay, image sync, stop/reset and pod routing all depend on these.
+/// `k3s server` settings the guest sets itself or depends on. `k8s_args` are
+/// appended after the guest's flags, so for single-value flags the user's
+/// value would win; katamaran's relay, image sync, stop/reset and pod routing
+/// all depend on these.
 const MANAGED_K3S_FLAGS: &[&str] = &[
     "data-dir",
     "d",
@@ -341,12 +342,17 @@ const MANAGED_K3S_FLAGS: &[&str] = &[
     "cluster-cidr",
     "service-cidr",
     "cluster-dns",
+    "disable-kube-proxy",
 ];
 
-/// kubelet settings the guest passes via `--kubelet-arg` that must not be
-/// overridden (stop/reset unmount the managed kubelet root; kubelet must use
-/// the shared containerd).
-const MANAGED_KUBELET_ARGS: &[&str] = &["root-dir", "container-runtime-endpoint"];
+/// Component settings the guest passes (or relies on) via `--kubelet-arg` /
+/// `--kube-proxy-arg`: stop/reset unmount the managed kubelet root and delete
+/// only kube-proxy's nftables table, and kubelet must use the shared
+/// containerd.
+const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
+    ("kubelet-arg", &["root-dir", "container-runtime-endpoint"]),
+    ("kube-proxy-arg", &["proxy-mode"]),
+];
 
 /// Flags whose value can carry credentials. `k8s_args` end up on the k3s
 /// process command line, which `k3s --debug` also writes to its log.
@@ -363,6 +369,44 @@ const CREDENTIAL_K3S_FLAGS: &[&str] = &[
     "vpn-auth",
 ];
 
+/// The setting a component argument such as `root-dir=/x`, `--root_dir=/x`
+/// or `root-dir+=/x` addresses, normalized the way kubelet/kube-proxy
+/// (`_` == `-`) and k3s (`+=`/`-=` suffixes) read it.
+fn component_arg_key(value: &str) -> String {
+    let setting = value.trim_start_matches('-');
+    let key = setting.split_once('=').map_or(setting, |(k, _)| k);
+    key.trim_end_matches(['+', '-']).replace('_', "-")
+}
+
+/// Reject a k3s setting (`name` without dashes, as a flag or a
+/// `k3s-config.yaml` key) that katamaran manages. `values` are the values it
+/// is given (inspected for `kubelet-arg` / `kube-proxy-arg`). Errors never
+/// echo values.
+pub fn check_managed_k3s_setting(name: &str, values: &[&str]) -> Result<(), String> {
+    if name == "config" || name == "c" {
+        return Err(
+            "--config (-c) cannot be set; put k3s settings in ~/.katamaran/k3s-config.yaml instead"
+                .into(),
+        );
+    }
+    if MANAGED_K3S_FLAGS.contains(&name) {
+        return Err(format!(
+            "--{name} cannot be set: katamaran manages it for the guest cluster"
+        ));
+    }
+    if let Some((_, managed)) = MANAGED_COMPONENT_ARGS.iter().find(|(f, _)| *f == name) {
+        for v in values {
+            let key = component_arg_key(v);
+            if managed.contains(&key.as_str()) {
+                return Err(format!(
+                    "--{name} cannot set {key}: katamaran manages it for the guest cluster"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate `k8s_args` before they are saved (host) and before `k3s server`
 /// starts (guest). Errors never echo argument values.
 pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
@@ -376,33 +420,12 @@ pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
         let Some((name, inline)) = parse_k3s_flag(arg) else {
             continue;
         };
-        if name == "config" || name == "c" {
-            return Err(
-                "k8s_args cannot set --config (-c); put k3s settings in ~/.katamaran/k3s-config.yaml instead"
-                    .into(),
-            );
-        }
-        if MANAGED_K3S_FLAGS.contains(&name) {
-            return Err(format!(
-                "k8s_args cannot set --{name}: katamaran manages it for the guest cluster"
-            ));
-        }
+        let value = inline.or_else(|| args.get(i + 1).map(String::as_str));
+        check_managed_k3s_setting(name, value.as_slice()).map_err(|e| format!("k8s_args: {e}"))?;
         if CREDENTIAL_K3S_FLAGS.contains(&name) {
             return Err(format!(
                 "k8s_args cannot pass --{name}, whose value can carry credentials and would appear in the k3s process command line and, with --debug, its log; set `{name}:` in ~/.katamaran/k3s-config.yaml (or use the matching *-file flag) instead"
             ));
-        }
-        if name == "kubelet-arg" {
-            let Some(value) = inline.or_else(|| args.get(i + 1).map(String::as_str)) else {
-                continue;
-            };
-            let setting = value.trim_start_matches('-');
-            let key = setting.split_once('=').map_or(setting, |(k, _)| k);
-            if MANAGED_KUBELET_ARGS.contains(&key) {
-                return Err(format!(
-                    "k8s_args cannot set the kubelet {key}: katamaran manages it for the guest cluster"
-                ));
-            }
         }
     }
     Ok(())
@@ -418,6 +441,7 @@ mod tests {
         v(&[]).unwrap();
         v(&["--disable=traefik", "--debug", "--kubelet-arg=max-pods=200"]).unwrap();
         v(&["--kubelet-arg", "max-pods=200", "--node-label", "a=b"]).unwrap();
+        v(&["--kube-proxy-arg=metrics-bind-address=0.0.0.0:10249"]).unwrap();
         // Positional values that merely look like names are not flags.
         v(&["--node-label", "token=x"]).unwrap();
 
@@ -466,8 +490,14 @@ mod tests {
             vec!["--kubelet-arg=root-dir=/x"],
             vec!["--kubelet-arg=--root-dir=/x"],
             vec!["--kubelet-arg", "root-dir=/x"],
+            vec!["--kubelet-arg=root_dir=/x"],
+            vec!["--kubelet-arg=root-dir+=/x"],
+            vec!["--kubelet-arg=root-dir-=/x"],
             vec!["-kubelet-arg=container-runtime-endpoint=unix:///x"],
+            vec!["--kubelet-arg=container_runtime_endpoint=unix:///x"],
             vec!["--kubelet-arg=root-dir"],
+            vec!["--kube-proxy-arg=proxy-mode=iptables"],
+            vec!["--kube-proxy-arg", "proxy_mode=ipvs"],
         ] {
             assert!(v(&kubelet).is_err(), "{kubelet:?}");
         }

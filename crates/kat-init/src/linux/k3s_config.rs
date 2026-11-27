@@ -56,6 +56,18 @@ fn unsupported(line: usize, what: &str) -> String {
 pub(super) fn normalize_k3s_config_yaml(yaml: &str) -> Result<String, String> {
     let entries = parse_subset(yaml)?;
     let (order, values) = merge_like_k3s(entries);
+    // Settings katamaran manages (data dir, kubelet root, kube-proxy mode, ...)
+    // are refused here as in `k8s_args`; for list flags such as `kubelet-arg`
+    // the YAML entries would otherwise be passed alongside the guest's own.
+    for key in &order {
+        let items: Vec<&str> = match &values[key] {
+            Value::Null => Vec::new(),
+            Value::Str(s) => vec![s.as_str()],
+            Value::List(l) => l.iter().map(|i| i.as_deref().unwrap_or("")).collect(),
+        };
+        kat_proto::k8s::check_managed_k3s_setting(key, &items)
+            .map_err(|e| format!("k3s-config.yaml: {e}"))?;
+    }
     if let Some(v) = values.get("etcd-s3-proxy") {
         let ok = match v {
             Value::Null => true,
@@ -376,6 +388,13 @@ fn parse_flow_sequence(v: &str, no: usize) -> Result<Vec<Option<String>>, String
 /// Parse one scalar at the start of `s` (no leading spaces). Returns the value
 /// (`None` for YAML null) and the unconsumed text after it.
 fn parse_scalar(s: &str, no: usize, in_flow: bool) -> Result<(Option<String>, &str), String> {
+    if s.is_empty() {
+        // Only reachable inside an unclosed flow sequence (`[`, `[a,`).
+        return Err(unsupported(
+            no,
+            "flow sequences must hold single-line scalars and close on the same line",
+        ));
+    }
     if let Some(body) = s.strip_prefix('"') {
         let end = body
             .find('"')
@@ -845,8 +864,8 @@ mod tests {
             # comment\n\
             node-label:\n  - role=dev   # trailing comment\n  - 'quote''d'\n\
             disable: [traefik, \"servicelb\", 'metrics-server']\n\
-            write-kubeconfig-mode: \"0644\"\r\n\
-            cluster-cidr: 10.42.0.0/16\n\
+            file-mode: \"0644\"\r\n\
+            pod-net: 10.42.0.0/16\n\
             secrets-encryption: true\n\
             max-pods: 200\n\
             token:\n\
@@ -856,7 +875,7 @@ mod tests {
             v: ~\n";
         assert_eq!(
             norm(yaml),
-            "{\n  \"node-label\": [\"role=dev\", \"quote'd\"],\n  \"disable\": [\"traefik\", \"servicelb\", \"metrics-server\"],\n  \"write-kubeconfig-mode\": \"0644\",\n  \"cluster-cidr\": \"10.42.0.0/16\",\n  \"secrets-encryption\": \"true\",\n  \"max-pods\": \"200\",\n  \"token\": null,\n  \"kubelet-arg\": [\"a=b\", null],\n  \"etcd-s3-proxy\": \"http://proxy.example.com:8080\",\n  \"empty\": [],\n  \"v\": null\n}\n"
+            "{\n  \"node-label\": [\"role=dev\", \"quote'd\"],\n  \"disable\": [\"traefik\", \"servicelb\", \"metrics-server\"],\n  \"file-mode\": \"0644\",\n  \"pod-net\": \"10.42.0.0/16\",\n  \"secrets-encryption\": \"true\",\n  \"max-pods\": \"200\",\n  \"token\": null,\n  \"kubelet-arg\": [\"a=b\", null],\n  \"etcd-s3-proxy\": \"http://proxy.example.com:8080\",\n  \"empty\": [],\n  \"v\": null\n}\n"
         );
         assert_eq!(norm(""), "{}\n");
         assert_eq!(norm("# only comments\n\n"), "{}\n");
@@ -950,6 +969,9 @@ mod tests {
             format!("a: [{m}: x]\n"),
             format!("a: [{m}, ]\n"),
             format!("a: [{m}\n  ]\n"),
+            "a: [\n".to_string(),
+            "a: [x,\n".to_string(),
+            "a: [x, \n".to_string(),
             format!("? a\n: {m}\n"),
             format!("\"a\": {m}\n"),
             format!("a b: {m}\n"),
@@ -985,6 +1007,64 @@ mod tests {
                 normalize_k3s_config_yaml(yaml).expect_err(&format!("{yaml:?} should be rejected"));
             assert!(err.starts_with("k3s-config.yaml line "), "{yaml:?}: {err}");
             assert!(!err.contains(m), "{yaml:?} echoed its value: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_settings_katamaran_manages() {
+        for yaml in [
+            "data-dir: /tmp/k3s\n",
+            "d: /tmp/k3s\n",
+            "config: /tmp/x.yaml\n",
+            "disable-kube-proxy: true\n",
+            "kubelet-arg: [root-dir=/x]\n",
+            "kubelet-arg:\n  - max-pods=200\n  - root_dir=/x\n",
+            "kubelet-arg: max-pods=200\nkubelet-arg+: [container-runtime-endpoint=unix:///x]\n",
+            "kube-proxy-arg: proxy-mode=iptables\n",
+        ] {
+            let err = normalize_k3s_config_yaml(yaml).expect_err(yaml);
+            assert!(err.starts_with("k3s-config.yaml: --"), "{yaml:?}: {err}");
+        }
+        norm("kubelet-arg: [max-pods=200]\nkube-proxy-arg: [metrics-bind-address=0.0.0.0:10249]\n");
+    }
+
+    /// The parser runs in PID 1 (built with `panic = "abort"`), so no input may
+    /// panic: every prefix and single-byte deletion of representative inputs,
+    /// plus a deterministic sweep of short strings over YAML-significant
+    /// characters, must return `Ok` or `Err`.
+    #[test]
+    fn never_panics_on_truncated_or_arbitrary_input() {
+        let samples = [
+            "--- # c\nnode-label:\n  - role=dev # x\n  - 'q''d'\ndisable: [traefik, \"servicelb\", 'm']\netcd-s3-proxy: http://proxy.example.com:8080\nk: \"v\"\nl:\n- a\n-\ne: []\nv: ~\n",
+            "a: [x, 'y', \"z\"]  # c\r\nb: 'it''s'\n",
+            "kubelet-arg:\n  - max-pods=200\nx: h\u{e9}llo \u{2713}\n",
+        ];
+        for sample in samples {
+            for (end, _) in sample.char_indices().chain([(sample.len(), ' ')]) {
+                let _ = normalize_k3s_config_yaml(&sample[..end]);
+                let _ = normalize_k3s_config_yaml(&sample[end..]);
+            }
+            for (i, c) in sample.char_indices() {
+                let mut s = sample.to_string();
+                s.replace_range(i..i + c.len_utf8(), "");
+                let _ = normalize_k3s_config_yaml(&s);
+            }
+        }
+        let alphabet: Vec<char> = "a:-[]{},'\"#&*!|> \n~0.+_\r\u{e9}".chars().collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..50_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 14) as usize;
+            let mut x = seed;
+            let s: String = (0..len)
+                .map(|_| {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    alphabet[(x >> 33) as usize % alphabet.len()]
+                })
+                .collect();
+            let _ = normalize_k3s_config_yaml(&s);
         }
     }
 
