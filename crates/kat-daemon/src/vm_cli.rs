@@ -1044,11 +1044,12 @@ impl OutputRelay {
             ];
             let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
             if rc < 0 {
-                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 self.proc.kill_and_wait();
-                return RelayFinish::Drained;
+                return RelayFinish::Error(e);
             }
             if pfds[1].revents != 0 {
                 self.proc.kill_and_wait();
@@ -1520,13 +1521,14 @@ impl OutputRelays {
             let rc =
                 unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
             if rc < 0 {
-                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 for chan in &mut chans {
                     chan.abort();
                 }
-                return failure.unwrap_or(RelayFinish::Drained);
+                return failure.unwrap_or(RelayFinish::Error(e));
             }
             if pfds[0].revents != 0 {
                 for chan in &mut chans {
@@ -2004,7 +2006,7 @@ enum Probe {
     Ready(UnixStream),
     NoSocket(io::Error),
     ClosedBeforeReady,
-    TimedOut(io::Error),
+    TimedOut,
     Failed(anyhow::Error),
 }
 
@@ -2013,7 +2015,7 @@ enum Probe {
 fn probe_ready(path: &Path, deadline: Instant) -> Probe {
     let mut conn = match connect_with_deadline(path, deadline) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Probe::TimedOut(e),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Probe::TimedOut,
         Err(e) => return Probe::NoSocket(e),
     };
     let reply = {
@@ -2036,7 +2038,7 @@ fn probe_ready(path: &Path, deadline: Instant) -> Probe {
                 e.kind(),
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
             ) {
-                return Probe::TimedOut(e);
+                return Probe::TimedOut;
             }
             return Probe::Failed(e.into());
         }
@@ -2065,7 +2067,7 @@ fn probe_ready(path: &Path, deadline: Instant) -> Probe {
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
             ) =>
         {
-            Probe::TimedOut(e)
+            Probe::TimedOut
         }
         Err(e) => Probe::Failed(e.into()),
     }
@@ -2178,6 +2180,7 @@ fn wait_for_ready_socket(
                             bail!("the VM did not start: {}", s.error.unwrap_or_default())
                         }
                         VmState::Running => {
+                            running_cap(&mut deadline, &s);
                             // Re-probe once in case the VM finished booting
                             // between our probe and the status check.
                             match probe_ready(
@@ -2190,8 +2193,11 @@ fn wait_for_ready_socket(
                                     "VM shell service is not available on the running VM ({}); run `kat restart` to upgrade",
                                     path.display()
                                 ),
-                                Probe::ClosedBeforeReady => saw_closed = true,
-                                Probe::TimedOut(_) => {}
+                                Probe::ClosedBeforeReady => {
+                                    saw_closed = true;
+                                    last_no_socket = None;
+                                }
+                                Probe::TimedOut => last_no_socket = None,
                             }
                         }
                         VmState::Starting | VmState::Stopping => {}
@@ -2208,7 +2214,7 @@ fn wait_for_ready_socket(
                     running_cap(&mut deadline, &s);
                 }
             }
-            Probe::TimedOut(_) => {
+            Probe::TimedOut => {
                 if let Some(s) = poll_status()? {
                     if matches!(s.state, VmState::Error | VmState::Stopped) {
                         bail!("the VM did not start: {}", s.error.unwrap_or_default());
@@ -2233,22 +2239,17 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
     let home = crate::state_dir()?;
     let path = socket_path(&home);
 
-    let fast_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    match probe_ready(&path, fast_deadline) {
+    match probe_ready(&path, Instant::now() + PROBE_ATTEMPT_TIMEOUT) {
         Probe::Ready(conn) => {
             let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
             return Ok((conn, token, path));
         }
         Probe::Failed(e) => return Err(e),
-        Probe::TimedOut(e) => {
-            return Err(e).context(
-                "timed out waiting for the VM shell service; check `kat logs --console` or run `kat restart`",
-            );
-        }
-        // `ClosedBeforeReady`: the VM process bound the Unix socket but kat-init
-        // may still be booting; like a missing socket, wait under the daemon's
-        // VM state (up to `VM_START_TIMEOUT` while it is starting).
-        Probe::ClosedBeforeReady | Probe::NoSocket(_) => {}
+        // Not ready yet (`ClosedBeforeReady` / `TimedOut`: the VM process bound
+        // the Unix socket but kat-init may still be booting): like a missing
+        // socket, wait under the daemon's VM state — up to `VM_START_TIMEOUT`
+        // while it boots, `HANDSHAKE_TIMEOUT` once it reports Running.
+        Probe::ClosedBeforeReady | Probe::TimedOut | Probe::NoSocket(_) => {}
     }
 
     // Socket is absent: consult the daemon, start the VM if needed, and poll
@@ -2270,7 +2271,7 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
             // A VM that is already running gets only the short handshake
             // bound: a guest whose exec listener is down must fail fast, not
             // after the full boot timeout.
-            Probe::ClosedBeforeReady | Probe::TimedOut(_) => {
+            Probe::ClosedBeforeReady | Probe::TimedOut => {
                 let conn =
                     wait_for_ready_socket(&path, Instant::now() + HANDSHAKE_TIMEOUT, || Ok(None))?;
                 let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
@@ -2282,7 +2283,27 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
             c.call(&Call::Start)?;
         }
         VmState::Stopping => {
-            c.call(&Call::Start)?;
+            // The daemon rejects Start while stopping: wait for the stop to
+            // finish, then start the VM again.
+            eprintln!("katamaran: waiting for the VM to stop before starting it");
+            let deadline = Instant::now() + VM_START_TIMEOUT;
+            loop {
+                let s = c.status()?;
+                match s.state {
+                    VmState::Stopping => {
+                        if Instant::now() >= deadline {
+                            bail!("timed out waiting for the VM to finish stopping");
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    VmState::Stopped | VmState::Error => {
+                        eprintln!("katamaran: starting the VM");
+                        c.call(&Call::Start)?;
+                        break;
+                    }
+                    VmState::Starting | VmState::Running => break,
+                }
+            }
         }
         VmState::Starting => {}
     }
@@ -4028,7 +4049,7 @@ mod tests {
 
         let t = Instant::now();
         let p = probe_ready(&sock, t + Duration::from_millis(120));
-        assert!(matches!(p, Probe::TimedOut(_)));
+        assert!(matches!(p, Probe::TimedOut));
         assert!(t.elapsed() < Duration::from_secs(1));
 
         let ready = match probe_ready(&sock, Instant::now() + Duration::from_secs(2)) {
