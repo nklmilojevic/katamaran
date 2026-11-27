@@ -8,7 +8,8 @@
 #   guest/kernel/build.sh clean      drop the object tree (keeps the source and ccache volumes)
 #   guest/kernel/build.sh shell CMD  run CMD in the build container, cwd = prepared source tree
 #                                    (guest/out is read-only there; edits to the cached tree are
-#                                    kept and built by the next build until the patch set changes)
+#                                    kept for later shells, but the next build re-extracts and
+#                                    re-patches a pristine tree)
 #   guest/kernel/build.sh stamp      print the input stamp (no Docker); a build records it in
 #                                    guest/out/Image.stamp so `cargo xtask test-vm` can reject
 #                                    an Image built from older patches or config
@@ -119,13 +120,16 @@ if [ ! -f "$tarball" ] || ! echo "$KSHA256  $tarball" | sha256sum -c --status; t
 	mv "$tarball.part" "$tarball"
 fi
 
-# A fresh tree (and object dir) whenever the version or the patch set changes.
+# A fresh tree (and object dir) whenever the version or the patch set changes, and before any
+# build after a shell session may have edited the cached tree (src/shell-used), so an installed
+# Image is always built from the checked-in patches exactly.
 stamp=$( { echo "$KVER"; cat /in/patches/*.patch 2>/dev/null || true; } | sha256sum | cut -c1-64)
 tree=src/linux
 obj=build/linux
-if [ "$(cat src/stamp 2>/dev/null)" != "$stamp" ]; then
+if [ "$(cat src/stamp 2>/dev/null)" != "$stamp" ] ||
+	{ [ "$MODE" = build ] && [ -e src/shell-used ]; }; then
 	echo ">> extracting linux-$KVER"
-	rm -rf "$tree" "$obj" src/stamp
+	rm -rf "$tree" "$obj" src/stamp src/shell-used
 	mkdir -p "$tree"
 	tar -xJf "$tarball" -C "$tree" --strip-components=1
 	for p in /in/patches/*.patch; do
@@ -145,6 +149,8 @@ MAKE=(make -C "/work/$tree" O="/work/$obj" ARCH=arm64 CC="ccache gcc" -j"$(nproc
 
 case "$MODE" in
 shell)
+	# Edits made here persist for later shells, but the next build starts from a pristine tree.
+	touch src/shell-used
 	cd "/work/$tree"
 	exec bash -c "$SHELL_CMD"
 	;;
