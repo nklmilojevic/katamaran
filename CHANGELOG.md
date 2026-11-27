@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.11.0 - 2026-11-27
+
+This release lets you choose the k3s version, run amd64 images in pods, open a shell in the VM, and grow the data disk. It also fixes file limits and slow container traffic.
+
+### New features
+
+- Choose the k3s version with the `k8s_version` config key. The guest refuses unsafe downgrades of existing cluster data. Use `kat k8s mark-version` for a cluster of unknown version.
+- Run amd64-only Docker images in pods under emulation. The guest makes a rewritten copy of the image for Kubernetes and never deletes a tag that it does not own.
+- Set custom k3s server flags with `k8s_args`, turn off components with `k8s_disable`, and use a `k3s-config.yaml` file. The guest accepts only settings that are safe for the VM.
+- Use `forward_addresses` or `--forward-address` to publish ports on macOS `lo0` aliases, such as `172.16.1.200`. The default is `127.0.0.1`.
+- Open a root shell or run a command in the Linux VM with `kat vm shell` and `kat vm exec`.
+- Grow the data disk with the `disk_gib` config key.
+- Add `--images` to `kat k8s reset` to also remove the cached images in the `k8s.io` namespace. The macOS app has a matching checkbox.
+
+### Fixes
+
+- Containerd, Docker, and all containers now get a higher open-file limit. The new `nofile` key sets it and the default is `1048576`. Elasticsearch and similar databases now start.
+- Keep-alive traffic between containers and pods no longer stalls for 40 to 50 ms for each request. A guest kernel patch fixes this. Set `kat.quickack=0` on the kernel command line to turn it off.
+- Docker ports that you publish on `127.0.0.1`, for example `docker run -p 127.0.0.1:8080:80`, now work from the Mac.
+- The file cache now starts the macOS file event stream only when the guest uses a shared folder. This reduces idle CPU use and macOS permission prompts.
+
 ## v0.10.0 - 2026-11-25
 
 This release adds Landlock sandbox support to the guest kernel. Container workloads that use Landlock now work in katamaran.
