@@ -395,6 +395,7 @@ impl Daemon {
             changed: Condvar::new(),
             started: SystemTime::now(),
             launchd_label: None,
+            relay_budget: crate::autofwd::RelayBudget::from_process_limits(),
             test_user_home: Some(user_home),
             test_kube_context: Some(ctx.into()),
             test_heartbeat_interval: None,

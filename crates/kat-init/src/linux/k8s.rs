@@ -11386,31 +11386,44 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        let add_entry = |builder: &mut tar::Builder<File>, path: &str, data: &[u8]| {
-            let mut h = tar::Header::new_ustar();
-            h.set_size(data.len() as u64);
-            h.set_mode(0o644);
-            h.set_entry_type(tar::EntryType::Regular);
-            builder
-                .append_data(&mut h, path, io::Cursor::new(data))
-                .unwrap();
+        let add_entry = |out: &mut dyn Write, path: &str, data: &[u8]| {
+            let name = path.as_bytes();
+            assert!(name.len() <= 100, "tar entry path too long: {path}");
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name);
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            let size = format!("{:011o}\0", data.len());
+            header[124..136].copy_from_slice(size.as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let cksum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+            let cksum_field = format!("{cksum:06o}\0 ");
+            header[148..156].copy_from_slice(cksum_field.as_bytes());
+            out.write_all(&header).unwrap();
+            out.write_all(data).unwrap();
+            let rem = data.len() % 512;
+            if rem != 0 {
+                out.write_all(&vec![0u8; 512 - rem]).unwrap();
+            }
+        };
+        let finish_tar = |out: &mut dyn Write| {
+            out.write_all(&[0u8; 1024]).unwrap();
         };
         {
-            let mut layer_tar = tar::Builder::new(Vec::new());
-            let mut lh = tar::Header::new_ustar();
+            let mut layer = Vec::new();
             let payload = b"katamaran-live-snapshot-fixture\n";
-            lh.set_size(payload.len() as u64);
-            lh.set_mode(0o644);
-            lh.set_entry_type(tar::EntryType::Regular);
-            layer_tar
-                .append_data(&mut lh, "fixture.txt", io::Cursor::new(payload))
-                .unwrap();
-            let layer = layer_tar.into_inner().unwrap();
+            add_entry(&mut layer, "fixture.txt", payload);
+            finish_tar(&mut layer);
 
-            let mut builder = tar::Builder::new(File::create(&image_tar).unwrap());
+            let mut archive = File::create(&image_tar).unwrap();
             let layer_hex = sha256_hex(&layer);
             let layer_digest = format!("sha256:{layer_hex}");
-            add_entry(&mut builder, &format!("blobs/sha256/{layer_hex}"), &layer);
+            add_entry(&mut archive, &format!("blobs/sha256/{layer_hex}"), &layer);
 
             let config_json = serde_json::to_vec(&serde_json::json!({
                 "architecture": NATIVE_ARCH,
@@ -11424,7 +11437,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             let config_hex = sha256_hex(&config_json);
             let config_digest = format!("sha256:{config_hex}");
             add_entry(
-                &mut builder,
+                &mut archive,
                 &format!("blobs/sha256/{config_hex}"),
                 &config_json,
             );
@@ -11447,7 +11460,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             let manifest_hex = sha256_hex(&manifest_json);
             let manifest_digest = format!("sha256:{manifest_hex}");
             add_entry(
-                &mut builder,
+                &mut archive,
                 &format!("blobs/sha256/{manifest_hex}"),
                 &manifest_json,
             );
@@ -11470,12 +11483,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             }))
             .unwrap();
             add_entry(
-                &mut builder,
+                &mut archive,
                 "oci-layout",
                 br#"{"imageLayoutVersion":"1.0.0"}"#,
             );
-            add_entry(&mut builder, "index.json", &index_json);
-            builder.finish().unwrap();
+            add_entry(&mut archive, "index.json", &index_json);
+            finish_tar(&mut archive);
         }
 
         struct DisposableContainerd {
