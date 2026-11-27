@@ -71,12 +71,13 @@ pub const API_ADDR: &str = "127.0.0.1:6443";
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
 /// How long VM shutdown waits for an in-flight guest Kubernetes operation to
-/// release `op_lock` before stopping k3s without it (the host allows ~45 s for
-/// the whole shutdown sequence).
-const SHUTDOWN_OP_LOCK_WAIT: Duration = Duration::from_secs(10);
-/// Total time VM shutdown spends on k3s (lock wait plus waiting for an
-/// in-flight stop) before leaving the rest to the shutdown process sweep.
-const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(25);
+/// release `op_lock` before falling back to [`stop_k3s_without_op_lock`].
+const SHUTDOWN_OP_LOCK_WAIT: Duration = Duration::from_secs(8);
+/// Total time VM shutdown spends on k3s when `op_lock` is stuck (lock wait
+/// plus waiting for an in-flight k3s exit) before leaving the rest to the
+/// shutdown sweep. Leaves room within the host's ~45 s shutdown deadline for
+/// the Docker stack stop (~19 s), the process sweep, and the data-disk sync.
+const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(18);
 const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -231,6 +232,10 @@ struct State {
     api_ready: bool,
     error: String,
     running: Option<Running>,
+    /// Set by whichever caller takes `running` to stop it, and cleared as soon
+    /// as k3s has exited (before Kubernetes workload cleanup), so VM shutdown
+    /// can wait for k3s itself without waiting for that cleanup.
+    k3s_terminating: bool,
 }
 
 pub struct K8s {
@@ -263,6 +268,7 @@ pub fn start_service(
             api_ready: false,
             error: String::new(),
             running: None,
+            k3s_terminating: false,
         }),
     });
     let _ = SERVICE.set(svc.clone());
@@ -304,12 +310,13 @@ pub fn start_service(
 /// Stop k3s cleanly during VM shutdown.
 /// Shutdown fallback when `op_lock` could not be acquired in time.
 ///
-/// Never runs Kubernetes workload teardown (the lock holder may still be using
+/// Never runs Kubernetes workload cleanup (the lock holder may still be using
 /// it, and the shutdown sweep stops containerd and every remaining process
 /// afterwards). If k3s is still owned by `state.running`, this caller takes
-/// sole ownership and terminates it; if another caller already took it (phase
-/// `stopping`), waits until that stop finishes or `deadline` passes instead of
-/// racing it. Returns a description for the shutdown log.
+/// sole ownership and terminates it. If another caller already took it, waits
+/// only until that caller reports k3s has exited (`k3s_terminating` cleared),
+/// not for its workload cleanup, and never past `deadline`. Returns a
+/// description for the shutdown log.
 fn stop_k3s_without_op_lock(
     state: &Mutex<State>,
     deadline: Instant,
@@ -317,23 +324,25 @@ fn stop_k3s_without_op_lock(
 ) -> &'static str {
     let running = {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        let r = st.running.take();
+        let r = take_running_for_stop(&mut st);
         if r.is_some() {
             st.phase = "stopping".into();
             st.api_ready = false;
         }
         r
     };
-    if let Some(r) = running {
-        terminate(r);
+    if running.is_some() {
+        finish_k3s_termination_with(state, running, terminate);
         ACTIVE.store(false, Ordering::SeqCst);
-        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.phase = "stopped".into();
         return "terminated k3s without the operation lock; workload cleanup left to shutdown";
     }
     loop {
-        if state.lock().unwrap_or_else(|e| e.into_inner()).phase != "stopping" {
-            return "in-flight k3s stop finished";
+        if !state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .k3s_terminating
+        {
+            return "k3s is not running";
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -2548,9 +2557,9 @@ impl K8s {
                 let mut st = self.state.lock().unwrap();
                 st.phase = "stopping".into();
                 st.api_ready = false;
-                st.running.take()
+                take_running_for_stop(&mut st)
             };
-            let reaped = running.is_none_or(terminate_running);
+            let reaped = finish_k3s_termination(&self.state, running);
             stop_k8s_workloads(&self.reaper);
             if reaped {
                 rollback_versions_if_untouched(
@@ -2892,12 +2901,10 @@ impl K8s {
             }
             st.phase = "stopping".into();
             st.api_ready = false;
-            (st.running.take(), needs_cleanup)
+            (take_running_for_stop(&mut st), needs_cleanup)
         };
         progress("stopping k3s");
-        if let Some(r) = running {
-            let _ = terminate_running(r);
-        }
+        let _ = finish_k3s_termination(&self.state, running);
         if needs_cleanup {
             stop_k8s_workloads_with_progress(&self.reaper, progress);
         }
@@ -3174,6 +3181,37 @@ fn restore_bridge_netfilter() {
             log(&format!("restore {path}: {e}"));
         }
     }
+}
+
+/// Take sole ownership of the running k3s (if any) to stop it, recording that
+/// termination is in flight. Pair with [`finish_k3s_termination`].
+fn take_running_for_stop(st: &mut State) -> Option<Running> {
+    let r = st.running.take();
+    if r.is_some() {
+        st.k3s_terminating = true;
+    }
+    r
+}
+
+/// Terminate k3s taken with [`take_running_for_stop`] and clear
+/// `k3s_terminating` once it has exited. Returns `true` if k3s was already
+/// absent or was reaped cleanly.
+fn finish_k3s_termination(state: &Mutex<State>, running: Option<Running>) -> bool {
+    finish_k3s_termination_with(state, running, terminate_running).unwrap_or(true)
+}
+
+fn finish_k3s_termination_with<R>(
+    state: &Mutex<State>,
+    running: Option<Running>,
+    terminate: impl FnOnce(Running) -> R,
+) -> Option<R> {
+    let r = running?;
+    let res = terminate(r);
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .k3s_terminating = false;
+    Some(res)
 }
 
 fn terminate_running(mut r: Running) -> bool {
@@ -10759,26 +10797,28 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         }
     }
 
-    fn test_state(phase: &str, running: Option<Running>) -> Mutex<State> {
+    fn test_state(phase: &str, running: Option<Running>, terminating: bool) -> Mutex<State> {
         Mutex::new(State {
             generation: 0,
             phase: phase.into(),
             api_ready: true,
             error: String::new(),
             running,
+            k3s_terminating: terminating,
         })
     }
 
     #[test]
-    fn shutdown_fallback_waits_for_in_flight_stop_without_tearing_down() {
-        // Another caller already owns termination (phase "stopping", running
-        // taken): the fallback must not terminate anything itself and must
-        // return only once that stop finishes.
-        let state = Arc::new(test_state("stopping", None));
+    fn shutdown_fallback_waits_only_for_k3s_exit_not_workload_cleanup() {
+        // Another caller owns termination. Once it reports k3s exited, the
+        // fallback returns even though that caller's workload cleanup keeps
+        // `phase` at "stopping", and it never terminates anything itself.
+        let state = Arc::new(test_state("stopping", None, true));
         let s2 = state.clone();
         let finisher = thread::spawn(move || {
             thread::sleep(Duration::from_millis(200));
-            s2.lock().unwrap().phase = "stopped".into();
+            // k3s exited; workload cleanup is still (indefinitely) running.
+            s2.lock().unwrap().k3s_terminating = false;
         });
         let started = Instant::now();
         let outcome =
@@ -10786,12 +10826,27 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 panic!("must not terminate k3s owned by another stop")
             });
         finisher.join().unwrap();
-        assert_eq!(outcome, "in-flight k3s stop finished");
-        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(outcome, "k3s is not running");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert_eq!(state.lock().unwrap().phase, "stopping");
 
-        // Termination still in progress past the budget: give up within the
-        // deadline, still without starting any teardown.
-        let state = test_state("stopping", None);
+        // Workload cleanup in flight with k3s already gone: return immediately.
+        let state = test_state("stopping", None, false);
+        let started = Instant::now();
+        assert_eq!(
+            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(10), |_| {
+                panic!("nothing to terminate")
+            }),
+            "k3s is not running"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // k3s termination still in progress past the budget: give up by the deadline.
+        let state = test_state("stopping", None, true);
         let started = Instant::now();
         let outcome =
             stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_millis(100), |_| {
@@ -10802,9 +10857,9 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "{outcome}"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(state.lock().unwrap().phase, "stopping");
 
-        // Nobody owns k3s yet: the fallback takes sole ownership and terminates it.
+        // Nobody owns k3s yet: the fallback takes sole ownership, terminates it,
+        // and clears the in-flight marker.
         let (_tx, exit_rx) = mpsc::channel();
         let running = Running {
             pid: -1,
@@ -10813,7 +10868,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             sync_stop: Arc::new(AtomicBool::new(false)),
             proxy_thread: None,
         };
-        let state = test_state("running", Some(running));
+        let state = test_state("running", Some(running), false);
         let mut terminated = false;
         let outcome =
             stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(1), |_| {
@@ -10823,7 +10878,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(outcome.starts_with("terminated k3s"), "{outcome}");
         let st = state.lock().unwrap();
         assert!(st.running.is_none());
-        assert_eq!(st.phase, "stopped");
+        assert!(!st.k3s_terminating);
     }
 
     #[test]
