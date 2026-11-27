@@ -1699,6 +1699,14 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         eprintln!(
             "pod-to-pod sustained 32MiB bulk median restored (quickack=Y): out_segs={bulk_acks_on2:.0} elapsed={bulk_ms_on2:.2}ms"
         );
+        // Coarse throughput guard for the per-packet receive-path hooks: a
+        // 32 MiB transfer takes a few ms either way, so only a gross slowdown
+        // (well beyond vCPU scheduling noise) trips this.
+        let bulk_ms_on_best = bulk_ms_on.min(bulk_ms_on2);
+        assert!(
+            bulk_ms_on_best <= bulk_ms_off * 2.0 + 5.0,
+            "quickack=Y slowed sustained bulk transfers (on={bulk_ms_on:.2}/{bulk_ms_on2:.2}ms, off={bulk_ms_off:.2}ms)"
+        );
         let bulk_on = bulk_acks_on.min(bulk_acks_on2);
         assert!(
             bulk_on < 260.0 && bulk_on <= bulk_acks_off * 1.4 + 48.0,
