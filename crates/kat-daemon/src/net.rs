@@ -1061,7 +1061,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     key,
                                     (PendingOp::Remove, Instant::now() + retry_base, 1),
                                 );
-                                report(&e, &label);
+                                report_removal_failure(&e, &label, was_active);
                                 on_event(removal_failure(e, was_active));
                             }
                             Some(e) => {
@@ -1166,7 +1166,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                             ),
                                         );
                                     } else {
-                                        report(&e, &label);
+                                        report_removal_failure(&e, &label, was_active);
                                         on_event(removal_failure(e, was_active));
                                     }
                                 }
@@ -1197,6 +1197,17 @@ fn removal_failure(e: Event, was_active: bool) -> Event {
     match e {
         Event::RemoveFailed(proto, port, _) if !was_active => Event::RefusedCleared(proto, port),
         e => e,
+    }
+}
+
+/// Log a failed remove: for a refused port it only concerns gvproxy cleanup.
+fn report_removal_failure(e: &Event, addrs: &str, was_active: bool) {
+    match e {
+        Event::RemoveFailed(proto, port, why) if !was_active => eprintln!(
+            "katamaran: cleaning up gvproxy state for refused forward {addrs}:{port}/{} failed ({why}); retrying",
+            proto.as_str()
+        ),
+        e => report(e, addrs),
     }
 }
 
