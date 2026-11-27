@@ -357,12 +357,11 @@ fn start_network(notifier: &Notifier) {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     match net::setup(&cmdline) {
         Ok(Some(_)) => {
-            let auto = autofwd::enabled(&cmdline)
-                .then(autofwd::AutoForward::start)
-                .and_then(|r| {
-                    r.inspect_err(|e| log(&format!("no auto-forward: {e}")))
-                        .ok()
-                });
+            // Started even with auto-forwarding off: it also carries the
+            // ports Docker publishes on the VM's loopback (`-p 127.0.0.1:...`).
+            let auto = autofwd::AutoForward::start(autofwd::enabled(&cmdline))
+                .inspect_err(|e| log(&format!("no auto-forward: {e}")))
+                .ok();
             ports::watch(notifier.clone(), auto)
         }
         Ok(None) => {}

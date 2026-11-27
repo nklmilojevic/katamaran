@@ -1,6 +1,9 @@
 //! Watches the root network namespace for TCP sockets listening on every
 //! address (0.0.0.0 or ::), such as docker-proxy for `docker run -p`, and
 //! tells the host, which forwards the Mac's 127.0.0.1:<port> to them.
+//! Loopback listeners (127.0.0.0/8, ::1) go to the auto-forwarder, which
+//! forwards the ones docker-proxy holds for `docker run -p 127.0.0.1:...`
+//! over vsock (linux/autofwd.rs); gvproxy cannot reach the VM's loopback.
 //!
 //! Each poll is one sock_diag dump of LISTEN sockets per address family,
 //! which walks only the listening hash. Reading /proc/net/tcp{,6} instead
@@ -10,6 +13,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
 use std::thread;
@@ -19,6 +23,7 @@ use kat_proto::{Msg, PortProto};
 
 use super::autofwd::{self, AutoForward};
 use super::service::Notifier;
+use crate::autofwd::Listener;
 
 const INTERVAL: Duration = Duration::from_millis(200);
 const TCP_LISTEN: &str = "0A";
@@ -28,13 +33,17 @@ pub fn watch(notifier: Notifier, mut auto: Option<AutoForward>) {
     let spawned = thread::Builder::new().name("ports".into()).spawn(move || {
         let mut known = BTreeSet::new();
         loop {
-            let mut now = listening();
+            let scan = root_listeners();
+            let mut now = scan.wildcard;
             now.extend(super::machines::forwarded_ports());
             now.retain(|p| !super::k8s::is_internal_port(*p));
             now.extend(super::k8s::forwarded_ports());
             let (added, removed) = diff(&known, &now);
             // An auto-forward gives way before the published port is added.
-            let mut auto_changes = auto.as_mut().map(|a| a.tick(&now)).unwrap_or_default();
+            let mut auto_changes = auto
+                .as_mut()
+                .map(|a| a.tick(&now, &scan.loopback))
+                .unwrap_or_default();
             auto_changes
                 .added
                 .retain(|p| !super::k8s::is_internal_port(*p));
@@ -73,9 +82,34 @@ struct RootDiag {
     buf: Vec<u8>,
 }
 
+/// The root namespace's TCP listeners the forwards care about.
+#[derive(Clone, Default)]
+pub struct RootListeners {
+    /// Ports listening on every address.
+    pub wildcard: BTreeSet<u16>,
+    /// Listeners on a loopback address, sorted.
+    pub loopback: Vec<Listener>,
+}
+
+impl RootListeners {
+    fn from_listeners(list: impl IntoIterator<Item = Listener>) -> RootListeners {
+        let mut out = RootListeners::default();
+        for l in list {
+            if l.addr.is_unspecified() {
+                out.wildcard.insert(l.port);
+            } else if l.addr.is_loopback() {
+                out.loopback.push(l);
+            }
+        }
+        out.loopback.sort();
+        out.loopback.dedup();
+        out
+    }
+}
+
 struct RootDiagState {
     diag: Option<RootDiag>,
-    last: Option<BTreeSet<u16>>,
+    last: Option<RootListeners>,
 }
 
 static ROOT_DIAG: Mutex<RootDiagState> = Mutex::new(RootDiagState {
@@ -86,6 +120,12 @@ static ROOT_DIAG: Mutex<RootDiagState> = Mutex::new(RootDiagState {
 /// Wildcard TCP listeners in the root network namespace. Call only from
 /// threads in that namespace (the socket is made by the first caller).
 pub fn listening() -> BTreeSet<u16> {
+    root_listeners().wildcard
+}
+
+/// Wildcard and loopback TCP listeners in the root network namespace, as
+/// [`listening`].
+pub fn root_listeners() -> RootListeners {
     let mut state = ROOT_DIAG.lock().unwrap_or_else(|e| e.into_inner());
     if state.diag.is_none() {
         state.diag = autofwd::diag_socket().ok().map(|fd| RootDiag {
@@ -97,13 +137,9 @@ pub fn listening() -> BTreeSet<u16> {
     match state.diag.as_mut() {
         Some(d) => match autofwd::listeners(&d.fd, &mut d.seq, &mut d.buf) {
             Ok(list) => {
-                let ports: BTreeSet<u16> = list
-                    .into_iter()
-                    .filter(|l| l.addr.is_unspecified())
-                    .map(|l| l.port)
-                    .collect();
-                state.last = Some(ports.clone());
-                ports
+                let now = RootListeners::from_listeners(list);
+                state.last = Some(now.clone());
+                now
             }
             Err(_) => {
                 // Drop the broken netlink socket so the next poll recreates it,
@@ -120,37 +156,69 @@ pub fn listening() -> BTreeSet<u16> {
     }
 }
 
-fn listening_proc() -> BTreeSet<u16> {
-    let mut ports = BTreeSet::new();
+fn listening_proc() -> RootListeners {
+    let mut all = Vec::new();
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
         if let Ok(table) = fs::read_to_string(path) {
-            ports.extend(wildcard_listeners(&table));
+            all.extend(proc_listeners(&table));
         }
     }
-    ports
+    RootListeners::from_listeners(all)
 }
 
 /// Ports of LISTEN sockets bound to the wildcard address in a
 /// /proc/net/tcp or /proc/net/tcp6 table. Loopback-only and specific-address
 /// listeners are not reachable through the gateway, so they are skipped.
 pub fn wildcard_listeners(table: &str) -> BTreeSet<u16> {
-    table
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let local = fields.nth(1)?;
-            let state = fields.nth(1)?;
-            if state != TCP_LISTEN {
-                return None;
-            }
-            let (addr, port) = local.split_once(':')?;
-            if addr.is_empty() || addr.bytes().any(|b| b != b'0') {
-                return None;
-            }
-            u16::from_str_radix(port, 16).ok().filter(|p| *p != 0)
-        })
+    proc_listeners(table)
+        .filter(|l| l.addr.is_unspecified())
+        .map(|l| l.port)
         .collect()
+}
+
+/// LISTEN sockets in a /proc/net/tcp or /proc/net/tcp6 table.
+fn proc_listeners(table: &str) -> impl Iterator<Item = Listener> + '_ {
+    table.lines().skip(1).filter_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.get(3) != Some(&TCP_LISTEN) {
+            return None;
+        }
+        let (addr, port) = fields.get(1)?.split_once(':')?;
+        let port = u16::from_str_radix(port, 16).ok().filter(|p| *p != 0)?;
+        let inode = fields.get(9)?.parse().ok()?;
+        Some(Listener {
+            addr: proc_addr(addr)?,
+            port,
+            inode,
+        })
+    })
+}
+
+/// A /proc/net/tcp{,6} address: the in-memory (network order) address
+/// printed as 32-bit words in host order, so each word's native bytes are
+/// the address bytes.
+fn proc_addr(hex: &str) -> Option<IpAddr> {
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let word = |i: usize| -> Option<[u8; 4]> {
+        Some(
+            u32::from_str_radix(hex.get(i * 8..i * 8 + 8)?, 16)
+                .ok()?
+                .to_ne_bytes(),
+        )
+    };
+    match hex.len() {
+        8 => Some(IpAddr::from(word(0)?)),
+        32 => {
+            let mut b = [0u8; 16];
+            for i in 0..4 {
+                b[i * 4..i * 4 + 4].copy_from_slice(&word(i)?);
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(b)))
+        }
+        _ => None,
+    }
 }
 
 /// Ports that appeared and ports that went away.
@@ -192,10 +260,55 @@ mod tests {
         assert_eq!(wildcard_listeners(TCP6), BTreeSet::from([8080, 9000]));
     }
 
+    fn listener(addr: &str, port: u16, inode: u32) -> Listener {
+        Listener {
+            addr: addr.parse().unwrap(),
+            port,
+            inode,
+        }
+    }
+
+    #[test]
+    fn decodes_proc_addresses() {
+        assert_eq!(proc_addr("0100007F"), "127.0.0.1".parse().ok());
+        assert_eq!(proc_addr("0202A8C0"), "192.168.2.2".parse().ok());
+        assert_eq!(
+            proc_addr("00000000000000000000000001000000"),
+            "::1".parse().ok()
+        );
+        assert_eq!(
+            proc_addr("0000000000000000FFFF00000100007F"),
+            "::ffff:127.0.0.1".parse().ok()
+        );
+        assert_eq!(proc_addr("0100007"), None);
+        assert_eq!(proc_addr("+100007F"), None);
+        assert_eq!(proc_addr("0100007G"), None);
+    }
+
+    #[test]
+    fn splits_root_listeners_into_wildcard_and_loopback() {
+        // 3306 on 127.0.0.1 and 8081 on ::1 are loopback; 80 on one address
+        // is neither, and established connections are not listeners.
+        let all = proc_listeners(TCP).chain(proc_listeners(TCP6));
+        let root = RootListeners::from_listeners(all);
+        assert_eq!(root.wildcard, BTreeSet::from([22, 8080, 9000]));
+        assert_eq!(
+            root.loopback,
+            [
+                listener("127.0.0.1", 3306, 2002),
+                listener("::1", 8081, 3002)
+            ]
+        );
+    }
+
     #[test]
     fn ignores_garbage() {
         assert!(wildcard_listeners("").is_empty());
         assert!(wildcard_listeners("header\n  0: junk\n  1: 00000000:ZZZZ 0 0A\n").is_empty());
+        assert_eq!(
+            proc_listeners("header\n  1: 0100007F:0050 0 0A\n").count(),
+            0
+        );
     }
 
     #[test]

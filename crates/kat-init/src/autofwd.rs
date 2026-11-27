@@ -12,16 +12,26 @@
 //! - Listeners bound only to loopback stay private, as `-p` would keep them.
 //! - Two containers on one port: the one that listened first keeps it; the
 //!   other takes over when it goes away.
+//!
+//! The same relay also carries ports Docker published on a loopback address
+//! of the VM (`-p 127.0.0.1:8080:80`, see [`published_loopback`]): gvproxy
+//! reaches only the VM's own interface, never its loopback.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// A listening socket: its bound address and port.
+/// A listening socket: its bound address, port and socket inode. The inode
+/// tells a socket that closed and was bound again apart from the same one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Listener {
     pub addr: IpAddr,
     pub port: u16,
+    pub inode: u32,
 }
+
+/// The [`Route::ns`] of the VM's root network namespace, where the relay
+/// already runs. Namespace keys are nsfs inodes, which are never 0.
+pub const ROOT_NS: u64 = 0;
 
 /// A container network namespace as the planner sees it.
 #[derive(Debug, Clone, Default)]
@@ -62,17 +72,66 @@ fn is_v4_mapped_loopback(a: &IpAddr) -> bool {
     matches!(a, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
 }
 
+/// Routes for the ports Docker published on a loopback address of the VM
+/// (`-p 127.0.0.1:8080:80`, `-p '[::1]:8080:80'`). docker-proxy listens on
+/// that address in the root namespace, which the gvproxy forward cannot
+/// reach, so the relay dials it from inside the VM instead.
+///
+/// `listeners` are the root namespace's loopback listeners and `hosts` the
+/// `-host-ip`/`-host-port` of every running TCP docker-proxy. A listener
+/// counts only if a docker-proxy was started for exactly its address and
+/// port, so the VM's own loopback services (containerd, k3s, kubelet)
+/// stay private to the VM. docker-proxy is the only process Docker starts
+/// for a published port with the userland proxy on (the default, which the
+/// guest image keeps), and nothing else can bind its address while it runs.
+///
+/// A port the root namespace also listens on for every address is the
+/// published forward's (`root`). The Mac has one 127.0.0.1:<port>, so if
+/// several loopback addresses publish one port, IPv4 and the lowest address
+/// win, as in [`target`].
+pub fn published_loopback(
+    root: &BTreeSet<u16>,
+    listeners: &[Listener],
+    hosts: &BTreeSet<(IpAddr, u16)>,
+) -> BTreeMap<u16, Route> {
+    let mut sorted: Vec<&Listener> = listeners
+        .iter()
+        .filter(|l| l.addr.is_loopback() && hosts.contains(&(l.addr, l.port)))
+        .filter(|l| !root.contains(&l.port))
+        .collect();
+    sorted.sort();
+    let mut out = BTreeMap::new();
+    for l in sorted {
+        out.entry(l.port).or_insert(Route {
+            ns: ROOT_NS,
+            target: SocketAddr::new(l.addr, l.port),
+        });
+    }
+    out
+}
+
+/// True while some loopback listener has no docker-proxy yet. dockerd binds
+/// a `-p` port before it starts docker-proxy with the socket
+/// (`-use-listen-fd`), so for a moment the listener has no proxy to match.
+pub fn loopback_unmatched(listeners: &[Listener], hosts: &BTreeSet<(IpAddr, u16)>) -> bool {
+    listeners
+        .iter()
+        .any(|l| l.addr.is_loopback() && !hosts.contains(&(l.addr, l.port)))
+}
+
 /// The routes for every auto-forwardable port. `namespaces` is in the order
 /// they were first seen; `current` keeps a port with its owner while that
-/// owner still listens.
+/// owner still listens. `loopback` ([`published_loopback`]) are `-p` ports
+/// too and win over container ports.
 pub fn plan(
     root: &BTreeSet<u16>,
     published: &BTreeSet<(IpAddr, u16)>,
+    loopback: &BTreeMap<u16, Route>,
     namespaces: &[Namespace],
     current: &BTreeMap<u16, Route>,
 ) -> BTreeMap<u16, Route> {
     let route = |ns: &Namespace, port: u16| -> Option<Route> {
-        if root.contains(&port) {
+        if root.contains(&port) || loopback.contains_key(&port) {
             return None;
         }
         let mapped = ns.addrs.iter().any(|a| published.contains(&(*a, port)))
@@ -88,8 +147,11 @@ pub fn plan(
             target: target(&ns.listeners, port)?,
         })
     };
-    let mut out = BTreeMap::new();
+    let mut out = loopback.clone();
     for (port, old) in current {
+        if old.ns == ROOT_NS {
+            continue;
+        }
         if let Some(r) = namespaces
             .iter()
             .find(|ns| ns.key == old.ns)
@@ -129,6 +191,16 @@ pub fn diff(before: &BTreeMap<u16, Route>, now: &BTreeMap<u16, Route>) -> (Vec<u
 /// The `-p` target in a docker-proxy command line (NUL-separated, as in
 /// /proc/<pid>/cmdline): `(proto, container ip, container port)`.
 pub fn docker_proxy_target(cmdline: &[u8]) -> Option<(String, IpAddr, u16)> {
+    docker_proxy_addr(cmdline, "-container-ip", "-container-port")
+}
+
+/// The address a docker-proxy listens on in the VM, from the same command
+/// line: `(proto, host ip, host port)`.
+pub fn docker_proxy_host(cmdline: &[u8]) -> Option<(String, IpAddr, u16)> {
+    docker_proxy_addr(cmdline, "-host-ip", "-host-port")
+}
+
+fn docker_proxy_addr(cmdline: &[u8], ip: &str, port: &str) -> Option<(String, IpAddr, u16)> {
     let args: Vec<&str> = cmdline
         .split(|b| *b == 0)
         .filter_map(|a| std::str::from_utf8(a).ok())
@@ -140,8 +212,8 @@ pub fn docker_proxy_target(cmdline: &[u8]) -> Option<(String, IpAddr, u16)> {
     };
     Some((
         flag("-proto").unwrap_or("tcp").to_string(),
-        flag("-container-ip")?.parse().ok()?,
-        flag("-container-port")?.parse().ok()?,
+        flag(ip)?.parse().ok()?,
+        flag(port)?.parse().ok()?,
     ))
 }
 
@@ -217,6 +289,7 @@ pub fn parse_diag(buf: &[u8], expected_seq: u32, out: &mut Vec<Listener>) -> Dia
             }
             SOCK_DIAG_BY_FAMILY if body.len() >= MSG_LEN => {
                 let port = u16::from_be_bytes([body[4], body[5]]);
+                let inode = u32::from_ne_bytes(body[68..72].try_into().unwrap());
                 let src = &body[8..24];
                 let addr = match body[0] {
                     AF_INET => Some(IpAddr::from(<[u8; 4]>::try_from(&src[..4]).unwrap())),
@@ -226,7 +299,7 @@ pub fn parse_diag(buf: &[u8], expected_seq: u32, out: &mut Vec<Listener>) -> Dia
                 if let Some(addr) = addr
                     && port != 0
                 {
-                    out.push(Listener { addr, port });
+                    out.push(Listener { addr, port, inode });
                 }
             }
             _ => {}
@@ -246,6 +319,7 @@ mod tests {
         Listener {
             addr: addr.parse().unwrap(),
             port,
+            inode: 0,
         }
     }
 
@@ -290,6 +364,7 @@ mod tests {
         let p = plan(
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &[a, b],
             &BTreeMap::new(),
         );
@@ -322,7 +397,13 @@ mod tests {
         let b = ns(2, "172.17.0.3", &[l("0.0.0.0", 3000)]);
         let root = BTreeSet::from([8080]);
         let published = BTreeSet::from([("172.17.0.2".parse().unwrap(), 80)]);
-        let p = plan(&root, &published, &[a, b], &BTreeMap::new());
+        let p = plan(
+            &root,
+            &published,
+            &BTreeMap::new(),
+            &[a, b],
+            &BTreeMap::new(),
+        );
         assert_eq!(p.keys().copied().collect::<Vec<_>>(), [3000]);
     }
 
@@ -331,7 +412,16 @@ mod tests {
         let mut a = ns(1, "172.18.0.5", &[l("172.18.0.5", 5000)]);
         a.addrs.clear();
         let published = BTreeSet::from([("172.18.0.5".parse().unwrap(), 5000)]);
-        assert!(plan(&BTreeSet::new(), &published, &[a], &BTreeMap::new()).is_empty());
+        assert!(
+            plan(
+                &BTreeSet::new(),
+                &published,
+                &BTreeMap::new(),
+                &[a],
+                &BTreeMap::new()
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -342,16 +432,23 @@ mod tests {
         let first = plan(
             &none,
             &BTreeSet::new(),
+            &BTreeMap::new(),
             &[a.clone(), b.clone()],
             &BTreeMap::new(),
         );
         assert_eq!(first[&8000].ns, 1);
         // Order changes (b was seen first after a restart of the scan), but
         // the current owner keeps it.
-        let again = plan(&none, &BTreeSet::new(), &[b.clone(), a], &first);
+        let again = plan(
+            &none,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &[b.clone(), a],
+            &first,
+        );
         assert_eq!(again[&8000].ns, 1);
         // a stops: b takes over, and the port never leaves the Mac.
-        let after = plan(&none, &BTreeSet::new(), &[b], &again);
+        let after = plan(&none, &BTreeSet::new(), &BTreeMap::new(), &[b], &again);
         assert_eq!(
             after[&8000],
             Route {
@@ -371,6 +468,146 @@ mod tests {
         let before = BTreeMap::from([(1, r(1)), (2, r(1))]);
         let now = BTreeMap::from([(2, r(2)), (3, r(1))]);
         assert_eq!(diff(&before, &now), (vec![1], vec![3]));
+    }
+
+    fn host(addr: &str, port: u16) -> (IpAddr, u16) {
+        (addr.parse().unwrap(), port)
+    }
+
+    fn root_route(target: &str) -> Route {
+        Route {
+            ns: ROOT_NS,
+            target: sa(target),
+        }
+    }
+
+    #[test]
+    fn forwards_only_docker_published_loopback_listeners() {
+        // 18098 is `-p 127.0.0.1:18098:80` and 18097 `-p [::1]:18097:80`;
+        // 6444 and 10248 are k3s/kubelet on 127.0.0.1 with no docker-proxy;
+        // 5000 is a docker-proxy on a non-loopback address.
+        let listeners = [
+            l("127.0.0.1", 18098),
+            l("::1", 18097),
+            l("127.0.0.1", 6444),
+            l("127.0.0.1", 10248),
+            l("192.168.127.2", 5000),
+        ];
+        let hosts = BTreeSet::from([
+            host("127.0.0.1", 18098),
+            host("::1", 18097),
+            host("192.168.127.2", 5000),
+            // A proxy whose listener is gone (or not bound yet): nothing.
+            host("127.0.0.1", 18096),
+        ]);
+        assert_eq!(
+            published_loopback(&BTreeSet::new(), &listeners, &hosts),
+            BTreeMap::from([
+                (18097, root_route("[::1]:18097")),
+                (18098, root_route("127.0.0.1:18098")),
+            ])
+        );
+        assert!(loopback_unmatched(&listeners, &hosts));
+        assert!(!loopback_unmatched(&listeners[..2], &hosts));
+    }
+
+    #[test]
+    fn published_loopback_needs_the_exact_address() {
+        // A proxy for 127.0.0.1:8080 says nothing about [::1]:8080 or
+        // 127.0.0.2:8080, which another VM process may hold.
+        let hosts = BTreeSet::from([host("127.0.0.1", 8080)]);
+        let listeners = [l("::1", 8080), l("127.0.0.2", 8080)];
+        assert!(published_loopback(&BTreeSet::new(), &listeners, &hosts).is_empty());
+    }
+
+    #[test]
+    fn published_loopback_prefers_ipv4_and_yields_to_wildcard_ports() {
+        let listeners = [l("::1", 80), l("127.0.0.2", 80), l("127.0.0.1", 80)];
+        let hosts = BTreeSet::from([
+            host("::1", 80),
+            host("127.0.0.2", 80),
+            host("127.0.0.1", 80),
+        ]);
+        assert_eq!(
+            published_loopback(&BTreeSet::new(), &listeners, &hosts),
+            BTreeMap::from([(80, root_route("127.0.0.1:80"))])
+        );
+        // The port is also published on every address: gvproxy has it.
+        assert!(published_loopback(&BTreeSet::from([80]), &listeners, &hosts).is_empty());
+    }
+
+    #[test]
+    fn published_loopback_ports_win_over_container_ports() {
+        // A container that listens on 8080 itself had the auto-forward;
+        // `-p 127.0.0.1:8080:80` for another container takes the port, and
+        // gives it back when it stops.
+        let a = ns(1, "172.17.0.2", &[l("0.0.0.0", 8080)]);
+        let none = BTreeSet::new();
+        let before = plan(
+            &none,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            std::slice::from_ref(&a),
+            &BTreeMap::new(),
+        );
+        assert_eq!(before[&8080].ns, 1);
+        let lo = BTreeMap::from([(8080, root_route("127.0.0.1:8080"))]);
+        let during = plan(
+            &none,
+            &BTreeSet::new(),
+            &lo,
+            std::slice::from_ref(&a),
+            &before,
+        );
+        assert_eq!(during, lo);
+        assert_eq!(diff(&before, &during), (vec![], vec![]));
+        let after = plan(&none, &BTreeSet::new(), &BTreeMap::new(), &[a], &during);
+        assert_eq!(after[&8080].ns, 1);
+        assert_eq!(after[&8080].target, sa("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn published_loopback_routes_go_with_their_proxy() {
+        // The container stops: docker-proxy exits and the route goes, even
+        // if the planner's previous routes still hold it.
+        let lo = BTreeMap::from([(18098, root_route("127.0.0.1:18098"))]);
+        let none = BTreeSet::new();
+        let during = plan(&none, &BTreeSet::new(), &lo, &[], &BTreeMap::new());
+        assert_eq!(during, lo);
+        let after = plan(&none, &BTreeSet::new(), &BTreeMap::new(), &[], &during);
+        assert!(after.is_empty());
+        assert_eq!(diff(&during, &after), (vec![18098], vec![]));
+    }
+
+    #[test]
+    fn parses_docker_proxy_host_addresses() {
+        let cmd = cmdline(&[
+            "/usr/bin/docker-proxy",
+            "-proto",
+            "tcp",
+            "-host-ip",
+            "127.0.0.1",
+            "-host-port",
+            "18098",
+            "-container-ip",
+            "172.17.0.2",
+            "-container-port",
+            "80",
+            "-use-listen-fd",
+        ]);
+        assert_eq!(
+            docker_proxy_host(&cmd),
+            Some(("tcp".into(), "127.0.0.1".parse().unwrap(), 18098))
+        );
+        let v6 = cmdline(&["docker-proxy", "-host-ip", "::1", "-host-port", "443"]);
+        assert_eq!(
+            docker_proxy_host(&v6),
+            Some(("tcp".into(), "::1".parse().unwrap(), 443))
+        );
+        assert_eq!(
+            docker_proxy_host(&cmdline(&["docker-proxy", "-host-port", "1"])),
+            None
+        );
     }
 
     fn cmdline(args: &[&str]) -> Vec<u8> {
@@ -438,6 +675,7 @@ mod tests {
         b[1] = TCP_LISTEN as u8;
         b[4..6].copy_from_slice(&port.to_be_bytes());
         b[8..8 + addr.len()].copy_from_slice(addr);
+        b[68..72].copy_from_slice(&u32::from(port).to_ne_bytes());
         b
     }
 
@@ -472,9 +710,17 @@ mod tests {
         let mut buf = nlmsg(SOCK_DIAG_BY_FAMILY, 7, &diag_msg(AF_INET6, &v6, 9000));
         buf.extend(nlmsg(NLMSG_DONE, 7, &[0; 4]));
         assert_eq!(parse_diag(&buf, 7, &mut out), DiagEnd::Done);
+        let with_inode = |addr, port| Listener {
+            inode: u32::from(port),
+            ..l(addr, port)
+        };
         assert_eq!(
             out,
-            [l("0.0.0.0", 8000), l("172.17.0.2", 443), l("::1", 9000)]
+            [
+                with_inode("0.0.0.0", 8000),
+                with_inode("172.17.0.2", 443),
+                with_inode("::1", 9000)
+            ]
         );
     }
 
@@ -515,6 +761,12 @@ mod tests {
         buf.extend(nlmsg(NLMSG_DONE, 42, &[0; 4]));
         let mut out = Vec::new();
         assert_eq!(parse_diag(&buf, 42, &mut out), DiagEnd::Done);
-        assert_eq!(out, [l("0.0.0.0", 2222)]);
+        assert_eq!(
+            out,
+            [Listener {
+                inode: 2222,
+                ..l("0.0.0.0", 2222)
+            }]
+        );
     }
 }

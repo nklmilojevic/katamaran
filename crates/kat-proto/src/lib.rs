@@ -88,8 +88,9 @@ pub enum Msg {
         port: u16,
     },
     /// Guest → host: a container listens on `port` in its own network
-    /// namespace and nothing in the root namespace does; forward the Mac's
-    /// `127.0.0.1:port` to it through [`AUTO_FORWARD_PORT`].
+    /// namespace and nothing in the root namespace does, or Docker published
+    /// `port` on the VM's loopback (`-p 127.0.0.1:port:...`); forward the
+    /// Mac's `127.0.0.1:port` to it through [`AUTO_FORWARD_PORT`].
     AutoForwardAdd {
         proto: PortProto,
         port: u16,

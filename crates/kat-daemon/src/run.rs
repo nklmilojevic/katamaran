@@ -640,6 +640,9 @@ fn session(
     let docker_sock = run_dir.join("docker.sock");
     // Unpublished container ports, relayed over vsock (see autofwd.rs).
     let auto_forward = !args.no_network && !args.no_auto_forward;
+    // The relay also carries ports published on the VM's loopback
+    // (`-p 127.0.0.1:...`), so it is there whenever the network is.
+    let vsock_forward = !args.no_network;
     let autofwd_sock = run_dir.join("autofwd.sock");
     // The guest's files on the Mac: (mount point, NFS port file).
     let nfs_port = nfs::port_file(&run_dir)
@@ -734,7 +737,7 @@ fn session(
             kernel_only: true,
             loopback_tcp: true,
         }))
-        .chain(auto_forward.then(|| HostListener {
+        .chain(vsock_forward.then(|| HostListener {
             port: AUTO_FORWARD_PORT,
             path: autofwd_sock.clone(),
             kernel_only: false,

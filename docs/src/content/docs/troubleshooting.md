@@ -104,7 +104,7 @@ umount -f ~/Katamaran
 
 ## Published or auto-forwarded port is unreachable
 
-1. Check that the service inside the container listens on `0.0.0.0` or `::`, not only `127.0.0.1`. Automatic port forwarding and `-p` only expose wildcard listeners.
+1. Check that the service inside the container listens on `0.0.0.0` or `::`, not only `127.0.0.1`. Automatic port forwarding and `-p` only expose wildcard listeners inside the container. (Publishing on the VM's loopback, as in `-p 127.0.0.1:8080:80`, is supported.)
 2. Check whether another macOS process already holds the same port on `127.0.0.1`:
 
 ```sh

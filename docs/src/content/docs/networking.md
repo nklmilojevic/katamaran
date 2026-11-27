@@ -18,6 +18,15 @@ curl http://127.0.0.1:8080/
 
 The guest watches wildcard TCP listeners in the root network namespace (such as `docker-proxy`) via netlink `sock_diag` and asks gvproxy to expose those ports on macOS.
 
+Ports published on a loopback address work the same way from your Mac:
+
+```sh
+docker run -d --rm -p 127.0.0.1:8080:80 nginx:alpine
+curl http://127.0.0.1:8080/
+```
+
+Docker binds such a port on the VM's loopback, which gvproxy cannot reach, so katamaran forwards it over virtio-vsock instead: the Mac's `127.0.0.1:<port>` connects to the guest agent, which dials `docker-proxy` on the VM's loopback. Only loopback listeners owned by a `docker-proxy` with that exact `-host-ip` and `-host-port` are forwarded (`127.0.0.1`, other `127.0.0.0/8` addresses, and `::1`); the VM's own loopback services, such as containerd, k3s, and kubelet, stay private to the VM. The port is never exposed on the VM's network interface, and on the Mac it listens only on loopback, on `127.0.0.1` (and any [`lo0` aliases](#listen-on-lo0-aliases) in `forward_addresses`) like every other forward. These ports are forwarded even when `auto_forward` is off, and tools that publish on `127.0.0.1` by default, such as the `ddev` router (`127.0.0.1:80` and `127.0.0.1:443`), work without `--router-bind-all-interfaces`.
+
 Privileged ports below `1024` (such as `80` and `443`) work without administrator privileges on macOS: when `127.0.0.1:<port>` returns `EACCES`, katamaran binds a wildcard socket scoped to `lo0` (`IP_BOUND_IF`) and drops non-loopback endpoints so traffic remains local to your Mac.
 
 If macOS refuses to bind a port (for example because another macOS service already holds it), `kat status` lists it under `port err` (and `port_errors` in `kat status --json`) and the app marks the port as not forwarded.
