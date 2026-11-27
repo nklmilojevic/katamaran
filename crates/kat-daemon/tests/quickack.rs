@@ -24,7 +24,7 @@ const QUICKACK_PARAM: &str = "/sys/module/kat/parameters/quickack";
 /// Without quick ACK, the client's delayed-ACK timer stalls every keep-alive
 /// request for ~40–50 ms.
 const SPLIT_WRITE_SERVER_PY: &str = r#"
-import socket, threading
+import socket, threading, time
 
 BODY = b"x" * 10240
 HDR = (
@@ -46,6 +46,21 @@ SHORT_CHUNKS = 512
 SHORT_HDR = (
     b"HTTP/1.1 200 OK\r\n"
     b"Content-Length: " + str(len(SHORT_CHUNK) * SHORT_CHUNKS).encode() + b"\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
+PACED_CHUNKS = 32
+PACED_HDR = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: " + str(len(SHORT_CHUNK) * PACED_CHUNKS).encode() + b"\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
+PUSHED_CHUNK = b"p" * 60000
+PUSHED_CHUNKS = 48
+PUSHED_HDR = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: " + str(len(PUSHED_CHUNK) * PUSHED_CHUNKS).encode() + b"\r\n"
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
@@ -71,6 +86,20 @@ def handle(conn):
                 for _ in range(SHORT_CHUNKS):
                     conn.sendall(SHORT_CHUNK)
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+            elif req_hdr.startswith(b"GET /paced "):
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.sendall(PACED_HDR)
+                for _ in range(PACED_CHUNKS):
+                    conn.sendall(SHORT_CHUNK)
+                    time.sleep(0.001)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+            elif req_hdr.startswith(b"GET /pushed "):
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.sendall(PUSHED_HDR)
+                for _ in range(PUSHED_CHUNKS):
+                    conn.sendall(PUSHED_CHUNK)
+                    time.sleep(0.0005)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             else:
                 conn.sendall(HDR)
                 conn.sendall(BODY)
@@ -89,8 +118,10 @@ while True:
 
 /// Keep-alive client that opens ONE persistent TCP connection to `host:8080`,
 /// reads commands from stdin (`<count>` for split-write bursts, `bulk` for a
-/// 32 MiB sustained download, `short` for a 512x4 KiB short-write stream, or
-/// `rcvlowat <N>` to set `SO_RCVLOWAT` and gate each read on `select.poll()`),
+/// 32 MiB sustained download, `short` for an unpaced 512x4 KiB short-write
+/// stream, `paced` for a 32x4 KiB paced short-write stream that lets the reader
+/// drain between writes, `pushed` for a 48x60000B pushed multi-segment stream,
+/// or `rcvlowat <N>` to set `SO_RCVLOWAT` and gate reads on `select.poll()`),
 /// and prints two space-separated floats flushed after each workload command.
 /// Passing an optional count on argv runs a single burst and exits.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
@@ -100,6 +131,8 @@ host = sys.argv[1]
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+pushed_req = b"GET /pushed HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
 def tcp_out_segs():
     with open("/proc/net/snmp") as f:
@@ -112,28 +145,50 @@ def tcp_out_segs():
     raise RuntimeError("OutSegs not found in /proc/net/snmp")
 
 def recv_exact(sock, n, buf):
-    while len(buf) < n:
-        chunk = sock.recv(min(n - len(buf), 65536))
-        if not chunk:
-            raise RuntimeError("unexpected EOF")
-        buf += chunk
+    lowered = False
+    try:
+        while len(buf) < n:
+            rem = n - len(buf)
+            if cur_lowat > 1 and rem < cur_lowat and not lowered:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                lowered = True
+            chunk = sock.recv(min(rem, 65536))
+            if not chunk:
+                raise RuntimeError("unexpected EOF")
+            buf += chunk
+    finally:
+        if lowered:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
     return buf[:n], buf[n:]
 
 def drain_exact(sock, n, buf):
     if len(buf) >= n:
         return buf[n:]
     rem = n - len(buf)
-    while rem > 0:
-        chunk = sock.recv(min(rem, 262144))
-        if not chunk:
-            raise RuntimeError("unexpected EOF in stream body")
-        rem -= len(chunk)
+    lowered = False
+    try:
+        while rem > 0:
+            if cur_lowat > 1 and rem < cur_lowat and not lowered:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                lowered = True
+            elif use_poll and rem >= cur_lowat:
+                events = poller.poll(10000)
+                if not events:
+                    raise RuntimeError("poll timed out draining stream")
+            chunk = sock.recv(min(rem, max(262144, cur_lowat)))
+            if not chunk:
+                raise RuntimeError("unexpected EOF in stream body")
+            rem -= len(chunk)
+    finally:
+        if lowered:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
     return b""
 
 sock = socket.create_connection((host, 8080), timeout=10)
 sock.settimeout(10)
 poller = select.poll()
 poller.register(sock, select.POLLIN)
+cur_lowat = 1
 use_poll = False
 buf = b""
 
@@ -168,8 +223,12 @@ def run_stream(req_bytes, expected_len):
     before = tcp_out_segs()
     t0 = time.monotonic()
     sock.sendall(req_bytes)
+    if use_poll and not buf:
+        events = poller.poll(10000)
+        if not events:
+            raise RuntimeError("poll timed out waiting for stream headers")
     while b"\r\n\r\n" not in buf:
-        chunk = sock.recv(65536)
+        chunk = sock.recv(max(65536, cur_lowat))
         if not chunk:
             raise RuntimeError("unexpected EOF in stream headers")
         buf += chunk
@@ -196,11 +255,15 @@ else:
             run_stream(bulk_req, 32 * 1024 * 1024)
         elif line == "short":
             run_stream(short_req, 512 * 4096)
+        elif line == "paced":
+            run_stream(paced_req, 32 * 4096)
+        elif line == "pushed":
+            run_stream(pushed_req, 48 * 60000)
         elif line.startswith("rcvlowat "):
-            lowat = int(line.split()[1])
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
-            use_poll = lowat > 1
-            print(f"{lowat} 0.000", flush=True)
+            cur_lowat = int(line.split()[1])
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
+            use_poll = cur_lowat > 1
+            print(f"{cur_lowat} 0.000", flush=True)
         else:
             run_burst(int(line))
 sock.close()
@@ -868,6 +931,11 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     eprintln!(
         "pod-to-pod short-write 512x4KiB stream (quickack=Y): out_segs={short_acks_on:.0} elapsed={short_ms_on:.2}ms"
     );
+    let (paced_acks_on, paced_ms_on) =
+        send_cmd("paced", "paced short-write 32x4KiB stream (quickack=Y)");
+    eprintln!(
+        "pod-to-pod paced short-write 32x4KiB stream (quickack=Y): out_segs={paced_acks_on:.0} elapsed={paced_ms_on:.2}ms"
+    );
 
     // Poll-driven split-write keep-alive with SO_RCVLOWAT=4096 (above ~80B
     // headers, below 10 KiB body): poll() cannot wake on the short header, so
@@ -881,6 +949,18 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     assert!(
         lowat_on_p50 < 15.0 && lowat_on_total < 300.0,
         "SO_RCVLOWAT=4096 poll keep-alive stalled with quickack=Y (p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms)"
+    );
+
+    // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments):
+    // !after(rcv_wup, copied_seq) ensures the override fires at most once per
+    // unread batch rather than ACKing every pushed segment below SO_RCVLOWAT.
+    send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144");
+    let (pushed_acks_on, pushed_ms_on) = send_cmd(
+        "pushed",
+        "SO_RCVLOWAT=262144 pushed 48x60000B stream (quickack=Y)",
+    );
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B (quickack=Y): out_segs={pushed_acks_on:.0} elapsed={pushed_ms_on:.2}ms"
     );
     send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1");
 
@@ -924,6 +1004,22 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             lowat_off_p50 >= 25.0,
             "expected SO_RCVLOWAT=4096 poll stall with quickack=0 (got p50={lowat_off_p50:.2}ms total={lowat_off_total:.2}ms)"
         );
+
+        send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144 (quickack=N)");
+        let (pushed_acks_off, pushed_ms_off) = send_cmd(
+            "pushed",
+            "SO_RCVLOWAT=262144 pushed 48x60000B stream (quickack=N)",
+        );
+        eprintln!(
+            "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B (quickack=N): out_segs={pushed_acks_off:.0} elapsed={pushed_ms_off:.2}ms"
+        );
+        // 48 pushed segments: without !after(rcv_wup, copied_seq) each segment
+        // below 262144 would be ACKed (~48+ OutSegs). With the guard, stock
+        // pacing handles subsequent segments in each batch.
+        assert!(
+            pushed_acks_on < 42.0 && pushed_acks_on <= pushed_acks_off * 1.5 + 8.0,
+            "SO_RCVLOWAT=262144 pushed stream inflated ACKs (on={pushed_acks_on:.0}, off={pushed_acks_off:.0})"
+        );
         send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1 (quickack=N)");
 
         let (bulk_acks_off, bulk_ms_off) = send_cmd("bulk", "sustained 32MiB bulk (quickack=N)");
@@ -942,6 +1038,15 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         assert!(
             short_acks_on < 256.0 && short_acks_on <= short_acks_off * 2.0 + 64.0,
             "quickack=Y inflated short-write stream ACK traffic (on={short_acks_on:.0}, off={short_acks_off:.0})"
+        );
+        let (paced_acks_off, paced_ms_off) =
+            send_cmd("paced", "paced short-write 32x4KiB stream (quickack=N)");
+        eprintln!(
+            "pod-to-pod paced short-write 32x4KiB stream (quickack=N): out_segs={paced_acks_off:.0} elapsed={paced_ms_off:.2}ms"
+        );
+        assert!(
+            paced_acks_on <= 40.0 && paced_ms_on < 500.0,
+            "paced short-write stream misbehaved (on={paced_acks_on:.0} segs in {paced_ms_on:.2}ms, off={paced_acks_off:.0} segs in {paced_ms_off:.2}ms)"
         );
 
         restore.restore();
