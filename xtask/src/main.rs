@@ -111,6 +111,7 @@ fn main() -> anyhow::Result<()> {
         }
         Task::TestVm => {
             require_tool("kubectl", "running `cargo xtask test-vm`")?;
+            require_tool("docker", "running `cargo xtask test-vm`")?;
             // Fail before building anything if guest/out/Image predates the current kernel
             // patches (e.g. the quickack suite needs kat.quickack from patch 0012).
             require_current_kernel(&root)?;

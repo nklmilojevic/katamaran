@@ -428,46 +428,56 @@ sock.close()
 /// has already deducted the TCP timestamp option from its `advmss`. Each
 /// message is a near-MSS first write plus a 1 KiB tail; the receiver polls
 /// with `SO_RCVLOWAT` above the first write, reads the whole message, and
-/// replies with one byte. The first message announces the sizes as
-/// `<first> <tail>\n`.
+/// replies with one byte. Each phase of messages is announced as
+/// `<first> <tail> <count>\n`.
 const NEAR_MSS_RECEIVER_PY: &str = r#"
 import select, socket, threading
 
+def recv_line(conn):
+    line = b""
+    while not line.endswith(b"\n"):
+        b = conn.recv(1)
+        if not b:
+            return None
+        line += b
+    return line
+
 def handle(conn):
     try:
-        meta = b""
-        while not meta.endswith(b"\n"):
-            b = conn.recv(1)
-            if not b:
-                return
-            meta += b
-        first, tail = (int(x) for x in meta.split())
-        total = first + tail
-        lowat = first + tail // 2
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
         poller = select.poll()
         poller.register(conn, select.POLLIN)
-        conn.sendall(b"k")
         while True:
-            if not poller.poll(10000):
-                raise RuntimeError("poll timed out")
-            got = 0
-            while got < total:
-                if total - got < lowat:
-                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
-                chunk = conn.recv(total - got)
-                if not chunk:
-                    return
-                got += len(chunk)
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
+            # Each phase starts with "<first> <tail> <count>\n" at
+            # SO_RCVLOWAT=1, acknowledged with one byte.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+            meta = recv_line(conn)
+            if meta is None:
+                return
+            first, tail, count = (int(x) for x in meta.split())
+            total = first + tail
+            lowat = first + tail // 2
             conn.sendall(b"k")
+            for _ in range(count):
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
+                if not poller.poll(10000):
+                    raise RuntimeError("poll timed out")
+                got = 0
+                while got < total:
+                    if total - got < lowat:
+                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                    chunk = conn.recv(total - got)
+                    if not chunk:
+                        return
+                    got += len(chunk)
+                conn.sendall(b"k")
     finally:
         conn.close()
 
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 # A fixed large buffer keeps the window open, so poll() wakes only on
-# SO_RCVLOWAT rather than on receive-window pressure.
+# SO_RCVLOWAT rather than on receive-window pressure, and lets the sender's
+# MSS grow past the half-window bound to the full link MSS.
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
 srv.bind(("0.0.0.0", 8081))
 srv.listen(8)
@@ -477,40 +487,47 @@ while True:
 "#;
 
 /// Sender side of the accepted-connection near-MSS probe (Nagle enabled).
-/// Connects to `argv[1]:8081`, sends `<count>` messages of a first write of
-/// `MSS - 8` bytes (just below the full-sized payload, but above it if the
-/// timestamp option were deducted twice) followed by a 1 KiB tail that Nagle
-/// holds until the first write is ACKed, after 30 warm-up messages that
-/// settle the receiver's rcv_mss and pingpong mode. Prints `<p50> <total>`.
+/// Connects to `argv[1]:8081`, first grows the receiver's advertised window
+/// with 60000 B + 1 KiB messages until the sender's MSS (which Linux caps at
+/// half the peer's largest window) reaches the full link MSS, asserts it is
+/// near the 64 KiB link MSS, then sends 30 warm-up and `argv[2]` timed
+/// messages of an `MSS - 8` first write (just below the full-sized payload,
+/// above it if the timestamp option were deducted twice) and a 1 KiB tail that
+/// Nagle holds until the first write is ACKed. Prints `<p50> <total>`.
 const NEAR_MSS_SENDER_PY: &str = r#"
 import socket, sys, time
 
 sock = socket.create_connection((sys.argv[1], 8081), timeout=10)
 sock.settimeout(10)
 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
-opts = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
-mss = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
-first, tail = mss - 8, 1024
-sock.sendall(f"{first} {tail}\n".encode())
-assert sock.recv(1) == b"k"
-first_buf, tail_buf = b"n" * first, b"t" * tail
 
-def exchange():
-    t0 = time.monotonic()
-    sock.sendall(first_buf)
-    sock.sendall(tail_buf)
+def phase(first, tail, count):
+    sock.sendall(f"{first} {tail} {count}\n".encode())
     if sock.recv(1) != b"k":
-        raise RuntimeError("bad reply")
-    return (time.monotonic() - t0) * 1000.0
+        raise RuntimeError("bad phase ack")
+    first_buf, tail_buf = b"n" * first, b"t" * tail
+    times = []
+    for _ in range(count):
+        t0 = time.monotonic()
+        sock.sendall(first_buf)
+        sock.sendall(tail_buf)
+        if sock.recv(1) != b"k":
+            raise RuntimeError("bad reply")
+        times.append((time.monotonic() - t0) * 1000.0)
+    return times
 
-for _ in range(30):
-    exchange()
-t_all = time.monotonic()
-times = sorted(exchange() for _ in range(int(sys.argv[2])))
-total = (time.monotonic() - t_all) * 1000.0
+phase(60000, 1024, 20)
+mss = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
 # struct tcp_info byte 5 is tcpi_options; bit 0 is TCPI_OPT_TIMESTAMPS, which
 # the case under test needs.
+opts = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
 assert opts[5] & 1, "TCP timestamps not negotiated"
+assert mss >= 65000, f"sender MSS {mss} did not reach the 64 KiB link MSS"
+first = mss - 8
+phase(first, 1024, 30)
+t_all = time.monotonic()
+times = sorted(phase(first, 1024, int(sys.argv[2])))
+total = (time.monotonic() - t_all) * 1000.0
 print(f"{times[len(times) // 2]:.3f} {total:.3f}", flush=True)
 "#;
 

@@ -143,6 +143,8 @@ MAKE=(make -C "/work/$tree" O="/work/$obj" ARCH=arm64 CC="ccache gcc" -j"$(nproc
 
 case "$MODE" in
 shell)
+	# A shell may replace /out/Image by hand; never leave a stamp vouching for it.
+	rm -f /out/Image.stamp
 	cd "/work/$tree"
 	exec bash -c "$SHELL_CMD"
 	;;
@@ -231,7 +233,7 @@ shell)
 	SHELL_CMD=${*:-bash}
 	;;
 *)
-	echo "usage: $0 [build|clean|shell CMD]" >&2
+	echo "usage: $0 [build|clean|shell CMD|stamp]" >&2
 	exit 2
 	;;
 esac

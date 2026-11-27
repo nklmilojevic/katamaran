@@ -61,7 +61,7 @@ pub const DEFAULT_API_PORT: u16 = 6443;
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
 pub const DEFAULT_DNS_PORT: u16 = 15353;
 pub const RESOLVER_PATH: &str = "/etc/resolver/k8s.kat.local";
-/// When set in the daemon's environment, the `*.k8s.kat.local` DNS responder
+/// When set to `1` in the daemon's environment, the `*.k8s.kat.local` DNS responder
 /// binds an ephemeral loopback port instead of the port named by an installed
 /// [`RESOLVER_PATH`]. Integration tests set it so their isolated daemons do not
 /// fail on the port held by the developer's real daemon.
@@ -1058,7 +1058,7 @@ pub struct DnsServer {
 
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
-        if std::env::var_os(ISOLATED_DNS_ENV).is_some() {
+        if std::env::var_os(ISOLATED_DNS_ENV).is_some_and(|v| v == "1") {
             return Self::start_ephemeral();
         }
         Self::start_with_installed_port(installed_dns_port())
