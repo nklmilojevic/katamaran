@@ -62,6 +62,14 @@ fn make_full_pipe() -> (File, File) {
     (read_end, write_end)
 }
 
+fn make_broken_pipe_writer() -> File {
+    let mut fds: [RawFd; 2] = [-1, -1];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // Close the read end immediately so writes to the write end fail with EPIPE.
+    assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+    unsafe { File::from_raw_fd(fds[1]) }
+}
+
 #[test]
 fn k8s_reset_exits_nonzero_on_rpc_error_even_when_stderr_pipe_is_full_and_unread() {
     let home = TempDirGuard::create("kat-rst-err");
@@ -71,7 +79,7 @@ fn k8s_reset_exits_nonzero_on_rpc_error_even_when_stderr_pipe_is_full_and_unread
     let listener = UnixListener::bind(&sock).unwrap();
 
     let srv = thread::spawn(move || {
-        for _ in 0..2 {
+        for call_idx in 0..3 {
             let (mut conn, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(conn.try_clone().unwrap());
             let mut line = String::new();
@@ -80,24 +88,35 @@ fn k8s_reset_exits_nonzero_on_rpc_error_even_when_stderr_pipe_is_full_and_unread
             assert_eq!(req["method"], "k8s.reset");
             let id = req["id"].clone();
 
-            for i in 0..40 {
-                let note = serde_json::json!({
+            if call_idx < 2 {
+                for i in 0..40 {
+                    let note = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "k8s.progress",
+                        "params": { "message": format!("progress step {i}") },
+                    });
+                    let mut out = serde_json::to_vec(&note).unwrap();
+                    out.push(b'\n');
+                    conn.write_all(&out).unwrap();
+                }
+                let resp = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "method": "k8s.progress",
-                    "params": { "message": format!("progress step {i}") },
+                    "id": id,
+                    "error": { "code": 1, "message": "simulated reset failure" },
                 });
-                let mut out = serde_json::to_vec(&note).unwrap();
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            } else {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": null,
+                });
+                let mut out = serde_json::to_vec(&resp).unwrap();
                 out.push(b'\n');
                 conn.write_all(&out).unwrap();
             }
-            let resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": 1, "message": "simulated reset failure" },
-            });
-            let mut out = serde_json::to_vec(&resp).unwrap();
-            out.push(b'\n');
-            conn.write_all(&out).unwrap();
         }
     });
 
@@ -147,7 +166,6 @@ fn k8s_reset_exits_nonzero_on_rpc_error_even_when_stderr_pipe_is_full_and_unread
         .read_to_string(&mut stderr_buf)
         .unwrap();
     let status2 = child2.wait().unwrap();
-    srv.join().unwrap();
 
     assert!(!status2.success(), "expected nonzero exit, got {status2}");
     assert!(
@@ -159,7 +177,37 @@ fn k8s_reset_exits_nonzero_on_rpc_error_even_when_stderr_pipe_is_full_and_unread
         "missing terminal error diagnostic in stderr: {stderr_buf}"
     );
 
-    // 3. Daemon connection failure with a full, unread stderr pipe also exits
+    // 3. Successful reset whose stdout confirmation fails (closed pipe / EPIPE):
+    //    CLI must NOT exit zero and must report the stdout write error.
+    let broken_stdout = make_broken_pipe_writer();
+    let mut child_stdout_err = Command::new(env!("CARGO_BIN_EXE_katamaran"))
+        .args(["k8s", "reset"])
+        .env("KATAMARAN_HOME", &home.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(broken_stdout))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr_buf_stdout = String::new();
+    child_stdout_err
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr_buf_stdout)
+        .unwrap();
+    let status_stdout_err = child_stdout_err.wait().unwrap();
+    srv.join().unwrap();
+
+    assert!(
+        !status_stdout_err.success(),
+        "expected nonzero exit when writing stdout confirmation fails, got {status_stdout_err}"
+    );
+    assert!(
+        stderr_buf_stdout.contains("write reset confirmation to stdout"),
+        "missing stdout write failure diagnostic: {stderr_buf_stdout}"
+    );
+
+    // 4. Daemon connection failure with a full, unread stderr pipe also exits
     //    nonzero promptly without hanging on stderr.
     let missing_home = TempDirGuard::create("kat-rst-no");
     let (_unread_pipe_read3, full_pipe_write3) = make_full_pipe();

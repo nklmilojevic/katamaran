@@ -279,31 +279,36 @@ impl ProgressPrinter {
     }
 }
 
+fn report_error_bounded(printer: ProgressPrinter, err: &anyhow::Error) -> anyhow::Error {
+    printer.finish(
+        Some(format!("Error: {err:?}\n")),
+        Duration::from_millis(250),
+    );
+    ReportedError.into()
+}
+
 fn reset(images: bool) -> anyhow::Result<()> {
     let mut printer = ProgressPrinter::spawn(RawStderr);
     let mut c = match Client::connect_default() {
         Ok(c) => c,
-        Err(e) => {
-            printer.finish(Some(format!("Error: {e:?}\n")), Duration::from_millis(250));
-            return Err(ReportedError.into());
-        }
+        Err(e) => return Err(report_error_bounded(printer, &e)),
     };
     let res = reset_with_client(&mut c, images, &mut |msg| printer.send(msg));
     if let Err(e) = res {
-        printer.finish(Some(format!("Error: {e:?}\n")), Duration::from_millis(250));
-        return Err(ReportedError.into());
+        return Err(report_error_bounded(printer, &e));
     }
     printer.finish(None, Duration::from_millis(250));
-    if images {
-        let _ = std::io::Write::write_all(
-            &mut std::io::stdout(),
-            b"katamaran: Kubernetes cluster reset (k8s.io images cleared)\n",
-        );
+    let confirmation = if images {
+        b"katamaran: Kubernetes cluster reset (k8s.io images cleared)\n".as_slice()
     } else {
-        let _ = std::io::Write::write_all(
-            &mut std::io::stdout(),
-            b"katamaran: Kubernetes cluster reset\n",
-        );
+        b"katamaran: Kubernetes cluster reset\n".as_slice()
+    };
+    if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), confirmation)
+        .and_then(|()| std::io::Write::flush(&mut std::io::stdout()))
+    {
+        let err = anyhow::Error::new(e).context("write reset confirmation to stdout");
+        let err_printer = ProgressPrinter::spawn(RawStderr);
+        return Err(report_error_bounded(err_printer, &err));
     }
     Ok(())
 }
