@@ -3448,7 +3448,18 @@ struct ClusterDataPaths<'a> {
     k3s_config: &'a Path,
 }
 
-fn next_stale_data_dir(parent: &Path) -> std::path::PathBuf {
+/// Like `Path::exists`, but uses `symlink_metadata` and propagates filesystem
+/// errors (such as `EIO`, `EACCES`, or `ENOTDIR`) instead of mistaking them for
+/// absence.
+fn path_exists_checked(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+fn next_stale_data_dir(parent: &Path) -> Result<std::path::PathBuf, String> {
     for _ in 0..16 {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let suffix = fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -3462,15 +3473,15 @@ fn next_stale_data_dir(parent: &Path) -> std::path::PathBuf {
                 format!("{}-{nanos}-{seq}", std::process::id())
             });
         let candidate = parent.join(format!("{DATA_DIR_STALE_PREFIX}{suffix}"));
-        if !candidate.exists() {
-            return candidate;
+        if !path_exists_checked(&candidate)? {
+            return Ok(candidate);
         }
     }
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(
+    Ok(parent.join(format!(
         "{DATA_DIR_STALE_PREFIX}{}-{seq}",
         std::process::id()
-    ))
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3530,20 +3541,20 @@ fn remove_cluster_data_dirs(
     // Remove the legacy pre-migration kubelet directory before detaching
     // `data_dir` so a failure here leaves active cluster state untouched.
     let mut beat = || progress("removing cluster data");
-    if paths.legacy_kubelet_dir.exists() {
+    if path_exists_checked(paths.legacy_kubelet_dir)? {
         remove_dir(paths.legacy_kubelet_dir, &mut beat)?;
     }
 
     // Detach the active `data_dir` atomically before any bounded recursive
     // deletion so a timeout can never leave a partially deleted live datastore.
     let mut detached: Option<std::path::PathBuf> = None;
-    if paths.data_dir.exists() {
+    if path_exists_checked(paths.data_dir)? {
         try_btrfs_delete(paths.data_dir, &mut beat)?;
-        if paths.data_dir.exists() {
+        if path_exists_checked(paths.data_dir)? {
             let parent = paths.data_dir.parent().ok_or_else(|| {
                 format!("missing parent directory for {}", paths.data_dir.display())
             })?;
-            let staged = next_stale_data_dir(parent);
+            let staged = next_stale_data_dir(parent)?;
             fs::rename(paths.data_dir, &staged).map_err(|e| {
                 format!(
                     "detach {} -> {}: {e}",
@@ -3564,19 +3575,31 @@ fn remove_cluster_data_dirs(
     if let Some(staged) = detached {
         to_reclaim.push(staged);
     }
-    if let Some(parent) = paths.data_dir.parent()
-        && let Ok(entries) = fs::read_dir(parent)
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
-            {
-                let p = entry.path();
-                if !to_reclaim.contains(&p) {
-                    to_reclaim.push(p);
+    if let Some(parent) = paths.data_dir.parent() {
+        match fs::read_dir(parent) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        format!("scan {} for detached cluster data: {e}", parent.display())
+                    })?;
+                    let name = entry.file_name();
+                    if name
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
+                    {
+                        let p = entry.path();
+                        if !to_reclaim.contains(&p) {
+                            to_reclaim.push(p);
+                        }
+                    }
                 }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "read {} for detached cluster data: {e}",
+                    parent.display()
+                ));
             }
         }
     }
@@ -3612,7 +3635,7 @@ fn rm_rf_reaped(
             format!("remove {}: {detail}", path.display())
         });
     }
-    if path.exists() {
+    if path_exists_checked(path)? {
         return Err(format!(
             "remove {}: path still exists after rm",
             path.display()
@@ -9717,6 +9740,80 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         .unwrap();
         assert_eq!(reclaimed_on_retry, vec![detached_path.clone()]);
         assert!(!detached_path.exists());
+
+        // Missing parent directory (fresh VM where k3s dir was never created)
+        // succeeds cleanly as an empty inventory.
+        let missing_parent = base.join("never-created");
+        let missing_paths = ClusterDataPaths {
+            data_dir: &missing_parent.join("data"),
+            legacy_kubelet_dir: &base.join("no-legacy"),
+            kubeconfig: &base.join("no-kc"),
+            k3s_config: &base.join("no-cfg"),
+        };
+        let mut missing_cleared = false;
+        remove_cluster_data_dirs(
+            &missing_paths,
+            |_, _| panic!("should not call btrfs on missing data_dir"),
+            |_, _| panic!("should not remove anything on missing parent"),
+            &mut || missing_cleared = true,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(missing_cleared);
+
+        // Filesystem error while statting `data_dir` (e.g. ENOTDIR when parent is a
+        // regular file) must fail BEFORE reporting `on_active_data_cleared`.
+        let file_parent = base.join("not-a-dir");
+        fs::write(&file_parent, b"file").unwrap();
+        let bad_stat_paths = ClusterDataPaths {
+            data_dir: &file_parent.join("data"),
+            legacy_kubelet_dir: &base.join("no-legacy"),
+            kubeconfig: &base.join("no-kc"),
+            k3s_config: &base.join("no-cfg"),
+        };
+        let mut bad_stat_cleared = false;
+        let err = remove_cluster_data_dirs(
+            &bad_stat_paths,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+            &mut || bad_stat_cleared = true,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("stat "), "{err}");
+        assert!(
+            !bad_stat_cleared,
+            "must not acknowledge data cleared when statting data_dir fails"
+        );
+
+        // Error opening parent directory to scan for `.data.removing-*` siblings
+        // AFTER `on_active_data_cleared` must surface as a reclamation error rather
+        // than silently succeeding.
+        let scan_parent = base.join("scan-parent");
+        fs::create_dir(&scan_parent).unwrap();
+        let scan_paths = ClusterDataPaths {
+            data_dir: &scan_parent.join("data"),
+            legacy_kubelet_dir: &base.join("no-legacy"),
+            kubeconfig: &base.join("no-kc"),
+            k3s_config: &base.join("no-cfg"),
+        };
+        let mut scan_cleared = false;
+        let err = remove_cluster_data_dirs(
+            &scan_paths,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+            &mut || {
+                scan_cleared = true;
+                // Replace parent dir with a regular file so `read_dir` returns ENOTDIR
+                // even when running tests as root (uid 0).
+                fs::remove_dir(&scan_parent).unwrap();
+                fs::write(&scan_parent, b"not-a-dir").unwrap();
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(scan_cleared, "on_active_data_cleared must run before scan");
+        assert!(err.contains("for detached cluster data"), "{err}");
     }
 
     #[test]
