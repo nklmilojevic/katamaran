@@ -1208,14 +1208,17 @@ fn openpty(t: &Tty) -> io::Result<(OwnedFd, OwnedFd)> {
 ///   own CID) use the loopback transport and carry a guest-side source CID, so
 ///   containers and other guest processes, which share the guest's vsock
 ///   namespace, are rejected here.
-/// - Only the virtio-vsock transport delivers `VMADDR_CID_HOST` peers, and
-///   libkrun's muxer creates those connections only when a host process
-///   connects to the host-side listener socket for this port
-///   (`<home>/run/vm-exec.sock`, inside the daemon's mode-0700 run directory).
-/// - A guest cannot loop back through libkrun to reach that listener: the
-///   muxer rejects guest TSI connects and proxy creation that target any
-///   host-listener port or its Unix socket path (`is_host_listener_id` /
-///   `is_protected_unix_path` in `vendor/libkrun/.../vsock/muxer.rs`).
+/// - Only the virtio-vsock transport delivers `VMADDR_CID_HOST` peers:
+///   `kat-vmm` creates the virtio-vsock device with `TsiFlags::empty()` (all
+///   TSI hijacking disabled) and registers `VM_EXEC_PORT` exclusively as a
+///   `listen = true` host Unix listener (`<home>/run/vm-exec.sock`, inside the
+///   daemon's mode-0700 run directory).
+/// - A guest cannot loop back through libkrun to reach that listener or spoof
+///   `VMADDR_CID_HOST`: `vendor/libkrun/src/devices/src/virtio/vsock/muxer.rs`
+///   rejects guest `VSOCK_OP_REQUEST` on `listen == true` ports and
+///   `is_host_listener_id` packets with `MuxerRx::Reset`, and `muxer_rxq.rs`
+///   stamps `src_cid = VSOCK_HOST_CID` exclusively on host-originated frames
+///   accepted by `UnixAcceptorProxy`.
 fn peer_is_host(addr: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
     len as usize == std::mem::size_of::<libc::sockaddr_vm>()
         && addr.svm_family == libc::AF_VSOCK as libc::sa_family_t
