@@ -1189,6 +1189,18 @@ fn effective_datastore_version_with(
     }
 }
 
+/// Stamp a datastore that k3s created during this start once its `server/db/`
+/// exists, clearing `*pending` on success (failures are logged and retried).
+fn stamp_new_datastore(data_dir: &Path, version: &str, pending: &mut bool) {
+    if !*pending || !server_db_dir_exists(data_dir).unwrap_or(false) {
+        return;
+    }
+    match write_server_version_stamp(data_dir, version) {
+        Ok(()) => *pending = false,
+        Err(e) => log(&format!("record version stamp for new datastore: {e}")),
+    }
+}
+
 /// Katamaran always writes `.katamaran-version` and the `server/db/` stamp
 /// together, so they only disagree when one was restored without the other
 /// (for example `server/db/` from a newer backup beside a stale outer marker).
@@ -2065,8 +2077,16 @@ impl K8s {
             MarkerFile::Present(v) => Some(v),
             MarkerFile::Missing | MarkerFile::Empty | MarkerFile::NonRegular => None,
         };
-        let wrote_stamp = server_db_dir_exists(Path::new(DATA_DIR))?
-            && prev_stamp.as_deref() != Some(installed_version.as_str());
+        let server_db_existed = server_db_dir_exists(Path::new(DATA_DIR))?;
+        let wrote_stamp =
+            server_db_existed && prev_stamp.as_deref() != Some(installed_version.as_str());
+        // A fresh datastore has no `server/db/` to stamp before launch; stamp it as
+        // soon as k3s creates the directory so even a backup taken after the very
+        // first shutdown carries the version.
+        let mut fresh_stamp_pending = !server_db_existed;
+        let stamp_fresh_datastore = |pending: &mut bool| {
+            stamp_new_datastore(Path::new(DATA_DIR), &installed_version, pending);
+        };
         // Put each version file back exactly as it was (removing ones that did not exist).
         let restore_versions = || {
             if wrote_data_version {
@@ -2298,6 +2318,7 @@ impl K8s {
         );
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
+            stamp_fresh_datastore(&mut fresh_stamp_pending);
             if SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return abort_for_shutdown();
             }
@@ -2344,6 +2365,12 @@ impl K8s {
 
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return abort_for_shutdown();
+        }
+        stamp_fresh_datastore(&mut fresh_stamp_pending);
+        if fresh_stamp_pending {
+            log(
+                "new datastore has no server/db yet; its version stamp will be written on the next start",
+            );
         }
         {
             let mut st = self.state.lock().unwrap();
@@ -4812,6 +4839,21 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         fs::write(server_version_stamp(&data_dir), "").unwrap();
         let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
         assert!(err.contains("is empty"), "{err}");
+
+        // A datastore created during this start is stamped as soon as k3s creates
+        // server/db/, so a backup after the first shutdown carries the version even if
+        // the node record is stale.
+        let new_data = dir.join("new/data");
+        let new_marker = new_data.join(".katamaran-version");
+        let mut pending = true;
+        stamp_new_datastore(&new_data, "v1.38.0+k3s1", &mut pending);
+        assert!(pending);
+        fs::create_dir_all(new_data.join("server/db")).unwrap();
+        fs::copy(db_dir.join("state.db"), new_data.join("server/db/state.db")).unwrap();
+        stamp_new_datastore(&new_data, "v1.38.0+k3s1", &mut pending);
+        assert!(!pending);
+        let err = check_datastore_compatible(&new_data, &new_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
 
         // Without server/db/, nothing is stamped.
         let fresh = dir.join("fresh");
