@@ -287,20 +287,10 @@ fn sync_dir(dir: &Path) -> Result<(), String> {
 
 /// Parse `(major, minor)` from a k3s release tag such as `v1.37.2+k3s1`.
 fn parse_k3s_minor(version: &str) -> Option<(u32, u32)> {
-    let rest = version.trim().strip_prefix('v')?;
-    let (kube, build) = rest.split_once("+k3s")?;
-    if build.is_empty() {
-        return None;
-    }
-    let core = kube.split_once('-').map_or(kube, |(c, _)| c);
-    let mut parts = core.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    let _patch: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor))
+    // Strict: the guard must never accept a malformed tag such as
+    // `v1.37.2+k3sgarbage`; anything that is not a canonical release tag is
+    // treated as unreadable and fails closed.
+    parse_strict_k3s_tag(version)
 }
 
 /// True once k3s has initialized server state under `data_dir`.
@@ -403,12 +393,15 @@ const PRE_TRACKING_K3S_VERSIONS: &[&str] = &["v1.37.2+k3s1"];
 struct StateDbProbe<'a> {
     sqlite3_bin: &'a Path,
     scratch_root: &'a Path,
+    /// Bound on the WAL-recovery copy (`STATE_DB_MAX_SCRATCH_BYTES` in production).
+    max_copy_bytes: u64,
 }
 
 fn state_db_probe() -> StateDbProbe<'static> {
     StateDbProbe {
         sqlite3_bin: Path::new(SQLITE3_BIN),
         scratch_root: Path::new(STATE_DB_SCRATCH_ROOT),
+        max_copy_bytes: STATE_DB_MAX_SCRATCH_BYTES,
     }
 }
 
@@ -496,7 +489,10 @@ fn write_atomic_new(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let link_res = fs::hard_link(&tmp, target);
     let _ = fs::remove_file(&tmp);
     match link_res {
-        Ok(()) => sync_dir(parent),
+        Ok(()) => sync_dir(parent).inspect_err(|_| {
+            // Do not leave a marker in place that the caller was told failed.
+            let _ = fs::remove_file(target);
+        }),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(format!(
             "datastore version marker {} already exists; refusing to overwrite an existing marker",
             target.display()
@@ -608,7 +604,7 @@ fn copy_regular_file_bounded(src: &Path, dst: &Path, budget: &mut u64) -> io::Re
     let copied = io::copy(&mut src_file.take(budget.saturating_add(1)), &mut dst_file)?;
     if copied > *budget {
         return Err(io::Error::other(format!(
-            "{} exceeds the {STATE_DB_MAX_SCRATCH_BYTES}-byte inspection limit",
+            "{} exceeds the inspection copy limit",
             src.display()
         )));
     }
@@ -886,57 +882,69 @@ fn detect_datastore_version_from_state_db_with(
         }
     }
 
-    // Always inspect a private copy (database plus WAL) on the /run tmpfs, so the
-    // live files are never opened by sqlite3 and the copy never reaches the disk.
-    let total = wal_len.unwrap_or(0).saturating_add(
-        fs::symlink_metadata(&db_path)
-            .map(|m| m.len())
-            .unwrap_or(u64::MAX),
-    );
-    if total > STATE_DB_MAX_SCRATCH_BYTES {
-        log(&format!(
-            "skip state.db detection: {total} bytes exceeds the \
-             {STATE_DB_MAX_SCRATCH_BYTES}-byte inspection limit"
-        ));
-        return None;
-    }
-    if let Err(e) = DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(probe.scratch_root)
-    {
-        log(&format!(
-            "create state.db scratch root {}: {e}",
-            probe.scratch_root.display()
-        ));
-        return None;
-    }
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let scratch_path = probe
-        .scratch_root
-        .join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
-    if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
-        log(&format!(
-            "create state.db scratch dir {}: {e}",
-            scratch_path.display()
-        ));
-        return None;
-    }
-    let scratch = ScratchDir(scratch_path);
-    let scratch_db = scratch.0.join("state.db");
-    let mut budget = STATE_DB_MAX_SCRATCH_BYTES;
-    if let Err(e) = copy_regular_file_bounded(&db_path, &scratch_db, &mut budget) {
-        log(&format!("copy state.db for inspection: {e}"));
-        return None;
-    }
-    if wal_len.is_some()
-        && let Err(e) =
+    // A checkpointed database (no WAL content) is read in place with SQLite's
+    // `immutable=1`, which opens it read-only, takes no locks, and never creates
+    // sidecar files, so any size works. Callers only probe with k3s stopped.
+    // WAL content is only visible through a writable open, so that case reads
+    // a bounded private copy on the /run tmpfs instead; the copy never reaches
+    // the disk and the live files are never opened by sqlite3.
+    let mut _scratch = None;
+    let sqlite_target = if wal_len.unwrap_or(0) == 0 {
+        if !db_path.is_absolute() {
+            return None;
+        }
+        format!("file:{}?immutable=1", encode_sqlite_uri_path(&db_path))
+    } else {
+        let total = wal_len.unwrap_or(0).saturating_add(
+            fs::symlink_metadata(&db_path)
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX),
+        );
+        if total > probe.max_copy_bytes {
+            log(&format!(
+                "skip state.db detection: {total} bytes of database and uncheckpointed WAL \
+                 exceed the {}-byte inspection copy limit",
+                probe.max_copy_bytes
+            ));
+            return None;
+        }
+        if let Err(e) = DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(probe.scratch_root)
+        {
+            log(&format!(
+                "create state.db scratch root {}: {e}",
+                probe.scratch_root.display()
+            ));
+            return None;
+        }
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let scratch_path = probe
+            .scratch_root
+            .join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
+        if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
+            log(&format!(
+                "create state.db scratch dir {}: {e}",
+                scratch_path.display()
+            ));
+            return None;
+        }
+        let scratch = _scratch.insert(ScratchDir(scratch_path));
+        let scratch_db = scratch.0.join("state.db");
+        let mut budget = probe.max_copy_bytes;
+        if let Err(e) = copy_regular_file_bounded(&db_path, &scratch_db, &mut budget) {
+            log(&format!("copy state.db for inspection: {e}"));
+            return None;
+        }
+        if let Err(e) =
             copy_regular_file_bounded(&wal_path, &scratch.0.join("state.db-wal"), &mut budget)
-    {
-        log(&format!("copy state.db-wal for inspection: {e}"));
-        return None;
-    }
-    let sqlite_target = format!("file:{}", encode_sqlite_uri_path(&scratch_db));
+        {
+            log(&format!("copy state.db-wal for inspection: {e}"));
+            return None;
+        }
+        format!("file:{}", encode_sqlite_uri_path(&scratch_db))
+    };
 
     let mut query = |sql: &str| -> Option<String> {
         let mut cmd = Command::new(sqlite3_bin);
@@ -1208,6 +1216,35 @@ fn newer_minor(recorded: String, detected: Option<String>) -> String {
     }
 }
 
+/// Publish the outer marker and the `server/db/` stamp before spawning k3s. Any
+/// failure, including a directory sync failure after a rename already made the
+/// new tag visible, runs `restore` (which puts both files back to their prior
+/// states) before returning the error, so a failed attempt never leaves a newer
+/// recorded version behind for a datastore k3s did not open.
+fn publish_version_files(
+    data_dir: &Path,
+    data_version_file: &Path,
+    version: &str,
+    write_marker_file: bool,
+    write_stamp: bool,
+    write_marker: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+    restore: impl FnOnce(),
+) -> Result<(), String> {
+    let res = (|| {
+        if write_marker_file {
+            write_marker(data_version_file, format!("{version}\n").as_bytes())?;
+        }
+        if write_stamp {
+            write_server_version_stamp(data_dir, version)?;
+        }
+        Ok(())
+    })();
+    if res.is_err() {
+        restore();
+    }
+    res
+}
+
 /// Stamp a datastore that k3s created during this start once its `server/db/`
 /// exists, clearing `*pending` on success (failures are logged and retried).
 fn stamp_new_datastore(data_dir: &Path, version: &str, pending: &mut bool) {
@@ -1237,6 +1274,12 @@ fn newer_of_marker_and_stamp(
     data_version_file: &Path,
     marker: String,
 ) -> Result<String, String> {
+    let Some(marker_mm) = parse_k3s_minor(&marker) else {
+        return Err(corrupt_datastore_version_error(
+            data_version_file,
+            &format!("records an invalid k3s version {marker:?}"),
+        ));
+    };
     let stamp_path = server_version_stamp(data_dir);
     match read_marker_file(&stamp_path)? {
         MarkerFile::Missing => Ok(marker),
@@ -1245,12 +1288,6 @@ fn newer_of_marker_and_stamp(
                 return Err(corrupt_datastore_version_error(
                     &stamp_path,
                     &format!("records an invalid k3s version {stamp:?}"),
-                ));
-            };
-            let Some(marker_mm) = parse_k3s_minor(&marker) else {
-                return Err(corrupt_datastore_version_error(
-                    data_version_file,
-                    &format!("records an invalid k3s version {marker:?}"),
                 ));
             };
             Ok(if marker_mm >= stamp_mm { marker } else { stamp })
@@ -2144,18 +2181,15 @@ impl K8s {
         } else {
             None
         };
-        if wrote_data_version {
-            write_atomic(
-                Path::new(DATA_VERSION_FILE),
-                format!("{installed_version}\n").as_bytes(),
-            )?;
-        }
-        if wrote_stamp
-            && let Err(e) = write_server_version_stamp(Path::new(DATA_DIR), &installed_version)
-        {
-            restore_versions();
-            return Err(e);
-        }
+        publish_version_files(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            &installed_version,
+            wrote_data_version,
+            wrote_stamp,
+            write_atomic,
+            restore_versions,
+        )?;
         if let Err(e) = enable_bridge_netfilter() {
             restore_versions();
             return Err(e);
@@ -4360,6 +4394,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         f(&StateDbProbe {
             sqlite3_bin: Path::new(SQLITE3_BIN),
             scratch_root: &scratch_root,
+            max_copy_bytes: STATE_DB_MAX_SCRATCH_BYTES,
         })
     }
 
@@ -4768,12 +4803,127 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &StateDbProbe {
                 sqlite3_bin: Path::new("/nonexistent/sqlite3"),
                 scratch_root: &scratch_root,
+                max_copy_bytes: STATE_DB_MAX_SCRATCH_BYTES,
             },
             run_test_cmd,
         )
         .unwrap_err();
         assert!(err.contains("no version marker"), "{err}");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_version_publish_restores_prior_marker_and_stamp() {
+        let dir = temp_dir("publish-restore");
+        let data_dir = dir.join("data");
+        let marker = data_dir.join(".katamaran-version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        write_atomic(&marker, b"v1.37.2+k3s1\n").unwrap();
+        write_server_version_stamp(&data_dir, "v1.37.2+k3s1").unwrap();
+        let restore = || {
+            restore_data_version(&marker, Some("v1.37.2+k3s1"));
+            restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        };
+        // The marker rename succeeds but its directory sync "fails": the new tag was
+        // already visible, so it must be rolled back.
+        let err = publish_version_files(
+            &data_dir,
+            &marker,
+            "v1.38.0+k3s1",
+            true,
+            true,
+            |p, b| {
+                write_atomic(p, b)?;
+                Err("sync failed".into())
+            },
+            restore,
+        )
+        .unwrap_err();
+        assert_eq!(err, "sync failed");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "v1.37.2+k3s1\n");
+        assert_eq!(
+            fs::read_to_string(server_version_stamp(&data_dir)).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+        // A stamp failure after the marker was published also restores both.
+        fs::remove_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(data_dir.join("server/db"), "not a dir").unwrap();
+        assert!(
+            publish_version_files(
+                &data_dir,
+                &marker,
+                "v1.38.0+k3s1",
+                true,
+                true,
+                write_atomic,
+                || restore_data_version(&marker, Some("v1.37.2+k3s1")),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "v1.37.2+k3s1\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_parsing_rejects_malformed_recorded_versions() {
+        for v in [
+            "v1.37.2+k3sgarbage",
+            "v1.37.2+k3s",
+            "v1.037.2+k3s1",
+            " v1.37.2+k3s1",
+            "1.37.2+k3s1",
+        ] {
+            assert_eq!(parse_k3s_minor(v), None, "{v}");
+        }
+        assert_eq!(parse_k3s_minor("v1.37.2+k3s1"), Some((1, 37)));
+        let dir = temp_dir("strict-marker");
+        let data_dir = dir.join("data");
+        let marker = data_dir.join(".katamaran-version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(&marker, "v1.37.2+k3sgarbage\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("invalid k3s version"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpointed_state_db_is_read_in_place_regardless_of_copy_limit() {
+        assert!(Path::new(SQLITE3_BIN).is_file());
+        let dir = temp_dir("immutable-probe");
+        let data_dir = dir.join("data");
+        let db_dir = data_dir.join("server/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let v37 = hex_upper(&encode_k8s_node_proto("v1.37.2+k3s1"));
+        sqlite_exec(
+            &db_dir.join("state.db"),
+            &format!(
+                "CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+        let scratch_root = test_scratch_root();
+        // A 1-byte copy limit would reject any copy; the checkpointed database is read
+        // in place, so a datastore larger than the copy limit still migrates.
+        let probe = StateDbProbe {
+            sqlite3_bin: Path::new(SQLITE3_BIN),
+            scratch_root: &scratch_root,
+            max_copy_bytes: 1,
+        };
+        let before = snapshot_datastore(&data_dir).unwrap();
+        assert_eq!(
+            detect_datastore_version_from_state_db_with(&data_dir, &probe, run_test_cmd).as_deref(),
+            Some("v1.37.2+k3s1")
+        );
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+        assert!(!db_dir.join("state.db-shm").exists());
+        assert!(!db_dir.join("state.db-wal").exists());
+        // With uncheckpointed WAL content, the copy limit applies and detection fails closed.
+        fs::write(db_dir.join("state.db-wal"), b"x").unwrap();
+        assert_eq!(
+            detect_datastore_version_from_state_db_with(&data_dir, &probe, run_test_cmd),
+            None
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
