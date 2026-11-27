@@ -70,6 +70,10 @@ pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
+/// How long VM shutdown waits for an in-flight guest Kubernetes operation to
+/// release `op_lock` before stopping k3s without it (the host allows ~45 s for
+/// the whole shutdown sequence).
+const SHUTDOWN_OP_LOCK_WAIT: Duration = Duration::from_secs(10);
 const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -298,7 +302,7 @@ pub fn start_service(
 pub fn stop_for_shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     if let Some(svc) = SERVICE.get() {
-        let _ = svc.stop_inner(None);
+        svc.stop_for_shutdown_bounded(SHUTDOWN_OP_LOCK_WAIT);
     }
 }
 
@@ -2674,6 +2678,36 @@ impl K8s {
         Ok(())
     }
 
+    /// Stop k3s for VM shutdown without waiting unboundedly for `op_lock`.
+    ///
+    /// Every guest Kubernetes operation (including reset) checks
+    /// `SHUTTING_DOWN` between steps and runs its long work in killable
+    /// helpers that abort on shutdown, so the lock is normally released within
+    /// moments. If a holder is still stuck (for example in an uninterruptible
+    /// filesystem call) after `wait`, stop k3s best-effort without the lock so
+    /// shutdown can still reach containerd teardown and the data-disk sync
+    /// instead of the host force-killing the VM.
+    fn stop_for_shutdown_bounded(&self, wait: Duration) {
+        match try_lock_with_deadline(
+            &self.op_lock,
+            wait,
+            wait,
+            "waiting for active guest Kubernetes operation",
+            || false,
+            &mut |_| {},
+        ) {
+            Ok(_guard) => {
+                let _ = self.stop_locked(None);
+            }
+            Err(e) => {
+                log(&format!(
+                    "shutdown: {e}; stopping k3s without the operation lock"
+                ));
+                let _ = self.stop_locked(None);
+            }
+        }
+    }
+
     fn stop_inner(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
         let _guard = self.op_lock.lock().unwrap();
         self.stop_locked(conn)
@@ -2776,6 +2810,9 @@ impl K8s {
                         }
                     },
                     |dir, beat| remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
+                    |parent, beat| {
+                        reclaim_stale_reaped(&self.reaper, parent, DATA_REMOVE_TIMEOUT, beat)
+                    },
                     &mut || {
                         if let Err(e) =
                             writer.write_required(&K8sMsg::reset_data_cleared(remove_images))
@@ -3221,7 +3258,14 @@ fn unmount_paths_under(prefixes: &[&str]) -> Result<(), String> {
 
 /// Stop and remove Kubernetes tasks and containers in containerd's `k8s.io`
 /// namespace without touching Docker's `moby` namespace.
-fn stop_k8s_containers_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&str)) {
+/// Stop and remove `k8s.io` tasks and containers one `ctr` call at a time.
+/// `abort` is checked before every call so a caller holding `op_lock` (reset
+/// preflight) stops issuing commands as soon as the VM starts shutting down.
+fn stop_k8s_containers_with_progress(
+    reaper: &Reaper,
+    abort: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(&str),
+) {
     let mut last_beat = Instant::now();
     let mut maybe_beat = |msg: &str| {
         if last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
@@ -3229,6 +3273,9 @@ fn stop_k8s_containers_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&
             last_beat = Instant::now();
         }
     };
+    if abort() {
+        return;
+    }
     let mut ls = Command::new("/usr/bin/ctr");
     ls.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io", "tasks", "ls", "-q"]);
     if let Ok((0, out, _)) = run_reaped_split(reaper, &mut ls, Duration::from_secs(10)) {
@@ -3238,6 +3285,9 @@ fn stop_k8s_containers_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&
             .filter(|s| !s.is_empty())
             .collect();
         for id in &ids {
+            if abort() {
+                return;
+            }
             maybe_beat("stopping k8s.io tasks");
             let mut kill = Command::new("/usr/bin/ctr");
             kill.args([
@@ -3258,6 +3308,9 @@ fn stop_k8s_containers_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&
             thread::sleep(Duration::from_millis(500));
         }
         for id in &ids {
+            if abort() {
+                return;
+            }
             maybe_beat("removing k8s.io tasks");
             let mut kill = Command::new("/usr/bin/ctr");
             kill.args([
@@ -3287,6 +3340,9 @@ fn stop_k8s_containers_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&
             let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
         }
     }
+    if abort() {
+        return;
+    }
     let mut cls = Command::new("/usr/bin/ctr");
     cls.args([
         "-a",
@@ -3299,6 +3355,9 @@ fn stop_k8s_containers_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&
     ]);
     if let Ok((0, out, _)) = run_reaped_split(reaper, &mut cls, Duration::from_secs(10)) {
         for id in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+            if abort() {
+                return;
+            }
             maybe_beat("removing k8s.io containers");
             let mut rm = Command::new("/usr/bin/ctr");
             rm.args([
@@ -3323,7 +3382,7 @@ fn stop_k8s_workloads(reaper: &Reaper) {
 }
 
 fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&str)) {
-    stop_k8s_containers_with_progress(reaper, progress);
+    stop_k8s_containers_with_progress(reaper, &|| false, progress);
     for iface in ["cni0", "flannel.1"] {
         let mut del = Command::new("/sbin/ip");
         del.args(["link", "delete", iface]);
@@ -3607,6 +3666,7 @@ fn remove_cluster_data_dirs(
     paths: &ClusterDataPaths<'_>,
     mut try_btrfs_delete: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
     mut remove_dir: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
+    mut reclaim_stale: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
     on_active_data_cleared: &mut dyn FnMut(),
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
@@ -3619,7 +3679,6 @@ fn remove_cluster_data_dirs(
 
     // Detach the active `data_dir` atomically before any bounded recursive
     // deletion so a timeout can never leave a partially deleted live datastore.
-    let mut detached: Option<std::path::PathBuf> = None;
     if path_exists_checked(paths.data_dir)? {
         let btrfs_err = try_btrfs_delete(paths.data_dir, &mut beat).err();
         if path_exists_checked(paths.data_dir)? {
@@ -3637,7 +3696,6 @@ fn remove_cluster_data_dirs(
                     staged.display()
                 )
             })?;
-            detached = Some(staged);
         } else if let Some(e) = btrfs_err {
             // Btrfs subvolume deletion already committed before interruption:
             // clean up config files and acknowledge data clearance before returning.
@@ -3652,41 +3710,47 @@ fn remove_cluster_data_dirs(
     on_active_data_cleared();
 
     // Reclaim the newly detached directory plus any leftover `.data.removing-*`
-    // siblings from an earlier timed-out reset.
-    let mut to_reclaim = Vec::new();
-    if let Some(staged) = detached {
-        to_reclaim.push(staged);
-    }
+    // siblings from an earlier timed-out reset. Discovery and removal both run
+    // through `reclaim_stale` (a killable helper in production) so no
+    // reclamation filesystem call runs inline under `op_lock`.
     if let Some(parent) = paths.data_dir.parent() {
-        match fs::read_dir(parent) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry.map_err(|e| {
-                        format!("scan {} for detached cluster data: {e}", parent.display())
-                    })?;
-                    let name = entry.file_name();
-                    if name
-                        .to_str()
-                        .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
-                    {
-                        let p = entry.path();
-                        if !to_reclaim.contains(&p) {
-                            to_reclaim.push(p);
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "read {} for detached cluster data: {e}",
-                    parent.display()
-                ));
-            }
+        reclaim_stale(parent, &mut beat)?;
+    }
+    Ok(())
+}
+
+/// Remove every `DATA_DIR_STALE_PREFIX*` entry directly under `parent` (the
+/// detached datastore of this reset plus leftovers from earlier timed-out
+/// resets) with `remove`. A missing `parent` is an empty inventory.
+fn reclaim_stale_dirs(
+    parent: &Path,
+    remove: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "read {} for detached cluster data: {e}",
+                parent.display()
+            ));
+        }
+    };
+    let mut stale = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("scan {} for detached cluster data: {e}", parent.display()))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
+        {
+            stale.push(entry.path());
         }
     }
-    for dir in to_reclaim {
-        remove_dir(&dir, &mut beat)?;
+    stale.sort();
+    for dir in stale {
+        remove(&dir)?;
     }
     Ok(())
 }
@@ -3695,54 +3759,94 @@ fn remove_cluster_data_dirs(
 /// [`rmtree_main`] instead of booting the guest.
 pub const RMTREE_HELPER_ARG: &str = "rmtree";
 
-/// Remove `path` recursively in a killable `/proc/self/exe rmtree <path>`
-/// helper supervised by PID 1's reaper with a finite `timeout`, shutdown
-/// abort, and periodic `beat` heartbeats.
+/// argv[2] after [`RMTREE_HELPER_ARG`] selecting stale-sibling reclamation.
+const RMTREE_STALE_FLAG: &str = "--stale-in";
+
+/// Run `/proc/self/exe rmtree <args>` as a killable helper supervised by PID
+/// 1's reaper with a finite `timeout`, shutdown abort, and periodic `beat`
+/// heartbeats; `what` names the target in errors.
 ///
 /// Running the walk in a child process (rather than inline) means a filesystem
 /// call that stalls in the kernel can never hold `op_lock` past the deadline or
 /// block orderly VM shutdown: the reaper SIGKILLs the helper and the wait stays
 /// bounded even if the child cannot exit immediately. The helper is kat-init
 /// itself, so reset does not depend on any particular `/bin/rm` in the rootfs.
+/// Exit status 0 means every target was unlinked (or already absent), so the
+/// parent performs no follow-up filesystem checks of its own.
+fn run_rmtree_helper(
+    reaper: &Reaper,
+    args: &[&std::ffi::OsStr],
+    what: &Path,
+    timeout: Duration,
+    beat: &mut dyn FnMut(),
+) -> Result<(), String> {
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg(RMTREE_HELPER_ARG).args(args);
+    let out = run_reaped_split_checked(reaper, &mut cmd, timeout, 64 << 10, true, Some(beat))
+        .map_err(|e| format!("remove {}: {e}", what.display()))?;
+    if out.code != 0 {
+        let detail = ctr_error_detail(&out.stdout, &out.stderr);
+        return Err(if detail.is_empty() {
+            format!(
+                "remove {}: helper exited with status {}",
+                what.display(),
+                out.code
+            )
+        } else {
+            detail.to_string()
+        });
+    }
+    Ok(())
+}
+
+/// Remove `path` recursively in the killable helper (see [`run_rmtree_helper`]).
 fn remove_tree_reaped(
     reaper: &Reaper,
     path: &Path,
     timeout: Duration,
     beat: &mut dyn FnMut(),
 ) -> Result<(), String> {
-    let mut cmd = Command::new("/proc/self/exe");
-    cmd.arg(RMTREE_HELPER_ARG).arg(path);
-    let out = run_reaped_split_checked(reaper, &mut cmd, timeout, 64 << 10, true, Some(beat))
-        .map_err(|e| format!("remove {}: {e}", path.display()))?;
-    if out.code != 0 {
-        let detail = ctr_error_detail(&out.stdout, &out.stderr);
-        return Err(if detail.is_empty() {
-            format!(
-                "remove {}: helper exited with status {}",
-                path.display(),
-                out.code
-            )
-        } else {
-            format!("remove {}: {detail}", path.display())
-        });
-    }
-    if path_exists_checked(path)? {
-        return Err(format!(
-            "remove {}: path still exists after removal",
-            path.display()
-        ));
-    }
-    Ok(())
+    run_rmtree_helper(reaper, &[path.as_os_str()], path, timeout, beat)
 }
 
-/// `/init rmtree <path>`: remove `<path>` with [`remove_tree_nofollow`] and
-/// exit 0 on success, or print the error to stderr and exit 1.
+/// Discover and remove detached `DATA_DIR_STALE_PREFIX*` siblings under
+/// `parent` entirely inside the killable helper (see [`reclaim_stale_dirs`]).
+fn reclaim_stale_reaped(
+    reaper: &Reaper,
+    parent: &Path,
+    timeout: Duration,
+    beat: &mut dyn FnMut(),
+) -> Result<(), String> {
+    run_rmtree_helper(
+        reaper,
+        &[std::ffi::OsStr::new(RMTREE_STALE_FLAG), parent.as_os_str()],
+        parent,
+        timeout,
+        beat,
+    )
+}
+
+/// `/init rmtree <path>` removes `<path>` with [`remove_tree_nofollow`];
+/// `/init rmtree --stale-in <parent>` runs [`reclaim_stale_dirs`] on `<parent>`.
+/// Exits 0 on success, or prints the error to stderr and exits 1.
 pub fn rmtree_main() -> ! {
-    let Some(path) = std::env::args_os().nth(2) else {
-        eprintln!("usage: {RMTREE_HELPER_ARG} <path>");
-        std::process::exit(2);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    let no_check = &mut |_: &Path| -> Result<(), String> { Ok(()) };
+    let res = match args.as_slice() {
+        [flag, parent] if flag == RMTREE_STALE_FLAG => {
+            reclaim_stale_dirs(Path::new(parent), &mut |p| {
+                remove_tree_nofollow(p, no_check)
+            })
+        }
+        [path] => remove_tree_nofollow(Path::new(path), no_check),
+        _ => {
+            eprintln!(
+                "usage: {RMTREE_HELPER_ARG} <path> | {RMTREE_HELPER_ARG} {RMTREE_STALE_FLAG} <parent>"
+            );
+            std::process::exit(2);
+        }
     };
-    match remove_tree_nofollow(Path::new(&path), &mut |_| Ok(())) {
+    match res {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("{e}");
@@ -3751,27 +3855,96 @@ pub fn rmtree_main() -> ! {
     }
 }
 
-/// An open directory stream plus the name it was opened by in its parent.
+/// Maximum directory streams [`remove_tree_nofollow`] keeps open at once,
+/// independent of tree depth (well below the guest's `nofile` limit).
+const RMTREE_MAX_OPEN_DIRS: usize = 32;
+
+/// One directory on the current descent path: the name it has in its parent,
+/// its identity, and its stream while open. Ancestors more than
+/// `max_open` levels above the deepest directory are closed and later
+/// reopened by name from the pinned root parent, with their identity checked.
 struct DirFrame {
-    dir: std::ptr::NonNull<libc::DIR>,
+    dir: Option<std::ptr::NonNull<libc::DIR>>,
     name: CString,
     path: std::path::PathBuf,
+    /// `(st_dev, st_ino)` recorded when first opened.
+    id: (u64, u64),
     /// Whether any entry was seen during the current readdir pass.
     saw_entry: bool,
 }
 
 impl DirFrame {
+    /// Descriptor of the open stream; callers ensure the frame is open.
     fn fd(&self) -> std::os::fd::RawFd {
+        let dir = self.dir.expect("directory frame is open");
         // SAFETY: `dir` is a live stream owned by this frame.
-        unsafe { libc::dirfd(self.dir.as_ptr()) }
+        unsafe { libc::dirfd(dir.as_ptr()) }
+    }
+
+    fn close(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            // SAFETY: `dir` came from `fdopendir` and is closed exactly once.
+            unsafe { libc::closedir(dir.as_ptr()) };
+        }
     }
 }
 
 impl Drop for DirFrame {
     fn drop(&mut self) {
-        // SAFETY: `dir` came from `fdopendir` and is closed exactly once.
-        unsafe { libc::closedir(self.dir.as_ptr()) };
+        self.close();
     }
+}
+
+fn dir_identity(dir: std::ptr::NonNull<libc::DIR>) -> io::Result<(u64, u64)> {
+    // SAFETY: `dir` is a live stream; `st` is fully written by fstat on success.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::dirfd(dir.as_ptr()), &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+}
+
+/// Reopen `stack[idx]` (and any closed ancestors) by walking names down from
+/// `root_parent` with `O_NOFOLLOW`, verifying each directory's recorded
+/// identity so a renamed or swapped ancestor is never entered. Keeps the
+/// deepest `max_open` reopened frames open.
+fn reopen_frames(
+    stack: &mut [DirFrame],
+    idx: usize,
+    root_parent: std::os::fd::RawFd,
+    max_open: usize,
+) -> Result<(), String> {
+    let first = stack[..=idx]
+        .iter()
+        .rposition(|f| f.dir.is_some())
+        .map_or(0, |i| i + 1);
+    for j in first..=idx {
+        let parent_fd = if j == 0 {
+            root_parent
+        } else {
+            stack[j - 1].fd()
+        };
+        let dir = open_dir_nofollow(parent_fd, &stack[j].name)
+            .map_err(|e| format!("reopen {}: {e}", stack[j].path.display()))?;
+        stack[j].dir = Some(dir);
+        let id = dir_identity(dir).map_err(|e| format!("stat {}: {e}", stack[j].path.display()))?;
+        if id != stack[j].id {
+            return Err(format!(
+                "remove {}: directory was replaced during removal",
+                stack[j].path.display()
+            ));
+        }
+        stack[j].saw_entry = false;
+        if j > 0 && j + max_open <= idx + 1 {
+            stack[j - 1].close();
+        }
+    }
+    for f in stack[..(idx + 1).saturating_sub(max_open)].iter_mut() {
+        f.close();
+    }
+    Ok(())
 }
 
 /// `openat(parent, name, O_DIRECTORY | O_NOFOLLOW)` + `fdopendir`. Fails with
@@ -3831,7 +4004,11 @@ fn unlinkat_checked(
 /// never re-resolved, so replacing a directory with a symlink between
 /// enumeration and descent makes the open fail with `ELOOP` and only the
 /// symlink itself is unlinked; files outside the tree are never touched.
-/// Iterative (one open descriptor per depth level, no recursion).
+///
+/// Iterative, with at most [`RMTREE_MAX_OPEN_DIRS`] directory streams open
+/// regardless of depth: ancestors further up are closed and reopened by name
+/// from the pinned parent of `root` (no-follow, identity-checked) when the
+/// walk climbs back to them.
 ///
 /// `check` is called with each path before it is opened or unlinked; returning
 /// an error aborts the walk.
@@ -3839,8 +4016,17 @@ fn remove_tree_nofollow(
     root: &Path,
     check: &mut dyn FnMut(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
+    remove_tree_nofollow_with(root, RMTREE_MAX_OPEN_DIRS, check)
+}
+
+fn remove_tree_nofollow_with(
+    root: &Path,
+    max_open: usize,
+    check: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
 
+    let max_open = max_open.max(1);
     let name = root
         .file_name()
         .ok_or_else(|| format!("refusing to remove {}", root.display()))?;
@@ -3862,16 +4048,22 @@ fn remove_tree_nofollow(
         CString::new(name.as_bytes()).map_err(|_| format!("invalid path {}", root.display()))?;
     let err_at = |path: &Path, e: io::Error| format!("remove {}: {e}", path.display());
     let not_a_dir = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP));
+    let new_frame = |dir, name, path: std::path::PathBuf| -> Result<DirFrame, String> {
+        let mut frame = DirFrame {
+            dir: Some(dir),
+            name,
+            path,
+            id: (0, 0),
+            saw_entry: false,
+        };
+        frame.id = dir_identity(dir).map_err(|e| format!("stat {}: {e}", frame.path.display()))?;
+        Ok(frame)
+    };
 
     check(root)?;
     let mut stack: Vec<DirFrame> = Vec::new();
     match open_dir_nofollow(parent_fd, &root_name) {
-        Ok(dir) => stack.push(DirFrame {
-            dir,
-            name: root_name,
-            path: root.to_path_buf(),
-            saw_entry: false,
-        }),
+        Ok(dir) => stack.push(new_frame(dir, root_name, root.to_path_buf())?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) if not_a_dir(&e) => {
             return unlinkat_checked(parent_fd, &root_name, 0).map_err(|e| err_at(root, e));
@@ -3879,12 +4071,17 @@ fn remove_tree_nofollow(
         Err(e) => return Err(err_at(root, e)),
     }
 
-    while let Some(top) = stack.last_mut() {
+    while let Some(top_idx) = stack.len().checked_sub(1) {
+        if stack[top_idx].dir.is_none() {
+            reopen_frames(&mut stack, top_idx, parent_fd, max_open)?;
+        }
+        let top = &mut stack[top_idx];
+        let dir = top.dir.expect("top frame is open");
         // SAFETY: errno is thread-local; reset it so a NULL return can be
         // distinguished between end-of-stream and an error.
         unsafe { *libc::__errno_location() = 0 };
-        // SAFETY: `top.dir` is a live stream owned by `top`.
-        let ent = unsafe { libc::readdir(top.dir.as_ptr()) };
+        // SAFETY: `dir` is a live stream owned by `top`.
+        let ent = unsafe { libc::readdir(dir.as_ptr()) };
         if ent.is_null() {
             let e = io::Error::last_os_error();
             if e.raw_os_error().unwrap_or(0) != 0 {
@@ -3894,14 +4091,22 @@ fn remove_tree_nofollow(
                 // Rescan: unlinking during iteration can make readdir skip
                 // entries, so only rmdir after a pass that saw nothing.
                 top.saw_entry = false;
-                // SAFETY: `top.dir` is a live stream owned by `top`.
-                unsafe { libc::rewinddir(top.dir.as_ptr()) };
+                // SAFETY: `dir` is a live stream owned by `top`.
+                unsafe { libc::rewinddir(dir.as_ptr()) };
                 continue;
             }
             let frame = stack.pop().expect("non-empty stack");
-            let pfd = stack.last().map_or(parent_fd, DirFrame::fd);
             let (name, path) = (frame.name.clone(), frame.path.clone());
             drop(frame);
+            let pfd = match stack.len().checked_sub(1) {
+                Some(i) => {
+                    if stack[i].dir.is_none() {
+                        reopen_frames(&mut stack, i, parent_fd, max_open)?;
+                    }
+                    stack[i].fd()
+                }
+                None => parent_fd,
+            };
             check(&path)?;
             unlinkat_checked(pfd, &name, libc::AT_REMOVEDIR).map_err(|e| err_at(&path, e))?;
             continue;
@@ -3927,12 +4132,12 @@ fn remove_tree_nofollow(
             if try_dir {
                 match open_dir_nofollow(fd, &d_name) {
                     Ok(dir) => {
-                        stack.push(DirFrame {
-                            dir,
-                            name: d_name,
-                            path: child,
-                            saw_entry: false,
-                        });
+                        stack.push(new_frame(dir, d_name, child)?);
+                        // Keep at most `max_open` streams open: close the
+                        // ancestor that just fell out of the window.
+                        if let Some(i) = stack.len().checked_sub(max_open + 1) {
+                            stack[i].close();
+                        }
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => break,
@@ -6137,7 +6342,11 @@ fn preflight_containerd_for_image_reset(
         return Err("aborted: VM is shutting down".into());
     }
     progress("stopping lingering k8s.io containers");
-    stop_k8s_containers_with_progress(reaper, progress);
+    let shutting_down = || SHUTTING_DOWN.load(Ordering::SeqCst);
+    stop_k8s_containers_with_progress(reaper, &shutting_down, progress);
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
     verify_no_k8s_workloads_with(
         || SHUTTING_DOWN.load(Ordering::SeqCst),
         |args, timeout, on_wait| run_ctr_k8s(reaper, args, timeout, on_wait),
@@ -10057,6 +10266,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             |path, _| {
                 fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
             },
+            |_, _| panic!("must not reclaim after legacy failure"),
             &mut || active_cleared.store(true, Ordering::SeqCst),
             &mut |_| {},
         )
@@ -10091,9 +10301,11 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 Ok(())
             },
             |path, _| {
-                if path == legacy_dir.as_path() {
-                    fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
-                } else {
+                assert_eq!(path, legacy_dir.as_path());
+                fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+            },
+            |parent, _| {
+                reclaim_stale_dirs(parent, &mut |path| {
                     assert_ne!(
                         path,
                         data_dir.as_path(),
@@ -10110,7 +10322,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                         active_cleared.load(Ordering::SeqCst) && !data_dir.exists();
                     detached_seen = Some(path.to_path_buf());
                     Err(format!("remove {}: timed out", path.display()))
-                }
+                })
             },
             &mut || active_cleared.store(true, Ordering::SeqCst),
             &mut |_| {},
@@ -10138,9 +10350,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         remove_cluster_data_dirs(
             &paths,
             |_, _| panic!("data_dir no longer exists"),
-            |path, _| {
-                reclaimed_on_retry.push(path.to_path_buf());
-                fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+            |_, _| panic!("legacy dir is already gone"),
+            |parent, _| {
+                reclaim_stale_dirs(parent, &mut |path| {
+                    reclaimed_on_retry.push(path.to_path_buf());
+                    fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+                })
             },
             &mut || {},
             &mut |_| {},
@@ -10163,6 +10378,9 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &missing_paths,
             |_, _| panic!("should not call btrfs on missing data_dir"),
             |_, _| panic!("should not remove anything on missing parent"),
+            |parent, _| {
+                reclaim_stale_dirs(parent, &mut |_| panic!("missing parent has no siblings"))
+            },
             &mut || missing_cleared = true,
             &mut |_| {},
         )
@@ -10182,6 +10400,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let mut bad_stat_cleared = false;
         let err = remove_cluster_data_dirs(
             &bad_stat_paths,
+            |_, _| Ok(()),
             |_, _| Ok(()),
             |_, _| Ok(()),
             &mut || bad_stat_cleared = true,
@@ -10210,6 +10429,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &scan_paths,
             |_, _| Ok(()),
             |_, _| Ok(()),
+            |parent, _| reclaim_stale_dirs(parent, &mut |_| Ok(())),
             &mut || {
                 scan_cleared = true;
                 // Replace parent dir with a regular file so `read_dir` returns ENOTDIR
@@ -10242,6 +10462,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 Err("aborted: VM is shutting down".into())
             },
             |_, _| Ok(()),
+            |_, _| Ok(()),
             &mut || committed_cleared = true,
             &mut |_| {},
         )
@@ -10265,6 +10486,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 k3s_config: &base.join("no-cfg"),
             },
             |_, _| Err("aborted: VM is shutting down".into()),
+            |_, _| Ok(()),
             |_, _| Ok(()),
             &mut || intact_cleared = true,
             &mut |_| {},
@@ -10361,6 +10583,93 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         .unwrap_err();
         assert!(err.contains("shutting down"), "{err}");
         assert!(untouched.join("f").exists());
+    }
+
+    #[test]
+    fn remove_tree_nofollow_bounds_open_dirs_independently_of_depth() {
+        let guard = TempDirGuard::create("kat-rmt-deep");
+        let base = &guard.0;
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        // A chain far deeper than the open-stream window, with files and a
+        // symlink at several levels and a sibling subtree near the top so the
+        // walk must climb back through closed ancestors more than once.
+        let tree = base.join("tree");
+        let mut dir = tree.clone();
+        for i in 0..200 {
+            dir = dir.join("d");
+            fs::create_dir_all(&dir).unwrap();
+            if i % 37 == 0 {
+                fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+                std::os::unix::fs::symlink(&outside, dir.join(format!("l{i}"))).unwrap();
+            }
+        }
+        fs::create_dir_all(tree.join("d/sibling/a/b")).unwrap();
+        fs::write(tree.join("d/sibling/a/b/f"), b"x").unwrap();
+
+        for max_open in [1, 2, 3] {
+            let t = base.join(format!("tree-{max_open}"));
+            let status = Command::new("cp")
+                .arg("-a")
+                .arg(&tree)
+                .arg(&t)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            remove_tree_nofollow_with(&t, max_open, &mut |_| Ok(())).unwrap();
+            assert!(fs::symlink_metadata(&t).is_err(), "max_open={max_open}");
+        }
+        remove_tree_nofollow(&tree, &mut |_| Ok(())).unwrap();
+        assert!(fs::symlink_metadata(&tree).is_err());
+        assert!(outside.join("keep").exists());
+    }
+
+    #[test]
+    fn remove_tree_nofollow_refuses_reopening_swapped_ancestor() {
+        let guard = TempDirGuard::create("kat-rmt-reopen");
+        let base = &guard.0;
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("x/y")).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        // With one open stream, `tree/x` is closed while `tree/x/y` is walked.
+        // Swapping `tree/x` for a symlink (or another directory) before the
+        // walk climbs back must abort rather than touch anything outside.
+        for replace_with_symlink in [true, false] {
+            let tree = base.join(format!("tree-{replace_with_symlink}"));
+            fs::create_dir_all(tree.join("x/y")).unwrap();
+            fs::write(tree.join("x/y/f"), b"x").unwrap();
+            fs::write(tree.join("x/g"), b"x").unwrap();
+            let moved = base.join(format!("moved-{replace_with_symlink}"));
+            let target = tree.join("x/y/f");
+            let mut swapped = false;
+            let err = remove_tree_nofollow_with(&tree, 1, &mut |p| {
+                if p == target && !swapped {
+                    swapped = true;
+                    fs::rename(tree.join("x"), &moved).unwrap();
+                    if replace_with_symlink {
+                        std::os::unix::fs::symlink(&outside, tree.join("x")).unwrap();
+                    } else {
+                        fs::create_dir_all(tree.join("x/y")).unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(swapped);
+            assert!(
+                err.contains("replaced") || err.contains("reopen"),
+                "replace_with_symlink={replace_with_symlink}: {err}"
+            );
+            assert!(outside.join("keep").exists());
+            assert!(outside.join("x/y").exists());
+            assert!(
+                moved.join("y").is_dir(),
+                "moved ancestor must be left in place"
+            );
+        }
     }
 
     #[test]
