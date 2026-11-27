@@ -1688,6 +1688,7 @@ impl Daemon {
         }
         let mut guest_reset_attempted = false;
         let mut guest_data_deleted = false;
+        let mut guest_reply_terminal = false;
         let mut persist_res: Option<anyhow::Result<()>> = None;
         let reset_res = (|| -> Result<(), RpcError> {
             if needs_wait_docker {
@@ -1724,11 +1725,12 @@ impl Daemon {
                     persist_res = Some(self.persist_k8s_enabled(false));
                 }
             };
-            crate::k8s::read_reset_answer(
+            crate::k8s::read_reset_answer_terminal(
                 &mut stream,
                 remove_images,
                 &mut guest_reset_attempted,
                 &mut guest_data_deleted,
+                &mut guest_reply_terminal,
                 &mut on_data_deleted,
                 &mut on_progress,
             )
@@ -1754,9 +1756,17 @@ impl Daemon {
             Ok(())
         };
 
+        // A started reset whose reply ended without `Done` / `Error` (the guest
+        // connection failed) may already have deleted cluster data without the
+        // host seeing the checkpoint; disable auto-start conservatively so the
+        // next boot never silently starts a fresh, empty cluster.
+        let outcome_unknown = reset_res.is_err()
+            && guest_reset_attempted
+            && !guest_data_deleted
+            && !guest_reply_terminal;
         let persist_res = match persist_res {
             Some(Ok(())) => Ok(()),
-            _ if guest_data_deleted => self.persist_k8s_enabled(false),
+            _ if guest_data_deleted || outcome_unknown => self.persist_k8s_enabled(false),
             _ => Ok(()),
         };
 
@@ -1812,6 +1822,16 @@ impl Daemon {
             }
             if guest_reset_attempted {
                 let mut msg = reset_err.message;
+                if outcome_unknown {
+                    match &persist_res {
+                        Ok(()) => msg.push_str(
+                            " (the guest may have deleted Kubernetes cluster data; Kubernetes auto-start was disabled, run `kat k8s start` to start it again)",
+                        ),
+                        Err(e) => msg.push_str(&format!(
+                            " (the guest may have deleted Kubernetes cluster data; also failed to disable Kubernetes auto-start: {e:#})"
+                        )),
+                    }
+                }
                 if let Some(ke) = kubeconfig_err {
                     msg.push_str(&format!(
                         " (also failed to clean up ~/.kube/config: {ke:#})"
@@ -2902,6 +2922,86 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_disables_autostart_when_started_reset_outcome_is_unknown() {
+        let root = temp("k8s-unknown");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-unknown");
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // (guest frames, expect auto-start disabled)
+        let cases: [(Vec<kat_proto::k8s::K8sMsg>, bool); 3] = [
+            // Started plain reset, then the connection drops: outcome unknown.
+            (
+                vec![
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_QUEUED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_STARTED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Progress("removing cluster data".into()),
+                ],
+                true,
+            ),
+            // Queued only, then the connection drops: nothing started.
+            (
+                vec![kat_proto::k8s::K8sMsg::Progress(
+                    kat_proto::k8s::RESET_QUEUED_PROGRESS.into(),
+                )],
+                false,
+            ),
+            // Started, then a clean guest error: data known to be intact.
+            (
+                vec![
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_QUEUED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_STARTED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Error("unmount busy".into()),
+                ],
+                false,
+            ),
+        ];
+        for (frames, expect_disabled) in cases {
+            Config {
+                kubernetes: true,
+                ..Config::default()
+            }
+            .save(&home)
+            .unwrap();
+            {
+                let mut g = d.lock();
+                g.state = VmState::Running;
+                d.k8s.lock().unwrap().state = "running".into();
+            }
+            let l = listener.try_clone().unwrap();
+            let guest = thread::spawn(move || {
+                let (mut conn, _) = l.accept().unwrap();
+                let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+                assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+                for f in &frames {
+                    kat_proto::k8s::write(&mut conn, f).unwrap();
+                }
+            });
+            let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
+            guest.join().unwrap();
+            assert_eq!(
+                !Config::load(&home).unwrap().kubernetes,
+                expect_disabled,
+                "{}",
+                err.message
+            );
+            assert_eq!(
+                err.message
+                    .contains("may have deleted Kubernetes cluster data"),
+                expect_disabled,
+                "{}",
+                err.message
+            );
+        }
     }
 
     #[test]

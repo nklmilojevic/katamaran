@@ -6,7 +6,8 @@
 //! 2. stop the NFS server;
 //! 3. stop dockerd, then containerd (SIGTERM, then SIGKILL on timeout);
 //! 4. SIGTERM every remaining process, then SIGKILL;
-//! 5. sync and unmount the data disk, so btrfs is clean;
+//! 5. detach leftover Kubernetes mounts, then sync and unmount the data
+//!    disk, so btrfs is clean;
 //! 6. power off (the caller).
 
 use std::fs;
@@ -96,6 +97,7 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
             let left = stop_processes(PROCESSES_TIMEOUT);
             format!("{left} killed")
         });
+        step("k8s mounts", super::k8s::detach_mounts_for_shutdown);
         step("data disk", || {
             unsafe { libc::sync() };
             unmount_data()

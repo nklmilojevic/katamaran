@@ -255,11 +255,36 @@ pub fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow
 /// Invokes `on_data_deleted` once as soon as `data_deleted` becomes `true` so
 /// the host can durably disable Kubernetes auto-start before deferred
 /// reclamation or image cleanup finishes.
+#[cfg(test)]
 pub fn read_reset_answer(
     s: &mut UnixStream,
     remove_images: bool,
     accepted: &mut bool,
     data_deleted: &mut bool,
+    on_data_deleted: &mut dyn FnMut(),
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let mut terminal = false;
+    read_reset_answer_terminal(
+        s,
+        remove_images,
+        accepted,
+        data_deleted,
+        &mut terminal,
+        on_data_deleted,
+        progress,
+    )
+}
+
+/// Like [`read_reset_answer`], also setting `terminal` when the guest sent a
+/// final `Done` / `Error` reply. A started reset that ends without one (the
+/// connection closed or failed) has an unknown outcome on the guest.
+pub fn read_reset_answer_terminal(
+    s: &mut UnixStream,
+    remove_images: bool,
+    accepted: &mut bool,
+    data_deleted: &mut bool,
+    terminal: &mut bool,
     on_data_deleted: &mut dyn FnMut(),
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<()> {
@@ -303,6 +328,7 @@ pub fn read_reset_answer(
                 progress(&p);
             }
             Some(K8sMsg::Done) => {
+                *terminal = true;
                 if remove_images {
                     if !*accepted {
                         bail!("guest completed image reset without accepting it");
@@ -318,6 +344,7 @@ pub fn read_reset_answer(
                 return Ok(());
             }
             Some(K8sMsg::Error(e)) => {
+                *terminal = true;
                 if let Some(reason) = e.strip_prefix(k8s::RESET_NOT_STARTED_PREFIX) {
                     if !*data_deleted {
                         *accepted = false;

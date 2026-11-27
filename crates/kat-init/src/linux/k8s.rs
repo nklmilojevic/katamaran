@@ -361,6 +361,27 @@ fn stop_k3s_without_op_lock(
     }
 }
 
+/// Lazily detach any mounts left under the k3s data and legacy kubelet
+/// directories (for example pod volume mounts whose cleanup was skipped
+/// because shutdown bypassed `op_lock`) so the data disk can unmount cleanly.
+/// Called by the shutdown sequence after the process sweep; `MNT_DETACH`
+/// never blocks on busy mounts and no lock is taken.
+pub fn detach_mounts_for_shutdown() -> String {
+    let text = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(t) => t,
+        Err(e) => return format!("read /proc/self/mountinfo: {e}"),
+    };
+    let mounts = mounts_under_prefixes(&text, &[DATA_DIR, LEGACY_KUBELET_DIR]);
+    let mut failed = 0usize;
+    for mp in &mounts {
+        if let Err(e) = umount_detach(mp) {
+            log(&format!("shutdown: {e}"));
+            failed += 1;
+        }
+    }
+    format!("{} detached, {failed} failed", mounts.len() - failed)
+}
+
 pub fn stop_for_shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     if let Some(svc) = SERVICE.get() {
@@ -2850,6 +2871,12 @@ impl K8s {
             },
             |progress| preflight_containerd_for_image_reset(&self.reaper, progress),
             |progress| {
+                // The data-cleared ack can only reach the host over this
+                // stream; if it already failed, keep the datastore so the
+                // host never loses track of a deletion it cannot observe.
+                if writer.failed() {
+                    return Err("client stream write failed; leaving cluster data intact".into());
+                }
                 // Remove the managed config copy first: if that fails, nothing has
                 // been destroyed yet and the reset error is accurate.
                 sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
