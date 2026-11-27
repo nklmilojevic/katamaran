@@ -1337,18 +1337,39 @@ impl Daemon {
         }
     }
 
-    fn lock_k8s_op_with_progress(&self, progress: &mut dyn FnMut(&str)) -> MutexGuard<'_, ()> {
+    fn lock_k8s_op_with_progress(
+        &self,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<MutexGuard<'_, ()>, RpcError> {
+        const K8S_OP_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+        self.lock_k8s_op_with_timeout(K8S_OP_WAIT_TIMEOUT, self.heartbeat_interval(), progress)
+    }
+
+    fn lock_k8s_op_with_timeout(
+        &self,
+        timeout: Duration,
+        heartbeat: Duration,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<MutexGuard<'_, ()>, RpcError> {
+        let deadline = Instant::now() + timeout;
         let mut last_beat: Option<Instant> = None;
         loop {
             match self.k8s_op.try_lock() {
-                Ok(g) => return g,
-                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Ok(g) => return Ok(g),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    if last_beat.is_none_or(|t| t.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(RpcError::new(
+                            api::FAILED,
+                            "timed out waiting for active Kubernetes operation",
+                        ));
+                    }
+                    if last_beat.is_none_or(|t| t.elapsed() >= heartbeat) {
                         progress("waiting for active Kubernetes operation");
                         last_beat = Some(Instant::now());
                     }
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(left.min(heartbeat).min(Duration::from_millis(100)));
                 }
             }
         }
@@ -1642,7 +1663,7 @@ impl Daemon {
         remove_images: bool,
         progress: &mut dyn FnMut(&str),
     ) -> Result<(), RpcError> {
-        let _op = self.lock_k8s_op_with_progress(progress);
+        let _op = self.lock_k8s_op_with_progress(progress)?;
         let failed = |m: String| RpcError::new(api::FAILED, m);
         let ctx = self
             .kube_context_name()
@@ -3382,6 +3403,42 @@ mod tests {
             "k8s_op lock must be released after kubectl timeout"
         );
         fs::remove_dir_all(&root2).unwrap();
+    }
+
+    #[test]
+    fn lock_k8s_op_with_timeout_emits_heartbeats_and_times_out() {
+        let root = temp("k8s-opto");
+        let home = root.join("h");
+        let user = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        let d = Daemon::new_for_test(home, user, "katamaran-test-opto");
+        let _held = d.k8s_op.lock().unwrap();
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = d
+            .lock_k8s_op_with_timeout(
+                Duration::from_millis(140),
+                Duration::from_millis(35),
+                &mut |m| beats.push(m.to_string()),
+            )
+            .unwrap_err();
+        assert!(
+            err.message
+                .contains("timed out waiting for active Kubernetes operation"),
+            "got: {}",
+            err.message
+        );
+        assert!(beats.len() >= 2, "expected heartbeats, got: {beats:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(_held);
+        let _ok = d
+            .lock_k8s_op_with_timeout(
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+                &mut |_| {},
+            )
+            .unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

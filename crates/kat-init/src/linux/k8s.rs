@@ -69,6 +69,8 @@ pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
+const IMAGE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const IMAGE_RM_BATCH_SIZE: usize = 64;
 const IMAGE_LS_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_LS_STDOUT_LIMIT: usize = 8 << 20;
@@ -2735,16 +2737,19 @@ impl K8s {
                 let mut cmd = Command::new("/sbin/btrfs");
                 cmd.args(["subvolume", "delete"]);
                 cmd.arg(data_dir);
-                let _ = run_reaped_split_checked(
+                match run_reaped_split_checked(
                     &self.reaper,
                     &mut cmd,
                     Duration::from_secs(30),
                     64 << 10,
-                    false,
+                    true,
                     Some(beat),
-                );
+                ) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e.to_string()),
+                    _ => Ok(()),
+                }
             },
-            PROGRESS_HEARTBEAT_INTERVAL,
+            |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
             &mut |m| {
                 let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
             },
@@ -3407,24 +3412,24 @@ fn remove_cluster_data_dirs(
     legacy_kubelet_dir: &Path,
     kubeconfig: &Path,
     k3s_config: &Path,
-    mut try_btrfs_delete: impl FnMut(&Path, &mut dyn FnMut()),
-    heartbeat_interval: Duration,
+    mut try_btrfs_delete: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
+    mut remove_dir: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     // Remove the legacy pre-migration kubelet directory before deleting
     // `data_dir` so a failure here leaves active cluster state untouched
     // and cannot occur after `data_dir` is deleted but before `ResetDataCleared`.
+    let mut beat = || progress("removing cluster data");
     if legacy_kubelet_dir.exists() {
-        remove_dir_all_with_progress(legacy_kubelet_dir, heartbeat_interval, progress)?;
+        remove_dir(legacy_kubelet_dir, &mut beat)?;
     }
     if data_dir.exists() {
         // Try btrfs subvolume delete first (instant if it is a subvolume),
-        // falling back to recursive removal. Send periodic progress during
+        // falling back to bounded recursive removal. Send periodic progress during
         // both so large cluster-data directories do not trip idle timeouts.
-        let mut beat = || progress("removing cluster data");
-        try_btrfs_delete(data_dir, &mut beat);
+        try_btrfs_delete(data_dir, &mut beat)?;
         if data_dir.exists() {
-            remove_dir_all_with_progress(data_dir, heartbeat_interval, progress)?;
+            remove_dir(data_dir, &mut beat)?;
         }
     }
     let _ = fs::remove_file(kubeconfig);
@@ -3432,46 +3437,71 @@ fn remove_cluster_data_dirs(
     Ok(())
 }
 
-fn remove_dir_all_with_progress(
+/// Remove `path` recursively via `/bin/rm -rf -- <path>` under PID 1's reaper
+/// with a finite deadline, shutdown abort, and periodic heartbeats. Running in
+/// a killable child avoids both unbounded stalls and a detached Rust thread
+/// continuing to unlink files after a timeout.
+fn rm_rf_reaped(
+    reaper: &Reaper,
     path: &Path,
-    interval: Duration,
-    progress: &mut dyn FnMut(&str),
+    timeout: Duration,
+    beat: &mut dyn FnMut(),
 ) -> Result<(), String> {
-    run_with_heartbeat(interval, "removing cluster data", progress, || {
-        fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
-    })
+    let mut cmd = Command::new("/bin/rm");
+    cmd.args(["-rf", "--"]).arg(path);
+    let out = run_reaped_split_checked(reaper, &mut cmd, timeout, 64 << 10, true, Some(beat))
+        .map_err(|e| format!("remove {}: {e}", path.display()))?;
+    if out.code != 0 {
+        let detail = ctr_error_detail(&out.stdout, &out.stderr);
+        return Err(if detail.is_empty() {
+            format!(
+                "remove {}: rm exited with status {}",
+                path.display(),
+                out.code
+            )
+        } else {
+            format!("remove {}: {detail}", path.display())
+        });
+    }
+    if path.exists() {
+        return Err(format!(
+            "remove {}: path still exists after rm",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
-fn run_with_heartbeat<T, F>(
-    interval: Duration,
-    msg: &str,
+fn try_lock_with_deadline<'a, T>(
+    mutex: &'a Mutex<T>,
+    timeout: Duration,
+    heartbeat: Duration,
+    wait_msg: &str,
+    shutting_down: impl Fn() -> bool,
     progress: &mut dyn FnMut(&str),
-    work: F,
-) -> Result<T, String>
-where
-    T: Send,
-    F: FnOnce() -> Result<T, String> + Send,
-{
-    thread::scope(|s| {
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name("k8s-reset-rm".into())
-            .spawn_scoped(s, move || {
-                let _ = tx.send(work());
-            });
-        if spawned.is_err() {
-            return Err(format!("spawn worker thread for {msg}"));
+) -> Result<std::sync::MutexGuard<'a, T>, String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_beat: Option<Instant> = None;
+    loop {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
         }
-        loop {
-            match rx.recv_timeout(interval) {
-                Ok(res) => return res,
-                Err(RecvTimeoutError::Timeout) => progress(msg),
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(format!("worker thread terminated while {msg}"));
+        match mutex.try_lock() {
+            Ok(g) => return Ok(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(format!("timed out {wait_msg}"));
                 }
+                if last_beat.is_none_or(|t| t.elapsed() >= heartbeat) {
+                    progress(wait_msg);
+                    last_beat = Some(Instant::now());
+                }
+                thread::sleep(left.min(heartbeat).min(Duration::from_millis(50)));
             }
         }
-    })
+    }
 }
 
 fn set_nonblocking_fd(fd: i32) -> io::Result<()> {
@@ -5381,25 +5411,14 @@ struct CtrPlatformRow {
 /// are reclaimed before returning — even on a retry that finds no image refs.
 fn clear_k8s_images(reaper: &Reaper, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
     wait_containerd_with_progress(progress)?;
-    let _sync_guard = {
-        let mut last_beat: Option<Instant> = None;
-        loop {
-            if SHUTTING_DOWN.load(Ordering::SeqCst) {
-                return Err("aborted: VM is shutting down".into());
-            }
-            match IMAGE_SYNC_LOCK.try_lock() {
-                Ok(g) => break g,
-                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if last_beat.is_none_or(|t| t.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL) {
-                        progress("waiting for background image sync to stop");
-                        last_beat = Some(Instant::now());
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-            }
-        }
-    };
+    let _sync_guard = try_lock_with_deadline(
+        &IMAGE_SYNC_LOCK,
+        IMAGE_SYNC_WAIT_TIMEOUT,
+        PROGRESS_HEARTBEAT_INTERVAL,
+        "waiting for background image sync to stop",
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        progress,
+    )?;
     if SHUTTING_DOWN.load(Ordering::SeqCst) {
         return Err("aborted: VM is shutting down".into());
     }
@@ -9026,23 +9045,55 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     }
 
     #[test]
-    fn run_with_heartbeat_emits_periodic_progress_during_slow_work() {
+    fn try_lock_with_deadline_emits_heartbeats_and_enforces_deadline_and_shutdown() {
+        let m = Mutex::new(());
+        let _held = m.lock().unwrap();
+
+        // 1. Times out with heartbeats when lock stays held.
         let mut beats = Vec::new();
-        let val = run_with_heartbeat(
-            Duration::from_millis(20),
-            "removing cluster data",
-            &mut |m| beats.push(m.to_string()),
-            || {
-                thread::sleep(Duration::from_millis(75));
-                Ok(42usize)
-            },
+        let started = Instant::now();
+        let err = try_lock_with_deadline(
+            &m,
+            Duration::from_millis(120),
+            Duration::from_millis(35),
+            "waiting for background image sync to stop",
+            || false,
+            &mut |msg| beats.push(msg.to_string()),
         )
-        .unwrap();
-        assert_eq!(val, 42);
+        .unwrap_err();
         assert!(
-            beats.len() >= 2 && beats.iter().all(|m| m == "removing cluster data"),
+            err.contains("timed out waiting for background image sync to stop"),
+            "{err}"
+        );
+        assert!(
+            beats.len() >= 2,
             "expected periodic heartbeats, got: {beats:?}"
         );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // 2. Aborts immediately when shutting down.
+        let err = try_lock_with_deadline(
+            &m,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            "waiting for background image sync to stop",
+            || true,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("VM is shutting down"), "{err}");
+
+        // 3. Succeeds immediately once released.
+        drop(_held);
+        let _g = try_lock_with_deadline(
+            &m,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+            "waiting for background image sync to stop",
+            || false,
+            &mut |_| {},
+        )
+        .unwrap();
     }
 
     #[test]
@@ -9419,8 +9470,13 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &legacy_dir,
             &kubeconfig,
             &k3s_cfg,
-            |_, _| btrfs_called = true,
-            Duration::from_millis(50),
+            |_, _| {
+                btrfs_called = true;
+                Ok(())
+            },
+            |path, _| {
+                fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+            },
             &mut |_| {},
         )
         .unwrap_err();
@@ -9446,8 +9502,11 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             |dir, _| {
                 assert_eq!(dir, data_dir.as_path());
                 saw_legacy_gone_before_data_delete = !legacy_dir.exists();
+                Ok(())
             },
-            Duration::from_millis(50),
+            |path, _| {
+                fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+            },
             &mut |_| {},
         )
         .unwrap();
@@ -9914,6 +9973,13 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             count_lines("moby", &["images", "ls", "-q"]),
             moby_images_before
         );
+        // Also exercise bounded `/bin/rm -rf --` removal under the live reaper.
+        let scratch_dir = base.join("scratch-rm");
+        fs::create_dir_all(scratch_dir.join("nested")).unwrap();
+        fs::write(scratch_dir.join("nested/data"), b"cluster-data").unwrap();
+        rm_rf_reaped(&reaper, &scratch_dir, Duration::from_secs(10), &mut || {}).unwrap();
+        assert!(!scratch_dir.exists());
+
         drop(daemon);
         drop(tmp_guard);
         assert!(
