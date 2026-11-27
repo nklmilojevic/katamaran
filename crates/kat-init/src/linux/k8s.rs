@@ -113,9 +113,19 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 /// flight fails harmlessly once containerd stops, and the sweep kills it.
 static SHUTDOWN_K8S_ABANDONED: AtomicBool = AtomicBool::new(false);
 
-/// Whether Kubernetes workload cleanup must stop issuing commands.
+thread_local! {
+    /// Set on the shutdown sequence's own k8s stop thread, the only caller that
+    /// keeps cleaning up after `SHUTTING_DOWN` is set.
+    static IS_SHUTDOWN_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether Kubernetes workload cleanup must stop issuing commands: shutdown
+/// cut it off, or the VM is shutting down and this is not the shutdown stop
+/// itself (a reset or stop still holding `op_lock` yields so the shutdown
+/// stop can take over promptly).
 fn workload_cleanup_cut_off() -> bool {
     SHUTDOWN_K8S_ABANDONED.load(Ordering::SeqCst)
+        || (SHUTTING_DOWN.load(Ordering::SeqCst) && !IS_SHUTDOWN_STOP.with(|c| c.get()))
 }
 
 /// Make a workload-cleanup command refuse to `exec` once shutdown has cut
@@ -137,6 +147,9 @@ fn guard_cleanup_command(cmd: &mut Command) -> &mut Command {
 }
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
+/// Serializes reclamation of `.data.removing-*` copies between the boot-time
+/// reclaim thread and resets, so two helpers never walk the same tree.
+static RECLAIM_LOCK: Mutex<()> = Mutex::new(());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A k3s child that survived SIGKILL after its `Running` handle was dropped,
 /// tracked by its own exit notification (never by a reusable pid lookup).
@@ -406,6 +419,7 @@ pub fn begin_shutdown() {
 /// [`SHUTDOWN_K8S_BUDGET`]; see [`abandon_shutdown_stop`].
 pub fn stop_for_shutdown() {
     begin_shutdown();
+    IS_SHUTDOWN_STOP.with(|c| c.set(true));
     if let Some(svc) = SERVICE.get() {
         let _ = svc.stop_inner(None);
     }
@@ -2890,6 +2904,11 @@ impl K8s {
                     &may_destroy,
                     |dir, beat| remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
                     |parent, beat| {
+                        // Never wait under `op_lock` for the boot-time reclaim:
+                        // it is already removing the same leftovers.
+                        let Ok(_guard) = RECLAIM_LOCK.try_lock() else {
+                            return Err("background reclamation is already running".into());
+                        };
                         reclaim_stale_reaped(&self.reaper, parent, DATA_REMOVE_TIMEOUT, beat)
                     },
                     &mut || {
@@ -3701,21 +3720,20 @@ fn describe_reset_abort(e: String, stream_failed: bool) -> String {
 
 /// Remove active Kubernetes cluster data with exactly one irreversible step.
 ///
-/// 1. Remove the legacy pre-migration kubelet directory (data-dir untouched
-///    if this fails).
-/// 2. Atomically rename `data_dir` to a unique `.data.removing-*` sibling —
+/// 1. Atomically rename `data_dir` to a unique `.data.removing-*` sibling —
 ///    the single step that makes the active datastore unreachable.
-/// 3. Remove the k3s kubeconfig and config, then acknowledge with
+/// 2. Remove the k3s kubeconfig and config, then acknowledge with
 ///    `on_active_data_cleared` (the host disables auto-start on this ack).
-/// 4. Best-effort reclaim every `.data.removing-*` sibling with
+/// 3. Best-effort cleanup: remove the legacy pre-migration kubelet directory
+///    with `remove_legacy` and reclaim every `.data.removing-*` sibling with
 ///    `reclaim_stale`.
 ///
-/// `may_destroy` is checked immediately before steps 1, 2 and 4; if it fails
+/// `may_destroy` is checked immediately before steps 1 and 3; if it fails
 /// (VM shutting down or the reply stream to the host already failed) nothing
-/// further is destroyed. If the ack in step 3 fails, reclamation is skipped
-/// and an error is returned. Reclamation failure is not a reset failure: the
-/// active data is already gone and the detached copy is retried on the next
-/// reset, so it is returned as `Ok(Some(warning))`.
+/// further is destroyed. If the ack in step 2 fails, cleanup is skipped and
+/// an error is returned. Cleanup failure is not a reset failure: the active
+/// data is already gone and leftovers are retried on the next reset or boot,
+/// so it is returned as `Ok(Some(warning))`.
 fn remove_cluster_data_dirs(
     paths: &ClusterDataPaths<'_>,
     may_destroy: &dyn Fn() -> Result<(), String>,
@@ -3725,11 +3743,6 @@ fn remove_cluster_data_dirs(
     progress: &mut dyn FnMut(&str),
 ) -> Result<Option<String>, String> {
     let mut beat = || progress("removing cluster data");
-    if path_exists_checked(paths.legacy_kubelet_dir)? {
-        may_destroy()?;
-        remove_legacy(paths.legacy_kubelet_dir, &mut beat)?;
-    }
-
     if path_exists_checked(paths.data_dir)? {
         let parent = paths
             .data_dir
@@ -3749,17 +3762,34 @@ fn remove_cluster_data_dirs(
     let _ = fs::remove_file(paths.k3s_config);
     on_active_data_cleared()?;
 
-    let Some(parent) = paths.data_dir.parent() else {
-        return Ok(None);
-    };
+    // Everything below is cleanup of data the host already knows is gone.
     if let Err(e) = may_destroy() {
         return Ok(Some(format!(
-            "detached cluster data not reclaimed ({e}); it is removed on the next reset"
+            "leftover cluster data not removed ({e}); it is removed on the next reset or boot"
         )));
     }
-    Ok(reclaim_stale(parent, &mut beat).err().map(|e| {
-        format!("could not reclaim detached cluster data ({e}); it is retried on the next reset")
-    }))
+    let mut warnings = Vec::new();
+    match path_exists_checked(paths.legacy_kubelet_dir) {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(e) = remove_legacy(paths.legacy_kubelet_dir, &mut beat) {
+                warnings.push(format!("could not remove legacy kubelet data ({e})"));
+            }
+        }
+        Err(e) => warnings.push(e),
+    }
+    if let Some(parent) = paths.data_dir.parent()
+        && let Err(e) = reclaim_stale(parent, &mut beat)
+    {
+        warnings.push(format!("could not reclaim detached cluster data ({e})"));
+    }
+    if warnings.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{}; it is retried on the next reset or boot",
+        warnings.join("; ")
+    )))
 }
 
 /// Remove every `DATA_DIR_STALE_PREFIX*` entry directly under `parent` (the
@@ -3792,10 +3822,14 @@ fn reclaim_stale_dirs(
         }
     }
     stale.sort();
-    for dir in stale {
-        remove(&dir)?;
+    // Try every copy: one that cannot be removed must not keep the others
+    // (including the one this reset just detached) on disk.
+    let errors: Vec<String> = stale.iter().filter_map(|dir| remove(dir).err()).collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
-    Ok(())
 }
 
 fn reclaim_stale_at_boot(reaper: &Reaper) {
@@ -3812,6 +3846,7 @@ fn reclaim_stale_at_boot(reaper: &Reaper) {
     {
         return;
     }
+    let _guard = RECLAIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = reclaim_stale_reaped(reaper, parent, DATA_REMOVE_TIMEOUT, &mut || {}) {
         log(&format!("k8s: reclaim detached cluster data: {e}"));
     }
@@ -10471,52 +10506,54 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         };
         seed();
 
-        // 1. Legacy kubelet cleanup fails: nothing else is touched or acked.
-        fs::write(&legacy_dir, b"not-a-directory").unwrap();
-        let mut acked = false;
-        let err = remove_cluster_data_dirs(
-            &paths,
-            &ok,
-            |_, _| Err("remove legacy: ENOTDIR".into()),
-            |_, _| panic!("must not reclaim after legacy failure"),
-            &mut || {
-                acked = true;
-                Ok(())
-            },
-            &mut |_| {},
-        )
-        .unwrap_err();
-        assert!(err.contains("legacy"), "{err}");
-        assert!(!acked);
-        assert!(data_dir.join("server/state.db").is_file());
-        assert!(kubeconfig.is_file() && k3s_cfg.is_file());
-        fs::remove_file(&legacy_dir).unwrap();
-
-        // 2. `may_destroy` failing (shutdown / failed reply stream) right before
-        //    the detach leaves the datastore and config untouched and unacked.
+        // 1. `may_destroy` failing (shutdown / failed reply stream) right before
+        //    the detach leaves the datastore, legacy data and config untouched.
         fs::create_dir_all(legacy_dir.join("pods")).unwrap();
-        let calls = std::cell::Cell::new(0);
         let err = remove_cluster_data_dirs(
             &paths,
-            &|| {
-                calls.set(calls.get() + 1);
-                if calls.get() >= 2 {
-                    Err("client stream write failed; leaving cluster data intact".into())
-                } else {
-                    Ok(())
-                }
-            },
-            |p, _| rm_all(p),
+            &|| Err("client stream write failed; leaving cluster data intact".into()),
+            |_, _| panic!("must not remove legacy data"),
             |_, _| panic!("must not reclaim"),
             &mut || panic!("must not ack"),
             &mut |_| {},
         )
         .unwrap_err();
         assert!(err.contains("leaving cluster data intact"), "{err}");
-        assert!(!legacy_dir.exists(), "legacy removal ran before the check");
+        assert!(legacy_dir.join("pods").is_dir());
         assert!(data_dir.join("server/state.db").is_file());
         assert!(kubeconfig.is_file() && k3s_cfg.is_file());
         assert!(stale().is_empty());
+
+        // 2. Legacy kubelet cleanup runs only after the ack, and its failure is
+        //    a warning (the active data is already detached).
+        let acked = AtomicBool::new(false);
+        let warning = remove_cluster_data_dirs(
+            &paths,
+            &ok,
+            |p, _| {
+                assert!(
+                    acked.load(Ordering::SeqCst),
+                    "ack must precede legacy cleanup"
+                );
+                Err(format!("remove {}: EPERM", p.display()))
+            },
+            |_, _| Ok(()),
+            &mut || {
+                acked.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap()
+        .expect("legacy cleanup failure must be a warning");
+        assert!(warning.contains("legacy kubelet"), "{warning}");
+        assert!(!data_dir.exists());
+        // Put the detached copy back aside for the next cases.
+        fs::remove_dir_all(&legacy_dir).unwrap();
+        for p in stale() {
+            fs::remove_dir_all(p).unwrap();
+        }
+        seed();
 
         // 3. The ack fails after the detach: an error is returned and nothing
         //    is reclaimed, so the detached copy stays for the next reset.
@@ -10547,10 +10584,15 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             |parent, _| {
                 assert!(acked.load(Ordering::SeqCst), "ack must precede reclamation");
                 assert!(!data_dir.exists(), "live data_dir must already be detached");
-                reclaim_stale_dirs(parent, &mut |p| {
+                // Every copy is attempted even though each one fails.
+                let mut attempts = 0;
+                let res = reclaim_stale_dirs(parent, &mut |p| {
                     assert_ne!(p, data_dir.as_path());
+                    attempts += 1;
                     Err(format!("remove {}: timed out", p.display()))
-                })
+                });
+                assert_eq!(attempts, 2);
+                res
             },
             &mut || {
                 acked.store(true, Ordering::SeqCst);
@@ -10603,7 +10645,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         )
         .unwrap()
         .unwrap();
-        assert!(warning.contains("not reclaimed"), "{warning}");
+        assert!(warning.contains("not removed"), "{warning}");
         assert_eq!(stale().len(), 1);
 
         // 7. Missing parent (fresh VM): acked, nothing to reclaim.

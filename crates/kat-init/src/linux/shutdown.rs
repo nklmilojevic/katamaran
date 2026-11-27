@@ -25,8 +25,10 @@ use super::{DATA_MOUNTS, sys};
 /// Seconds Docker gives each container between SIGTERM and SIGKILL.
 const CONTAINER_STOP_SECS: u64 = 8;
 const CONTAINERS_TIMEOUT: Duration = Duration::from_secs(CONTAINER_STOP_SECS + 2);
-/// With dockerd's 10 s and containerd's 5 s, the worst case of the whole
-/// sequence is about 30 s; the host waits longer than that.
+/// Worst case of the whole sequence: up to `k8s::SHUTDOWN_K8S_BUDGET` (18 s,
+/// overlapping the container stop) for Kubernetes, then dockerd's 10 s and
+/// containerd's 5 s, the process sweep, and the sync — under the host's 45 s
+/// shutdown deadline. Keep new steps within that margin.
 const PROCESSES_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {

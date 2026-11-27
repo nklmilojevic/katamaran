@@ -365,7 +365,7 @@ pub fn read_reset_answer_terminal(
                     // still queued (it sent progress) is not out of date.
                     if first_frame {
                         bail!(
-                            "the guest closed the Kubernetes connection before accepting the image reset (restart the VM to update the guest)"
+                            "the guest closed the Kubernetes connection before accepting the image reset (the guest may be busy, or outdated: retry, or restart the VM to update the guest)"
                         );
                     }
                     bail!(
