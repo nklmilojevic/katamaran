@@ -3376,6 +3376,9 @@ mod tests {
         /// modelling Docker changing the source while the delete is in flight.
         mutate_moby_on_k8s_delete: Option<(String, Option<String>)>,
         k8s_create_calls: usize,
+        /// Optional hook: retarget this `moby` image right after the next
+        /// successful `k8s.io` `Images.Create` (Docker retagging mid-publish).
+        retarget_moby_after_k8s_create: Option<(String, String)>,
         k8s_delete_committed: bool,
         k8s_delete_calls: usize,
         last_delete_grpc_timeout: Option<String>,
@@ -3781,6 +3784,14 @@ mod tests {
                                         let mut out = Vec::new();
                                         encode_proto_bytes(&mut out, 1, &encode_image(&img));
                                         e.insert(img);
+                                        if ns == "k8s.io"
+                                            && let Some((src, to)) =
+                                                st.retarget_moby_after_k8s_create.take()
+                                            && let Some(img) =
+                                                st.images.get_mut(&("moby".to_string(), src))
+                                        {
+                                            img.target.digest = to;
+                                        }
                                         send_grpc_ok(&mut conn, sid, &out);
                                     } else {
                                         send_grpc_err(&mut conn, sid, "6", "already%20exists");
@@ -5173,6 +5184,60 @@ mod tests {
                 .map(String::as_str),
             Some("sha256:source-amd64")
         );
+        drop(st);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test (startup-sync race): if Docker retags the source right
+    /// after the mirror is created, the non-destructive post-publish re-check
+    /// returns `SourceChanged` (so the caller re-lists) and keeps the new tag;
+    /// nothing is deleted.
+    #[test]
+    fn publish_rewritten_image_rechecks_source_after_publishing() {
+        let (dir, sock) = temp_sock("post-check");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "d".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let name = "docker.io/library/app:dev";
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([moby_source(name, "sha256:source-amd64")]),
+            remaining_disk_bytes: 1 << 20,
+            retarget_moby_after_k8s_create: Some((name.into(), "sha256:source-b".into())),
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
+        let err = publish_rewritten_image(
+            &sock,
+            name,
+            "io.katamaran.k8s.source-digest",
+            None,
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PublishError::SourceChanged { ref actual, .. } if actual == "sha256:source-b"),
+            "expected SourceChanged, got {err:?}"
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.k8s_delete_calls, 0,
+            "the re-check never deletes anything"
+        );
+        assert!(
+            st.images.contains_key(&("k8s.io".into(), name.into())),
+            "the published tag is kept for the re-list to replace"
+        );
+        assert!(st.leases.is_empty());
         drop(st);
 
         server.join().unwrap();
