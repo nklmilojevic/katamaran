@@ -3358,8 +3358,8 @@ mod tests {
         // gvproxy removes the proxy: live socket is preserved and reconciled
         // when the guest removes the refused port and later re-adds it, OR
         // cleaned up promptly via unexpose retries when left removed.
-        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
-        let busy_port = busy.local_addr().unwrap().port();
+        let busy_port = free_high_port();
+        let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, busy_port)).unwrap();
         let busy_sock = crate::autofwd::Upstream::socket(&dir, busy_port);
         fake.fail_next_unexpose_before_remove
             .store(true, Ordering::SeqCst);
@@ -3390,9 +3390,20 @@ mod tests {
             "removing a refused port after rollback failure must clean up its Unix socket"
         );
         // After freeing the Mac port and re-adding, forwarding works cleanly.
+        // Retry briefly in case a parallel test subprocess transiently inherited
+        // `busy`'s fd during macOS's non-atomic `socket()` + `FIOCLEX` window.
         drop(busy);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let readded = loop {
+            let ev = fwd.add(TCP, busy_port);
+            if matches!(ev, Some(Event::Forwarded(..))) || Instant::now() >= deadline {
+                break ev;
+            }
+            let _ = fwd.remove(TCP, busy_port);
+            thread::sleep(Duration::from_millis(20));
+        };
         assert_eq!(
-            fwd.add(TCP, busy_port),
+            readded,
             Some(Event::Forwarded(TCP, busy_port, vec![Ipv4Addr::LOCALHOST]))
         );
         assert_eq!(
@@ -3403,8 +3414,8 @@ mod tests {
         // 3. Verify the worker thread automatically retries upstream cleanup
         // for a refused port left removed without ever re-adding it.
         drop(fwd);
-        let busy2 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let busy2_port = busy2.local_addr().unwrap().port();
+        let busy2_port = free_high_port();
+        let busy2 = TcpListener::bind((Ipv4Addr::LOCALHOST, busy2_port)).unwrap();
         let busy2_sock = crate::autofwd::Upstream::socket(&dir, busy2_port);
         let (ev_tx, ev_rx) = mpsc::channel();
         let worker = spawn_forwarder_with(

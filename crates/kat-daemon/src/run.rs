@@ -176,6 +176,12 @@ struct AutoForwardTracker {
 }
 
 /// A wanted automatic port that is not bound yet.
+/// Initial delay before retrying an unbound forward that failed to bind on the
+/// Mac (for example because an unrelated Mac process held the port).
+const UNBOUND_RETRY_INITIAL: Duration = Duration::from_millis(250);
+/// Maximum delay between retries for a still-wanted unbound forward.
+const UNBOUND_RETRY_MAX: Duration = Duration::from_secs(2);
+
 struct Unbound {
     key: (PortProto, u16),
     /// Errors already reported for this port, so repeated or alternating
@@ -183,6 +189,12 @@ struct Unbound {
     reported: std::collections::BTreeSet<String>,
     /// Whether the wait for a published remove was already logged.
     wait_logged: bool,
+    /// When to next retry binding this port on a timer (`Some` after an I/O
+    /// bind failure such as an external listener holding the port; `None`
+    /// while waiting for internal capacity or a published remove).
+    retry_at: Option<Instant>,
+    /// Backoff for the next timer retry.
+    retry_delay: Duration,
 }
 
 impl AutoForwardTracker {
@@ -197,6 +209,16 @@ impl AutoForwardTracker {
 
     /// The guest wants `port` forwarded.
     fn add(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
+        self.add_at(proto, port, Instant::now(), on_event);
+    }
+
+    fn add_at(
+        &mut self,
+        proto: PortProto,
+        port: u16,
+        now: Instant,
+        on_event: &mut dyn FnMut(Event),
+    ) {
         let key = (proto, port);
         if self.forwards.contains(port) {
             return;
@@ -206,18 +228,21 @@ impl AutoForwardTracker {
                 key,
                 reported: std::collections::BTreeSet::new(),
                 wait_logged: false,
+                retry_at: None,
+                retry_delay: UNBOUND_RETRY_INITIAL,
             });
         }
-        self.try_bind(key, on_event);
+        self.try_bind(key, now, on_event);
     }
 
     /// Try to bind one wanted, unbound port.
-    fn try_bind(&mut self, key: (PortProto, u16), on_event: &mut dyn FnMut(Event)) {
+    fn try_bind(&mut self, key: (PortProto, u16), now: Instant, on_event: &mut dyn FnMut(Event)) {
         let (proto, port) = key;
         let Some(idx) = self.unbound.iter().position(|u| u.key == key) else {
             return;
         };
         if self.published_removing.contains_key(&key) {
+            self.unbound[idx].retry_at = None;
             if !std::mem::replace(&mut self.unbound[idx].wait_logged, true) {
                 eprintln!(
                     "katamaran: auto-forward {}:{port}/{} waits for the published forward to release the port",
@@ -245,12 +270,21 @@ impl AutoForwardTracker {
                 }
                 return;
             }
-            Err(crate::autofwd::AddError::CapacityExhausted(reason)) => reason,
-            Err(crate::autofwd::AddError::Io(e)) => e.to_string(),
+            Err(crate::autofwd::AddError::CapacityExhausted(reason)) => {
+                self.unbound[idx].retry_at = None;
+                self.unbound[idx].retry_delay = UNBOUND_RETRY_INITIAL;
+                reason
+            }
+            Err(crate::autofwd::AddError::Io(e)) => {
+                let delay = self.unbound[idx].retry_delay;
+                self.unbound[idx].retry_at = Some(now + delay);
+                self.unbound[idx].retry_delay = delay.saturating_mul(2).min(UNBOUND_RETRY_MAX);
+                e.to_string()
+            }
         };
         if !self.unbound[idx].reported.contains(&err) {
             eprintln!(
-                "katamaran: cannot auto-forward {}:{port}/{} yet ({err}); will retry when a listener is released",
+                "katamaran: cannot auto-forward {}:{port}/{} yet ({err}); will retry",
                 self.forwards.label(),
                 proto.as_str()
             );
@@ -264,11 +298,33 @@ impl AutoForwardTracker {
         }
     }
 
+    /// Earliest scheduled timer retry across wanted, unbound ports.
+    fn next_retry_at(&self) -> Option<Instant> {
+        self.unbound.iter().filter_map(|u| u.retry_at).min()
+    }
+
+    /// Retry every wanted, unbound port whose timer deadline has elapsed.
+    fn retry_due(&mut self, now: Instant, on_event: &mut dyn FnMut(Event)) {
+        let keys: Vec<_> = self
+            .unbound
+            .iter()
+            .filter(|u| u.retry_at.is_some_and(|at| at <= now))
+            .map(|u| u.key)
+            .collect();
+        for key in keys {
+            self.try_bind(key, now, on_event);
+        }
+    }
+
     /// Something on the Mac was released: retry every wanted, unbound port.
     fn retry_unbound(&mut self, on_event: &mut dyn FnMut(Event)) {
+        let now = Instant::now();
+        for u in &mut self.unbound {
+            u.retry_delay = UNBOUND_RETRY_INITIAL;
+        }
         let keys: Vec<_> = self.unbound.iter().map(|u| u.key).collect();
         for key in keys {
-            self.try_bind(key, on_event);
+            self.try_bind(key, now, on_event);
         }
     }
 
@@ -297,7 +353,11 @@ impl AutoForwardTracker {
 
     /// Published remove `seq` for `port` was dispatched to the worker.
     fn published_removing(&mut self, proto: PortProto, port: u16, seq: u64) {
-        self.published_removing.insert((proto, port), seq);
+        let key = (proto, port);
+        self.published_removing.insert(key, seq);
+        if let Some(u) = self.unbound.iter_mut().find(|u| u.key == key) {
+            u.retry_at = None;
+        }
     }
 
     /// The worker attempted published remove `seq` for `port`. If it is the
@@ -714,7 +774,18 @@ fn session(
     let mount_cancel = Arc::new(AtomicBool::new(false));
     let mut mount_task: Option<thread::JoinHandle<()>> = None;
     let end = loop {
-        match rx.recv() {
+        let input = match auto_forwards.next_retry_at() {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(msg) => Ok(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    auto_forwards.retry_due(Instant::now(), on_event);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+            },
+            None => rx.recv().map_err(|_| ()),
+        };
+        match input {
             // From an earlier session's reader or worker.
             Ok(Input::Guest(from, _))
             | Ok(Input::Forward(from, _))
@@ -1400,6 +1471,93 @@ mod tests {
         guest_stop.store(true, Ordering::SeqCst);
         let _ = std::os::unix::net::UnixStream::connect(&g_path);
         let _ = guest_thread.join();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_forward_tracker_retries_after_external_listener_exits() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        let dir = std::env::temp_dir().join(format!("kat-run-ext-retry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut next_port = 22_000 + ((std::process::id() % 1000) as u16) * 8;
+        let mut free_port = || loop {
+            let candidate = next_port;
+            next_port += 1;
+            if TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, candidate)),
+                Duration::from_millis(20),
+            )
+            .is_err()
+            {
+                return candidate;
+            }
+        };
+
+        // Budget of 3 listener fds (1 single-address port total) so we can verify
+        // capacity-blocked ports do not schedule a polling timer.
+        let budget = crate::autofwd::RelayBudget::with_limits(3, 4);
+        let mut tracker =
+            AutoForwardTracker::new(crate::autofwd::AutoForwards::with_limits_and_budget(
+                crate::autofwd::Upstream::AutoForward(dir.join("autofwd.sock")),
+                &[Ipv4Addr::LOCALHOST],
+                crate::autofwd::ConnLimit::Shared(4),
+                None,
+                budget,
+            ));
+        let mut events = Vec::new();
+        let base = Instant::now();
+
+        let busy_port = free_port();
+        let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, busy_port)).unwrap();
+        tracker.add_at(PortProto::Tcp, busy_port, base, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == busy_port
+        ));
+        // Initial retry scheduled after UNBOUND_RETRY_INITIAL (250ms).
+        let first_retry = tracker.next_retry_at().expect("timer retry scheduled");
+        assert_eq!(first_retry, base + UNBOUND_RETRY_INITIAL);
+
+        // Retrying while still held backs off (500ms) without repeating PortFailed.
+        tracker.retry_due(first_retry, &mut |e| events.push(e));
+        assert!(events.is_empty(), "duplicate error must not re-emit");
+        let second_retry = tracker.next_retry_at().expect("second retry scheduled");
+        assert_eq!(second_retry, first_retry + UNBOUND_RETRY_INITIAL * 2);
+
+        // External listener exits with no Katamaran release event: timer retry binds it.
+        // Loop briefly in case a parallel test subprocess inherited `busy`'s fd
+        // during macOS's non-atomic `socket()` + `FIOCLEX` window.
+        drop(busy);
+        let mut retry_now = second_retry;
+        let bound_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            tracker.retry_due(retry_now, &mut |e| events.push(e));
+            if !events.is_empty() || Instant::now() >= bound_deadline {
+                break;
+            }
+            retry_now = tracker.next_retry_at().unwrap_or(retry_now);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, ref a))
+                if p == busy_port && a == &[Ipv4Addr::LOCALHOST]
+        ));
+        assert_eq!(tracker.next_retry_at(), None);
+
+        // Capacity-blocked port does NOT schedule a polling timer (it wakes via budget release).
+        let cap_port = free_port();
+        tracker.add_at(PortProto::Tcp, cap_port, retry_now, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == cap_port
+        ));
+        assert_eq!(tracker.next_retry_at(), None);
+
+        drop(tracker);
         let _ = fs::remove_dir_all(&dir);
     }
 }

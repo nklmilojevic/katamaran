@@ -357,6 +357,7 @@ impl Config {
         if let Some(v) = &self.k8s_version {
             validate_k8s_version(v)?;
         }
+        validate_forward_addresses(&self.forward_addresses)?;
         // `k8s_disable` / `k8s_args` are deliberately not checked here: this
         // runs on every load, and a bad Kubernetes setting in a hand-edited
         // config.toml must fail only the Kubernetes start, not the VM.
@@ -394,7 +395,6 @@ impl Config {
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
             bail!("k8s_disable and k8s_args exceed maximum size of {MAX_K8S_ARGS_BYTES} bytes");
         }
-        validate_forward_addresses(&self.forward_addresses)?;
         Ok(())
     }
 
