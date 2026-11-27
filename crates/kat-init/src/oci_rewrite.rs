@@ -24,6 +24,7 @@
 //!    the `moby` source digest, and publishes the tag in `k8s.io`.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -68,6 +69,15 @@ pub enum BlobReadError {
     Other(String),
 }
 
+/// Platform fields extracted from an OCI image config JSON blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPlatform {
+    pub os: String,
+    pub architecture: String,
+    pub variant: Option<String>,
+    pub os_features: Vec<String>,
+}
+
 /// Read-only content-addressed blob lookup backed by containerd's `moby`
 /// content store (or an in-memory map in tests).
 pub trait BlobStore {
@@ -87,6 +97,12 @@ pub trait BlobStore {
     /// before fetching its payload when the blob's authoritative stored size
     /// exceeds `max_bytes`.
     fn read_json_blob(&mut self, digest: &str, max_bytes: usize) -> Result<Vec<u8>, BlobReadError>;
+
+    /// Stream-inspect `(os, architecture, variant, os.features)` of a config
+    /// JSON blob without buffering the full blob or enforcing the rewrite
+    /// metadata byte budget (so >16 MiB platformless native configs never
+    /// block native sync).
+    fn inspect_config_platform(&mut self, digest: &str) -> Result<Option<ConfigPlatform>, String>;
 }
 
 /// True when `name` is pinned to a content digest (e.g. `repo@sha256:...`,
@@ -112,6 +128,7 @@ pub struct NativePlatform<'a> {
     pub os: &'a str,
     pub arch: &'a str,
     pub variant: Option<&'a str>,
+    pub os_features: &'a [&'a str],
 }
 
 impl<'a> NativePlatform<'a> {
@@ -120,13 +137,23 @@ impl<'a> NativePlatform<'a> {
             os: "linux",
             arch,
             variant,
+            os_features: &[],
         }
     }
 
-    fn matches_strict(self, os: &str, arch: &str, variant: Option<&str>) -> bool {
+    fn matches_strict(
+        self,
+        os: &str,
+        arch: &str,
+        variant: Option<&str>,
+        required_os_features: &[String],
+    ) -> bool {
         os.eq_ignore_ascii_case(self.os)
             && normalize_arch_variant(arch, variant)
                 == normalize_arch_variant(self.arch, self.variant)
+            && required_os_features
+                .iter()
+                .all(|req| self.os_features.iter().any(|sup| sup == req))
     }
 }
 
@@ -135,11 +162,12 @@ impl<'a> NativePlatform<'a> {
 ///
 /// Katamaran's arm64 guest kernel disables `CONFIG_COMPAT` (no 32-bit ARM
 /// execution) and `ctr images export --local` defaults to `DefaultStrict()`
-/// (`linux/arm64`, where `v8` normalizes to baseline `""`, rejecting both
-/// `linux/arm/*` and non-baseline variants such as `linux/arm64/v8.2`).
+/// (`linux/arm64`, where `8`, `v8`, and `v8.0` normalize to baseline `""`,
+/// rejecting both `linux/arm/*` and non-baseline variants such as
+/// `linux/arm64/v8.2`).
 pub fn has_native_platform(platforms: &str, native_arch: &str) -> bool {
     let target = NativePlatform::linux(native_arch, None);
-    platform_list(platforms).any(|(os, arch, var)| target.matches_strict(os, arch, var))
+    platform_list(platforms).any(|(os, arch, var)| target.matches_strict(os, arch, var, &[]))
 }
 
 /// True when `ctr images ls` lists a `linux/amd64` platform variant.
@@ -174,7 +202,7 @@ fn normalize_arch_variant(arch: &str, variant: Option<&str>) -> (String, Option<
         "i386" | "386" => ("386".into(), variant),
         "arm64" | "aarch64" => {
             let v = match variant.as_deref() {
-                None | Some("8" | "v8") => None,
+                None | Some("8" | "v8" | "v8.0") => None,
                 Some("9" | "9.0" | "v9.0") => Some("v9".into()),
                 Some(other) => Some(other.into()),
             };
@@ -563,6 +591,9 @@ impl<'a, S: BlobStore> BudgetedStore<'a, S> {
         self.remaining_bytes -= data.len();
         Ok(ReadOutcome::Data(data))
     }
+    fn inspect_config_platform(&mut self, digest: &str) -> Result<Option<ConfigPlatform>, String> {
+        self.inner.inspect_config_platform(digest)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -570,11 +601,22 @@ struct PlatformDesc {
     os: Option<String>,
     architecture: Option<String>,
     variant: Option<String>,
+    os_features: Vec<String>,
 }
 
 impl PlatformDesc {
     fn from_value(v: &Value) -> Option<Self> {
         let obj = v.as_object()?;
+        let os_features = obj
+            .get("os.features")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             os: obj.get("os").and_then(Value::as_str).map(str::to_string),
             architecture: obj
@@ -585,6 +627,7 @@ impl PlatformDesc {
                 .get("variant")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            os_features,
         })
     }
 
@@ -603,13 +646,13 @@ impl PlatformDesc {
     }
 
     /// Strict match matching containerd's `platforms.OnlyStrict(target)`
-    /// (requires explicit `os` and `architecture`, and matching normalized
-    /// `variant`).
+    /// (requires explicit `os` and `architecture`, matching normalized
+    /// `variant`, and every required `os.features` entry supported by `target`).
     fn matches_strict(&self, target: NativePlatform<'_>) -> bool {
         let (Some(os), Some(arch)) = (self.os.as_deref(), self.architecture.as_deref()) else {
             return false;
         };
-        target.matches_strict(os, arch, self.variant.as_deref())
+        target.matches_strict(os, arch, self.variant.as_deref(), &self.os_features)
     }
 
     /// Explicit normalized `linux/amd64[/variant]` selector when this
@@ -712,6 +755,350 @@ fn inspect_config_platform(raw: &[u8]) -> Option<(String, String, Option<String>
         .and_then(Value::as_str)
         .map(str::to_string);
     Some((os, arch, variant))
+}
+
+/// Stream-parse only top-level `os`, `architecture`, `variant`, and
+/// `os.features` from an OCI/Docker image config JSON stream using O(1) memory,
+/// skipping arbitrarily large fields (e.g. >16 MiB `history` or `config.Labels`)
+/// without buffering the config blob.
+///
+/// Always drains trailing bytes after the closing `}` so upstream producers
+/// such as `ctr content get` exit cleanly without `EPIPE`.
+pub fn parse_config_platform_reader(r: impl Read) -> Result<Option<ConfigPlatform>, String> {
+    let mut scanner = JsonStreamScanner::new(r);
+    let result = scanner.parse_config_platform()?;
+    scanner.drain_to_eof()?;
+    Ok(result)
+}
+
+struct JsonStreamScanner<R: Read> {
+    reader: BufReader<R>,
+    peeked: Option<u8>,
+}
+
+enum BoundedString {
+    Value(String),
+    TooLong,
+    Invalid,
+}
+
+impl<R: Read> JsonStreamScanner<R> {
+    fn new(r: R) -> Self {
+        Self {
+            reader: BufReader::with_capacity(8192, r),
+            peeked: None,
+        }
+    }
+
+    fn peek(&mut self) -> Result<Option<u8>, String> {
+        if let Some(b) = self.peeked {
+            return Ok(Some(b));
+        }
+        let buf = self
+            .reader
+            .fill_buf()
+            .map_err(|e| format!("read image config stream: {e}"))?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let b = buf[0];
+        self.reader.consume(1);
+        self.peeked = Some(b);
+        Ok(Some(b))
+    }
+
+    fn next_byte(&mut self) -> Result<Option<u8>, String> {
+        if let Some(b) = self.peeked.take() {
+            return Ok(Some(b));
+        }
+        let buf = self
+            .reader
+            .fill_buf()
+            .map_err(|e| format!("read image config stream: {e}"))?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let b = buf[0];
+        self.reader.consume(1);
+        Ok(Some(b))
+    }
+
+    fn drain_to_eof(&mut self) -> Result<(), String> {
+        self.peeked = None;
+        loop {
+            let len = self
+                .reader
+                .fill_buf()
+                .map_err(|e| format!("drain image config stream: {e}"))?
+                .len();
+            if len == 0 {
+                return Ok(());
+            }
+            self.reader.consume(len);
+        }
+    }
+
+    fn skip_ws(&mut self) -> Result<Option<u8>, String> {
+        while let Some(b) = self.peek()? {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                self.next_byte()?;
+            } else {
+                return Ok(Some(b));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Skip the remainder of a JSON string after its opening `"` has been consumed.
+    fn skip_string_rest(&mut self) -> Result<bool, String> {
+        while let Some(b) = self.next_byte()? {
+            match b {
+                b'"' => return Ok(true),
+                b'\\' if self.next_byte()?.is_none() => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// Read a JSON string starting at its opening `"` up to `max_raw_bytes`,
+    /// delegating escape/UTF-16 decoding to `serde_json` on the bounded slice.
+    fn read_bounded_string(&mut self, max_raw_bytes: usize) -> Result<BoundedString, String> {
+        if self.next_byte()? != Some(b'"') {
+            return Ok(BoundedString::Invalid);
+        }
+        let mut raw = Vec::with_capacity(64);
+        raw.push(b'"');
+        let mut escaped = false;
+        while let Some(b) = self.next_byte()? {
+            if raw.len() >= max_raw_bytes {
+                if escaped {
+                    // Already consumed the escaped byte `b`; continue scanning.
+                } else if b == b'"' {
+                    return Ok(BoundedString::TooLong);
+                } else if b == b'\\' && self.next_byte()?.is_none() {
+                    return Ok(BoundedString::Invalid);
+                }
+                return if self.skip_string_rest()? {
+                    Ok(BoundedString::TooLong)
+                } else {
+                    Ok(BoundedString::Invalid)
+                };
+            }
+            raw.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                return match serde_json::from_slice::<String>(&raw) {
+                    Ok(s) => Ok(BoundedString::Value(s)),
+                    Err(_) => Ok(BoundedString::Invalid),
+                };
+            }
+        }
+        Ok(BoundedString::Invalid)
+    }
+
+    /// Skip any JSON value in O(1) memory without recursion.
+    fn skip_value(&mut self) -> Result<bool, String> {
+        let Some(first) = self.skip_ws()? else {
+            return Ok(false);
+        };
+        match first {
+            b'"' => {
+                self.next_byte()?;
+                self.skip_string_rest()
+            }
+            b'{' | b'[' => {
+                self.next_byte()?;
+                let mut depth: usize = 1;
+                while depth > 0 {
+                    let Some(b) = self.next_byte()? else {
+                        return Ok(false);
+                    };
+                    match b {
+                        b'"' => {
+                            if !self.skip_string_rest()? {
+                                return Ok(false);
+                            }
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                Ok(true)
+            }
+            _ => {
+                let mut consumed = false;
+                while let Some(b) = self.peek()? {
+                    if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b',' | b'}' | b']') {
+                        break;
+                    }
+                    self.next_byte()?;
+                    consumed = true;
+                }
+                Ok(consumed)
+            }
+        }
+    }
+
+    fn read_os_features(&mut self) -> Result<Option<Vec<String>>, String> {
+        let Some(first) = self.skip_ws()? else {
+            return Ok(None);
+        };
+        if first != b'[' {
+            return if self.skip_value()? {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(None)
+            };
+        }
+        self.next_byte()?;
+        let mut features = Vec::new();
+        if self.skip_ws()? == Some(b']') {
+            self.next_byte()?;
+            return Ok(Some(features));
+        }
+        loop {
+            match self.skip_ws()? {
+                Some(b'"') => match self.read_bounded_string(256)? {
+                    BoundedString::Value(s) => {
+                        if features.len() < 256 {
+                            features.push(s);
+                        }
+                    }
+                    BoundedString::TooLong => {
+                        // Preserve non-emptiness if an unexpectedly long feature name exists.
+                        if features.len() < 256 {
+                            features.push("<oversized-os-feature>".into());
+                        }
+                    }
+                    BoundedString::Invalid => return Ok(None),
+                },
+                Some(_) => {
+                    if !self.skip_value()? {
+                        return Ok(None);
+                    }
+                }
+                None => return Ok(None),
+            }
+            match self.skip_ws()? {
+                Some(b',') => {
+                    self.next_byte()?;
+                }
+                Some(b']') => {
+                    self.next_byte()?;
+                    return Ok(Some(features));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    fn parse_config_platform(&mut self) -> Result<Option<ConfigPlatform>, String> {
+        if self.skip_ws()? != Some(b'{') {
+            return Ok(None);
+        }
+        self.next_byte()?;
+        if self.skip_ws()? == Some(b'}') {
+            self.next_byte()?;
+            return Ok(None);
+        }
+
+        let mut os: Option<String> = None;
+        let mut architecture: Option<String> = None;
+        let mut variant: Option<String> = None;
+        let mut os_features: Vec<String> = Vec::new();
+
+        loop {
+            if self.skip_ws()? != Some(b'"') {
+                return Ok(None);
+            }
+            let key = match self.read_bounded_string(64)? {
+                BoundedString::Value(k) => Some(k),
+                BoundedString::TooLong => None,
+                BoundedString::Invalid => return Ok(None),
+            };
+            if self.skip_ws()? != Some(b':') {
+                return Ok(None);
+            }
+            self.next_byte()?;
+            match key.as_deref() {
+                Some("os") => {
+                    if self.skip_ws()? == Some(b'"') {
+                        match self.read_bounded_string(256)? {
+                            BoundedString::Value(v) => os = Some(v),
+                            BoundedString::TooLong => os = None,
+                            BoundedString::Invalid => return Ok(None),
+                        }
+                    } else if !self.skip_value()? {
+                        return Ok(None);
+                    } else {
+                        os = None;
+                    }
+                }
+                Some("architecture") => {
+                    if self.skip_ws()? == Some(b'"') {
+                        match self.read_bounded_string(256)? {
+                            BoundedString::Value(v) => architecture = Some(v),
+                            BoundedString::TooLong => architecture = None,
+                            BoundedString::Invalid => return Ok(None),
+                        }
+                    } else if !self.skip_value()? {
+                        return Ok(None);
+                    } else {
+                        architecture = None;
+                    }
+                }
+                Some("variant") => {
+                    if self.skip_ws()? == Some(b'"') {
+                        match self.read_bounded_string(256)? {
+                            BoundedString::Value(v) => variant = Some(v),
+                            BoundedString::TooLong => variant = None,
+                            BoundedString::Invalid => return Ok(None),
+                        }
+                    } else if !self.skip_value()? {
+                        return Ok(None);
+                    } else {
+                        variant = None;
+                    }
+                }
+                Some("os.features") => {
+                    let Some(feats) = self.read_os_features()? else {
+                        return Ok(None);
+                    };
+                    os_features = feats;
+                }
+                _ => {
+                    if !self.skip_value()? {
+                        return Ok(None);
+                    }
+                }
+            }
+            match self.skip_ws()? {
+                Some(b',') => {
+                    self.next_byte()?;
+                }
+                Some(b'}') => {
+                    self.next_byte()?;
+                    break;
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let (Some(os), Some(architecture)) = (os, architecture) else {
+            return Ok(None);
+        };
+        Ok(Some(ConfigPlatform {
+            os,
+            architecture,
+            variant,
+            os_features,
+        }))
+    }
 }
 
 /// Walk `digest` (a manifest, or an OCI index / Docker manifest list, including
@@ -1006,7 +1393,11 @@ fn walk_native_manifest<S: BlobStore>(
             let Some(selected) = matching.into_iter().next() else {
                 return Ok(false);
             };
-            let child_explicit = explicit_platform_matched || selected.platform.is_some();
+            // Only the immediate selected descriptor's platform can skip
+            // reading the leaf config — never inherit an ancestor index's
+            // platform into a platformless leaf (matching containerd v2.4.2's
+            // `images.Manifest`).
+            let child_explicit = selected.platform.is_some();
             walk_native_manifest(
                 &selected.digest,
                 selected.media_type.as_deref(),
@@ -1058,28 +1449,25 @@ fn resolve_native_leaf_manifest<S: BlobStore>(
         }
     }
 
-    // When the selected index descriptor explicitly declared a strictly
-    // matching native platform (e.g. `linux/arm64`), containerd's
-    // `images.Manifest` trusts that descriptor platform without fetching the
-    // config body. Skip reading the config bytes here so large native configs
-    // (> MAX_TOTAL_METADATA_BYTES) never block native sync.
+    // When the leaf descriptor itself explicitly declared a strictly matching
+    // native platform (e.g. `linux/arm64`), containerd's `images.Manifest`
+    // trusts that descriptor platform without opening the config body.
     if explicit_platform_matched {
         return Ok(true);
     }
 
-    let config_bytes = match store.read_json_blob(&config_digest)? {
-        ReadOutcome::Data(data) => data,
-        ReadOutcome::BudgetExhausted(msg) => {
-            if notes.budget_err.is_none() {
-                notes.budget_err = Some(msg);
-            }
-            return Ok(false);
-        }
-    };
-    let Some((cfg_os, cfg_arch, cfg_variant)) = inspect_config_platform(&config_bytes) else {
+    // For a single-manifest root or a platformless leaf descriptor, stream-read
+    // only the config's platform fields without buffering the full blob or
+    // hitting the 16 MiB amd64-rewrite metadata byte cap.
+    let Some(cfg) = store.inspect_config_platform(&config_digest)? else {
         return Ok(false);
     };
-    Ok(target.matches_strict(&cfg_os, &cfg_arch, cfg_variant.as_deref()))
+    Ok(target.matches_strict(
+        &cfg.os,
+        &cfg.architecture,
+        cfg.variant.as_deref(),
+        &cfg.os_features,
+    ))
 }
 
 fn sha256(data: &[u8]) -> String {
@@ -1170,6 +1558,23 @@ mod tests {
                 )));
             }
             Ok(data.clone())
+        }
+
+        fn inspect_config_platform(
+            &mut self,
+            digest: &str,
+        ) -> Result<Option<ConfigPlatform>, String> {
+            assert!(
+                !self.forbid_read.iter().any(|d| d == digest),
+                "native check must not read forbidden blob {digest}"
+            );
+            if self.fail_digest.as_deref() == Some(digest) {
+                return Err(format!("simulated containerd i/o error reading {digest}"));
+            }
+            let Some(data) = self.blobs.get(digest) else {
+                return Ok(None);
+            };
+            parse_config_platform_reader(data.as_slice())
         }
     }
 
@@ -1863,6 +2268,15 @@ mod tests {
                 self.fetched.push(digest.to_string());
                 Ok(self.blobs[digest].clone())
             }
+            fn inspect_config_platform(
+                &mut self,
+                digest: &str,
+            ) -> Result<Option<ConfigPlatform>, String> {
+                let Some(data) = self.blobs.get(digest) else {
+                    return Ok(None);
+                };
+                parse_config_platform_reader(data.as_slice())
+            }
         }
 
         let mut store = SizeGuardedStore {
@@ -2307,17 +2721,88 @@ mod tests {
         );
     }
 
-    /// Regression test: when an OCI index selects a descriptor with an explicit
-    /// strictly matching `linux/arm64` platform, `has_complete_native_manifest`
-    /// stats the config and layers without reading the config body — so native
-    /// images with > `MAX_TOTAL_METADATA_BYTES` configs succeed without hitting
-    /// the rewrite metadata budget. Platformless descriptors still read the
-    /// config within budget.
+    /// Regression test: `has_complete_native_manifest` covers:
+    /// 1. Explicit `linux/arm64/v8` descriptor with a config larger than
+    ///    `MAX_TOTAL_METADATA_BYTES` succeeds without reading the config body.
+    /// 2. Platformless single-manifest (and platformless index child) with a
+    ///    `linux/arm64` config larger than `MAX_TOTAL_METADATA_BYTES` streams
+    ///    platform fields in O(1) memory and returns `Complete` without hitting
+    ///    the rewrite metadata budget.
+    /// 3. Platformless single-manifest with a `linux/amd64` config larger than
+    ///    `MAX_TOTAL_METADATA_BYTES` returns `Incomplete` on the native probe
+    ///    while `prepare_rewrite_from_store` still enforces the 16 MiB cap.
     #[test]
-    fn native_manifest_check_skips_fetching_oversized_config_for_explicit_arm64_descriptor() {
+    fn native_manifest_check_handles_oversized_explicit_and_platformless_configs() {
+        /// Zero-allocation synthetic reader streaming a >16 MiB OCI config JSON:
+        /// `{"history":"aaaa...(>16MiB)...","os":"linux","architecture":"<arch>","variant":"v8.0"}`
+        struct SyntheticHugeConfigReader {
+            prefix: &'static [u8],
+            suffix: Vec<u8>,
+            padding_left: usize,
+            stage: u8,
+            pos: usize,
+        }
+
+        impl SyntheticHugeConfigReader {
+            fn new(arch: &str, padding_bytes: usize) -> Self {
+                Self {
+                    prefix: br#"{"config":{"Env":["ESC=\"}\""]},"history":""#,
+                    suffix: format!(r#"","os":"linux","architecture":"{arch}","variant":"v8.0"}}"#)
+                        .into_bytes(),
+                    padding_left: padding_bytes,
+                    stage: 0,
+                    pos: 0,
+                }
+            }
+
+            fn total_len(&self) -> u64 {
+                (self.prefix.len() + self.padding_left + self.suffix.len()) as u64
+            }
+        }
+
+        impl Read for SyntheticHugeConfigReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.stage {
+                    0 => {
+                        let rem = &self.prefix[self.pos..];
+                        let n = rem.len().min(buf.len());
+                        buf[..n].copy_from_slice(&rem[..n]);
+                        self.pos += n;
+                        if self.pos == self.prefix.len() {
+                            self.stage = 1;
+                            self.pos = 0;
+                        }
+                        Ok(n)
+                    }
+                    1 => {
+                        let n = self.padding_left.min(buf.len());
+                        buf[..n].fill(b'x');
+                        self.padding_left -= n;
+                        if self.padding_left == 0 {
+                            self.stage = 2;
+                            self.pos = 0;
+                        }
+                        Ok(n)
+                    }
+                    2 => {
+                        let rem = &self.suffix[self.pos..];
+                        let n = rem.len().min(buf.len());
+                        buf[..n].copy_from_slice(&rem[..n]);
+                        self.pos += n;
+                        if self.pos == self.suffix.len() {
+                            self.stage = 3;
+                        }
+                        Ok(n)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
         struct OversizedConfigStore {
             blobs: HashMap<String, Vec<u8>>,
             extra_sizes: HashMap<String, u64>,
+            synthetic_configs: HashMap<String, (&'static str, usize)>,
             forbid_read: Vec<String>,
         }
 
@@ -2362,63 +2847,269 @@ mod tests {
                 }
                 Ok(self.blobs[digest].clone())
             }
+
+            fn inspect_config_platform(
+                &mut self,
+                digest: &str,
+            ) -> Result<Option<ConfigPlatform>, String> {
+                assert!(
+                    !self.forbid_read.iter().any(|d| d == digest),
+                    "explicitly platformed config {digest} must not be opened"
+                );
+                if let Some(&(arch, pad)) = self.synthetic_configs.get(digest) {
+                    return parse_config_platform_reader(SyntheticHugeConfigReader::new(arch, pad));
+                }
+                let Some(data) = self.blobs.get(digest) else {
+                    return Ok(None);
+                };
+                parse_config_platform_reader(data.as_slice())
+            }
         }
 
-        let oversized_cfg = format!("sha256:{}", "c".repeat(64));
+        let padding = MAX_TOTAL_METADATA_BYTES + 4096;
+        let huge_arm64_len = SyntheticHugeConfigReader::new("arm64", padding).total_len();
+        let huge_amd64_len = SyntheticHugeConfigReader::new("amd64", padding).total_len();
+        let huge_arm64_cfg = format!("sha256:{}", "c".repeat(64));
+        let huge_amd64_cfg = format!("sha256:{}", "d".repeat(64));
         let arm64_layer = format!("sha256:{}", "b".repeat(64));
-        let manifest_bytes = serde_json::to_vec(&json!({
+
+        let arm64_manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": MT_OCI_MANIFEST,
             "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": oversized_cfg, "size": (MAX_TOTAL_METADATA_BYTES as u64) + 4096},
+                       "digest": huge_arm64_cfg, "size": huge_arm64_len},
             "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
                         "digest": arm64_layer, "size": 1024}],
         }))
         .unwrap();
-        let manifest_d = format!("sha256:{}", sha256(&manifest_bytes));
-        let idx_bytes = serde_json::to_vec(&json!({
+        let arm64_manifest_d = format!("sha256:{}", sha256(&arm64_manifest));
+
+        let amd64_manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": huge_amd64_cfg, "size": huge_amd64_len},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": arm64_layer, "size": 1024}],
+        }))
+        .unwrap();
+        let amd64_manifest_d = format!("sha256:{}", sha256(&amd64_manifest));
+
+        let explicit_idx = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": MT_OCI_INDEX,
             "manifests": [{
                 "mediaType": MT_OCI_MANIFEST,
-                "digest": manifest_d,
-                "size": manifest_bytes.len(),
+                "digest": arm64_manifest_d,
+                "size": arm64_manifest.len(),
                 "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"},
             }],
         }))
         .unwrap();
-        let idx_d = format!("sha256:{}", sha256(&idx_bytes));
+        let explicit_idx_d = format!("sha256:{}", sha256(&explicit_idx));
+
+        let platformless_idx = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_INDEX,
+            "manifests": [{
+                "mediaType": MT_OCI_MANIFEST,
+                "digest": arm64_manifest_d,
+                "size": arm64_manifest.len(),
+            }],
+        }))
+        .unwrap();
+        let platformless_idx_d = format!("sha256:{}", sha256(&platformless_idx));
 
         let mut store = OversizedConfigStore {
             blobs: HashMap::from([
-                (manifest_d.clone(), manifest_bytes),
-                (idx_d.clone(), idx_bytes),
+                (arm64_manifest_d.clone(), arm64_manifest),
+                (amd64_manifest_d.clone(), amd64_manifest),
+                (explicit_idx_d.clone(), explicit_idx),
+                (platformless_idx_d.clone(), platformless_idx),
             ]),
             extra_sizes: HashMap::from([
-                (
-                    oversized_cfg.clone(),
-                    (MAX_TOTAL_METADATA_BYTES as u64) + 4096,
-                ),
+                (huge_arm64_cfg.clone(), huge_arm64_len),
+                (huge_amd64_cfg.clone(), huge_amd64_len),
                 (arm64_layer.clone(), 1024),
             ]),
-            forbid_read: vec![oversized_cfg.clone(), arm64_layer],
+            synthetic_configs: HashMap::from([
+                (huge_arm64_cfg.clone(), ("arm64", padding)),
+                (huge_amd64_cfg.clone(), ("amd64", padding)),
+            ]),
+            forbid_read: vec![huge_arm64_cfg.clone(), arm64_layer],
         };
 
-        // Explicit `linux/arm64/v8` descriptor: succeeds without reading the >16 MiB config.
+        // 1. Explicit `linux/arm64/v8` descriptor: succeeds without opening the >16 MiB config.
         assert_eq!(
-            has_complete_native_manifest(&idx_d, NativePlatform::linux("arm64", None), &mut store)
-                .unwrap(),
+            has_complete_native_manifest(
+                &explicit_idx_d,
+                NativePlatform::linux("arm64", None),
+                &mut store
+            )
+            .unwrap(),
             NativeManifestCheck::Complete
         );
 
-        // Platformless single manifest with >16 MiB config: still enforces the metadata read cap.
-        store.forbid_read.retain(|d| d != &oversized_cfg);
-        let err = has_complete_native_manifest(
-            &manifest_d,
-            NativePlatform::linux("arm64", None),
-            &mut store,
-        )
-        .unwrap_err();
-        assert!(err.contains("exceeded"), "{err}");
+        // 2. Platformless single manifest & platformless index child with >16 MiB
+        //    `linux/arm64/v8.0` config: stream-parses platform in O(1) memory -> Complete!
+        store.forbid_read.retain(|d| d != &huge_arm64_cfg);
+        assert_eq!(
+            has_complete_native_manifest(
+                &arm64_manifest_d,
+                NativePlatform::linux("arm64", None),
+                &mut store
+            )
+            .unwrap(),
+            NativeManifestCheck::Complete
+        );
+        assert_eq!(
+            has_complete_native_manifest(
+                &platformless_idx_d,
+                NativePlatform::linux("arm64", None),
+                &mut store
+            )
+            .unwrap(),
+            NativeManifestCheck::Complete
+        );
+
+        // 3. Platformless >16 MiB `linux/amd64` config: native probe returns
+        //    `Incomplete` (not an error), while amd64 rewrite still enforces the
+        //    16 MiB `MAX_TOTAL_METADATA_BYTES` budget.
+        assert_eq!(
+            has_complete_native_manifest(
+                &amd64_manifest_d,
+                NativePlatform::linux("arm64", None),
+                &mut store
+            )
+            .unwrap(),
+            NativeManifestCheck::Incomplete
+        );
+        let rewrite_err =
+            prepare_rewrite_from_store(&amd64_manifest_d, "arm64", &mut store).unwrap_err();
+        assert!(rewrite_err.contains("exceeded"), "{rewrite_err}");
+    }
+
+    /// Regression test: containerd `platforms` v1.0.0-rc.5 normalizes
+    /// `linux/arm64/v8.0` as baseline `linux/arm64`, rejects descriptors
+    /// requiring unsupported `os.features`, and checks each leaf's own
+    /// descriptor platform rather than inheriting an ancestor index's platform
+    /// into a platformless leaf.
+    #[test]
+    fn native_manifest_check_matches_v80_os_features_and_nested_platformless_leaf() {
+        let mut store = MemStore::new();
+        let arm64_layer = store.insert_layer(b"arm64-layer".to_vec());
+        let arm64_cfg = store
+            .insert(serde_json::to_vec(&json!({"os": "linux", "architecture": "arm64"})).unwrap());
+        let complete_arm64 = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": arm64_cfg, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": arm64_layer, "size": 11}],
+            }))
+            .unwrap(),
+        );
+
+        let amd64_layer = store.insert_layer(b"amd64-layer".to_vec());
+        let amd64_cfg = store
+            .insert(serde_json::to_vec(&json!({"os": "linux", "architecture": "amd64"})).unwrap());
+        let complete_amd64 = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": amd64_cfg, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": amd64_layer, "size": 11}],
+            }))
+            .unwrap(),
+        );
+        let target = NativePlatform::linux("arm64", None);
+
+        // 1. `linux/arm64/v8.0` normalizes to baseline `linux/arm64` in both
+        //    `has_native_platform` and `has_complete_native_manifest`.
+        assert!(has_native_platform("linux/arm64/v8.0,linux/amd64", "arm64"));
+        let v80_idx = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_arm64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64", "variant": "v8.0"}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_amd64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "amd64"}},
+                ],
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            has_complete_native_manifest(&v80_idx, target, &mut store).unwrap(),
+            NativeManifestCheck::Complete
+        );
+
+        // 2. Missing first `linux/arm64` descriptor requiring an unsupported OS
+        //    feature is excluded by `OnlyStrict(DefaultSpec())`, allowing the
+        //    complete second plain `linux/arm64` descriptor to be selected.
+        let missing_featured = format!("sha256:{}", "e".repeat(64));
+        let features_idx = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": missing_featured, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64",
+                                  "os.features": ["win32k"]}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_arm64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64"}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_amd64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "amd64"}},
+                ],
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            has_complete_native_manifest(&features_idx, target, &mut store).unwrap(),
+            NativeManifestCheck::Complete
+        );
+
+        // 3. Nested index marked `linux/arm64` pointing to a platformless leaf
+        //    whose config is `linux/amd64` MUST NOT inherit the ancestor index's
+        //    platform match — it must read the leaf config and return `Incomplete`
+        //    so sync can fall back to rewriting the complete `amd64` sibling.
+        let nested_idx = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_amd64, "size": 128},
+                ],
+            }))
+            .unwrap(),
+        );
+        let outer_idx = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_INDEX, "digest": nested_idx, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64"}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_amd64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "amd64"}},
+                ],
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            has_complete_native_manifest(&outer_idx, target, &mut store).unwrap(),
+            NativeManifestCheck::Incomplete
+        );
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&outer_idx, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready amd64 rewrite when nested platformless leaf is amd64");
+        };
+        assert_eq!(plan.layer_digests, vec![amd64_layer]);
     }
 }

@@ -3688,6 +3688,7 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             |digest: &str, max_bytes: usize| {
                                 get_ctr_content_blob(reaper, "moby", digest, max_bytes)
                             },
+                            |digest: &str| inspect_ctr_config_platform(reaper, "moby", digest),
                         );
                         oci_rewrite::prepare_rewrite_from_store(
                             &img.digest,
@@ -3735,14 +3736,21 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         }
                     };
                     let selected_platform = plan.selected_platform.clone();
-                    let expected_k8s_digest = k8s_img.map(|k| k.digest.as_str());
+                    let expected_k8s = k8s_img.map(|k| containerd_grpc::ExpectedK8sTarget {
+                        digest: k.digest.as_str(),
+                        is_katamaran_mirror: k.label(SOURCE_DIGEST_LABEL).is_some(),
+                        is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
+                    });
                     match containerd_grpc::publish_rewritten_image(
                         Path::new(CONTAINERD_SOCKET),
                         &name,
                         SOURCE_DIGEST_LABEL,
-                        expected_k8s_digest,
+                        expected_k8s,
                         &plan,
                         Duration::from_secs(120),
+                        |digest| {
+                            probe_content_native_complete(reaper, "k8s.io", digest, NATIVE_ARCH)
+                        },
                     ) {
                         Ok(_) => log(&format!(
                             "mirrored amd64 image {name} ({selected_platform}) as linux/{NATIVE_ARCH} (runs under emulation)"
@@ -4057,6 +4065,7 @@ fn probe_native_complete(
             namespace,
         },
         |digest: &str, max_bytes: usize| get_ctr_content_blob(reaper, namespace, digest, max_bytes),
+        |digest: &str| inspect_ctr_config_platform(reaper, namespace, digest),
     );
     match oci_rewrite::has_complete_native_manifest(
         expected_digest,
@@ -4066,6 +4075,39 @@ fn probe_native_complete(
         oci_rewrite::NativeManifestCheck::Complete => Ok(NativeAvailability::Present),
         oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
         oci_rewrite::NativeManifestCheck::RootMissing => Ok(NativeAvailability::Stale),
+    }
+}
+
+/// Directly check whether `digest` in `namespace`'s content store has a
+/// locally complete native `linux/<native_arch>` manifest (used by
+/// `publish_rewritten_image` before and immediately after deleting an
+/// unlabelled `k8s.io` tag while `digest` is pinned under the publish lease).
+fn probe_content_native_complete(
+    reaper: &Reaper,
+    namespace: &str,
+    digest: &str,
+    native_arch: &str,
+) -> Result<bool, String> {
+    let mut client = containerd_grpc::ContentInfoClient::connect(
+        Path::new(CONTAINERD_SOCKET),
+        Duration::from_secs(30),
+    )?;
+    let mut store = MobyContentStore::new(
+        GrpcNamespaceMeta {
+            client: &mut client,
+            namespace,
+        },
+        |d: &str, max_bytes: usize| get_ctr_content_blob(reaper, namespace, d, max_bytes),
+        |d: &str| inspect_ctr_config_platform(reaper, namespace, d),
+    );
+    match oci_rewrite::has_complete_native_manifest(
+        digest,
+        oci_rewrite::NativePlatform::linux(native_arch, None),
+        &mut store,
+    )? {
+        oci_rewrite::NativeManifestCheck::Complete => Ok(true),
+        oci_rewrite::NativeManifestCheck::Incomplete
+        | oci_rewrite::NativeManifestCheck::RootMissing => Ok(false),
     }
 }
 
@@ -4137,30 +4179,34 @@ impl MobyContentMeta for GrpcNamespaceMeta<'_> {
 /// batches; never `Content.List`) so unrelated blobs in `moby` never slow or
 /// block a rewrite. Rejects over-budget metadata blobs before running
 /// `ctr content get`, keeping the bounded stdout read as a backstop.
-struct MobyContentStore<M, F> {
+struct MobyContentStore<M, F, C> {
     cache: HashMap<String, Option<u64>>,
     meta: M,
     fetch: F,
+    inspect_config: C,
 }
 
-impl<M, F> MobyContentStore<M, F>
+impl<M, F, C> MobyContentStore<M, F, C>
 where
     M: MobyContentMeta,
     F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
+    C: FnMut(&str) -> Result<Option<oci_rewrite::ConfigPlatform>, String>,
 {
-    fn new(meta: M, fetch: F) -> Self {
+    fn new(meta: M, fetch: F, inspect_config: C) -> Self {
         Self {
             cache: HashMap::new(),
             meta,
             fetch,
+            inspect_config,
         }
     }
 }
 
-impl<M, F> oci_rewrite::BlobStore for MobyContentStore<M, F>
+impl<M, F, C> oci_rewrite::BlobStore for MobyContentStore<M, F, C>
 where
     M: MobyContentMeta,
     F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
+    C: FnMut(&str) -> Result<Option<oci_rewrite::ConfigPlatform>, String>,
 {
     fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
         if let Some(&cached) = self.cache.get(digest) {
@@ -4219,6 +4265,91 @@ where
         }
         (self.fetch)(digest, max_bytes)
     }
+
+    fn inspect_config_platform(
+        &mut self,
+        digest: &str,
+    ) -> Result<Option<oci_rewrite::ConfigPlatform>, String> {
+        if self.blob_size(digest)?.is_none() {
+            return Ok(None);
+        }
+        (self.inspect_config)(digest)
+    }
+}
+
+/// Stream-inspect `(os, architecture, variant, os.features)` of `digest` in
+/// `ns` directly from `ctr content get`'s stdout pipe using O(1) memory so
+/// platformless native configs larger than `MAX_TOTAL_METADATA_BYTES` never
+/// block native sync or spike guest PID 1 memory.
+fn inspect_ctr_config_platform(
+    reaper: &Reaper,
+    ns: &str,
+    digest: &str,
+) -> Result<Option<oci_rewrite::ConfigPlatform>, String> {
+    let mut cmd = Command::new("/usr/bin/ctr");
+    cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "content", "get", digest]);
+    let (out_r, out_w) = pipe().map_err(|e| format!("ctr content get {digest} pipe: {e}"))?;
+    let (err_r, err_w) = pipe().map_err(|e| format!("ctr content get {digest} pipe: {e}"))?;
+    cmd.env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_w))
+        .stderr(Stdio::from(err_w));
+    let (pid, exited) = reaper
+        .spawn(&mut cmd)
+        .map_err(|e| format!("spawn ctr content get {digest}: {e}"))?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let out_t = match thread::Builder::new()
+        .name("k8s-cfg-scan".into())
+        .spawn(move || oci_rewrite::parse_config_platform_reader(File::from(out_r)))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Err(format!("spawn config stream reader: {e}"));
+        }
+    };
+    let err_t = match thread::Builder::new()
+        .name("k8s-cfg-err".into())
+        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            return Err(format!("spawn config stderr reader: {e}"));
+        }
+    };
+
+    let status = match exited.recv_timeout(Duration::from_secs(15)) {
+        Ok(s) => s,
+        Err(RecvTimeoutError::Timeout) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            let _ = err_t.join();
+            return Err(format!("ctr content get {digest} timed out"));
+        }
+        Err(RecvTimeoutError::Disconnected) => -1,
+    };
+    let parsed = out_t
+        .join()
+        .map_err(|_| "config stream reader panicked".to_string())??;
+    let stderr = err_t.join().unwrap_or_default();
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    };
+    if code != 0 {
+        return Err(format!(
+            "ctr content get {digest} exited {code}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(parsed)
 }
 
 fn get_ctr_content_blob(
@@ -5323,6 +5454,42 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             ),
             SyncAction::MirrorRewrite
         );
+
+        // Baseline alias `linux/arm64/v8.0` + `linux/amd64`: containerd's
+        // `DefaultStrict()` normalizes `v8.0` to baseline `arm64`, so a
+        // complete native probe must select `MirrorNative` instead of rewriting.
+        let v80_and_amd64 = ctr_img("sha256:v80", "linux/arm64/v8.0,linux/amd64", &[]);
+        assert!(needs_native_probe(
+            "app:v80",
+            &v80_and_amd64,
+            None,
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+        let ok_present: Result<NativeAvailability, String> = Ok(NativeAvailability::Present);
+        let native_v80 = classify_native_availability(
+            "app:v80",
+            &v80_and_amd64,
+            None,
+            Some(&ok_present),
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(native_v80, NativeAvailability::Present);
+        assert_eq!(
+            plan_sync_action(
+                "app:v80",
+                &v80_and_amd64,
+                None,
+                native_v80,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
+        );
     }
 
     /// Regression test: `MobyContentStore` queries authoritative sizes lazily
@@ -5476,6 +5643,13 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                     .cloned()
                     .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
             },
+            |digest: &str| {
+                payloads
+                    .get(digest)
+                    .map(|b| oci_rewrite::parse_config_platform_reader(b.as_slice()))
+                    .transpose()
+                    .map(Option::flatten)
+            },
         );
 
         let oci_rewrite::PrepareRewrite::Ready(plan) =
@@ -5518,6 +5692,13 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                     .cloned()
                     .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
             },
+            |digest: &str| {
+                payloads
+                    .get(digest)
+                    .map(|b| oci_rewrite::parse_config_platform_reader(b.as_slice()))
+                    .transpose()
+                    .map(Option::flatten)
+            },
         );
         let oci_rewrite::PrepareRewrite::Ready(small_plan) =
             oci_rewrite::prepare_rewrite_from_store(&manifest_d, "arm64", &mut small_store)
@@ -5540,6 +5721,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 fail_batch: false,
             },
             |_digest: &str, _max: usize| unreachable!(),
+            |_digest: &str| unreachable!(),
         );
         let err = oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_single_store)
             .unwrap_err();
@@ -5560,6 +5742,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                     .cloned()
                     .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
             },
+            |_digest: &str| unreachable!(),
         );
         let err = oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_batch_store)
             .unwrap_err();
