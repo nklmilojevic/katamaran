@@ -280,8 +280,8 @@ fn run_ok(cmd: &mut Command, what: &str) -> String {
 }
 
 /// Regression test for single-manifest `linux/amd64` Docker-to-CRI mirroring:
-/// `ctr images check` reports `complete` for single-manifest amd64 images even
-/// on arm64, so `kat k8s sync-images` must still rewrite the config platform.
+/// `kat k8s sync-images` must publish the emulated rewrite (config platform
+/// `arm64`, unchanged layers) for a local amd64 image with no native variant.
 /// Running the pod with `imagePullPolicy=Never` guarantees kubelet resolves the
 /// synced tag locally through CRI (failing with `ErrImageNeverPull` if sync
 /// took the unchanged native path) and executes the x86-64 binary under emulation.
