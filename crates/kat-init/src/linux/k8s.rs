@@ -4823,6 +4823,8 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     /// Run against a real k3s data directory (for example one copied from
     /// `rancher/k3s:v1.37.2-k3s1` or a pre-tracking katamaran guest):
     /// `KAT_REAL_K3S_DATA=<data dir> KAT_REAL_K3S_VERSION=v1.37.2+k3s1 cargo test -- --ignored real_k3s`
+    /// Verified against a `rancher/k3s:v1.37.2-k3s1` datastore whose node record
+    /// lived only in an uncheckpointed `state.db-wal` (`k8s\0` protobuf envelope).
     #[test]
     #[ignore = "needs KAT_REAL_K3S_DATA and KAT_REAL_K3S_VERSION"]
     fn detects_version_from_real_k3s_datastore() {
