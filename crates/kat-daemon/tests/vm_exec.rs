@@ -912,3 +912,164 @@ fn merged_stdout_and_stderr_preserve_order_in_subprocess() {
     server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Exercise the real `katamaran vm exec` binary inside a controlling PTY where
+/// stdout is attached directly to the PTY slave and stderr is opened via
+/// `/dev/tty` (different `st_rdev`, same underlying terminal), verifying exact
+/// guest stdout/stderr frame ordering.
+#[test]
+fn direct_pty_stdout_and_dev_tty_stderr_preserve_order_in_subprocess() {
+    use kat_proto::vm_exec::{self, VmExecMsg};
+    use std::os::unix::net::UnixListener;
+
+    let dir = PathBuf::from(format!("/tmp/kve-devtty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run_dir = dir.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let sock = run_dir.join("vm-exec.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let mut expected = Vec::new();
+    let mut frames = Vec::new();
+    for i in 0..80u32 {
+        let o = format!("OUT-{i:03}\n");
+        let e = format!("ERR-{i:03}\n");
+        expected.extend_from_slice(o.as_bytes());
+        expected.extend_from_slice(e.as_bytes());
+        frames.push(VmExecMsg::Stdout(o.into_bytes()));
+        frames.push(VmExecMsg::Stderr(e.into_bytes()));
+    }
+
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        assert_eq!(vm_exec::read(&mut conn).unwrap(), Some(VmExecMsg::Ping));
+        vm_exec::write(&mut conn, &VmExecMsg::Pong).unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut conn).unwrap(),
+            Some(VmExecMsg::Exec(_))
+        ));
+        vm_exec::write(&mut conn, &VmExecMsg::Started { token: [3; 16] }).unwrap();
+        for f in frames {
+            vm_exec::write(&mut conn, &f).unwrap();
+        }
+        vm_exec::write(&mut conn, &VmExecMsg::Exit { code: 0 }).unwrap();
+    });
+
+    let (mut master_raw, mut slave_raw) = (0, 0);
+    let mut ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_raw,
+                &mut slave_raw,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut ws,
+            )
+        },
+        0
+    );
+    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+    unsafe {
+        // Keep `master` out of the child so EOF arrives as soon as the child
+        // and its output relay helper close the slave side.
+        assert_eq!(
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC),
+            0
+        );
+        // Disable output post-processing so `\n` is not translated to `\r\n`.
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut t), 0);
+        t.c_oflag &= !libc::OPOST;
+        t.c_lflag &= !libc::ECHO;
+        assert_eq!(libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &t), 0);
+    }
+    let slave_fd = slave.as_raw_fd();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_katamaran"));
+    cmd.args(["vm", "exec", "--", "true"])
+        .env("KATAMARAN_HOME", &dir)
+        .stdin(Stdio::null());
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let tty_fd = libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY);
+            if tty_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Confirm direct slave and `/dev/tty` genuinely have different
+            // `st_rdev` on this host while writing to the same PTY.
+            let mut st_slave: libc::stat = std::mem::zeroed();
+            let mut st_tty: libc::stat = std::mem::zeroed();
+            if libc::fstat(slave_fd, &mut st_slave) != 0
+                || libc::fstat(tty_fd, &mut st_tty) != 0
+                || st_slave.st_rdev == st_tty.st_rdev
+            {
+                return Err(io::Error::other(
+                    "expected distinct st_rdev for direct PTY slave and /dev/tty",
+                ));
+            }
+            if libc::dup2(slave_fd, 1) < 0 || libc::dup2(tty_fd, 2) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if tty_fd > 2 {
+                libc::close(tty_fd);
+            }
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            Ok(())
+        });
+    }
+    let mut child = ChildGuard::new(cmd.spawn().expect("spawn katamaran vm exec"));
+    drop(cmd);
+    drop(slave);
+
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n =
+                unsafe { libc::read(master.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n > 0 {
+                buf.extend_from_slice(&chunk[..n as usize]);
+            } else if n == 0 {
+                break;
+            } else {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "katamaran vm exec did not exit promptly"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "expected exit 0, got {status}");
+    assert_eq!(reader.join().unwrap(), expected);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

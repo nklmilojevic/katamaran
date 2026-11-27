@@ -2,6 +2,7 @@
 //! the Linux VM's own namespaces (not an LXC machine), relayed over
 //! `<home>/run/vm-exec.sock` (see [`kat_proto::vm_exec`]).
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 #[cfg(test)]
 use std::io::Write;
@@ -647,8 +648,10 @@ impl Drop for HelperProc {
 
 /// Returns `true` only when `fstat` proves `a` and `b` refer to distinct
 /// underlying destinations (different file types, different device numbers for
-/// char/block devices, or distinct nonzero `(st_dev, st_ino)` pairs for pipes
-/// and files). Returns `false` conservatively for identical, dup'd, or
+/// block devices, or distinct nonzero `(st_dev, st_ino)` pairs for pipes and
+/// files). Returns `false` conservatively for identical, dup'd, character-
+/// device pairs (such as a direct PTY slave paired with `/dev/tty`, which
+/// alias the same controlling terminal despite different `st_rdev`), or
 /// ambiguous descriptors (such as sockets reporting `st_ino == 0`).
 fn provably_distinct_fds(a: RawFd, b: RawFd) -> bool {
     if a < 0 || b < 0 || a == b {
@@ -664,7 +667,14 @@ fn provably_distinct_fds(a: RawFd, b: RawFd) -> bool {
     if fa != fb {
         return true;
     }
-    if fa == libc::S_IFCHR || fa == libc::S_IFBLK {
+    if fa == libc::S_IFCHR {
+        // Two character devices can alias the same controlling terminal (e.g.
+        // direct PTY slave + `/dev/tty`, where XNU `cttywrite` forwards to the
+        // controlling terminal despite different `st_rdev`). Keep one ordered
+        // relay conservatively.
+        return false;
+    }
+    if fa == libc::S_IFBLK {
         return sa.st_rdev != sb.st_rdev;
     }
     // On macOS, pipes and files carry unique nonzero st_ino; sockets may
@@ -783,7 +793,6 @@ impl OutputRelay {
         &self,
         data: &[u8],
         term_wake_r: Option<RawFd>,
-        peer_status_r: Option<RawFd>,
     ) -> io::Result<WriteOutcome> {
         let fd = self
             .cmd_w
@@ -801,9 +810,6 @@ impl OutputRelay {
                     None | Some(libc::EPIPE) => Ok(WriteOutcome::BrokenPipe),
                     Some(errno) => Err(io::Error::from_raw_os_error(errno)),
                 };
-            }
-            if peer_status_r.is_some_and(fd_ready) {
-                return Ok(WriteOutcome::PeerFailed);
             }
             let rc =
                 unsafe { libc::write(fd, data[offset..].as_ptr().cast(), data.len() - offset) };
@@ -836,38 +842,13 @@ impl OutputRelay {
                             revents: 0,
                         },
                         libc::pollfd {
-                            fd: -1,
-                            events: 0,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: -1,
-                            events: 0,
+                            fd: term_wake_r.unwrap_or(-1),
+                            events: libc::POLLIN,
                             revents: 0,
                         },
                     ];
-                    let mut nfds = 2usize;
-                    let term_idx = term_wake_r.map(|tfd| {
-                        let i = nfds;
-                        pfds[i] = libc::pollfd {
-                            fd: tfd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        nfds += 1;
-                        i
-                    });
-                    let peer_idx = peer_status_r.map(|pfd| {
-                        let i = nfds;
-                        pfds[i] = libc::pollfd {
-                            fd: pfd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        nfds += 1;
-                        i
-                    });
-                    let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
+                    let nfds = if term_wake_r.is_some() { 3 } else { 2 };
+                    let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
                     if prc < 0 {
                         let pe = io::Error::last_os_error();
                         if pe.kind() == io::ErrorKind::Interrupted {
@@ -875,9 +856,7 @@ impl OutputRelay {
                         }
                         return Err(pe);
                     }
-                    if let Some(i) = term_idx
-                        && pfds[i].revents != 0
-                    {
+                    if nfds == 3 && pfds[2].revents != 0 {
                         return Ok(WriteOutcome::Cancelled);
                     }
                     if pfds[1].revents != 0 {
@@ -885,11 +864,6 @@ impl OutputRelay {
                             None | Some(libc::EPIPE) => Ok(WriteOutcome::BrokenPipe),
                             Some(errno) => Err(io::Error::from_raw_os_error(errno)),
                         };
-                    }
-                    if let Some(i) = peer_idx
-                        && pfds[i].revents != 0
-                    {
-                        return Ok(WriteOutcome::PeerFailed);
                     }
                     if (pfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
                         && (pfds[0].revents & libc::POLLOUT) == 0
@@ -911,15 +885,14 @@ impl OutputRelay {
         dest: u8,
         data: &[u8],
         term_wake_r: Option<RawFd>,
-        peer_status_r: Option<RawFd>,
     ) -> io::Result<WriteOutcome> {
         if data.is_empty() {
             return Ok(WriteOutcome::Written);
         }
         let len_bytes = (data.len() as u32).to_le_bytes();
         let hdr = [dest, len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]];
-        match self.write_slice_cancellable(&hdr, term_wake_r, peer_status_r)? {
-            WriteOutcome::Written => self.write_slice_cancellable(data, term_wake_r, peer_status_r),
+        match self.write_slice_cancellable(&hdr, term_wake_r)? {
+            WriteOutcome::Written => self.write_slice_cancellable(data, term_wake_r),
             other => Ok(other),
         }
     }
@@ -971,19 +944,226 @@ impl Drop for OutputRelay {
     }
 }
 
+/// Maximum bytes buffered per stream on the host when a split output relay's
+/// command pipe is full, keeping the independent peer stream (e.g. stderr
+/// while stdout is blocked) moving without unbounded host memory growth.
+const SPLIT_STREAM_QUEUE_CAP: usize = 2 << 20;
+
+#[derive(Default)]
+struct PendingBytes {
+    chunks: VecDeque<Vec<u8>>,
+    head_off: usize,
+    bytes: usize,
+}
+
+impl PendingBytes {
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.bytes >= SPLIT_STREAM_QUEUE_CAP
+    }
+
+    fn push(&mut self, data: Vec<u8>) {
+        if !data.is_empty() {
+            self.bytes += data.len();
+            self.chunks.push_back(data);
+        }
+    }
+
+    fn front(&self) -> Option<&[u8]> {
+        self.chunks.front().map(|v| &v[self.head_off..])
+    }
+
+    fn advance(&mut self, n: usize) {
+        self.head_off += n;
+        self.bytes = self.bytes.saturating_sub(n);
+        if let Some(front) = self.chunks.front()
+            && self.head_off >= front.len()
+        {
+            self.chunks.pop_front();
+            self.head_off = 0;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.head_off = 0;
+        self.bytes = 0;
+    }
+}
+
+enum FlushOutcome {
+    Ok,
+    BrokenPipe,
+    Error(io::Error),
+}
+
+fn flush_nonblock_fd(fd: RawFd, pending: &mut PendingBytes) -> FlushOutcome {
+    while let Some(slice) = pending.front() {
+        let rc = unsafe { libc::write(fd, slice.as_ptr().cast(), slice.len()) };
+        if rc > 0 {
+            pending.advance(rc as usize);
+            continue;
+        }
+        if rc == 0 {
+            return FlushOutcome::BrokenPipe;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => return FlushOutcome::Ok,
+            io::ErrorKind::BrokenPipe => return FlushOutcome::BrokenPipe,
+            _ => return FlushOutcome::Error(e),
+        }
+    }
+    FlushOutcome::Ok
+}
+
+/// One independent stream (stdout or stderr) inside [`OutputRelays::Split`].
+enum SplitChannel {
+    Relay {
+        relay: OutputRelay,
+        dest: u8,
+        pending: PendingBytes,
+    },
+    Direct {
+        fd: RawFd,
+        pending: PendingBytes,
+    },
+}
+
+impl SplitChannel {
+    fn status_fd(&self) -> Option<RawFd> {
+        match self {
+            Self::Relay { relay, .. } => Some(relay.status_fd()),
+            Self::Direct { .. } => None,
+        }
+    }
+
+    fn write_poll_fd(&self) -> Option<RawFd> {
+        match self {
+            Self::Relay { relay, pending, .. } if !pending.is_empty() => {
+                relay.cmd_w.as_ref().map(AsRawFd::as_raw_fd)
+            }
+            Self::Direct { fd, pending } if !pending.is_empty() && *fd >= 0 => Some(*fd),
+            _ => None,
+        }
+    }
+
+    fn is_queue_full(&self) -> bool {
+        match self {
+            Self::Relay { pending, .. } | Self::Direct { pending, .. } => pending.is_full(),
+        }
+    }
+
+    fn try_flush(&mut self) -> FlushOutcome {
+        match self {
+            Self::Relay { relay, pending, .. } => {
+                if pending.is_empty() {
+                    return FlushOutcome::Ok;
+                }
+                let Some(fd) = relay.cmd_w.as_ref().map(AsRawFd::as_raw_fd) else {
+                    return FlushOutcome::BrokenPipe;
+                };
+                match flush_nonblock_fd(fd, pending) {
+                    FlushOutcome::BrokenPipe => match relay.read_status_errno() {
+                        None | Some(libc::EPIPE) => FlushOutcome::BrokenPipe,
+                        Some(errno) => FlushOutcome::Error(io::Error::from_raw_os_error(errno)),
+                    },
+                    other => other,
+                }
+            }
+            Self::Direct { fd, pending } => {
+                if pending.is_empty() {
+                    return FlushOutcome::Ok;
+                }
+                flush_nonblock_fd(*fd, pending)
+            }
+        }
+    }
+
+    fn enqueue_and_flush(&mut self, data: Vec<u8>) -> FlushOutcome {
+        if data.is_empty() {
+            return FlushOutcome::Ok;
+        }
+        match self {
+            Self::Relay { dest, pending, .. } => {
+                let mut frame = Vec::with_capacity(5 + data.len());
+                frame.push(*dest);
+                frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&data);
+                pending.push(frame);
+            }
+            Self::Direct { pending, .. } => {
+                pending.push(data);
+            }
+        }
+        self.try_flush()
+    }
+
+    /// Close `cmd_w` once all host-queued bytes have been pushed into the
+    /// helper pipe. Returns `true` when this channel has no helper left to
+    /// wait on (i.e. an idle `Direct` channel).
+    fn close_if_idle(&mut self) -> bool {
+        match self {
+            Self::Relay { relay, pending, .. } => {
+                if pending.is_empty() {
+                    relay.cmd_w.take();
+                }
+                false
+            }
+            Self::Direct { pending, .. } => pending.is_empty(),
+        }
+    }
+
+    fn collect_finished(&mut self) -> RelayFinish {
+        match self {
+            Self::Relay { relay, pending, .. } => {
+                let res = relay.collect_finished();
+                if matches!(res, RelayFinish::Drained) && !pending.is_empty() {
+                    RelayFinish::BrokenPipe
+                } else {
+                    res
+                }
+            }
+            Self::Direct { .. } => RelayFinish::Drained,
+        }
+    }
+
+    fn classify_active_failure(&self) -> RelayOutcome {
+        match self {
+            Self::Relay { relay, .. } => relay.classify_active_failure(),
+            Self::Direct { .. } => RelayOutcome::LocalBrokenPipe,
+        }
+    }
+
+    fn abort(&mut self) {
+        match self {
+            Self::Relay { relay, pending, .. } => {
+                pending.clear();
+                relay.abort();
+            }
+            Self::Direct { pending, .. } => pending.clear(),
+        }
+    }
+}
+
 /// Manages blocking output relay helpers for stdout and stderr:
 /// - Uses ONE shared ordered FIFO helper when stdout and stderr share a
-///   destination (e.g. `2>&1`, same TTY, or ambiguous `fstat` identity),
-///   preserving exact guest frame order.
-/// - Uses TWO independent helpers when stdout and stderr are provably distinct
-///   (e.g. separate pipes with distinct `fstat` device/inode pairs, or pipe +
-///   TTY) so a full stdout pipe never head-of-line blocks stderr.
+///   destination (e.g. `2>&1`, same TTY, `/dev/tty` alias, or ambiguous
+///   `fstat` identity), preserving exact guest frame order.
+/// - Uses TWO independent nonblocking channels when stdout and stderr are
+///   provably distinct (e.g. separate pipes with distinct nonzero `fstat`
+///   device/inode pairs, or pipe + TTY) so a full stdout pipe (and even a full
+///   stdout relay command pipe) never blocks reading or delivering stderr.
 enum OutputRelays {
     None,
     Shared(OutputRelay),
     Split {
-        out: Option<OutputRelay>,
-        err: Option<OutputRelay>,
+        out: SplitChannel,
+        err: SplitChannel,
     },
 }
 
@@ -993,164 +1173,34 @@ impl OutputRelays {
             && provably_distinct_fds(o, e)
         {
             let out = if needs_blocking_relay(o) {
-                Some(OutputRelay::spawn(Some(o), None)?)
+                SplitChannel::Relay {
+                    relay: OutputRelay::spawn(Some(o), None)?,
+                    dest: RELAY_DEST_STDOUT,
+                    pending: PendingBytes::default(),
+                }
             } else {
-                None
+                SplitChannel::Direct {
+                    fd: o,
+                    pending: PendingBytes::default(),
+                }
             };
             let err = if needs_blocking_relay(e) {
-                Some(OutputRelay::spawn(None, Some(e))?)
+                SplitChannel::Relay {
+                    relay: OutputRelay::spawn(None, Some(e))?,
+                    dest: RELAY_DEST_STDERR,
+                    pending: PendingBytes::default(),
+                }
             } else {
-                None
+                SplitChannel::Direct {
+                    fd: e,
+                    pending: PendingBytes::default(),
+                }
             };
-            return if out.is_none() && err.is_none() {
-                Ok(Self::None)
-            } else {
-                Ok(Self::Split { out, err })
-            };
+            return Ok(Self::Split { out, err });
         }
         match OutputRelay::maybe_spawn(out_fd, err_fd)? {
             Some(r) => Ok(Self::Shared(r)),
             None => Ok(Self::None),
-        }
-    }
-
-    fn status_fds(&self) -> [Option<RawFd>; 2] {
-        match self {
-            Self::None => [None, None],
-            Self::Shared(r) => [Some(r.status_fd()), None],
-            Self::Split { out, err } => [
-                out.as_ref().map(OutputRelay::status_fd),
-                err.as_ref().map(OutputRelay::status_fd),
-            ],
-        }
-    }
-
-    fn classify_active_failure(&self, idx: usize) -> RelayOutcome {
-        match (self, idx) {
-            (Self::Shared(r), _) => r.classify_active_failure(),
-            (Self::Split { out: Some(r), .. }, 0) => r.classify_active_failure(),
-            (Self::Split { err: Some(r), .. }, 1) => r.classify_active_failure(),
-            _ => RelayOutcome::LocalBrokenPipe,
-        }
-    }
-
-    fn write_stdout(
-        &self,
-        data: &[u8],
-        fallback: &mut OutputSink<'_>,
-        term_wake_r: Option<RawFd>,
-    ) -> RelayOutcomeOrContinue {
-        match self {
-            Self::Shared(r) if r.handles_out => {
-                match r.write_frame_cancellable(RELAY_DEST_STDOUT, data, term_wake_r, None) {
-                    Ok(WriteOutcome::Written) => RelayOutcomeOrContinue::Continue,
-                    Ok(WriteOutcome::BrokenPipe) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::LocalBrokenPipe)
-                    }
-                    Ok(WriteOutcome::Cancelled) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::Cancelled)
-                    }
-                    Ok(WriteOutcome::PeerFailed) => {
-                        RelayOutcomeOrContinue::Stop(r.classify_active_failure())
-                    }
-                    Err(e) => RelayOutcomeOrContinue::Stop(RelayOutcome::LocalError(e)),
-                }
-            }
-            Self::Split { out: Some(r), err } => {
-                let peer_status = err.as_ref().map(OutputRelay::status_fd);
-                match r.write_frame_cancellable(RELAY_DEST_STDOUT, data, term_wake_r, peer_status) {
-                    Ok(WriteOutcome::Written) => RelayOutcomeOrContinue::Continue,
-                    Ok(WriteOutcome::BrokenPipe) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::LocalBrokenPipe)
-                    }
-                    Ok(WriteOutcome::Cancelled) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::Cancelled)
-                    }
-                    Ok(WriteOutcome::PeerFailed) => {
-                        RelayOutcomeOrContinue::Stop(self.classify_active_failure(1))
-                    }
-                    Err(e) => RelayOutcomeOrContinue::Stop(RelayOutcome::LocalError(e)),
-                }
-            }
-            _ => {
-                let peer_status = match self {
-                    Self::Split { err: Some(r), .. } => Some(r.status_fd()),
-                    _ => None,
-                };
-                match write_cancellable(fallback, data, term_wake_r, peer_status) {
-                    Ok(WriteOutcome::Written) => RelayOutcomeOrContinue::Continue,
-                    Ok(WriteOutcome::BrokenPipe) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::LocalBrokenPipe)
-                    }
-                    Ok(WriteOutcome::Cancelled) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::Cancelled)
-                    }
-                    Ok(WriteOutcome::PeerFailed) => {
-                        RelayOutcomeOrContinue::Stop(self.classify_active_failure(1))
-                    }
-                    Err(e) => RelayOutcomeOrContinue::Stop(RelayOutcome::LocalError(e)),
-                }
-            }
-        }
-    }
-
-    fn write_stderr(
-        &self,
-        data: &[u8],
-        fallback: &mut OutputSink<'_>,
-        term_wake_r: Option<RawFd>,
-    ) -> RelayOutcomeOrContinue {
-        match self {
-            Self::Shared(r) if r.handles_err => {
-                match r.write_frame_cancellable(RELAY_DEST_STDERR, data, term_wake_r, None) {
-                    Ok(WriteOutcome::Written) => RelayOutcomeOrContinue::Continue,
-                    Ok(WriteOutcome::BrokenPipe) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::LocalBrokenPipe)
-                    }
-                    Ok(WriteOutcome::Cancelled) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::Cancelled)
-                    }
-                    Ok(WriteOutcome::PeerFailed) => {
-                        RelayOutcomeOrContinue::Stop(r.classify_active_failure())
-                    }
-                    Err(e) => RelayOutcomeOrContinue::Stop(RelayOutcome::LocalError(e)),
-                }
-            }
-            Self::Split { out, err: Some(r) } => {
-                let peer_status = out.as_ref().map(OutputRelay::status_fd);
-                match r.write_frame_cancellable(RELAY_DEST_STDERR, data, term_wake_r, peer_status) {
-                    Ok(WriteOutcome::Written) => RelayOutcomeOrContinue::Continue,
-                    Ok(WriteOutcome::BrokenPipe) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::LocalBrokenPipe)
-                    }
-                    Ok(WriteOutcome::Cancelled) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::Cancelled)
-                    }
-                    Ok(WriteOutcome::PeerFailed) => {
-                        RelayOutcomeOrContinue::Stop(self.classify_active_failure(0))
-                    }
-                    Err(e) => RelayOutcomeOrContinue::Stop(RelayOutcome::LocalError(e)),
-                }
-            }
-            _ => {
-                let peer_status = match self {
-                    Self::Split { out: Some(r), .. } => Some(r.status_fd()),
-                    _ => None,
-                };
-                match write_cancellable(fallback, data, term_wake_r, peer_status) {
-                    Ok(WriteOutcome::Written) => RelayOutcomeOrContinue::Continue,
-                    Ok(WriteOutcome::BrokenPipe) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::LocalBrokenPipe)
-                    }
-                    Ok(WriteOutcome::Cancelled) => {
-                        RelayOutcomeOrContinue::Stop(RelayOutcome::Cancelled)
-                    }
-                    Ok(WriteOutcome::PeerFailed) => {
-                        RelayOutcomeOrContinue::Stop(self.classify_active_failure(0))
-                    }
-                    Err(e) => RelayOutcomeOrContinue::Stop(RelayOutcome::LocalError(e)),
-                }
-            }
         }
     }
 
@@ -1159,99 +1209,148 @@ impl OutputRelays {
             Self::None => RelayFinish::Drained,
             Self::Shared(r) => r.finish(term_wake_r),
             Self::Split { out, err } => {
-                // Close BOTH command pipes upfront so stdout and stderr drain
-                // concurrently even if downstream reads one stream to EOF
-                // before reading the other.
-                if let Some(r) = out.as_mut() {
-                    r.cmd_w.take();
-                }
-                if let Some(r) = err.as_mut() {
-                    r.cmd_w.take();
-                }
-                let mut out_done = out.is_none();
-                let mut err_done = err.is_none();
-                let mut combined = RelayFinish::Drained;
-                let merge = |cur: &mut RelayFinish, next: RelayFinish| match (&*cur, next) {
-                    (_, RelayFinish::Drained) => {}
-                    (_, RelayFinish::Cancelled) => *cur = RelayFinish::Cancelled,
-                    (RelayFinish::Error(_), _) => {}
-                    (_, RelayFinish::Error(e)) => *cur = RelayFinish::Error(e),
-                    (RelayFinish::Drained, RelayFinish::BrokenPipe) => {
-                        *cur = RelayFinish::BrokenPipe;
+                let mut out_done = false;
+                let mut err_done = false;
+                loop {
+                    // Flush any host-queued frames and close `cmd_w` as soon as
+                    // each channel's host queue empties so both helpers drain
+                    // concurrently. On any write failure, abort both channels
+                    // immediately so an unread peer pipe never hangs teardown.
+                    if !out_done {
+                        match out.try_flush() {
+                            FlushOutcome::Ok => {
+                                if out.close_if_idle() {
+                                    out_done = true;
+                                }
+                            }
+                            FlushOutcome::BrokenPipe => {
+                                self.abort();
+                                return RelayFinish::BrokenPipe;
+                            }
+                            FlushOutcome::Error(e) => {
+                                self.abort();
+                                return RelayFinish::Error(e);
+                            }
+                        }
                     }
-                    _ => {}
-                };
-                while !out_done || !err_done {
-                    let mut pfds = [
-                        libc::pollfd {
-                            fd: term_wake_r,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: -1,
-                            events: 0,
-                            revents: 0,
-                        },
-                        libc::pollfd {
-                            fd: -1,
-                            events: 0,
-                            revents: 0,
-                        },
-                    ];
-                    let mut nfds = 1usize;
-                    let out_idx = if !out_done {
+                    if !err_done {
+                        match err.try_flush() {
+                            FlushOutcome::Ok => {
+                                if err.close_if_idle() {
+                                    err_done = true;
+                                }
+                            }
+                            FlushOutcome::BrokenPipe => {
+                                self.abort();
+                                return RelayFinish::BrokenPipe;
+                            }
+                            FlushOutcome::Error(e) => {
+                                self.abort();
+                                return RelayFinish::Error(e);
+                            }
+                        }
+                    }
+                    if out_done && err_done {
+                        return RelayFinish::Drained;
+                    }
+
+                    let mut pfds = [libc::pollfd {
+                        fd: -1,
+                        events: 0,
+                        revents: 0,
+                    }; 5];
+                    let mut nfds = 0usize;
+                    let mut push_pfd = |fd: RawFd, events: libc::c_short| -> usize {
                         let i = nfds;
                         pfds[i] = libc::pollfd {
-                            fd: out.as_ref().unwrap().status_fd(),
-                            events: libc::POLLIN,
+                            fd,
+                            events,
                             revents: 0,
                         };
                         nfds += 1;
-                        Some(i)
+                        i
+                    };
+                    let term_idx = push_pfd(term_wake_r, libc::POLLIN);
+                    let out_status_idx = if !out_done {
+                        out.status_fd().map(|fd| push_pfd(fd, libc::POLLIN))
                     } else {
                         None
                     };
-                    let err_idx = if !err_done {
-                        let i = nfds;
-                        pfds[i] = libc::pollfd {
-                            fd: err.as_ref().unwrap().status_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        nfds += 1;
-                        Some(i)
+                    let err_status_idx = if !err_done {
+                        err.status_fd().map(|fd| push_pfd(fd, libc::POLLIN))
                     } else {
                         None
                     };
+                    let out_write_idx = if !out_done {
+                        out.write_poll_fd().map(|fd| push_pfd(fd, libc::POLLOUT))
+                    } else {
+                        None
+                    };
+                    let err_write_idx = if !err_done {
+                        err.write_poll_fd().map(|fd| push_pfd(fd, libc::POLLOUT))
+                    } else {
+                        None
+                    };
+
                     let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
                     if rc < 0 {
                         if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                             continue;
                         }
                         self.abort();
-                        return combined;
+                        return RelayFinish::Drained;
                     }
-                    if pfds[0].revents != 0 {
+                    if pfds[term_idx].revents != 0 {
                         self.abort();
                         return RelayFinish::Cancelled;
                     }
-                    if let Some(i) = out_idx
+                    if let Some(i) = out_status_idx
                         && pfds[i].revents != 0
                     {
-                        let res = out.as_mut().unwrap().collect_finished();
-                        merge(&mut combined, res);
-                        out_done = true;
+                        match out.collect_finished() {
+                            RelayFinish::Drained => out_done = true,
+                            failure => {
+                                self.abort();
+                                return failure;
+                            }
+                        }
                     }
-                    if let Some(i) = err_idx
+                    if let Some(i) = err_status_idx
                         && pfds[i].revents != 0
                     {
-                        let res = err.as_mut().unwrap().collect_finished();
-                        merge(&mut combined, res);
-                        err_done = true;
+                        match err.collect_finished() {
+                            RelayFinish::Drained => err_done = true,
+                            failure => {
+                                self.abort();
+                                return failure;
+                            }
+                        }
+                    }
+                    if !out_done
+                        && let Some(i) = out_write_idx
+                        && (pfds[i].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                        && (pfds[i].revents & libc::POLLOUT) == 0
+                    {
+                        let failure = match out.try_flush() {
+                            FlushOutcome::Ok | FlushOutcome::BrokenPipe => RelayFinish::BrokenPipe,
+                            FlushOutcome::Error(e) => RelayFinish::Error(e),
+                        };
+                        self.abort();
+                        return failure;
+                    }
+                    if !err_done
+                        && let Some(i) = err_write_idx
+                        && (pfds[i].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                        && (pfds[i].revents & libc::POLLOUT) == 0
+                    {
+                        let failure = match err.try_flush() {
+                            FlushOutcome::Ok | FlushOutcome::BrokenPipe => RelayFinish::BrokenPipe,
+                            FlushOutcome::Error(e) => RelayFinish::Error(e),
+                        };
+                        self.abort();
+                        return failure;
                     }
                 }
-                combined
             }
         }
     }
@@ -1261,20 +1360,11 @@ impl OutputRelays {
             Self::None => {}
             Self::Shared(r) => r.abort(),
             Self::Split { out, err } => {
-                if let Some(r) = out.as_mut() {
-                    r.abort();
-                }
-                if let Some(r) = err.as_mut() {
-                    r.abort();
-                }
+                out.abort();
+                err.abort();
             }
         }
     }
-}
-
-enum RelayOutcomeOrContinue {
-    Continue,
-    Stop(RelayOutcome),
 }
 
 /// Relays an inherited blocking `stdin_fd` into a private nonblocking pipe via
@@ -2314,14 +2404,12 @@ enum WriteOutcome {
     Written,
     BrokenPipe,
     Cancelled,
-    PeerFailed,
 }
 
 fn write_cancellable(
     sink: &mut OutputSink<'_>,
     data: &[u8],
     term_wake_r: Option<RawFd>,
-    peer_status_r: Option<RawFd>,
 ) -> io::Result<WriteOutcome> {
     if data.is_empty() {
         return Ok(WriteOutcome::Written);
@@ -2341,9 +2429,6 @@ fn write_cancellable(
             while offset < data.len() {
                 if term_wake_r.is_some_and(fd_ready) {
                     return Ok(WriteOutcome::Cancelled);
-                }
-                if peer_status_r.is_some_and(fd_ready) {
-                    return Ok(WriteOutcome::PeerFailed);
                 }
                 let rc =
                     unsafe { libc::write(fd, data[offset..].as_ptr().cast(), data.len() - offset) };
@@ -2366,39 +2451,13 @@ fn write_cancellable(
                                 revents: 0,
                             },
                             libc::pollfd {
-                                fd: -1,
-                                events: 0,
-                                revents: 0,
-                            },
-                            libc::pollfd {
-                                fd: -1,
-                                events: 0,
+                                fd: term_wake_r.unwrap_or(-1),
+                                events: libc::POLLIN,
                                 revents: 0,
                             },
                         ];
-                        let mut nfds = 1usize;
-                        let term_idx = term_wake_r.map(|tfd| {
-                            let i = nfds;
-                            pfds[i] = libc::pollfd {
-                                fd: tfd,
-                                events: libc::POLLIN,
-                                revents: 0,
-                            };
-                            nfds += 1;
-                            i
-                        });
-                        let peer_idx = peer_status_r.map(|pfd| {
-                            let i = nfds;
-                            pfds[i] = libc::pollfd {
-                                fd: pfd,
-                                events: libc::POLLIN,
-                                revents: 0,
-                            };
-                            nfds += 1;
-                            i
-                        });
-                        let prc =
-                            unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
+                        let nfds = if term_wake_r.is_some() { 2 } else { 1 };
+                        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
                         if prc < 0 {
                             let pe = io::Error::last_os_error();
                             if pe.kind() == io::ErrorKind::Interrupted {
@@ -2406,15 +2465,8 @@ fn write_cancellable(
                             }
                             return Err(pe);
                         }
-                        if let Some(i) = term_idx
-                            && pfds[i].revents != 0
-                        {
+                        if nfds == 2 && pfds[1].revents != 0 {
                             return Ok(WriteOutcome::Cancelled);
-                        }
-                        if let Some(i) = peer_idx
-                            && pfds[i].revents != 0
-                        {
-                            return Ok(WriteOutcome::PeerFailed);
                         }
                         if (pfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
                             && (pfds[0].revents & libc::POLLOUT) == 0
@@ -2434,23 +2486,21 @@ enum ReadOutcome {
     Msg(VmExecMsg),
     Eof,
     Cancelled,
-    RelayFailed(usize),
+    RelayFailed,
 }
 
 fn read_frame_cancellable(
     conn: &UnixStream,
     frames: &mut FrameReader,
     term_wake_r: Option<RawFd>,
-    relay_status_rs: [Option<RawFd>; 2],
+    relay_status_r: Option<RawFd>,
 ) -> io::Result<ReadOutcome> {
     loop {
         if term_wake_r.is_some_and(fd_ready) {
             return Ok(ReadOutcome::Cancelled);
         }
-        for (idx, sfd) in relay_status_rs.into_iter().enumerate() {
-            if sfd.is_some_and(fd_ready) {
-                return Ok(ReadOutcome::RelayFailed(idx));
-            }
+        if relay_status_r.is_some_and(fd_ready) {
+            return Ok(ReadOutcome::RelayFailed);
         }
         match frames.poll_frame(conn.as_raw_fd())? {
             PollFrame::Msg(m) => return Ok(ReadOutcome::Msg(m)),
@@ -2461,11 +2511,6 @@ fn read_frame_cancellable(
             libc::pollfd {
                 fd: conn.as_raw_fd(),
                 events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: -1,
-                events: 0,
                 revents: 0,
             },
             libc::pollfd {
@@ -2490,19 +2535,16 @@ fn read_frame_cancellable(
             nfds += 1;
             i
         });
-        let mut relay_idxs: [Option<usize>; 2] = [None, None];
-        for (slot, sfd) in relay_status_rs.into_iter().enumerate() {
-            if let Some(fd) = sfd {
-                let i = nfds;
-                pfds[i] = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                nfds += 1;
-                relay_idxs[slot] = Some(i);
-            }
-        }
+        let relay_idx = relay_status_r.map(|fd| {
+            let i = nfds;
+            pfds[i] = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+            i
+        });
         let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
         if prc < 0 {
             let e = io::Error::last_os_error();
@@ -2516,12 +2558,10 @@ fn read_frame_cancellable(
         {
             return Ok(ReadOutcome::Cancelled);
         }
-        for (slot, idx) in relay_idxs.into_iter().enumerate() {
-            if let Some(i) = idx
-                && pfds[i].revents != 0
-            {
-                return Ok(ReadOutcome::RelayFailed(slot));
-            }
+        if let Some(i) = relay_idx
+            && pfds[i].revents != 0
+        {
+            return Ok(ReadOutcome::RelayFailed);
         }
     }
 }
@@ -2814,7 +2854,7 @@ fn run_session_io(
         conn,
         out,
         err,
-        &output_relays,
+        &mut output_relays,
         Some(term_wake_r.as_raw_fd()),
     );
 
@@ -2871,6 +2911,148 @@ fn run_session_io(
     }
 }
 
+/// Multiplex guest output frames across two independent split channels without
+/// letting a full stdout pipe (or full stdout relay command pipe) block
+/// reading or delivering stderr frames queued behind it.
+fn relay_split_cancellable(
+    conn: UnixStream,
+    out: &mut SplitChannel,
+    err: &mut SplitChannel,
+    term_wake_r: Option<RawFd>,
+) -> RelayOutcome {
+    let mut frames = FrameReader::default();
+    let conn_fd = conn.as_raw_fd();
+    loop {
+        if term_wake_r.is_some_and(fd_ready) {
+            return RelayOutcome::Cancelled;
+        }
+        if out.status_fd().is_some_and(fd_ready) {
+            return out.classify_active_failure();
+        }
+        if err.status_fd().is_some_and(fd_ready) {
+            return err.classify_active_failure();
+        }
+        match out.try_flush() {
+            FlushOutcome::Ok => {}
+            FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+            FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
+        }
+        match err.try_flush() {
+            FlushOutcome::Ok => {}
+            FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+            FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
+        }
+
+        while !out.is_queue_full() && !err.is_queue_full() {
+            if term_wake_r.is_some_and(fd_ready) {
+                return RelayOutcome::Cancelled;
+            }
+            if out.status_fd().is_some_and(fd_ready) {
+                return out.classify_active_failure();
+            }
+            if err.status_fd().is_some_and(fd_ready) {
+                return err.classify_active_failure();
+            }
+            match frames.poll_frame(conn_fd) {
+                Ok(PollFrame::Msg(VmExecMsg::Stdout(d))) => match out.enqueue_and_flush(d) {
+                    FlushOutcome::Ok => {}
+                    FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+                    FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
+                },
+                Ok(PollFrame::Msg(VmExecMsg::Stderr(d))) => match err.enqueue_and_flush(d) {
+                    FlushOutcome::Ok => {}
+                    FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+                    FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
+                },
+                Ok(PollFrame::Msg(VmExecMsg::Exit { code })) => {
+                    return RelayOutcome::GuestExit(code);
+                }
+                Ok(PollFrame::Msg(VmExecMsg::Error(e))) => {
+                    return RelayOutcome::GuestError(anyhow::anyhow!("{e}"));
+                }
+                Ok(PollFrame::Msg(_)) => {}
+                Ok(PollFrame::Eof) => {
+                    return RelayOutcome::GuestError(anyhow::anyhow!(
+                        "the guest closed the connection"
+                    ));
+                }
+                Ok(PollFrame::WouldBlock) => break,
+                Err(e) => return RelayOutcome::GuestError(e.into()),
+            }
+        }
+
+        let mut pfds = [libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; 6];
+        let mut nfds = 0usize;
+        let mut push_pfd = |fd: RawFd, events: libc::c_short| -> usize {
+            let i = nfds;
+            pfds[i] = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            nfds += 1;
+            i
+        };
+
+        if !out.is_queue_full() && !err.is_queue_full() {
+            push_pfd(conn_fd, libc::POLLIN);
+        }
+        let term_idx = term_wake_r.map(|fd| push_pfd(fd, libc::POLLIN));
+        let out_status_idx = out.status_fd().map(|fd| push_pfd(fd, libc::POLLIN));
+        let err_status_idx = err.status_fd().map(|fd| push_pfd(fd, libc::POLLIN));
+        let out_write_idx = out.write_poll_fd().map(|fd| push_pfd(fd, libc::POLLOUT));
+        let err_write_idx = err.write_poll_fd().map(|fd| push_pfd(fd, libc::POLLOUT));
+
+        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
+        if prc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return RelayOutcome::GuestError(e.into());
+        }
+        if let Some(i) = term_idx
+            && pfds[i].revents != 0
+        {
+            return RelayOutcome::Cancelled;
+        }
+        if let Some(i) = out_status_idx
+            && pfds[i].revents != 0
+        {
+            return out.classify_active_failure();
+        }
+        if let Some(i) = err_status_idx
+            && pfds[i].revents != 0
+        {
+            return err.classify_active_failure();
+        }
+        if let Some(i) = out_write_idx
+            && (pfds[i].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+            && (pfds[i].revents & libc::POLLOUT) == 0
+        {
+            match out.try_flush() {
+                FlushOutcome::Ok => return out.classify_active_failure(),
+                FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+                FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
+            }
+        }
+        if let Some(i) = err_write_idx
+            && (pfds[i].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+            && (pfds[i].revents & libc::POLLOUT) == 0
+        {
+            match err.try_flush() {
+                FlushOutcome::Ok => return err.classify_active_failure(),
+                FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+                FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
+            }
+        }
+    }
+}
+
 /// Read output/exit frames from `conn` into `output_relays` (or direct `out` /
 /// `err` sinks), waking immediately on `term_wake_r` or downstream helper
 /// failure (`status_fd`) even if the guest sends no further frames.
@@ -2878,25 +3060,50 @@ fn relay_output_cancellable(
     conn: UnixStream,
     out: &mut OutputSink<'_>,
     err: &mut OutputSink<'_>,
-    output_relays: &OutputRelays,
+    output_relays: &mut OutputRelays,
     term_wake_r: Option<RawFd>,
 ) -> RelayOutcome {
+    if let OutputRelays::Split {
+        out: out_ch,
+        err: err_ch,
+    } = output_relays
+    {
+        return relay_split_cancellable(conn, out_ch, err_ch, term_wake_r);
+    }
     let mut frames = FrameReader::default();
-    let relay_status_rs = output_relays.status_fds();
+    let shared = match output_relays {
+        OutputRelays::Shared(r) => Some(&*r),
+        _ => None,
+    };
+    let relay_status_r = shared.map(OutputRelay::status_fd);
     loop {
-        match read_frame_cancellable(&conn, &mut frames, term_wake_r, relay_status_rs) {
+        match read_frame_cancellable(&conn, &mut frames, term_wake_r, relay_status_r) {
             Ok(ReadOutcome::Msg(VmExecMsg::Stdout(d))) => {
-                if let RelayOutcomeOrContinue::Stop(outcome) =
-                    output_relays.write_stdout(&d, out, term_wake_r)
-                {
-                    return outcome;
+                let res = match shared {
+                    Some(r) if r.handles_out => {
+                        r.write_frame_cancellable(RELAY_DEST_STDOUT, &d, term_wake_r)
+                    }
+                    _ => write_cancellable(out, &d, term_wake_r),
+                };
+                match res {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::BrokenPipe) => return RelayOutcome::LocalBrokenPipe,
+                    Ok(WriteOutcome::Cancelled) => return RelayOutcome::Cancelled,
+                    Err(e) => return RelayOutcome::LocalError(e),
                 }
             }
             Ok(ReadOutcome::Msg(VmExecMsg::Stderr(d))) => {
-                if let RelayOutcomeOrContinue::Stop(outcome) =
-                    output_relays.write_stderr(&d, err, term_wake_r)
-                {
-                    return outcome;
+                let res = match shared {
+                    Some(r) if r.handles_err => {
+                        r.write_frame_cancellable(RELAY_DEST_STDERR, &d, term_wake_r)
+                    }
+                    _ => write_cancellable(err, &d, term_wake_r),
+                };
+                match res {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::BrokenPipe) => return RelayOutcome::LocalBrokenPipe,
+                    Ok(WriteOutcome::Cancelled) => return RelayOutcome::Cancelled,
+                    Err(e) => return RelayOutcome::LocalError(e),
                 }
             }
             Ok(ReadOutcome::Msg(VmExecMsg::Exit { code })) => return RelayOutcome::GuestExit(code),
@@ -2905,8 +3112,11 @@ fn relay_output_cancellable(
             }
             Ok(ReadOutcome::Msg(_)) => {}
             Ok(ReadOutcome::Cancelled) => return RelayOutcome::Cancelled,
-            Ok(ReadOutcome::RelayFailed(idx)) => {
-                return output_relays.classify_active_failure(idx);
+            Ok(ReadOutcome::RelayFailed) => {
+                return shared.map_or(
+                    RelayOutcome::LocalBrokenPipe,
+                    OutputRelay::classify_active_failure,
+                );
             }
             Ok(ReadOutcome::Eof) => {
                 return RelayOutcome::GuestError(anyhow::anyhow!(
@@ -3155,7 +3365,8 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let outcome = relay_output_cancellable(host, &mut out, &mut err, &OutputRelays::None, None);
+        let outcome =
+            relay_output_cancellable(host, &mut out, &mut err, &mut OutputRelays::None, None);
         peer.join().unwrap();
         assert!(matches!(outcome, RelayOutcome::GuestExit(7)));
         assert_eq!(out_buf, b"hello vm\n");
@@ -3170,7 +3381,7 @@ mod tests {
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
         let RelayOutcome::GuestError(e) =
-            relay_output_cancellable(host, &mut out, &mut err, &OutputRelays::None, None)
+            relay_output_cancellable(host, &mut out, &mut err, &mut OutputRelays::None, None)
         else {
             panic!("expected GuestError");
         };
@@ -3179,7 +3390,7 @@ mod tests {
         let (host, guest) = UnixStream::pair().unwrap();
         drop(guest);
         let RelayOutcome::GuestError(e) =
-            relay_output_cancellable(host, &mut out, &mut err, &OutputRelays::None, None)
+            relay_output_cancellable(host, &mut out, &mut err, &mut OutputRelays::None, None)
         else {
             panic!("expected GuestError");
         };
@@ -3477,7 +3688,7 @@ mod tests {
         // `relay_output_cancellable` blocks waiting on the full pipe.
         let guest_flood = thread::spawn(move || {
             let chunk = vec![b'O'; 16 << 10];
-            for _ in 0..32 {
+            loop {
                 if vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).is_err() {
                     return;
                 }
@@ -3827,20 +4038,30 @@ mod tests {
             0
         );
 
-        // Race a rival blocking reader against StdinHelper, then let the guest
-        // exit while stdin_w is still open (so StdinHelper blocks in read(0));
-        // teardown must kill/reap the helper promptly without hanging.
+        // Race a rival blocking reader thread against StdinHelper, then let
+        // the guest exit while stdin_w is still open (so StdinHelper blocks in
+        // read(0)). Running the rival reader on a background thread avoids any
+        // poll-vs-read hang on the main thread if StdinHelper wins the byte;
+        // teardown must kill/reap the helper promptly before `wf` is closed.
+        let rival = thread::spawn(move || {
+            let mut scratch = [0u8; 1];
+            loop {
+                let rc = unsafe { libc::read(dup_r.as_raw_fd(), scratch.as_mut_ptr().cast(), 1) };
+                if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Blocking fd must never surface EAGAIN to a rival reader.
+                assert!(
+                    rc >= 0,
+                    "rival blocking read failed: {}",
+                    io::Error::last_os_error()
+                );
+                return rc;
+            }
+        });
         let mut wf = std::fs::File::from(stdin_w);
         wf.write_all(b"x").unwrap();
-        let mut scratch = [0u8; 1];
-        let mut pfd = libc::pollfd {
-            fd: dup_r.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, 20) } > 0 {
-            let _ = unsafe { libc::read(dup_r.as_raw_fd(), scratch.as_mut_ptr().cast(), 1) };
-        }
+        thread::sleep(Duration::from_millis(20));
 
         let t = Instant::now();
         vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 0 }).unwrap();
@@ -3851,8 +4072,9 @@ mod tests {
             unsafe { libc::fcntl(stdin_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
             0
         );
+        // Closing stdin_w delivers EOF if StdinHelper won the single byte.
         drop(wf);
-        drop(dup_r);
+        let _ = rival.join().unwrap();
         drop(stdin_r);
     }
 
@@ -4019,7 +4241,7 @@ mod tests {
         });
         let guest_flood = thread::spawn(move || {
             let chunk = vec![b'O'; 16 << 10];
-            for _ in 0..32 {
+            loop {
                 if vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).is_err() {
                     return;
                 }
@@ -4088,7 +4310,7 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let guest_flood = thread::spawn(move || {
             let chunk = vec![b'P'; 16 << 10];
-            for _ in 0..32 {
+            loop {
                 if vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).is_err() {
                     return;
                 }
@@ -4576,6 +4798,11 @@ mod tests {
             out_dup.as_raw_fd()
         ));
         drop(out_dup);
+        // Two character devices (e.g. PTY slave vs `/dev/tty`) conservatively
+        // share one ordered relay.
+        let (_m1, s1) = open_test_pty(24, 80);
+        let (_m2, s2) = open_test_pty(24, 80);
+        assert!(!provably_distinct_fds(s1.as_raw_fd(), s2.as_raw_fd()));
 
         let (host, mut guest) = UnixStream::pair().unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -4603,19 +4830,22 @@ mod tests {
 
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        // Fill the downstream stdout pipe (leaving `out_r` completely unread),
-        // queue another small stdout frame behind it, and then emit a stderr
-        // readiness marker. With independent relays, the marker MUST arrive on
-        // `err_r` before a single byte is read from `out_r`.
-        let fill_payload = vec![b'O'; 72 << 10];
+        // Overflow BOTH the downstream stdout pipe AND the stdout relay
+        // helper's command pipe (512 KiB >> 2 * 64 KiB + helper buffer) while
+        // `out_r` stays completely unread, queue another small stdout frame,
+        // and then emit a stderr readiness marker. The marker MUST still be
+        // read from `conn` and arrive on `err_r` before reading `out_r`.
+        let fill_chunk = vec![b'O'; 16 << 10];
+        let fill_chunks = 32usize;
         let tail_payload = b"queued-after-fill\n";
         let marker = b"STDERR_READY\n";
         let (unblock_tx, unblock_rx) = mpsc::channel();
         let guest_bg = {
-            let fill_payload = fill_payload.clone();
+            let fill_chunk = fill_chunk.clone();
             thread::spawn(move || {
-                vm_exec::write(&mut guest, &VmExecMsg::Stdout(fill_payload)).unwrap();
-                thread::sleep(Duration::from_millis(30));
+                for _ in 0..fill_chunks {
+                    vm_exec::write(&mut guest, &VmExecMsg::Stdout(fill_chunk.clone())).unwrap();
+                }
                 vm_exec::write(&mut guest, &VmExecMsg::Stdout(tail_payload.to_vec())).unwrap();
                 vm_exec::write(&mut guest, &VmExecMsg::Stderr(marker.to_vec())).unwrap();
                 unblock_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -4630,7 +4860,7 @@ mod tests {
             let rem = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !rem.is_zero(),
-                "stderr marker blocked behind full stdout pipe (got {:?})",
+                "stderr marker blocked behind full stdout relay queue (got {:?})",
                 String::from_utf8_lossy(&got_err)
             );
             let mut pfd = libc::pollfd {
@@ -4648,7 +4878,8 @@ mod tests {
         }
         assert_eq!(got_err, marker);
 
-        // Now release guest exit and drain stdout.
+        // Now release guest exit and drain stdout (verifying every host-queued
+        // byte flushes cleanly during `OutputRelays::finish`).
         let _ = unblock_tx.send(());
         let out_reader = thread::spawn(move || {
             let mut f = std::fs::File::from(out_r);
@@ -4661,12 +4892,86 @@ mod tests {
         drop(out_w);
         drop(err_w);
         let received_out = out_reader.join().unwrap();
-        assert_eq!(received_out.len(), fill_payload.len() + tail_payload.len());
+        assert_eq!(
+            received_out.len(),
+            fill_chunk.len() * fill_chunks + tail_payload.len()
+        );
         assert!(received_out.ends_with(tail_payload));
         guest_bg.join().unwrap();
         drop(err_r);
         drop(stdin_w);
         drop(stdin_r);
+    }
+
+    #[test]
+    fn split_drain_aborts_blocked_peer_on_epipe_and_preserves_nonzero_exit() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (guest_code, expected) in [(42, 42), (0, 128 + libc::SIGPIPE)] {
+            let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+            let (out_r, out_w) = pipe_cloexec(false).unwrap();
+            let (err_r, err_w) = pipe_cloexec(false).unwrap();
+
+            let (host, mut guest) = UnixStream::pair().unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let stdin_fd = stdin_r.as_raw_fd();
+            let out_fd = out_w.as_raw_fd();
+            let err_fd = err_w.as_raw_fd();
+
+            let session = thread::spawn(move || {
+                let mut out = OutputSink::Fd(out_fd);
+                let mut err = OutputSink::Fd(err_fd);
+                run_session_io(
+                    host,
+                    [0; 16],
+                    no_ctrl,
+                    None,
+                    stdin_fd,
+                    out_fd,
+                    &mut out,
+                    &mut err,
+                    || (24, 80),
+                    SIGINT_DELIVERY_TIMEOUT,
+                    Some(ready_tx),
+                )
+            });
+
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Fill BOTH stdout and stderr beyond pipe+relay capacity while
+            // keeping `err_r` open and unread for the entire test. Send Exit,
+            // wait for host socket shutdown (proving Exit was received and
+            // drain has begun), then close ONLY `out_r`. Split draining must
+            // abort the blocked stderr helper promptly and return `expected`.
+            let guest_bg = thread::spawn(move || {
+                let chunk = vec![b'E'; 16 << 10];
+                for _ in 0..16 {
+                    vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).unwrap();
+                    vm_exec::write(&mut guest, &VmExecMsg::Stderr(chunk.clone())).unwrap();
+                }
+                vm_exec::write(&mut guest, &VmExecMsg::Exit { code: guest_code }).unwrap();
+                let mut ds = DeadlineStream::new(
+                    &mut guest,
+                    Instant::now() + Duration::from_secs(2),
+                    "timed out waiting for host shutdown before drain".into(),
+                );
+                let _ = vm_exec::read(&mut ds);
+                drop(ds);
+                drop(out_r);
+            });
+
+            let t = Instant::now();
+            let exit = session.join().unwrap().unwrap();
+            assert_eq!(exit, SessionExit::Code(expected));
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "split drain hung on unread peer pipe after EPIPE"
+            );
+            guest_bg.join().unwrap();
+            drop(err_r);
+            drop(out_w);
+            drop(err_w);
+            drop(stdin_w);
+            drop(stdin_r);
+        }
     }
 
     #[test]
