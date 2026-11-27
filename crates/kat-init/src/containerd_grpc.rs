@@ -1506,50 +1506,59 @@ impl GrpcConn {
         }
 
         let sid = self.alloc_stream_id();
-        self.send_request_headers(sid, op, namespace, Some(lease))?;
-        let mut state = StreamState::new(
-            sid,
-            self.peer_initial_stream_window,
-            DEFAULT_UNARY_RESPONSE_LIMIT,
-        );
-
-        let mut offset = 0usize;
-        while offset < data.len() && !state.ended {
-            let end = (offset + CONTENT_WRITE_CHUNK).min(data.len());
-            let is_last = end == data.len();
-            let action = if is_last {
-                WRITE_ACTION_COMMIT
-            } else {
-                WRITE_ACTION_WRITE
-            };
-            let req = encode_write_content_request(
-                action,
-                if offset == 0 { write_ref } else { "" },
-                total,
-                if offset == 0 { expected_digest } else { "" },
-                offset as i64,
-                &data[offset..end],
-                if is_last { labels } else { &[] },
+        let res = (|| {
+            self.send_request_headers(sid, op, namespace, Some(lease))?;
+            let mut state = StreamState::new(
+                sid,
+                self.peer_initial_stream_window,
+                DEFAULT_UNARY_RESPONSE_LIMIT,
             );
-            let framed = frame_grpc_message(&req)?;
-            self.send_stream_data(&mut state, &framed, is_last, op)?;
-            self.stream
-                .flush()
-                .map_err(|e| format!("flush h2 Content.Write chunk: {e}"))?;
 
-            if !is_last {
-                // Wait for the server's per-chunk WriteContentResponse (or
-                // early stream termination such as ALREADY_EXISTS) so both
-                // sides stay synchronized under HTTP/2 flow control.
-                let target_msgs = state.messages.len() + 1;
-                while state.messages.len() < target_msgs && !state.ended {
-                    self.read_one_frame(&mut state, op)?;
+            let mut offset = 0usize;
+            while offset < data.len() && !state.ended {
+                let end = (offset + CONTENT_WRITE_CHUNK).min(data.len());
+                let is_last = end == data.len();
+                let action = if is_last {
+                    WRITE_ACTION_COMMIT
+                } else {
+                    WRITE_ACTION_WRITE
+                };
+                let req = encode_write_content_request(
+                    action,
+                    if offset == 0 { write_ref } else { "" },
+                    total,
+                    if offset == 0 { expected_digest } else { "" },
+                    offset as i64,
+                    &data[offset..end],
+                    if is_last { labels } else { &[] },
+                );
+                let framed = frame_grpc_message(&req)?;
+                self.send_stream_data(&mut state, &framed, is_last, op)?;
+                self.stream
+                    .flush()
+                    .map_err(|e| format!("flush h2 Content.Write chunk: {e}"))?;
+
+                if !is_last {
+                    // Wait for the server's per-chunk WriteContentResponse (or
+                    // early stream termination such as ALREADY_EXISTS) so both
+                    // sides stay synchronized under HTTP/2 flow control.
+                    let target_msgs = state.messages.len() + 1;
+                    while state.messages.len() < target_msgs && !state.ended {
+                        self.read_one_frame(&mut state, op)?;
+                    }
                 }
+                offset = end;
             }
-            offset = end;
-        }
 
-        let resp = self.finish_stream(&mut state, op)?;
+            self.finish_stream(&mut state, op)
+        })();
+        let resp = match res {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.send_rst_stream_cancel(sid);
+                return Err(e);
+            }
+        };
         match resp.grpc_status.as_str() {
             GRPC_OK => Ok(WriteOutcome::Committed),
             GRPC_ALREADY_EXISTS => Ok(WriteOutcome::AlreadyExists),

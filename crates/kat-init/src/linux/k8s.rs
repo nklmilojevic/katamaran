@@ -72,7 +72,7 @@ static SERVICE: OnceLock<Arc<K8s>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-static IMAGE_SYNC_LOCK: Mutex<()> = Mutex::new(());
+static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A k3s child that survived SIGKILL after its `Running` handle was dropped,
 /// tracked by its own exit notification (never by a reusable pid lookup).
@@ -3439,39 +3439,92 @@ fn spawn_image_sync(reaper: Reaper, stop: Arc<AtomicBool>) {
     let _ = thread::Builder::new()
         .name("k8s-img-sync".into())
         .spawn(move || {
-            let _ = sync_moby_images(&reaper);
-            while !stop.load(Ordering::Relaxed) {
-                if let Err(e) = watch_docker_image_events(&reaper, &stop) {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    log(&format!("image sync watcher: {e}"));
-                    for _ in 0..20 {
-                        if stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(250));
-                    }
-                }
-            }
+            run_image_sync_loop(&stop, Duration::from_secs(5), || {
+                watch_docker_image_events(Path::new(DOCKER_SOCKET), &reaper, &stop)
+            });
         });
 }
 
-fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<()> {
-    let mut stream = UnixStream::connect(DOCKER_SOCKET)?;
+fn run_image_sync_loop(
+    stop: &AtomicBool,
+    backoff: Duration,
+    mut watch_once: impl FnMut() -> io::Result<()>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        if let Err(e) = watch_once() {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            log(&format!("image sync watcher: {e}"));
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        sleep_interruptible(stop, backoff);
+    }
+}
+
+fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
+    let deadline = Instant::now() + total;
+    while !stop.load(Ordering::Relaxed) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(Duration::from_millis(250)));
+    }
+}
+
+fn watch_docker_image_events(
+    socket_path: &Path,
+    reaper: &Reaper,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    watch_docker_image_events_with(socket_path, stop, || {
+        if let Err(e) = sync_moby_images(reaper) {
+            log(&format!("background image sync: {e}"));
+        }
+    })
+}
+
+fn watch_docker_image_events_with(
+    socket_path: &Path,
+    stop: &AtomicBool,
+    mut on_sync: impl FnMut(),
+) -> io::Result<()> {
+    let mut stream = crate::unix_connect::connect_unix_until(
+        socket_path,
+        Instant::now() + Duration::from_secs(5),
+    )?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     // HTTP/1.0 avoids chunked framing; Docker streams one JSON object per line.
     write!(
         stream,
         "GET /events?filters=%7B%22type%22%3A%5B%22image%22%5D%7D HTTP/1.0\r\nHost: docker\r\n\r\n"
     )?;
+    stream.flush()?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    // Skip HTTP headers.
+    // Read HTTP response status line and headers before running the initial
+    // sync so we never sync against a failed subscription and never miss a
+    // Docker change made while the sync runs.
+    let mut saw_status = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
+            Ok(_) if !saw_status => {
+                saw_status = true;
+                if line.split_whitespace().nth(1) != Some("200") {
+                    return Err(io::Error::other(format!(
+                        "unexpected Docker /events status: {}",
+                        line.trim()
+                    )));
+                }
+            }
             Ok(_) if line == "\r\n" || line == "\n" => break,
             Ok(_) => continue,
             Err(e)
@@ -3485,13 +3538,12 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
             Err(e) => return Err(e),
         }
     }
-    // Subscribed: re-sync now so any Docker change made before or while the
-    // subscription was (re)established (including during the initial sync,
-    // and across watcher reconnects) is picked up; later changes arrive as
-    // events, buffered on this stream while a sync runs.
-    if let Err(e) = sync_moby_images(reaper) {
-        log(&format!("background image sync: {e}"));
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
     }
+    // Subscribed: run the initial / post-reconnect sync now. Changes made
+    // while this sync runs buffer as events on this stream.
+    on_sync();
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -3500,10 +3552,8 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
             Ok(_) => {
-                if is_docker_image_sync_event(&line)
-                    && let Err(e) = sync_moby_images(reaper)
-                {
-                    log(&format!("background image sync: {e}"));
+                if is_docker_image_sync_event(&line) {
+                    on_sync();
                 }
             }
             Err(e)
@@ -3551,15 +3601,52 @@ enum EmulationMode {
 
 const MAX_SYNC_RETRIES: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SyncNoticeKind {
+    SkipDigestAmd64,
+    KeepMirrorEmulationOff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SyncNotice {
+    kind: SyncNoticeKind,
+    name: String,
+    digest: String,
+}
+
+/// Deduplicates non-failure informational sync logs (`SkipDigestAmd64`,
+/// `KeepMirrorEmulationOff`) to once per `(kind, image, digest)` while active.
+struct SyncLogState {
+    logged: BTreeSet<SyncNotice>,
+}
+
+impl SyncLogState {
+    const fn new() -> Self {
+        Self {
+            logged: BTreeSet::new(),
+        }
+    }
+
+    fn should_log(&mut self, notice: SyncNotice) -> bool {
+        self.logged.insert(notice)
+    }
+
+    fn retain_active(&mut self, active: &BTreeSet<SyncNotice>) {
+        self.logged.retain(|n| active.contains(n));
+    }
+}
+
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
-    let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sync_log = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut failures: Vec<String> = Vec::new();
     let mut only_refs: Option<HashSet<String>> = None;
     let mut logged_unknown: Vec<String> = Vec::new();
+    let mut active_notices: BTreeSet<SyncNotice> = BTreeSet::new();
+    let mut completed_full_scan = false;
 
     for attempt in 0..=MAX_SYNC_RETRIES {
         // Re-read the emulation state on every pass so a retry never acts on
-        // a stale "disabled" reading.
+        // a stale reading.
         let emulation = current_emulation_mode(&mut logged_unknown);
         let moby = match list_ctr_images(reaper, "moby") {
             Ok(m) => m,
@@ -3568,7 +3655,10 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 break;
             }
         };
-        if moby.is_empty() && emulation != EmulationMode::Disabled && only_refs.is_none() {
+        if moby.is_empty() {
+            if attempt == 0 {
+                completed_full_scan = true;
+            }
             break;
         }
         let k8s = match list_ctr_images(reaper, "k8s.io") {
@@ -3578,6 +3668,9 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 break;
             }
         };
+        if attempt == 0 {
+            completed_full_scan = true;
+        }
 
         let candidates: Vec<(String, CtrImage)> = match &only_refs {
             Some(filter) => moby
@@ -3630,9 +3723,17 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
             ) {
                 SyncAction::Skip => {}
                 SyncAction::SkipDigestAmd64 => {
-                    log(&format!(
-                        "skipping amd64 rewrite for digest-pinned image {name}; tag it locally to run under emulation"
-                    ));
+                    let notice = SyncNotice {
+                        kind: SyncNoticeKind::SkipDigestAmd64,
+                        name: name.clone(),
+                        digest: img.digest.clone(),
+                    };
+                    active_notices.insert(notice.clone());
+                    if sync_log.should_log(notice) {
+                        log(&format!(
+                            "skipping amd64 rewrite for digest-pinned image {name}; tag it locally to run under emulation"
+                        ));
+                    }
                 }
                 SyncAction::ReportProbeError => {
                     let detail = source_probe
@@ -3641,16 +3742,41 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         .or_else(|| dest_probe.as_ref().and_then(|r| r.as_ref().err()))
                         .map(String::as_str)
                         .unwrap_or("native platform check unavailable");
-                    log(&format!("preserving existing mirror for {name}: {detail}"));
+                    if k8s_img.is_some() {
+                        log(&format!(
+                            "preserving existing Kubernetes image for {name}: {detail}"
+                        ));
+                    } else {
+                        log(&format!(
+                            "skipping {name} due to native platform check error: {detail}"
+                        ));
+                    }
                     failures.push(format!("{name}: {detail}"));
                 }
                 SyncAction::Relist => {
                     retry_refs.insert(name);
                 }
+                SyncAction::ReportEmulationDisabled => {
+                    let msg = if k8s_img.is_some() {
+                        format!(
+                            "{name}: amd64 image not mirrored because amd64 emulation is off; existing Kubernetes copy is kept"
+                        )
+                    } else {
+                        format!("{name}: amd64 image not mirrored because amd64 emulation is off")
+                    };
+                    log(&msg);
+                    failures.push(msg);
+                }
                 SyncAction::ReportEmulationUnavailable => {
-                    let msg = format!(
-                        "{name}: amd64 image not mirrored: amd64 emulation is unavailable (see the guest log); any existing Kubernetes copy is kept"
-                    );
+                    let msg = if k8s_img.is_some() {
+                        format!(
+                            "{name}: amd64 image not mirrored: amd64 emulation is unavailable (see the guest log); existing Kubernetes copy is kept"
+                        )
+                    } else {
+                        format!(
+                            "{name}: amd64 image not mirrored: amd64 emulation is unavailable (see the guest log)"
+                        )
+                    };
                     log(&msg);
                     failures.push(msg);
                 }
@@ -3679,9 +3805,21 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 SyncAction::KeepMirrorEmulationOff => {
                     // Never deleted automatically: a pod may still use it, and
                     // its Docker source may be gone. Leaking it is acceptable.
-                    log(&format!(
-                        "keeping amd64 mirror {name} in Kubernetes although amd64 emulation is off"
-                    ));
+                    let notice = SyncNotice {
+                        kind: SyncNoticeKind::KeepMirrorEmulationOff,
+                        name: name.clone(),
+                        digest: format!(
+                            "{}:{}",
+                            img.digest,
+                            k8s_img.map(|k| k.digest.as_str()).unwrap_or("")
+                        ),
+                    };
+                    active_notices.insert(notice.clone());
+                    if sync_log.should_log(notice) {
+                        log(&format!(
+                            "keeping amd64 mirror {name} in Kubernetes although amd64 emulation is off"
+                        ));
+                    }
                 }
                 SyncAction::MirrorNative { clear_source_label } => {
                     match mirror_native_image(reaper, &name) {
@@ -3752,7 +3890,19 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     let plan = match prepare_res {
                         Ok(oci_rewrite::PrepareRewrite::Ready(plan)) => *plan,
                         Ok(oci_rewrite::PrepareRewrite::RootMissing) => {
-                            retry_refs.insert(name);
+                            match classify_prepare_root_missing(
+                                &name,
+                                &img.digest,
+                                info_client.image_digest("moby", &name),
+                            ) {
+                                Ok(()) => {
+                                    retry_refs.insert(name);
+                                }
+                                Err(msg) => {
+                                    log(&msg);
+                                    failures.push(msg);
+                                }
+                            }
                             continue;
                         }
                         Ok(oci_rewrite::PrepareRewrite::NotAvailable) => {
@@ -3797,11 +3947,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             retry_refs.insert(name);
                         }
                         Err(containerd_grpc::PublishError::ReplacementUncertain(e)) => {
-                            // Nothing was released; report it and re-list so a
-                            // missing tag is recreated from Docker.
+                            // Nothing was released; report it and re-list (when
+                            // retries remain) so a missing tag is recreated
+                            // from Docker.
                             log(&format!("mirror image {name}: {e}; re-listing"));
                             failures.push(format!("{name}: {e}"));
-                            retry_refs.insert(name);
+                            if attempt < MAX_SYNC_RETRIES {
+                                retry_refs.insert(name);
+                            }
                         }
                         Err(containerd_grpc::PublishError::Failed(e)) => {
                             log(&format!("mirror image {name}: {e}"));
@@ -3831,6 +3984,10 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         only_refs = Some(retry_refs);
     }
 
+    if completed_full_scan {
+        sync_log.retain_active(&active_notices);
+    }
+
     if !failures.is_empty() {
         return Err(format!("failed to mirror images: {}", failures.join("; ")));
     }
@@ -3842,11 +3999,9 @@ fn current_emulation_mode(logged_unknown: &mut Vec<String>) -> EmulationMode {
         super::amd64::EmulationStatus::Enabled => EmulationMode::Enabled,
         super::amd64::EmulationStatus::Disabled => EmulationMode::Disabled,
         super::amd64::EmulationStatus::Unknown(e) => {
-            // Not a sync failure: native images still mirror normally. Only
-            // amd64 rewrites and retirements are held back while unknown.
-            let msg = format!(
-                "amd64 emulation state unknown ({e}); not rewriting or retiring amd64 mirrors"
-            );
+            // Not a sync failure by itself: native images still mirror
+            // normally, while amd64 tags are held back and reported per image.
+            let msg = format!("amd64 emulation state unknown ({e}); not rewriting amd64 images");
             if !logged_unknown.contains(&msg) {
                 log(&msg);
                 logged_unknown.push(msg);
@@ -3886,11 +4041,14 @@ enum SyncAction {
     /// swap cannot be made atomic, and an interrupted swap could lose a tag
     /// Katamaran cannot rebuild); the user is told how to resolve the conflict.
     ReportUnownedDestination,
+    /// An amd64 tag that cannot be mirrored because `amd64 = "off"`; any
+    /// existing Kubernetes copy is kept.
+    ReportEmulationDisabled,
     /// An amd64 tag that would be mirrored under emulation, but the emulation
     /// state is unknown (e.g. the emulator failed to register at boot).
     ReportEmulationUnavailable,
     /// Docker's tag now points to an image Katamaran cannot mirror (no
-    /// linux/arm64 or rewritable linux/amd64 variant); the previous mirror is
+    /// linux/arm64 or rewritable linux/amd64 variant); the previous build is
     /// kept under the tag.
     ReportStaleMirror,
 }
@@ -3912,10 +4070,10 @@ fn unowned_destination_message(name: &str) -> String {
 /// merely advertising a native descriptor in a multi-platform index, or only
 /// having 32-bit `linux/arm/*` blobs).
 fn needs_native_probe(
-    _name: &str,
+    name: &str,
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
-    _emulation: EmulationMode,
+    emulation: EmulationMode,
     native_arch: &str,
 ) -> bool {
     let Some(platforms) = moby.platforms.as_deref() else {
@@ -3925,7 +4083,21 @@ fn needs_native_probe(
         return false;
     }
     let k8s_is_rewritten = k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some());
-    oci_rewrite::has_amd64_platform(platforms) || k8s_is_rewritten
+    if k8s_is_rewritten {
+        return true;
+    }
+    if !oci_rewrite::has_amd64_platform(platforms) {
+        return false;
+    }
+    // When `k8s.io` already holds the exact same unlabelled digest, skip the
+    // probe whenever the outcome cannot change the sync action (emulation is
+    // not enabled, or the reference is digest-pinned and never rewritten).
+    // With emulation enabled on a tagged image, keep probing so an unusable
+    // same-digest legacy copy is still reported instead of claimed synced.
+    let same_unlabelled =
+        k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_none() && k.digest == moby.digest);
+    !(same_unlabelled
+        && (emulation != EmulationMode::Enabled || oci_rewrite::is_digest_reference(name)))
 }
 
 /// True when a strict native-content probe on `k8s.io` is needed before
@@ -4010,30 +4182,9 @@ fn classify_dest_native_availability(
 }
 
 /// Decide how to synchronize a single `moby` image into `k8s.io`. Never
-/// claims an image synced when Kubernetes keeps a different unlabelled image
-/// under the same name.
+/// claims an image synced when Kubernetes keeps a different image or an
+/// unmirrored amd64 tag under the same name.
 fn plan_sync_action(
-    name: &str,
-    moby: &CtrImage,
-    k8s: Option<&CtrImage>,
-    native: NativeAvailability,
-    dest_native: NativeAvailability,
-    emulation: EmulationMode,
-    native_arch: &str,
-) -> SyncAction {
-    let action =
-        plan_sync_action_inner(name, moby, k8s, native, dest_native, emulation, native_arch);
-    let diverged_unlabelled =
-        k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_none() && k.digest != moby.digest);
-    if action == SyncAction::Skip && diverged_unlabelled && !oci_rewrite::is_digest_reference(name)
-    {
-        SyncAction::ReportDivergedTag
-    } else {
-        action
-    }
-}
-
-fn plan_sync_action_inner(
     name: &str,
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
@@ -4064,9 +4215,12 @@ fn plan_sync_action_inner(
             };
             let has_amd64 = oci_rewrite::has_amd64_platform(platforms);
             let is_digest_ref = oci_rewrite::is_digest_reference(name);
-            // Retirement is destructive, so it happens only when emulation is
-            // explicitly off. With emulation on (or unknown), an existing
-            // mirror is kept whenever the source cannot be (re)mirrored.
+            let resolved = !platforms.trim().is_empty() && platforms.trim() != "-";
+            let k8s_matches_source =
+                k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str()));
+
+            // Digest-pinned references can never be rewritten because rewriting
+            // changes the manifest digest; existing mirrors are kept.
             if is_digest_ref {
                 if emulation == EmulationMode::Disabled && k8s_is_rewritten {
                     return SyncAction::KeepMirrorEmulationOff;
@@ -4074,75 +4228,104 @@ fn plan_sync_action_inner(
                 if emulation == EmulationMode::Enabled && has_amd64 {
                     return SyncAction::SkipDigestAmd64;
                 }
-            }
-            if is_digest_ref && k8s_is_rewritten {
+                if k8s_is_rewritten {
+                    return SyncAction::Skip;
+                }
+                if !resolved {
+                    return if k8s.is_some_and(|k| k.digest == moby.digest) {
+                        SyncAction::Skip
+                    } else {
+                        SyncAction::MirrorNative {
+                            clear_source_label: false,
+                        }
+                    };
+                }
                 return SyncAction::Skip;
             }
-            if emulation == EmulationMode::Enabled && has_amd64 && !is_digest_ref {
-                if let Some(k) = k8s {
-                    if k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str()) {
-                        match k.platforms.as_deref() {
-                            None => SyncAction::Relist,
-                            Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
-                                SyncAction::Skip
+
+            if has_amd64 {
+                return match emulation {
+                    EmulationMode::Enabled => {
+                        if let Some(k) = k8s {
+                            if k8s_matches_source {
+                                match k.platforms.as_deref() {
+                                    None => SyncAction::Relist,
+                                    Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
+                                        SyncAction::Skip
+                                    }
+                                    Some(_) => SyncAction::MirrorRewrite,
+                                }
+                            } else if k8s_is_rewritten {
+                                // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
+                                SyncAction::MirrorRewrite
+                            } else {
+                                // Unlabelled `k8s.io` image (a kubelet/`ctr` pull, a
+                                // native mirror, or a copy left by an earlier release):
+                                // never replaced. Stay quiet only when its local native
+                                // arm64 content is verified complete and it matches
+                                // Docker's digest; otherwise report the conflict.
+                                match dest_native {
+                                    NativeAvailability::Present if k.digest == moby.digest => {
+                                        SyncAction::Skip
+                                    }
+                                    NativeAvailability::Present => SyncAction::ReportDivergedTag,
+                                    NativeAvailability::Absent => {
+                                        SyncAction::ReportUnownedDestination
+                                    }
+                                    NativeAvailability::Stale => SyncAction::Relist,
+                                    NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
+                                }
                             }
-                            Some(_) => SyncAction::MirrorRewrite,
-                        }
-                    } else if k.label(SOURCE_DIGEST_LABEL).is_some() {
-                        // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
-                        SyncAction::MirrorRewrite
-                    } else {
-                        // Unlabelled `k8s.io` image (a kubelet/`ctr` pull, a
-                        // native mirror, or a copy left by an earlier release):
-                        // never replaced. Stay quiet only when its local native
-                        // arm64 content is verified complete (not merely
-                        // advertised in `ctr images ls`) and it is the same
-                        // image; otherwise tell the user how to resolve it.
-                        match dest_native {
-                            NativeAvailability::Present => SyncAction::Skip,
-                            NativeAvailability::Absent => SyncAction::ReportUnownedDestination,
-                            NativeAvailability::Stale => SyncAction::Relist,
-                            NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
+                        } else {
+                            SyncAction::MirrorRewrite
                         }
                     }
-                } else {
-                    SyncAction::MirrorRewrite
-                }
-            } else if emulation == EmulationMode::Disabled && k8s_is_rewritten {
-                SyncAction::KeepMirrorEmulationOff
-            } else if emulation == EmulationMode::Unknown
-                && has_amd64
-                && !is_digest_ref
-                && k8s.is_none_or(|k| {
-                    k.label(SOURCE_DIGEST_LABEL)
-                        .is_some_and(|src| src != moby.digest.as_str())
-                })
-            {
-                // Would be (re)mirrored under emulation, but its state is
-                // unknown: keep any existing mirror and report the image.
-                SyncAction::ReportEmulationUnavailable
-            } else if k8s_is_rewritten {
-                // Emulation on/unknown but the source has no rewritable amd64
-                // variant (or its platforms could not be resolved): keep the
-                // existing mirror rather than deleting a working tag, and
-                // report if Docker's tag now points elsewhere.
-                let resolved = !platforms.trim().is_empty() && platforms.trim() != "-";
-                if resolved
-                    && k8s
-                        .is_some_and(|k| k.label(SOURCE_DIGEST_LABEL) != Some(moby.digest.as_str()))
-                {
-                    SyncAction::ReportStaleMirror
-                } else {
-                    SyncAction::Skip
-                }
-            } else if !k8s_is_rewritten && (platforms.is_empty() || platforms == "-") {
-                if k8s.is_some_and(|k| k.digest == moby.digest) {
+                    EmulationMode::Disabled => {
+                        if k8s_matches_source {
+                            SyncAction::KeepMirrorEmulationOff
+                        } else {
+                            SyncAction::ReportEmulationDisabled
+                        }
+                    }
+                    EmulationMode::Unknown => {
+                        if k8s_matches_source {
+                            SyncAction::Skip
+                        } else {
+                            SyncAction::ReportEmulationUnavailable
+                        }
+                    }
+                };
+            }
+
+            if !resolved {
+                return if k8s_is_rewritten {
+                    if emulation == EmulationMode::Disabled {
+                        SyncAction::KeepMirrorEmulationOff
+                    } else {
+                        SyncAction::Skip
+                    }
+                } else if k8s.is_some_and(|k| k.digest == moby.digest) {
                     SyncAction::Skip
                 } else {
                     SyncAction::MirrorNative {
                         clear_source_label: false,
                     }
+                };
+            }
+
+            // Resolved non-native, non-amd64 image (e.g. linux/s390x): keep any
+            // existing Kubernetes copy, and report when Docker's tag moved to a
+            // different digest that Katamaran cannot mirror.
+            if k8s_is_rewritten {
+                if !k8s_matches_source {
+                    SyncAction::ReportStaleMirror
+                } else if emulation == EmulationMode::Disabled {
+                    SyncAction::KeepMirrorEmulationOff
+                } else {
+                    SyncAction::Skip
                 }
+            } else if k8s.is_some_and(|k| k.digest != moby.digest) {
+                SyncAction::ReportStaleMirror
             } else {
                 SyncAction::Skip
             }
@@ -4151,8 +4334,7 @@ fn plan_sync_action_inner(
 }
 
 /// Bounded stdout cap for `ctr images ls` and `Images.List`. Exceeding this
-/// cap returns an explicit error instead of silently truncating the inventory
-/// (which could otherwise misclassify images past the cutoff as orphaned).
+/// cap returns an explicit error instead of silently truncating the inventory.
 const IMAGE_LIST_LIMIT: usize = 16 << 20;
 
 /// Strictly verify whether `name` in `namespace` (expected to still point to
@@ -4175,22 +4357,63 @@ fn probe_native_complete(
         Some(cur) if cur == expected_digest => {}
         _ => return Ok(NativeAvailability::Stale),
     }
-    let mut store = MobyContentStore::new(
-        GrpcNamespaceMeta {
-            client: &mut client,
-            namespace,
-        },
-        |digest: &str, max_bytes: usize| get_ctr_content_blob(reaper, namespace, digest, max_bytes),
-        |digest: &str| inspect_ctr_config_platform(reaper, namespace, digest),
-    );
-    match oci_rewrite::has_complete_native_manifest(
-        expected_digest,
-        oci_rewrite::NativePlatform::linux(native_arch, None),
-        &mut store,
-    )? {
+    let check = {
+        let mut store = MobyContentStore::new(
+            GrpcNamespaceMeta {
+                client: &mut client,
+                namespace,
+            },
+            |digest: &str, max_bytes: usize| {
+                get_ctr_content_blob(reaper, namespace, digest, max_bytes)
+            },
+            |digest: &str| inspect_ctr_config_platform(reaper, namespace, digest),
+        );
+        oci_rewrite::has_complete_native_manifest(
+            expected_digest,
+            oci_rewrite::NativePlatform::linux(native_arch, None),
+            &mut store,
+        )?
+    };
+    classify_native_check_outcome(namespace, expected_digest, check, || {
+        client.image_digest(namespace, name)
+    })
+}
+
+/// Distinguish a genuine concurrent retag (`Stale` -> re-list) from a dangling
+/// image record whose root manifest blob is missing from `namespace`'s content
+/// store (`Err` -> fail immediately instead of relisting into a misleading
+/// "changed concurrently" error).
+fn classify_native_check_outcome(
+    namespace: &str,
+    expected_digest: &str,
+    check: oci_rewrite::NativeManifestCheck,
+    mut recheck_digest: impl FnMut() -> Result<Option<String>, String>,
+) -> Result<NativeAvailability, String> {
+    match check {
         oci_rewrite::NativeManifestCheck::Complete => Ok(NativeAvailability::Present),
         oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
-        oci_rewrite::NativeManifestCheck::RootMissing => Ok(NativeAvailability::Stale),
+        oci_rewrite::NativeManifestCheck::RootMissing => match recheck_digest()? {
+            Some(cur) if cur == expected_digest => Err(format!(
+                "root manifest blob {expected_digest} is missing from {namespace} content store"
+            )),
+            _ => Ok(NativeAvailability::Stale),
+        },
+    }
+}
+
+fn classify_prepare_root_missing(
+    name: &str,
+    expected_digest: &str,
+    current_digest: Result<Option<String>, String>,
+) -> Result<(), String> {
+    match current_digest {
+        Ok(Some(cur)) if cur == expected_digest => Err(format!(
+            "{name}: root manifest blob {expected_digest} is missing from moby content store"
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!(
+            "{name}: root manifest blob {expected_digest} is missing from moby content store (re-check failed: {e})"
+        )),
     }
 }
 
@@ -4961,7 +5184,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
         assert_eq!(app.label(SOURCE_DIGEST_LABEL), None);
 
         // Comma-embedded ownership marker in another label's value must NEVER
-        // match SOURCE_DIGEST_LABEL or cause cleanup to retire an unrelated tag.
+        // match SOURCE_DIGEST_LABEL or be mistaken for a Katamaran mirror.
         let web = &images["docker.io/library/web:1"];
         assert_eq!(web.platforms.as_deref(), Some("linux/amd64,linux/arm64/v8"));
         assert_eq!(web.label(SOURCE_DIGEST_LABEL), None);
@@ -4974,6 +5197,18 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                 NativeAvailability::Absent,
                 NativeAvailability::Present,
                 EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "docker.io/library/web:1",
+                app,
+                Some(web),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::ReportDivergedTag
@@ -5383,8 +5618,10 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             SyncAction::ReportUnownedDestination
         );
         let k8s_unchanged_multi = ctr_img(&amd64_idx.digest, "linux/amd64,linux/arm64/v8", &[]);
-        // A diverged unlabelled tag that sync would otherwise skip (here:
-        // emulation off) is reported, never claimed as synced.
+        // When emulation is off or unknown and Kubernetes has a different
+        // unlabelled image under the same tag, report the emulation cause
+        // directly (not ReportDivergedTag with a retag workaround that still
+        // cannot mirror).
         let k8s_native_old = ctr_img("sha256:old-native", "linux/arm64", &[]);
         assert_eq!(
             plan_sync_action(
@@ -5396,7 +5633,19 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::ReportDivergedTag
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_native_old),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationUnavailable
         );
         assert_eq!(
             plan_sync_action(
@@ -5411,10 +5660,9 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             SyncAction::ReportUnownedDestination
         );
 
-        // Emulation disabled for an amd64-only index: keep (never delete)
-        // Katamaran's rewritten alias, and never touch unrelated Kubernetes
-        // images (even if another label value contains commas); a different
-        // unrelated image under the same name is reported, not claimed synced.
+        // Emulation disabled for an amd64-only image: keep (never delete)
+        // an up-to-date Katamaran mirror, and report unmirrored amd64 tags
+        // (whether k8s.io has no copy, a stale mirror, or a different image).
         assert_eq!(
             plan_sync_action(
                 "app:dev",
@@ -5431,13 +5679,25 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             plan_sync_action(
                 "app:dev",
                 &amd64_idx,
+                Some(&k8s_stale_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
                 Some(&k8s_unrelated),
                 NativeAvailability::Absent,
                 NativeAvailability::Present,
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::ReportDivergedTag
+            SyncAction::ReportEmulationDisabled
         );
         assert_eq!(
             plan_sync_action(
@@ -5449,7 +5709,19 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::Skip
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unchanged_copy),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
         );
 
         // Emulation status Unknown (e.g. transient binfmt_misc read error): NEVER
@@ -5703,6 +5975,276 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             SyncAction::MirrorNative {
                 clear_source_label: false
             }
+        );
+
+        // Non-arm64/non-amd64 source over a different unlabelled k8s tag
+        // reports ReportStaleMirror rather than ReportDivergedTag.
+        let s390x = ctr_img("sha256:s390x", "linux/s390x", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &s390x,
+                Some(&k8s_native_old),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportStaleMirror
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &s390x,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+    }
+
+    #[test]
+    fn needs_native_probe_skips_same_unlabelled_digest_when_action_cannot_change() {
+        let multi = ctr_img("sha256:same", "linux/amd64,linux/arm64/v8", &[]);
+        let k8s_same = ctr_img("sha256:same", "linux/amd64,linux/arm64/v8", &[]);
+        let k8s_diff = ctr_img("sha256:other", "linux/amd64,linux/arm64/v8", &[]);
+        let k8s_rewritten = ctr_img(
+            "sha256:rewritten",
+            "linux/arm64",
+            &[(SOURCE_DIGEST_LABEL, "sha256:same")],
+        );
+        let digest_ref = "docker.io/library/app@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let failed_probe: Result<NativeAvailability, String> = Err("transient rpc timeout".into());
+
+        // Emulation Disabled or Unknown with same unlabelled digest: no action
+        // can differ, so skip probing and ignore transient probe failures.
+        for mode in [EmulationMode::Disabled, EmulationMode::Unknown] {
+            assert!(!needs_native_probe(
+                "app:dev",
+                &multi,
+                Some(&k8s_same),
+                mode,
+                "arm64"
+            ));
+            let native = classify_native_availability(
+                "app:dev",
+                &multi,
+                Some(&k8s_same),
+                Some(&failed_probe),
+                mode,
+                "arm64",
+            );
+            assert_eq!(native, NativeAvailability::Present);
+            assert_eq!(
+                plan_sync_action(
+                    "app:dev",
+                    &multi,
+                    Some(&k8s_same),
+                    native,
+                    NativeAvailability::Absent,
+                    mode,
+                    "arm64"
+                ),
+                SyncAction::Skip
+            );
+        }
+
+        // Digest-pinned reference with same unlabelled digest: never rewritten,
+        // so skip probing even when emulation is enabled.
+        assert!(!needs_native_probe(
+            digest_ref,
+            &multi,
+            Some(&k8s_same),
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+
+        // Tagged image with emulation Enabled and same unlabelled digest: MUST
+        // still probe so an unusable amd64-only legacy copy is reported.
+        assert!(needs_native_probe(
+            "app:dev",
+            &multi,
+            Some(&k8s_same),
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+
+        // Missing, diverged, or Katamaran-rewritten destination: probe still
+        // matters even when emulation is off (decides MirrorNative vs report).
+        for dst in [None, Some(&k8s_diff), Some(&k8s_rewritten)] {
+            assert!(needs_native_probe(
+                "app:dev",
+                &multi,
+                dst,
+                EmulationMode::Disabled,
+                "arm64"
+            ));
+        }
+    }
+
+    #[test]
+    fn root_missing_relists_only_when_tag_changed_and_errors_when_dangling() {
+        // Native probe: RootMissing with unchanged digest -> Err (no relist).
+        let err = classify_native_check_outcome(
+            "moby",
+            "sha256:dangling",
+            oci_rewrite::NativeManifestCheck::RootMissing,
+            || Ok(Some("sha256:dangling".into())),
+        )
+        .unwrap_err();
+        assert!(err.contains("root manifest blob sha256:dangling"), "{err}");
+        assert!(err.contains("moby"), "{err}");
+
+        // Native probe: RootMissing after concurrent retag or delete -> Stale (relist).
+        assert_eq!(
+            classify_native_check_outcome(
+                "moby",
+                "sha256:old",
+                oci_rewrite::NativeManifestCheck::RootMissing,
+                || Ok(Some("sha256:new".into())),
+            )
+            .unwrap(),
+            NativeAvailability::Stale
+        );
+        assert_eq!(
+            classify_native_check_outcome(
+                "moby",
+                "sha256:old",
+                oci_rewrite::NativeManifestCheck::RootMissing,
+                || Ok(None),
+            )
+            .unwrap(),
+            NativeAvailability::Stale
+        );
+
+        // Prepare rewrite: RootMissing with unchanged digest -> Err (no relist).
+        let err = classify_prepare_root_missing(
+            "app:dev",
+            "sha256:dangling",
+            Ok(Some("sha256:dangling".into())),
+        )
+        .unwrap_err();
+        assert!(err.contains("root manifest blob sha256:dangling"), "{err}");
+
+        // Prepare rewrite: RootMissing after retag or deletion -> Ok (relist).
+        classify_prepare_root_missing("app:dev", "sha256:old", Ok(Some("sha256:new".into())))
+            .unwrap();
+        classify_prepare_root_missing("app:dev", "sha256:old", Ok(None)).unwrap();
+
+        // Prepare rewrite: re-check RPC failure -> Err.
+        let err =
+            classify_prepare_root_missing("app:dev", "sha256:old", Err("grpc timeout".into()))
+                .unwrap_err();
+        assert!(err.contains("grpc timeout"), "{err}");
+    }
+
+    #[test]
+    fn sync_log_state_deduplicates_per_image_and_digest_and_prunes_removed() {
+        let mut state = SyncLogState::new();
+        let n1 = SyncNotice {
+            kind: SyncNoticeKind::SkipDigestAmd64,
+            name: "app@sha256:1111".into(),
+            digest: "sha256:1111".into(),
+        };
+        let n2 = SyncNotice {
+            kind: SyncNoticeKind::KeepMirrorEmulationOff,
+            name: "app:dev".into(),
+            digest: "sha256:src:sha256:k8s".into(),
+        };
+        let n2_updated = SyncNotice {
+            kind: SyncNoticeKind::KeepMirrorEmulationOff,
+            name: "app:dev".into(),
+            digest: "sha256:src2:sha256:k8s".into(),
+        };
+
+        assert!(state.should_log(n1.clone()));
+        assert!(!state.should_log(n1.clone()));
+        assert!(state.should_log(n2.clone()));
+        assert!(!state.should_log(n2.clone()));
+        // A different digest logs once again.
+        assert!(state.should_log(n2_updated.clone()));
+        assert!(!state.should_log(n2_updated.clone()));
+
+        // Retaining only n2_updated prunes n1 and n2 so re-adding n1 logs again.
+        let active = BTreeSet::from([n2_updated.clone()]);
+        state.retain_active(&active);
+        assert!(!state.should_log(n2_updated));
+        assert!(state.should_log(n1));
+    }
+
+    #[test]
+    fn docker_event_watcher_syncs_once_on_subscribe_checks_status_and_backs_off_on_eof() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_dir("events-watch");
+        let sock = dir.join("docker.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = thread::spawn(move || {
+            // Connection 1: 200 OK -> 1 initial sync + 1 tag event -> clean EOF.
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut req = [0u8; 256];
+            let _ = s1.read(&mut req);
+            s1.write_all(
+                b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                  {\"Action\":\"delete\"}\n\
+                  not-json\n\
+                  {\"Action\":\"tag\"}\n",
+            )
+            .unwrap();
+            drop(s1);
+
+            // Connection 2: non-200 status -> must error without syncing.
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.read(&mut req);
+            s2.write_all(b"HTTP/1.0 500 Internal Server Error\r\n\r\nboom\n")
+                .unwrap();
+            drop(s2);
+
+            // Connection 3: immediate EOF before headers -> Ok without syncing.
+            let (mut s3, _) = listener.accept().unwrap();
+            let _ = s3.read(&mut req);
+            drop(s3);
+        });
+
+        let stop = AtomicBool::new(false);
+        let mut sync_calls = 0usize;
+        watch_docker_image_events_with(&sock, &stop, || sync_calls += 1).unwrap();
+        // Exactly 2 syncs: 1 right after subscribing + 1 for the "tag" event.
+        assert_eq!(sync_calls, 2);
+
+        let mut err_syncs = 0usize;
+        let err = watch_docker_image_events_with(&sock, &stop, || err_syncs += 1).unwrap_err();
+        assert!(err.to_string().contains("500"), "{err}");
+        assert_eq!(err_syncs, 0);
+
+        let mut eof_syncs = 0usize;
+        watch_docker_image_events_with(&sock, &stop, || eof_syncs += 1).unwrap();
+        assert_eq!(eof_syncs, 0);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        // Clean EOF (`Ok(())`) must wait for the backoff before reconnecting
+        // instead of tight-spinning.
+        let loop_stop = AtomicBool::new(false);
+        let mut attempts = 0usize;
+        let started = Instant::now();
+        run_image_sync_loop(&loop_stop, Duration::from_millis(60), || {
+            attempts += 1;
+            if attempts == 2 {
+                loop_stop.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(attempts, 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "expected backoff after clean EOF, elapsed {:?}",
+            started.elapsed()
         );
     }
 

@@ -101,17 +101,16 @@ pub enum EmulationStatus {
     /// the registered handler entry currently report `enabled`.
     Enabled,
     /// No emulator was requested on the kernel command line (`amd64 = "off"`).
-    /// This is the only state in which callers may retire emulation mirrors.
     Disabled,
     /// An emulator was requested, but it failed to register at boot, its
     /// handler is now missing or disabled, or `binfmt_misc` state could not be
-    /// read; callers must not treat this as disabled or retire mirrors.
+    /// read; callers must distinguish this from `amd64 = "off"`.
     Unknown(String),
 }
 
 /// Query whether an x86-64 emulator was registered at boot and its
-/// `binfmt_misc` handler is currently enabled, distinguishing I/O errors
-/// (`Unknown`) from an actually disabled or unregistered handler (`Disabled`).
+/// `binfmt_misc` handler is currently enabled, distinguishing I/O errors or a
+/// missing/disabled handler (`Unknown`) from `amd64 = "off"` (`Disabled`).
 pub fn status() -> EmulationStatus {
     status_from(
         REQUESTED.get().copied(),
@@ -128,7 +127,7 @@ fn status_from(
     match (requested, registered) {
         (_, Some(emu)) => binfmt_handler_status(binfmt_dir, emu.name()),
         // Requested but registration failed at boot: not a user choice to turn
-        // emulation off, so callers must not retire mirrors.
+        // emulation off, so callers must report unavailability rather than off.
         (Some(req), None) => EmulationStatus::Unknown(format!(
             "amd64 emulation ({}) was requested but failed to register at boot",
             req.name()
@@ -141,7 +140,7 @@ fn status_from(
 /// a handler that was registered at boot and is now missing or disabled
 /// (e.g. removed by a `binfmt --uninstall` / `qemu-user-static --reset`
 /// container) is not the user turning emulation off in katamaran's config, so
-/// callers must not treat it as `Disabled` (which retires mirrors).
+/// callers must report it as unavailable rather than `Disabled`.
 fn binfmt_handler_status(binfmt_dir: &Path, name: &str) -> EmulationStatus {
     let read =
         |path: &Path| fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()));
