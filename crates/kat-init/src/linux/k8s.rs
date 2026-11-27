@@ -69,6 +69,7 @@ const API_PORT: &str = "6443";
 pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
+const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
 const IMAGE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2681,7 +2682,20 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
-        let _guard = self.op_lock.lock().unwrap();
+        // Stream heartbeats while queued behind an in-flight guest Kubernetes
+        // operation so callers with idle timeouts stay alive, and bound the wait
+        // without sending `ResetAccepted` until this reset actually acquires
+        // `op_lock` and is ready to mutate cluster state.
+        let _guard = try_lock_with_deadline(
+            &self.op_lock,
+            OP_LOCK_WAIT_TIMEOUT,
+            PROGRESS_HEARTBEAT_INTERVAL,
+            "waiting for active guest Kubernetes operation",
+            || SHUTTING_DOWN.load(Ordering::SeqCst),
+            &mut |msg| {
+                let _ = k8s::write(&*conn, &K8sMsg::Progress(msg.into()));
+            },
+        )?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }

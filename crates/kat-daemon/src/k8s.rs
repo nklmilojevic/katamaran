@@ -279,9 +279,9 @@ pub fn read_reset_answer(
                 progress(k8s::RESET_DATA_CLEARED_PROGRESS);
             }
             Some(K8sMsg::Progress(p)) => {
-                if remove_images && !*accepted {
-                    bail!("unexpected Progress before ResetAccepted");
-                }
+                // Compatible guests may emit queued lock-wait heartbeats before
+                // `ResetAccepted`; forward them to refresh client idle timeouts
+                // without marking the reset accepted until `ResetAccepted` arrives.
                 if !remove_images && p == k8s::RESET_DATA_CLEARED_PROGRESS {
                     mark_deleted(data_deleted);
                 }
@@ -2905,5 +2905,72 @@ users:
         t.join().unwrap();
         assert!(deleted);
         assert_eq!(deleted_calls, 1);
+
+        // 4. Image reset forwards queued pre-acceptance Progress heartbeats without
+        //    marking accepted until ResetAccepted arrives, and preserves accepted=false
+        //    if the queued wait fails before ResetAccepted.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            k8s::write(&mut guest, &K8sMsg::ResetAccepted).unwrap();
+            k8s::write(&mut guest, &K8sMsg::ResetDataCleared).unwrap();
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = false;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let mut progress = Vec::new();
+        read_reset_answer(
+            &mut host,
+            true,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+        t.join().unwrap();
+        assert!(accepted);
+        assert!(deleted);
+        assert_eq!(deleted_calls, 1);
+        assert_eq!(
+            progress.first().map(String::as_str),
+            Some("waiting for active guest Kubernetes operation")
+        );
+
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Error("timed out waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+        });
+        let mut accepted = false;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let err = read_reset_answer(
+            &mut host,
+            true,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(!accepted, "pre-acceptance progress must not mark accepted");
+        assert!(!deleted);
+        assert_eq!(deleted_calls, 0);
     }
 }
