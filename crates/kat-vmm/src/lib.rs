@@ -455,7 +455,21 @@ pub mod run {
                 .map_err(err)?;
 
         if let Some((_, listener, shares)) = fscache {
-            crate::fscache::start(shares, listener).context("watch the shares")?;
+            let mut exclusions = Vec::new();
+            if let Some(run_dir) = cfg.control_socket.parent()
+                && run_dir.file_name().is_some_and(|n| n == "run")
+                && let Some(state_dir) = run_dir.parent()
+            {
+                exclusions.push(state_dir.to_path_buf());
+            }
+            for d in &cfg.disks {
+                if !d.read_only
+                    && let Some(dir) = d.path.parent()
+                {
+                    exclusions.push(dir.to_path_buf());
+                }
+            }
+            crate::fscache::start(shares, exclusions, listener).context("watch the shares")?;
         }
 
         let vmm = VmmBuilder::new()
