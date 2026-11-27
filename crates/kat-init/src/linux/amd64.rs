@@ -100,12 +100,12 @@ pub enum EmulationStatus {
     /// An emulator was registered at boot and both `binfmt_misc/status` and
     /// the registered handler entry currently report `enabled`.
     Enabled,
-    /// No emulator was registered at boot, or the kernel explicitly reports
-    /// `binfmt_misc` or the handler as disabled/unregistered (`NotFound`).
+    /// No emulator was requested on the kernel command line (`amd64 = "off"`).
+    /// This is the only state in which callers may retire emulation mirrors.
     Disabled,
-    /// An emulator was registered at boot, but reading `binfmt_misc` state
-    /// failed with a non-`NotFound` I/O error; callers must not treat this as
-    /// disabled or retire existing emulation mirrors.
+    /// An emulator was requested, but it failed to register at boot, its
+    /// handler is now missing or disabled, or `binfmt_misc` state could not be
+    /// read; callers must not treat this as disabled or retire mirrors.
     Unknown(String),
 }
 

@@ -3655,13 +3655,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     }
                     if let Some(k) = k8s_img {
                         match retire_rewritten_image(reaper, &name, Some(&img.digest), &k.digest) {
-                            Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
+                            Ok(RetireResult::Deleted) => log(&format!(
                                 "retired Katamaran amd64 mirror {name} from k8s.io"
                             )),
-                            Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => log(&format!(
+                            Ok(RetireResult::NotFoundOrChanged) => log(&format!(
                                 "skipped retiring {name}: k8s.io target already removed or replaced"
                             )),
-                            Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                            Ok(RetireResult::NotOwned) => {}
+                            Ok(RetireResult::SourceChanged) => {
                                 log(&format!(
                                     "skipped retiring {name}: moby source digest changed concurrently; re-listing"
                                 ));
@@ -3834,13 +3835,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         continue;
                     }
                     match retire_rewritten_image(reaper, name, None, &k8s_img.digest) {
-                        Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
+                        Ok(RetireResult::Deleted) => log(&format!(
                             "retired orphaned Katamaran amd64 mirror {name} from k8s.io"
                         )),
-                        Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => log(&format!(
+                        Ok(RetireResult::NotFoundOrChanged) => log(&format!(
                             "skipped retiring orphaned {name}: k8s.io target already removed or replaced"
                         )),
-                        Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                        Ok(RetireResult::NotOwned) => {}
+                        Ok(RetireResult::SourceChanged) => {
                             log(&format!(
                                 "skipped retiring orphaned {name}: tag reappeared in moby; re-listing"
                             ));
@@ -3868,6 +3870,9 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
             }
             break;
         }
+        // Brief backoff so a burst of Docker retags can settle before the
+        // next pass re-lists.
+        thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
         only_refs = Some(retry_refs);
     }
 
@@ -4244,20 +4249,38 @@ fn retire_rewritten_image(
     name: &str,
     expected_moby_digest: Option<&str>,
     expected_k8s_digest: &str,
-) -> Result<containerd_grpc::RetireOutcome, String> {
+) -> Result<RetireResult, String> {
     if !is_katamaran_published(reaper, name, expected_k8s_digest)? {
         log(&format!(
             "not retiring {name}: k8s.io target {expected_k8s_digest} is not a katamaran-published mirror"
         ));
-        return Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged);
+        return Ok(RetireResult::NotOwned);
     }
-    containerd_grpc::retire_image_if_unchanged(
+    let outcome = containerd_grpc::retire_image_if_unchanged(
         Path::new(CONTAINERD_SOCKET),
         name,
         expected_moby_digest,
         expected_k8s_digest,
         Duration::from_secs(15),
-    )
+    )?;
+    Ok(match outcome {
+        containerd_grpc::RetireOutcome::Deleted => RetireResult::Deleted,
+        containerd_grpc::RetireOutcome::NotFoundOrChanged => RetireResult::NotFoundOrChanged,
+        containerd_grpc::RetireOutcome::SourceChanged => RetireResult::SourceChanged,
+    })
+}
+
+/// Result of [`retire_rewritten_image`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireResult {
+    Deleted,
+    /// `k8s.io` was already absent or no longer points to the expected digest.
+    NotFoundOrChanged,
+    /// `moby` changed concurrently; re-list.
+    SourceChanged,
+    /// The tag is still present but is not a Katamaran publication, so it was
+    /// left untouched (already logged).
+    NotOwned,
 }
 
 /// Upper bound for a manifest `publish_rewritten_image` can have written: the
