@@ -46,9 +46,9 @@ const MAX_STAT_LOOKUPS: usize = 512;
 
 /// Number of platform-eligible child digests (or leaf layers) prefetched per
 /// bounded batch presence query so absent siblings neither exhaust
-/// [`MAX_STAT_LOOKUPS`] nor force unnecessary queries once an ideal baseline
+/// [`MAX_STAT_LOOKUPS`] nor force unnecessary lookups once an ideal baseline
 /// candidate is found.
-const PREFETCH_BATCH_SIZE: usize = 128;
+const PREFETCH_BATCH_SIZE: usize = 64;
 
 /// Maximum OCI index nesting depth traversed per branch. Hitting this cap fails
 /// only the overly deep branch so shallower sibling manifests remain usable.

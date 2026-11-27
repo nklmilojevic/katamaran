@@ -3661,7 +3661,6 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         let mut store = MobyContentStore::new(
                             GrpcMobyMeta {
                                 client: &mut info_client,
-                                max_response_bytes: IMAGE_LIST_LIMIT,
                             },
                             |digest: &str, max_bytes: usize| {
                                 get_ctr_content_blob(reaper, "moby", digest, max_bytes)
@@ -3713,17 +3712,22 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         }
                     };
                     let selected_platform = plan.selected_platform.clone();
+                    let expected_k8s_digest = k8s_img.map(|k| k.digest.as_str());
                     match containerd_grpc::publish_rewritten_image(
                         Path::new(CONTAINERD_SOCKET),
                         &name,
                         SOURCE_DIGEST_LABEL,
+                        expected_k8s_digest,
                         &plan,
                         Duration::from_secs(120),
                     ) {
                         Ok(_) => log(&format!(
                             "mirrored amd64 image {name} ({selected_platform}) as linux/{NATIVE_ARCH} (runs under emulation)"
                         )),
-                        Err(containerd_grpc::PublishError::SourceChanged { .. }) => {
+                        Err(
+                            containerd_grpc::PublishError::SourceChanged { .. }
+                            | containerd_grpc::PublishError::DestinationChanged { .. },
+                        ) => {
                             retry_refs.insert(name);
                         }
                         Err(containerd_grpc::PublishError::Failed(e)) => {
@@ -3907,15 +3911,30 @@ fn plan_sync_action(
                 };
             }
             if emulation && has_amd64 {
-                if let Some(k) = k8s
-                    && k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str())
-                {
-                    match k.platforms.as_deref() {
-                        None => SyncAction::Relist,
-                        Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
-                            SyncAction::Skip
+                if let Some(k) = k8s {
+                    if k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str()) {
+                        match k.platforms.as_deref() {
+                            None => SyncAction::Relist,
+                            Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
+                                SyncAction::Skip
+                            }
+                            Some(_) => SyncAction::MirrorRewrite,
                         }
-                        Some(_) => SyncAction::MirrorRewrite,
+                    } else if k.label(SOURCE_DIGEST_LABEL).is_some() {
+                        // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
+                        SyncAction::MirrorRewrite
+                    } else {
+                        // Unlabelled `k8s.io` image (e.g. pulled natively by kubelet):
+                        // preserve it whenever it already provides the native platform
+                        // so automatic sync never replaces a native Kubernetes tag with
+                        // an emulated amd64 rewrite.
+                        match k.platforms.as_deref() {
+                            None => SyncAction::Relist,
+                            Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
+                                SyncAction::Skip
+                            }
+                            Some(_) => SyncAction::MirrorRewrite,
+                        }
                     }
                 } else {
                     SyncAction::MirrorRewrite
@@ -4054,7 +4073,6 @@ trait MobyContentMeta {
 
 struct GrpcMobyMeta<'a> {
     client: &'a mut containerd_grpc::ContentInfoClient,
-    max_response_bytes: usize,
 }
 
 impl MobyContentMeta for GrpcMobyMeta<'_> {
@@ -4063,16 +4081,15 @@ impl MobyContentMeta for GrpcMobyMeta<'_> {
     }
 
     fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
-        self.client
-            .batch_blob_sizes("moby", digests, self.max_response_bytes)
+        self.client.batch_blob_sizes("moby", digests)
     }
 }
 
 /// Lazy, caching `moby` content-store adapter that resolves authoritative blob
-/// sizes via containerd's `Content.Info` (single digest) and digest-filtered
-/// `Content.List` (bounded batches) so unrelated blobs in `moby` never affect a
-/// rewrite. Rejects over-budget metadata blobs before running `ctr content get`,
-/// keeping the bounded stdout read as a backstop.
+/// sizes via direct digest-keyed `Content.Info` lookups (single and bounded
+/// batches; never `Content.List`) so unrelated blobs in `moby` never slow or
+/// block a rewrite. Rejects over-budget metadata blobs before running
+/// `ctr content get`, keeping the bounded stdout read as a backstop.
 struct MobyContentStore<M, F> {
     cache: HashMap<String, Option<u64>>,
     meta: M,
@@ -4913,6 +4930,49 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             SyncAction::MirrorRewrite
         );
 
+        // Emulation on: preserve an existing unlabelled native Kubernetes image
+        // (e.g. pulled natively by kubelet), re-list if its platform row drifted,
+        // and still upgrade an unlabelled amd64-only tag in k8s.io.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unrelated),
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        let k8s_unlabelled_drifted = CtrImage {
+            digest: "sha256:drifted".into(),
+            platforms: None,
+            labels: HashMap::new(),
+        };
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unlabelled_drifted),
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
+            SyncAction::Relist
+        );
+        let k8s_unlabelled_amd64 = ctr_img("sha256:legacy-amd64", "linux/amd64", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unlabelled_amd64),
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+
         // Emulation disabled for an amd64-only index: retire Katamaran's rewritten
         // alias instead of falling through to native export, and leave unrelated
         // Kubernetes images untouched (even if another label value contains commas).
@@ -5166,8 +5226,11 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         for i in 0..5_000u64 {
             sizes.insert(format!("sha256:unrelated{i:055}"), 16 << 10);
         }
-        let payloads =
-            HashMap::from([(root_d.clone(), root), (manifest_d, manifest), (cfg_d, cfg)]);
+        let payloads = HashMap::from([
+            (root_d.clone(), root),
+            (manifest_d.clone(), manifest),
+            (cfg_d, cfg),
+        ]);
 
         let mut fetched = Vec::new();
         let mut store = MobyContentStore::new(
@@ -5196,7 +5259,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 "expected Ready plan for complete sibling after 511 absent + oversized siblings"
             );
         };
-        assert_eq!(plan.layer_digests, vec![layer_d]);
+        assert_eq!(plan.layer_digests, vec![layer_d.clone()]);
         assert!(
             store.meta.queried.values().all(|&n| n == 1),
             "each inspected digest must be queried at most once"
@@ -5206,12 +5269,40 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 .meta
                 .batch_sizes
                 .iter()
-                .all(|&n| n > 0 && n <= containerd_grpc::CONTENT_LIST_BATCH_SIZE),
+                .all(|&n| n > 0 && n <= containerd_grpc::CONTENT_INFO_BATCH_SIZE),
             "batch sizes must stay bounded: {:?}",
             store.meta.batch_sizes
         );
         drop(store);
         assert!(!fetched.contains(&huge_a) && !fetched.contains(&huge_b));
+
+        // Small single-manifest 1-layer case (config + layer = 2 digests) also
+        // resolves via direct cached lookups without scanning unrelated blobs.
+        let mut small_store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: false,
+                fail_batch: false,
+            },
+            |digest: &str, _max: usize| {
+                payloads
+                    .get(digest)
+                    .cloned()
+                    .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
+            },
+        );
+        let oci_rewrite::PrepareRewrite::Ready(small_plan) =
+            oci_rewrite::prepare_rewrite_from_store(&manifest_d, "arm64", &mut small_store)
+                .unwrap()
+        else {
+            panic!("expected Ready plan for small single-manifest 1-layer image");
+        };
+        assert_eq!(small_plan.layer_digests, vec![layer_d]);
+        assert_eq!(small_store.meta.queried.len(), 3); // manifest, config, layer
+        assert!(small_store.meta.queried.values().all(|&n| n == 1));
+        assert_eq!(small_store.meta.batch_sizes, vec![2]); // [config, layer]
 
         // RPC errors on Content.Info must propagate instead of looking like RootMissing.
         let mut err_single_store = MobyContentStore::new(

@@ -9,15 +9,19 @@
 //!   `retire_image_if_unchanged`): verifies `moby`'s source digest and performs
 //!   an atomic compare-and-delete inside containerd's BoltDB write transaction,
 //!   leaving any concurrent replacement image untouched.
-//! - `Content.Info` / digest-filtered `Content.List`: resolves authoritative
-//!   blob sizes lazily or in bounded digest-filtered batches without enumerating
-//!   unrelated `moby` blobs.
+//! - `Content.Info`: resolves authoritative blob sizes via direct O(1)
+//!   digest-keyed lookups (never `Content.List`, which scans the entire
+//!   namespace in containerd v2.4.2) so unrelated `moby` blobs never slow or
+//!   block a rewrite.
 //! - Zero-copy rewritten image publication (`Leases.Create`/`Delete`,
-//!   `Content.Info`/`Write`/`Update`, `Images.Get`/`Create`/`Update`): links
+//!   `Content.Info`/`Write`/`Update`, `Images.Get`/`Delete`/`Create`): links
 //!   existing `moby` layer blobs into `k8s.io` through containerd's shared
 //!   content commit path without reading, transmitting, or copying layer bytes
 //!   to disk, writes only the rewritten config and manifest blobs with GC child
-//!   labels, re-checks the `moby` source digest, and publishes the tag.
+//!   labels, re-checks the `moby` source digest, and publishes the tag via
+//!   guarded `Images.Create` (or atomic compare-and-delete + `Images.Create`
+//!   when replacing a known `k8s.io` target) so concurrent native kubelet pulls
+//!   are never overwritten.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -60,8 +64,9 @@ const DEFAULT_UNARY_RESPONSE_LIMIT: usize = 1 << 20;
 /// Chunk size for streaming metadata blobs over `Content.Write` (fits well
 /// inside HTTP/2's default 65,535-byte window so each chunk round-trips cleanly).
 const CONTENT_WRITE_CHUNK: usize = 32_768;
-/// Maximum number of digest equality filters sent in a single `Content.List` RPC.
-pub const CONTENT_LIST_BATCH_SIZE: usize = 128;
+/// Maximum number of digest-keyed `Content.Info` lookups processed per chunk in
+/// [`ContentInfoClient::batch_blob_sizes`].
+pub const CONTENT_INFO_BATCH_SIZE: usize = 64;
 
 const GRPC_OK: &str = "0";
 const GRPC_NOT_FOUND: &str = "5";
@@ -125,6 +130,10 @@ pub enum PublishError {
     /// The `moby` source image was deleted or retagged before publication
     /// completed; no `k8s.io` image record was modified.
     SourceChanged { expected: String, actual: String },
+    /// The `k8s.io` destination tag changed concurrently (for example, created
+    /// or replaced by a native kubelet pull); the existing `k8s.io` tag was
+    /// left untouched.
+    DestinationChanged { expected: String, actual: String },
     /// Any other containerd gRPC, content, or I/O error.
     Failed(String),
 }
@@ -135,6 +144,10 @@ impl fmt::Display for PublishError {
             Self::SourceChanged { expected, actual } => write!(
                 f,
                 "source image digest changed before publish (expected {expected}, got {actual})"
+            ),
+            Self::DestinationChanged { expected, actual } => write!(
+                f,
+                "k8s.io destination digest changed before publish (expected {expected}, got {actual})"
             ),
             Self::Failed(msg) => f.write_str(msg),
         }
@@ -147,11 +160,16 @@ enum WriteOutcome {
     AlreadyExists,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateOutcome {
+    Created,
+    AlreadyExists,
+}
+
 struct GrpcResponse {
     grpc_status: String,
     grpc_message: String,
     messages: Vec<Vec<u8>>,
-    total_response_bytes: usize,
 }
 
 /// List all images in `namespace` via `/containerd.services.images.v1.Images/List`,
@@ -182,9 +200,10 @@ pub fn list_images(
     decode_list_images_response(body)
 }
 
-/// Reusable containerd gRPC client for lazy per-digest `Content.Info` and
-/// bounded digest-filtered `Content.List` metadata lookups over a single
-/// deadline-bounded Unix-socket HTTP/2 connection.
+/// Reusable containerd gRPC client for direct digest-keyed `Content.Info`
+/// metadata lookups over a single deadline-bounded Unix-socket HTTP/2
+/// connection (never calling `Content.List`, which scans the entire namespace
+/// in containerd v2.4.2).
 pub struct ContentInfoClient {
     conn: GrpcConn,
 }
@@ -213,18 +232,17 @@ impl ContentInfoClient {
     }
 
     /// Look up authoritative committed byte sizes for a batch of digests in
-    /// `namespace`, returning ONLY the subset of digests that exist locally.
+    /// `namespace` via direct digest-keyed `Content.Info` RPCs in bounded
+    /// chunks of [`CONTENT_INFO_BATCH_SIZE`], returning ONLY the subset of
+    /// digests that exist locally.
     ///
-    /// Invalid digest strings are ignored locally; a single valid digest uses
-    /// O(1) `Content.Info`; larger batches query `/containerd.services.content.v1.Content/List`
-    /// in chunks of at most [`CONTENT_LIST_BATCH_SIZE`] `digest=="..."` filters
-    /// bounded by `max_response_bytes` across all chunks and by this client's
-    /// shared connection deadline.
+    /// Invalid digest strings are skipped locally, duplicates are queried once,
+    /// `NOT_FOUND` omits the digest, and all other RPC or shared-deadline
+    /// failures propagate immediately. Never calls `Content.List`.
     pub fn batch_blob_sizes(
         &mut self,
         namespace: &str,
         digests: &[&str],
-        max_response_bytes: usize,
     ) -> Result<HashMap<String, u64>, String> {
         let mut seen = HashSet::new();
         let mut valid: Vec<&str> = Vec::new();
@@ -233,33 +251,12 @@ impl ContentInfoClient {
                 valid.push(digest);
             }
         }
-        if valid.is_empty() {
-            return Ok(HashMap::new());
-        }
-        if valid.len() == 1 {
-            let mut out = HashMap::new();
-            if let Some(size) = self.blob_size(namespace, valid[0])? {
-                out.insert(valid[0].to_string(), size);
-            }
-            return Ok(out);
-        }
-
-        let mut remaining_bytes = max_response_bytes;
         let mut out = HashMap::new();
-        for chunk in valid.chunks(CONTENT_LIST_BATCH_SIZE) {
-            let filters: Vec<String> = chunk.iter().map(|d| format!("digest==\"{d}\"")).collect();
-            let (infos, bytes_read) =
-                self.conn
-                    .list_content_filtered(namespace, &filters, remaining_bytes)?;
-            remaining_bytes = remaining_bytes.saturating_sub(bytes_read);
-            for info in infos {
-                if !seen.contains(info.digest.as_str()) {
-                    continue;
+        for chunk in valid.chunks(CONTENT_INFO_BATCH_SIZE) {
+            for &digest in chunk {
+                if let Some(size) = self.blob_size(namespace, digest)? {
+                    out.insert(digest.to_string(), size);
                 }
-                let size = u64::try_from(info.size).map_err(|_| {
-                    format!("invalid negative size {} for {}", info.size, info.digest)
-                })?;
-                out.insert(info.digest, size);
             }
         }
         Ok(out)
@@ -333,12 +330,22 @@ pub fn retire_image_if_unchanged(
 /// the rewritten config and manifest blobs are written (with containerd GC
 /// child labels on the manifest), the `moby` source image digest is verified
 /// both before and immediately prior to image publication, and a temporary
-/// lease protects in-flight metadata from GC until `Images.Create`/`Update`
+/// lease protects in-flight metadata from GC until guarded publication
 /// completes.
+///
+/// `expected_k8s_digest` prevents overwriting concurrent Kubernetes image pulls:
+/// - `None`: publishes strictly via `Images.Create`; if the tag already exists
+///   (e.g. a concurrent native kubelet pull), returns
+///   [`PublishError::DestinationChanged`] without touching `k8s.io`.
+/// - `Some(digest)`: verifies `k8s.io` still points to `digest`, atomically
+///   compare-and-deletes `digest` via `Images.Delete(target = digest)`, and
+///   creates the new record via `Images.Create` (never unconditional
+///   `Images.Update`).
 pub fn publish_rewritten_image(
     socket_path: &Path,
     name: &str,
     source_digest_label: &str,
+    expected_k8s_digest: Option<&str>,
     plan: &RewritePlan,
     timeout: Duration,
 ) -> Result<Rewritten, PublishError> {
@@ -350,6 +357,11 @@ pub fn publish_rewritten_image(
     if is_digest_reference(name) {
         return Err(PublishError::Failed(format!(
             "refusing to rewrite digest-qualified image reference {name}; tag it locally first"
+        )));
+    }
+    if matches!(expected_k8s_digest, Some("")) {
+        return Err(PublishError::Failed(format!(
+            "refusing to publish {name} with empty expected k8s.io target digest"
         )));
     }
 
@@ -397,6 +409,7 @@ pub fn publish_rewritten_image(
         &mut conn,
         name,
         source_digest_label,
+        expected_k8s_digest,
         plan,
         &unique_layers,
         &lease_id,
@@ -418,6 +431,7 @@ fn publish_under_lease(
     conn: &mut GrpcConn,
     name: &str,
     source_digest_label: &str,
+    expected_k8s_digest: Option<&str>,
     plan: &RewritePlan,
     unique_layers: &[(&str, i64)],
     lease_id: &str,
@@ -496,7 +510,9 @@ fn publish_under_lease(
     //    rewritten metadata.
     verify_moby_source_digest(conn, name, &plan.source_digest)?;
 
-    // 8. Create or update the `k8s.io` image record.
+    // 8. Guarded publication of the `k8s.io` image record (never unconditional
+    //    `Images.Update`, so a concurrent native kubelet pull cannot be
+    //    overwritten).
     let manifest_size = i64::try_from(plan.new_manifest_bytes.len())
         .map_err(|_| PublishError::Failed("rewritten manifest size overflows i64".into()))?;
     let image = ContainerdImage {
@@ -508,8 +524,77 @@ fn publish_under_lease(
             size: manifest_size,
         },
     };
-    conn.upsert_image("k8s.io", Some(lease_id), &image)
-        .map_err(PublishError::Failed)?;
+    match expected_k8s_digest {
+        None => match conn
+            .create_image("k8s.io", Some(lease_id), &image)
+            .map_err(PublishError::Failed)?
+        {
+            CreateOutcome::Created => {}
+            CreateOutcome::AlreadyExists => {
+                return Err(PublishError::DestinationChanged {
+                    expected: "<absent>".into(),
+                    actual: "<exists>".into(),
+                });
+            }
+        },
+        Some(expected_k8s) => {
+            match conn
+                .get_image("k8s.io", name)
+                .map_err(PublishError::Failed)?
+            {
+                Some(cur)
+                    if cur.target.digest == manifest_digest
+                        && cur.labels.get(source_digest_label).map(String::as_str)
+                            == Some(plan.source_digest.as_str()) =>
+                {
+                    return Ok(Rewritten {
+                        manifest: manifest_digest,
+                        config: config_digest,
+                    });
+                }
+                Some(cur) if cur.target.digest != expected_k8s => {
+                    return Err(PublishError::DestinationChanged {
+                        expected: expected_k8s.to_string(),
+                        actual: cur.target.digest,
+                    });
+                }
+                None => {
+                    return Err(PublishError::DestinationChanged {
+                        expected: expected_k8s.to_string(),
+                        actual: "<deleted>".into(),
+                    });
+                }
+                Some(_) => {}
+            }
+
+            // Atomic BoltDB compare-and-delete on `expected_k8s`, followed by
+            // `Images.Create` under `lease_id`.
+            match conn
+                .delete_image_if_target_matches("k8s.io", name, expected_k8s)
+                .map_err(PublishError::Failed)?
+            {
+                DeleteOutcome::Deleted => {}
+                DeleteOutcome::NotFoundOrChanged => {
+                    return Err(PublishError::DestinationChanged {
+                        expected: expected_k8s.to_string(),
+                        actual: "<changed>".into(),
+                    });
+                }
+            }
+            match conn
+                .create_image("k8s.io", Some(lease_id), &image)
+                .map_err(PublishError::Failed)?
+            {
+                CreateOutcome::Created => {}
+                CreateOutcome::AlreadyExists => {
+                    return Err(PublishError::DestinationChanged {
+                        expected: expected_k8s.to_string(),
+                        actual: "<exists>".into(),
+                    });
+                }
+            }
+        }
+    }
 
     Ok(Rewritten {
         manifest: manifest_digest,
@@ -750,7 +835,6 @@ impl GrpcConn {
             grpc_status,
             grpc_message: std::mem::take(&mut state.grpc_message),
             messages: std::mem::take(&mut state.messages),
-            total_response_bytes: state.total_response_bytes,
         })
     }
 
@@ -963,12 +1047,12 @@ impl GrpcConn {
         }
     }
 
-    fn upsert_image(
+    fn create_image(
         &mut self,
         namespace: &str,
         lease: Option<&str>,
         image: &ContainerdImage,
-    ) -> Result<(), String> {
+    ) -> Result<CreateOutcome, String> {
         let create_req = encode_create_image_request(image);
         let resp = self.unary_rpc(
             "/containerd.services.images.v1.Images/Create",
@@ -978,46 +1062,10 @@ impl GrpcConn {
             DEFAULT_UNARY_RESPONSE_LIMIT,
         )?;
         match resp.grpc_status.as_str() {
-            GRPC_OK => return Ok(()),
-            GRPC_ALREADY_EXISTS => {}
-            code => {
-                return Err(format!(
-                    "containerd Images.Create {} ({namespace}) failed (grpc-status {code}): {}",
-                    image.name, resp.grpc_message
-                ));
-            }
-        }
-
-        let update_req = encode_update_image_request(image, &["target", "labels"]);
-        let resp = self.unary_rpc(
-            "/containerd.services.images.v1.Images/Update",
-            namespace,
-            lease,
-            &update_req,
-            DEFAULT_UNARY_RESPONSE_LIMIT,
-        )?;
-        match resp.grpc_status.as_str() {
-            GRPC_OK => Ok(()),
-            GRPC_NOT_FOUND => {
-                // Concurrently deleted between Create and Update; retry Create once.
-                let retry = self.unary_rpc(
-                    "/containerd.services.images.v1.Images/Create",
-                    namespace,
-                    lease,
-                    &create_req,
-                    DEFAULT_UNARY_RESPONSE_LIMIT,
-                )?;
-                if retry.grpc_status == GRPC_OK {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "containerd Images.Create retry {} ({namespace}) failed (grpc-status {}): {}",
-                        image.name, retry.grpc_status, retry.grpc_message
-                    ))
-                }
-            }
+            GRPC_OK => Ok(CreateOutcome::Created),
+            GRPC_ALREADY_EXISTS => Ok(CreateOutcome::AlreadyExists),
             code => Err(format!(
-                "containerd Images.Update {} ({namespace}) failed (grpc-status {code}): {}",
+                "containerd Images.Create {} ({namespace}) failed (grpc-status {code}): {}",
                 image.name, resp.grpc_message
             )),
         }
@@ -1094,38 +1142,6 @@ impl GrpcConn {
                 resp.grpc_message
             )),
         }
-    }
-
-    fn list_content_filtered(
-        &mut self,
-        namespace: &str,
-        filters: &[String],
-        max_response_bytes: usize,
-    ) -> Result<(Vec<ContentInfo>, usize), String> {
-        // Containerd's filters.ParseAll() with zero filters matches every blob
-        // in the namespace; refuse empty filter lists here as defense in depth.
-        if filters.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        let req = encode_list_content_request(filters);
-        let resp = self.unary_rpc(
-            "/containerd.services.content.v1.Content/List",
-            namespace,
-            None,
-            &req,
-            max_response_bytes,
-        )?;
-        if resp.grpc_status != GRPC_OK {
-            return Err(format!(
-                "containerd Content.List ({namespace}) failed (grpc-status {}): {}",
-                resp.grpc_status, resp.grpc_message
-            ));
-        }
-        let mut infos = Vec::new();
-        for msg in &resp.messages {
-            infos.extend(decode_list_content_response(msg)?);
-        }
-        Ok((infos, resp.total_response_bytes))
     }
 
     fn update_content_labels(
@@ -1457,9 +1473,8 @@ const WRITE_ACTION_WRITE: u64 = 1;
 const WRITE_ACTION_COMMIT: u64 = 2;
 
 /// True when `digest` matches the OCI `<algorithm>:<encoded>` grammar
-/// (`[a-z0-9+._-]+:[a-zA-Z0-9=_-]+`) so it can safely appear inside a quoted
-/// containerd filter expression (`digest=="..."`) without escapes or syntax
-/// errors. Invalid digests cannot exist in containerd's content store.
+/// (`[a-z0-9+._-]+:[a-zA-Z0-9=_-]+`). Invalid digests cannot exist in
+/// containerd's content store and are skipped locally without an RPC.
 fn is_valid_oci_digest(digest: &str) -> bool {
     let Some((algo, encoded)) = digest.split_once(':') else {
         return false;
@@ -1472,16 +1487,6 @@ fn is_valid_oci_digest(digest: &str) -> bool {
         && encoded
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b'_' | b'-'))
-}
-
-/// Encode `containerd.services.content.v1.ListContentRequest`:
-/// - field 1 (repeated string): `filters`
-fn encode_list_content_request(filters: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for f in filters {
-        encode_proto_bytes(&mut out, 1, f.as_bytes());
-    }
-    out
 }
 
 /// Encode `containerd.services.images.v1.DeleteImageRequest`:
@@ -1529,29 +1534,10 @@ fn encode_image(img: &ContainerdImage) -> Vec<u8> {
     out
 }
 
-fn encode_field_mask(paths: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for path in paths {
-        encode_proto_bytes(&mut out, 1, path.as_bytes());
-    }
-    out
-}
-
 fn encode_create_image_request(img: &ContainerdImage) -> Vec<u8> {
     let mut out = Vec::new();
     let encoded_img = encode_image(img);
     encode_proto_bytes(&mut out, 1, &encoded_img);
-    out
-}
-
-fn encode_update_image_request(img: &ContainerdImage, mask_paths: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let encoded_img = encode_image(img);
-    encode_proto_bytes(&mut out, 1, &encoded_img);
-    if !mask_paths.is_empty() {
-        let mask = encode_field_mask(mask_paths);
-        encode_proto_bytes(&mut out, 2, &mask);
-    }
     out
 }
 
@@ -1858,24 +1844,6 @@ fn decode_content_info_response(mut data: &[u8]) -> Result<Option<ContentInfo>, 
         }
     }
     Ok(info)
-}
-
-fn decode_list_content_response(mut data: &[u8]) -> Result<Vec<ContentInfo>, String> {
-    let mut infos = Vec::new();
-    while !data.is_empty() {
-        let (tag, rest) = decode_varint(data)?;
-        let field = tag >> 3;
-        let wt = tag & 0x7;
-        match (field, wt) {
-            (1, 2) => {
-                let (bytes, next) = decode_len_delimited(rest)?;
-                infos.push(decode_content_info(bytes)?);
-                data = next;
-            }
-            _ => data = skip_proto_field(wt, rest)?,
-        }
-    }
-    Ok(infos)
 }
 
 /// Decode `containerd.services.leases.v1.CreateResponse`:
@@ -3068,14 +3036,15 @@ mod tests {
         total_disk_bytes_written: i64,
         /// Optional hook: mutate `moby` target right after manifest write commits.
         mutate_moby_after_manifest: Option<(String, String)>,
-        /// Last `Images.Update` field mask received.
-        last_update_mask: Vec<String>,
+        /// Optional hook: insert or replace a `k8s.io` image right after manifest write commits.
+        mutate_k8s_after_manifest: Option<ContainerdImage>,
+        /// Count of `Images.Update` RPCs received (must remain 0 under CAS publish).
+        images_update_calls: usize,
         /// Optional image name that triggers a gRPC INTERNAL error on `Images.Get`.
         fail_get_image: Option<String>,
-        /// Call counters for verifying lazy vs batched content metadata queries.
+        /// Call counters for verifying direct `Content.Info` vs `Content.List`.
         content_info_calls: usize,
         content_list_calls: usize,
-        content_list_batch_sizes: Vec<usize>,
     }
 
     fn spawn_mock_containerd(
@@ -3257,12 +3226,22 @@ mod tests {
                                         if wreq
                                             .labels
                                             .contains_key("containerd.io/gc.ref.content.config")
-                                            && let Some((moby_name, new_digest)) =
-                                                st.mutate_moby_after_manifest.take()
-                                            && let Some(img) =
-                                                st.images.get_mut(&("moby".into(), moby_name))
                                         {
-                                            img.target.digest = new_digest;
+                                            if let Some((moby_name, new_digest)) =
+                                                st.mutate_moby_after_manifest.take()
+                                                && let Some(img) =
+                                                    st.images.get_mut(&("moby".into(), moby_name))
+                                            {
+                                                img.target.digest = new_digest;
+                                            }
+                                            if let Some(k8s_img) =
+                                                st.mutate_k8s_after_manifest.take()
+                                            {
+                                                st.images.insert(
+                                                    ("k8s.io".into(), k8s_img.name.clone()),
+                                                    k8s_img,
+                                                );
+                                            }
                                         }
                                         drop(st);
                                         let mut resp_msg = Vec::new();
@@ -3382,13 +3361,15 @@ mod tests {
                                     }
                                 }
                                 "/containerd.services.images.v1.Images/Update" => {
-                                    let (img, mask) = decode_image_and_mask(&req_proto);
+                                    st.images_update_calls += 1;
+                                    let (img, _) = decode_image_and_mask(&req_proto);
                                     let key = (ns.clone(), img.name.clone());
-                                    if st.images.contains_key(&key) {
-                                        st.last_update_mask = mask;
+                                    if let std::collections::hash_map::Entry::Occupied(mut e) =
+                                        st.images.entry(key)
+                                    {
                                         let mut out = Vec::new();
                                         encode_proto_bytes(&mut out, 1, &encode_image(&img));
-                                        st.images.insert(key, img);
+                                        e.insert(img);
                                         send_grpc_ok(&mut conn, sid, &out);
                                     } else {
                                         send_grpc_err(&mut conn, sid, "5", "not%20found");
@@ -3433,7 +3414,6 @@ mod tests {
                                 "/containerd.services.content.v1.Content/List" => {
                                     let filters = decode_repeated_strings(&req_proto);
                                     st.content_list_calls += 1;
-                                    st.content_list_batch_sizes.push(filters.len());
 
                                     let mut wanted: Option<HashSet<String>> = None;
                                     let mut parse_err: Option<&str> = None;
@@ -3641,7 +3621,8 @@ mod tests {
     /// headroom is only 1 MiB (enough for rewritten metadata, far less than a
     /// second copy of the layer) must succeed by linking the shared layer blob
     /// with zero bytes copied, setting GC child labels, and cleaning up its
-    /// temporary lease. Also exercises idempotent re-publish via `Images.Update`.
+    /// temporary lease. Also exercises idempotent re-publish and guarded CAS
+    /// replacement without calling `Images.Update`.
     #[test]
     fn publish_rewritten_image_links_10gib_layer_zero_copy_under_1mib_disk_headroom() {
         let (dir, sock) = temp_sock("zero-copy");
@@ -3678,12 +3659,13 @@ mod tests {
             ..Default::default()
         }));
 
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 3, 65_535);
 
         let rewritten = publish_rewritten_image(
             &sock,
             "docker.io/library/huge:dev",
             "io.katamaran.k8s.source-digest",
+            None,
             &plan,
             Duration::from_secs(5),
         )
@@ -3740,19 +3722,153 @@ mod tests {
         }
 
         // Second publish when manifest/config/layers already exist in k8s.io
-        // exercises ALREADY_EXISTS + Content.Update + Images.Update(target, labels).
+        // exercises ALREADY_EXISTS + Content.Update + idempotent k8s.io check.
         publish_rewritten_image(
             &sock,
             "docker.io/library/huge:dev",
             "io.katamaran.k8s.source-digest",
+            Some(&rewritten.manifest),
             &plan,
             Duration::from_secs(5),
         )
         .unwrap();
-        assert_eq!(
-            state.lock().unwrap().last_update_mask,
-            vec!["target".to_string(), "labels".to_string()]
+
+        // Third publish replacing an older Katamaran mirror digest uses atomic
+        // compare-and-delete + Create (never unconditional Images.Update).
+        {
+            let mut st = state.lock().unwrap();
+            let k8s_img = st
+                .images
+                .get_mut(&("k8s.io".into(), "docker.io/library/huge:dev".into()))
+                .unwrap();
+            k8s_img.target.digest = "sha256:stale-mirror".into();
+        }
+        publish_rewritten_image(
+            &sock,
+            "docker.io/library/huge:dev",
+            "io.katamaran.k8s.source-digest",
+            Some("sha256:stale-mirror"),
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.images_update_calls, 0);
+            assert_eq!(
+                st.images[&("k8s.io".into(), "docker.io/library/huge:dev".into())]
+                    .target
+                    .digest,
+                rewritten.manifest
+            );
+        }
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: a concurrent native kubelet pull in `k8s.io` must NEVER
+    /// be overwritten by `publish_rewritten_image` (neither when `k8s.io` was
+    /// initially absent nor when replacing a prior mirror digest).
+    #[test]
+    fn publish_rewritten_image_preserves_concurrent_native_k8s_tag_without_update() {
+        let (dir, sock) = temp_sock("dest-changed");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "e".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
         );
+        let native_kubelet = ContainerdImage {
+            name: "docker.io/library/app:dev".into(),
+            labels: HashMap::from([("io.cri-containerd.image".into(), "managed".into())]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:native-kubelet-arm64".into(),
+                size: 512,
+            },
+        };
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([(
+                ("moby".into(), "docker.io/library/app:dev".into()),
+                ContainerdImage {
+                    name: "docker.io/library/app:dev".into(),
+                    labels: HashMap::new(),
+                    target: Descriptor {
+                        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                        digest: "sha256:source-amd64".into(),
+                        size: 128,
+                    },
+                },
+            )]),
+            remaining_disk_bytes: 1 << 20,
+            mutate_k8s_after_manifest: Some(native_kubelet.clone()),
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+
+        // Case 1: k8s.io tag was absent when sync listed it, and kubelet pulled
+        // a native arm64 tag before Images.Create ran -> DestinationChanged!
+        let err = publish_rewritten_image(
+            &sock,
+            "docker.io/library/app:dev",
+            "io.katamaran.k8s.source-digest",
+            None,
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PublishError::DestinationChanged { .. }),
+            "expected DestinationChanged, got {err:?}"
+        );
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.images_update_calls, 0);
+            assert!(st.leases.is_empty());
+            assert_eq!(
+                st.images[&("k8s.io".into(), "docker.io/library/app:dev".into())]
+                    .target
+                    .digest,
+                "sha256:native-kubelet-arm64",
+                "concurrent native kubelet pull must remain untouched"
+            );
+        }
+
+        // Case 2: sync expected to replace `sha256:old-mirror`, but kubelet
+        // already replaced it with `sha256:native-kubelet-arm64` -> DestinationChanged!
+        let err = publish_rewritten_image(
+            &sock,
+            "docker.io/library/app:dev",
+            "io.katamaran.k8s.source-digest",
+            Some("sha256:old-mirror"),
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PublishError::DestinationChanged {
+                expected: "sha256:old-mirror".into(),
+                actual: "sha256:native-kubelet-arm64".into(),
+            }
+        );
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.images_update_calls, 0);
+            assert!(st.leases.is_empty());
+            assert_eq!(
+                st.images[&("k8s.io".into(), "docker.io/library/app:dev".into())]
+                    .target
+                    .digest,
+                "sha256:native-kubelet-arm64"
+            );
+        }
 
         server.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -3799,6 +3915,7 @@ mod tests {
             &sock,
             "docker.io/library/app:dev",
             "io.katamaran.k8s.source-digest",
+            None,
             &plan,
             Duration::from_secs(5),
         )
@@ -3865,6 +3982,7 @@ mod tests {
             &sock,
             "docker.io/library/bigcfg:dev",
             "io.katamaran.k8s.source-digest",
+            None,
             &plan,
             Duration::from_secs(5),
         )
@@ -3887,6 +4005,7 @@ mod tests {
             &sock,
             &format!("docker.io/library/app@sha256:{}", "e".repeat(64)),
             "io.katamaran.k8s.source-digest",
+            None,
             &plan,
             Duration::from_secs(1),
         )
@@ -3940,6 +4059,7 @@ mod tests {
             &sock,
             "docker.io/library/app:dev",
             "io.katamaran.k8s.source-digest",
+            None,
             &plan,
             Duration::from_secs(5),
         )
@@ -4000,14 +4120,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Regression test: `ContentInfoClient::batch_blob_sizes` uses direct
+    /// digest-keyed `Content.Info` lookups (NEVER `Content.List`) for both small
+    /// batches (such as a one-layer manifest's config + layer) and large runs of
+    /// 511+ absent index siblings, preserving deduplication, `NOT_FOUND`
+    /// omission, and explicit propagation of non-`NOT_FOUND` RPC errors.
     #[test]
-    fn content_info_client_batch_blob_sizes_filters_digests_across_batches() {
+    fn content_info_client_batch_blob_sizes_uses_direct_info_without_content_list() {
         let (dir, sock) = temp_sock("batch");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let mut ns_content = HashMap::new();
-        // Populate 500 unrelated blobs with padded labels; filtered batch
-        // queries must return ONLY matching requested digests.
+        // Populate 500 unrelated blobs with padded labels; direct Content.Info
+        // lookups must never scan them or call Content.List.
         for i in 0..500u64 {
             ns_content.insert(
                 ("moby".into(), format!("sha256:0000{i:060x}")),
@@ -4031,83 +4156,77 @@ mod tests {
             ns_content,
             ..Default::default()
         }));
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
 
         let mut client = ContentInfoClient::connect(&sock, Duration::from_secs(5)).unwrap();
 
-        // 297 absent digests + 3 present digests + duplicate + malformed digest string
-        // -> 300 unique valid digests -> 3 bounded Content.List batches (128 + 128 + 44).
-        let absent: Vec<String> = (0..297u64)
+        // 1. Small multi-digest batch (e.g. a 1-layer manifest's config + layer):
+        //    resolves via direct Content.Info with zero Content.List calls.
+        let small = client
+            .batch_blob_sizes("moby", &[hit_a.as_str(), hit_b.as_str()])
+            .unwrap();
+        assert_eq!(small.len(), 2);
+        assert_eq!(small.get(&hit_a).copied(), Some(111));
+        assert_eq!(small.get(&hit_b).copied(), Some(222));
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(
+                st.content_list_calls, 0,
+                "small batch must never call Content.List"
+            );
+            assert_eq!(st.content_info_calls, 2);
+        }
+
+        // 2. Large batch with 511 absent digests + 3 present digests + duplicate
+        //    + invalid digest strings -> 514 unique valid Content.Info calls,
+        //    zero Content.List calls.
+        let absent: Vec<String> = (0..511u64)
             .map(|i| format!("sha256:eeee{i:060x}"))
             .collect();
         let mut query: Vec<&str> = Vec::new();
         query.push("not-a-valid-digest");
         query.push("sha256:bad\"quote");
-        query.push(&hit_a);
-        for d in &absent[..150] {
+        for d in &absent[..256] {
             query.push(d.as_str());
         }
+        query.push(&hit_a);
         query.push(&hit_b);
         query.push(&hit_b); // duplicate should be deduplicated
-        for d in &absent[150..] {
+        for d in &absent[256..] {
             query.push(d.as_str());
         }
         query.push(&hit_c);
 
-        let got = client.batch_blob_sizes("moby", &query, 1 << 20).unwrap();
+        let got = client.batch_blob_sizes("moby", &query).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got.get(&hit_a).copied(), Some(111));
         assert_eq!(got.get(&hit_b).copied(), Some(222));
         assert_eq!(got.get(&hit_c).copied(), Some(333));
 
-        // All-absent batch returns empty map cleanly (zero DATA frames / trailers-only).
+        // 3. All-absent batch returns empty map cleanly with zero Content.List calls.
         let absent_only: Vec<&str> = absent[..4].iter().map(String::as_str).collect();
         assert!(
             client
-                .batch_blob_sizes("moby", &absent_only, 1 << 20)
+                .batch_blob_sizes("moby", &absent_only)
                 .unwrap()
                 .is_empty()
         );
 
-        // Single valid digest uses O(1) Content.Info instead of Content.List.
-        let single = client
-            .batch_blob_sizes("moby", &[hit_a.as_str()], 1 << 20)
-            .unwrap();
-        assert_eq!(single.get(&hit_a).copied(), Some(111));
-
-        // RPC errors propagate explicitly.
+        // 4. Non-NOT_FOUND RPC errors propagate explicitly.
         let err = client
-            .batch_blob_sizes(
-                "moby",
-                &[hit_a.as_str(), "sha256:trigger-rpc-error"],
-                1 << 20,
-            )
+            .batch_blob_sizes("moby", &[hit_a.as_str(), "sha256:trigger-rpc-error"])
             .unwrap_err();
         assert!(err.contains("grpc-status 13"), "{err}");
-        assert!(err.contains("bolt list error"), "{err}");
+        assert!(err.contains("bolt read error"), "{err}");
         drop(client);
 
-        // Response-byte cap is enforced explicitly on matching responses.
-        let mut tight = ContentInfoClient::connect(&sock, Duration::from_secs(5)).unwrap();
-        let err = tight
-            .batch_blob_sizes("moby", &[hit_a.as_str(), hit_c.as_str()], 256)
-            .unwrap_err();
-        assert!(err.contains("exceeded"), "{err}");
-        drop(tight);
-
         let st = state.lock().unwrap();
-        assert_eq!(st.content_info_calls, 1);
-        assert!(
-            st.content_list_batch_sizes
-                .iter()
-                .all(|&n| n > 0 && n <= CONTENT_LIST_BATCH_SIZE),
-            "every Content.List batch must be non-empty and <= {CONTENT_LIST_BATCH_SIZE}: {:?}",
-            st.content_list_batch_sizes
-        );
         assert_eq!(
-            &st.content_list_batch_sizes[..3],
-            &[CONTENT_LIST_BATCH_SIZE, CONTENT_LIST_BATCH_SIZE, 44]
+            st.content_list_calls, 0,
+            "batch_blob_sizes must never trigger a full-namespace Content.List scan"
         );
+        // 2 (small) + 514 (large unique valid) + 4 (absent_only) + 2 (error test)
+        assert_eq!(st.content_info_calls, 522);
         drop(st);
 
         server.join().unwrap();
