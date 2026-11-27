@@ -321,4 +321,73 @@ mod tests {
         assert_eq!(diff(&now, &now), (vec![], vec![]));
         assert_eq!(diff(&BTreeSet::new(), &now), (vec![80, 8080, 9000], vec![]));
     }
+
+    #[test]
+    fn sock_diag_and_proc_extract_real_socket_inode() {
+        use std::net::TcpListener;
+        use std::os::fd::AsRawFd;
+
+        let listener_v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_v4 = listener_v4.local_addr().unwrap().port();
+        let fd_v4 = listener_v4.as_raw_fd();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd_v4, &mut st) }, 0);
+        let inode_v4 = u32::try_from(st.st_ino).expect("socket inode fits u32");
+        assert_ne!(inode_v4, 0);
+
+        // Verify /proc/self/fd/<fd> reports the same socket:[inode] link format
+        // that docker-proxy fd inspection parses.
+        let link = fs::read_link(format!("/proc/self/fd/{fd_v4}")).unwrap();
+        assert_eq!(
+            crate::autofwd::socket_inode(link.as_os_str().as_encoded_bytes()),
+            Some(inode_v4)
+        );
+
+        let expected_v4 = Listener {
+            addr: "127.0.0.1".parse().unwrap(),
+            port: port_v4,
+            inode: inode_v4,
+        };
+
+        // Real /proc/net/tcp parsing matches the live kernel socket inode.
+        let proc_root = listening_proc();
+        assert!(
+            proc_root.loopback.contains(&expected_v4),
+            "expected {expected_v4:?} in /proc/net/tcp loopback listeners: {:?}",
+            proc_root.loopback
+        );
+
+        // Real NETLINK_SOCK_DIAG dump matches the live kernel inet_diag_msg
+        // layout (idiag_inode at offset 68) and produces the exact same inode.
+        let diag_fd = autofwd::diag_socket().expect("open NETLINK_SOCK_DIAG");
+        let mut seq = 0u32;
+        let mut buf = vec![0u8; 32 << 10];
+        let diag_root = RootListeners::from_listeners(
+            autofwd::listeners(&diag_fd, &mut seq, &mut buf).expect("sock_diag dump"),
+        );
+        assert!(
+            diag_root.loopback.contains(&expected_v4),
+            "expected {expected_v4:?} in sock_diag loopback listeners: {:?}",
+            diag_root.loopback
+        );
+
+        // Also check IPv6 ::1 when available in the test namespace.
+        if let Ok(listener_v6) = TcpListener::bind("[::1]:0") {
+            let port_v6 = listener_v6.local_addr().unwrap().port();
+            let fd_v6 = listener_v6.as_raw_fd();
+            let mut st6: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd_v6, &mut st6) }, 0);
+            let inode_v6 = u32::try_from(st6.st_ino).expect("ipv6 socket inode fits u32");
+            let expected_v6 = Listener {
+                addr: "::1".parse().unwrap(),
+                port: port_v6,
+                inode: inode_v6,
+            };
+            assert!(listening_proc().loopback.contains(&expected_v6));
+            let diag_root6 = RootListeners::from_listeners(
+                autofwd::listeners(&diag_fd, &mut seq, &mut buf).expect("sock_diag dump v6"),
+            );
+            assert!(diag_root6.loopback.contains(&expected_v6));
+        }
+    }
 }

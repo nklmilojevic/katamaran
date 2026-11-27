@@ -262,7 +262,10 @@ pub const IPPROTO_TCP: u8 = 6;
 pub const TCP_LISTEN: u32 = 10;
 /// `struct inet_diag_req_v2`.
 const REQ_LEN: usize = 56;
-/// `struct inet_diag_msg`.
+/// `struct inet_diag_msg` (Linux UAPI `include/uapi/linux/inet_diag.h`, 72 bytes):
+/// family(0), state(1), timer(2), retrans(3), inet_diag_sockid(4..52: sport 4..6,
+/// dport 6..8, src 8..24, dst 24..40, if 40..44, cookie 44..52), expires(52..56),
+/// rqueue(56..60), wqueue(60..64), uid(64..68), idiag_inode(68..72).
 const MSG_LEN: usize = 72;
 pub const REQUEST_LEN: usize = NLMSG_HDR + REQ_LEN;
 
