@@ -257,7 +257,7 @@ Flags that Katamaran manages internally (`--data-dir`/`-d`, `--write-kubeconfig`
 
 ### Use a `k3s` config file (`~/.katamaran/k3s-config.yaml`)
 
-If `~/.katamaran/k3s-config.yaml` (or `$KATAMARAN_HOME/k3s-config.yaml`) exists on your Mac, katamaran copies it to `/var/lib/katamaran/k3s/config.yaml` (mode `0600`) inside the guest and selects it with `K3S_CONFIG_FILE` before starting `k3s server`. If you later remove the host file, katamaran removes only that managed copy and leaves any manually managed `/etc/rancher/k3s/config.yaml` inside the guest untouched:
+If `~/.katamaran/k3s-config.yaml` (or `$KATAMARAN_HOME/k3s-config.yaml`) exists on your Mac, katamaran validates it when Kubernetes starts, writes an equivalent normalized copy to `/var/lib/katamaran/k3s/config.yaml` (mode `0600`) inside the guest, and selects it with `K3S_CONFIG_FILE` before starting `k3s server`. If you later remove the host file, katamaran removes only that managed copy and leaves any manually managed `/etc/rancher/k3s/config.yaml` inside the guest untouched:
 
 ```yaml
 disable:
@@ -266,7 +266,16 @@ kube-apiserver-arg:
   - "service-node-port-range=30000-32767"
 ```
 
-For scalar settings, Katamaran's CLI flags take precedence over the synced YAML config. For repeatable flags such as `kubelet-arg`, `k3s` reads the YAML entries first and then appends CLI entries. The `+` suffix is for merging values across YAML files, not for appending to CLI flags.
+For scalar settings, Katamaran's CLI flags take precedence over the synced YAML config. For repeatable flags such as `kubelet-arg`, `k3s` reads the YAML entries first and then appends CLI entries. A repeated key replaces the earlier value and a `key+:` entry appends to it, as in `k3s`; the `+` suffix does not append to CLI flags.
+
+katamaran accepts a well-defined subset of YAML, which covers ordinary `k3s` configs, and rejects anything else with an error naming the line (never the value):
+
+- One `key: value` per line at the start of the line, with `#` comments and an optional leading `---`. Keys are plain `k3s` flag names, optionally ending in `+`.
+- A value is a single-line scalar, a single-line list (`[a, "b"]`), or a list of single-line scalars written as `- item` lines.
+- Scalars are unquoted, `'single-quoted'` (`''` for a literal `'`), or `"double-quoted"` without backslash escapes. Quote values that YAML would otherwise read as a boolean, number or date — such as `yes`, `on`, `0644`, `1e3` or `2024-01-01`. Unquoted `true`, `false`, whole numbers and `null`/`~`/empty values are fine.
+- Not supported: anchors and aliases (`&`, `*`), tags (`!!str`), merge keys (`<<`), directives, multiple documents, block scalars (`|`, `>`), multi-line values, nested or inline (`{}`) mappings, and tab characters.
+
+These limits exist because `k3s` writes some YAML and URL parsing errors, including the offending value, to `/var/log/k3s.log`. Validating a well-defined subset and handing `k3s` a normalized copy keeps such values, for example `etcd-s3-proxy` URLs with embedded credentials, out of the log. For the same reason, `etcd-s3-proxy` must be `none` or a valid URL with a scheme and host, and katamaran refuses to start Kubernetes if a `/var/lib/katamaran/k3s/config.yaml.d` drop-in directory exists in the guest.
 
 Changes to `k8s_disable`, `k8s_args`, or `k3s-config.yaml` apply the next time Kubernetes starts (no VM restart is needed once the VM is running a guest initramfs that supports them; if a VM was booted from an older guest initramfs, update or rebuild the guest image and run `kat restart` first). For a running cluster, use `kat k8s stop && kat k8s start`. If disabling Traefik leaves Gateway API CRDs or admission policies behind, inspect and clean up the leftover resources separately. Use `kat k8s reset` only if you intend to wipe **all cluster state, workloads, and persistent volumes**; back up anything you need first.
 

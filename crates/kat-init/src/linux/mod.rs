@@ -3,6 +3,7 @@ mod autofwd;
 mod clock;
 mod fscache;
 mod fsnotify;
+mod k3s_config;
 mod k8s;
 mod machines;
 mod memory;
