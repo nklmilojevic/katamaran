@@ -137,35 +137,35 @@ fn status_from(
     }
 }
 
+/// Live state of the handler registered at boot. Only `Enabled` or `Unknown`:
+/// a handler that was registered at boot and is now missing or disabled
+/// (e.g. removed by a `binfmt --uninstall` / `qemu-user-static --reset`
+/// container) is not the user turning emulation off in katamaran's config, so
+/// callers must not treat it as `Disabled` (which retires mirrors).
 fn binfmt_handler_status(binfmt_dir: &Path, name: &str) -> EmulationStatus {
+    let read =
+        |path: &Path| fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()));
     let status_path = binfmt_dir.join("status");
-    let global = match fs::read_to_string(&status_path) {
+    let global = match read(&status_path) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return EmulationStatus::Disabled,
-        Err(e) => return EmulationStatus::Unknown(format!("read {}: {e}", status_path.display())),
+        Err(e) => return EmulationStatus::Unknown(e),
     };
-    match global.trim() {
-        "enabled" => {}
-        "disabled" => return EmulationStatus::Disabled,
-        other => {
-            return EmulationStatus::Unknown(format!(
-                "unexpected {} content: {:?}",
-                status_path.display(),
-                other
-            ));
-        }
+    if global.trim() != "enabled" {
+        return EmulationStatus::Unknown(format!(
+            "{} reports {:?} although {name} was registered at boot",
+            status_path.display(),
+            global.trim()
+        ));
     }
     let handler_path = binfmt_dir.join(name);
-    let handler = match fs::read_to_string(&handler_path) {
+    let handler = match read(&handler_path) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return EmulationStatus::Disabled,
-        Err(e) => return EmulationStatus::Unknown(format!("read {}: {e}", handler_path.display())),
+        Err(e) => return EmulationStatus::Unknown(e),
     };
     match handler.lines().next().map(str::trim) {
         Some("enabled") => EmulationStatus::Enabled,
-        Some("disabled") => EmulationStatus::Disabled,
         other => EmulationStatus::Unknown(format!(
-            "unexpected {} content: {:?}",
+            "{} reports {:?} although {name} was registered at boot",
             handler_path.display(),
             other
         )),
@@ -229,11 +229,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        // Missing status and handler files -> Disabled.
-        assert_eq!(
+        // Missing status and handler files after registration -> Unknown.
+        assert!(matches!(
             binfmt_handler_status(&dir, "rosetta"),
-            EmulationStatus::Disabled
-        );
+            EmulationStatus::Unknown(_)
+        ));
 
         // Enabled global status and handler -> Enabled.
         fs::write(dir.join("status"), "enabled\n").unwrap();
@@ -246,33 +246,33 @@ mod tests {
             binfmt_handler_status(&dir, "rosetta"),
             EmulationStatus::Enabled
         );
-        assert_eq!(
+        assert!(matches!(
             binfmt_handler_status(&dir, "qemu-x86_64"),
-            EmulationStatus::Disabled
-        );
+            EmulationStatus::Unknown(_)
+        ));
 
-        // Handler disabled -> Disabled.
+        // Handler disabled after registration -> Unknown (never Disabled).
         fs::write(
             dir.join("rosetta"),
             "disabled\ninterpreter /run/rosetta/rosetta\n",
         )
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             binfmt_handler_status(&dir, "rosetta"),
-            EmulationStatus::Disabled
-        );
+            EmulationStatus::Unknown(_)
+        ));
 
-        // Global binfmt_misc disabled -> Disabled even if handler says enabled.
+        // Global binfmt_misc disabled -> Unknown even if handler says enabled.
         fs::write(dir.join("status"), "disabled\n").unwrap();
         fs::write(
             dir.join("rosetta"),
             "enabled\ninterpreter /run/rosetta/rosetta\n",
         )
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             binfmt_handler_status(&dir, "rosetta"),
-            EmulationStatus::Disabled
-        );
+            EmulationStatus::Unknown(_)
+        ));
 
         // Non-NotFound read failure (e.g. EISDIR) on handler -> Unknown (never Disabled).
         fs::write(dir.join("status"), "enabled\n").unwrap();

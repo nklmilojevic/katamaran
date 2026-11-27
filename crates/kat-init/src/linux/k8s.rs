@@ -3548,11 +3548,12 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut failures: Vec<String> = Vec::new();
     let mut only_refs: Option<HashSet<String>> = None;
+    let mut logged_unknown: Vec<String> = Vec::new();
 
     for attempt in 0..=MAX_SYNC_RETRIES {
         // Re-read the emulation state on every pass so a retry never acts on
         // a stale "disabled" reading.
-        let emulation = current_emulation_mode(&mut failures);
+        let emulation = current_emulation_mode(&mut logged_unknown);
         let moby = match list_ctr_images(reaper, "moby") {
             Ok(m) => m,
             Err(e) => {
@@ -3583,7 +3584,12 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         let mut retry_refs: HashSet<String> = HashSet::new();
 
         for (name, img) in candidates {
-            if name.starts_with("sha256:") || name.contains("<none>") {
+            // `moby-dangling@<digest>` is how Docker's containerd image store
+            // keeps untagged images; never mirror or report those.
+            if name.starts_with("sha256:")
+                || name.starts_with("moby-dangling@")
+                || name.contains("<none>")
+            {
                 continue;
             }
             let k8s_img = k8s.get(&name);
@@ -3871,15 +3877,19 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     Ok(())
 }
 
-fn current_emulation_mode(failures: &mut Vec<String>) -> EmulationMode {
+fn current_emulation_mode(logged_unknown: &mut Vec<String>) -> EmulationMode {
     match super::amd64::status() {
         super::amd64::EmulationStatus::Enabled => EmulationMode::Enabled,
         super::amd64::EmulationStatus::Disabled => EmulationMode::Disabled,
         super::amd64::EmulationStatus::Unknown(e) => {
-            let msg = format!("check amd64 binfmt_misc status: {e}");
-            if !failures.contains(&msg) {
+            // Not a sync failure: native images still mirror normally. Only
+            // amd64 rewrites and retirements are held back while unknown.
+            let msg = format!(
+                "amd64 emulation state unknown ({e}); not rewriting or retiring amd64 mirrors"
+            );
+            if !logged_unknown.contains(&msg) {
                 log(&msg);
-                failures.push(msg);
+                logged_unknown.push(msg);
             }
             EmulationMode::Unknown
         }
@@ -3975,6 +3985,12 @@ fn needs_native_probe(
         return false;
     };
     if !oci_rewrite::has_native_platform(platforms, native_arch) {
+        return false;
+    }
+    // Fast path: an unlabelled `k8s.io` copy of exactly this digest is kept
+    // whatever the probe says (an amd64-only legacy copy of a multi-platform
+    // index is never adopted), so skip the expensive content walk.
+    if k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_none() && k.digest == moby.digest) {
         return false;
     }
     let k8s_is_rewritten = k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some());
