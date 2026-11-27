@@ -127,6 +127,25 @@ pub struct UnlockedSpawnSpec {
     /// True for PTY sessions (`setsid` + `TIOCSCTTY` + `pidfd_open`); false
     /// for piped sessions (`setpgid(0, 0)`).
     pub pty: bool,
+    /// Optional peer socket/pipe monitored for hangup (`POLLRDHUP | POLLHUP |
+    /// POLLERR`) while waiting for the child to complete `execve`, so a stalled
+    /// spawn aborts, kills the child, and releases its session slot promptly if
+    /// the caller disconnects.
+    pub cancel_fd: Option<RawFd>,
+}
+
+fn cancel_fd_closed(fd: Option<RawFd>) -> bool {
+    let Some(fd) = fd else {
+        return false;
+    };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    rc > 0
+        && (pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
 }
 
 fn last_errno() -> libc::c_int {
@@ -314,6 +333,13 @@ impl Reaper {
         spec: UnlockedSpawnSpec,
         before_reg: Option<Box<dyn FnOnce()>>,
     ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)> {
+        let cancel_fd = spec.cancel_fd;
+        if cancel_fd_closed(cancel_fd) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "peer disconnected before spawn",
+            ));
+        }
         let mut prepared = prepare_exec_tables(&spec.program, &spec.args, &spec.env)?;
         let mut argv_ptrs: Vec<*const libc::c_char> =
             prepared.argv.iter().map(|c| c.as_ptr()).collect();
@@ -324,6 +350,12 @@ impl Reaper {
 
         let (go_r, go_w) = cmd::pipe()?;
         let (err_r, err_w) = cmd::pipe()?;
+        unsafe {
+            let fl = libc::fcntl(err_r.as_raw_fd(), libc::F_GETFL);
+            if fl < 0 || libc::fcntl(err_r.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let sc = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         let max_fd: u32 = if sc > 0 {
             (sc as u64).clamp(1024, 65536) as u32
@@ -522,6 +554,15 @@ impl Reaper {
         let mut err_buf = [0u8; 4];
         let mut err_off = 0usize;
         while err_off < err_buf.len() {
+            if cancel_fd_closed(cancel_fd) {
+                self.signal_target(&target, libc::SIGKILL);
+                let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
+                self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "peer disconnected during spawn",
+                ));
+            }
             let rc = unsafe {
                 libc::read(
                     err_r.as_raw_fd(),
@@ -531,17 +572,73 @@ impl Reaper {
             };
             if rc > 0 {
                 err_off += rc as usize;
-            } else if rc == 0 {
+                continue;
+            }
+            if rc == 0 {
                 break;
-            } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                let e = io::Error::last_os_error();
-                self.finish_failed_unlocked_child(pgrp, &target, &rx);
-                return Err(e);
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: err_r.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: cancel_fd.unwrap_or(-1),
+                            events: libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR,
+                            revents: 0,
+                        },
+                    ];
+                    let nfds = if cancel_fd.is_some() { 2 } else { 1 };
+                    let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+                    if prc < 0 {
+                        let pe = io::Error::last_os_error();
+                        if pe.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        self.signal_target(&target, libc::SIGKILL);
+                        let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
+                        self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                        return Err(pe);
+                    }
+                    if nfds == 2
+                        && (pfds[1].revents
+                            & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL))
+                            != 0
+                    {
+                        self.signal_target(&target, libc::SIGKILL);
+                        let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
+                        self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "peer disconnected during spawn",
+                        ));
+                    }
+                }
+                _ => {
+                    self.signal_target(&target, libc::SIGKILL);
+                    let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
+                    self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                    return Err(e);
+                }
             }
         }
         drop(err_r);
 
         if err_off == 0 {
+            if cancel_fd_closed(cancel_fd) {
+                self.signal_target(&target, libc::SIGKILL);
+                let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
+                self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "peer disconnected during spawn",
+                ));
+            }
             return Ok((target, pgrp, rx));
         }
 
@@ -563,7 +660,7 @@ impl Reaper {
         rx: &Receiver<i32>,
     ) {
         if !matches!(target, ChildTarget::Exited) {
-            let _ = rx.recv_timeout(Duration::from_secs(2));
+            let _ = rx.recv_timeout(Duration::from_millis(500));
         }
         let mut table = self.watched.lock().unwrap();
         if table.matches(pgrp.pid, pgrp.token) {
@@ -1580,6 +1677,7 @@ mod tests {
                 cwd_fd: open_dir_fd("/"),
                 cgroup_procs_fd: None,
                 pty: false,
+                cancel_fd: None,
             };
             r2.spawn_unlocked_inner(
                 spec,
@@ -1634,6 +1732,7 @@ mod tests {
                 cwd_fd: open_dir_fd("/"),
                 cgroup_procs_fd: None,
                 pty: false,
+                cancel_fd: None,
             };
             let err = reaper.spawn_unlocked(spec).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
@@ -1674,8 +1773,73 @@ mod tests {
             cwd_fd: open_dir_fd("/"),
             cgroup_procs_fd: None,
             pty: false,
+            cancel_fd: None,
         };
         let (_, _, rx) = reaper.spawn_unlocked(spec).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn spawn_unlocked_aborts_and_reaps_when_cancel_fd_closes() {
+        let reaper = Reaper::shared_for_tests();
+
+        // 1. Peer already closed before spawn: fails immediately without forking.
+        let (peer_a, peer_b) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer_a);
+        let spec = UnlockedSpawnSpec {
+            program: "/bin/true".into(),
+            args: vec![],
+            env: vec![("PATH".into(), PATH.into())],
+            stdin: open_devnull_fd(),
+            stdout: open_devnull_fd(),
+            stderr: open_devnull_fd(),
+            cwd_fd: open_dir_fd("/"),
+            cgroup_procs_fd: None,
+            pty: false,
+            cancel_fd: Some(peer_b.as_raw_fd()),
+        };
+        let err = reaper.spawn_unlocked(spec).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+
+        // 2. Child stalled writing to `cgroup_procs_fd` (simulated with a full
+        //    unread pipe) while peer disconnects: parent kills/reaps child and
+        //    returns BrokenPipe promptly.
+        let (peer_a, peer_b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (stall_r, stall_w) = cmd::pipe().unwrap();
+        unsafe {
+            let fl = libc::fcntl(stall_w.as_raw_fd(), libc::F_GETFL);
+            assert!(
+                fl >= 0
+                    && libc::fcntl(stall_w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) == 0
+            );
+            let chunk = [b'x'; 4096];
+            while libc::write(stall_w.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) > 0 {}
+            assert_eq!(libc::fcntl(stall_w.as_raw_fd(), libc::F_SETFL, fl), 0);
+        }
+        let r2 = reaper.clone();
+        let cancel_raw = peer_b.as_raw_fd();
+        let spawner = thread::spawn(move || {
+            let spec = UnlockedSpawnSpec {
+                program: "/bin/true".into(),
+                args: vec![],
+                env: vec![("PATH".into(), PATH.into())],
+                stdin: open_devnull_fd(),
+                stdout: open_devnull_fd(),
+                stderr: open_devnull_fd(),
+                cwd_fd: open_dir_fd("/"),
+                cgroup_procs_fd: Some(stall_w),
+                pty: false,
+                cancel_fd: Some(cancel_raw),
+            };
+            r2.spawn_unlocked(spec)
+        });
+        thread::sleep(Duration::from_millis(40));
+        let t = Instant::now();
+        drop(peer_a);
+        let err = spawner.join().unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+        assert!(t.elapsed() < Duration::from_secs(2));
+        drop(peer_b);
+        drop(stall_r);
     }
 }

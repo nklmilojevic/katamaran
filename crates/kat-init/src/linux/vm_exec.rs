@@ -48,9 +48,6 @@ const BACKPRESSURE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// Idle window after the main child exits before cancelling pumps held open by
 /// a surviving background descendant.
 const POST_EXIT_IDLE: Duration = Duration::from_millis(200);
-/// Maximum chunks drained per outer poll cycle when writers remain open so
-/// `wake_r` (child exit) is always observed promptly during continuous output.
-const PUMP_DRAIN_BATCH: usize = 4;
 /// Maximum buffered stdin bytes held in user space while guest stdin is
 /// backpressured, keeping memory bounded while still monitoring disconnect.
 const STDIN_BUF_CAP: usize = 128 << 10;
@@ -297,11 +294,46 @@ fn fd_has_hup(fd: RawFd) -> bool {
     rc > 0 && (pfd.revents & libc::POLLHUP) != 0
 }
 
+/// Query exact unread bytes buffered in a Linux pipe without consuming any.
+fn pipe_unread_bytes(fd: RawFd) -> Option<usize> {
+    let mut avail: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut avail) } == 0 && avail >= 0 {
+        Some(avail as usize)
+    } else {
+        None
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum OutputStream {
+    Stdout = 0,
+    Stderr = 1,
+}
+
+impl OutputStream {
+    fn encode_frame(self, data: Vec<u8>) -> Vec<u8> {
+        match self {
+            Self::Stdout => VmExecMsg::Stdout(data).encode(),
+            Self::Stderr => VmExecMsg::Stderr(data).encode(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct GuestWriterState {
     ctrl: VecDeque<Vec<u8>>,
-    queue: VecDeque<Vec<u8>>,
+    queues: [VecDeque<Vec<u8>>; 2],
+    /// Remaining per-stream output byte windows (`None` = unmetered, e.g. PTY
+    /// or merged stdout/stderr).
+    windows: [Option<u64>; 2],
+    /// Round-robin selector between stdout (`0`) and stderr (`1`) so neither
+    /// stream starves the other inside the guest writer.
+    next_stream: usize,
+    final_frame: Option<Vec<u8>>,
+    /// Coalesced stdin credit (`InputWindow`) not yet sent to the host.
+    input_credit: u64,
     probe_pending: bool,
+    child_exited: bool,
     post_exit: bool,
     finish: bool,
     closed: bool,
@@ -311,10 +343,12 @@ struct GuestWriterState {
 /// `Stderr`, `SignalAck`, `Pong` backpressure probes, and terminal `Exit`/`Error`).
 ///
 /// Decoupling socket writes from `pump` threads eliminates blocking I/O under a
-/// shared mutex, lets `SignalAck` and `Pong` probes preempt queued output without
-/// blocking `stdin_worker`, and periodically retries stalled nonblocking sends
-/// so Linux `AF_VSOCK` `SEND_SHUTDOWN` (`EPIPE`) is detected even when
-/// `vsock_poll()` reports neither `POLLOUT` nor `POLLHUP`.
+/// shared mutex, gives stdout and stderr independent queues and optional
+/// per-stream byte windows so a stalled host stdout pipe never blocks stderr,
+/// lets `SignalAck` and `Pong` probes preempt queued output without blocking
+/// `stdin_worker`, and periodically retries stalled nonblocking sends so Linux
+/// `AF_VSOCK` `SEND_SHUTDOWN` (`EPIPE`) is detected even when `vsock_poll()`
+/// reports neither `POLLOUT` nor `POLLHUP`.
 struct GuestWriter {
     state: Mutex<GuestWriterState>,
     cv: Condvar,
@@ -323,17 +357,45 @@ struct GuestWriter {
 }
 
 impl GuestWriter {
+    #[cfg(test)]
     fn start(
         stream: UnixStream,
         host_disconnected: Arc<AtomicBool>,
         disconnect_w: OwnedFd,
         backpressure_probe: Duration,
     ) -> io::Result<(Arc<Self>, OwnedFd, thread::JoinHandle<()>)> {
+        Self::start_with_window(
+            stream,
+            host_disconnected,
+            disconnect_w,
+            backpressure_probe,
+            0,
+        )
+    }
+
+    fn start_with_window(
+        stream: UnixStream,
+        host_disconnected: Arc<AtomicBool>,
+        disconnect_w: OwnedFd,
+        backpressure_probe: Duration,
+        output_window: u32,
+    ) -> io::Result<(Arc<Self>, OwnedFd, thread::JoinHandle<()>)> {
         stream.set_nonblocking(true)?;
         let (wake_r, wake_w) = pipe_nonblock()?;
         let (ctrl_space_r, ctrl_space_w) = pipe_nonblock()?;
+        let windows = if output_window > 0 {
+            [
+                Some(u64::from(output_window)),
+                Some(u64::from(output_window)),
+            ]
+        } else {
+            [None, None]
+        };
         let writer = Arc::new(Self {
-            state: Mutex::new(GuestWriterState::default()),
+            state: Mutex::new(GuestWriterState {
+                windows,
+                ..GuestWriterState::default()
+            }),
             cv: Condvar::new(),
             wake_w,
             ctrl_space_w,
@@ -354,18 +416,83 @@ impl GuestWriter {
         Ok((writer, ctrl_space_r, handle))
     }
 
-    fn send_output(&self, frame: Vec<u8>) -> io::Result<()> {
+    /// Wait until `stream` has queue space and (when flow-controlled) at least
+    /// 1 byte of window credit. Returns `Ok(Some(allowed_bytes))` with
+    /// `1..=max_len`, `Ok(None)` if `child_exited` transitioned or `deadline`
+    /// expired, or `Err(BrokenPipe)` if the session closed.
+    fn wait_for_send_budget(
+        &self,
+        stream: OutputStream,
+        max_len: usize,
+        known_child_exited: bool,
+        deadline: Option<Instant>,
+    ) -> io::Result<Option<usize>> {
+        let idx = stream as usize;
         let mut st = self.state.lock().unwrap();
-        while !st.closed && st.queue.len() >= GUEST_OUT_QUEUE_CAP {
-            st = self.cv.wait(st).unwrap();
+        loop {
+            if st.closed {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "exec closed"));
+            }
+            if !known_child_exited && st.child_exited {
+                return Ok(None);
+            }
+            let queue_ok = st.queues[idx].len() < GUEST_OUT_QUEUE_CAP;
+            let win_avail = match st.windows[idx] {
+                None => max_len,
+                Some(w) => (w as usize).min(max_len),
+            };
+            if queue_ok && win_avail > 0 {
+                return Ok(Some(win_avail));
+            }
+            match deadline {
+                None => {
+                    st = self.cv.wait(st).unwrap();
+                }
+                Some(dl) => {
+                    let rem = dl.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        return Ok(None);
+                    }
+                    let (guard, _) = self.cv.wait_timeout(st, rem).unwrap();
+                    st = guard;
+                }
+            }
         }
+    }
+
+    fn send_output(
+        &self,
+        stream: OutputStream,
+        frame: Vec<u8>,
+        payload_len: usize,
+    ) -> io::Result<()> {
+        let idx = stream as usize;
+        let mut st = self.state.lock().unwrap();
         if st.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "exec closed"));
         }
-        st.queue.push_back(frame);
+        if let Some(w) = st.windows[idx].as_mut() {
+            *w = w.saturating_sub(payload_len as u64);
+        }
+        st.queues[idx].push_back(frame);
         drop(st);
         notify_wake(&self.wake_w);
         Ok(())
+    }
+
+    fn add_window(&self, stream: u8, bytes: u32) {
+        let idx = usize::from(stream);
+        if idx >= 2 || bytes == 0 {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        if let Some(w) = st.windows[idx].as_mut() {
+            *w = w.saturating_add(u64::from(bytes));
+            self.cv.notify_all();
+        }
     }
 
     fn ctrl_has_space(&self) -> bool {
@@ -383,6 +510,28 @@ impl GuestWriter {
         notify_wake(&self.wake_w);
     }
 
+    /// True when the host negotiated flow control (`ExecSpec::output_window`),
+    /// which also bounds unacknowledged stdin to [`vm_exec::INPUT_WINDOW`].
+    fn windowed(&self) -> bool {
+        self.state.lock().unwrap().windows[0].is_some()
+    }
+
+    /// Queue (coalesced) stdin credit for the host in windowed sessions. Sent
+    /// ahead of queued output so it is never delayed by output backpressure
+    /// beyond the frame currently in flight.
+    fn add_input_credit(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        st.input_credit = st.input_credit.saturating_add(bytes);
+        drop(st);
+        notify_wake(&self.wake_w);
+    }
+
     fn request_probe(&self) {
         let mut st = self.state.lock().unwrap();
         if st.closed {
@@ -393,14 +542,16 @@ impl GuestWriter {
         notify_wake(&self.wake_w);
     }
 
-    /// Take over peer-disconnect monitoring (`POLLRDHUP` + periodic probes)
-    /// once `stdin_worker` has stopped after the command leader exited.
+    /// Enable post-exit peer disconnect probes and wake any pump waiting on
+    /// window/queue capacity so it transitions to its post-exit drain window.
     fn mark_post_exit(&self) {
         let mut st = self.state.lock().unwrap();
         if st.closed {
             return;
         }
+        st.child_exited = true;
         st.post_exit = true;
+        self.cv.notify_all();
         drop(st);
         notify_wake(&self.wake_w);
     }
@@ -410,8 +561,8 @@ impl GuestWriter {
         if st.closed {
             return;
         }
-        if let Some(frame) = final_frame {
-            st.queue.push_back(frame);
+        if final_frame.is_some() {
+            st.final_frame = final_frame;
         }
         st.finish = true;
         drop(st);
@@ -422,7 +573,9 @@ impl GuestWriter {
         let mut st = self.state.lock().unwrap();
         st.closed = true;
         st.ctrl.clear();
-        st.queue.clear();
+        st.queues[0].clear();
+        st.queues[1].clear();
+        st.final_frame = None;
         self.cv.notify_all();
         drop(st);
         notify_wake(&self.wake_w);
@@ -457,14 +610,32 @@ fn guest_writer_worker(
                         wake_ctrl_space = true;
                     }
                     out_buf = frame;
-                } else if let Some(frame) = st.queue.pop_front() {
-                    out_buf = frame;
-                    writer.cv.notify_all();
-                } else if st.probe_pending {
-                    st.probe_pending = false;
-                    out_buf = VmExecMsg::Pong.encode();
-                } else if st.finish {
-                    return;
+                } else if st.input_credit > 0 {
+                    let bytes = st.input_credit.min(u64::from(u32::MAX));
+                    st.input_credit -= bytes;
+                    out_buf = VmExecMsg::InputWindow {
+                        bytes: bytes as u32,
+                    }
+                    .encode();
+                } else {
+                    let first = st.next_stream;
+                    let second = 1 - first;
+                    if let Some(frame) = st.queues[first].pop_front() {
+                        st.next_stream = second;
+                        out_buf = frame;
+                        writer.cv.notify_all();
+                    } else if let Some(frame) = st.queues[second].pop_front() {
+                        st.next_stream = first;
+                        out_buf = frame;
+                        writer.cv.notify_all();
+                    } else if st.probe_pending {
+                        st.probe_pending = false;
+                        out_buf = VmExecMsg::Pong.encode();
+                    } else if let Some(frame) = st.final_frame.take() {
+                        out_buf = frame;
+                    } else if st.finish {
+                        return;
+                    }
                 }
             }
             if wake_ctrl_space {
@@ -583,7 +754,9 @@ fn guest_writer_worker(
         let mut st = writer.state.lock().unwrap();
         st.closed = true;
         st.ctrl.clear();
-        st.queue.clear();
+        st.queues[0].clear();
+        st.queues[1].clear();
+        st.final_frame = None;
         writer.cv.notify_all();
         drop(st);
         notify_wake(&disconnect_w);
@@ -1196,7 +1369,7 @@ fn stdin_worker(
     cancel_r: OwnedFd,
     disconnect_r: OwnedFd,
     ctrl_space_r: OwnedFd,
-    mut stdin: Option<OwnedFd>,
+    stdin: Option<OwnedFd>,
     master: Option<OwnedFd>,
     tty: bool,
     reaper: Reaper,
@@ -1206,16 +1379,39 @@ fn stdin_worker(
     disconnect_grace: Duration,
     backpressure_probe: Duration,
 ) {
+    let mut stdin: Option<OwnedFd> = stdin;
+    let mut master: Option<OwnedFd> = master;
     let mut frames = FrameReader::default();
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut eof_pending = false;
     let mut canon = PtyCanonTracker::default();
     let mut disconnected = false;
+    let mut post_exit = false;
     let mut last_probe: Option<Instant> = None;
+    // Windowed sessions: the host never has more than `INPUT_WINDOW`
+    // unacknowledged stdin bytes in flight, so `pending` is bounded by the
+    // protocol and the connection is read regardless of `pending` (keeping
+    // `OutputWindow` credits flowing even while the command ignores stdin).
+    let windowed = writer.windowed();
+    let mut stdin_received: u64 = 0;
+    let mut stdin_credited: u64 = 0;
 
     'outer: loop {
-        let ctrl_ok = writer.ctrl_has_space();
-        let can_read = pending.len() < STDIN_BUF_CAP && ctrl_ok;
+        if windowed && !post_exit {
+            // Credit back every received byte that has left `pending`
+            // (written to the command, or discarded after stdin closed).
+            let release = stdin_received
+                .saturating_sub(stdin_credited)
+                .saturating_sub(pending.len() as u64);
+            if release > 0
+                && (pending.is_empty() || release >= u64::from(vm_exec::INPUT_WINDOW) / 4)
+            {
+                stdin_credited += release;
+                writer.add_input_credit(release);
+            }
+        }
+        let ctrl_ok = post_exit || writer.ctrl_has_space();
+        let can_read = post_exit || (ctrl_ok && (windowed || pending.len() < STDIN_BUF_CAP));
         let poll_timeout_ms = if can_read {
             last_probe = None;
             -1
@@ -1293,9 +1489,28 @@ fn stdin_worker(
             last_probe = Some(Instant::now());
             continue;
         }
-        // Normal child exit wakes cancel_r: exit cleanly without signaling.
+        // Two-stage cancel pipe:
+        // - A byte (`b'e'`) signals the leader exited: close `stdin`/`master`
+        //   immediately and stay in `post_exit` mode reading only
+        //   `OutputWindow` credits and peer disconnect until output pumps join.
+        // - EOF (`rc == 0`) signals all output pumps have finished: exit cleanly.
         if pfds[0].revents != 0 {
-            break;
+            let mut b = [0u8; 16];
+            let rc = unsafe { libc::read(cancel_r.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
+            if rc == 0 {
+                break;
+            }
+            if rc > 0 {
+                post_exit = true;
+                stdin = None;
+                master = None;
+                pending.clear();
+                eof_pending = false;
+                continue;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
         }
         // Writer thread hit EPIPE/POLLERR/POLLHUP (even when both vsock
         // directions were backpressured): immediately trigger disconnect cleanup.
@@ -1326,10 +1541,26 @@ fn stdin_worker(
         }
         if pfds[2].revents != 0 {
             if can_read {
-                while pending.len() < STDIN_BUF_CAP && writer.ctrl_has_space() {
+                while post_exit
+                    || (writer.ctrl_has_space() && (windowed || pending.len() < STDIN_BUF_CAP))
+                {
                     match frames.poll_frame(reader.as_raw_fd()) {
                         Ok(PollFrame::Msg(m)) => match m {
+                            VmExecMsg::OutputWindow { stream, bytes } => {
+                                writer.add_window(stream, bytes);
+                            }
+                            _ if post_exit => {}
                             VmExecMsg::Data(d) => {
+                                if windowed {
+                                    stdin_received += d.len() as u64;
+                                    if stdin_received - stdin_credited
+                                        > u64::from(vm_exec::INPUT_WINDOW)
+                                    {
+                                        log("host exceeded the stdin flow-control window");
+                                        disconnected = true;
+                                        break 'outer;
+                                    }
+                                }
                                 if !eof_pending && stdin.is_some() && !d.is_empty() {
                                     pending.extend(&d);
                                     flush_stdin(
@@ -1388,14 +1619,18 @@ fn stdin_worker(
         // Unblock writer_thread and any output pumps immediately before
         // running the disconnect grace period.
         writer.abort();
-        // The host went away: hang up the session or process group, then
-        // escalate to SIGKILL after a bounded grace period if the leader or
-        // any surviving session descendant remains live.
-        signal_handle(&reaper, &handle, libc::SIGHUP);
-        if let Some(cg) = &cgroup {
-            cg.cleanup_after_disconnect(&cancel_r, disconnect_grace, &reaper, &handle);
-        } else if !wait_for_cancel(&cancel_r, disconnect_grace) {
-            signal_handle(&reaper, &handle, libc::SIGKILL);
+        // If the leader already exited (`post_exit`), `exec_with_timeouts`
+        // performs post-exit cgroup descendant cleanup once pumps join.
+        if !post_exit {
+            // The host went away: hang up the session or process group, then
+            // escalate to SIGKILL after a bounded grace period if the leader or
+            // any surviving session descendant remains live.
+            signal_handle(&reaper, &handle, libc::SIGHUP);
+            if let Some(cg) = &cgroup {
+                cg.cleanup_after_disconnect(&cancel_r, disconnect_grace, &reaper, &handle);
+            } else if !wait_for_cancel(&cancel_r, disconnect_grace) {
+                signal_handle(&reaper, &handle, libc::SIGKILL);
+            }
         }
     }
     drop(cgroup);
@@ -1403,6 +1638,8 @@ fn stdin_worker(
 
 /// Relay output from `from` (nonblocking pipe or PTY master) until EOF/EIO.
 ///
+/// Honors optional per-stream byte windows on `writer` so a blocked stdout sink
+/// pauses only its own pipe reader without filling the shared connection.
 /// Once `wake_r` closes (main child exited):
 /// - If all write ends have closed (`POLLHUP`), drains every buffered byte
 ///   across arbitrary host backpressure without discarding output.
@@ -1415,7 +1652,7 @@ fn pump(
     from: OwnedFd,
     wake_r: OwnedFd,
     writer: Arc<GuestWriter>,
-    kind: fn(Vec<u8>) -> VmExecMsg,
+    stream: OutputStream,
     post_exit_idle: Duration,
     host_disconnected: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -1428,6 +1665,41 @@ fn pump(
         if host_disconnected.load(Ordering::Acquire) {
             return Ok(());
         }
+        if fd_has_hup(from.as_raw_fd()) {
+            all_writers_closed = true;
+            if pipe_unread_bytes(from.as_raw_fd()) == Some(0) {
+                return Ok(());
+            }
+        }
+
+        let budget_deadline = if !child_exited || all_writers_closed {
+            None
+        } else {
+            idle_deadline
+        };
+        let allowed =
+            match writer.wait_for_send_budget(stream, buf.len(), child_exited, budget_deadline) {
+                Ok(Some(n)) => n,
+                Ok(None) => {
+                    if !child_exited {
+                        child_exited = true;
+                        idle_deadline = Some(Instant::now() + post_exit_idle);
+                        continue;
+                    }
+                    if fd_has_hup(from.as_raw_fd()) {
+                        all_writers_closed = true;
+                        continue;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    if host_disconnected.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+
         let timeout_ms = if !child_exited || all_writers_closed {
             -1
         } else {
@@ -1485,37 +1757,39 @@ fn pump(
             all_writers_closed = true;
         }
         if pfds[0].revents != 0 || child_exited {
-            let mut chunks = 0usize;
-            loop {
+            // Exactly one budgeted read per outer iteration: the next pass
+            // re-checks per-stream queue space and window credit before reading
+            // again, and always re-polls `wake_r`/`idle_deadline`, so continuous
+            // descendant output can never starve child-exit detection.
+            let want = allowed.min(buf.len());
+            let n = loop {
+                let n = unsafe { libc::read(from.as_raw_fd(), buf.as_mut_ptr().cast(), want) };
+                if n >= 0 {
+                    break n as usize;
+                }
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => break usize::MAX,
+                    // On Linux PTY master, EIO signals all slave descriptors closed.
+                    _ if e.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                    _ => return Err(e),
+                }
+            };
+            if n == 0 {
+                return Ok(());
+            }
+            if n != usize::MAX {
                 if host_disconnected.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                if !all_writers_closed && chunks >= PUMP_DRAIN_BATCH {
-                    // Return to the outer poll so `wake_r` (child exit) and
-                    // `idle_deadline` are always observed during continuous
-                    // output from a surviving descendant.
-                    break;
-                }
-                let n = unsafe { libc::read(from.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-                if n > 0 {
-                    chunks += 1;
-                    if let Err(e) = writer.send_output(kind(buf[..n as usize].to_vec()).encode()) {
-                        if host_disconnected.load(Ordering::Acquire) {
-                            return Ok(());
-                        }
-                        return Err(e);
+                if let Err(e) =
+                    writer.send_output(stream, stream.encode_frame(buf[..n].to_vec()), n)
+                {
+                    if host_disconnected.load(Ordering::Acquire) {
+                        return Ok(());
                     }
-                } else if n == 0 {
-                    return Ok(());
-                } else {
-                    let e = io::Error::last_os_error();
-                    match e.kind() {
-                        io::ErrorKind::Interrupted => continue,
-                        io::ErrorKind::WouldBlock => break,
-                        // On Linux PTY master, EIO signals all slave descriptors closed.
-                        _ if e.raw_os_error() == Some(libc::EIO) => return Ok(()),
-                        _ => return Err(e),
-                    }
+                    return Err(e);
                 }
             }
         }
@@ -1877,21 +2151,23 @@ fn exec_with_timeouts(
                 cwd_fd: built.cwd_fd,
                 cgroup_procs_fd: procs_fd,
                 pty: true,
+                cancel_fd: Some(conn.as_raw_fd()),
             };
-            let (target, pgrp, exited) = reaper
-                .spawn_unlocked(spawn_spec)
-                .map_err(|e| format!("exec {program:?}: {e}"))?;
+            let (target, pgrp, exited) = match reaper.spawn_unlocked(spawn_spec) {
+                Ok(t) => t,
+                Err(e) => {
+                    if let Some(cg) = &cgroup {
+                        cg.kill();
+                    }
+                    return Err(format!("exec {program:?}: {e}"));
+                }
+            };
             (
                 ChildHandle::Pty { target, pgrp },
                 exited,
                 Some(stdin),
                 Some(master),
-                vec![(
-                    out,
-                    out_wake_r,
-                    out_wake_w,
-                    VmExecMsg::Stdout as fn(Vec<u8>) -> VmExecMsg,
-                )],
+                vec![(out, out_wake_r, out_wake_w, OutputStream::Stdout)],
             )
         }
         None => {
@@ -1913,23 +2189,25 @@ fn exec_with_timeouts(
                 cwd_fd: built.cwd_fd,
                 cgroup_procs_fd: procs_fd,
                 pty: false,
+                cancel_fd: Some(conn.as_raw_fd()),
             };
-            let (_, pgrp, exited) = reaper
-                .spawn_unlocked(spawn_spec)
-                .map_err(|e| format!("exec {program:?}: {e}"))?;
+            let (_, pgrp, exited) = match reaper.spawn_unlocked(spawn_spec) {
+                Ok(t) => t,
+                Err(e) => {
+                    if let Some(cg) = &cgroup {
+                        cg.kill();
+                    }
+                    return Err(format!("exec {program:?}: {e}"));
+                }
+            };
             (
                 ChildHandle::Pipe(pgrp),
                 exited,
                 Some(in_w),
                 None,
                 vec![
-                    (
-                        out_r,
-                        out_wake_r,
-                        out_wake_w,
-                        VmExecMsg::Stdout as fn(Vec<u8>) -> VmExecMsg,
-                    ),
-                    (err_r, err_wake_r, err_wake_w, VmExecMsg::Stderr),
+                    (out_r, out_wake_r, out_wake_w, OutputStream::Stdout),
+                    (err_r, err_wake_r, err_wake_w, OutputStream::Stderr),
                 ],
             )
         }
@@ -1962,11 +2240,17 @@ fn exec_with_timeouts(
         }
     }
 
-    let (writer, ctrl_space_r, writer_thread) = match GuestWriter::start(
+    let output_window = if spec.tty.is_none() {
+        spec.output_window
+    } else {
+        0
+    };
+    let (writer, ctrl_space_r, writer_thread) = match GuestWriter::start_with_window(
         conn,
         host_disconnected.clone(),
         disconnect_w,
         backpressure_probe,
+        output_window,
     ) {
         Ok(triple) => triple,
         Err(e) => {
@@ -2025,12 +2309,12 @@ fn exec_with_timeouts(
 
     let mut outputs = Vec::with_capacity(out_specs.len());
     let mut out_wakes = Vec::with_capacity(out_specs.len());
-    for (out, wake_r, wake_w, kind) in out_specs {
+    for (out, wake_r, wake_w, stream) in out_specs {
         let w2 = writer.clone();
         let disc = host_disconnected.clone();
         match thread::Builder::new()
             .name("vm-exec-out".into())
-            .spawn(move || pump(out, wake_r, w2, kind, post_exit_idle, disc))
+            .spawn(move || pump(out, wake_r, w2, stream, post_exit_idle, disc))
         {
             Ok(h) => {
                 outputs.push(h);
@@ -2045,6 +2329,7 @@ fn exec_with_timeouts(
                 drop(stdin_cancel_w);
                 drop(out_wakes);
                 drop(wake_w);
+                writer.mark_post_exit();
                 let _ = stdin_thread.join();
                 for o in outputs {
                     let _ = o.join();
@@ -2060,13 +2345,14 @@ fn exec_with_timeouts(
     }
 
     let status = exited.recv().unwrap_or(-1);
-    // Clear the handle and wake stdin_worker via its dedicated cancel pipe so
-    // normal child exit is never confused with host disconnect. Hand off peer
-    // disconnect detection to `writer` while post-exit output drains so any
-    // disconnect during drain still cleans up surviving descendants in `cgroup`.
+    // Clear the handle and transition `stdin_thread` into post-exit mode
+    // (dropping `stdin`/`master` immediately while continuing to read
+    // `OutputWindow` credits and peer disconnects until all output pumps drain).
     *handle.lock().unwrap() = None;
-    drop(stdin_cancel_w);
-    let _ = stdin_thread.join();
+    let exited_byte = *b"e";
+    unsafe {
+        let _ = libc::write(stdin_cancel_w.as_raw_fd(), exited_byte.as_ptr().cast(), 1);
+    }
     writer.mark_post_exit();
 
     // Signal output pumps that the main child has exited, then join every
@@ -2089,6 +2375,8 @@ fn exec_with_timeouts(
             }
         }
     }
+    drop(stdin_cancel_w);
+    let _ = stdin_thread.join();
 
     let cleanup_post_exit_descendants = |cg: &Option<Arc<SessionCgroup>>| {
         if let Some(cg) = cg
@@ -2137,6 +2425,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
             }),
+            output_window: 0,
         })
         .unwrap();
         assert_eq!(built.program, DEFAULT_SHELL);
@@ -2166,6 +2455,7 @@ mod tests {
             env: vec![],
             argv: vec!["sysctl".into(), "-n".into(), "kernel.ostype".into()],
             tty: None,
+            output_window: 0,
         })
         .unwrap();
         assert_eq!(built.program, "sysctl");
@@ -2470,6 +2760,7 @@ mod tests {
                 env: vec![],
                 argv: vec!["/bin/true".into()],
                 tty: None,
+                output_window: 0,
             }),
         )
         .unwrap();
@@ -2513,6 +2804,7 @@ mod tests {
                     "trap 'exit 77' INT; echo READY; while true; do sleep 1; done".into(),
                 ],
                 tty: None,
+                output_window: 0,
             }),
         )
         .unwrap();
@@ -2573,7 +2865,7 @@ mod tests {
                 r,
                 wake_r,
                 writer_clone,
-                VmExecMsg::Stdout,
+                OutputStream::Stdout,
                 Duration::from_millis(50),
                 disc,
             )
@@ -2630,7 +2922,7 @@ mod tests {
                 r,
                 wake_r,
                 writer_clone,
-                VmExecMsg::Stdout,
+                OutputStream::Stdout,
                 Duration::from_millis(80),
                 disc,
             )
@@ -2709,7 +3001,7 @@ mod tests {
                 r,
                 wake_r,
                 writer_clone,
-                VmExecMsg::Stdout,
+                OutputStream::Stdout,
                 Duration::from_millis(80),
                 disc,
             )
@@ -2756,7 +3048,7 @@ mod tests {
                 r,
                 wake_r,
                 writer_clone,
-                VmExecMsg::Stdout,
+                OutputStream::Stdout,
                 Duration::from_millis(80),
                 disc,
             )
@@ -2823,6 +3115,7 @@ mod tests {
                     "trap '' HUP; sleep 60".into(),
                 ],
                 tty: None,
+                output_window: 0,
             }),
         )
         .unwrap();
@@ -2885,6 +3178,7 @@ mod tests {
                     "trap '' HUP; while true; do printf '0123456789abcdef%.0s' 1 2 3 4 5 6 7 8 9 0; done".into(),
                 ],
                 tty: None,
+                output_window: 0,
             }),
         )
         .unwrap();
@@ -2951,6 +3245,7 @@ mod tests {
                     "trap 'exit 77' INT; while true; do printf '0123456789abcdef%.0s' 1 2 3 4 5 6 7 8 9 0; done".into(),
                 ],
                 tty: None,
+                output_window: 0,
             }),
         )
         .unwrap();
@@ -3066,5 +3361,181 @@ mod tests {
         let sf = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFD) };
         assert!(mf >= 0 && (mf & libc::FD_CLOEXEC) != 0);
         assert!(sf >= 0 && (sf & libc::FD_CLOEXEC) != 0);
+    }
+
+    #[test]
+    fn windowed_session_keeps_reading_credits_while_command_ignores_stdin() {
+        let reaper = Reaper::shared_for_tests();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                None,
+                &active_sessions,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+
+        // The command writes 16x its stdout window BEFORE reading any stdin,
+        // while the host has already sent its full stdin window. The guest
+        // must keep reading the connection (stdin is bounded by
+        // `INPUT_WINDOW`), so `OutputWindow` credits are never stuck behind
+        // unread `Data`, then credit stdin back once it is consumed.
+        let window = 32u32 << 10;
+        let input = vm_exec::INPUT_WINDOW as usize;
+        let script =
+            format!("dd if=/dev/zero bs=4096 count=128 2>/dev/null; head -c {input} >/dev/null");
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec!["/bin/sh".into(), "-c".into(), script],
+                tty: None,
+                output_window: window,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
+        let mut sent = 0usize;
+        while sent < input {
+            let n = CHUNK.min(input - sent);
+            vm_exec::write(&mut host, &VmExecMsg::Data(vec![b'i'; n])).unwrap();
+            sent += n;
+        }
+
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut stdout_bytes = 0usize;
+        let mut outstanding = 0usize;
+        let mut input_credit = 0usize;
+        let code = loop {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => {
+                    outstanding += d.len();
+                    assert!(
+                        outstanding <= window as usize,
+                        "guest exceeded stdout window"
+                    );
+                    stdout_bytes += d.len();
+                    outstanding -= d.len();
+                    vm_exec::write(
+                        &mut host,
+                        &VmExecMsg::OutputWindow {
+                            stream: vm_exec::OUTPUT_STREAM_STDOUT,
+                            bytes: d.len() as u32,
+                        },
+                    )
+                    .unwrap();
+                }
+                Some(VmExecMsg::InputWindow { bytes }) => input_credit += bytes as usize,
+                Some(VmExecMsg::Pong) => {}
+                Some(VmExecMsg::Exit { code }) => break code,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        };
+        assert_eq!(code, 0);
+        assert_eq!(stdout_bytes, 128 * 4096);
+        assert_eq!(input_credit, input);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn output_window_keeps_stderr_moving_when_stdout_window_is_exhausted() {
+        let reaper = Reaper::shared_for_tests();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                None,
+                &active_sessions,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+
+        let window = 32u32 << 10;
+        // Write 256 KiB to stdout in the background (8x the 32 KiB window!)
+        // and emit a stderr readiness marker independently. Even while the
+        // host never replenishes stdout credits, stdout stops at 32 KiB and
+        // the stderr marker MUST arrive promptly, followed by the rest of
+        // stdout once stdout credits are replenished.
+        let script =
+            "dd if=/dev/zero bs=4096 count=64 2>/dev/null & printf 'STDERR_READY\\n' >&2; wait";
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+                tty: None,
+                output_window: window,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
+
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut stdout_bytes = 0usize;
+        let mut stderr_buf = Vec::new();
+        while !stderr_buf.windows(12).any(|w| w == b"STDERR_READY") {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => {
+                    stdout_bytes += d.len();
+                    assert!(
+                        stdout_bytes <= window as usize,
+                        "guest exceeded stdout window ({stdout_bytes} > {window})"
+                    );
+                }
+                Some(VmExecMsg::Stderr(d)) => stderr_buf.extend_from_slice(&d),
+                Some(VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame before stderr marker: {other:?}"),
+            }
+        }
+        assert!(stdout_bytes <= window as usize);
+
+        // Now replenish stdout window; all 256 KiB of stdout + Exit(0) arrive.
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::OutputWindow {
+                stream: vm_exec::OUTPUT_STREAM_STDOUT,
+                bytes: 512 << 10,
+            },
+        )
+        .unwrap();
+        let mut exit_code_seen = None;
+        while let Some(msg) = vm_exec::read(&mut host).unwrap() {
+            match msg {
+                VmExecMsg::Stdout(d) => stdout_bytes += d.len(),
+                VmExecMsg::Stderr(d) => stderr_buf.extend_from_slice(&d),
+                VmExecMsg::Exit { code } => {
+                    exit_code_seen = Some(code);
+                    break;
+                }
+                VmExecMsg::Pong => {}
+                other => panic!("unexpected frame during drain: {other:?}"),
+            }
+        }
+        assert_eq!(exit_code_seen, Some(0));
+        assert_eq!(stdout_bytes, 64 * 4096);
+        server.join().unwrap();
     }
 }

@@ -105,7 +105,13 @@ fn run_spec(
     let spec = build_spec(workdir, extra_env, argv, allocate_pty)?;
     let initial_tty_size = spec.tty.as_ref().map(|t| (t.rows, t.cols));
     let (conn, session_token, sock_path) = connect_and_start(&spec)?;
-    match run_session(conn, session_token, sock_path, initial_tty_size)? {
+    match run_session(
+        conn,
+        session_token,
+        sock_path,
+        initial_tty_size,
+        spec.output_window,
+    )? {
         SessionExit::Code(code) => std::process::exit(code),
         SessionExit::Signal(sig) => {
             // Raw mode has already been restored; re-raise with default
@@ -138,11 +144,19 @@ fn build_spec(
             cols,
         }
     });
+    // Non-PTY sessions are flow-controlled per stream so a stalled stdout
+    // reader can never block stderr (see `kat_proto::vm_exec`).
+    let output_window = if tty.is_none() {
+        vm_exec::OUTPUT_WINDOW_DEFAULT
+    } else {
+        0
+    };
     Ok(ExecSpec {
         cwd,
         env,
         argv,
         tty,
+        output_window,
     })
 }
 
@@ -945,15 +959,26 @@ impl Drop for OutputRelay {
 }
 
 /// Maximum bytes buffered per stream on the host when a split output relay's
-/// command pipe is full, keeping the independent peer stream (e.g. stderr
-/// while stdout is blocked) moving without unbounded host memory growth.
+/// command pipe is full and the guest is NOT flow-controlled
+/// (`ExecSpec::output_window == 0`). Windowed sessions never reach it: the
+/// guest sends at most `output_window` unacknowledged bytes per stream, so the
+/// host keeps reading the connection (and delivering stderr) unconditionally.
 const SPLIT_STREAM_QUEUE_CAP: usize = 2 << 20;
+/// After one split channel fails during the post-exit drain, how long the
+/// surviving channel may go without observable progress before it is aborted
+/// (so an unread peer pipe cannot hang teardown, while a slow but live reader
+/// still receives every buffered byte).
+const SPLIT_DRAIN_SURVIVOR_IDLE: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct PendingBytes {
-    chunks: VecDeque<Vec<u8>>,
+    /// Encoded chunks with the guest payload bytes (flow-control credit) each
+    /// releases once fully written downstream.
+    chunks: VecDeque<(Vec<u8>, usize)>,
     head_off: usize,
     bytes: usize,
+    /// Credit released by fully written chunks, not yet granted to the guest.
+    released: usize,
 }
 
 impl PendingBytes {
@@ -965,32 +990,38 @@ impl PendingBytes {
         self.bytes >= SPLIT_STREAM_QUEUE_CAP
     }
 
-    fn push(&mut self, data: Vec<u8>) {
+    fn push(&mut self, data: Vec<u8>, credit: usize) {
         if !data.is_empty() {
             self.bytes += data.len();
-            self.chunks.push_back(data);
+            self.chunks.push_back((data, credit));
         }
     }
 
     fn front(&self) -> Option<&[u8]> {
-        self.chunks.front().map(|v| &v[self.head_off..])
+        self.chunks.front().map(|(v, _)| &v[self.head_off..])
     }
 
     fn advance(&mut self, n: usize) {
         self.head_off += n;
         self.bytes = self.bytes.saturating_sub(n);
-        if let Some(front) = self.chunks.front()
+        if let Some((front, credit)) = self.chunks.front()
             && self.head_off >= front.len()
         {
+            self.released += *credit;
             self.chunks.pop_front();
             self.head_off = 0;
         }
+    }
+
+    fn take_released(&mut self) -> usize {
+        std::mem::take(&mut self.released)
     }
 
     fn clear(&mut self) {
         self.chunks.clear();
         self.head_off = 0;
         self.bytes = 0;
+        self.released = 0;
     }
 }
 
@@ -1053,8 +1084,19 @@ impl SplitChannel {
     }
 
     fn is_queue_full(&self) -> bool {
+        self.pending().is_full()
+    }
+
+    fn pending(&self) -> &PendingBytes {
         match self {
-            Self::Relay { pending, .. } | Self::Direct { pending, .. } => pending.is_full(),
+            Self::Relay { pending, .. } | Self::Direct { pending, .. } => pending,
+        }
+    }
+
+    /// Guest payload bytes fully handed downstream since the last call.
+    fn take_released(&mut self) -> usize {
+        match self {
+            Self::Relay { pending, .. } | Self::Direct { pending, .. } => pending.take_released(),
         }
     }
 
@@ -1088,16 +1130,17 @@ impl SplitChannel {
         if data.is_empty() {
             return FlushOutcome::Ok;
         }
+        let credit = data.len();
         match self {
             Self::Relay { dest, pending, .. } => {
                 let mut frame = Vec::with_capacity(5 + data.len());
                 frame.push(*dest);
                 frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 frame.extend_from_slice(&data);
-                pending.push(frame);
+                pending.push(frame, credit);
             }
             Self::Direct { pending, .. } => {
-                pending.push(data);
+                pending.push(data, credit);
             }
         }
         self.try_flush()
@@ -1208,148 +1251,174 @@ impl OutputRelays {
         match self {
             Self::None => RelayFinish::Drained,
             Self::Shared(r) => r.finish(term_wake_r),
-            Self::Split { out, err } => {
-                let mut out_done = false;
-                let mut err_done = false;
-                loop {
-                    // Flush any host-queued frames and close `cmd_w` as soon as
-                    // each channel's host queue empties so both helpers drain
-                    // concurrently. On any write failure, abort both channels
-                    // immediately so an unread peer pipe never hangs teardown.
-                    if !out_done {
-                        match out.try_flush() {
-                            FlushOutcome::Ok => {
-                                if out.close_if_idle() {
-                                    out_done = true;
-                                }
-                            }
-                            FlushOutcome::BrokenPipe => {
-                                self.abort();
-                                return RelayFinish::BrokenPipe;
-                            }
-                            FlushOutcome::Error(e) => {
-                                self.abort();
-                                return RelayFinish::Error(e);
-                            }
-                        }
-                    }
-                    if !err_done {
-                        match err.try_flush() {
-                            FlushOutcome::Ok => {
-                                if err.close_if_idle() {
-                                    err_done = true;
-                                }
-                            }
-                            FlushOutcome::BrokenPipe => {
-                                self.abort();
-                                return RelayFinish::BrokenPipe;
-                            }
-                            FlushOutcome::Error(e) => {
-                                self.abort();
-                                return RelayFinish::Error(e);
-                            }
-                        }
-                    }
-                    if out_done && err_done {
-                        return RelayFinish::Drained;
-                    }
+            Self::Split { out, err } => Self::finish_split([out, err], term_wake_r),
+        }
+    }
 
-                    let mut pfds = [libc::pollfd {
-                        fd: -1,
-                        events: 0,
+    /// Drain both split channels concurrently. A failure on one channel aborts
+    /// ONLY that channel and is recorded as the result; the surviving channel
+    /// keeps flushing every byte already received from the guest (e.g. stderr
+    /// diagnostics after `head` closed stdout) until it drains, fails, or makes
+    /// no observable progress for [`SPLIT_DRAIN_SURVIVOR_IDLE`] (an unread peer
+    /// pipe), at which point it is aborted too.
+    fn finish_split(mut chans: [&mut SplitChannel; 2], term_wake_r: RawFd) -> RelayFinish {
+        let mut done = [false; 2];
+        let mut failure: Option<RelayFinish> = None;
+        let mut survivor_deadline: Option<Instant> = None;
+        let mut last_pending = [chans[0].pending().bytes, chans[1].pending().bytes];
+
+        let fail = |chan: &mut SplitChannel,
+                    done: &mut bool,
+                    failure: &mut Option<RelayFinish>,
+                    deadline: &mut Option<Instant>,
+                    f: RelayFinish| {
+            chan.abort();
+            *done = true;
+            if failure.is_none() {
+                *failure = Some(f);
+            }
+            if deadline.is_none() {
+                *deadline = Some(Instant::now() + SPLIT_DRAIN_SURVIVOR_IDLE);
+            }
+        };
+
+        loop {
+            // Flush host-queued frames and close `cmd_w` as soon as a channel's
+            // host queue empties so both helpers drain concurrently.
+            for i in 0..2 {
+                if done[i] {
+                    continue;
+                }
+                match chans[i].try_flush() {
+                    FlushOutcome::Ok => {
+                        if chans[i].close_if_idle() {
+                            done[i] = true;
+                        }
+                    }
+                    FlushOutcome::BrokenPipe => fail(
+                        chans[i],
+                        &mut done[i],
+                        &mut failure,
+                        &mut survivor_deadline,
+                        RelayFinish::BrokenPipe,
+                    ),
+                    FlushOutcome::Error(e) => fail(
+                        chans[i],
+                        &mut done[i],
+                        &mut failure,
+                        &mut survivor_deadline,
+                        RelayFinish::Error(e),
+                    ),
+                }
+                // Observable progress by the survivor extends its deadline.
+                let now_pending = chans[i].pending().bytes;
+                if now_pending < last_pending[i]
+                    && let Some(dl) = survivor_deadline.as_mut()
+                {
+                    *dl = Instant::now() + SPLIT_DRAIN_SURVIVOR_IDLE;
+                }
+                last_pending[i] = now_pending;
+            }
+            if done[0] && done[1] {
+                return failure.unwrap_or(RelayFinish::Drained);
+            }
+
+            let timeout_ms = match survivor_deadline {
+                None => -1,
+                Some(dl) => {
+                    let rem = dl.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        for (i, chan) in chans.iter_mut().enumerate() {
+                            if !done[i] {
+                                chan.abort();
+                            }
+                        }
+                        return failure.unwrap_or(RelayFinish::BrokenPipe);
+                    }
+                    rem.as_millis().clamp(1, i32::MAX as u128) as i32
+                }
+            };
+
+            let mut pfds = [libc::pollfd {
+                fd: -1,
+                events: 0,
+                revents: 0,
+            }; 5];
+            pfds[0] = libc::pollfd {
+                fd: term_wake_r,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Per channel: [status_fd POLLIN, write_fd POLLOUT] at 1 + 2*i.
+            for (i, chan) in chans.iter().enumerate() {
+                if done[i] {
+                    continue;
+                }
+                if let Some(fd) = chan.status_fd() {
+                    pfds[1 + 2 * i] = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
                         revents: 0,
-                    }; 5];
-                    let mut nfds = 0usize;
-                    let mut push_pfd = |fd: RawFd, events: libc::c_short| -> usize {
-                        let i = nfds;
-                        pfds[i] = libc::pollfd {
-                            fd,
-                            events,
-                            revents: 0,
-                        };
-                        nfds += 1;
-                        i
                     };
-                    let term_idx = push_pfd(term_wake_r, libc::POLLIN);
-                    let out_status_idx = if !out_done {
-                        out.status_fd().map(|fd| push_pfd(fd, libc::POLLIN))
-                    } else {
-                        None
+                }
+                if let Some(fd) = chan.write_poll_fd() {
+                    pfds[2 + 2 * i] = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
                     };
-                    let err_status_idx = if !err_done {
-                        err.status_fd().map(|fd| push_pfd(fd, libc::POLLIN))
-                    } else {
-                        None
-                    };
-                    let out_write_idx = if !out_done {
-                        out.write_poll_fd().map(|fd| push_pfd(fd, libc::POLLOUT))
-                    } else {
-                        None
-                    };
-                    let err_write_idx = if !err_done {
-                        err.write_poll_fd().map(|fd| push_pfd(fd, libc::POLLOUT))
-                    } else {
-                        None
-                    };
+                }
+            }
 
-                    let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
-                    if rc < 0 {
-                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                            continue;
-                        }
-                        self.abort();
-                        return RelayFinish::Drained;
+            let rc =
+                unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
+            if rc < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                for chan in &mut chans {
+                    chan.abort();
+                }
+                return failure.unwrap_or(RelayFinish::Drained);
+            }
+            if pfds[0].revents != 0 {
+                for chan in &mut chans {
+                    chan.abort();
+                }
+                return RelayFinish::Cancelled;
+            }
+            for i in 0..2 {
+                if done[i] {
+                    continue;
+                }
+                if pfds[1 + 2 * i].revents != 0 {
+                    match chans[i].collect_finished() {
+                        RelayFinish::Drained => done[i] = true,
+                        f => fail(
+                            chans[i],
+                            &mut done[i],
+                            &mut failure,
+                            &mut survivor_deadline,
+                            f,
+                        ),
                     }
-                    if pfds[term_idx].revents != 0 {
-                        self.abort();
-                        return RelayFinish::Cancelled;
-                    }
-                    if let Some(i) = out_status_idx
-                        && pfds[i].revents != 0
-                    {
-                        match out.collect_finished() {
-                            RelayFinish::Drained => out_done = true,
-                            failure => {
-                                self.abort();
-                                return failure;
-                            }
-                        }
-                    }
-                    if let Some(i) = err_status_idx
-                        && pfds[i].revents != 0
-                    {
-                        match err.collect_finished() {
-                            RelayFinish::Drained => err_done = true,
-                            failure => {
-                                self.abort();
-                                return failure;
-                            }
-                        }
-                    }
-                    if !out_done
-                        && let Some(i) = out_write_idx
-                        && (pfds[i].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-                        && (pfds[i].revents & libc::POLLOUT) == 0
-                    {
-                        let failure = match out.try_flush() {
-                            FlushOutcome::Ok | FlushOutcome::BrokenPipe => RelayFinish::BrokenPipe,
-                            FlushOutcome::Error(e) => RelayFinish::Error(e),
-                        };
-                        self.abort();
-                        return failure;
-                    }
-                    if !err_done
-                        && let Some(i) = err_write_idx
-                        && (pfds[i].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-                        && (pfds[i].revents & libc::POLLOUT) == 0
-                    {
-                        let failure = match err.try_flush() {
-                            FlushOutcome::Ok | FlushOutcome::BrokenPipe => RelayFinish::BrokenPipe,
-                            FlushOutcome::Error(e) => RelayFinish::Error(e),
-                        };
-                        self.abort();
-                        return failure;
-                    }
+                    continue;
+                }
+                let wr = pfds[2 + 2 * i].revents;
+                if (wr & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                    && (wr & libc::POLLOUT) == 0
+                {
+                    let f = match chans[i].try_flush() {
+                        FlushOutcome::Ok | FlushOutcome::BrokenPipe => RelayFinish::BrokenPipe,
+                        FlushOutcome::Error(e) => RelayFinish::Error(e),
+                    };
+                    fail(
+                        chans[i],
+                        &mut done[i],
+                        &mut failure,
+                        &mut survivor_deadline,
+                        f,
+                    );
                 }
             }
         }
@@ -1997,7 +2066,80 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
 }
 
 enum WriterCtrl {
-    Resize { rows: u16, cols: u16 },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    /// Replenish the guest's send window for an output stream.
+    OutputWindow {
+        stream: u8,
+        bytes: u32,
+    },
+    /// Guest-granted stdin credit (`VmExecMsg::InputWindow`).
+    InputWindow(u32),
+}
+
+/// Host side of windowed (non-PTY) flow control; see [`kat_proto::vm_exec`].
+///
+/// Tracks the guest's remaining per-stream output credit, returns credit (via
+/// `writer_worker`) once output has been handed to the local sink, and forwards
+/// guest stdin credit to `writer_worker`. Because the guest can never have more
+/// than `output_window` unacknowledged bytes per stream, the split relay keeps
+/// reading the connection while stdout is blocked without unbounded buffering.
+struct FlowCtl {
+    remaining: [u64; 2],
+    ctrl_tx: mpsc::Sender<WriterCtrl>,
+    ctrl_wake_w: Arc<OwnedFd>,
+}
+
+impl FlowCtl {
+    fn new(window: u32, ctrl_tx: mpsc::Sender<WriterCtrl>, ctrl_wake_w: Arc<OwnedFd>) -> Self {
+        Self {
+            remaining: [u64::from(window); 2],
+            ctrl_tx,
+            ctrl_wake_w,
+        }
+    }
+
+    /// Account for an output frame received from the guest.
+    fn on_output(&mut self, stream: u8, len: usize) -> anyhow::Result<()> {
+        let rem = &mut self.remaining[usize::from(stream)];
+        let len = len as u64;
+        if len > *rem {
+            bail!(
+                "the guest exceeded the {} flow-control window",
+                if stream == vm_exec::OUTPUT_STREAM_STDOUT {
+                    "stdout"
+                } else {
+                    "stderr"
+                }
+            );
+        }
+        *rem -= len;
+        Ok(())
+    }
+
+    /// Return `bytes` of output credit to the guest.
+    fn grant(&mut self, stream: u8, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let bytes = bytes.min(u32::MAX as usize) as u32;
+        self.remaining[usize::from(stream)] += u64::from(bytes);
+        if self
+            .ctrl_tx
+            .send(WriterCtrl::OutputWindow { stream, bytes })
+            .is_ok()
+        {
+            notify_wake(&self.ctrl_wake_w);
+        }
+    }
+
+    fn forward_input_credit(&self, bytes: u32) {
+        if bytes > 0 && self.ctrl_tx.send(WriterCtrl::InputWindow(bytes)).is_ok() {
+            notify_wake(&self.ctrl_wake_w);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2147,33 +2289,56 @@ fn send_signal_oob(
 ///
 /// Using a single `poll` + nonblocking `send` loop eliminates any shared socket
 /// writer mutex and guarantees `Resize` takes priority over further stdin reads.
+/// `stdin_window`: `Some(INPUT_WINDOW)` in windowed sessions, where stdin is
+/// only read (and sent as `Data`) while guest-granted credit remains, so the
+/// guest never has to stop reading the connection; `None` = unmetered (PTY).
 fn writer_worker(
     sock: UnixStream,
     stdin_fd: RawFd,
     stop_r: OwnedFd,
     ctrl_wake_r: OwnedFd,
     ctrl_rx: mpsc::Receiver<WriterCtrl>,
+    mut stdin_window: Option<u64>,
 ) {
     let mut out_buf: Vec<u8> = Vec::new();
     let mut out_off: usize = 0;
     let mut pending_resize: Option<(u16, u16)> = None;
+    let mut pending_out_credit = [0u64; 2];
     let mut stdin_open = stdin_fd >= 0;
     let mut stdin_buf = vec![0u8; CHUNK];
 
     loop {
-        // 1. Drain any pending high-priority resize events without blocking.
+        // 1. Drain any pending high-priority control events without blocking.
         while let Ok(ev) = ctrl_rx.try_recv() {
             match ev {
                 WriterCtrl::Resize { rows, cols } => pending_resize = Some((rows, cols)),
+                WriterCtrl::OutputWindow { stream, bytes } => {
+                    let c = &mut pending_out_credit[usize::from(stream)];
+                    *c = c.saturating_add(u64::from(bytes));
+                }
+                WriterCtrl::InputWindow(bytes) => {
+                    if let Some(w) = stdin_window.as_mut() {
+                        *w = w.saturating_add(u64::from(bytes));
+                    }
+                }
             }
         }
 
-        // 2. If no frame is mid-flight, pick the next frame in priority order.
+        // 2. If no frame is mid-flight, pick the next frame in priority order:
+        //    resize, coalesced output credit, then stdin.
         if out_off == out_buf.len() {
             out_buf.clear();
             out_off = 0;
             if let Some((rows, cols)) = pending_resize.take() {
                 out_buf = VmExecMsg::Resize { rows, cols }.encode();
+            } else if let Some(stream) = pending_out_credit.iter().position(|&c| c > 0) {
+                let bytes = pending_out_credit[stream].min(u64::from(u32::MAX));
+                pending_out_credit[stream] -= bytes;
+                out_buf = VmExecMsg::OutputWindow {
+                    stream: stream as u8,
+                    bytes: bytes as u32,
+                }
+                .encode();
             }
         }
 
@@ -2216,7 +2381,11 @@ fn writer_worker(
         // 4. Wait for stop, control wakeup, socket writability (if mid-frame),
         //    or stdin readability (only when idle and no resize is pending).
         let need_write = out_off < out_buf.len();
-        let can_read_stdin = stdin_open && !need_write && pending_resize.is_none();
+        let can_read_stdin = stdin_open
+            && !need_write
+            && pending_resize.is_none()
+            && pending_out_credit == [0, 0]
+            && stdin_window != Some(0);
 
         let mut pfds = [
             libc::pollfd {
@@ -2278,7 +2447,7 @@ fn writer_worker(
         }
         if pfds[1].revents != 0 {
             drain_wake(&ctrl_wake_r);
-            // Loop immediately so high-priority resize frames run before stdin.
+            // Loop immediately so resize/credit frames run before stdin.
             continue;
         }
         if let Some(i) = sock_idx
@@ -2290,9 +2459,13 @@ fn writer_worker(
         if let Some(i) = stdin_idx
             && pfds[i].revents != 0
         {
+            let max = stdin_window.map_or(stdin_buf.len(), |w| {
+                usize::try_from(w)
+                    .unwrap_or(usize::MAX)
+                    .min(stdin_buf.len())
+            });
             let n = loop {
-                let rc =
-                    unsafe { libc::read(stdin_fd, stdin_buf.as_mut_ptr().cast(), stdin_buf.len()) };
+                let rc = unsafe { libc::read(stdin_fd, stdin_buf.as_mut_ptr().cast(), max) };
                 if rc >= 0 {
                     break Some(rc as usize);
                 }
@@ -2308,6 +2481,9 @@ fn writer_worker(
                     stdin_open = false;
                     out_buf = VmExecMsg::DataEnd.encode();
                 } else {
+                    if let Some(w) = stdin_window.as_mut() {
+                        *w -= n as u64;
+                    }
                     out_buf = VmExecMsg::Data(stdin_buf[..n].to_vec()).encode();
                 }
                 out_off = 0;
@@ -2584,10 +2760,11 @@ fn run_session(
     session_token: [u8; 16],
     sock_path: PathBuf,
     initial_tty_size: Option<(u16, u16)>,
+    output_window: u32,
 ) -> anyhow::Result<SessionExit> {
     let mut out = OutputSink::Fd(1);
     let mut err = OutputSink::Fd(2);
-    run_session_io(
+    run_session_io_windowed(
         conn,
         session_token,
         move |deadline, stop_r| {
@@ -2601,9 +2778,12 @@ fn run_session(
         window_size,
         SIGINT_DELIVERY_TIMEOUT,
         None,
+        output_window,
     )
 }
 
+/// [`run_session_io_windowed`] against an unmetered guest (`output_window == 0`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_session_io(
     conn: UnixStream,
@@ -2618,7 +2798,42 @@ fn run_session_io(
     sigint_timeout: Duration,
     on_ready: Option<mpsc::Sender<()>>,
 ) -> anyhow::Result<SessionExit> {
+    run_session_io_windowed(
+        conn,
+        session_token,
+        connect_ctrl,
+        initial_tty_size,
+        stdin_fd,
+        stdout_fd,
+        out,
+        err,
+        get_window_size,
+        sigint_timeout,
+        on_ready,
+        0,
+    )
+}
+
+/// `output_window` must equal the `ExecSpec::output_window` the guest accepted
+/// (nonzero enables bidirectional flow control for non-PTY sessions).
+#[allow(clippy::too_many_arguments)]
+fn run_session_io_windowed(
+    conn: UnixStream,
+    session_token: [u8; 16],
+    connect_ctrl: impl Fn(Instant, RawFd) -> io::Result<UnixStream> + Send + 'static,
+    initial_tty_size: Option<(u16, u16)>,
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+    out: &mut OutputSink<'_>,
+    err: &mut OutputSink<'_>,
+    get_window_size: impl Fn() -> (u16, u16) + Send + 'static,
+    sigint_timeout: Duration,
+    on_ready: Option<mpsc::Sender<()>>,
+    output_window: u32,
+) -> anyhow::Result<SessionExit> {
     let allocate_pty = initial_tty_size.is_some();
+    // The guest ignores `output_window` for PTY sessions; mirror that here.
+    let output_window = if allocate_pty { 0 } else { output_window };
     let stdin_is_tty = is_tty(stdin_fd);
     let stdout_is_tty = is_tty(stdout_fd);
     let want_raw = allocate_pty && stdin_is_tty;
@@ -2734,7 +2949,14 @@ fn run_session_io(
     let writer_thread = {
         let stop_fd = stop_r.try_clone()?;
         thread::spawn(move || {
-            writer_worker(writer_sock, worker_stdin_fd, stop_fd, ctrl_wake_r, ctrl_rx);
+            writer_worker(
+                writer_sock,
+                worker_stdin_fd,
+                stop_fd,
+                ctrl_wake_r,
+                ctrl_rx,
+                (output_window > 0).then_some(u64::from(vm_exec::INPUT_WINDOW)),
+            );
         })
     };
 
@@ -2850,13 +3072,17 @@ fn run_session_io(
         let _ = tx.send(());
     }
 
+    let mut flow = (output_window > 0)
+        .then(|| FlowCtl::new(output_window, ctrl_tx.clone(), ctrl_wake_w.clone()));
     let outcome = relay_output_cancellable(
         conn,
         out,
         err,
         &mut output_relays,
         Some(term_wake_r.as_raw_fd()),
+        flow.as_mut(),
     );
+    drop(flow);
 
     // Shut down the socket lock-free BEFORE joining relay workers so a blocked
     // writer cannot hang cleanup (e.g. after BrokenPipe on stdout) and the
@@ -2911,17 +3137,33 @@ fn run_session_io(
     }
 }
 
+/// Return output credit for bytes `ch` has fully handed downstream.
+fn grant_released(flow: Option<&mut FlowCtl>, ch: &mut SplitChannel, stream: u8) {
+    let released = ch.take_released();
+    if let Some(f) = flow {
+        f.grant(stream, released);
+    }
+}
+
 /// Multiplex guest output frames across two independent split channels without
 /// letting a full stdout pipe (or full stdout relay command pipe) block
 /// reading or delivering stderr frames queued behind it.
+///
+/// With `flow` (windowed guest), the connection is read unconditionally: each
+/// host queue is bounded by the guest's per-stream window, and credit is
+/// returned only as bytes leave the queue, so a blocked stdout throttles only
+/// the guest's stdout. Without `flow` (unmetered guest), reading pauses once
+/// either queue reaches [`SPLIT_STREAM_QUEUE_CAP`] to bound host memory.
 fn relay_split_cancellable(
     conn: UnixStream,
     out: &mut SplitChannel,
     err: &mut SplitChannel,
     term_wake_r: Option<RawFd>,
+    mut flow: Option<&mut FlowCtl>,
 ) -> RelayOutcome {
     let mut frames = FrameReader::default();
     let conn_fd = conn.as_raw_fd();
+    let windowed = flow.is_some();
     loop {
         if term_wake_r.is_some_and(fd_ready) {
             return RelayOutcome::Cancelled;
@@ -2942,8 +3184,10 @@ fn relay_split_cancellable(
             FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
             FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
         }
+        grant_released(flow.as_deref_mut(), out, vm_exec::OUTPUT_STREAM_STDOUT);
+        grant_released(flow.as_deref_mut(), err, vm_exec::OUTPUT_STREAM_STDERR);
 
-        while !out.is_queue_full() && !err.is_queue_full() {
+        while windowed || (!out.is_queue_full() && !err.is_queue_full()) {
             if term_wake_r.is_some_and(fd_ready) {
                 return RelayOutcome::Cancelled;
             }
@@ -2953,24 +3197,8 @@ fn relay_split_cancellable(
             if err.status_fd().is_some_and(fd_ready) {
                 return err.classify_active_failure();
             }
-            match frames.poll_frame(conn_fd) {
-                Ok(PollFrame::Msg(VmExecMsg::Stdout(d))) => match out.enqueue_and_flush(d) {
-                    FlushOutcome::Ok => {}
-                    FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
-                    FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
-                },
-                Ok(PollFrame::Msg(VmExecMsg::Stderr(d))) => match err.enqueue_and_flush(d) {
-                    FlushOutcome::Ok => {}
-                    FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
-                    FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
-                },
-                Ok(PollFrame::Msg(VmExecMsg::Exit { code })) => {
-                    return RelayOutcome::GuestExit(code);
-                }
-                Ok(PollFrame::Msg(VmExecMsg::Error(e))) => {
-                    return RelayOutcome::GuestError(anyhow::anyhow!("{e}"));
-                }
-                Ok(PollFrame::Msg(_)) => {}
+            let msg = match frames.poll_frame(conn_fd) {
+                Ok(PollFrame::Msg(m)) => m,
                 Ok(PollFrame::Eof) => {
                     return RelayOutcome::GuestError(anyhow::anyhow!(
                         "the guest closed the connection"
@@ -2978,9 +3206,31 @@ fn relay_split_cancellable(
                 }
                 Ok(PollFrame::WouldBlock) => break,
                 Err(e) => return RelayOutcome::GuestError(e.into()),
+            };
+            let (ch, stream, d) = match msg {
+                VmExecMsg::Stdout(d) => (&mut *out, vm_exec::OUTPUT_STREAM_STDOUT, d),
+                VmExecMsg::Stderr(d) => (&mut *err, vm_exec::OUTPUT_STREAM_STDERR, d),
+                VmExecMsg::Exit { code } => return RelayOutcome::GuestExit(code),
+                VmExecMsg::Error(e) => return RelayOutcome::GuestError(anyhow::anyhow!("{e}")),
+                VmExecMsg::InputWindow { bytes } => {
+                    if let Some(f) = flow.as_deref() {
+                        f.forward_input_credit(bytes);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            if let Some(f) = flow.as_deref_mut()
+                && let Err(e) = f.on_output(stream, d.len())
+            {
+                return RelayOutcome::GuestError(e);
+            }
+            match ch.enqueue_and_flush(d) {
+                FlushOutcome::Ok => grant_released(flow.as_deref_mut(), ch, stream),
+                FlushOutcome::BrokenPipe => return RelayOutcome::LocalBrokenPipe,
+                FlushOutcome::Error(e) => return RelayOutcome::LocalError(e),
             }
         }
-
         let mut pfds = [libc::pollfd {
             fd: -1,
             events: 0,
@@ -2998,7 +3248,7 @@ fn relay_split_cancellable(
             i
         };
 
-        if !out.is_queue_full() && !err.is_queue_full() {
+        if windowed || (!out.is_queue_full() && !err.is_queue_full()) {
             push_pfd(conn_fd, libc::POLLIN);
         }
         let term_idx = term_wake_r.map(|fd| push_pfd(fd, libc::POLLIN));
@@ -3062,13 +3312,14 @@ fn relay_output_cancellable(
     err: &mut OutputSink<'_>,
     output_relays: &mut OutputRelays,
     term_wake_r: Option<RawFd>,
+    mut flow: Option<&mut FlowCtl>,
 ) -> RelayOutcome {
     if let OutputRelays::Split {
         out: out_ch,
         err: err_ch,
     } = output_relays
     {
-        return relay_split_cancellable(conn, out_ch, err_ch, term_wake_r);
+        return relay_split_cancellable(conn, out_ch, err_ch, term_wake_r, flow);
     }
     let mut frames = FrameReader::default();
     let shared = match output_relays {
@@ -3079,6 +3330,11 @@ fn relay_output_cancellable(
     loop {
         match read_frame_cancellable(&conn, &mut frames, term_wake_r, relay_status_r) {
             Ok(ReadOutcome::Msg(VmExecMsg::Stdout(d))) => {
+                if let Some(f) = flow.as_deref_mut()
+                    && let Err(e) = f.on_output(vm_exec::OUTPUT_STREAM_STDOUT, d.len())
+                {
+                    return RelayOutcome::GuestError(e);
+                }
                 let res = match shared {
                     Some(r) if r.handles_out => {
                         r.write_frame_cancellable(RELAY_DEST_STDOUT, &d, term_wake_r)
@@ -3086,13 +3342,22 @@ fn relay_output_cancellable(
                     _ => write_cancellable(out, &d, term_wake_r),
                 };
                 match res {
-                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::Written) => {
+                        if let Some(f) = flow.as_deref_mut() {
+                            f.grant(vm_exec::OUTPUT_STREAM_STDOUT, d.len());
+                        }
+                    }
                     Ok(WriteOutcome::BrokenPipe) => return RelayOutcome::LocalBrokenPipe,
                     Ok(WriteOutcome::Cancelled) => return RelayOutcome::Cancelled,
                     Err(e) => return RelayOutcome::LocalError(e),
                 }
             }
             Ok(ReadOutcome::Msg(VmExecMsg::Stderr(d))) => {
+                if let Some(f) = flow.as_deref_mut()
+                    && let Err(e) = f.on_output(vm_exec::OUTPUT_STREAM_STDERR, d.len())
+                {
+                    return RelayOutcome::GuestError(e);
+                }
                 let res = match shared {
                     Some(r) if r.handles_err => {
                         r.write_frame_cancellable(RELAY_DEST_STDERR, &d, term_wake_r)
@@ -3100,13 +3365,22 @@ fn relay_output_cancellable(
                     _ => write_cancellable(err, &d, term_wake_r),
                 };
                 match res {
-                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::Written) => {
+                        if let Some(f) = flow.as_deref_mut() {
+                            f.grant(vm_exec::OUTPUT_STREAM_STDERR, d.len());
+                        }
+                    }
                     Ok(WriteOutcome::BrokenPipe) => return RelayOutcome::LocalBrokenPipe,
                     Ok(WriteOutcome::Cancelled) => return RelayOutcome::Cancelled,
                     Err(e) => return RelayOutcome::LocalError(e),
                 }
             }
             Ok(ReadOutcome::Msg(VmExecMsg::Exit { code })) => return RelayOutcome::GuestExit(code),
+            Ok(ReadOutcome::Msg(VmExecMsg::InputWindow { bytes })) => {
+                if let Some(f) = flow.as_deref() {
+                    f.forward_input_credit(bytes);
+                }
+            }
             Ok(ReadOutcome::Msg(VmExecMsg::Error(e))) => {
                 return RelayOutcome::GuestError(anyhow::anyhow!("{e}"));
             }
@@ -3365,8 +3639,14 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let outcome =
-            relay_output_cancellable(host, &mut out, &mut err, &mut OutputRelays::None, None);
+        let outcome = relay_output_cancellable(
+            host,
+            &mut out,
+            &mut err,
+            &mut OutputRelays::None,
+            None,
+            None,
+        );
         peer.join().unwrap();
         assert!(matches!(outcome, RelayOutcome::GuestExit(7)));
         assert_eq!(out_buf, b"hello vm\n");
@@ -3380,18 +3660,28 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let RelayOutcome::GuestError(e) =
-            relay_output_cancellable(host, &mut out, &mut err, &mut OutputRelays::None, None)
-        else {
+        let RelayOutcome::GuestError(e) = relay_output_cancellable(
+            host,
+            &mut out,
+            &mut err,
+            &mut OutputRelays::None,
+            None,
+            None,
+        ) else {
             panic!("expected GuestError");
         };
         assert!(e.to_string().contains("boom"), "{e}");
 
         let (host, guest) = UnixStream::pair().unwrap();
         drop(guest);
-        let RelayOutcome::GuestError(e) =
-            relay_output_cancellable(host, &mut out, &mut err, &mut OutputRelays::None, None)
-        else {
+        let RelayOutcome::GuestError(e) = relay_output_cancellable(
+            host,
+            &mut out,
+            &mut err,
+            &mut OutputRelays::None,
+            None,
+            None,
+        ) else {
             panic!("expected GuestError");
         };
         assert!(e.to_string().contains("closed"), "{e}");
@@ -4940,7 +5230,9 @@ mod tests {
             // keeping `err_r` open and unread for the entire test. Send Exit,
             // wait for host socket shutdown (proving Exit was received and
             // drain has begun), then close ONLY `out_r`. Split draining must
-            // abort the blocked stderr helper promptly and return `expected`.
+            // abort ONLY stdout, keep the stderr survivor draining until it
+            // makes no progress for `SPLIT_DRAIN_SURVIVOR_IDLE`, then abort
+            // the still-blocked stderr helper and return `expected`.
             let guest_bg = thread::spawn(move || {
                 let chunk = vec![b'E'; 16 << 10];
                 for _ in 0..16 {
@@ -4962,7 +5254,7 @@ mod tests {
             let exit = session.join().unwrap().unwrap();
             assert_eq!(exit, SessionExit::Code(expected));
             assert!(
-                t.elapsed() < Duration::from_secs(2),
+                t.elapsed() < SPLIT_DRAIN_SURVIVOR_IDLE + Duration::from_secs(2),
                 "split drain hung on unread peer pipe after EPIPE"
             );
             guest_bg.join().unwrap();
@@ -5032,6 +5324,325 @@ mod tests {
             drop(stdin_w);
             drop(stdin_r);
         }
+    }
+
+    #[test]
+    fn split_drain_keeps_flushing_stderr_to_slow_reader_after_stdout_epipe() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (err_r, err_w) = pipe_cloexec(false).unwrap();
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Buffer far more stderr than the pipe + relay can hold, send Exit,
+        // wait until drain has begun, then close stdout (EPIPE during drain)
+        // and only THEN start a slow stderr reader: every stderr byte already
+        // received from the guest must still be delivered.
+        let chunk = 16usize << 10;
+        let chunks = 24usize;
+        let guest_bg = thread::spawn(move || {
+            vm_exec::write(&mut guest, &VmExecMsg::Stdout(vec![b'O'; 96 << 10])).unwrap();
+            for i in 0..chunks {
+                vm_exec::write(&mut guest, &VmExecMsg::Stderr(vec![b'a' + i as u8; chunk]))
+                    .unwrap();
+            }
+            vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 3 }).unwrap();
+            let mut ds = DeadlineStream::new(
+                &mut guest,
+                Instant::now() + Duration::from_secs(2),
+                "timed out waiting for host shutdown before drain".into(),
+            );
+            let _ = vm_exec::read(&mut ds);
+            drop(ds);
+            drop(out_r);
+            let mut f = std::fs::File::from(err_r);
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 8 << 10];
+            loop {
+                thread::sleep(Duration::from_millis(5));
+                match io::Read::read(&mut f, &mut buf) {
+                    Ok(0) => return got,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("stderr read: {e}"),
+                }
+            }
+        });
+
+        let exit = session.join().unwrap().unwrap();
+        // Nonzero guest status wins over the drain-time stdout EPIPE.
+        assert_eq!(exit, SessionExit::Code(3));
+        drop(out_w);
+        drop(err_w);
+        let got = guest_bg.join().unwrap();
+        let expected: Vec<u8> = (0..chunks)
+            .flat_map(|i| std::iter::repeat_n(b'a' + i as u8, chunk))
+            .collect();
+        assert_eq!(got.len(), expected.len());
+        assert!(
+            got == expected,
+            "stderr bytes lost or reordered after stdout EPIPE"
+        );
+        drop(stdin_w);
+        drop(stdin_r);
+    }
+
+    #[test]
+    fn windowed_split_reads_stderr_past_host_queue_cap_and_returns_stdout_credit() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (err_r, err_w) = pipe_cloexec(false).unwrap();
+        // A window larger than `SPLIT_STREAM_QUEUE_CAP`: an unmetered host
+        // would stop reading the connection at the cap and never see the
+        // stderr marker queued behind this much blocked stdout.
+        let window = (SPLIT_STREAM_QUEUE_CAP + (1 << 20)) as u32;
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io_windowed(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+                window,
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let credits = Arc::new(Mutex::new([0u64; 2]));
+        let mut guest_rd = guest.try_clone().unwrap();
+        let credit_reader = {
+            let credits = credits.clone();
+            thread::spawn(move || {
+                while let Ok(Some(m)) = vm_exec::read(&mut guest_rd) {
+                    if let VmExecMsg::OutputWindow { stream, bytes } = m {
+                        credits.lock().unwrap()[usize::from(stream)] += u64::from(bytes);
+                    }
+                }
+            })
+        };
+
+        let marker = b"STDERR_READY\n";
+        let (exit_tx, exit_rx) = mpsc::channel::<()>();
+        let guest_bg = thread::spawn(move || {
+            let mut sent = 0usize;
+            while sent < window as usize {
+                let n = CHUNK.min(window as usize - sent);
+                vm_exec::write(&mut guest, &VmExecMsg::Stdout(vec![b'O'; n])).unwrap();
+                sent += n;
+            }
+            vm_exec::write(&mut guest, &VmExecMsg::Stderr(marker.to_vec())).unwrap();
+            exit_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 0 }).unwrap();
+        });
+
+        // The marker arrives while `out_r` is still completely unread.
+        let mut got_err = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 64];
+        while got_err.len() < marker.len() {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(!rem.is_zero(), "stderr marker blocked behind stdout");
+            let mut pfd = libc::pollfd {
+                fd: err_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, rem.as_millis().clamp(1, 1000) as i32) } > 0 {
+                let n =
+                    unsafe { libc::read(err_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                assert!(n > 0);
+                got_err.extend_from_slice(&buf[..n as usize]);
+            }
+        }
+        assert_eq!(got_err, marker);
+        let early_stdout_credit = credits.lock().unwrap()[0];
+        assert!(
+            early_stdout_credit < u64::from(window),
+            "stdout credit returned for bytes still queued on the host"
+        );
+
+        // Draining stdout hands the queued bytes downstream, returning credit.
+        let out_reader = thread::spawn(move || {
+            let mut f = std::fs::File::from(out_r);
+            let mut out = Vec::new();
+            io::Read::read_to_end(&mut f, &mut out).unwrap();
+            out.len()
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while credits.lock().unwrap()[0] < u64::from(window) {
+            assert!(Instant::now() < deadline, "stdout credit never returned");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(credits.lock().unwrap()[1], marker.len() as u64);
+        exit_tx.send(()).unwrap();
+
+        assert_eq!(session.join().unwrap().unwrap(), SessionExit::Code(0));
+        drop(out_w);
+        drop(err_w);
+        assert_eq!(out_reader.join().unwrap(), window as usize);
+        guest_bg.join().unwrap();
+        credit_reader.join().unwrap();
+        drop(stdin_w);
+        drop(stdin_r);
+    }
+
+    #[test]
+    fn flow_ctl_returns_credit_forwards_stdin_credit_and_rejects_window_overrun() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        vm_exec::write(&mut guest, &VmExecMsg::InputWindow { bytes: 77 }).unwrap();
+        vm_exec::write(&mut guest, &VmExecMsg::Stdout(vec![b'x'; 1000])).unwrap();
+        vm_exec::write(&mut guest, &VmExecMsg::Stderr(vec![b'y'; 1025])).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (_wake_r, wake_w) = pipe_cloexec(true).unwrap();
+        let mut flow = FlowCtl::new(1024, tx, Arc::new(wake_w));
+        let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
+        let mut out = OutputSink::Writer(&mut out_buf);
+        let mut err = OutputSink::Writer(&mut err_buf);
+        let RelayOutcome::GuestError(e) = relay_output_cancellable(
+            host,
+            &mut out,
+            &mut err,
+            &mut OutputRelays::None,
+            None,
+            Some(&mut flow),
+        ) else {
+            panic!("expected GuestError for a stderr window overrun");
+        };
+        assert!(e.to_string().contains("stderr flow-control window"), "{e}");
+        assert_eq!(out_buf.len(), 1000);
+        assert!(err_buf.is_empty());
+        let ctrl: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(ctrl[0], WriterCtrl::InputWindow(77)));
+        assert!(matches!(
+            ctrl[1],
+            WriterCtrl::OutputWindow {
+                stream: vm_exec::OUTPUT_STREAM_STDOUT,
+                bytes: 1000
+            }
+        ));
+        assert_eq!(ctrl.len(), 2);
+    }
+
+    #[test]
+    fn writer_sends_stdin_only_within_guest_granted_window() {
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (stop_r, stop_w) = pipe_cloexec(false).unwrap();
+        let (ctrl_wake_r, ctrl_wake_w) = pipe_cloexec(true).unwrap();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let writer = thread::spawn(move || {
+            writer_worker(
+                host,
+                stdin_fd,
+                stop_r,
+                ctrl_wake_r,
+                ctrl_rx,
+                Some(u64::from(vm_exec::INPUT_WINDOW)),
+            );
+        });
+        let feeder = thread::spawn(move || {
+            let mut f = std::fs::File::from(stdin_w);
+            let chunk = vec![b's'; 32 << 10];
+            // Far more than the window; blocks once the writer stops reading.
+            for _ in 0..32 {
+                if io::Write::write_all(&mut f, &chunk).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let read_data_until_quiet = |guest: &mut UnixStream| -> usize {
+            let mut total = 0usize;
+            loop {
+                let mut ds = DeadlineStream::new(
+                    guest,
+                    Instant::now() + Duration::from_millis(300),
+                    "quiet".into(),
+                );
+                match vm_exec::read(&mut ds) {
+                    Ok(Some(VmExecMsg::Data(d))) => total += d.len(),
+                    Ok(Some(other)) => panic!("unexpected frame {other:?}"),
+                    Ok(None) => panic!("writer closed the connection"),
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => return total,
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+        };
+
+        let window = vm_exec::INPUT_WINDOW as usize;
+        assert_eq!(read_data_until_quiet(&mut guest), window);
+        ctrl_tx.send(WriterCtrl::InputWindow(10_000)).unwrap();
+        notify_wake(&ctrl_wake_w);
+        assert_eq!(read_data_until_quiet(&mut guest), 10_000);
+
+        // Output credit is sent ahead of further stdin.
+        ctrl_tx
+            .send(WriterCtrl::OutputWindow {
+                stream: vm_exec::OUTPUT_STREAM_STDERR,
+                bytes: 5,
+            })
+            .unwrap();
+        notify_wake(&ctrl_wake_w);
+        let mut ds = DeadlineStream::new(
+            &mut guest,
+            Instant::now() + Duration::from_secs(2),
+            "no OutputWindow".into(),
+        );
+        assert_eq!(
+            vm_exec::read(&mut ds).unwrap(),
+            Some(VmExecMsg::OutputWindow {
+                stream: vm_exec::OUTPUT_STREAM_STDERR,
+                bytes: 5
+            })
+        );
+        drop(ds);
+
+        drop(stop_w);
+        writer.join().unwrap();
+        drop(stdin_r);
+        drop(guest);
+        feeder.join().unwrap();
     }
 
     struct SharedVec(Arc<Mutex<Vec<u8>>>);
