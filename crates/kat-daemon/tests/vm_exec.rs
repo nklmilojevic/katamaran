@@ -685,3 +685,121 @@ fn vm_shell_and_exec_run_as_root_in_vm_namespaces() {
         "{missing:?}"
     );
 }
+
+/// Spawn the real `katamaran vm exec` binary against a mock `vm-exec.sock`
+/// inheriting shared blocking output and input pipes, terminate it with
+/// `SIGTERM`, and verify the parent's duplicate pipe descriptors still have
+/// `O_NONBLOCK` clear afterward.
+#[test]
+fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
+    use kat_proto::vm_exec::{self, VmExecMsg};
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = PathBuf::from(format!("/tmp/kve-sigterm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run_dir = dir.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let sock = run_dir.join("vm-exec.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let (stop_srv_tx, stop_srv_rx) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        assert_eq!(vm_exec::read(&mut conn).unwrap(), Some(VmExecMsg::Ping));
+        vm_exec::write(&mut conn, &VmExecMsg::Pong).unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut conn).unwrap(),
+            Some(VmExecMsg::Exec(_))
+        ));
+        vm_exec::write(&mut conn, &VmExecMsg::Started).unwrap();
+        vm_exec::write(&mut conn, &VmExecMsg::Stdout(b"READY\n".to_vec())).unwrap();
+        let _ = stop_srv_rx.recv_timeout(Duration::from_secs(5));
+    });
+
+    let mk_pipe = || -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe {
+            let r = OwnedFd::from_raw_fd(fds[0]);
+            let w = OwnedFd::from_raw_fd(fds[1]);
+            libc::fcntl(r.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(w.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            (r, w)
+        }
+    };
+
+    let (in_r, in_w) = mk_pipe();
+    let (out_r, out_w) = mk_pipe();
+    let (err_r, err_w) = mk_pipe();
+    let in_r_child = in_r.try_clone().unwrap();
+    let out_w_child = out_w.try_clone().unwrap();
+    let err_w_child = err_w.try_clone().unwrap();
+
+    assert_eq!(
+        unsafe { libc::fcntl(out_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(in_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_katamaran"));
+    cmd.args(["vm", "exec", "--", "sleep", "60"])
+        .env("KATAMARAN_HOME", &dir)
+        .stdin(Stdio::from(in_r_child))
+        .stdout(Stdio::from(out_w_child))
+        .stderr(Stdio::from(err_w_child));
+    let mut child = ChildGuard::new(cmd.spawn().expect("spawn katamaran vm exec"));
+
+    // Wait for `READY\n` so we know run_session_io has entered its relay loop
+    // and enabled O_NONBLOCK on the inherited descriptors.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut out = String::new();
+    read_fd_until(out_r.as_raw_fd(), &mut out, "READY", deadline);
+
+    let pid = child.as_mut().id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "katamaran vm exec did not exit promptly after SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "expected SIGTERM termination, got {status}"
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(out_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0,
+        "shared stdout pipe was left nonblocking after SIGTERM"
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(err_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0,
+        "shared stderr pipe was left nonblocking after SIGTERM"
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(in_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0,
+        "shared stdin pipe was left nonblocking after SIGTERM"
+    );
+
+    let _ = stop_srv_tx.send(());
+    server.join().unwrap();
+    drop(in_w);
+    drop(in_r);
+    drop(out_r);
+    drop(out_w);
+    drop(err_r);
+    drop(err_w);
+    let _ = std::fs::remove_dir_all(&dir);
+}

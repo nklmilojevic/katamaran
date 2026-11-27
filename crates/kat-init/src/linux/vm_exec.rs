@@ -16,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,10 @@ const PUMP_DRAIN_BATCH: usize = 4;
 /// Maximum buffered stdin bytes held in user space while guest stdin is
 /// backpressured, keeping memory bounded while still monitoring disconnect.
 const STDIN_BUF_CAP: usize = 128 << 10;
+/// Maximum queued output frames held between output pumps and the nonblocking
+/// guest socket writer so backpressure stays bounded without holding a socket
+/// mutex across blocking writes.
+const GUEST_OUT_QUEUE_CAP: usize = 2;
 const CGROUP_PARENT: &str = "/sys/fs/cgroup/kat-vm-exec";
 
 static NEXT_CGROUP_ID: AtomicUsize = AtomicUsize::new(1);
@@ -199,99 +203,262 @@ impl Write for DeadlineStream<'_> {
     }
 }
 
-struct ExecWriter {
-    stream: UnixStream,
-    closed: bool,
+fn pipe_nonblock() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (r, w) = cmd::pipe()?;
+    set_nonblocking(&r)?;
+    set_nonblocking(&w)?;
+    Ok((r, w))
 }
 
-type Writer = Arc<Mutex<ExecWriter>>;
-
-fn send(w: &Writer, m: &VmExecMsg) -> io::Result<()> {
-    let mut guard = w.lock().unwrap();
-    if guard.closed {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "exec closed"));
+fn notify_wake(w: &OwnedFd) {
+    let b: u8 = 1;
+    unsafe {
+        let _ = libc::write(w.as_raw_fd(), (&b as *const u8).cast(), 1);
     }
-    vm_exec::write(&mut guard.stream, m)
 }
 
-fn send_final(w: &Writer, m: &VmExecMsg) -> io::Result<()> {
-    let mut guard = w.lock().unwrap();
-    if guard.closed {
-        return Ok(());
+fn drain_wake(r: &OwnedFd) {
+    let mut buf = [0u8; 64];
+    loop {
+        let rc = unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if rc <= 0 {
+            break;
+        }
     }
-    guard.closed = true;
-    vm_exec::write(&mut guard.stream, m)
 }
 
-/// Send a 6-byte `Pong` keepalive probe without blocking indefinitely.
-///
-/// When guest stdin is backpressured and `stdin_worker` stops draining `reader`,
-/// the host vsock proxy can enter `WaitingCreditUpdate` and stop observing host
-/// `HANG_UP` until the guest writes a packet. Sending `Pong` triggers an
-/// immediate `EPIPE` / `VSOCK_SHUTDOWN_RCV` if the host closed its socket.
-///
-/// Returns `Ok(true)` if the probe succeeded or was deferred (socket busy),
-/// `Ok(false)` if the writer is already closed, or `Err(e)` if the peer closed.
-fn try_send_probe(w: &Writer) -> io::Result<bool> {
-    let Ok(mut guard) = w.try_lock() else {
-        return Ok(true);
-    };
-    if guard.closed {
-        return Ok(false);
-    }
-    let fd = guard.stream.as_raw_fd();
+/// Nonblocking zero-timeout check for whether all write ends of `fd` have closed.
+fn fd_has_hup(fd: RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd,
-        events: libc::POLLOUT,
+        events: libc::POLLIN,
         revents: 0,
     };
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-    if rc < 0 {
-        return Ok(true);
+    rc > 0 && (pfd.revents & libc::POLLHUP) != 0
+}
+
+#[derive(Default)]
+struct GuestWriterState {
+    ctrl: VecDeque<Vec<u8>>,
+    queue: VecDeque<Vec<u8>>,
+    probe_pending: bool,
+    finish: bool,
+    closed: bool,
+}
+
+/// Nonblocking single-owner writer for all guest-to-host frames (`Stdout`,
+/// `Stderr`, `SignalAck`, `Pong` backpressure probes, and terminal `Exit`/`Error`).
+///
+/// Decoupling socket writes from `pump` threads eliminates blocking I/O under a
+/// shared mutex, lets `SignalAck` and `Pong` probes preempt queued output without
+/// blocking `stdin_worker`, and detects host disconnect immediately on `POLLOUT` /
+/// `EPIPE` even when both vsock directions are simultaneously backpressured.
+struct GuestWriter {
+    state: Mutex<GuestWriterState>,
+    cv: Condvar,
+    wake_w: OwnedFd,
+}
+
+impl GuestWriter {
+    fn start(
+        stream: UnixStream,
+        host_disconnected: Arc<AtomicBool>,
+        disconnect_w: OwnedFd,
+    ) -> io::Result<(Arc<Self>, thread::JoinHandle<()>)> {
+        stream.set_nonblocking(true)?;
+        let (wake_r, wake_w) = pipe_nonblock()?;
+        let writer = Arc::new(Self {
+            state: Mutex::new(GuestWriterState::default()),
+            cv: Condvar::new(),
+            wake_w,
+        });
+        let writer_bg = writer.clone();
+        let handle = thread::Builder::new()
+            .name("vm-exec-tx".into())
+            .spawn(move || {
+                guest_writer_worker(stream, writer_bg, wake_r, host_disconnected, disconnect_w);
+            })?;
+        Ok((writer, handle))
     }
-    if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-        && (pfd.revents & libc::POLLOUT) == 0
-    {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer closed"));
-    }
-    if (pfd.revents & libc::POLLOUT) == 0 {
-        return Ok(true);
-    }
-    let frame = VmExecMsg::Pong.encode();
-    let sent = unsafe {
-        libc::send(
-            fd,
-            frame.as_ptr().cast(),
-            frame.len(),
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-        )
-    };
-    if sent < 0 {
-        let e = io::Error::last_os_error();
-        if matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
-            return Ok(true);
+
+    fn send_output(&self, frame: Vec<u8>) -> io::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        while !st.closed && st.queue.len() >= GUEST_OUT_QUEUE_CAP {
+            st = self.cv.wait(st).unwrap();
         }
-        return Err(e);
+        if st.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "exec closed"));
+        }
+        st.queue.push_back(frame);
+        drop(st);
+        notify_wake(&self.wake_w);
+        Ok(())
     }
-    if sent == 0 {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer closed"));
+
+    fn send_ctrl(&self, frame: Vec<u8>) {
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        st.ctrl.push_back(frame);
+        drop(st);
+        notify_wake(&self.wake_w);
     }
-    let sent = sent as usize;
-    if sent < frame.len() {
-        // Complete any partial 6-byte frame write so framing stays intact.
-        let mut ds = DeadlineStream {
-            conn: &mut guard.stream,
-            deadline: Instant::now() + Duration::from_millis(500),
-        };
-        if let Err(e) = ds.write_all(&frame[sent..]) {
-            guard.closed = true;
-            return Err(e);
+
+    fn request_probe(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        st.probe_pending = true;
+        drop(st);
+        notify_wake(&self.wake_w);
+    }
+
+    fn finish_with(&self, final_frame: Option<Vec<u8>>) {
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        if let Some(frame) = final_frame {
+            st.queue.push_back(frame);
+        }
+        st.finish = true;
+        drop(st);
+        notify_wake(&self.wake_w);
+    }
+
+    fn abort(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.closed = true;
+        st.ctrl.clear();
+        st.queue.clear();
+        self.cv.notify_all();
+        drop(st);
+        notify_wake(&self.wake_w);
+    }
+}
+
+fn guest_writer_worker(
+    stream: UnixStream,
+    writer: Arc<GuestWriter>,
+    wake_r: OwnedFd,
+    host_disconnected: Arc<AtomicBool>,
+    disconnect_w: OwnedFd,
+) {
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut out_off: usize = 0;
+    let mut failed = false;
+
+    loop {
+        if out_off == out_buf.len() {
+            out_buf.clear();
+            out_off = 0;
+            let mut st = writer.state.lock().unwrap();
+            if st.closed {
+                return;
+            }
+            if let Some(frame) = st.ctrl.pop_front() {
+                out_buf = frame;
+            } else if let Some(frame) = st.queue.pop_front() {
+                out_buf = frame;
+                writer.cv.notify_all();
+            } else if st.probe_pending {
+                st.probe_pending = false;
+                out_buf = VmExecMsg::Pong.encode();
+            } else if st.finish {
+                return;
+            }
+        }
+
+        if out_off < out_buf.len() {
+            let mut flush_done = false;
+            loop {
+                let rc = unsafe {
+                    libc::send(
+                        stream.as_raw_fd(),
+                        out_buf[out_off..].as_ptr().cast(),
+                        out_buf.len() - out_off,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if rc > 0 {
+                    out_off += rc as usize;
+                    if out_off == out_buf.len() {
+                        out_buf.clear();
+                        out_off = 0;
+                        flush_done = true;
+                        break;
+                    }
+                } else if rc == 0 {
+                    failed = true;
+                    break;
+                } else {
+                    let e = io::Error::last_os_error();
+                    match e.kind() {
+                        io::ErrorKind::Interrupted => continue,
+                        io::ErrorKind::WouldBlock => break,
+                        _ => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if failed {
+                break;
+            }
+            if flush_done {
+                continue;
+            }
+        }
+
+        let need_write = out_off < out_buf.len();
+        let mut pfds = [
+            libc::pollfd {
+                fd: wake_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: if need_write { libc::POLLOUT } else { 0 },
+                revents: 0,
+            },
+        ];
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            failed = true;
+            break;
+        }
+        if pfds[0].revents != 0 {
+            drain_wake(&wake_r);
+            if writer.state.lock().unwrap().closed {
+                return;
+            }
+        }
+        if (pfds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+            && (pfds[1].revents & libc::POLLOUT) == 0
+        {
+            failed = true;
+            break;
         }
     }
-    Ok(true)
+
+    if failed {
+        host_disconnected.store(true, Ordering::Release);
+        let mut st = writer.state.lock().unwrap();
+        st.closed = true;
+        st.ctrl.clear();
+        st.queue.clear();
+        writer.cv.notify_all();
+        drop(st);
+        notify_wake(&disconnect_w);
+    }
 }
 
 enum ChildHandle {
@@ -333,7 +500,16 @@ fn cgroup_events_populated(text: &str) -> bool {
     text.lines().any(|line| line.trim() == "populated 1")
 }
 
-/// Optional per-session cgroup v2 leaf under `/sys/fs/cgroup/kat-vm-exec/<n>`.
+enum CgroupMode<'a> {
+    /// Production mode: require per-session cgroup v2 isolation and fail loudly
+    /// rather than silently falling back to leader-only disconnect cleanup.
+    Required(&'a Path),
+    /// Unprivileged unit-test mode when `/sys/fs/cgroup` is not writable.
+    #[cfg(test)]
+    BestEffort(&'a Path),
+}
+
+/// Per-session cgroup v2 leaf under `/sys/fs/cgroup/kat-vm-exec/s-<n>`.
 ///
 /// On host disconnect, allows finishing `SIGKILL` escalation for surviving
 /// descendants even after the process-group leader has exited and been reaped,
@@ -346,10 +522,8 @@ struct SessionCgroup {
 }
 
 impl SessionCgroup {
-    fn create() -> Option<(Self, OwnedFd)> {
-        if fs::create_dir_all(CGROUP_PARENT).is_err() {
-            return None;
-        }
+    fn create(parent: &Path) -> io::Result<(Self, OwnedFd)> {
+        fs::create_dir_all(parent)?;
         let id = NEXT_CGROUP_ID.fetch_add(1, Ordering::Relaxed);
         {
             let mut live = LIVE_CGROUPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -357,7 +531,7 @@ impl SessionCgroup {
             // Best-effort sweep of empty leftover directories from prior
             // sessions whose detached background processes have since exited,
             // never touching any cgroup currently owned by an active session.
-            if let Ok(entries) = fs::read_dir(CGROUP_PARENT) {
+            if let Ok(entries) = fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     let is_live = name
@@ -377,37 +551,47 @@ impl SessionCgroup {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id);
         };
-        let path = PathBuf::from(CGROUP_PARENT).join(format!("s-{id}"));
-        if fs::create_dir(&path).is_err() {
+        let path = parent.join(format!("s-{id}"));
+        if let Err(e) = fs::create_dir(&path) {
             release_id();
-            return None;
+            return Err(e);
         }
-        let open_cloexec = |name: &str, flags: libc::c_int| -> Option<OwnedFd> {
+        let open_cloexec = |name: &str, flags: libc::c_int| -> io::Result<OwnedFd> {
             let p = path.join(name);
-            let c = CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+            let c = CString::new(p.as_os_str().as_encoded_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in cgroup path"))?;
             let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };
             if fd < 0 {
-                None
+                Err(io::Error::last_os_error())
             } else {
-                Some(unsafe { OwnedFd::from_raw_fd(fd) })
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
         };
-        let Some(procs_fd) = open_cloexec("cgroup.procs", libc::O_WRONLY) else {
-            let _ = fs::remove_dir(&path);
-            release_id();
-            return None;
+        let procs_fd = match open_cloexec("cgroup.procs", libc::O_WRONLY) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = fs::remove_dir(&path);
+                release_id();
+                return Err(e);
+            }
         };
-        let Some(kill_fd) = open_cloexec("cgroup.kill", libc::O_WRONLY) else {
-            let _ = fs::remove_dir(&path);
-            release_id();
-            return None;
+        let kill_fd = match open_cloexec("cgroup.kill", libc::O_WRONLY) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = fs::remove_dir(&path);
+                release_id();
+                return Err(e);
+            }
         };
-        let Some(events_fd) = open_cloexec("cgroup.events", libc::O_RDONLY) else {
-            let _ = fs::remove_dir(&path);
-            release_id();
-            return None;
+        let events_fd = match open_cloexec("cgroup.events", libc::O_RDONLY) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = fs::remove_dir(&path);
+                release_id();
+                return Err(e);
+            }
         };
-        Some((
+        Ok((
             SessionCgroup {
                 id,
                 path,
@@ -456,7 +640,7 @@ impl SessionCgroup {
                 events: libc::POLLPRI,
                 revents: 0,
             };
-            let timeout_ms = rem.as_millis().clamp(1, 50) as i32;
+            let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as i32;
             let _ = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         }
     }
@@ -482,25 +666,24 @@ impl SessionCgroup {
             if rem.is_zero() {
                 break;
             }
-            let timeout_ms = rem.as_millis().clamp(1, 50) as i32;
+            let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as i32;
             if !leader_exited {
-                let mut pfds = [
-                    libc::pollfd {
-                        fd: cancel_r.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: self.events_fd.as_raw_fd(),
-                        events: libc::POLLPRI,
-                        revents: 0,
-                    },
-                ];
-                let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
-                if rc > 0 && pfds[0].revents != 0 {
+                // Poll only `cancel_r` while waiting for the leader: kernfs
+                // `cgroup.events` reports `POLLPRI|POLLERR` immediately until
+                // its first read, which would busy-spin before `leader_exited`.
+                let mut pfd = libc::pollfd {
+                    fd: cancel_r.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if rc > 0 && pfd.revents != 0 {
                     leader_exited = true;
                 }
             } else {
+                // `is_populated()` at the top of this loop just read
+                // `cgroup.events`, advancing kernfs's event counter so `POLLPRI`
+                // sleeps cleanly until the next populated transition.
                 let mut pfd = libc::pollfd {
                     fd: self.events_fd.as_raw_fd(),
                     events: libc::POLLPRI,
@@ -880,8 +1063,9 @@ fn wait_for_cancel(cancel_r: &OwnedFd, timeout: Duration) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn stdin_worker(
     reader: UnixStream,
-    writer: Writer,
+    writer: Arc<GuestWriter>,
     cancel_r: OwnedFd,
+    disconnect_r: OwnedFd,
     mut stdin: Option<OwnedFd>,
     master: Option<OwnedFd>,
     tty: bool,
@@ -915,17 +1099,9 @@ fn stdin_worker(
             };
             let rem = next_probe.saturating_duration_since(now);
             if rem.is_zero() {
-                match try_send_probe(&writer) {
-                    Ok(true) => {
-                        last_probe = Some(now);
-                        backpressure_probe.as_millis().clamp(1, i32::MAX as u128) as i32
-                    }
-                    Ok(false) => break 'outer,
-                    Err(_) => {
-                        disconnected = true;
-                        break 'outer;
-                    }
-                }
+                writer.request_probe();
+                last_probe = Some(now);
+                backpressure_probe.as_millis().clamp(1, i32::MAX as u128) as i32
             } else {
                 rem.as_millis().clamp(1, i32::MAX as u128) as i32
             }
@@ -934,6 +1110,11 @@ fn stdin_worker(
         let mut pfds = [
             libc::pollfd {
                 fd: cancel_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: disconnect_r.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -953,9 +1134,9 @@ fn stdin_worker(
             },
         ];
         let nfds = if stdin.is_some() && !pending.is_empty() {
-            3
+            4
         } else {
-            2
+            3
         };
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, poll_timeout_ms) };
         if rc < 0 {
@@ -965,26 +1146,26 @@ fn stdin_worker(
             break;
         }
         if rc == 0 {
-            // Backpressure probe interval fired: probe the peer via a 6-byte
-            // Pong write to detect host close even when the host vsock proxy
-            // is in WaitingCreditUpdate with a full guest receive window.
-            match try_send_probe(&writer) {
-                Ok(true) => last_probe = Some(Instant::now()),
-                Ok(false) => break 'outer,
-                Err(_) => {
-                    disconnected = true;
-                    break 'outer;
-                }
-            }
+            // Backpressure probe interval fired: ask the nonblocking writer
+            // thread to send a 6-byte Pong probe so host close is detected even
+            // when the host vsock proxy is in WaitingCreditUpdate.
+            writer.request_probe();
+            last_probe = Some(Instant::now());
             continue;
         }
         // Normal child exit wakes cancel_r: exit cleanly without signaling.
         if pfds[0].revents != 0 {
             break;
         }
-        if nfds == 3 && pfds[2].revents != 0 {
-            if (pfds[2].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-                && (pfds[2].revents & libc::POLLOUT) == 0
+        // Writer thread hit EPIPE/POLLERR/POLLHUP (even when both vsock
+        // directions were backpressured): immediately trigger disconnect cleanup.
+        if pfds[1].revents != 0 {
+            disconnected = true;
+            break;
+        }
+        if nfds == 4 && pfds[3].revents != 0 {
+            if (pfds[3].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                && (pfds[3].revents & libc::POLLOUT) == 0
             {
                 stdin = None;
                 pending.clear();
@@ -1000,7 +1181,7 @@ fn stdin_worker(
                 );
             }
         }
-        if pfds[1].revents != 0 {
+        if pfds[2].revents != 0 {
             if can_read {
                 while pending.len() < STDIN_BUF_CAP {
                     match frames.poll_frame(reader.as_raw_fd()) {
@@ -1037,6 +1218,7 @@ fn stdin_worker(
                             }
                             VmExecMsg::Signal { signal } if valid_signal(signal) => {
                                 signal_handle(&reaper, &handle, signal);
+                                writer.send_ctrl(VmExecMsg::SignalAck.encode());
                             }
                             _ => {}
                         },
@@ -1047,7 +1229,7 @@ fn stdin_worker(
                         }
                     }
                 }
-            } else if (pfds[1].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)) != 0 {
+            } else if (pfds[2].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR)) != 0 {
                 // Input is backpressured, yet the peer closed the connection.
                 disconnected = true;
                 break 'outer;
@@ -1060,6 +1242,9 @@ fn stdin_worker(
 
     if disconnected {
         host_disconnected.store(true, Ordering::Release);
+        // Unblock writer_thread and any output pumps immediately before
+        // running the disconnect grace period.
+        writer.abort();
         // The host went away: hang up the session or process group, then
         // escalate to SIGKILL after a bounded grace period if the leader or
         // any surviving session descendant remains live.
@@ -1081,11 +1266,12 @@ fn stdin_worker(
 /// - If a surviving background descendant still holds the write end open,
 ///   bounds the post-exit window to `post_exit_idle` and bounds each read
 ///   batch so `wake_r` is always observed promptly even under continuous
-///   descendant output.
+///   descendant output. At the deadline, rechecks `POLLHUP` so a writer that
+///   closed while a send was backpressured still drains completely.
 fn pump(
     from: OwnedFd,
     wake_r: OwnedFd,
-    w: Writer,
+    writer: Arc<GuestWriter>,
     kind: fn(Vec<u8>) -> VmExecMsg,
     post_exit_idle: Duration,
     host_disconnected: Arc<AtomicBool>,
@@ -1107,9 +1293,15 @@ fn pump(
                 Some(dl) => {
                     let rem = dl.saturating_duration_since(Instant::now());
                     if rem.is_zero() {
-                        return Ok(());
+                        if fd_has_hup(from.as_raw_fd()) {
+                            all_writers_closed = true;
+                            -1
+                        } else {
+                            return Ok(());
+                        }
+                    } else {
+                        rem.as_millis().clamp(1, i32::MAX as u128) as i32
                     }
-                    rem.as_millis().clamp(1, i32::MAX as u128) as i32
                 }
             }
         };
@@ -1136,6 +1328,10 @@ fn pump(
             return Err(e);
         }
         if rc == 0 {
+            if fd_has_hup(from.as_raw_fd()) {
+                all_writers_closed = true;
+                continue;
+            }
             return Ok(());
         }
         if !child_exited && pfds[1].revents != 0 {
@@ -1160,7 +1356,12 @@ fn pump(
                 let n = unsafe { libc::read(from.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     chunks += 1;
-                    send(&w, &kind(buf[..n as usize].to_vec()))?;
+                    if let Err(e) = writer.send_output(kind(buf[..n as usize].to_vec()).encode()) {
+                        if host_disconnected.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        return Err(e);
+                    }
                 } else if n == 0 {
                     return Ok(());
                 } else {
@@ -1236,6 +1437,7 @@ fn serve(reaper: &Reaper, conn: UnixStream) {
         DISCONNECT_GRACE,
         POST_EXIT_IDLE,
         BACKPRESSURE_PROBE_INTERVAL,
+        CgroupMode::Required(Path::new(CGROUP_PARENT)),
     );
 }
 
@@ -1246,6 +1448,7 @@ fn serve_with_timeouts(
     disconnect_grace: Duration,
     post_exit_idle: Duration,
     backpressure_probe: Duration,
+    cgroup_mode: CgroupMode<'_>,
 ) {
     let deadline = Instant::now() + first_frame_timeout;
     let spec = {
@@ -1289,9 +1492,11 @@ fn serve_with_timeouts(
         reaper,
         conn.try_clone(),
         &spec,
+        first_frame_timeout,
         disconnect_grace,
         post_exit_idle,
         backpressure_probe,
+        cgroup_mode,
     ) {
         let mut ds = DeadlineStream {
             conn: &mut conn,
@@ -1388,31 +1593,40 @@ fn exit_code(status: i32) -> i32 {
 
 /// Spawn and relay `spec`. Returns `Err` only before `Started` has been sent
 /// (so the caller can reply with a single `Error` frame); once `Started` has
-/// been sent, all terminal frames (`Exit` or `Error`) are sent through `w`.
+/// been sent, all terminal frames (`Exit` or `Error`) are sent through the
+/// nonblocking [`GuestWriter`].
+#[allow(clippy::too_many_arguments)]
 fn exec_with_timeouts(
     reaper: &Reaper,
     conn: io::Result<UnixStream>,
     spec: &ExecSpec,
+    first_frame_timeout: Duration,
     disconnect_grace: Duration,
     post_exit_idle: Duration,
     backpressure_probe: Duration,
+    cgroup_mode: CgroupMode<'_>,
 ) -> Result<(), String> {
-    let conn = conn.map_err(|e| format!("clone stream: {e}"))?;
+    let mut conn = conn.map_err(|e| format!("clone stream: {e}"))?;
     let (mut c, program) = build_command(spec)?;
 
-    let w: Writer = Arc::new(Mutex::new(ExecWriter {
-        stream: conn.try_clone().map_err(|e| format!("clone stream: {e}"))?,
-        closed: false,
-    }));
-    let reader = conn;
+    let reader = conn.try_clone().map_err(|e| format!("clone stream: {e}"))?;
 
     // Allocate all control pipes, cgroup descriptors, and PTY/pipe descriptors
     // BEFORE spawning the child so no fallible descriptor allocation can occur
     // after spawn.
     let (stdin_cancel_r, stdin_cancel_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
-    let (cgroup, procs_fd) = match SessionCgroup::create() {
-        Some((cg, pfd)) => (Some(Arc::new(cg)), Some(pfd)),
-        None => (None, None),
+    let (disconnect_r, disconnect_w) = pipe_nonblock().map_err(|e| format!("pipe: {e}"))?;
+    let (cgroup, procs_fd) = match cgroup_mode {
+        CgroupMode::Required(parent) => {
+            let (cg, pfd) =
+                SessionCgroup::create(parent).map_err(|e| format!("create session cgroup: {e}"))?;
+            (Some(Arc::new(cg)), Some(pfd))
+        }
+        #[cfg(test)]
+        CgroupMode::BestEffort(parent) => match SessionCgroup::create(parent) {
+            Ok((cg, pfd)) => (Some(Arc::new(cg)), Some(pfd)),
+            Err(_) => (None, None),
+        },
     };
     let procs_raw = procs_fd.as_ref().map(AsRawFd::as_raw_fd);
 
@@ -1438,7 +1652,17 @@ fn exec_with_timeouts(
             unsafe {
                 c.pre_exec(move || {
                     if let Some(pfd) = procs_raw {
-                        let _ = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                        let n = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                        if n != 2 {
+                            return Err(if n < 0 {
+                                io::Error::last_os_error()
+                            } else {
+                                io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "short write to cgroup.procs",
+                                )
+                            });
+                        }
                     }
                     if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                         return Err(io::Error::last_os_error());
@@ -1482,7 +1706,17 @@ fn exec_with_timeouts(
             unsafe {
                 c.pre_exec(move || {
                     if let Some(pfd) = procs_raw {
-                        let _ = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                        let n = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                        if n != 2 {
+                            return Err(if n < 0 {
+                                io::Error::last_os_error()
+                            } else {
+                                io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "short write to cgroup.procs",
+                                )
+                            });
+                        }
                     }
                     if libc::setpgid(0, 0) < 0 {
                         return Err(io::Error::last_os_error());
@@ -1516,21 +1750,42 @@ fn exec_with_timeouts(
     let handle = Arc::new(Mutex::new(Some(handle)));
     let host_disconnected = Arc::new(AtomicBool::new(false));
 
-    if send(&w, &VmExecMsg::Started).is_err() {
-        signal_handle(reaper, &handle, libc::SIGKILL);
-        if let Some(cg) = &cgroup {
-            cg.kill();
+    {
+        let mut ds = DeadlineStream {
+            conn: &mut conn,
+            deadline: Instant::now() + first_frame_timeout,
+        };
+        if vm_exec::write(&mut ds, &VmExecMsg::Started).is_err() {
+            signal_handle(reaper, &handle, libc::SIGKILL);
+            if let Some(cg) = &cgroup {
+                cg.kill();
+            }
+            *handle.lock().unwrap() = None;
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Ok(());
         }
-        *handle.lock().unwrap() = None;
-        let _ = exited.recv_timeout(Duration::from_secs(2));
-        return Ok(());
     }
+
+    let (writer, writer_thread) =
+        match GuestWriter::start(conn, host_disconnected.clone(), disconnect_w) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log(&format!("start writer thread: {e}"));
+                signal_handle(reaper, &handle, libc::SIGKILL);
+                if let Some(cg) = &cgroup {
+                    cg.kill();
+                }
+                *handle.lock().unwrap() = None;
+                let _ = exited.recv_timeout(Duration::from_secs(2));
+                return Ok(());
+            }
+        };
 
     let tty = spec.tty.is_some();
     let handle_in = handle.clone();
     let reaper_in = reaper.clone();
     let disc_in = host_disconnected.clone();
-    let w_in = w.clone();
+    let w_in = writer.clone();
     let cg_in = cgroup.clone();
     let stdin_thread = match thread::Builder::new()
         .name("vm-exec-in".into())
@@ -1539,6 +1794,7 @@ fn exec_with_timeouts(
                 reader,
                 w_in,
                 stdin_cancel_r,
+                disconnect_r,
                 stdin,
                 master,
                 tty,
@@ -1557,10 +1813,10 @@ fn exec_with_timeouts(
                 cg.kill();
             }
             *handle.lock().unwrap() = None;
-            let _ = send_final(
-                &w,
-                &VmExecMsg::Error(truncate_error(&format!("spawn stdin thread: {e}"))),
-            );
+            writer.finish_with(Some(
+                VmExecMsg::Error(truncate_error(&format!("spawn stdin thread: {e}"))).encode(),
+            ));
+            let _ = writer_thread.join();
             let _ = exited.recv_timeout(Duration::from_secs(2));
             return Ok(());
         }
@@ -1569,7 +1825,7 @@ fn exec_with_timeouts(
     let mut outputs = Vec::with_capacity(out_specs.len());
     let mut out_wakes = Vec::with_capacity(out_specs.len());
     for (out, wake_r, wake_w, kind) in out_specs {
-        let w2 = w.clone();
+        let w2 = writer.clone();
         let disc = host_disconnected.clone();
         match thread::Builder::new()
             .name("vm-exec-out".into())
@@ -1585,10 +1841,6 @@ fn exec_with_timeouts(
                     cg.kill();
                 }
                 *handle.lock().unwrap() = None;
-                let _ = send_final(
-                    &w,
-                    &VmExecMsg::Error(truncate_error(&format!("spawn output thread: {e}"))),
-                );
                 drop(stdin_cancel_w);
                 drop(out_wakes);
                 drop(wake_w);
@@ -1596,6 +1848,10 @@ fn exec_with_timeouts(
                 for o in outputs {
                     let _ = o.join();
                 }
+                writer.finish_with(Some(
+                    VmExecMsg::Error(truncate_error(&format!("spawn output thread: {e}"))).encode(),
+                ));
+                let _ = writer_thread.join();
                 let _ = exited.recv_timeout(Duration::from_secs(2));
                 return Ok(());
             }
@@ -1631,21 +1887,19 @@ fn exec_with_timeouts(
     }
 
     if host_disconnected.load(Ordering::Acquire) {
+        writer.abort();
+        let _ = writer_thread.join();
         return Ok(());
     }
-    if let Some(e) = output_err {
-        let _ = send_final(
-            &w,
-            &VmExecMsg::Error(truncate_error(&format!("output relay failed: {e}"))),
-        );
-        return Ok(());
-    }
-    let _ = send_final(
-        &w,
-        &VmExecMsg::Exit {
+    let final_msg = if let Some(e) = output_err {
+        VmExecMsg::Error(truncate_error(&format!("output relay failed: {e}")))
+    } else {
+        VmExecMsg::Exit {
             code: exit_code(status),
-        },
-    );
+        }
+    };
+    writer.finish_with(Some(final_msg.encode()));
+    let _ = writer_thread.join();
     Ok(())
 }
 
@@ -1923,6 +2177,27 @@ mod tests {
         assert_eq!(tr.eof_bytes(&no_eof), ([0, 0, 0], 0));
     }
 
+    fn shrink_pair(a: &UnixStream, b: &UnixStream, bytes: libc::c_int) {
+        unsafe {
+            for fd in [a.as_raw_fd(), b.as_raw_fd()] {
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&bytes as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                let _ = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&bytes as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+
     #[test]
     fn idle_first_frame_connection_releases_slot() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -1941,6 +2216,7 @@ mod tests {
                 Duration::from_millis(100),
                 Duration::from_millis(50),
                 Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
             );
         });
         handle.join().unwrap();
@@ -1950,35 +2226,116 @@ mod tests {
     }
 
     #[test]
+    fn required_cgroup_mode_fails_loudly_when_cgroup_unavailable() {
+        let reaper = Reaper::start();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        // `/dev/null/kat-vm-exec` cannot be created as a directory; Required
+        // mode must return a guest Error instead of silently falling back to
+        // leader-only disconnect cleanup.
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::Required(Path::new("/dev/null/kat-vm-exec")),
+            );
+        });
+
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec!["/bin/true".into()],
+                tty: None,
+            }),
+        )
+        .unwrap();
+        match vm_exec::read(&mut host).unwrap() {
+            Some(VmExecMsg::Error(e)) => {
+                assert!(e.contains("cgroup"), "expected cgroup error, got {e:?}");
+            }
+            other => panic!("expected cgroup Error, got {other:?}"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn signal_frame_emits_signal_ack() {
+        let reaper = Reaper::start();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap 'exit 77' INT; echo READY; while true; do sleep 1; done".into(),
+                ],
+                tty: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Started));
+        assert_eq!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Stdout(b"READY\n".to_vec()))
+        );
+
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Signal {
+                signal: libc::SIGINT,
+            },
+        )
+        .unwrap();
+
+        let mut saw_ack = false;
+        let mut exit_status = None;
+        while let Ok(Some(msg)) = vm_exec::read(&mut host) {
+            match msg {
+                VmExecMsg::SignalAck => saw_ack = true,
+                VmExecMsg::Exit { code } => {
+                    exit_status = Some(code);
+                    break;
+                }
+                VmExecMsg::Stdout(_) | VmExecMsg::Stderr(_) | VmExecMsg::Pong => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert!(saw_ack, "expected VmExecMsg::SignalAck after Signal");
+        assert_eq!(exit_status, Some(77));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn pump_preserves_buffered_output_across_slow_reader() {
         let (r, w_pipe) = cmd::pipe().unwrap();
         set_nonblocking(&r).unwrap();
         let (wake_r, wake_w) = cmd::pipe().unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();
-        // Shrink socket buffers so `send` experiences real backpressure while
-        // the host pauses reading.
-        let small: libc::c_int = 8192;
-        unsafe {
-            let _ = libc::setsockopt(
-                guest.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&small as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            let _ = libc::setsockopt(
-                host.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&small as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        let writer: Writer = Arc::new(Mutex::new(ExecWriter {
-            stream: guest,
-            closed: false,
-        }));
+        shrink_pair(&host, &guest, 8192);
         let disc = Arc::new(AtomicBool::new(false));
+        let (_disc_r, disc_w) = pipe_nonblock().unwrap();
+        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
 
         let payload = vec![b'A'; 48 << 10];
         let payload_w = payload.clone();
@@ -2021,11 +2378,86 @@ mod tests {
 
         producer.join().unwrap();
         pump_handle.join().unwrap().unwrap();
-        send_final(&writer, &VmExecMsg::Exit { code: 0 }).unwrap();
+        writer.finish_with(Some(VmExecMsg::Exit { code: 0 }.encode()));
+        writer_thread.join().unwrap();
         let (received, code) = drain.join().unwrap();
         assert_eq!(code, 0);
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn pump_drains_buffered_output_when_descendant_closes_during_backpressured_send() {
+        let (r, w_pipe) = cmd::pipe().unwrap();
+        set_nonblocking(&r).unwrap();
+        let (wake_r, wake_w) = cmd::pipe().unwrap();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        shrink_pair(&host, &guest, 4096);
+        let disc = Arc::new(AtomicBool::new(false));
+        let (_disc_r, disc_w) = pipe_nonblock().unwrap();
+        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
+
+        let writer_clone = writer.clone();
+        let pump_handle = thread::spawn(move || {
+            pump(
+                r,
+                wake_r,
+                writer_clone,
+                VmExecMsg::Stdout,
+                Duration::from_millis(80),
+                disc,
+            )
+        });
+
+        // Write enough data across multiple chunks to fill the shrunk socket
+        // AND GuestWriter's bounded queue while keeping the pipe writer open at
+        // leader exit (`wake_w` dropped), then close the pipe writer while the
+        // relay is backpressured past `post_exit_idle`, leaving tail bytes
+        // buffered in the pipe.
+        let chunk_size = 32 << 10;
+        let chunks = 8usize;
+        let expected = vec![b'B'; chunk_size * chunks];
+        let producer = thread::spawn(move || {
+            let mut wf = std::fs::File::from(w_pipe);
+            let chunk = vec![b'B'; chunk_size];
+            // Write first 4 chunks while pipe remains open, then signal leader exit.
+            for _ in 0..4 {
+                wf.write_all(&chunk).unwrap();
+            }
+            drop(wake_w);
+            // Write remaining chunks while host is stalled past post_exit_idle,
+            // then close the last writer end.
+            for _ in 4..chunks {
+                wf.write_all(&chunk).unwrap();
+            }
+            drop(wf);
+        });
+
+        // Hold host reading past post_exit_idle so `pump`'s deadline expires
+        // while sends are backpressured and the descendant has closed the pipe.
+        thread::sleep(Duration::from_millis(220));
+
+        let drain = thread::spawn(move || {
+            let mut received = Vec::new();
+            while let Ok(Some(msg)) = vm_exec::read(&mut host) {
+                match msg {
+                    VmExecMsg::Stdout(d) => received.extend_from_slice(&d),
+                    VmExecMsg::Exit { code } => return (received, code),
+                    VmExecMsg::Pong => {}
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+            panic!("EOF before Exit");
+        });
+
+        producer.join().unwrap();
+        pump_handle.join().unwrap().unwrap();
+        writer.finish_with(Some(VmExecMsg::Exit { code: 0 }.encode()));
+        writer_thread.join().unwrap();
+        let (received, code) = drain.join().unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(received.len(), expected.len());
+        assert_eq!(received, expected);
     }
 
     #[test]
@@ -2034,22 +2466,21 @@ mod tests {
         set_nonblocking(&r).unwrap();
         let (wake_r, wake_w) = cmd::pipe().unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();
-        let writer: Writer = Arc::new(Mutex::new(ExecWriter {
-            stream: guest,
-            closed: false,
-        }));
         let disc = Arc::new(AtomicBool::new(false));
+        let (_disc_r, disc_w) = pipe_nonblock().unwrap();
+        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
 
         let mut wf = std::fs::File::from(w_pipe);
         wf.write_all(b"hi\n").unwrap();
         drop(wake_w);
 
         let t = Instant::now();
+        let writer_clone = writer.clone();
         let pump_handle = thread::spawn(move || {
             pump(
                 r,
                 wake_r,
-                writer,
+                writer_clone,
                 VmExecMsg::Stdout,
                 Duration::from_millis(80),
                 disc,
@@ -2062,6 +2493,8 @@ mod tests {
         );
         pump_handle.join().unwrap().unwrap();
         assert!(t.elapsed() < Duration::from_secs(1));
+        writer.finish_with(None);
+        writer_thread.join().unwrap();
         drop(wf);
     }
 
@@ -2071,11 +2504,9 @@ mod tests {
         set_nonblocking(&r).unwrap();
         let (wake_r, wake_w) = cmd::pipe().unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();
-        let writer: Writer = Arc::new(Mutex::new(ExecWriter {
-            stream: guest,
-            closed: false,
-        }));
         let disc = Arc::new(AtomicBool::new(false));
+        let (_disc_r, disc_w) = pipe_nonblock().unwrap();
+        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
         let stop_spam = Arc::new(AtomicBool::new(false));
         let stop_spam_w = stop_spam.clone();
 
@@ -2122,7 +2553,8 @@ mod tests {
             "pump did not observe wake_r under continuous output ({:?})",
             t.elapsed()
         );
-        send_final(&writer, &VmExecMsg::Exit { code: 42 }).unwrap();
+        writer.finish_with(Some(VmExecMsg::Exit { code: 42 }.encode()));
+        writer_thread.join().unwrap();
         assert_eq!(drain.join().unwrap(), 42);
 
         stop_spam.store(true, Ordering::Relaxed);
@@ -2142,6 +2574,7 @@ mod tests {
                 Duration::from_millis(150),
                 Duration::from_millis(50),
                 Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
             );
         });
 
@@ -2180,6 +2613,64 @@ mod tests {
         assert!(
             t.elapsed() < Duration::from_secs(3),
             "disconnect cleanup under full rx window took {:?}",
+            t.elapsed()
+        );
+        drop(host);
+    }
+
+    #[test]
+    fn disconnect_detected_when_both_directions_are_backpressured() {
+        let reaper = Reaper::start();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        shrink_pair(&host, &guest, 8192);
+
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap '' HUP; while true; do printf '0123456789abcdef%.0s' 1 2 3 4 5 6 7 8 9 0; done".into(),
+                ],
+                tty: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Started));
+
+        // Stop reading stdout (backpressuring guest->host) AND flood stdin
+        // (backpressuring host->guest) so both directions stall simultaneously.
+        let chunk = vec![b'x'; CHUNK];
+        for _ in 0..6 {
+            if vm_exec::write(&mut host, &VmExecMsg::Data(chunk.clone())).is_err() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(80));
+
+        // Shut down ONLY host read (no POLLRDHUP on guest reader); the
+        // nonblocking guest writer must detect EPIPE immediately, wake
+        // stdin_worker, unblock output pumps, and terminate the child.
+        let t = Instant::now();
+        host.shutdown(Shutdown::Read).unwrap();
+        server.join().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "disconnect cleanup under bidirectional backpressure took {:?}",
             t.elapsed()
         );
         drop(host);

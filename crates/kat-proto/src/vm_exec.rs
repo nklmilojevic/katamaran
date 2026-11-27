@@ -14,6 +14,9 @@
 //!    is in canonical mode (`ICANON`) — flushing any pending partial line
 //!    before delivering EOF — and injects no control byte in noncanonical/raw
 //!    mode, where `DataEnd` cannot signal EOF to the guest process.
+//!    After reading a `Signal` frame and signaling the guest process group, the
+//!    guest replies with `SignalAck` so the host knows a forwarded `SIGINT`
+//!    crossed any backpressured stdin stream.
 //! 5. Guest streams `Stdout` / `Stderr`, then `Exit { code }` (or `Error`).
 
 use std::io::{self, Read, Write};
@@ -49,6 +52,9 @@ pub enum VmExecMsg {
     /// no-op keepalive probe during backpressured sessions (ignored by the host
     /// output relay).
     Pong,
+    /// Guest acknowledgment sent after reading a [`VmExecMsg::Signal`] frame
+    /// and signaling the target process group.
+    SignalAck,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -75,6 +81,7 @@ mod kind {
     pub const ERROR: u16 = 0x90a;
     pub const PING: u16 = 0x90b;
     pub const PONG: u16 = 0x90c;
+    pub const SIGNAL_ACK: u16 = 0x90d;
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -142,6 +149,7 @@ impl VmExecMsg {
             }
             VmExecMsg::Ping => kind::PING,
             VmExecMsg::Pong => kind::PONG,
+            VmExecMsg::SignalAck => kind::SIGNAL_ACK,
         };
         let len = (buf.len() - 4) as u32;
         buf[0..4].copy_from_slice(&len.to_le_bytes());
@@ -211,6 +219,7 @@ impl VmExecMsg {
             kind::ERROR => VmExecMsg::Error(r.string()?),
             kind::PING => VmExecMsg::Ping,
             kind::PONG => VmExecMsg::Pong,
+            kind::SIGNAL_ACK => VmExecMsg::SignalAck,
             other => return Err(ProtoError::UnknownKind(other)),
         };
         if !r.buf.is_empty() {
@@ -290,6 +299,7 @@ mod tests {
             VmExecMsg::Error("exec failed".into()),
             VmExecMsg::Ping,
             VmExecMsg::Pong,
+            VmExecMsg::SignalAck,
         ]
     }
 
