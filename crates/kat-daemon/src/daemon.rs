@@ -1495,11 +1495,17 @@ impl Daemon {
             other => return Err(failed(format!("unexpected mark-version reply {other:?}"))),
         }
         {
+            // Clear only the failure this command resolves (an unmarked datastore);
+            // any other startup failure stays visible until the next start.
             let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
-            if k.state == "failed" {
+            if k.state == "failed"
+                && k.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("has no version marker"))
+            {
                 k.state = "stopped".into();
+                k.error = None;
             }
-            k.error = None;
         }
         Ok(())
     }

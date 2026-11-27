@@ -6,7 +6,7 @@
 # by kat-init's `--kube-proxy-arg=proxy-mode=nftables`) depends on the guest rootfs's nftables
 # package being on PATH. This runs the release binary in the guest's pinned Alpine image with
 # only the rootfs networking packages installed and kat-init's k3s server flags, then checks:
-#   - the release bundles no nft (so the rootfs binary is what gets used),
+#   - whether the release bundles nft (if not, the rootfs binary is what kube-proxy used),
 #   - kube-proxy created its `ip`/`ip6 kube-proxy` nftables tables,
 #   - the node reports Ready.
 # Examples:
@@ -60,14 +60,14 @@ for _ in $(seq 1 60); do
         docker "$@" exec "$name" sh -c '
             set -e
             bin=$(ls -d /var/lib/rancher/k3s/data/*/bin | head -1)
-            if [ -e "$bin/nft" ] || [ -e "$bin/aux/nft" ]; then
-                echo "bundled nft: yes ($bin)"
-            else
-                echo "bundled nft: no (kube-proxy used $(command -v nft))"
-            fi
             nft list tables | grep kube-proxy
             /opt/k3s kubectl get node katamaran --no-headers'
-        echo "OK: $tag runs kube-proxy in nftables mode with the guest rootfs nft"
+        if docker "$@" exec "$name" sh -c \
+            'bin=$(ls -d /var/lib/rancher/k3s/data/*/bin | head -1); [ -e "$bin/nft" ] || [ -e "$bin/aux/nft" ]'; then
+            echo "OK: $tag runs kube-proxy in nftables mode (with its own bundled nft)"
+        else
+            echo "OK: $tag bundles no nft and runs kube-proxy in nftables mode with the guest rootfs $(docker "$@" exec "$name" sh -c 'command -v nft')"
+        fi
         exit 0
     fi
     sleep 5

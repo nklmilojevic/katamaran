@@ -256,6 +256,12 @@ where
             fetch_text(&url).with_context(|| format!("fetch k3s {version} arm64 checksums"))?;
         parse_arm64_sha256(&sums).with_context(|| format!("read {url}"))?
     };
+    // The checksum sidecar is best effort; a cached binary that matches the
+    // freshly fetched checksum is reused instead of downloading it again.
+    if !pinned && path.is_file() && verify_sha256(&path, &expected).is_ok() {
+        write_sum_sidecar(parent, &sum_path, &expected);
+        return Ok(path);
+    }
     let pid = std::process::id();
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!("{K3S_ARM64}.{pid}.{seq}.part"));
@@ -279,17 +285,24 @@ where
         return Err(e).with_context(|| format!("save {}", path.display()));
     }
     if !pinned {
-        // Best effort: without it the next start fetches the checksums again.
-        let sum_tmp = parent.join(format!("{K3S_ARM64}.sha256.{pid}.{seq}.part"));
-        let line = format!("{expected}  {K3S_ARM64}\n");
-        if fs::write(&sum_tmp, line)
-            .and_then(|()| fs::rename(&sum_tmp, &sum_path))
-            .is_err()
-        {
-            let _ = fs::remove_file(&sum_tmp);
-        }
+        write_sum_sidecar(parent, &sum_path, &expected);
     }
     Ok(path)
+}
+
+/// Best effort: without the sidecar the next start fetches the checksums again
+/// (but still reuses a cached binary that matches them).
+fn write_sum_sidecar(parent: &Path, sum_path: &Path, expected: &str) {
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let sum_tmp = parent.join(format!("{K3S_ARM64}.sha256.{pid}.{seq}.part"));
+    let line = format!("{expected}  {K3S_ARM64}\n");
+    if fs::write(&sum_tmp, line)
+        .and_then(|()| fs::rename(&sum_tmp, sum_path))
+        .is_err()
+    {
+        let _ = fs::remove_file(&sum_tmp);
+    }
 }
 
 fn verify_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
@@ -1306,6 +1319,26 @@ EB62D8BA346F7C6A0BB5C874EA92335ECAD7CB3FA167508F94888AAEB43E7F22 *k3s-arm64
         )
         .unwrap();
         assert_eq!(cached, got);
+
+        // A lost checksum sidecar refetches only the checksums: the cached binary
+        // matches them, so it is reused (and the sidecar rewritten) without a download.
+        let sidecar = got.with_file_name(format!("{K3S_ARM64}.sha256"));
+        fs::remove_file(&sidecar).unwrap();
+        let mut text_fetches = 0usize;
+        let reused = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| {
+                text_fetches += 1;
+                Ok(format!("{expected_hash}  {K3S_ARM64}\n"))
+            },
+            |url, _| panic!("unexpected binary fetch: {url}"),
+        )
+        .unwrap();
+        assert_eq!(reused, got);
+        assert_eq!(text_fetches, 1);
+        assert!(sidecar.is_file());
 
         let _ = fs::remove_dir_all(&home);
     }

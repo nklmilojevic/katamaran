@@ -274,7 +274,15 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
             target.display()
         ));
     }
-    Ok(())
+    sync_dir(parent)
+}
+
+/// fsync `dir` so a rename or link inside it survives a crash. The datastore
+/// version files must be durable before k3s is allowed to touch the datastore.
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("sync {}: {e}", dir.display()))
 }
 
 /// Parse `(major, minor)` from a k3s release tag such as `v1.37.2+k3s1`.
@@ -376,7 +384,9 @@ const STATE_DB_MAX_NODE_ROWS: usize = 4;
 /// fit the 1 MiB stdout capture of `run_reaped_split`, or the trailing `END`
 /// would be cut off and detection would fail silently.
 const STATE_DB_MAX_BLOB_BYTES: usize = 96 << 10;
-const _: () = assert!(STATE_DB_MAX_NODE_ROWS * (2 * STATE_DB_MAX_BLOB_BYTES + 32) + 64 < 1 << 20);
+// The query returns up to one extra row to detect overflow.
+const _: () =
+    assert!((STATE_DB_MAX_NODE_ROWS + 1) * (2 * STATE_DB_MAX_BLOB_BYTES + 32) + 64 < 1 << 20);
 /// Every k3s release a pre-tracking katamaran release (v0.5.0 through v0.10.0)
 /// could run: those releases always ran their pinned build and never wrote
 /// `.katamaran-version`, while every tracking-enabled release writes the
@@ -482,7 +492,7 @@ fn write_atomic_new(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let link_res = fs::hard_link(&tmp, target);
     let _ = fs::remove_file(&tmp);
     match link_res {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_dir(parent),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(format!(
             "datastore version marker {} already exists; refusing to overwrite an existing marker",
             target.display()
@@ -1221,10 +1231,13 @@ fn newer_of_marker_and_stamp(data_dir: &Path, marker: String) -> Result<String, 
                     &format!("records an invalid k3s version {stamp:?}"),
                 ));
             };
-            match parse_k3s_minor(&marker) {
-                Some(marker_mm) if marker_mm >= stamp_mm => Ok(marker),
-                _ => Ok(stamp),
-            }
+            let Some(marker_mm) = parse_k3s_minor(&marker) else {
+                return Err(corrupt_datastore_version_error(
+                    &data_dir.join(".katamaran-version"),
+                    &format!("records an invalid k3s version {marker:?}"),
+                ));
+            };
+            Ok(if marker_mm >= stamp_mm { marker } else { stamp })
         }
         MarkerFile::Empty => Err(corrupt_datastore_version_error(&stamp_path, "is empty")),
         MarkerFile::NonRegular => Err(corrupt_datastore_version_error(
@@ -4876,6 +4889,13 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let err = mark_datastore_version_at(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
         assert!(err.contains("not a valid version stamp"), "{err}");
         assert!(err.contains("kat k8s reset"), "{err}");
+
+        // An invalid marker beside a valid stamp fails closed too.
+        restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        fs::write(&marker, "v1.39\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("invalid k3s version \"v1.39\""), "{err}");
+        fs::remove_file(&marker).unwrap();
 
         // An empty stamp fails closed instead of falling back to the node record.
         fs::write(server_version_stamp(&data_dir), "").unwrap();
