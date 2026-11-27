@@ -33,12 +33,18 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
     let t = Instant::now();
     // Machines halt in parallel with the containers; each has
     // `lxc::STOP_SECS` before it is killed.
+    // The k8s stop runs on its own thread and is waited for at most
+    // `SHUTDOWN_K8S_BUDGET`, so nothing in the guest Kubernetes service (a
+    // reset still holding its lock, a slow k3s exit, serial `ctr` cleanup)
+    // can delay the Docker stop, process sweep, or data-disk sync.
+    let k8s_budget = Instant::now() + super::k8s::SHUTDOWN_K8S_BUDGET;
+    let (k8s_tx, k8s_rx) = std::sync::mpsc::channel();
     let k8s_stop = thread::Builder::new()
         .name("shutdown-k8s".into())
-        .spawn(|| {
+        .spawn(move || {
             let t = Instant::now();
             super::k8s::stop_for_shutdown();
-            t.elapsed()
+            let _ = k8s_tx.send(t.elapsed());
         });
     let machines = thread::Builder::new()
         .name("shutdown-machines".into())
@@ -55,19 +61,27 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
         nfs.stop();
     }
     match k8s_stop {
-        Ok(h) => {
-            if let Ok(took) = h.join() {
-                super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
+        Ok(_detached) => {
+            match k8s_rx.recv_timeout(k8s_budget.saturating_duration_since(Instant::now())) {
+                Ok(took) => {
+                    super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
+                }
+                Err(_) => {
+                    super::k8s::abandon_shutdown_stop();
+                    super::log(&format!(
+                        "shutdown: k8s stop still running after {} s; cutting off Kubernetes cleanup and continuing",
+                        super::k8s::SHUTDOWN_K8S_BUDGET.as_secs()
+                    ));
+                }
             }
         }
         Err(e) => {
-            super::log(&format!("shutdown: spawn k8s stop thread: {e}"));
-            let t = Instant::now();
-            super::k8s::stop_for_shutdown();
+            // Without a thread the stop could not be bounded: leave k3s to the
+            // process sweep rather than risk delaying the data-disk sync.
             super::log(&format!(
-                "shutdown: k8s stopped in {} ms",
-                t.elapsed().as_millis()
+                "shutdown: spawn k8s stop thread: {e}; leaving k3s to the process sweep"
             ));
+            super::k8s::abandon_shutdown_stop();
         }
     }
     match machines {
