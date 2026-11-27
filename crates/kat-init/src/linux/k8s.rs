@@ -70,14 +70,17 @@ pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
+/// containerd's runtime state for `k8s.io` tasks (each task's rootfs mount
+/// lives under `<this>/<id>/rootfs`).
+const K8S_TASK_STATE_DIR: &str = "/run/containerd/io.containerd.runtime.v2.task/k8s.io";
 /// How long the VM shutdown sequence waits for the k8s stop thread before it
 /// cuts off Kubernetes cleanup (see [`abandon_shutdown_stop`]) and moves on.
 /// Leaves room within the host's ~45 s shutdown deadline for the Docker stack
 /// stop (~19 s), the process sweep, and the data-disk sync.
-/// containerd's runtime state for `k8s.io` tasks (each task's rootfs mount
-/// lives under `<this>/<id>/rootfs`).
-const K8S_TASK_STATE_DIR: &str = "/run/containerd/io.containerd.runtime.v2.task/k8s.io";
 pub const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(18);
+/// SIGTERM grace for k3s during VM shutdown: short enough (with the SIGKILL
+/// reap) that workload cleanup still fits in [`SHUTDOWN_K8S_BUDGET`].
+const SHUTDOWN_K3S_STOP_TIMEOUT: Duration = Duration::from_secs(6);
 const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -113,6 +116,24 @@ static SHUTDOWN_K8S_ABANDONED: AtomicBool = AtomicBool::new(false);
 /// Whether Kubernetes workload cleanup must stop issuing commands.
 fn workload_cleanup_cut_off() -> bool {
     SHUTDOWN_K8S_ABANDONED.load(Ordering::SeqCst)
+}
+
+/// Make a workload-cleanup command refuse to `exec` once shutdown has cut
+/// Kubernetes cleanup off. The check runs in the forked child, so a command
+/// forked after [`abandon_shutdown_stop`] (for example after the shutdown
+/// process sweep) never runs, closing the gap between the parent's
+/// [`workload_cleanup_cut_off`] check and the spawn.
+fn guard_cleanup_command(cmd: &mut Command) -> &mut Command {
+    // SAFETY: the closure only performs an atomic load, which is
+    // async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if SHUTDOWN_K8S_ABANDONED.load(Ordering::SeqCst) {
+                return Err(io::Error::from_raw_os_error(libc::ECANCELED));
+            }
+            Ok(())
+        })
+    }
 }
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
@@ -279,6 +300,15 @@ pub fn start_service(
         }),
     });
     let _ = SERVICE.set(svc.clone());
+    // Best-effort: reclaim detached `.data.removing-*` copies left by a reset
+    // whose reclamation was interrupted or timed out, so their disk space never
+    // depends on another reset. Only stale siblings are touched (never
+    // `DATA_DIR`), in the same killable no-follow helper; a concurrent reset
+    // reclaiming the same copies only turns into a harmless warning.
+    let boot_reaper = svc.reaper.clone();
+    let _ = thread::Builder::new()
+        .name("k8s-reclaim".into())
+        .spawn(move || reclaim_stale_at_boot(&boot_reaper));
     let listener = sys::vsock_listen(K8S_PORT)?;
     let s = svc.clone();
     let active = Arc::new(AtomicUsize::new(0));
@@ -2801,7 +2831,7 @@ impl K8s {
             || SHUTTING_DOWN.load(Ordering::SeqCst) || writer.failed(),
             &mut |msg| writer.write_progress(msg),
         )
-        .map_err(|e| not_started(&e))?;
+        .map_err(|e| not_started(&describe_reset_abort(e, writer.failed())))?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err(not_started("aborted: VM is shutting down"));
         }
@@ -2885,7 +2915,7 @@ impl K8s {
                 )
             },
         );
-        res?;
+        res.map_err(|e| describe_reset_abort(e, writer.failed()))?;
         log(if remove_images {
             "k3s cluster data and k8s.io images reset"
         } else {
@@ -3195,7 +3225,12 @@ fn terminate_running(mut r: Running) -> bool {
         true
     } else {
         unsafe { libc::kill(r.pid, libc::SIGTERM) };
-        if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_ok() {
+        let grace = if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            SHUTDOWN_K3S_STOP_TIMEOUT
+        } else {
+            STOP_TIMEOUT
+        };
+        if r.exit_rx.recv_timeout(grace).is_ok() {
             true
         } else {
             log("k3s did not stop in time, killing it");
@@ -3301,7 +3336,8 @@ fn stop_k8s_containers_with_progress(
             return None;
         }
         let mut cmd = Command::new("/usr/bin/ctr");
-        cmd.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io"])
+        guard_cleanup_command(&mut cmd)
+            .args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io"])
             .args(args);
         match run_reaped_split(reaper, &mut cmd, timeout) {
             Ok((0, out, _)) => Some(out),
@@ -3365,7 +3401,7 @@ fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&s
             return;
         }
         let mut del = Command::new("/sbin/ip");
-        del.args(["link", "delete", iface]);
+        guard_cleanup_command(&mut del).args(["link", "delete", iface]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
     }
     let nft_bin = [
@@ -3382,7 +3418,7 @@ fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&s
             return;
         }
         let mut del = Command::new(nft_bin);
-        del.args(["delete", "table", family, "kube-proxy"]);
+        guard_cleanup_command(&mut del).args(["delete", "table", family, "kube-proxy"]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
     }
     if cut_off() {
@@ -3650,6 +3686,19 @@ fn execute_reset_sequence<T>(
     Ok(())
 }
 
+/// Reset steps share one abort check (`SHUTTING_DOWN || reply stream failed`)
+/// whose message names the shutdown; report a failed reply stream as such.
+fn describe_reset_abort(e: String, stream_failed: bool) -> String {
+    if stream_failed && !SHUTTING_DOWN.load(Ordering::SeqCst) {
+        e.replace(
+            "aborted: VM is shutting down",
+            "aborted: the reply stream to the host failed",
+        )
+    } else {
+        e
+    }
+}
+
 /// Remove active Kubernetes cluster data with exactly one irreversible step.
 ///
 /// 1. Remove the legacy pre-migration kubelet directory (data-dir untouched
@@ -3747,6 +3796,25 @@ fn reclaim_stale_dirs(
         remove(&dir)?;
     }
     Ok(())
+}
+
+fn reclaim_stale_at_boot(reaper: &Reaper) {
+    let Some(parent) = Path::new(DATA_DIR).parent() else {
+        return;
+    };
+    let mut any = false;
+    if reclaim_stale_dirs(parent, &mut |_| {
+        any = true;
+        Ok(())
+    })
+    .is_err()
+        || !any
+    {
+        return;
+    }
+    if let Err(e) = reclaim_stale_reaped(reaper, parent, DATA_REMOVE_TIMEOUT, &mut || {}) {
+        log(&format!("k8s: reclaim detached cluster data: {e}"));
+    }
 }
 
 /// argv[1] that makes `/proc/self/exe` (kat-init, not PID 1) run
@@ -6393,13 +6461,13 @@ where
     }
     if tasks_out.stdout_truncated {
         return Err(
-            "ctr tasks ls (k8s.io) output exceeded capture limit; refusing to purge images".into(),
+            "ctr tasks ls (k8s.io) output exceeded capture limit; refusing to reset".into(),
         );
     }
     let remaining_tasks = parse_ctr_image_refs(&tasks_out.stdout);
     if !remaining_tasks.is_empty() {
         return Err(format!(
-            "cannot clear k8s.io images: {} task(s) still remain in k8s.io ({})",
+            "Kubernetes workloads survived the stop: {} task(s) still remain in k8s.io ({}); refusing to reset",
             remaining_tasks.len(),
             format_remaining_ids(&remaining_tasks)
         ));
@@ -6422,14 +6490,13 @@ where
     }
     if containers_out.stdout_truncated {
         return Err(
-            "ctr containers ls (k8s.io) output exceeded capture limit; refusing to purge images"
-                .into(),
+            "ctr containers ls (k8s.io) output exceeded capture limit; refusing to reset".into(),
         );
     }
     let remaining_containers = parse_ctr_image_refs(&containers_out.stdout);
     if !remaining_containers.is_empty() {
         return Err(format!(
-            "cannot clear k8s.io images: {} container(s) still remain in k8s.io ({})",
+            "Kubernetes workloads survived the stop: {} container(s) still remain in k8s.io ({}); refusing to reset",
             remaining_containers.len(),
             format_remaining_ids(&remaining_containers)
         ));
@@ -6440,7 +6507,25 @@ where
 /// Verify containerd is not just listening on its socket but answering gRPC
 /// RPCs, stop any lingering `k8s.io` containers from an unclean shutdown, and
 /// confirm no tasks/containers remain — all before detaching active cluster data.
+/// Refuses (keeping cluster data) unless containerd answers and confirms no
+/// `k8s.io` workload survived the stop: with containerd down, pod shims may
+/// still be running and using the data that reset would delete.
 fn preflight_containerd_for_reset(
+    reaper: &Reaper,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    preflight_containerd_checks(reaper, progress).map_err(|e| {
+        if e.starts_with("aborted:") {
+            e
+        } else {
+            format!(
+                "{e}; cluster data was left intact (restart the VM with `kat restart` and retry the reset)"
+            )
+        }
+    })
+}
+
+fn preflight_containerd_checks(
     reaper: &Reaper,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
