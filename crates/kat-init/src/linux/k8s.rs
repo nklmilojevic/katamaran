@@ -74,6 +74,9 @@ const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
 /// cuts off Kubernetes cleanup (see [`abandon_shutdown_stop`]) and moves on.
 /// Leaves room within the host's ~45 s shutdown deadline for the Docker stack
 /// stop (~19 s), the process sweep, and the data-disk sync.
+/// containerd's runtime state for `k8s.io` tasks (each task's rootfs mount
+/// lives under `<this>/<id>/rootfs`).
+const K8S_TASK_STATE_DIR: &str = "/run/containerd/io.containerd.runtime.v2.task/k8s.io";
 pub const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(18);
 const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -311,7 +314,6 @@ pub fn start_service(
     Ok(svc)
 }
 
-/// Stop k3s cleanly during VM shutdown.
 /// Lazily detach (`MNT_DETACH`) every mount under `prefixes`, deepest first.
 /// Unlike a plain `umount`, a lazy detach never blocks on a busy or
 /// unreachable filesystem (for example a stale NFS pod volume), so reset can
@@ -339,8 +341,8 @@ fn detach_paths_under(prefixes: &[&str]) -> Result<(), String> {
 }
 
 /// Lazily detach any mounts left under the k3s data and legacy kubelet
-/// directories (for example pod volume mounts whose cleanup was cut off by
-/// [`abandon_shutdown_stop`]) so the data disk can unmount cleanly.
+/// directories and `k8s.io` task rootfs mounts (for example when cleanup was
+/// cut off by [`abandon_shutdown_stop`]) so the data disk can unmount cleanly.
 /// Called by the shutdown sequence after the process sweep; `MNT_DETACH`
 /// never blocks on busy mounts and no lock is taken.
 pub fn detach_mounts_for_shutdown() -> String {
@@ -348,7 +350,7 @@ pub fn detach_mounts_for_shutdown() -> String {
         Ok(t) => t,
         Err(e) => return format!("read /proc/self/mountinfo: {e}"),
     };
-    let mounts = mounts_under_prefixes(&text, &[DATA_DIR, LEGACY_KUBELET_DIR]);
+    let mounts = mounts_under_prefixes(&text, &[DATA_DIR, LEGACY_KUBELET_DIR, K8S_TASK_STATE_DIR]);
     let mut failed = 0usize;
     for mp in &mounts {
         if let Err(e) = umount_detach(mp) {
@@ -359,11 +361,6 @@ pub fn detach_mounts_for_shutdown() -> String {
     format!("{} detached, {failed} failed", mounts.len() - failed)
 }
 
-/// Stop k3s for VM shutdown. Every guest Kubernetes operation (including
-/// reset) checks `SHUTTING_DOWN` between steps and runs long work in killable
-/// helpers that abort on shutdown, so `op_lock` is normally released quickly.
-/// The shutdown sequence runs this on its own thread and waits at most
-/// [`SHUTDOWN_K8S_BUDGET`]; see [`abandon_shutdown_stop`].
 /// Mark the VM as shutting down so every guest Kubernetes operation (reset,
 /// start, helpers with `abort_on_shutdown`) stops at its next check and no new
 /// one starts. The shutdown sequence calls this first, before anything that
@@ -372,6 +369,11 @@ pub fn begin_shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
 }
 
+/// Stop k3s for VM shutdown. Every guest Kubernetes operation (including
+/// reset) checks `SHUTTING_DOWN` between steps and runs long work in killable
+/// helpers that abort on shutdown, so `op_lock` is normally released quickly.
+/// The shutdown sequence runs this on its own thread and waits at most
+/// [`SHUTDOWN_K8S_BUDGET`]; see [`abandon_shutdown_stop`].
 pub fn stop_for_shutdown() {
     begin_shutdown();
     if let Some(svc) = SERVICE.get() {
@@ -2834,7 +2836,7 @@ impl K8s {
                 // the datastore underneath a live k3s.
                 ensure_no_unreaped_k3s()
             },
-            |progress| preflight_containerd_for_image_reset(&self.reaper, progress),
+            |progress| preflight_containerd_for_reset(&self.reaper, progress),
             |progress| {
                 // Nothing destructive runs once the reply stream to the host
                 // has failed: the data-cleared ack could never arrive.
@@ -3277,39 +3279,6 @@ fn umount_detach(target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn unmount_paths_under(prefixes: &[&str]) -> Result<(), String> {
-    let text = fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
-    let mut failures = Vec::new();
-    for mp in mounts_under_prefixes(&text, prefixes) {
-        if let Err(e) = sys::umount(&mp)
-            && let Err(de) = umount_detach(&mp)
-        {
-            let msg = format!("unmount {mp} failed ({e}); detach failed: {de}");
-            log(&msg);
-            failures.push(msg);
-        }
-    }
-    let after = fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|e| format!("re-read /proc/self/mountinfo: {e}"))?;
-    let remaining = mounts_under_prefixes(&after, prefixes);
-    if !remaining.is_empty() {
-        let detail = if failures.is_empty() {
-            format!("mounts still active: {}", remaining.join(", "))
-        } else {
-            format!(
-                "mounts still active ({}): {}",
-                remaining.join(", "),
-                failures.join("; ")
-            )
-        };
-        return Err(detail);
-    }
-    Ok(())
-}
-
-/// Stop and remove Kubernetes tasks and containers in containerd's `k8s.io`
-/// namespace without touching Docker's `moby` namespace.
 /// Stop and remove `k8s.io` tasks and containers one `ctr` call at a time.
 /// `abort` is checked before every call so a caller holding `op_lock` (reset
 /// preflight) stops issuing commands as soon as the VM starts shutting down.
@@ -3419,7 +3388,9 @@ fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&s
     if cut_off() {
         return;
     }
-    if let Err(e) = unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
+    // Lazy detach: a plain umount can block forever on an unreachable pod
+    // volume (e.g. NFS) while the caller holds `op_lock`.
+    if let Err(e) = detach_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
         log(&format!("cleanup mounts: {e}"));
     }
 }
@@ -3649,23 +3620,23 @@ fn execute_reset_sequence<T>(
     ) -> Result<(), String>,
 ) -> Result<(), String> {
     stop(progress)?;
-    // Acquire `IMAGE_SYNC_LOCK` and check containerd readiness BEFORE deleting
-    // cluster data so ordinary sync contention or readiness timeouts leave the
-    // active datastore intact.
+    // For image resets acquire `IMAGE_SYNC_LOCK` first; then, for EVERY reset,
+    // confirm via containerd that no `k8s.io` task or container is left BEFORE
+    // deleting cluster data, so sync contention, an unreachable containerd, or
+    // a pod that survived the stop leaves the active datastore intact.
     let sync_guard = if remove_images {
-        let g = try_lock_with_deadline(
+        Some(try_lock_with_deadline(
             image_sync_lock,
             sync_wait_timeout,
             heartbeat,
             "waiting for background image sync to stop",
             &shutting_down,
             progress,
-        )?;
-        wait_containerd(progress)?;
-        Some(g)
+        )?)
     } else {
         None
     };
+    wait_containerd(progress)?;
     if shutting_down() {
         return Err("aborted: VM is shutting down".into());
     }
@@ -6469,7 +6440,7 @@ where
 /// Verify containerd is not just listening on its socket but answering gRPC
 /// RPCs, stop any lingering `k8s.io` containers from an unclean shutdown, and
 /// confirm no tasks/containers remain — all before detaching active cluster data.
-fn preflight_containerd_for_image_reset(
+fn preflight_containerd_for_reset(
     reaper: &Reaper,
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
@@ -10872,6 +10843,47 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "files behind a swapped-in symlink must never be removed"
         );
         assert!(moved.join("inner").exists());
+    }
+
+    #[test]
+    fn plain_reset_requires_workload_preflight_before_removing_data() {
+        let sync_lock = Mutex::new(());
+        for preflight_ok in [false, true] {
+            let mut order = Vec::new();
+            let order_cell = std::cell::RefCell::new(&mut order);
+            let res = execute_reset_sequence(
+                false,
+                &sync_lock,
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+                || false,
+                &mut |_| {},
+                |_| {
+                    order_cell.borrow_mut().push("stop");
+                    Ok(())
+                },
+                |_| {
+                    order_cell.borrow_mut().push("preflight");
+                    if preflight_ok {
+                        Ok(())
+                    } else {
+                        Err("k8s.io tasks still present: abc".into())
+                    }
+                },
+                |_| {
+                    order_cell.borrow_mut().push("remove");
+                    Ok(())
+                },
+                |_, _| panic!("plain reset never clears images"),
+            );
+            assert_eq!(res.is_ok(), preflight_ok, "{res:?}");
+            let expected: &[&str] = if preflight_ok {
+                &["stop", "preflight", "remove"]
+            } else {
+                &["stop", "preflight"]
+            };
+            assert_eq!(order, expected);
+        }
     }
 
     #[test]

@@ -288,6 +288,7 @@ pub fn read_reset_answer_terminal(
     on_data_deleted: &mut dyn FnMut(),
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<()> {
+    let mut saw_frame = false;
     let mut mark_deleted = |deleted: &mut bool| {
         if !*deleted {
             *deleted = true;
@@ -295,7 +296,10 @@ pub fn read_reset_answer_terminal(
         }
     };
     loop {
-        match k8s::read(&mut *s)? {
+        let msg = k8s::read(&mut *s)?;
+        let first_frame = !saw_frame;
+        saw_frame |= msg.is_some();
+        match msg {
             Some(K8sMsg::ResetAccepted) if remove_images => {
                 *accepted = true;
                 progress("starting Kubernetes cluster reset");
@@ -356,8 +360,16 @@ pub fn read_reset_answer_terminal(
             Some(other) => bail!("unexpected k8s reset reply {other:?}"),
             None => {
                 if remove_images && !*accepted {
+                    // Older guests close right after rejecting the flag byte
+                    // without sending anything; a compatible guest that was
+                    // still queued (it sent progress) is not out of date.
+                    if first_frame {
+                        bail!(
+                            "the guest closed the Kubernetes connection before accepting the image reset (restart the VM to update the guest)"
+                        );
+                    }
                     bail!(
-                        "the guest closed the Kubernetes connection before accepting the image reset (restart the VM to update the guest)"
+                        "the guest closed the Kubernetes connection before starting the image reset; cluster data was not touched"
                     );
                 }
                 bail!("the guest closed the Kubernetes connection");
@@ -1197,8 +1209,15 @@ fn run_kubectl_with_deadline(
             drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
         let more_err =
             drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                drop(stdout);
+                drop(stderr);
+                kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
+                return Err(e);
+            }
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
