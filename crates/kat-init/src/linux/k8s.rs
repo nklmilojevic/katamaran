@@ -20,7 +20,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -72,6 +72,32 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<()> = Mutex::new(());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// pid of a k3s that survived SIGKILL after its `Running` handle was dropped
+/// (0 = none). While it is alive, nothing may read or modify the datastore.
+static UNREAPED_K3S_PID: AtomicI32 = AtomicI32::new(0);
+
+fn note_unreaped_k3s(pid: i32) {
+    UNREAPED_K3S_PID.store(pid, Ordering::SeqCst);
+}
+
+/// Refuse datastore operations while an earlier k3s may still be writing to it.
+fn ensure_no_unreaped_k3s() -> Result<(), String> {
+    let pid = UNREAPED_K3S_PID.load(Ordering::SeqCst);
+    if pid == 0 {
+        return Ok(());
+    }
+    // kill(pid, 0) succeeds (or fails with EPERM) while the process exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if alive {
+        return Err(format!(
+            "an earlier k3s (pid {pid}) did not exit and may still be using the cluster data; \
+             restart the VM (`kat restart`) before starting, installing, marking, or resetting Kubernetes"
+        ));
+    }
+    let _ = UNREAPED_K3S_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    Ok(())
+}
 
 struct ConnGuard(Arc<AtomicUsize>);
 
@@ -1544,6 +1570,24 @@ fn rollback_versions_if_untouched(
     }
 }
 
+/// Remove a version file that did not exist before and fsync its directory, so
+/// a crash cannot bring back a newer recorded version after a rollback.
+fn remove_durably(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log(&format!("remove {}: {e}", path.display()));
+            return;
+        }
+    }
+    if let Some(parent) = path.parent()
+        && let Err(e) = sync_dir(parent)
+    {
+        log(&format!("after removing {}: {e}", path.display()));
+    }
+}
+
 /// Restore the `server/db/` stamp to `prev`, removing it if it did not exist.
 fn restore_server_version_stamp(data_dir: &Path, prev: Option<&str>) {
     match prev {
@@ -1552,14 +1596,7 @@ fn restore_server_version_stamp(data_dir: &Path, prev: Option<&str>) {
                 log(&format!("restore server version stamp: {e}"));
             }
         }
-        None => {
-            let stamp = server_version_stamp(data_dir);
-            if let Err(e) = fs::remove_file(&stamp)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                log(&format!("remove {}: {e}", stamp.display()));
-            }
-        }
+        None => remove_durably(&server_version_stamp(data_dir)),
     }
 }
 
@@ -1570,13 +1607,7 @@ fn restore_data_version(path: &Path, prev: Option<&str>) {
                 log(&format!("restore {}: {e}", path.display()));
             }
         }
-        None => {
-            if let Err(e) = fs::remove_file(path)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                log(&format!("remove {}: {e}", path.display()));
-            }
-        }
+        None => remove_durably(path),
     }
 }
 
@@ -1981,6 +2012,7 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
+        ensure_no_unreaped_k3s()?;
         {
             let st = self.state.lock().unwrap();
             if st.running.is_some()
@@ -2011,6 +2043,8 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
+        ensure_no_unreaped_k3s()?;
+        validate_k3s_release_tag(version)?;
         if self.state.lock().unwrap().running.is_some() {
             return Err("stop Kubernetes before installing a new k3s binary".into());
         }
@@ -2084,6 +2118,7 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
+        ensure_no_unreaped_k3s()?;
         {
             let st = self.state.lock().unwrap();
             if st.phase == "running" && st.api_ready {
@@ -2097,6 +2132,12 @@ impl K8s {
         let installed_version = read_trimmed_file(Path::new(VERSION_FILE))?.ok_or_else(|| {
             "k3s installation is incomplete (missing version marker); restart Kubernetes to reinstall"
                 .to_string()
+        })?;
+        // Never copy a malformed tag into the datastore's version files.
+        validate_k3s_release_tag(&installed_version).map_err(|e| {
+            format!(
+                "installed k3s has an invalid version marker ({e}); restart Kubernetes to reinstall"
+            )
         })?;
         check_datastore_compatible_with(
             Path::new(DATA_DIR),
@@ -2315,6 +2356,7 @@ impl K8s {
                     FORWARDED.lock().unwrap().clear();
                     restore_bridge_netfilter();
                 } else {
+                    note_unreaped_k3s(pid);
                     log(&format!(
                         "k3s pid {pid} did not exit after SIGKILL; skipping workload teardown"
                     ));
@@ -2564,6 +2606,7 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
+        ensure_no_unreaped_k3s()?;
         self.stop_locked(Some(&mut *conn))?;
         let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
         unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
@@ -2796,6 +2839,9 @@ fn terminate_running(mut r: Running) -> bool {
             r.exit_rx.recv_timeout(Duration::from_secs(3)).is_ok()
         }
     };
+    if !reaped {
+        note_unreaped_k3s(r.pid);
+    }
     if let Some(t) = r.proxy_thread.take() {
         let _ = t.join();
     }
@@ -4935,6 +4981,18 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             None
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreaped_k3s_blocks_datastore_operations_until_it_exits() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        note_unreaped_k3s(child.id() as i32);
+        let err = ensure_no_unreaped_k3s().unwrap_err();
+        assert!(err.contains("did not exit"), "{err}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        ensure_no_unreaped_k3s().unwrap();
+        assert_eq!(UNREAPED_K3S_PID.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -215,8 +215,10 @@ impl Config {
             "k8s_version" => {
                 next.k8s_version = match value {
                     "" | "default" => None,
-                    v if v.starts_with('v') => Some(v.to_string()),
-                    v => Some(format!("v{v}")),
+                    // Only a bare version number gets the `v`; anything else is
+                    // validated as typed, so errors quote the user's input.
+                    v if v.starts_with(|c: char| c.is_ascii_digit()) => Some(format!("v{v}")),
+                    v => Some(v.to_string()),
                 }
             }
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
@@ -614,6 +616,8 @@ mod tests {
             "{err:#}"
         );
         assert!(cfg.set("k8s_version", "v1.37.0+k3s1", &HOST).is_ok());
+        let err = cfg.set("k8s_version", "V1.32.5+k3s1", &HOST).unwrap_err();
+        assert!(format!("{err:#}").contains("\"V1.32.5+k3s1\""), "{err:#}");
     }
 
     #[test]

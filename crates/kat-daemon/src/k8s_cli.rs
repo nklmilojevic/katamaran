@@ -161,10 +161,10 @@ fn reset() -> anyhow::Result<()> {
 
 fn mark_version(version: &str) -> anyhow::Result<()> {
     // Accept the same input as `kat config set k8s_version=...` (leading `v` optional).
-    let version = &if version.starts_with('v') {
-        version.to_string()
-    } else {
+    let version = &if version.starts_with(|c: char| c.is_ascii_digit()) {
         format!("v{version}")
+    } else {
+        version.to_string()
     };
     crate::config::validate_k8s_version(version)?;
     let mut c = Client::connect_default().context(
