@@ -27,6 +27,15 @@ use kat_proto::{CONTROL_PORT, DOCKER_PORT, Hello, K8S_API_PORT, Msg, PROTOCOL_VE
 
 use service::{DockerStack, Notifier, Reaper};
 
+/// `/init rmtree <path>` helper used by Kubernetes reset to remove detached
+/// cluster data in a killable child process.
+pub fn rmtree_main() -> ! {
+    k8s::rmtree_main()
+}
+
+/// argv[1] selecting [`rmtree_main`].
+pub const RMTREE_HELPER_ARG: &str = k8s::RMTREE_HELPER_ARG;
+
 const HOST_CID: u32 = 2;
 const DIAL_ATTEMPTS: u32 = 2000;
 

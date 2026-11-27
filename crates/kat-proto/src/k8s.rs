@@ -9,7 +9,7 @@
 //! | `Install`              | the `k3s` binary as `Data`..., `DataEnd`                                    | `Progress`…, then `Done` / `Error`                                                                                              |
 //! | `Start`                | optional `extra_args`, `config_yaml`                                        | `Progress`…, then `StatusInfo` / `Error`                                                                                        |
 //! | `Stop`                 | –                                                                           | `Progress`…, then `Done` / `Error`                                                                                              |
-//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | plain (`0`): `Progress`… (with reserved [`RESET_DATA_CLEARED_PROGRESS`] on detach), then `Done` / `Error` (prefixed with [`RESET_NOT_STARTED_PREFIX`] if rejected before mutating state); image reset (`1`): optional queued `Progress`…, `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` |
+//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | plain (`0`): `Progress`… (compatible guests first emit reserved [`RESET_QUEUED_PROGRESS`], then [`RESET_STARTED_PROGRESS`] once the reset may mutate state, and [`RESET_DATA_CLEARED_PROGRESS`] on detach), then `Done` / `Error` (prefixed with [`RESET_NOT_STARTED_PREFIX`] if rejected before mutating state); image reset (`1`): optional queued `Progress`…, `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` |
 //! | `Kubeconfig`           | –                                                                           | `KubeconfigData`, or `Error`                                                                                                    |
 //! | `Connect`              | `Data`… (`DataEnd` closes the write side)                                   | `Done` then `Data`…, `DataEnd`; or `Error`                                                                                      |
 //! | `SyncImages`           | –                                                                           | `Done`, or `Error`                                                                                                              |
@@ -37,6 +37,24 @@ pub const CAP_START_CONFIG: u32 = 1 << 0;
 /// while newer daemons match this exact string on plain resets to record
 /// confirmed deletion and disable Kubernetes auto-start immediately.
 pub const RESET_DATA_CLEARED_PROGRESS: &str = "cluster data deleted";
+
+/// Reserved `Progress` text emitted by compatible guests as the very first
+/// reply to a plain reset (`images == false`), before waiting for the guest
+/// operation lock or touching any state.
+///
+/// Older guests never send it and mutate state without an explicit
+/// acceptance, so newer daemons treat a plain reset as started by default.
+/// Seeing this marker tells the daemon the guest will announce
+/// [`RESET_STARTED_PROGRESS`] before mutating anything, so a connection that
+/// closes while the reset is still queued leaves host state untouched.
+pub const RESET_QUEUED_PROGRESS: &str = "Kubernetes cluster reset queued";
+
+/// Reserved `Progress` text emitted by compatible guests on plain resets once
+/// the guest operation lock is held and immediately before k3s is stopped or
+/// any cluster state is mutated (the plain-reset counterpart of
+/// [`K8sMsg::ResetAccepted`], carried in a legacy `Progress` frame so older
+/// daemons can still decode it).
+pub const RESET_STARTED_PROGRESS: &str = "starting Kubernetes cluster reset";
 
 /// Reserved prefix on [`K8sMsg::Error`] replies emitted by compatible guests
 /// when a reset fails before acquiring the guest operation lock (or before

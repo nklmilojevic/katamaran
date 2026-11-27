@@ -22,6 +22,7 @@ fn main() {
         match std::env::args().nth(1).as_deref() {
             Some("nfsd") => linux::nfs::main(),
             Some("vm-exec-probe") => linux::vm_exec::probe_main(),
+            Some(linux::RMTREE_HELPER_ARG) => linux::rmtree_main(),
             _ => {}
         }
     }

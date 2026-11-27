@@ -2694,6 +2694,14 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err(not_started("aborted: VM is shutting down"));
         }
+        if !remove_images {
+            // Tell compatible daemons this plain reset is only queued so a
+            // connection that closes before RESET_STARTED_PROGRESS preserves
+            // host state (older daemons just display it as progress).
+            writer
+                .write_required(&K8sMsg::Progress(k8s::RESET_QUEUED_PROGRESS.into()))
+                .map_err(|e| not_started(&format!("send reset queued notice: {e}")))?;
+        }
         // Stream bounded heartbeats while queued behind an in-flight guest
         // Kubernetes operation so callers with idle timeouts stay alive, and
         // bound the wait without sending `ResetAccepted` (or mutating state)
@@ -2713,12 +2721,15 @@ impl K8s {
         if writer.failed() {
             return Err(not_started("client stream write failed while queued"));
         }
-        ensure_no_unreaped_k3s()?;
-        if remove_images {
-            writer
-                .write_required(&K8sMsg::ResetAccepted)
-                .map_err(|e| not_started(&format!("send reset ack: {e}")))?;
-        }
+        ensure_no_unreaped_k3s().map_err(|e| not_started(&e))?;
+        let accept = if remove_images {
+            K8sMsg::ResetAccepted
+        } else {
+            K8sMsg::Progress(k8s::RESET_STARTED_PROGRESS.into())
+        };
+        writer
+            .write_required(&accept)
+            .map_err(|e| not_started(&format!("send reset ack: {e}")))?;
         let mut ack_err: Option<String> = None;
         let paths = ClusterDataPaths {
             data_dir: Path::new(DATA_DIR),
@@ -2764,15 +2775,7 @@ impl K8s {
                             _ => Ok(()),
                         }
                     },
-                    |dir, beat| {
-                        remove_tree_bounded(
-                            dir,
-                            DATA_REMOVE_TIMEOUT,
-                            PROGRESS_HEARTBEAT_INTERVAL,
-                            || SHUTTING_DOWN.load(Ordering::SeqCst),
-                            beat,
-                        )
-                    },
+                    |dir, beat| remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
                     &mut || {
                         if let Err(e) =
                             writer.write_required(&K8sMsg::reset_data_cleared(remove_images))
@@ -3688,83 +3691,262 @@ fn remove_cluster_data_dirs(
     Ok(())
 }
 
-/// Recursively remove `root` without following symlinks, enforcing a finite
-/// `timeout`, checking `shutting_down`, and emitting `beat` heartbeats at
-/// `heartbeat` intervals. Runs inline with an explicit heap stack — no external
-/// `/bin/rm` binary, no deep recursion, and no detached background thread that
-/// keeps unlinking after a timeout or shutdown abort.
-fn remove_tree_bounded(
-    root: &Path,
+/// argv[1] that makes `/proc/self/exe` (kat-init, not PID 1) run
+/// [`rmtree_main`] instead of booting the guest.
+pub const RMTREE_HELPER_ARG: &str = "rmtree";
+
+/// Remove `path` recursively in a killable `/proc/self/exe rmtree <path>`
+/// helper supervised by PID 1's reaper with a finite `timeout`, shutdown
+/// abort, and periodic `beat` heartbeats.
+///
+/// Running the walk in a child process (rather than inline) means a filesystem
+/// call that stalls in the kernel can never hold `op_lock` past the deadline or
+/// block orderly VM shutdown: the reaper SIGKILLs the helper and the wait stays
+/// bounded even if the child cannot exit immediately. The helper is kat-init
+/// itself, so reset does not depend on any particular `/bin/rm` in the rootfs.
+fn remove_tree_reaped(
+    reaper: &Reaper,
+    path: &Path,
     timeout: Duration,
-    heartbeat: Duration,
-    shutting_down: impl Fn() -> bool,
     beat: &mut dyn FnMut(),
 ) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut last_beat = Instant::now();
-    let mut check_budget = || -> Result<(), String> {
-        if shutting_down() {
-            return Err("aborted: VM is shutting down".into());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("remove {}: timed out", root.display()));
-        }
-        if last_beat.elapsed() >= heartbeat {
-            beat();
-            last_beat = Instant::now();
-        }
-        Ok(())
-    };
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg(RMTREE_HELPER_ARG).arg(path);
+    let out = run_reaped_split_checked(reaper, &mut cmd, timeout, 64 << 10, true, Some(beat))
+        .map_err(|e| format!("remove {}: {e}", path.display()))?;
+    if out.code != 0 {
+        let detail = ctr_error_detail(&out.stdout, &out.stderr);
+        return Err(if detail.is_empty() {
+            format!(
+                "remove {}: helper exited with status {}",
+                path.display(),
+                out.code
+            )
+        } else {
+            format!("remove {}: {detail}", path.display())
+        });
+    }
+    if path_exists_checked(path)? {
+        return Err(format!(
+            "remove {}: path still exists after removal",
+            path.display()
+        ));
+    }
+    Ok(())
+}
 
-    check_budget()?;
-    let meta = match fs::symlink_metadata(root) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("stat {}: {e}", root.display())),
+/// `/init rmtree <path>`: remove `<path>` with [`remove_tree_nofollow`] and
+/// exit 0 on success, or print the error to stderr and exit 1.
+pub fn rmtree_main() -> ! {
+    let Some(path) = std::env::args_os().nth(2) else {
+        eprintln!("usage: {RMTREE_HELPER_ARG} <path>");
+        std::process::exit(2);
     };
-    if !meta.file_type().is_dir() {
-        return match fs::remove_file(root) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("remove {}: {e}", root.display())),
-        };
+    match remove_tree_nofollow(Path::new(&path), &mut |_| Ok(())) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// An open directory stream plus the name it was opened by in its parent.
+struct DirFrame {
+    dir: std::ptr::NonNull<libc::DIR>,
+    name: CString,
+    path: std::path::PathBuf,
+    /// Whether any entry was seen during the current readdir pass.
+    saw_entry: bool,
+}
+
+impl DirFrame {
+    fn fd(&self) -> std::os::fd::RawFd {
+        // SAFETY: `dir` is a live stream owned by this frame.
+        unsafe { libc::dirfd(self.dir.as_ptr()) }
+    }
+}
+
+impl Drop for DirFrame {
+    fn drop(&mut self) {
+        // SAFETY: `dir` came from `fdopendir` and is closed exactly once.
+        unsafe { libc::closedir(self.dir.as_ptr()) };
+    }
+}
+
+/// `openat(parent, name, O_DIRECTORY | O_NOFOLLOW)` + `fdopendir`. Fails with
+/// `ELOOP` / `ENOTDIR` if `name` is (now) a symlink or non-directory, so a
+/// directory swapped for a symlink is never entered.
+fn open_dir_nofollow(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> io::Result<std::ptr::NonNull<libc::DIR>> {
+    // SAFETY: `name` is NUL-terminated; the fd is owned by the stream on success.
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a valid directory descriptor we own.
+    match std::ptr::NonNull::new(unsafe { libc::fdopendir(fd) }) {
+        Some(dir) => Ok(dir),
+        None => {
+            let e = io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+            unsafe { libc::close(fd) };
+            Err(e)
+        }
+    }
+}
+
+/// `unlinkat(parent, name, flags)`, treating `ENOENT` as success.
+fn unlinkat_checked(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> io::Result<()> {
+    // SAFETY: `name` is NUL-terminated.
+    if unsafe { libc::unlinkat(parent, name.as_ptr(), flags) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+/// Recursively remove `root` using only descriptor-relative syscalls so no
+/// symlink is ever followed, even if the tree is modified concurrently.
+///
+/// Every directory is opened relative to its already-open parent with
+/// `O_DIRECTORY | O_NOFOLLOW`, and every entry is removed with `unlinkat`
+/// relative to the descriptor it was enumerated from. Queued pathnames are
+/// never re-resolved, so replacing a directory with a symlink between
+/// enumeration and descent makes the open fail with `ELOOP` and only the
+/// symlink itself is unlinked; files outside the tree are never touched.
+/// Iterative (one open descriptor per depth level, no recursion).
+///
+/// `check` is called with each path before it is opened or unlinked; returning
+/// an error aborts the walk.
+fn remove_tree_nofollow(
+    root: &Path,
+    check: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = root
+        .file_name()
+        .ok_or_else(|| format!("refusing to remove {}", root.display()))?;
+    let parent = match root.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent_dir = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("open {}: {e}", parent.display())),
+    };
+    let parent_fd = parent_dir.as_raw_fd();
+    let root_name =
+        CString::new(name.as_bytes()).map_err(|_| format!("invalid path {}", root.display()))?;
+    let err_at = |path: &Path, e: io::Error| format!("remove {}: {e}", path.display());
+    let not_a_dir = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP));
+
+    check(root)?;
+    let mut stack: Vec<DirFrame> = Vec::new();
+    match open_dir_nofollow(parent_fd, &root_name) {
+        Ok(dir) => stack.push(DirFrame {
+            dir,
+            name: root_name,
+            path: root.to_path_buf(),
+            saw_entry: false,
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if not_a_dir(&e) => {
+            return unlinkat_checked(parent_fd, &root_name, 0).map_err(|e| err_at(root, e));
+        }
+        Err(e) => return Err(err_at(root, e)),
     }
 
-    let mut stack: Vec<(std::path::PathBuf, bool)> = vec![(root.to_path_buf(), false)];
-    while let Some((dir, expanded)) = stack.pop() {
-        check_budget()?;
-        if expanded {
-            match fs::remove_dir(&dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("remove {}: {e}", dir.display())),
+    while let Some(top) = stack.last_mut() {
+        // SAFETY: errno is thread-local; reset it so a NULL return can be
+        // distinguished between end-of-stream and an error.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `top.dir` is a live stream owned by `top`.
+        let ent = unsafe { libc::readdir(top.dir.as_ptr()) };
+        if ent.is_null() {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error().unwrap_or(0) != 0 {
+                return Err(format!("read {}: {e}", top.path.display()));
             }
+            if top.saw_entry {
+                // Rescan: unlinking during iteration can make readdir skip
+                // entries, so only rmdir after a pass that saw nothing.
+                top.saw_entry = false;
+                // SAFETY: `top.dir` is a live stream owned by `top`.
+                unsafe { libc::rewinddir(top.dir.as_ptr()) };
+                continue;
+            }
+            let frame = stack.pop().expect("non-empty stack");
+            let pfd = stack.last().map_or(parent_fd, DirFrame::fd);
+            let (name, path) = (frame.name.clone(), frame.path.clone());
+            drop(frame);
+            check(&path)?;
+            unlinkat_checked(pfd, &name, libc::AT_REMOVEDIR).map_err(|e| err_at(&path, e))?;
             continue;
         }
-        stack.push((dir.clone(), true));
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("read {}: {e}", dir.display())),
+        // SAFETY: `ent` stays valid until the next readdir/closedir on this
+        // stream; the name is copied out immediately.
+        let (d_name, d_type) = unsafe {
+            (
+                std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()).to_owned(),
+                (*ent).d_type,
+            )
         };
-        for entry in entries {
-            check_budget()?;
-            let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
-            let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("stat {}: {e}", path.display())),
-            };
-            if ft.is_dir() {
-                // `DirEntry::file_type()` never follows symlinks on Unix/Linux.
-                stack.push((path, false));
-            } else {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        let bytes = d_name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        top.saw_entry = true;
+        let fd = top.fd();
+        let child = top.path.join(std::ffi::OsStr::from_bytes(bytes));
+        check(&child)?;
+        let mut try_dir = d_type == libc::DT_DIR || d_type == libc::DT_UNKNOWN;
+        loop {
+            if try_dir {
+                match open_dir_nofollow(fd, &d_name) {
+                    Ok(dir) => {
+                        stack.push(DirFrame {
+                            dir,
+                            name: d_name,
+                            path: child,
+                            saw_entry: false,
+                        });
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    // Not a directory (or swapped for a symlink): unlink the
+                    // entry itself below without following it.
+                    Err(e) if not_a_dir(&e) => {}
+                    Err(e) => return Err(err_at(&child, e)),
                 }
+            }
+            match unlinkat_checked(fd, &d_name, 0) {
+                Ok(()) => break,
+                // Replaced by a directory since enumeration: descend into it.
+                Err(e) if e.raw_os_error() == Some(libc::EISDIR) && !try_dir => try_dir = true,
+                Err(e) => return Err(err_at(&child, e)),
             }
         }
     }
@@ -10122,101 +10304,99 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     }
 
     #[test]
-    fn remove_tree_bounded_clears_trees_preserves_symlink_targets_and_enforces_limits() {
+    fn remove_tree_nofollow_clears_trees_and_preserves_symlink_targets() {
         let guard = TempDirGuard::create("kat-rmt");
         let base = &guard.0;
+        let no_check = &mut |_: &Path| -> Result<(), String> { Ok(()) };
 
-        // 1. Nested tree containing files, subdirs, and a symlink pointing outside
-        //    the tree removes the tree without touching the external target.
         let outside = base.join("outside");
         fs::create_dir(&outside).unwrap();
         let outside_file = outside.join("keep");
         fs::write(&outside_file, b"preserve").unwrap();
 
+        // 1. Nested tree with files, subdirs, a symlink to an outside directory,
+        //    and a wide directory (exercises readdir rescans after unlinks).
         let tree = base.join("tree");
         fs::create_dir_all(tree.join("a/b/c")).unwrap();
         fs::write(tree.join("a/b/c/file.txt"), b"data").unwrap();
         fs::write(tree.join("top"), b"top").unwrap();
         std::os::unix::fs::symlink(&outside, tree.join("a/link-to-outside")).unwrap();
-
-        let mut beats = 0usize;
-        remove_tree_bounded(
-            &tree,
-            Duration::from_secs(5),
-            Duration::ZERO,
-            || false,
-            &mut || beats += 1,
-        )
+        fs::create_dir(tree.join("wide")).unwrap();
+        for i in 0..2000 {
+            fs::write(tree.join(format!("wide/f{i}")), b"x").unwrap();
+        }
+        let mut checked = 0usize;
+        remove_tree_nofollow(&tree, &mut |_| {
+            checked += 1;
+            Ok(())
+        })
         .unwrap();
-        assert!(!tree.exists());
-        assert!(
-            outside_file.exists(),
-            "must never follow symlinks outside tree"
-        );
-        assert!(
-            beats >= 2,
-            "expected heartbeats during traversal, got {beats}"
-        );
+        assert!(fs::symlink_metadata(&tree).is_err());
+        assert!(outside_file.exists(), "must never follow symlinks");
+        assert!(checked > 2000, "check must run per entry, got {checked}");
 
-        // 2. Root symlink to a directory unlinks only the symlink, preserving target.
+        // 2. Root symlink to a directory unlinks only the symlink.
         let root_link = base.join("root-link");
         std::os::unix::fs::symlink(&outside, &root_link).unwrap();
-        remove_tree_bounded(
-            &root_link,
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            || false,
-            &mut || {},
-        )
-        .unwrap();
+        remove_tree_nofollow(&root_link, no_check).unwrap();
         assert!(fs::symlink_metadata(&root_link).is_err());
         assert!(outside_file.exists());
 
-        // 3. Missing path succeeds cleanly; single regular file is deleted.
-        remove_tree_bounded(
-            &base.join("does-not-exist"),
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            || false,
-            &mut || {},
-        )
-        .unwrap();
+        // 3. Missing path succeeds; a single regular file is deleted.
+        remove_tree_nofollow(&base.join("does-not-exist"), no_check).unwrap();
+        remove_tree_nofollow(&base.join("no-parent/child"), no_check).unwrap();
+        assert!(remove_tree_nofollow(Path::new("/"), no_check).is_err());
         let single = base.join("single-file");
         fs::write(&single, b"x").unwrap();
-        remove_tree_bounded(
-            &single,
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            || false,
-            &mut || {},
-        )
-        .unwrap();
+        remove_tree_nofollow(&single, no_check).unwrap();
         assert!(!single.exists());
 
-        // 4. Expired deadline and shutdown flag abort immediately without deleting.
+        // 4. An aborting check leaves the tree untouched.
         let untouched = base.join("untouched");
         fs::create_dir(&untouched).unwrap();
-        let err_to = remove_tree_bounded(
-            &untouched,
-            Duration::ZERO,
-            Duration::from_secs(1),
-            || false,
-            &mut || {},
-        )
+        fs::write(untouched.join("f"), b"x").unwrap();
+        let err = remove_tree_nofollow(&untouched, &mut |_| {
+            Err("aborted: VM is shutting down".into())
+        })
         .unwrap_err();
-        assert!(err_to.contains("timed out"), "{err_to}");
-        assert!(untouched.exists());
+        assert!(err.contains("shutting down"), "{err}");
+        assert!(untouched.join("f").exists());
+    }
 
-        let err_sd = remove_tree_bounded(
-            &untouched,
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            || true,
-            &mut || {},
-        )
-        .unwrap_err();
-        assert!(err_sd.contains("shutting down"), "{err_sd}");
-        assert!(untouched.exists());
+    #[test]
+    fn remove_tree_nofollow_never_enters_directory_swapped_for_symlink() {
+        let guard = TempDirGuard::create("kat-rmt-swap");
+        let base = &guard.0;
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        let tree = base.join("tree");
+        fs::create_dir_all(tree.join("a")).unwrap();
+        fs::write(tree.join("a/inner"), b"data").unwrap();
+        let moved = base.join("moved");
+
+        // After `a` is enumerated as a directory but before it is opened,
+        // replace it with a symlink to `outside` (a concurrent writer with
+        // access to the detached tree).
+        let target = tree.join("a");
+        let mut swapped = false;
+        remove_tree_nofollow(&tree, &mut |p| {
+            if p == target && !swapped {
+                swapped = true;
+                fs::rename(&target, &moved).unwrap();
+                std::os::unix::fs::symlink(&outside, &target).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(swapped);
+        assert!(fs::symlink_metadata(&tree).is_err());
+        assert!(
+            outside.join("keep").exists(),
+            "files behind a swapped-in symlink must never be removed"
+        );
+        assert!(moved.join("inner").exists());
     }
 
     #[test]

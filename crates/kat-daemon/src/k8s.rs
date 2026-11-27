@@ -244,9 +244,13 @@ pub fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow
 /// marking `accepted = true` (so an older guest closing the connection after
 /// rejecting the trailing flag byte never triggers host teardown) and tracks
 /// `ResetDataCleared` separately from `Done` / `Error`. For plain resets
-/// (`remove_images == false`), recognizes the reserved
-/// [`k8s::RESET_DATA_CLEARED_PROGRESS`] `Progress` marker (keeping replies
-/// readable by older daemons) and falls back to `Done` for older guests.
+/// (`remove_images == false`), `accepted` starts `true` because older guests
+/// mutate state without announcing it; a compatible guest's reserved
+/// [`k8s::RESET_QUEUED_PROGRESS`] marker clears it until
+/// [`k8s::RESET_STARTED_PROGRESS`] arrives, so a connection that closes while
+/// the reset is still queued never triggers host teardown. The reserved
+/// [`k8s::RESET_DATA_CLEARED_PROGRESS`] marker (keeping replies readable by
+/// older daemons) records deletion, falling back to `Done` for older guests.
 ///
 /// Invokes `on_data_deleted` once as soon as `data_deleted` becomes `true` so
 /// the host can durably disable Kubernetes auto-start before deferred
@@ -282,8 +286,19 @@ pub fn read_reset_answer(
                 // Compatible guests may emit queued lock-wait heartbeats before
                 // `ResetAccepted`; forward them to refresh client idle timeouts
                 // without marking the reset accepted until `ResetAccepted` arrives.
-                if !remove_images && p == k8s::RESET_DATA_CLEARED_PROGRESS {
-                    mark_deleted(data_deleted);
+                if !remove_images {
+                    if p == k8s::RESET_QUEUED_PROGRESS && !*data_deleted {
+                        // A compatible guest announced the plain reset is only
+                        // queued: nothing is mutated until RESET_STARTED_PROGRESS,
+                        // so a connection that closes before then must leave host
+                        // kubeconfig/proxy state untouched.
+                        *accepted = false;
+                    } else if p == k8s::RESET_STARTED_PROGRESS {
+                        *accepted = true;
+                    } else if p == k8s::RESET_DATA_CLEARED_PROGRESS {
+                        *accepted = true;
+                        mark_deleted(data_deleted);
+                    }
                 }
                 progress(&p);
             }
@@ -2824,6 +2839,74 @@ users:
             "kill_and_reap_bounded took too long: {:?}",
             started2.elapsed()
         );
+    }
+
+    #[test]
+    fn read_reset_answer_plain_reset_closed_while_queued_is_not_attempted() {
+        // A compatible guest that announces the plain reset as queued and then
+        // closes the connection before RESET_STARTED_PROGRESS never mutated state,
+        // so `accepted` must end false (host kubeconfig/proxies are preserved).
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_QUEUED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            drop(guest);
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let err = read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || {},
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(err.to_string().contains("closed"), "{err:#}");
+        assert!(!accepted, "queued plain reset must not count as attempted");
+        assert!(!deleted);
+
+        // Once the guest announces RESET_STARTED_PROGRESS, a later close is
+        // treated as an attempted reset so host state is torn down.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_QUEUED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_STARTED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(&mut guest, &K8sMsg::Progress("stopping k3s".into())).unwrap();
+            drop(guest);
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || {},
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(accepted, "started plain reset must count as attempted");
+        assert!(!deleted);
     }
 
     #[test]
