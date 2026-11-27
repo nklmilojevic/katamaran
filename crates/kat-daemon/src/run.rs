@@ -175,12 +175,79 @@ struct AutoForwardTracker {
     remove_seq: u64,
 }
 
-/// A wanted automatic port that is not bound yet.
 /// Initial delay before retrying an unbound forward that failed to bind on the
 /// Mac (for example because an unrelated Mac process held the port).
 const UNBOUND_RETRY_INITIAL: Duration = Duration::from_millis(250);
 /// Maximum delay between retries for a still-wanted unbound forward.
 const UNBOUND_RETRY_MAX: Duration = Duration::from_secs(2);
+/// Maximum number of due automatic forwards retried in a single session-loop
+/// turn before yielding back to dispatch queued inputs.
+const UNBOUND_RETRY_BATCH: usize = 8;
+
+/// Outcome of polling the session input channel alongside automatic-forward
+/// retry deadlines.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionPoll<T> {
+    /// A queued or freshly arrived input ready to dispatch.
+    Input(T),
+    /// A scheduled retry deadline elapsed (either on idle timeout or yielded
+    /// between queued inputs so traffic cannot starve due retries).
+    RetryDue,
+    /// All input senders dropped.
+    Disconnected,
+}
+
+/// Interleaves session input reception with due automatic-forward retries so
+/// neither a busy input queue nor a backlog of due retries can starve the
+/// other.
+struct SessionPoller {
+    /// Alternates between receiving one queued input and running one bounded
+    /// retry batch whenever both are ready. Starts `true` so a queued guest
+    /// removal, published-handoff update, or shutdown is handled before an
+    /// overdue retry.
+    prefer_input: bool,
+}
+
+impl SessionPoller {
+    fn new() -> Self {
+        Self { prefer_input: true }
+    }
+
+    fn next<T>(
+        &mut self,
+        rx: &mpsc::Receiver<T>,
+        next_retry_at: Option<Instant>,
+        now: Instant,
+    ) -> SessionPoll<T> {
+        let Some(at) = next_retry_at else {
+            self.prefer_input = true;
+            return rx
+                .recv()
+                .map(SessionPoll::Input)
+                .unwrap_or(SessionPoll::Disconnected);
+        };
+        if at <= now {
+            if self.prefer_input {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        self.prefer_input = false;
+                        return SessionPoll::Input(msg);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return SessionPoll::RetryDue,
+                    Err(mpsc::TryRecvError::Disconnected) => return SessionPoll::Disconnected,
+                }
+            }
+            self.prefer_input = true;
+            return SessionPoll::RetryDue;
+        }
+        self.prefer_input = true;
+        match rx.recv_timeout(at.saturating_duration_since(now)) {
+            Ok(msg) => SessionPoll::Input(msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => SessionPoll::RetryDue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => SessionPoll::Disconnected,
+        }
+    }
+}
 
 struct Unbound {
     key: (PortProto, u16),
@@ -303,12 +370,15 @@ impl AutoForwardTracker {
         self.unbound.iter().filter_map(|u| u.retry_at).min()
     }
 
-    /// Retry every wanted, unbound port whose timer deadline has elapsed.
+    /// Retry up to [`UNBOUND_RETRY_BATCH`] wanted, unbound ports whose timer
+    /// deadline has elapsed so a large backlog of retries cannot starve input
+    /// dispatch.
     fn retry_due(&mut self, now: Instant, on_event: &mut dyn FnMut(Event)) {
         let keys: Vec<_> = self
             .unbound
             .iter()
             .filter(|u| u.retry_at.is_some_and(|at| at <= now))
+            .take(UNBOUND_RETRY_BATCH)
             .map(|u| u.key)
             .collect();
         for key in keys {
@@ -773,17 +843,15 @@ fn session(
     let mut paused = false;
     let mount_cancel = Arc::new(AtomicBool::new(false));
     let mut mount_task: Option<thread::JoinHandle<()>> = None;
+    let mut poller = SessionPoller::new();
     let end = loop {
-        let input = match auto_forwards.next_retry_at() {
-            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                Ok(msg) => Ok(msg),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    auto_forwards.retry_due(Instant::now(), on_event);
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
-            },
-            None => rx.recv().map_err(|_| ()),
+        let input = match poller.next(rx, auto_forwards.next_retry_at(), Instant::now()) {
+            SessionPoll::Input(msg) => Ok(msg),
+            SessionPoll::RetryDue => {
+                auto_forwards.retry_due(Instant::now(), on_event);
+                continue;
+            }
+            SessionPoll::Disconnected => Err(()),
         };
         match input {
             // From an earlier session's reader or worker.
@@ -1557,6 +1625,207 @@ mod tests {
         ));
         assert_eq!(tracker.next_retry_at(), None);
 
+        drop(tracker);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_poller_runs_due_retries_with_queued_inputs() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        let dir =
+            std::env::temp_dir().join(format!("kat-run-poll-interleave-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut next_port = 26_000 + ((std::process::id() % 1000) as u16) * 16;
+        let mut free_port = || loop {
+            let candidate = next_port;
+            next_port += 1;
+            if TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, candidate)),
+                Duration::from_millis(20),
+            )
+            .is_err()
+            {
+                return candidate;
+            }
+        };
+
+        let budget = crate::autofwd::RelayBudget::with_limits(64, 16);
+        let mut tracker =
+            AutoForwardTracker::new(crate::autofwd::AutoForwards::with_limits_and_budget(
+                crate::autofwd::Upstream::AutoForward(dir.join("autofwd.sock")),
+                &[Ipv4Addr::LOCALHOST],
+                crate::autofwd::ConnLimit::Shared(4),
+                None,
+                budget,
+            ));
+        let mut events = Vec::new();
+        let base = Instant::now();
+
+        let busy_port = free_port();
+        let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, busy_port)).unwrap();
+        tracker.add_at(PortProto::Tcp, busy_port, base, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == busy_port
+        ));
+        let first_retry = tracker.next_retry_at().expect("timer retry scheduled");
+
+        // Release the external listener while unrelated messages are already
+        // queued in the session channel.
+        drop(busy);
+        let (tx, rx) = mpsc::channel::<usize>();
+        for i in 0..8 {
+            tx.send(i).unwrap();
+        }
+        let mut poller = SessionPoller::new();
+
+        // First poll dispatches one queued message (preserving queued removal,
+        // handoff, or shutdown handling), and the very next poll yields
+        // RetryDue without waiting for the remaining 7 queued messages to drain.
+        assert_eq!(
+            poller.next(&rx, tracker.next_retry_at(), first_retry),
+            SessionPoll::Input(0)
+        );
+        assert_eq!(
+            poller.next(&rx, tracker.next_retry_at(), first_retry),
+            SessionPoll::RetryDue
+        );
+
+        // Retry until bound (tolerating macOS's brief non-atomic FIOCLEX fd
+        // inheritance window by parallel test subprocesses) while keeping
+        // unrelated messages queued in `rx`.
+        let mut retry_now = first_retry;
+        let mut dispatched_before_bind = vec![0usize];
+        let mut next_msg_id = 8usize;
+        let bound_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            tracker.retry_due(retry_now, &mut |e| events.push(e));
+            if !events.is_empty() || Instant::now() >= bound_deadline {
+                break;
+            }
+            // Keep the channel nonempty across any transient retry backoff.
+            tx.send(next_msg_id).unwrap();
+            next_msg_id += 1;
+            retry_now = tracker.next_retry_at().unwrap_or(retry_now);
+            thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                poller.next(&rx, tracker.next_retry_at(), retry_now),
+                SessionPoll::Input(dispatched_before_bind.len())
+            );
+            dispatched_before_bind.push(dispatched_before_bind.len());
+            assert_eq!(
+                poller.next(&rx, tracker.next_retry_at(), retry_now),
+                SessionPoll::RetryDue
+            );
+        }
+
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, ref a))
+                if p == busy_port && a == &[Ipv4Addr::LOCALHOST]
+        ));
+        assert_eq!(tracker.next_retry_at(), None);
+        // Unrelated messages are still queued and were not required to drain
+        // before the timer retry bound the port.
+        let remaining: Vec<_> = rx.try_iter().collect();
+        assert!(
+            remaining.len() >= 7,
+            "expected queued inputs to still remain after retry bound port, got {remaining:?}"
+        );
+
+        // A queued guest removal ahead of an overdue retry is processed first
+        // so the removed port is not spuriously bound.
+        let removed_port = free_port();
+        let hold = TcpListener::bind((Ipv4Addr::LOCALHOST, removed_port)).unwrap();
+        tracker.add_at(PortProto::Tcp, removed_port, retry_now, &mut |e| {
+            events.push(e)
+        });
+        events.clear();
+        let removed_retry = tracker.next_retry_at().expect("retry scheduled");
+        drop(hold);
+        let (rtx, rrx) = mpsc::channel::<&str>();
+        rtx.send("remove").unwrap();
+        rtx.send("unrelated").unwrap();
+        let mut guard_poller = SessionPoller::new();
+        assert_eq!(
+            guard_poller.next(&rrx, tracker.next_retry_at(), removed_retry),
+            SessionPoll::Input("remove")
+        );
+        tracker.remove(PortProto::Tcp, removed_port, &mut |e| events.push(e));
+        assert_eq!(tracker.next_retry_at(), None);
+        assert_eq!(
+            guard_poller.next(&rrx, tracker.next_retry_at(), removed_retry),
+            SessionPoll::Input("unrelated")
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::PortErrorClear(PortOrigin::Automatic, PortProto::Tcp, p)]
+                    if *p == removed_port
+            ),
+            "removed port must clear its error and not bind after queued removal: {events:?}"
+        );
+
+        // When idle, SessionPoller still waits via recv_timeout and wakes on
+        // the scheduled deadline.
+        let (_itx, irx) = mpsc::channel::<usize>();
+        let mut idle_poller = SessionPoller::new();
+        let now = Instant::now();
+        assert_eq!(
+            idle_poller.next(&irx, Some(now + Duration::from_millis(10)), now),
+            SessionPoll::RetryDue
+        );
+
+        // When more than UNBOUND_RETRY_BATCH ports are due simultaneously,
+        // retry_due bounds work per turn so queued inputs interleave between
+        // retry batches.
+        let mut held = Vec::new();
+        let batch_base = Instant::now();
+        for _ in 0..(UNBOUND_RETRY_BATCH + 2) {
+            let p = free_port();
+            held.push(TcpListener::bind((Ipv4Addr::LOCALHOST, p)).unwrap());
+            tracker.add_at(PortProto::Tcp, p, batch_base, &mut |e| events.push(e));
+        }
+        let batch_due = tracker.next_retry_at().expect("batch retry scheduled");
+        let (btx, brx) = mpsc::channel::<&str>();
+        for m in ["m0", "m1", "m2"] {
+            btx.send(m).unwrap();
+        }
+        let mut batch_poller = SessionPoller::new();
+        assert_eq!(
+            batch_poller.next(&brx, tracker.next_retry_at(), batch_due),
+            SessionPoll::Input("m0")
+        );
+        assert_eq!(
+            batch_poller.next(&brx, tracker.next_retry_at(), batch_due),
+            SessionPoll::RetryDue
+        );
+        tracker.retry_due(batch_due, &mut |e| events.push(e));
+        // Exactly UNBOUND_RETRY_BATCH moved forward; 2 remain due at batch_due,
+        // and the next poll interleaves queued input before the second batch.
+        assert_eq!(tracker.next_retry_at(), Some(batch_due));
+        assert_eq!(
+            batch_poller.next(&brx, tracker.next_retry_at(), batch_due),
+            SessionPoll::Input("m1")
+        );
+        assert_eq!(
+            batch_poller.next(&brx, tracker.next_retry_at(), batch_due),
+            SessionPoll::RetryDue
+        );
+        tracker.retry_due(batch_due, &mut |e| events.push(e));
+        assert!(
+            tracker.next_retry_at().is_some_and(|at| at > batch_due),
+            "second batch should advance all remaining due retries"
+        );
+        assert_eq!(
+            batch_poller.next(&brx, tracker.next_retry_at(), batch_due),
+            SessionPoll::Input("m2")
+        );
+
+        drop(held);
         drop(tracker);
         let _ = fs::remove_dir_all(&dir);
     }
