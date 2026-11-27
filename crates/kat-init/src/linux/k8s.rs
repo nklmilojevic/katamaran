@@ -3542,8 +3542,11 @@ fn remove_cluster_data_dirs(
     // deletion so a timeout can never leave a partially deleted live datastore.
     let mut detached: Option<std::path::PathBuf> = None;
     if path_exists_checked(paths.data_dir)? {
-        try_btrfs_delete(paths.data_dir, &mut beat)?;
+        let btrfs_err = try_btrfs_delete(paths.data_dir, &mut beat).err();
         if path_exists_checked(paths.data_dir)? {
+            if let Some(e) = btrfs_err {
+                return Err(e);
+            }
             let parent = paths.data_dir.parent().ok_or_else(|| {
                 format!("missing parent directory for {}", paths.data_dir.display())
             })?;
@@ -3556,6 +3559,13 @@ fn remove_cluster_data_dirs(
                 )
             })?;
             detached = Some(staged);
+        } else if let Some(e) = btrfs_err {
+            // Btrfs subvolume deletion already committed before interruption:
+            // clean up config files and acknowledge data clearance before returning.
+            let _ = fs::remove_file(paths.kubeconfig);
+            let _ = fs::remove_file(paths.k3s_config);
+            on_active_data_cleared();
+            return Err(e);
         }
     }
     let _ = fs::remove_file(paths.kubeconfig);
@@ -9906,6 +9916,60 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         .unwrap_err();
         assert!(scan_cleared, "on_active_data_cleared must run before scan");
         assert!(err.contains("for detached cluster data"), "{err}");
+
+        // Btrfs helper interrupted AFTER deletion already committed must still
+        // acknowledge active-data clearance before returning the interruption error.
+        let btrfs_committed_dir = base.join("btrfs-committed");
+        fs::create_dir(&btrfs_committed_dir).unwrap();
+        let btrfs_committed_kc = base.join("btrfs-committed.kc");
+        fs::write(&btrfs_committed_kc, b"kc").unwrap();
+        let mut committed_cleared = false;
+        let err = remove_cluster_data_dirs(
+            &ClusterDataPaths {
+                data_dir: &btrfs_committed_dir,
+                legacy_kubelet_dir: &base.join("no-legacy"),
+                kubeconfig: &btrfs_committed_kc,
+                k3s_config: &base.join("no-cfg"),
+            },
+            |dir, _| {
+                fs::remove_dir(dir).unwrap();
+                Err("aborted: VM is shutting down".into())
+            },
+            |_, _| Ok(()),
+            &mut || committed_cleared = true,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("shutting down"), "{err}");
+        assert!(
+            committed_cleared,
+            "must acknowledge clearance if btrfs delete committed before interruption"
+        );
+        assert!(!btrfs_committed_kc.exists());
+
+        // Btrfs helper interrupted BEFORE deletion commits must NOT acknowledge clearance.
+        let btrfs_intact_dir = base.join("btrfs-intact");
+        fs::create_dir(&btrfs_intact_dir).unwrap();
+        let mut intact_cleared = false;
+        let err = remove_cluster_data_dirs(
+            &ClusterDataPaths {
+                data_dir: &btrfs_intact_dir,
+                legacy_kubelet_dir: &base.join("no-legacy"),
+                kubeconfig: &base.join("no-kc"),
+                k3s_config: &base.join("no-cfg"),
+            },
+            |_, _| Err("aborted: VM is shutting down".into()),
+            |_, _| Ok(()),
+            &mut || intact_cleared = true,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("shutting down"), "{err}");
+        assert!(
+            !intact_cleared,
+            "must not acknowledge clearance while active data_dir still exists"
+        );
+        assert!(btrfs_intact_dir.exists());
     }
 
     #[test]

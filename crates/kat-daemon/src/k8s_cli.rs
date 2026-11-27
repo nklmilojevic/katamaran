@@ -174,11 +174,55 @@ fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Sentinel error returned when `k8s reset` has already submitted its failure
+/// diagnostic to its bounded stderr writer, so `main` exits nonzero without
+/// blocking on Rust's synchronous stderr termination handler.
+#[derive(Debug)]
+pub struct ReportedError;
+
+impl std::fmt::Display for ReportedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reset failed")
+    }
+}
+
+impl std::error::Error for ReportedError {}
+
+/// Unbuffered writer targeting `STDERR_FILENO` directly so the detached
+/// progress worker never holds Rust's global `std::io::stderr()` mutex.
+struct RawStderr;
+
+impl std::io::Write for RawStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            let n = unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    buf.as_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Asynchronous bounded progress writer so a closed (`EPIPE`) or undrained
 /// stderr pipe can never panic or block the CLI while reading daemon RPC
-/// notifications and the terminal reset result.
+/// notifications or reporting the terminal reset outcome.
 struct ProgressPrinter {
     tx: Option<std::sync::mpsc::SyncSender<String>>,
+    terminal_tx: std::sync::mpsc::SyncSender<String>,
     done: std::sync::mpsc::Receiver<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -186,20 +230,26 @@ struct ProgressPrinter {
 impl ProgressPrinter {
     fn spawn<W: std::io::Write + Send + 'static>(mut writer: W) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(32);
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::sync_channel::<String>(1);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let worker = std::thread::Builder::new()
             .name("k8s-reset-progress".into())
             .spawn(move || {
                 while let Ok(line) = rx.recv() {
                     if writer.write_all(line.as_bytes()).is_err() {
-                        break;
+                        let _ = done_tx.try_send(());
+                        return;
                     }
+                }
+                if let Ok(final_line) = terminal_rx.try_recv() {
+                    let _ = writer.write_all(final_line.as_bytes());
                 }
                 let _ = done_tx.try_send(());
             })
             .ok();
         Self {
             tx: worker.as_ref().map(|_| tx),
+            terminal_tx,
             done: done_rx,
             worker,
         }
@@ -216,7 +266,10 @@ impl ProgressPrinter {
         }
     }
 
-    fn finish(mut self, flush_timeout: Duration) {
+    fn finish(mut self, terminal: Option<String>, flush_timeout: Duration) {
+        if let Some(line) = terminal {
+            let _ = self.terminal_tx.try_send(line);
+        }
         self.tx = None;
         if self.done.recv_timeout(flush_timeout).is_ok()
             && let Some(worker) = self.worker.take()
@@ -228,10 +281,13 @@ impl ProgressPrinter {
 
 fn reset(images: bool) -> anyhow::Result<()> {
     let mut c = Client::connect_default()?;
-    let mut printer = ProgressPrinter::spawn(std::io::stderr());
+    let mut printer = ProgressPrinter::spawn(RawStderr);
     let res = reset_with_client(&mut c, images, &mut |msg| printer.send(msg));
-    printer.finish(Duration::from_millis(250));
-    res?;
+    if let Err(e) = res {
+        printer.finish(Some(format!("Error: {e:?}\n")), Duration::from_millis(250));
+        return Err(ReportedError.into());
+    }
+    printer.finish(None, Duration::from_millis(250));
     if images {
         let _ = std::io::Write::write_all(
             &mut std::io::stdout(),
@@ -850,7 +906,7 @@ mod tests {
         let mut client1 = Client::connect(&sock).unwrap();
         let mut printer1 = ProgressPrinter::spawn(BrokenPipeWriter(attempts.clone()));
         reset_with_client(&mut client1, false, &mut |msg| printer1.send(msg)).unwrap();
-        printer1.finish(Duration::from_millis(250));
+        printer1.finish(None, Duration::from_millis(250));
         assert!(*attempts.lock().unwrap() >= 1);
 
         let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
@@ -858,7 +914,7 @@ mod tests {
         let mut printer2 = ProgressPrinter::spawn(BlockingWriter(unblock_rx));
         let started = Instant::now();
         reset_with_client(&mut client2, false, &mut |msg| printer2.send(msg)).unwrap();
-        printer2.finish(Duration::from_millis(50));
+        printer2.finish(None, Duration::from_millis(50));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "undrained progress writer blocked reset completion: {:?}",

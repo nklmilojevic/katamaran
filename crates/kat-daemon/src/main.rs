@@ -100,7 +100,7 @@ enum Command {
     DebugBoot(boot::BootArgs),
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
     // Fast-path the internal ordered I/O relay helper before clap parsing so
     // it adds minimal startup overhead and never touches stdout/stderr (0/1/2).
     match std::env::args_os()
@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
         Some("vm-stdin-relay") => vm_cli::run_stdin_relay_helper(),
         _ => {}
     }
-    match Cli::parse().command {
+    let res = match Cli::parse().command {
         Command::Start(args) => cli::start(args),
         Command::Stop => cli::stop(),
         Command::Restart(args) => cli::restart(args),
@@ -136,6 +136,17 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => run::run(args),
         Command::PackImage(args) => sparse::pack_cmd(args),
         Command::DebugBoot(args) => boot::debug_boot(args),
+    };
+    match res {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<k8s_cli::ReportedError>().is_some() => {
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            let _ =
+                std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
