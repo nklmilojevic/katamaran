@@ -152,19 +152,17 @@ enum Input {
 /// It also covers the published-to-automatic handoff: the guest sends
 /// `PortRemove` before `AutoForwardAdd` for the same port, but the published
 /// worker may not have closed its listener yet (or even reported binding it).
-/// While the published side holds the port or a dispatched remove has not
+/// While the latest published remove dispatched for the port has not
 /// completed, an automatic add is deferred without attempting a bind (so it
-/// can neither fail for good nor bind only some addresses), then retried when
-/// the worker confirms the port is released.
+/// can neither fail for good nor bind only some addresses), then attempted
+/// once the worker reports that remove done. A conflict after that is a real
+/// one and is reported as a failure.
 struct AutoForwardTracker {
     forwards: crate::autofwd::AutoForwards,
     /// FIFO queue of `(proto, port)` waiting for listener descriptors.
     pending_capacity: Vec<(PortProto, u16)>,
     /// Ports waiting for the published worker to release the same port.
     pending_release: Vec<(PortProto, u16)>,
-    /// Ports the published worker reported `Forwarded` and has not yet
-    /// reported `Removed`.
-    published_held: std::collections::BTreeSet<(PortProto, u16)>,
     /// For each port, the sequence number of the latest published remove
     /// dispatched to the worker whose `RemoveDone` has not arrived. Only that
     /// remove's completion releases the port: an earlier remove's completion
@@ -191,7 +189,6 @@ impl AutoForwardTracker {
             forwards,
             pending_capacity: Vec::new(),
             pending_release: Vec::new(),
-            published_held: std::collections::BTreeSet::new(),
             published_removing: std::collections::BTreeMap::new(),
             remove_seq: 0,
         }
@@ -209,9 +206,7 @@ impl AutoForwardTracker {
         on_event: &mut dyn FnMut(Event),
     ) {
         let key = (proto, port);
-        if !self.forwards.contains(port)
-            && (self.published_held.contains(&key) || self.published_removing.contains_key(&key))
-        {
+        if !self.forwards.contains(port) && self.published_removing.contains_key(&key) {
             self.pending_capacity.retain(|&k| k != key);
             if !self.pending_release.contains(&key) {
                 self.pending_release.push(key);
@@ -302,11 +297,6 @@ impl AutoForwardTracker {
         }
     }
 
-    /// The published worker now listens on `port`.
-    fn published_forwarded(&mut self, proto: PortProto, port: u16) {
-        self.published_held.insert((proto, port));
-    }
-
     /// The sequence number for the next published remove.
     fn next_remove_seq(&mut self) -> u64 {
         self.remove_seq += 1;
@@ -318,31 +308,14 @@ impl AutoForwardTracker {
         self.published_removing.insert((proto, port), seq);
     }
 
-    /// The published side has no listener on `port` (`Removed`, or a
-    /// `Refused` add). With no remove still outstanding, retry an automatic
-    /// forward that was waiting for it.
-    fn published_closed(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
-        let key = (proto, port);
-        self.published_held.remove(&key);
-        if self.pending_release.contains(&key) && !self.published_removing.contains_key(&key) {
-            self.pending_release.retain(|&k| k != key);
-            self.attempt(proto, port, Attempt::Release, on_event);
-        }
-    }
-
-    /// The worker finished published remove `seq` for `port`. Completions of
-    /// superseded removes are ignored. If the published side `released` the
-    /// port, retry an automatic forward that was waiting for it. Otherwise a
-    /// listener may still be bound (retries ran out, or a re-add superseded
-    /// the remove), so the port is treated as held: the automatic forward
-    /// keeps waiting rather than risk a failed or partial bind, and its status
-    /// says why.
+    /// The worker finished published remove `seq` for `port`. If it is the
+    /// latest one dispatched, attempt an automatic forward that was waiting
+    /// for it; completions of superseded removes are ignored.
     fn published_remove_done(
         &mut self,
         proto: PortProto,
         port: u16,
         seq: u64,
-        released: bool,
         on_event: &mut dyn FnMut(Event),
     ) {
         let key = (proto, port);
@@ -350,19 +323,6 @@ impl AutoForwardTracker {
             return;
         }
         self.published_removing.remove(&key);
-        if !released {
-            self.published_held.insert(key);
-            if self.pending_release.contains(&key) {
-                on_event(Event::PortFailed(
-                    PortOrigin::Automatic,
-                    proto,
-                    port,
-                    "the published forward still holds this port".into(),
-                ));
-            }
-            return;
-        }
-        self.published_held.remove(&key);
         if self.pending_release.contains(&key) {
             self.pending_release.retain(|&k| k != key);
             self.attempt(proto, port, Attempt::Release, on_event);
@@ -843,28 +803,23 @@ fn session(
                 }
             }
             Ok(Input::Forward(_, net::Event::Forwarded(proto, port, addrs))) => {
-                auto_forwards.published_forwarded(proto, port);
                 on_event(Event::PortAdd(PortOrigin::Published, proto, port, addrs));
             }
             Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
                 on_event(Event::PortRemove(PortOrigin::Published, proto, port));
-                auto_forwards.published_closed(proto, port, on_event);
             }
-            Ok(Input::Forward(_, net::Event::Refused(proto, port, why))) => {
-                on_event(Event::PortFailed(PortOrigin::Published, proto, port, why));
-                auto_forwards.published_closed(proto, port, on_event);
-            }
-            Ok(Input::Forward(_, net::Event::CapacityWait(proto, port, why))) => {
+            Ok(Input::Forward(_, net::Event::Refused(proto, port, why)))
+            | Ok(Input::Forward(_, net::Event::CapacityWait(proto, port, why))) => {
                 on_event(Event::PortFailed(PortOrigin::Published, proto, port, why));
             }
             Ok(Input::Forward(_, net::Event::RefusedCleared(proto, port))) => {
                 on_event(Event::PortErrorClear(PortOrigin::Published, proto, port));
             }
-            Ok(Input::Forward(_, net::Event::RemoveDone(proto, port, seq, released))) => {
+            Ok(Input::Forward(_, net::Event::RemoveDone(proto, port, seq))) => {
                 // The guest removed the port, so a published error for it is
                 // stale even if gvproxy cleanup gave up.
                 on_event(Event::PortErrorClear(PortOrigin::Published, proto, port));
-                auto_forwards.published_remove_done(proto, port, seq, released, on_event);
+                auto_forwards.published_remove_done(proto, port, seq, on_event);
             }
             Ok(Input::Forward(_, net::Event::Transient(..) | net::Event::RemoveFailed(..))) => {}
             Ok(Input::ListenerCapacityAvailable(_)) => {
@@ -1122,8 +1077,10 @@ mod tests {
         };
         let tcp = PortProto::Tcp;
 
-        // The worker has bound the published port but its `Forwarded` is
-        // queued behind the guest's PortRemove and AutoForwardAdd.
+        // The worker has bound the published port, but its events are queued
+        // behind the guest's PortRemove and AutoForwardAdd: the automatic add
+        // waits without attempting a bind, then binds once the remove is done,
+        // without a second AutoForwardAdd.
         let published = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = published.local_addr().unwrap().port();
         let seq = tracker.next_remove_seq();
@@ -1131,14 +1088,9 @@ mod tests {
         tracker.add(tcp, port, &mut |e| events.push(e));
         assert!(events.is_empty(), "handoff conflict reported: {events:?}");
         assert_eq!(tracker.pending_release, vec![(tcp, port)]);
-        tracker.published_forwarded(tcp, port);
         assert!(!tracker.forwards.contains(port));
-        // The worker closes the port and finishes the remove: the automatic
-        // forward binds without a second AutoForwardAdd.
         drop(published);
-        tracker.published_closed(tcp, port, &mut |e| events.push(e));
-        assert!(events.is_empty());
-        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
         assert!(bound_auto(&events, port), "{events:?}");
         assert!(tracker.pending_release.is_empty());
         events.clear();
@@ -1150,23 +1102,19 @@ mod tests {
         // Only the latest remove's completion releases the automatic forward.
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = first.local_addr().unwrap().port();
-        tracker.published_forwarded(tcp, port);
         let seq1 = tracker.next_remove_seq();
         tracker.published_removing(tcp, port, seq1);
         let seq2 = tracker.next_remove_seq();
         tracker.published_removing(tcp, port, seq2);
         tracker.add(tcp, port, &mut |e| events.push(e));
         drop(first);
-        tracker.published_closed(tcp, port, &mut |e| events.push(e));
         let second = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        tracker.published_remove_done(tcp, port, seq1, true, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq1, &mut |e| events.push(e));
         assert!(events.is_empty(), "stale completion acted on: {events:?}");
         assert_eq!(tracker.pending_release, vec![(tcp, port)]);
         assert!(!tracker.forwards.contains(port));
-        tracker.published_forwarded(tcp, port);
         drop(second);
-        tracker.published_closed(tcp, port, &mut |e| events.push(e));
-        tracker.published_remove_done(tcp, port, seq2, true, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq2, &mut |e| events.push(e));
         assert!(bound_auto(&events, port), "{events:?}");
         events.clear();
         tracker.remove(tcp, port, &mut |e| events.push(e));
@@ -1174,8 +1122,7 @@ mod tests {
 
         // While a remove is in flight no bind is attempted even if the port
         // looks free, so a published listener still holding some addresses
-        // cannot leave a partial automatic bind behind. A remove that found
-        // no listener completes the handoff too.
+        // cannot leave a partial automatic bind behind.
         let free = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = free.local_addr().unwrap().port();
         drop(free);
@@ -1184,7 +1131,7 @@ mod tests {
         tracker.add(tcp, port, &mut |e| events.push(e));
         assert!(events.is_empty());
         assert!(!tracker.forwards.contains(port));
-        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
         assert!(bound_auto(&events, port), "{events:?}");
         events.clear();
         tracker.remove(tcp, port, &mut |e| events.push(e));
@@ -1194,7 +1141,6 @@ mod tests {
         // release does not resurrect it.
         let published = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = published.local_addr().unwrap().port();
-        tracker.published_forwarded(tcp, port);
         let seq = tracker.next_remove_seq();
         tracker.published_removing(tcp, port, seq);
         tracker.add(tcp, port, &mut |e| events.push(e));
@@ -1202,61 +1148,29 @@ mod tests {
         assert!(tracker.pending_release.is_empty());
         events.clear();
         drop(published);
-        tracker.published_closed(tcp, port, &mut |e| events.push(e));
-        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
         assert!(events.is_empty());
         assert!(!tracker.forwards.contains(port));
 
-        // A remove that ends without releasing the port (retries ran out, or
-        // a re-add superseded it) leaves the listener bound: the automatic
-        // forward keeps waiting, reports why, and binds on a later release.
+        // If the port is still taken once the latest remove is done (the
+        // remove gave up, or something else holds it), the automatic forward
+        // reports a failure instead of waiting silently.
         let stuck = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = stuck.local_addr().unwrap().port();
-        tracker.published_forwarded(tcp, port);
         let seq = tracker.next_remove_seq();
         tracker.published_removing(tcp, port, seq);
         tracker.add(tcp, port, &mut |e| events.push(e));
-        tracker.published_remove_done(tcp, port, seq, false, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
         assert!(matches!(
             events.as_slice(),
             [Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)] if *p == port
         ));
-        assert_eq!(tracker.pending_release, vec![(tcp, port)]);
-        assert!(!tracker.forwards.contains(port));
-        events.clear();
-        // Later adds keep deferring while the listener is held.
-        tracker.add(tcp, port, &mut |e| events.push(e));
-        assert!(events.is_empty());
-        drop(stuck);
-        tracker.published_closed(tcp, port, &mut |e| events.push(e));
-        let seq = tracker.next_remove_seq();
-        tracker.published_removing(tcp, port, seq);
-        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
-        assert!(bound_auto(&events, port), "{events:?}");
-        events.clear();
-        tracker.remove(tcp, port, &mut |e| events.push(e));
-        events.clear();
-
-        // A remove that did not release the port, superseded by a re-add that
-        // the published side then refused: nothing holds the port any more,
-        // so the waiting automatic forward binds.
-        let stuck = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = stuck.local_addr().unwrap().port();
-        tracker.published_forwarded(tcp, port);
-        let seq = tracker.next_remove_seq();
-        tracker.published_removing(tcp, port, seq);
-        tracker.add(tcp, port, &mut |e| events.push(e));
-        tracker.published_remove_done(tcp, port, seq, false, &mut |e| events.push(e));
+        assert!(tracker.pending_release.is_empty());
         events.clear();
         drop(stuck);
-        tracker.published_closed(tcp, port, &mut |e| events.push(e));
-        assert!(bound_auto(&events, port), "{events:?}");
-        events.clear();
-        tracker.remove(tcp, port, &mut |e| events.push(e));
-        events.clear();
 
-        // Without a published forward on the port, a bind conflict is still a
-        // permanent failure.
+        // Without a published remove in flight, a bind conflict is reported
+        // as a failure right away.
         let busy = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = busy.local_addr().unwrap().port();
         tracker.add(tcp, port, &mut |e| events.push(e));

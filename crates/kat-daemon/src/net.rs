@@ -352,12 +352,6 @@ pub trait ForwardApi {
     fn listener_budget(&self) -> Option<crate::autofwd::RelayBudget> {
         None
     }
-    /// Whether a Mac listener for an active `port` may still be bound. The
-    /// default is conservative: gvproxy owns the listener, so an active port
-    /// whose unexpose did not succeed may still be listening.
-    fn mac_listening(&self, _proto: PortProto, _port: u16) -> bool {
-        true
-    }
     /// The Mac addresses `port` is actually listening on (or configured to
     /// listen on when not yet active).
     fn port_addrs(&self, _proto: PortProto, _port: u16) -> Vec<Ipv4Addr> {
@@ -650,21 +644,23 @@ impl ForwardApi for AddressesApi {
             return self.gvproxy.unexpose(proto, port);
         }
         let sock = crate::autofwd::Upstream::socket(&self.sockets, port);
-        // Close the Mac listeners first: the guest no longer serves the port,
-        // so it must be released on the Mac even if gvproxy cannot drop its
-        // private Unix socket. A failed upstream unexpose is retried, and a
-        // re-add reconciles that socket via `ensure_upstream_exposed`.
-        self.listeners.remove(port);
+        if self.listeners.remove(port) {
+            // Closing the Mac listeners is the removal: the guest no longer
+            // serves the port, so it is released on the Mac whatever gvproxy
+            // says. If gvproxy cannot drop its private Unix socket,
+            // `unexpose_upstream` marks it Uncertain; a re-add reconciles it
+            // via `ensure_upstream_exposed`, and `Drop` cleans it up at
+            // session end.
+            if self.unexpose_upstream(port, &sock).is_ok() {
+                let _ = fs::remove_file(&sock);
+            }
+            return Ok(());
+        }
+        // No Mac listener (a refused port): this call only cleans up gvproxy's
+        // socket, so report failures and let the worker retry.
         self.unexpose_upstream(port, &sock)?;
         let _ = fs::remove_file(&sock);
         Ok(())
-    }
-
-    fn mac_listening(&self, proto: PortProto, port: u16) -> bool {
-        if proto != PortProto::Tcp {
-            return self.gvproxy.mac_listening(proto, port);
-        }
-        self.listeners.contains(port)
     }
 
     fn ensure_exposed(&mut self, proto: PortProto, port: u16) -> Result<(), ForwardError> {
@@ -784,12 +780,9 @@ pub enum Event {
     /// The worker finished handling `PortChange::Remove` number `.2` for the
     /// port: emitted exactly once per remove, after its other events, whether
     /// it closed a listener, found none, gave up after retries, or was
-    /// superseded by a later change for the same port. `.3` says whether the
-    /// published side released the port on the Mac: `false` only while an
-    /// active forward may still have a Mac listener bound (for example its
-    /// gvproxy unexpose kept failing).
-    /// The session matches it against the latest remove it sent.
-    RemoveDone(PortProto, u16, u64, bool),
+    /// superseded by a later change for the same port. The session matches
+    /// it against the latest remove it sent.
+    RemoveDone(PortProto, u16, u64),
 }
 
 impl<A: ForwardApi> Forwards<A> {
@@ -905,11 +898,6 @@ impl<A: ForwardApi> Forwards<A> {
 
     fn port_label(&self, proto: PortProto, port: u16) -> String {
         self.api.port_label(proto, port)
-    }
-
-    /// Whether the published side may still hold a Mac listener on `port`.
-    fn holds_mac_port(&self, proto: PortProto, port: u16) -> bool {
-        self.active.contains(&(proto, port)) && self.api.mac_listening(proto, port)
     }
 
     #[cfg(test)]
@@ -1028,12 +1016,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(WorkerMsg::Change(PortChange::Add(proto, port))) => {
                         let key = (proto, port);
                         if let Some((PendingOp::Remove(seq), ..)) = pending.remove(&key) {
-                            on_event(Event::RemoveDone(
-                                proto,
-                                port,
-                                seq,
-                                !fwd.holds_mac_port(proto, port),
-                            ));
+                            on_event(Event::RemoveDone(proto, port, seq));
                         }
                         capacity_wait.retain(|&k| k != key);
                         match fwd.add(proto, port) {
@@ -1058,12 +1041,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(WorkerMsg::Change(PortChange::Remove(proto, port, seq))) => {
                         let key = (proto, port);
                         if let Some((PendingOp::Remove(old), ..)) = pending.remove(&key) {
-                            on_event(Event::RemoveDone(
-                                proto,
-                                port,
-                                old,
-                                !fwd.holds_mac_port(proto, port),
-                            ));
+                            on_event(Event::RemoveDone(proto, port, old));
                         }
                         let before = capacity_wait.len();
                         capacity_wait.retain(|&k| k != key);
@@ -1081,28 +1059,13 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e) => {
                                 report(&e, &label);
                                 on_event(e);
-                                on_event(Event::RemoveDone(
-                                    proto,
-                                    port,
-                                    seq,
-                                    !fwd.holds_mac_port(proto, port),
-                                ));
+                                on_event(Event::RemoveDone(proto, port, seq));
                             }
                             None if was_waiting => {
                                 on_event(Event::RefusedCleared(proto, port));
-                                on_event(Event::RemoveDone(
-                                    proto,
-                                    port,
-                                    seq,
-                                    !fwd.holds_mac_port(proto, port),
-                                ));
+                                on_event(Event::RemoveDone(proto, port, seq));
                             }
-                            None => on_event(Event::RemoveDone(
-                                proto,
-                                port,
-                                seq,
-                                !fwd.holds_mac_port(proto, port),
-                            )),
+                            None => on_event(Event::RemoveDone(proto, port, seq)),
                         }
                     }
                     Ok(WorkerMsg::CapacityAvailable) => {
@@ -1194,30 +1157,15 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     } else {
                                         report(&e, &label);
                                         on_event(e);
-                                        on_event(Event::RemoveDone(
-                                            proto,
-                                            port,
-                                            seq,
-                                            !fwd.holds_mac_port(proto, port),
-                                        ));
+                                        on_event(Event::RemoveDone(proto, port, seq));
                                     }
                                 }
                                 Some(e) => {
                                     report(&e, &label);
                                     on_event(e);
-                                    on_event(Event::RemoveDone(
-                                        proto,
-                                        port,
-                                        seq,
-                                        !fwd.holds_mac_port(proto, port),
-                                    ));
+                                    on_event(Event::RemoveDone(proto, port, seq));
                                 }
-                                None => on_event(Event::RemoveDone(
-                                    proto,
-                                    port,
-                                    seq,
-                                    !fwd.holds_mac_port(proto, port),
-                                )),
+                                None => on_event(Event::RemoveDone(proto, port, seq)),
                             }
                         }
                     }
@@ -1956,7 +1904,7 @@ mod tests {
         // The remove completes with no listener to close, and cancels the retry.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, 8081, 1, true)
+            Event::RemoveDone(TCP, 8081, 1)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2018,7 +1966,7 @@ mod tests {
         // The retried remove completes exactly once.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, 9100, 1, true)
+            Event::RemoveDone(TCP, 9100, 1)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 2);
@@ -2052,7 +2000,7 @@ mod tests {
         // The superseded remove still completes, exactly once.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, 9101, 1, false)
+            Event::RemoveDone(TCP, 9101, 1)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 1);
@@ -3219,59 +3167,38 @@ mod tests {
             &[Ipv4Addr::LOCALHOST],
         ));
 
-        // 1. Unexpose closes gvproxy socket, loses response -> retry receives
-        // "proxy not found", treats removal as complete, and closes Mac listener.
-        let p1 = free_high_port();
-        assert_eq!(
-            fwd.add(TCP, p1),
-            Some(Event::Forwarded(TCP, p1, vec![Ipv4Addr::LOCALHOST]))
-        );
-        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p1, "before"), "gv:before");
-        fake.drop_next_unexpose_reply.store(true, Ordering::SeqCst);
-        assert!(matches!(
-            fwd.remove(TCP, p1),
-            Some(Event::RemoveFailed(TCP, p, _)) if p == p1
-        ));
-        // The Mac listeners are already closed: the port is released even
-        // though the gvproxy side is still being reconciled.
-        assert!(!fwd.holds_mac_port(TCP, p1));
-        assert_port_rebindable(p1);
-        assert_eq!(fwd.remove(TCP, p1), Some(Event::Removed(TCP, p1)));
-        assert_port_rebindable(p1);
+        // Removing a published port closes its Mac listeners even when gvproxy
+        // cannot confirm dropping its private Unix socket: the removal is
+        // complete on the Mac, and a re-add reconciles the uncertain socket.
+        for fail_before_remove in [false, true] {
+            let p = free_high_port();
+            assert_eq!(
+                fwd.add(TCP, p),
+                Some(Event::Forwarded(TCP, p, vec![Ipv4Addr::LOCALHOST]))
+            );
+            assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p, "before"), "gv:before");
+            if fail_before_remove {
+                // gvproxy errors before dropping its socket.
+                fake.fail_next_unexpose_before_remove
+                    .store(true, Ordering::SeqCst);
+            } else {
+                // gvproxy drops its socket but the reply is lost.
+                fake.drop_next_unexpose_reply.store(true, Ordering::SeqCst);
+            }
+            assert_eq!(fwd.remove(TCP, p), Some(Event::Removed(TCP, p)));
+            assert_port_rebindable(p);
 
-        // 1b. gvproxy fails before dropping its socket: the Mac port is still
-        // released, and the retry cleans up the private Unix socket.
-        let p3 = free_high_port();
-        assert_eq!(
-            fwd.add(TCP, p3),
-            Some(Event::Forwarded(TCP, p3, vec![Ipv4Addr::LOCALHOST]))
-        );
-        fake.fail_next_unexpose_before_remove
-            .store(true, Ordering::SeqCst);
-        assert!(matches!(
-            fwd.remove(TCP, p3),
-            Some(Event::RemoveFailed(TCP, p, _)) if p == p3
-        ));
-        assert!(!fwd.holds_mac_port(TCP, p3));
-        assert_port_rebindable(p3);
-        assert_eq!(fwd.remove(TCP, p3), Some(Event::Removed(TCP, p3)));
-        assert!(!crate::autofwd::Upstream::socket(&dir, p3).exists());
-
-        // 2. Guest immediately re-adds after an ambiguous unexpose whose effect
-        // already closed gvproxy's socket: upstream is recreated so the running
-        // Mac listener relays again.
-        let p2 = free_high_port();
-        assert_eq!(
-            fwd.add(TCP, p2),
-            Some(Event::Forwarded(TCP, p2, vec![Ipv4Addr::LOCALHOST]))
-        );
-        fake.drop_next_unexpose_reply.store(true, Ordering::SeqCst);
-        assert!(matches!(
-            fwd.remove(TCP, p2),
-            Some(Event::RemoveFailed(TCP, p, _)) if p == p2
-        ));
-        assert_eq!(fwd.add(TCP, p2), None);
-        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p2, "readded"), "gv:readded");
+            // The guest re-adds the port: the gvproxy socket is verified or
+            // recreated and the new listener relays again.
+            assert_eq!(
+                fwd.add(TCP, p),
+                Some(Event::Forwarded(TCP, p, vec![Ipv4Addr::LOCALHOST]))
+            );
+            assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p, "readded"), "gv:readded");
+            assert_eq!(fwd.remove(TCP, p), Some(Event::Removed(TCP, p)));
+            assert_port_rebindable(p);
+            assert!(!crate::autofwd::Upstream::socket(&dir, p).exists());
+        }
 
         drop(fwd);
         drop(fake);
@@ -3662,7 +3589,7 @@ mod tests {
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, p4, 1, true)
+            Event::RemoveDone(TCP, p4, 1)
         );
 
         // Removing p1 releases 3 descriptors and automatically forwards p3
@@ -3674,7 +3601,7 @@ mod tests {
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, p1, 2, true)
+            Event::RemoveDone(TCP, p1, 2)
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -3692,7 +3619,7 @@ mod tests {
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, p2, 3, true)
+            Event::RemoveDone(TCP, p2, 3)
         );
         let mut auto = crate::autofwd::AutoForwards::with_limits_and_budget(
             crate::autofwd::Upstream::PerPort(dir.clone()),
