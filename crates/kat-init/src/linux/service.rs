@@ -68,6 +68,15 @@ pub struct PgrpTarget {
     token: u64,
 }
 
+impl PgrpTarget {
+    /// Process-group (and, for PTY sessions, session) id. Only for comparing
+    /// against kernel-reported ids; signal through [`Reaper`], which pins the
+    /// token against PID reuse.
+    pub fn id(&self) -> i32 {
+        self.pid
+    }
+}
+
 /// How to signal a spawned child without racing PID reuse.
 #[derive(Debug)]
 pub enum ChildTarget {

@@ -769,6 +769,9 @@ enum ChildHandle {
     Pty {
         target: ChildTarget,
         pgrp: PgrpTarget,
+        /// Dup of the PTY master, used to find the terminal's foreground
+        /// process group for out-of-band signals.
+        tty: OwnedFd,
     },
     /// Non-PTY process group leader spawned with `setpgid(0, 0)`, guarded by
     /// a token-pinned [`PgrpTarget`] inside [`Reaper`].
@@ -778,10 +781,23 @@ enum ChildHandle {
 impl ChildHandle {
     fn signal(&self, reaper: &Reaper, sig: i32) {
         match self {
-            ChildHandle::Pty { target, pgrp } => {
-                reaper.signal_target(target, sig);
+            ChildHandle::Pty { target, pgrp, tty } => {
                 if matches!(sig, libc::SIGHUP | libc::SIGKILL) {
+                    reaper.signal_target(target, sig);
                     let _ = reaper.signal_pgrp_target(*pgrp, sig);
+                    return;
+                }
+                // Like a terminal: deliver to the foreground process group
+                // (e.g. `sleep` under a non-interactive `bash -c`, or a job
+                // an interactive shell put in its own group), never outside
+                // this session.
+                let fg = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+                if fg == pgrp.id() {
+                    let _ = reaper.signal_pgrp_target(*pgrp, sig);
+                } else if fg > 0 && unsafe { libc::getsid(fg) } == pgrp.id() {
+                    unsafe { libc::kill(-fg, sig) };
+                } else {
+                    reaper.signal_target(target, sig);
                 }
             }
             ChildHandle::Pipe(pgrp) => {
@@ -2263,6 +2279,9 @@ fn exec_with_timeouts(
             let stdin = master
                 .try_clone()
                 .map_err(|e| format!("pty master dup: {e}"))?;
+            let tty = master
+                .try_clone()
+                .map_err(|e| format!("pty master dup: {e}"))?;
             let (out_wake_r, out_wake_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
             let spawn_spec = UnlockedSpawnSpec {
                 program: built.program,
@@ -2286,7 +2305,7 @@ fn exec_with_timeouts(
                 }
             };
             (
-                ChildHandle::Pty { target, pgrp },
+                ChildHandle::Pty { target, pgrp, tty },
                 exited,
                 Some(stdin),
                 Some(master),
@@ -3680,6 +3699,85 @@ mod tests {
         };
         assert_eq!(code, 0);
         assert_eq!(stdout_bytes, total, "leader output lost at exit");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pty_signal_reaches_foreground_job_not_just_session_leader() {
+        let reaper = Reaper::shared_for_tests();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                None,
+                &active_sessions,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+        // The session leader traps INT; only signalling the foreground job
+        // (`sleep`) like a real terminal ends the 30 s sleep promptly.
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap 'echo TRAPPED' INT; echo READY; sleep 30; echo DONE".into(),
+                ],
+                tty: Some(Tty {
+                    term: "xterm".into(),
+                    rows: 24,
+                    cols: 80,
+                }),
+                output_window: 0,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        while !out.windows(5).any(|w| w == b"READY") {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => out.extend_from_slice(&d),
+                Some(VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+        let t = Instant::now();
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Signal {
+                signal: libc::SIGINT,
+            },
+        )
+        .unwrap();
+        let code = loop {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => out.extend_from_slice(&d),
+                Some(VmExecMsg::Exit { code }) => break code,
+                Some(VmExecMsg::SignalAck | VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        };
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "SIGINT never reached sleep"
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("TRAPPED") && text.contains("DONE"), "{text}");
+        assert_eq!(code, 0);
         server.join().unwrap();
     }
 
