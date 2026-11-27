@@ -140,14 +140,14 @@ diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_soc
 diff -ruN a/net/core/gro.c b/net/core/gro.c
 --- a/net/core/gro.c
 +++ b/net/core/gro.c
-@@ -691,6 +691,7 @@
- 		skb_ext_reset(skb);
+@@ -692,6 +692,7 @@
  		nf_reset_ct(skb);
  		skb->slow_gro = 0;
-+		skb->kat_from_uplink = 0;
  	}
++	skb->kat_from_uplink = 0;
  
  	napi->skb = skb;
+ }
 diff -ruN a/net/core/sock.c b/net/core/sock.c
 --- a/net/core/sock.c
 +++ b/net/core/sock.c
@@ -237,7 +237,7 @@ diff -ruN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -224,6 +224,76 @@
+@@ -224,6 +224,79 @@
  /* Adapt the MSS value used to make delayed ack decision to the
   * real world.
   */
@@ -277,7 +277,10 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 + * treated as short. The cost is bounded and never delays data: only while
 + * unread data sits below SO_RCVLOWAT, at most one immediate ACK per unread
 + * batch, otherwise a delayed ACK on the next timer tick. An underestimate
-+ * instead yields stock Linux behaviour.
++ * instead yields stock Linux behaviour. The same bounded cost applies when
++ * tcp_add_backlog() coalesces a short and a full-sized segment into one skb
++ * (classified by its last gso_size-sized slice). When data fills an
++ * out-of-order hole, stock code already ACKs immediately (ICSK_ACK_NOW).
 + */
 +static bool kat_is_short_push(const struct sock *sk, const struct sk_buff *skb)
 +{
@@ -314,7 +317,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
  {
  	struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -236,6 +306,7 @@
+@@ -236,6 +309,7 @@
  	 * sends good full-sized frames.
  	 */
  	len = skb_shinfo(skb)->gso_size ? : skb->len;
@@ -322,7 +325,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	if (len >= icsk->icsk_ack.rcv_mss) {
  		/* Note: divides are still a bit expensive.
  		 * For the moment, only adjust scaling_ratio
-@@ -1017,6 +1088,7 @@
+@@ -1017,6 +1091,7 @@
  		}
  	}
  	icsk->icsk_ack.lrcvtime = now;
@@ -330,7 +333,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -5926,8 +5998,21 @@
+@@ -5926,8 +6001,21 @@
  static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
@@ -352,7 +355,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
  	     /* ... and right edge of window advances far enough.
-@@ -5940,7 +6025,12 @@
+@@ -5940,7 +6028,12 @@
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
@@ -366,10 +369,16 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		/* If we are running from __release_sock() in user context,
  		 * Defer the ack until tcp_release_cb().
  		 */
-@@ -5956,6 +6046,16 @@
+@@ -5956,6 +6049,22 @@
  
  	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
  		tcp_send_delayed_ack(sk);
++		/* Shorten, never extend, the stock delayed-ACK timer. It still
++		 * expires through tcp_delack_timer_handler(), with the same
++		 * pingpong/ato/DelayedACKs accounting as a stock expiry, only
++		 * sooner; ACKing every such segment directly would defeat
++		 * batching of later pushes in the same unread batch.
++		 */
 +		if (kat_lowat_pushed) {
 +			struct inet_connection_sock *icsk = inet_csk(sk);
 +			unsigned long cap = msecs_to_jiffies(4);
@@ -383,7 +392,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		return;
  	}
  
-@@ -6543,6 +6643,7 @@
+@@ -6543,6 +6652,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {

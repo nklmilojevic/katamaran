@@ -1059,6 +1059,9 @@ pub struct DnsServer {
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
         if std::env::var_os(ISOLATED_DNS_ENV).is_some_and(|v| v == "1") {
+            eprintln!(
+                "warning: {ISOLATED_DNS_ENV}=1: serving *.{DNS_DOMAIN} on an ephemeral port; {RESOLVER_PATH} is not used"
+            );
             return Self::start_ephemeral();
         }
         Self::start_with_installed_port(installed_dns_port())

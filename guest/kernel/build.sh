@@ -143,8 +143,9 @@ MAKE=(make -C "/work/$tree" O="/work/$obj" ARCH=arm64 CC="ccache gcc" -j"$(nproc
 
 case "$MODE" in
 shell)
-	# A shell may replace /out/Image by hand; never leave a stamp vouching for it.
-	rm -f /out/Image.stamp
+	# A shell may replace /out/Image or edit the cached tree by hand; never leave a stamp
+	# vouching for either, and make the next build re-extract a pristine patched tree.
+	rm -f /out/Image.stamp src/stamp
 	cd "/work/$tree"
 	exec bash -c "$SHELL_CMD"
 	;;
