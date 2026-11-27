@@ -148,7 +148,7 @@ pub enum PublishError {
     /// publication failed, so it is unknown whether Docker changed the source
     /// concurrently. The new tag is kept (a read error never deletes a working
     /// tag); the caller should re-list and re-check this reference.
-    SourceUnverified(String),
+    SourceUnverified { published: String, detail: String },
     /// Any other containerd gRPC, content, or I/O error.
     Failed(String),
 }
@@ -164,9 +164,10 @@ impl fmt::Display for PublishError {
                 f,
                 "k8s.io destination digest changed before publish (expected {expected}, got {actual})"
             ),
-            Self::SourceUnverified(msg) => {
-                write!(f, "published, but could not re-verify the source: {msg}")
-            }
+            Self::SourceUnverified { published, detail } => write!(
+                f,
+                "published {published}, but could not re-verify the source: {detail}"
+            ),
             Self::Failed(msg) => f.write_str(msg),
         }
     }
@@ -739,10 +740,10 @@ fn confirm_source_after_create(
                 })?;
             Err(PublishError::SourceChanged { expected, actual })
         }
-        Err(PublishError::Failed(e)) => Err(PublishError::SourceUnverified(format!(
-            "verify moby source of {} after publish: {e}",
-            image.name
-        ))),
+        Err(PublishError::Failed(e)) => Err(PublishError::SourceUnverified {
+            published: image.target.digest.clone(),
+            detail: format!("verify moby source of {} after publish: {e}", image.name),
+        }),
         Err(other) => Err(other),
     }
 }
@@ -6117,7 +6118,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, PublishError::SourceUnverified(_)),
+            matches!(err, PublishError::SourceUnverified { ref published, .. } if published != &old_digest),
             "expected SourceUnverified, got {err:?}"
         );
 

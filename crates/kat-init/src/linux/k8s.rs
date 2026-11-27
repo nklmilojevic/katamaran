@@ -3546,20 +3546,17 @@ const MAX_SYNC_RETRIES: usize = 2;
 
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut failures = Vec::new();
-    let emulation = match super::amd64::status() {
-        super::amd64::EmulationStatus::Enabled => EmulationMode::Enabled,
-        super::amd64::EmulationStatus::Disabled => EmulationMode::Disabled,
-        super::amd64::EmulationStatus::Unknown(e) => {
-            let msg = format!("check amd64 binfmt_misc status: {e}");
-            log(&msg);
-            failures.push(msg);
-            EmulationMode::Unknown
-        }
-    };
+    let mut failures: Vec<String> = Vec::new();
     let mut only_refs: Option<HashSet<String>> = None;
+    // Publications whose post-create source check was inconclusive:
+    // name -> published k8s.io digest, reconciled on the next pass even if
+    // the name has disappeared from `moby`.
+    let mut unverified: HashMap<String, String> = HashMap::new();
 
     for attempt in 0..=MAX_SYNC_RETRIES {
+        // Re-read the emulation state on every pass so a retry never acts on
+        // a stale "disabled" reading.
+        let emulation = current_emulation_mode(&mut failures);
         let moby = list_ctr_images(reaper, "moby")?;
         if moby.is_empty() && emulation != EmulationMode::Disabled && only_refs.is_none() {
             break;
@@ -3576,6 +3573,30 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         };
 
         let mut retry_refs: HashSet<String> = HashSet::new();
+
+        // Reconcile inconclusive publications from the previous pass. A name
+        // still in `moby` is re-evaluated as a regular candidate (it is in
+        // `only_refs`); if Docker removed it, retire exactly the digest that
+        // was published, guarded on `moby` still lacking the name and
+        // `k8s.io` still pointing to that digest.
+        for (uname, udigest) in std::mem::take(&mut unverified) {
+            if moby.contains_key(&uname) {
+                continue;
+            }
+            match retire_rewritten_image(&uname, None, &udigest) {
+                Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
+                    "retired amd64 mirror {uname}: its Docker source was removed during publication"
+                )),
+                Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => {}
+                Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                    retry_refs.insert(uname);
+                }
+                Err(e) => {
+                    log(&format!("retire unverified amd64 mirror {uname}: {e}"));
+                    failures.push(format!("{uname}: {e}"));
+                }
+            }
+        }
 
         for (name, img) in candidates {
             if name.starts_with("sha256:") || name.contains("<none>") {
@@ -3635,6 +3656,13 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     failures.push(msg);
                 }
                 SyncAction::RetireRewritten => {
+                    if emulation == EmulationMode::Disabled && !emulation_still_disabled() {
+                        log(&format!(
+                            "skipped retiring {name}: amd64 emulation state changed; re-listing"
+                        ));
+                        retry_refs.insert(name);
+                        continue;
+                    }
                     if let Some(k) = k8s_img {
                         match retire_rewritten_image(&name, Some(&img.digest), &k.digest) {
                             Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
@@ -3767,10 +3795,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         ) => {
                             retry_refs.insert(name);
                         }
-                        Err(containerd_grpc::PublishError::SourceUnverified(e)) => {
+                        Err(containerd_grpc::PublishError::SourceUnverified {
+                            published,
+                            detail,
+                        }) => {
                             // Published but not re-verified: keep the tag and
                             // re-check this reference on the next pass.
-                            log(&format!("mirror image {name}: {e}; re-listing"));
+                            log(&format!("mirror image {name}: {detail}; re-listing"));
+                            unverified.insert(name.clone(), published);
                             retry_refs.insert(name);
                         }
                         Err(containerd_grpc::PublishError::Failed(e)) => {
@@ -3798,6 +3830,13 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     && !moby.contains_key(name)
                     && k8s_img.label(SOURCE_DIGEST_LABEL).is_some()
                 {
+                    if !emulation_still_disabled() {
+                        log(&format!(
+                            "skipped retiring orphaned {name}: amd64 emulation state changed; re-listing"
+                        ));
+                        retry_refs.insert(name.clone());
+                        continue;
+                    }
                     match retire_rewritten_image(name, None, &k8s_img.digest) {
                         Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                             "retired orphaned Katamaran amd64 mirror {name} from k8s.io"
@@ -3842,6 +3881,30 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     Ok(())
 }
 
+fn current_emulation_mode(failures: &mut Vec<String>) -> EmulationMode {
+    match super::amd64::status() {
+        super::amd64::EmulationStatus::Enabled => EmulationMode::Enabled,
+        super::amd64::EmulationStatus::Disabled => EmulationMode::Disabled,
+        super::amd64::EmulationStatus::Unknown(e) => {
+            let msg = format!("check amd64 binfmt_misc status: {e}");
+            if !failures.contains(&msg) {
+                log(&msg);
+                failures.push(msg);
+            }
+            EmulationMode::Unknown
+        }
+    }
+}
+
+/// Re-check, right before retiring a mirror because emulation is disabled,
+/// that it is still explicitly disabled (never on an unknown reading).
+fn emulation_still_disabled() -> bool {
+    matches!(
+        super::amd64::status(),
+        super::amd64::EmulationStatus::Disabled
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeAvailability {
     Present,
@@ -3876,13 +3939,23 @@ enum SyncAction {
 /// concurrent kubelet pull can never give that digest usable native content
 /// (CRI rejects a manifest without a native match before creating any image
 /// record) and the conditional delete cannot remove a native tag.
+///
+/// Both platform lists must be resolved (`ctr images ls` prints `-` or
+/// nothing when it cannot walk the descriptor graph, e.g. a platformless
+/// child manifest is missing locally); an unresolved list is never taken as
+/// proof that no native variant exists. `moby` holds the fuller graph for the
+/// same digest, so a partially present native child shows up there.
 fn is_adoptable_source_copy(k8s: &CtrImage, moby: &CtrImage, native_arch: &str) -> bool {
+    let resolved_non_native = |platforms: Option<&str>| {
+        platforms.is_some_and(|p| {
+            let p = p.trim();
+            !p.is_empty() && p != "-" && !oci_rewrite::has_native_platform(p, native_arch)
+        })
+    };
     k8s.label(SOURCE_DIGEST_LABEL).is_none()
         && k8s.digest == moby.digest
-        && k8s
-            .platforms
-            .as_deref()
-            .is_some_and(|p| !oci_rewrite::has_native_platform(p, native_arch))
+        && resolved_non_native(k8s.platforms.as_deref())
+        && resolved_non_native(moby.platforms.as_deref())
 }
 
 fn unowned_destination_message(name: &str) -> String {
@@ -5312,6 +5385,26 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         assert!(!is_adoptable_source_copy(
             &k8s_unchanged_multi,
             &amd64_idx,
+            "arm64"
+        ));
+        // An unresolved platform inventory (`-`, e.g. a platformless arm64
+        // child missing from k8s.io) on either side is never proof of absence.
+        let k8s_unresolved = ctr_img(&amd64_idx.digest, "-", &[]);
+        assert!(!is_adoptable_source_copy(
+            &k8s_unresolved,
+            &amd64_idx,
+            "arm64"
+        ));
+        let moby_partial_native = ctr_img(&amd64_idx.digest, "linux/amd64,linux/arm64", &[]);
+        assert!(!is_adoptable_source_copy(
+            &k8s_unchanged_copy,
+            &moby_partial_native,
+            "arm64"
+        ));
+        let moby_unresolved = ctr_img(&amd64_idx.digest, "-", &[]);
+        assert!(!is_adoptable_source_copy(
+            &k8s_unchanged_copy,
+            &moby_unresolved,
             "arm64"
         ));
         assert_eq!(
