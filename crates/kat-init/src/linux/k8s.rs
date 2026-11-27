@@ -3485,6 +3485,13 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
             Err(e) => return Err(e),
         }
     }
+    // Subscribed: re-sync now so any Docker change made before or while the
+    // subscription was (re)established (including during the initial sync,
+    // and across watcher reconnects) is picked up; later changes arrive as
+    // events, buffered on this stream while a sync runs.
+    if let Err(e) = sync_moby_images(reaper) {
+        log(&format!("background image sync: {e}"));
+    }
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -3639,6 +3646,21 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 }
                 SyncAction::Relist => {
                     retry_refs.insert(name);
+                }
+                SyncAction::ReportEmulationUnavailable => {
+                    let msg = format!(
+                        "{name}: amd64 image not mirrored: amd64 emulation is unavailable (see the guest log); any existing Kubernetes copy is kept"
+                    );
+                    log(&msg);
+                    failures.push(msg);
+                }
+                SyncAction::ReportStaleMirror => {
+                    let msg = format!(
+                        "{name}: Docker now points to {} with no linux/{NATIVE_ARCH} or linux/amd64 variant to mirror; Kubernetes keeps the previous build under this tag",
+                        img.digest
+                    );
+                    log(&msg);
+                    failures.push(msg);
                 }
                 SyncAction::ReportUnownedDestination => {
                     let msg = unowned_destination_message(&name);
@@ -3935,6 +3957,13 @@ enum SyncAction {
     /// swap cannot be made atomic, and an interrupted swap could lose a tag
     /// Katamaran cannot rebuild); the user is told how to resolve the conflict.
     ReportUnownedDestination,
+    /// An amd64 tag that would be mirrored under emulation, but the emulation
+    /// state is unknown (e.g. the emulator failed to register at boot).
+    ReportEmulationUnavailable,
+    /// Docker's tag now points to an image Katamaran cannot mirror (no
+    /// linux/arm64 or rewritable linux/amd64 variant); the previous mirror is
+    /// kept under the tag.
+    ReportStaleMirror,
 }
 
 /// True when an unlabelled `k8s.io` tag can be adopted (replaced by the
@@ -3990,12 +4019,6 @@ fn needs_native_probe(
         return false;
     };
     if !oci_rewrite::has_native_platform(platforms, native_arch) {
-        return false;
-    }
-    // Fast path: an unlabelled `k8s.io` copy of exactly this digest is kept
-    // whatever the probe says (an amd64-only legacy copy of a multi-platform
-    // index is never adopted), so skip the expensive content walk.
-    if k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_none() && k.digest == moby.digest) {
         return false;
     }
     let k8s_is_rewritten = k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some());
@@ -4169,11 +4192,31 @@ fn plan_sync_action(
                 }
             } else if emulation == EmulationMode::Disabled && k8s_is_rewritten {
                 SyncAction::RetireRewritten
+            } else if emulation == EmulationMode::Unknown
+                && has_amd64
+                && !is_digest_ref
+                && k8s.is_none_or(|k| {
+                    k.label(SOURCE_DIGEST_LABEL)
+                        .is_some_and(|src| src != moby.digest.as_str())
+                })
+            {
+                // Would be (re)mirrored under emulation, but its state is
+                // unknown: keep any existing mirror and report the image.
+                SyncAction::ReportEmulationUnavailable
             } else if k8s_is_rewritten {
                 // Emulation on/unknown but the source has no rewritable amd64
                 // variant (or its platforms could not be resolved): keep the
-                // existing mirror rather than deleting a working tag.
-                SyncAction::Skip
+                // existing mirror rather than deleting a working tag, and
+                // report if Docker's tag now points elsewhere.
+                let resolved = !platforms.trim().is_empty() && platforms.trim() != "-";
+                if resolved
+                    && k8s
+                        .is_some_and(|k| k.label(SOURCE_DIGEST_LABEL) != Some(moby.digest.as_str()))
+                {
+                    SyncAction::ReportStaleMirror
+                } else {
+                    SyncAction::Skip
+                }
             } else if !k8s_is_rewritten && (platforms.is_empty() || platforms == "-") {
                 if k8s.is_some_and(|k| k.digest == moby.digest) {
                     SyncAction::Skip
@@ -5554,7 +5597,8 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
 
         // Emulation status Unknown (e.g. transient binfmt_misc read error): NEVER
         // retire existing working Katamaran mirrors and NEVER publish new amd64
-        // rewrites, while still allowing native arm64 images to sync.
+        // rewrites (report them instead), while still allowing native arm64
+        // images to sync.
         assert_eq!(
             plan_sync_action(
                 "app:dev",
@@ -5577,7 +5621,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Unknown,
                 "arm64"
             ),
-            SyncAction::Skip
+            SyncAction::ReportEmulationUnavailable
         );
         assert_eq!(
             plan_sync_action(
@@ -5666,7 +5710,12 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         );
         // Emulation on, but the source's platforms are unresolved (`-`) or
         // have no amd64 variant: never delete the existing working mirror.
-        for platforms in ["-", "linux/s390x"] {
+        // (A resolved non-amd64 source is reported as leaving the previous
+        // build in place; an unresolved list just keeps it.)
+        for (platforms, want) in [
+            ("-", SyncAction::Skip),
+            ("linux/s390x", SyncAction::ReportStaleMirror),
+        ] {
             let unresolved = ctr_img("sha256:src2", platforms, &[]);
             assert_eq!(
                 plan_sync_action(
@@ -5678,10 +5727,25 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                     EmulationMode::Enabled,
                     "arm64"
                 ),
-                SyncAction::Skip,
+                want,
                 "platforms {platforms}"
             );
         }
+        // Emulation unknown (e.g. registration failed): an amd64 tag with no
+        // up-to-date mirror is reported, never silently skipped; an existing
+        // mirror is kept.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationUnavailable
+        );
         assert_eq!(
             plan_sync_action(
                 digest_ref,

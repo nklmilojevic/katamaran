@@ -681,12 +681,20 @@ fn recover_uncertain_delete(
     let _ =
         conn.delete_image_if_target_matches(namespace, &old_image.name, &old_image.target.digest)?;
 
-    // Never publish a stale plan: if Docker removed or retagged the source
-    // while the delete was uncertain, return `SourceChanged` with the tag
-    // fenced (absent) so the re-list recreates the mirror from the current
-    // source, if any.
-    if let Err(changed) = source {
-        return Ok(Err(changed));
+    // If Docker retagged the source while the delete was uncertain, never
+    // publish the stale plan: return `SourceChanged` with the tag fenced so
+    // the re-list publishes the mirror of the new source. If Docker removed
+    // the source, still publish this plan (the last Docker state before the
+    // removal): removing a Docker image never removes its Kubernetes copy,
+    // so the tag must not be left absent.
+    let source_removed = matches!(
+        &source,
+        Err(PublishError::SourceChanged { actual, .. }) if actual == "<deleted>"
+    );
+    if let Err(changed) = &source
+        && !source_removed
+    {
+        return Ok(Err(changed.clone()));
     }
 
     match conn.create_image(namespace, Some(lease_id), new_image)? {
@@ -694,6 +702,9 @@ fn recover_uncertain_delete(
             // `k8s.io[name]` now points to `new_image.target.digest`, unique
             // to this publication, so the original in-flight
             // `Delete(target = old_digest)` can never match or remove this tag.
+            if let Err(removed) = source {
+                return Ok(Err(removed));
+            }
             Ok(Ok(Rewritten {
                 manifest: new_image.target.digest.clone(),
                 config: new_config_digest.to_string(),
@@ -5654,10 +5665,11 @@ mod tests {
 
     /// Regression test: if Docker removes the source while the replacement
     /// `Images.Delete` is uncertain (its reply is lost after it committed),
-    /// recovery re-checks `moby` BEFORE creating anything, never publishes the
-    /// stale plan, and returns `SourceChanged` so the caller re-lists.
+    /// recovery still leaves a mirror under the tag (removing a Docker image
+    /// never removes its Kubernetes copy): it publishes the planned mirror of
+    /// the last Docker state and reports `SourceChanged`.
     #[test]
-    fn publish_rewritten_image_recovery_checks_source_before_create() {
+    fn publish_rewritten_image_recovery_keeps_a_tag_when_source_removed() {
         let (dir, sock) = temp_sock("recover-src");
         let listener = UnixListener::bind(&sock).unwrap();
 
@@ -5703,10 +5715,19 @@ mod tests {
         );
 
         let st = state.lock().unwrap();
-        assert_eq!(st.k8s_create_calls, 0, "stale plan must never be published");
-        assert!(
-            !st.images.contains_key(&("k8s.io".into(), name.into())),
-            "no stale replacement may be created for a removed source"
+        let cur = st
+            .images
+            .get(&("k8s.io".into(), name.into()))
+            .expect("a Docker removal must never leave the Kubernetes tag absent");
+        assert_ne!(
+            cur.target.digest, old_digest,
+            "in-flight delete must be fenced"
+        );
+        assert_eq!(
+            cur.labels
+                .get("io.katamaran.k8s.source-digest")
+                .map(String::as_str),
+            Some("sha256:source-amd64")
         );
         assert!(st.leases.is_empty());
         drop(st);
