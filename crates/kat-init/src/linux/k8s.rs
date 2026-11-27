@@ -10093,8 +10093,18 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 .unwrap();
         };
         {
+            let mut layer_tar = tar::Builder::new(Vec::new());
+            let mut lh = tar::Header::new_ustar();
+            let payload = b"katamaran-live-snapshot-fixture\n";
+            lh.set_size(payload.len() as u64);
+            lh.set_mode(0o644);
+            lh.set_entry_type(tar::EntryType::Regular);
+            layer_tar
+                .append_data(&mut lh, "fixture.txt", io::Cursor::new(payload))
+                .unwrap();
+            let layer = layer_tar.into_inner().unwrap();
+
             let mut builder = tar::Builder::new(File::create(&image_tar).unwrap());
-            let layer = vec![0u8; 1024];
             let layer_hex = sha256_hex(&layer);
             let layer_digest = format!("sha256:{layer_hex}");
             add_entry(&mut builder, &format!("blobs/sha256/{layer_hex}"), &layer);
@@ -10247,12 +10257,44 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let count_lines = |ns: &str, args: &[&str]| -> usize {
             parse_ctr_image_refs(&run_ctr(ns, args).stdout).len()
         };
+        let count_snapshots = |ns: &str| -> usize {
+            let out = run_ctr(ns, &["snapshots", "ls"]).stdout;
+            let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+            let header = lines.next().expect("expected snapshots ls header");
+            assert!(
+                header.starts_with("KEY"),
+                "unexpected snapshots ls header: {header:?}"
+            );
+            lines.count()
+        };
 
-        // Populate both `moby` and `k8s.io` on our private containerd instance,
-        // adding enough tags in `k8s.io` to exercise multiple `images rm --` batches.
+        // Populate both `moby` and `k8s.io` on our private containerd instance
+        // with real unpacked snapshots, adding enough tags in `k8s.io` to
+        // exercise multiple `images rm --` batches.
         let tar_str = image_tar.to_string_lossy().into_owned();
-        run_ctr("moby", &["images", "import", "--no-unpack", &tar_str]);
-        run_ctr("k8s.io", &["images", "import", "--no-unpack", &tar_str]);
+        let platform = format!("linux/{NATIVE_ARCH}");
+        run_ctr(
+            "moby",
+            &[
+                "images",
+                "import",
+                "--local",
+                "--platform",
+                &platform,
+                &tar_str,
+            ],
+        );
+        run_ctr(
+            "k8s.io",
+            &[
+                "images",
+                "import",
+                "--local",
+                "--platform",
+                &platform,
+                &tar_str,
+            ],
+        );
         let base_ref = parse_ctr_image_refs(&run_ctr("k8s.io", &["images", "ls", "-q"]).stdout)
             .into_iter()
             .next()
@@ -10264,12 +10306,22 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 
         let k8s_images_before = count_lines("k8s.io", &["images", "ls", "-q"]);
         let k8s_content_before = count_lines("k8s.io", &["content", "ls", "-q"]);
+        let k8s_snapshots_before = count_snapshots("k8s.io");
         let moby_images_before = count_lines("moby", &["images", "ls", "-q"]);
         let moby_content_before = count_lines("moby", &["content", "ls", "-q"]);
+        let moby_snapshots_before = count_snapshots("moby");
         assert_eq!(k8s_images_before, IMAGE_RM_BATCH_SIZE + 2);
         assert!(k8s_content_before > 0, "expected k8s.io content blobs");
+        assert!(
+            k8s_snapshots_before > 0,
+            "expected unpacked k8s.io snapshots"
+        );
         assert_eq!(moby_images_before, 1);
         assert!(moby_content_before > 0, "expected moby content to preserve");
+        assert!(
+            moby_snapshots_before > 0,
+            "expected unpacked moby snapshots"
+        );
 
         let mut progress = Vec::new();
         let lease1 = next_gc_lease_id();
@@ -10304,6 +10356,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 
         assert_eq!(count_lines("k8s.io", &["images", "ls", "-q"]), 0);
         assert_eq!(count_lines("k8s.io", &["content", "ls", "-q"]), 0);
+        assert_eq!(count_snapshots("k8s.io"), 0);
         assert_eq!(count_lines("k8s.io", &["leases", "ls", "-q"]), 0);
         assert_eq!(
             count_lines("moby", &["images", "ls", "-q"]),
@@ -10313,6 +10366,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             count_lines("moby", &["content", "ls", "-q"]),
             moby_content_before
         );
+        assert_eq!(count_snapshots("moby"), moby_snapshots_before);
 
         // Retry on an already-empty `k8s.io` namespace also runs the lease GC barrier cleanly.
         let lease2 = next_gc_lease_id();
@@ -10326,10 +10380,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         )
         .unwrap();
         assert_eq!(count_lines("k8s.io", &["leases", "ls", "-q"]), 0);
+        assert_eq!(count_snapshots("k8s.io"), 0);
         assert_eq!(
             count_lines("moby", &["images", "ls", "-q"]),
             moby_images_before
         );
+        assert_eq!(count_snapshots("moby"), moby_snapshots_before);
         // Also exercise bounded `/bin/rm -rf --` removal under the live reaper.
         let scratch_dir = base.join("scratch-rm");
         fs::create_dir_all(scratch_dir.join("nested")).unwrap();
