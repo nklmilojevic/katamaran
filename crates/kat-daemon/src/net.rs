@@ -3624,9 +3624,22 @@ mod tests {
         found
     }
 
-    /// Connect from a specific local source IPv4 to `(dst, port)` and confirm
-    /// the listener does not echo data (either connect fails or peer is dropped).
-    fn assert_non_loopback_source_rejected(src: Ipv4Addr, dst: Ipv4Addr, port: u16) {
+    /// A non-loopback source address for the peer-rejection probe. In strict
+    /// mode (`KATAMARAN_REQUIRE_LO0_ALIAS`) a missing one fails the test rather
+    /// than silently skipping the probe.
+    fn probe_source_v4() -> Option<Ipv4Addr> {
+        let found = first_non_loopback_v4();
+        assert!(
+            found.is_some() || !env_flag("KATAMARAN_REQUIRE_LO0_ALIAS"),
+            "KATAMARAN_REQUIRE_LO0_ALIAS is set but no non-loopback IPv4 address is \
+             available to probe peer rejection"
+        );
+        found
+    }
+
+    /// A TCP socket bound to local source `src`; panics instead of skipping if
+    /// the bind fails, so the probe can never pass without running.
+    fn socket_from(src: Ipv4Addr) -> OwnedFd {
         let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -3648,18 +3661,55 @@ mod tests {
             )
         } < 0
         {
-            return;
+            panic!(
+                "cannot bind probe source {src}: {}",
+                io::Error::last_os_error()
+            );
         }
-        let remote = libc::sockaddr_in {
+        fd
+    }
+
+    /// Connect from a specific local source IPv4 to `(dst, port)` and confirm
+    /// the listener does not echo data (either connect fails or peer is dropped).
+    /// A control connection first proves that `src` reaches an unfiltered
+    /// listener on `dst`, so the rejection comes from the forward's peer filter.
+    fn assert_non_loopback_source_rejected(src: Ipv4Addr, dst: Ipv4Addr, port: u16) {
+        let control = TcpListener::bind((dst, 0)).unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let fd = socket_from(src);
+        let to = |p: u16| libc::sockaddr_in {
             #[cfg(target_os = "macos")]
             sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
             sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: port.to_be(),
+            sin_port: p.to_be(),
             sin_addr: libc::in_addr {
                 s_addr: u32::from(dst).to_be(),
             },
             sin_zero: [0; 8],
         };
+        let control_addr = to(control_port);
+        assert_eq!(
+            unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    (&control_addr as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            },
+            0,
+            "control connect from {src} to {dst}:{control_port}: {}",
+            io::Error::last_os_error()
+        );
+        let (_conn, peer) = control.accept().unwrap();
+        assert_eq!(
+            peer.ip(),
+            src,
+            "control connection did not use source {src}"
+        );
+        drop(fd);
+
+        let fd = socket_from(src);
+        let remote = to(port);
         if unsafe {
             libc::connect(
                 fd.as_raw_fd(),
@@ -3713,7 +3763,7 @@ mod tests {
             conn.write_all(&buf).unwrap();
         });
 
-        if let Some(non_lo) = first_non_loopback_v4() {
+        if let Some(non_lo) = probe_source_v4() {
             assert_non_loopback_source_rejected(non_lo, Ipv4Addr::LOCALHOST, port);
         }
 
@@ -3857,7 +3907,7 @@ mod tests {
             &configured,
         );
 
-        let non_lo = first_non_loopback_v4();
+        let non_lo = probe_source_v4();
         let high = free_high_port();
         api.expose(TCP, high).unwrap();
         let (low, ()) = try_test_low_port(|p| api.expose(TCP, p));
