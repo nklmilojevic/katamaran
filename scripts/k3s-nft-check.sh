@@ -37,16 +37,23 @@ chmod +x "$work/k3s-arm64"
 
 docker "$@" volume create "$name" >/dev/null
 # Keep the server flags in sync with `K8s::start_inner` in crates/kat-init/src/linux/k8s.rs.
-docker "$@" run -d --name "$name" --privileged --cgroupns=host \
-    -v "$name":/var/lib/rancher/k3s -v "$work/k3s-arm64":/opt/k3s:ro "$image" sh -c '
+# The binary is copied in rather than bind-mounted so this works with engines that
+# cannot share the host's temp directory.
+docker "$@" create --name "$name" --privileged --cgroupns=host \
+    -v "$name":/var/lib/rancher/k3s "$image" sh -c '
     apk add --no-cache nftables iptables >/dev/null &&
     exec env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /opt/k3s server \
         --node-name=katamaran --flannel-backend=host-gw \
         --cluster-cidr=10.42.0.0/16 --service-cidr=10.43.0.0/16 --cluster-dns=10.43.0.10 \
         --https-listen-port=6443 --kubelet-arg=fail-swap-on=false \
         --kube-proxy-arg=proxy-mode=nftables' >/dev/null
+docker "$@" cp "$work/k3s-arm64" "$name":/opt/k3s
+docker "$@" start "$name" >/dev/null
 
 for _ in $(seq 1 60); do
+    if [ "$(docker "$@" inspect -f '{{.State.Running}}' "$name")" != true ]; then
+        break
+    fi
     if docker "$@" exec "$name" sh -c \
         '/opt/k3s kubectl get node katamaran 2>/dev/null | grep -qw Ready &&
          nft list table ip kube-proxy >/dev/null 2>&1' 2>/dev/null; then
