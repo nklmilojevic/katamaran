@@ -93,7 +93,7 @@ Run fast host unit tests:
 cargo test --lib -p kat-proto -p kat-vmm -p kat-daemon -p xtask
 ```
 
-Run the full VM integration test suite (boots real VMs; requires `docker` and `kubectl` on `PATH`, plus internet access):
+Run the full VM integration test suite (boots real VMs; requires `docker` and `kubectl` on `PATH`, plus internet access). `cargo xtask kernel` records the inputs it built from in `guest/out/Image.stamp`; `test-vm` refuses to start when that stamp is missing or no longer matches the kernel patches and config (for example an `Image` built before the quick ACK patch), so run `cargo xtask kernel` first in that case:
 
 ```sh
 cargo xtask test-vm

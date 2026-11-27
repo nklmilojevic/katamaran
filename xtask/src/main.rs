@@ -111,6 +111,9 @@ fn main() -> anyhow::Result<()> {
         }
         Task::TestVm => {
             require_tool("kubectl", "running `cargo xtask test-vm`")?;
+            // Fail before building anything if guest/out/Image predates the current kernel
+            // patches (e.g. the quickack suite needs kat.quickack from patch 0012).
+            require_current_kernel(&root)?;
             initramfs(&root)?;
             host(&root)?;
             require_guest_images(&root)?;
@@ -202,6 +205,42 @@ fn require_kernel(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fails unless guest/out/Image.stamp (written by guest/kernel/build.sh next to the Image)
+/// matches the stamp of the current kernel version, patches, and config.
+fn require_current_kernel(root: &Path) -> anyhow::Result<()> {
+    require_kernel(root)?;
+    let out = Command::new("bash")
+        .arg(root.join("guest/kernel/build.sh"))
+        .arg("stamp")
+        .output()
+        .context("run guest/kernel/build.sh stamp")?;
+    if !out.status.success() {
+        bail!(
+            "guest/kernel/build.sh stamp failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let want = String::from_utf8_lossy(&out.stdout);
+    let have = std::fs::read_to_string(root.join("guest/out/Image.stamp")).ok();
+    check_kernel_stamp(have.as_deref(), &want)
+}
+
+fn check_kernel_stamp(have: Option<&str>, want: &str) -> anyhow::Result<()> {
+    let want = want.trim();
+    if want.is_empty() {
+        bail!("guest/kernel/build.sh stamp printed nothing");
+    }
+    match have.map(str::trim) {
+        Some(have) if have == want => Ok(()),
+        Some(_) => bail!(
+            "guest/out/Image was built from older kernel patches or config; run `cargo xtask kernel` first"
+        ),
+        None => bail!(
+            "guest/out/Image has no build stamp (built before guest/out/Image.stamp existed, or by hand); run `cargo xtask kernel` first"
+        ),
+    }
+}
+
 fn require_guest_images(root: &Path) -> anyhow::Result<()> {
     require_kernel(root)?;
     for (file, task) in [("rootfs.erofs", "rootfs"), ("data.img", "disk")] {
@@ -218,17 +257,33 @@ fn require_tool(bin: &str, why: &str) -> anyhow::Result<()> {
 }
 
 fn require_tool_in(bin: &str, why: &str, path: &std::ffi::OsStr) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let found = std::env::split_paths(path).any(|dir| {
-        let candidate = dir.join(bin);
-        std::fs::metadata(&candidate)
-            .is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-    });
+    let found = std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(bin)));
     if !found {
-        bail!("{bin} is not on PATH; install {bin} before {why}");
+        bail!("no {bin} executable by the current user on PATH; install {bin} before {why}");
     }
     Ok(())
+}
+
+/// A regular file the current effective user may execute (`faccessat(X_OK, AT_EACCESS)`),
+/// not merely one with some execute bit set.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: c_path is a valid NUL-terminated string that outlives the call.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 fn host(root: &Path) -> anyhow::Result<()> {
@@ -269,8 +324,9 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::require_tool_in;
+    use super::{check_kernel_stamp, require_tool_in};
     use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn require_tool_reports_missing_binary() {
@@ -288,5 +344,33 @@ mod tests {
     #[test]
     fn require_tool_finds_existing_executable() {
         require_tool_in("sh", "testing", OsStr::new("/bin:/usr/bin")).unwrap();
+    }
+
+    #[test]
+    fn require_tool_rejects_file_the_user_cannot_execute() {
+        let dir = std::env::temp_dir().join(format!("xtask-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("kat-fake-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let denied = require_tool_in("kat-fake-tool", "testing", dir.as_os_str());
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let allowed = require_tool_in("kat-fake-tool", "testing", dir.as_os_str());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(denied.is_err());
+        allowed.unwrap();
+    }
+
+    #[test]
+    fn kernel_stamp_must_match() {
+        check_kernel_stamp(Some("abc\n"), "abc\n").unwrap();
+        let stale = check_kernel_stamp(Some("old"), "abc").unwrap_err();
+        assert!(stale.to_string().contains("cargo xtask kernel"), "{stale}");
+        let missing = check_kernel_stamp(None, "abc").unwrap_err();
+        assert!(
+            missing.to_string().contains("cargo xtask kernel"),
+            "{missing}"
+        );
+        assert!(check_kernel_stamp(Some(""), "").is_err());
     }
 }

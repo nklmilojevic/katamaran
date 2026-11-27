@@ -61,6 +61,11 @@ pub const DEFAULT_API_PORT: u16 = 6443;
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
 pub const DEFAULT_DNS_PORT: u16 = 15353;
 pub const RESOLVER_PATH: &str = "/etc/resolver/k8s.kat.local";
+/// When set in the daemon's environment, the `*.k8s.kat.local` DNS responder
+/// binds an ephemeral loopback port instead of the port named by an installed
+/// [`RESOLVER_PATH`]. Integration tests set it so their isolated daemons do not
+/// fail on the port held by the developer's real daemon.
+pub const ISOLATED_DNS_ENV: &str = "KATAMARAN_ISOLATED_DNS";
 
 pub fn socket_path(home: &Path) -> PathBuf {
     home.join("run").join(SOCKET_NAME)
@@ -1053,7 +1058,23 @@ pub struct DnsServer {
 
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
+        if std::env::var_os(ISOLATED_DNS_ENV).is_some() {
+            return Self::start_ephemeral();
+        }
         Self::start_with_installed_port(installed_dns_port())
+    }
+
+    /// Bind an ephemeral loopback port, ignoring `/etc/resolver/k8s.kat.local`
+    /// and `DEFAULT_DNS_PORT`, so a throwaway daemon never contends with the
+    /// developer's real daemon for the installed resolver port.
+    fn start_ephemeral() -> io::Result<DnsServer> {
+        let sock = UdpSocket::bind(("127.0.0.1", 0)).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("bind 127.0.0.1:0 for isolated *.{DNS_DOMAIN} DNS: {e}"),
+            )
+        })?;
+        Self::serve(sock)
     }
 
     fn start_with_installed_port(installed: Option<u16>) -> io::Result<DnsServer> {
@@ -1073,6 +1094,10 @@ impl DnsServer {
                     )
                 })?,
         };
+        Self::serve(sock)
+    }
+
+    fn serve(sock: UdpSocket) -> io::Result<DnsServer> {
         let port = sock.local_addr()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(250)))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -1516,6 +1541,19 @@ users:
         drop(g2);
         drop(g3);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dns_server_ephemeral_ignores_installed_port() {
+        let holder = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let held = holder.local_addr().unwrap().port();
+        // The installed-port path must fail on a held port...
+        assert!(DnsServer::start_with_installed_port(Some(held)).is_err());
+        // ...while the isolated path binds a fresh one.
+        let mut srv = DnsServer::start_ephemeral().unwrap();
+        assert_ne!(srv.port, 0);
+        assert_ne!(srv.port, held);
+        srv.stop();
     }
 
     #[test]

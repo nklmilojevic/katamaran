@@ -24,7 +24,7 @@ const QUICKACK_PARAM: &str = "/sys/module/kat/parameters/quickack";
 /// Without quick ACK, the client's delayed-ACK timer stalls every keep-alive
 /// request for ~40–50 ms.
 const SPLIT_WRITE_SERVER_PY: &str = r#"
-import socket, threading, time
+import fcntl, socket, struct, termios, threading, time
 
 BODY = b"x" * 10240
 HDR = (
@@ -72,6 +72,18 @@ THREE_HDR = (
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
+FULL_CHUNKS = 48
+# Linux SIOCOUTQ (== TIOCOUTQ): bytes not yet ACKed by the peer (unsent + in
+# flight). SIOCOUTQNSD: bytes not yet sent.
+SIOCOUTQ = termios.TIOCOUTQ
+SIOCOUTQNSD = 0x894B
+
+def wait_outq_empty(conn, req, what):
+    deadline = time.monotonic() + 2.0
+    while struct.unpack("i", fcntl.ioctl(conn.fileno(), req, b"\0\0\0\0"))[0] > 0:
+        if time.monotonic() > deadline:
+            raise RuntimeError("timed out waiting for " + what)
+        time.sleep(0.0002)
 
 def handle(conn):
     try:
@@ -109,13 +121,34 @@ def handle(conn):
                     time.sleep(0.0005)
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             elif req_hdr.startswith(b"GET /three "):
-                # Three sub-MSS writes with TCP_NODELAY=0: let write 1's ACK
-                # arrive before sending write 2 (hdr + 2 KiB < 4 KiB lowat),
-                # then immediately queue write 3 (8 KiB) behind Nagle.
+                # Three sub-MSS writes with TCP_NODELAY=0. Wait (bounded) until
+                # the peer has ACKed write 1 so write 2 goes out on its own
+                # (hdr + 2 KiB < 4 KiB lowat), confirm write 2 left the send
+                # queue, then queue write 3 (8 KiB) behind Nagle so it waits
+                # on write 2's ACK: the second delayed-ACK deadline under test.
                 conn.sendall(THREE_HDR)
-                time.sleep(0.002)
+                wait_outq_empty(conn, SIOCOUTQ, "ACK of the three-write header")
                 conn.sendall(THREE_MID)
+                wait_outq_empty(conn, SIOCOUTQNSD, "three-write middle chunk to be sent")
                 conn.sendall(THREE_TAIL)
+            elif req_hdr.startswith(b"GET /fullmss "):
+                # Full-sized PSH segments (exactly one MSS per write) paced
+                # 12 ms apart: longer than the shortened delayed-ACK cap, shorter
+                # than the stock 40 ms delayed-ACK timer, so stock TCP batches
+                # several segments per ACK.
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                mss = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
+                chunk = b"f" * mss
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Length: " + str(mss * FULL_CHUNKS).encode() + b"\r\n"
+                    b"Connection: keep-alive\r\n"
+                    b"\r\n"
+                )
+                for _ in range(FULL_CHUNKS):
+                    time.sleep(0.012)
+                    conn.sendall(chunk)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             else:
                 conn.sendall(HDR)
                 conn.sendall(BODY)
@@ -137,7 +170,8 @@ while True:
 /// 32 MiB sustained download, `short` for an unpaced 512x4 KiB short-write
 /// stream, `paced` for a 32x4 KiB paced short-write stream that lets the reader
 /// drain between writes, `pushed` for a 48x60000B pushed multi-segment stream,
-/// or `rcvlowat <N>` to set `SO_RCVLOWAT` and gate reads on `select.poll()`),
+/// `fullmss` for 48 exactly-one-MSS PSH segments paced 12 ms apart, or
+/// `rcvlowat <N>` to set `SO_RCVLOWAT` and gate reads on `select.poll()`),
 /// and prints two space-separated floats flushed after each workload command.
 /// Passing an optional count on argv runs a single burst and exits.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
@@ -150,6 +184,7 @@ bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 pushed_req = b"GET /pushed HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+fullmss_req = b"GET /fullmss HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
 def tcp_out_segs():
     with open("/proc/net/snmp") as f:
@@ -255,7 +290,7 @@ def run_stream(req_bytes, expected_len):
     for line in hdr.split(b"\r\n")[1:]:
         if line.lower().startswith(b"content-length:"):
             cl = int(line.split(b":", 1)[1].strip())
-    assert cl == expected_len, cl
+    assert expected_len is None or cl == expected_len, cl
     buf = drain_exact(sock, cl, buf)
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     after = tcp_out_segs()
@@ -276,6 +311,8 @@ else:
             run_stream(paced_req, 32 * 4096)
         elif line == "pushed":
             run_stream(pushed_req, 48 * 60000)
+        elif line == "fullmss":
+            run_stream(fullmss_req, None)
         elif line.startswith("three "):
             run_burst(int(line.split()[1]), three_req)
         elif line.startswith("rcvlowat "):
@@ -348,6 +385,96 @@ after = delayed_acks()
 sock.close()
 print(after - before)
 "#;
+
+/// Dumps every IPv4 and IPv6 route in every table of the current network
+/// namespace with `ip -j route show table all` and inspects the structured
+/// `metrics` of each one. Prints `routes=<n> eth0=<n> quickack=<n>` and then
+/// one JSON line per route that carries a QUICKACK metric (locked or not).
+const ROUTE_CHECK_PY: &str = r#"
+import json, subprocess
+
+def has_quickack(v):
+    if isinstance(v, dict):
+        return any(k == "quickack" or has_quickack(x) for k, x in v.items())
+    if isinstance(v, list):
+        return any(has_quickack(x) for x in v)
+    return False
+
+routes = []
+for fam in ("-4", "-6"):
+    out = subprocess.run(
+        ["ip", "-j", fam, "route", "show", "table", "all"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    routes += json.loads(out or "[]")
+eth0 = sum(1 for r in routes if r.get("dev") == "eth0")
+bad = [r for r in routes if has_quickack(r.get("metrics", []))]
+print(f"routes={len(routes)} eth0={eth0} quickack={len(bad)}")
+for r in bad:
+    print(json.dumps(r))
+"#;
+
+/// Installs a `/32` route to `argv[1]` over `eth0` whose RTAX_QUICKACK metric
+/// is 0 and locked (RTAX_LOCK bit 15). iproute2 has no `lock` keyword for
+/// `quickack`, so this sends RTM_NEWROUTE over rtnetlink directly.
+const LOCKED_ROUTE_PY: &str = r#"
+import socket, struct, sys
+
+RTM_NEWROUTE, NLMSG_ERROR = 24, 2
+NLM_F_REQUEST, NLM_F_ACK, NLM_F_REPLACE, NLM_F_CREATE = 0x1, 0x4, 0x100, 0x400
+RTA_DST, RTA_OIF, RTA_METRICS = 1, 4, 8
+RTAX_LOCK, RTAX_QUICKACK = 1, 15
+RT_TABLE_MAIN, RTPROT_BOOT, RT_SCOPE_LINK, RTN_UNICAST = 254, 3, 253, 1
+
+def rta(kind, payload):
+    n = 4 + len(payload)
+    return struct.pack("=HH", n, kind) + payload + b"\0" * (-n % 4)
+
+metrics = rta(RTAX_LOCK, struct.pack("=I", 1 << RTAX_QUICKACK))
+metrics += rta(RTAX_QUICKACK, struct.pack("=I", 0))
+body = struct.pack("=BBBBBBBBI", socket.AF_INET, 32, 0, 0, RT_TABLE_MAIN,
+                   RTPROT_BOOT, RT_SCOPE_LINK, RTN_UNICAST, 0)
+body += rta(RTA_DST, socket.inet_aton(sys.argv[1]))
+body += rta(RTA_OIF, struct.pack("=i", socket.if_nametoindex("eth0")))
+body += rta(RTA_METRICS, metrics)
+flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE | NLM_F_CREATE
+msg = struct.pack("=IHHII", 16 + len(body), RTM_NEWROUTE, flags, 1, 0) + body
+
+nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+nl.bind((0, 0))
+nl.send(msg)
+resp = nl.recv(65536)
+kind = struct.unpack_from("=H", resp, 4)[0]
+err = struct.unpack_from("=i", resp, 16)[0]
+if kind != NLMSG_ERROR or err != 0:
+    raise SystemExit(f"RTM_NEWROUTE failed: type={kind} error={err}")
+"#;
+
+/// Runs [`ROUTE_CHECK_PY`] output through assertions: some routes exist,
+/// at least one uses `eth0`, and none carries a QUICKACK metric.
+fn assert_no_quickack_routes(out: &str, where_: &str) {
+    let summary = out
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("{where_}: empty route check output"));
+    let field = |name: &str| -> u64 {
+        summary
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{where_}: bad route check summary {summary:?}"))
+    };
+    assert!(field("routes") > 0, "{where_}: no routes found:\n{out}");
+    assert!(
+        field("eth0") > 0,
+        "{where_}: expected an eth0 route:\n{out}"
+    );
+    assert_eq!(
+        field("quickack"),
+        0,
+        "{where_}: routes must not carry a QUICKACK metric (quick ACK lives in the kernel, not route rewrites):\n{out}"
+    );
+}
 
 fn root() -> PathBuf {
     // Canonical, so Unix socket paths stay under macOS's 104-byte limit.
@@ -485,6 +612,10 @@ impl Daemon {
             .arg("daemon")
             .env("KATAMARAN_HOME", home)
             .env("HOME", user_home)
+            // Bind the *.k8s.kat.local responder to an ephemeral port instead of
+            // the one in /etc/resolver/k8s.kat.local, which the developer's own
+            // daemon may hold (ISOLATED_DNS_ENV in src/k8s.rs).
+            .env("KATAMARAN_ISOLATED_DNS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -605,6 +736,7 @@ fn docker_timeout(docker_host: &str, args: &[&str], timeout: Duration) -> Result
     let mut cmd = Command::new("docker");
     cmd.env("DOCKER_HOST", docker_host)
         .env_remove("DOCKER_CONTEXT")
+        .env_remove("BUILDX_BUILDER")
         .args(args);
     run_output_timeout(&mut cmd, timeout)
 }
@@ -617,7 +749,11 @@ fn docker(docker_host: &str, args: &[&str]) -> Output {
 fn build_test_image(docker_host: &str) {
     let mut build = Command::new("docker")
         .env("DOCKER_HOST", docker_host)
+        // Keep the build (and its result) on the test VM's engine: a selected
+        // context or Buildx builder could build elsewhere and never load the
+        // image that `kat k8s sync-images` mirrors into k3s.
         .env_remove("DOCKER_CONTEXT")
+        .env_remove("BUILDX_BUILDER")
         .args(["build", "-q", "-t", TEST_IMAGE, "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -809,8 +945,10 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                     &format!("--image={TEST_IMAGE}"),
                     "--image-pull-policy=Never",
                     "--",
+                    // The test's daemon guard tears the whole VM down; a finite
+                    // sleep could make the pod terminal mid-test.
                     "sleep",
-                    "300",
+                    "infinity",
                 ],
             ),
             &format!("create pod {name}"),
@@ -1004,9 +1142,10 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "SO_RCVLOWAT=4096 three-write hit stock delayed-ACK stall with quickack=Y (p50={three_on_p50:.2}ms total={three_on_total:.2}ms)"
     );
 
-    // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments):
-    // !after(rcv_wup, copied_seq) ensures the override fires at most once per
-    // unread batch rather than ACKing every pushed segment below SO_RCVLOWAT.
+    // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments): only
+    // short pushed segments take the SO_RCVLOWAT override (the repeated 60000B
+    // size becomes rcv_mss after the first), and !after(rcv_wup, copied_seq)
+    // limits it to one immediate ACK per unread batch.
     send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144");
     let (pushed_acks_on, pushed_ms_on) = median_of_3(
         &mut send_cmd,
@@ -1015,6 +1154,17 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     );
     eprintln!(
         "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=Y): out_segs={pushed_acks_on:.0} elapsed={pushed_ms_on:.2}ms"
+    );
+    // Full-sized PSH segments paced 12 ms apart below SO_RCVLOWAT: neither the
+    // immediate ACK nor the shortened delayed-ACK cap may apply, so ACK
+    // batching must match stock (compared against quickack=N below).
+    let (fullmss_acks_on, fullmss_ms_on) = median_of_3(
+        &mut send_cmd,
+        "fullmss",
+        "SO_RCVLOWAT=262144 paced full-MSS stream (quickack=Y)",
+    );
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=262144 paced 48xMSS median (quickack=Y): out_segs={fullmss_acks_on:.0} elapsed={fullmss_ms_on:.2}ms"
     );
     send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1");
 
@@ -1079,12 +1229,26 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         eprintln!(
             "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=N): out_segs={pushed_acks_off:.0} elapsed={pushed_ms_off:.2}ms"
         );
-        // 48 pushed segments: without !after(rcv_wup, copied_seq) each segment
-        // below 262144 would be ACKed (~48+ OutSegs). With the guard, stock
-        // pacing handles subsequent segments in each batch.
+        // 48 pushed segments: ACKing each one below 262144 would give ~48+
+        // OutSegs; stock pacing must handle subsequent segments in each batch.
         assert!(
             pushed_acks_on < 40.0 && pushed_acks_on <= pushed_acks_off * 1.4 + 6.0,
             "SO_RCVLOWAT=262144 pushed stream inflated ACKs (on={pushed_acks_on:.0}, off={pushed_acks_off:.0})"
+        );
+        let (fullmss_acks_off, fullmss_ms_off) = median_of_3(
+            &mut send_cmd,
+            "fullmss",
+            "SO_RCVLOWAT=262144 paced full-MSS stream (quickack=N)",
+        );
+        eprintln!(
+            "pod-to-pod SO_RCVLOWAT=262144 paced 48xMSS median (quickack=N): out_segs={fullmss_acks_off:.0} elapsed={fullmss_ms_off:.2}ms"
+        );
+        // ACKing every full-sized segment (immediately or via the capped
+        // timer) would give ~48 OutSegs, while stock batches the 12 ms-paced
+        // segments; the small slack covers the final sub-SO_RCVLOWAT drain.
+        assert!(
+            fullmss_acks_on <= fullmss_acks_off * 1.25 + 6.0,
+            "SO_RCVLOWAT=262144 paced full-MSS stream lost ACK batching (on={fullmss_acks_on:.0}, off={fullmss_acks_off:.0})"
         );
         send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1 (quickack=N)");
 
@@ -1092,12 +1256,6 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             median_of_3(&mut send_cmd, "bulk", "sustained 32MiB bulk (quickack=N)");
         eprintln!(
             "pod-to-pod sustained 32MiB bulk median (quickack=N): out_segs={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
-        );
-        // Tight enough to catch a 2x doubling in sustained bulk ACK traffic
-        // (32 MiB exceeds sk_rcvbuf so both peers run in steady state).
-        assert!(
-            bulk_acks_on < 260.0 && bulk_acks_on <= bulk_acks_off * 1.4 + 16.0,
-            "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}, off={bulk_acks_off:.0})"
         );
         let (short_acks_off, short_ms_off) = median_of_3(
             &mut send_cmd,
@@ -1133,6 +1291,24 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         assert!(
             on_p50 < 15.0 && on_total < 300.0,
             "established socket stayed stalled after restoring quickack=1 (p50={on_p50:.2}ms total={on_total:.2}ms)"
+        );
+
+        // Stock bulk ACK counts swing widely with vCPU scheduling and receive
+        // buffer state (tens to ~100 OutSegs per 32 MiB), so sample quickack=Y
+        // on both sides of the quickack=N sample and compare the smaller
+        // median: a real 2x ACK doubling inflates both.
+        let (bulk_acks_on2, bulk_ms_on2) = median_of_3(
+            &mut send_cmd,
+            "bulk",
+            "sustained 32MiB bulk restored (quickack=Y)",
+        );
+        eprintln!(
+            "pod-to-pod sustained 32MiB bulk median restored (quickack=Y): out_segs={bulk_acks_on2:.0} elapsed={bulk_ms_on2:.2}ms"
+        );
+        let bulk_on = bulk_acks_on.min(bulk_acks_on2);
+        assert!(
+            bulk_on < 260.0 && bulk_on <= bulk_acks_off * 1.4 + 16.0,
+            "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}/{bulk_acks_on2:.0}, off={bulk_acks_off:.0})"
         );
     }
     drop(client_in);
@@ -1297,6 +1473,57 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "root-to-bridge keep-alive stalled (p50={br_p50:.2}ms total={br_total:.2}ms)"
     );
 
+    // A route that locks RTAX_QUICKACK (here locked at 0) overrides
+    // Katamaran's default: a bridged container client on such a route sees the
+    // stock delayed-ACK stall even with kat.quickack=1. Deleting the route and
+    // reconnecting over the ordinary bridge subnet route restores quick ACKs.
+    let locked_out = ok(
+        &docker(
+            &docker_host,
+            &[
+                "run",
+                "--rm",
+                "--cap-add",
+                "NET_ADMIN",
+                "-e",
+                &format!("LOCK_PY={LOCKED_ROUTE_PY}"),
+                "-e",
+                &format!("CLIENT_PY={KEEP_ALIVE_CLIENT_PY}"),
+                TEST_IMAGE,
+                "sh",
+                "-euc",
+                r#"python3 -c "$LOCK_PY" "$1"
+ip route show "$1/32" >&2
+python3 -c "$CLIENT_PY" "$1" 21
+ip route del "$1/32"
+python3 -c "$CLIENT_PY" "$1" 21"#,
+                "sh",
+                &srv_ip,
+            ],
+        ),
+        "container keep-alive over a route with RTAX_QUICKACK locked",
+    );
+    let mut locked_lines = locked_out.lines().filter(|l| !l.trim().is_empty());
+    let (locked_p50, locked_total) = parse_latencies(
+        locked_lines.next().unwrap_or(""),
+        "container keep-alive (RTAX_QUICKACK locked at 0)",
+    );
+    let (unlocked_p50, unlocked_total) = parse_latencies(
+        locked_lines.next().unwrap_or(""),
+        "container keep-alive (route lock removed)",
+    );
+    eprintln!(
+        "container-to-bridge keep-alive: locked quickack=0 p50={locked_p50:.2}ms total={locked_total:.2}ms, unlocked p50={unlocked_p50:.2}ms total={unlocked_total:.2}ms"
+    );
+    assert!(
+        locked_p50 >= 25.0,
+        "a locked RTAX_QUICKACK=0 route must keep stock delayed ACKs (p50={locked_p50:.2}ms total={locked_total:.2}ms)"
+    );
+    assert!(
+        unlocked_p50 < 15.0 && unlocked_total < 300.0,
+        "keep-alive stalled after removing the locked route (p50={unlocked_p50:.2}ms total={unlocked_total:.2}ms)"
+    );
+
     // 4) Container-to-uplink (`eth0` / virtio-net -> host.docker.internal)
     //    vs container-to-container (`docker0`, in-VM): verifies packets
     //    arriving over virtio-net (`eth0`) do NOT force quick ACKs (delayed
@@ -1354,8 +1581,9 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "expected immediate quick ACKs (0 delayed ACKs) on in-VM container connection"
     );
 
-    // 5) Confirm the guest root routing table is completely unmutated (no
-    //    `quickack 1` rewritten onto `eth0` or bridge routes).
+    // 5) No route in any table of the guest root namespace or a pod's
+    //    namespace (where a userspace workaround used to rewrite routes)
+    //    carries a QUICKACK metric, locked or not.
     let root_routes = ok(
         &docker(
             &docker_host,
@@ -1365,23 +1593,22 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                 "--network",
                 "host",
                 TEST_IMAGE,
-                "sh",
+                "python3",
                 "-c",
-                "ip -4 route show && ip -6 route show",
+                ROUTE_CHECK_PY,
             ],
         ),
         "inspect root namespace routes",
     );
-    assert!(
-        root_routes.lines().any(|l| l.contains("dev eth0")),
-        "expected eth0 route in root table:\n{root_routes}"
+    assert_no_quickack_routes(&root_routes, "guest root namespace");
+    let pod_routes = ok(
+        &kubectl(
+            &kubeconfig,
+            &["exec", "qa-probe", "--", "python3", "-c", ROUTE_CHECK_PY],
+        ),
+        "inspect qa-probe pod routes",
     );
-    for line in root_routes.lines() {
-        assert!(
-            !line.contains("quickack 1"),
-            "routing table must not be rewritten by a userspace watcher: {line}\n{root_routes}"
-        );
-    }
+    assert_no_quickack_routes(&pod_routes, "qa-probe pod namespace");
 
     ok(&cli(&home, &user_home, &["stop"]), "kat stop");
 }
@@ -1399,7 +1626,10 @@ fn cmdline_opt_out_disables_quickack() {
         fn drop(&mut self) {
             if let Ok(None) = self.0.try_wait() {
                 unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
-                for _ in 0..200 {
+                // `katamaran run` gives its katamaran-vm child up to 45 s
+                // (lifecycle::SHUTDOWN_TIMEOUT) before killing and reaping it
+                // itself; wait past that so SIGKILL never skips that cleanup.
+                for _ in 0..1300 {
                     if let Ok(Some(_)) = self.0.try_wait() {
                         break;
                     }

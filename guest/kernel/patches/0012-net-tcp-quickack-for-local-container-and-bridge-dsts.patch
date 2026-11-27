@@ -34,8 +34,11 @@ sustained bulk transfers), lift only the pingpong suppression in
 __tcp_cleanup_rbuf() when userspace drains a small or PSH-terminated
 segment (ICSK_ACK_PUSHED && !sk_rmem_alloc) on an eligible non-uplink
 socket with READ_ONCE(kat_quickack_enabled), and handle the matching
-SO_RCVLOWAT case in __tcp_ack_snd_check() when pushed in-order data is
-queued below sk_rcvlowat and tcp_epollin_ready() is false: send an
+SO_RCVLOWAT case in __tcp_ack_snd_check() when a short pushed segment
+(sub-MSS and not a repeated stable size, recorded as kat_short_push in
+tcp_measure_rcv_mss(); full-sized PSH segments keep stock delayed-ACK
+batching and timers) leaves in-order data queued below sk_rcvlowat and
+tcp_epollin_ready() is false: send an
 immediate ACK if the previous cumulative ACK has not already covered
 unread data (!after(tp->rcv_wup, tp->copied_seq)), and otherwise let
 stock ACK checks run while capping any armed delayed-ACK timer to a
@@ -86,7 +89,7 @@ diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_soc
 -				  unused:3;
 +				  kat_quick_ack:1, /* eligible local container/bridge dst  */
 +				  kat_from_uplink:1, /* last rx segment came via virtio_net */
-+				  unused:1;
++				  kat_short_push:1; /* last rx data segment was short	   */
  		__u32		  lrcvtime;	 /* timestamp of last received data packet */
  		__u16		  last_seg_size; /* Size of last incoming segment	   */
  		__u16		  rcv_mss;	 /* MSS used for delayed ACK decisions	   */
@@ -200,7 +203,27 @@ diff -ruN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -1017,6 +1017,7 @@
+@@ -231,6 +231,7 @@
+ 	unsigned int len;
+ 
+ 	icsk->icsk_ack.last_seg_size = 0;
++	icsk->icsk_ack.kat_short_push = 0;
+ 
+ 	/* skb->len may jitter because of SACKs, even if peer
+ 	 * sends good full-sized frames.
+@@ -305,6 +306,11 @@
+ 		if (icsk->icsk_ack.pending & ICSK_ACK_PUSHED)
+ 			icsk->icsk_ack.pending |= ICSK_ACK_PUSHED2;
+ 		icsk->icsk_ack.pending |= ICSK_ACK_PUSHED;
++		/* Short segment (below rcv_mss and not a repeated stable
++		 * size): the end of a sub-MSS write Nagle may hold the
++		 * rest of. Full-sized PSH segments leave this clear.
++		 */
++		icsk->icsk_ack.kat_short_push = 1;
+ 	}
+ }
+ 
+@@ -1017,6 +1023,7 @@
  		}
  	}
  	icsk->icsk_ack.lrcvtime = now;
@@ -208,24 +231,28 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -5926,8 +5927,16 @@
+@@ -5926,7 +5933,20 @@
  static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
 +	bool kat_lowat_pushed;
  	unsigned long rtt, delay;
- 
++
++	/* Only a short pushed segment (see tcp_measure_rcv_mss()) can be a
++	 * sub-MSS write the peer's Nagle is waiting on; full-sized PSH
++	 * segments keep stock delayed-ACK batching and timers.
++	 */
 +	kat_lowat_pushed = (inet_csk(sk)->icsk_ack.pending & ICSK_ACK_PUSHED) &&
++			   inet_csk(sk)->icsk_ack.kat_short_push &&
 +			   sk->sk_rcvlowat > 1 &&
 +			   after(tp->rcv_nxt, tp->copied_seq) &&
 +			   (int)(tp->rcv_nxt - tp->copied_seq) < sk->sk_rcvlowat &&
 +			   !tcp_epollin_ready(sk, sk->sk_rcvlowat) &&
 +			   kat_sk_wants_quickack(sk);
-+
+ 
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
- 	     /* ... and right edge of window advances far enough.
-@@ -5940,7 +5949,12 @@
+@@ -5940,7 +5960,12 @@
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
@@ -239,7 +266,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		/* If we are running from __release_sock() in user context,
  		 * Defer the ack until tcp_release_cb().
  		 */
-@@ -5956,6 +5970,16 @@
+@@ -5956,6 +5981,16 @@
  
  	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
  		tcp_send_delayed_ack(sk);
@@ -256,7 +283,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		return;
  	}
  
-@@ -6543,6 +6567,7 @@
+@@ -6543,6 +6578,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {

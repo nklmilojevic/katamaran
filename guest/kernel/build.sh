@@ -7,6 +7,9 @@
 #                                    then run moby's check-config.sh -> guest/out/check-config.txt
 #   guest/kernel/build.sh clean      drop the object tree (keeps the source and ccache volumes)
 #   guest/kernel/build.sh shell CMD  run CMD in the build container, cwd = prepared source tree
+#   guest/kernel/build.sh stamp      print the input stamp (no Docker); a build records it in
+#                                    guest/out/Image.stamp so `cargo xtask test-vm` can reject
+#                                    an Image built from older patches or config
 #
 # Method: allnoconfig + KCONFIG_ALLCONFIG=katamaran.config, then olddefconfig, then every
 # CONFIG_*=<value> line of the fragment must appear verbatim in .config (else `MISSING: ...`) and
@@ -41,14 +44,36 @@ if [[ -n ${KATAMARAN_BUILD_CONTEXT:-} ]]; then
 fi
 SRC_VOL=katamaran-kbuild-src
 CCACHE_VOL=katamaran-kbuild-ccache
-if command -v shasum >/dev/null 2>&1; then
-	TOOL_TAG=$(printf '%s\n' "$BASE_IMAGE" "$PACKAGES" | shasum -a 256 | cut -c1-12)
-else
-	TOOL_TAG=$(printf '%s\n' "$BASE_IMAGE" "$PACKAGES" | sha256sum | cut -c1-12)
-fi
+sha256() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256
+	else
+		sha256sum
+	fi
+}
+TOOL_TAG=$(printf '%s\n' "$BASE_IMAGE" "$PACKAGES" | sha256 | cut -c1-12)
 TOOL_IMAGE=katamaran-kbuild-toolchain:$TOOL_TAG
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# Identity of everything the Image is built from: kernel version, patch set (in name order)
+# and config fragment. Written next to the Image as Image.stamp.
+image_stamp() {
+	(
+		export LC_ALL=C
+		{
+			echo "$KVER"
+			cat "$HERE"/patches/*.patch 2>/dev/null || true
+			cat "$HERE/katamaran.config"
+		} | sha256 | cut -c1-64
+	)
+}
+if [[ ${1:-} == stamp ]]; then
+	image_stamp
+	exit 0
+fi
+IMAGE_STAMP=$(image_stamp)
+
 OUT=$(cd "$HERE/.." && pwd)/out
 mkdir -p "$OUT"
 
@@ -152,6 +177,7 @@ start=$(date +%s)
 echo ">> built in $(( $(date +%s) - start ))s; ccache: $(ccache -s | grep -iE 'hits:' | head -1 | tr -s ' ')"
 install -m 0644 "$obj/arch/arm64/boot/Image" /out/Image
 install -m 0644 "$obj/.config" /out/kernel.config
+printf '%s\n' "$IMAGE_STAMP" > /out/Image.stamp
 echo ">> $(cat "$obj/include/config/kernel.release"): Image $(stat -c %s /out/Image) bytes"
 
 checker=cache/check-config-$MOBY_COMMIT.sh
@@ -213,4 +239,5 @@ tty=()
 	-e KVER="$KVER" -e KSHA256="$KSHA256" -e KURL="$KURL" \
 	-e KBUILD_BUILD_TIMESTAMP="$KBUILD_TIMESTAMP" \
 	-e MOBY_COMMIT="$MOBY_COMMIT" -e CHECK_CONFIG_SHA256="$CHECK_CONFIG_SHA256" \
+	-e IMAGE_STAMP="$IMAGE_STAMP" \
 	"$TOOL_IMAGE" bash -c "$INNER"
