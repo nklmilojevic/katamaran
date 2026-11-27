@@ -3804,13 +3804,41 @@ fn scan_yaml_root_prologue(text: &str) -> Result<YamlRootStart, ()> {
     Ok(YamlRootStart::Empty)
 }
 
+#[derive(Default)]
+struct FileProxyValues {
+    /// Validity of the latest non-empty value for each distinct raw YAML key
+    /// that normalized to `etcd-s3-proxy` (or `etcd-s3-proxy+`) in one file.
+    valid_by_raw_key: HashMap<String, bool>,
+    last_value: Option<String>,
+}
+
+impl FileProxyValues {
+    fn record(&mut self, raw_key: &str, value: Option<String>) {
+        if let Some(v) = value {
+            let valid = is_valid_etcd_s3_proxy(&v);
+            self.valid_by_raw_key.insert(raw_key.to_string(), valid);
+            self.last_value = Some(v);
+        } else {
+            self.valid_by_raw_key
+                .entry(raw_key.to_string())
+                .or_insert(true);
+        }
+    }
+
+    fn resolve(self) -> Result<Option<String>, ()> {
+        if self.valid_by_raw_key.len() > 1 && self.valid_by_raw_key.values().any(|&valid| !valid) {
+            return Err(());
+        }
+        Ok(self.last_value)
+    }
+}
+
 fn extract_etcd_s3_proxy_from_flow_map(
     doc: &str,
     open_brace_idx: usize,
 ) -> Result<Option<String>, ()> {
     let mut i = open_brace_idx + 1;
-    let mut plain_found: Option<String> = None;
-    let mut append_found: Option<String> = None;
+    let mut values = FileProxyValues::default();
     loop {
         i = skip_flow_ws_and_comments(doc, i);
         let rest = doc.get(i..).ok_or(())?;
@@ -3832,7 +3860,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
         };
         let (key_rest, key_prop_consumed) = strip_yaml_key_properties(rest)?;
         i += key_prop_consumed;
-        let (key, key_consumed) = if key_rest.starts_with('"') {
+        let (raw_key, key_consumed) = if key_rest.starts_with('"') {
             let (k, after) = parse_yaml_double_quoted(key_rest)?;
             (k, key_rest.len() - after.len())
         } else if key_rest.starts_with('\'') {
@@ -3862,7 +3890,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
 
         // Normalize decoded keys with Go `strings.TrimSpace` semantics to match
         // k3s `configfilearg.ToString` before merge, `+` suffix, and proxy checks.
-        let key = key.trim();
+        let key = raw_key.trim();
         if key == "<<" {
             if doc.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(doc) {
                 return Err(());
@@ -3878,9 +3906,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
                     i = skip_flow_value(doc, i)?;
                 }
             } else if !has_value {
-                if !is_append {
-                    plain_found = Some(String::new());
-                }
+                values.record(&raw_key, (!is_append).then(String::new));
             } else {
                 let val_start = skip_flow_ws_and_comments(doc, i);
                 let val_end = skip_flow_value(doc, val_start)?;
@@ -3892,28 +3918,21 @@ fn extract_etcd_s3_proxy_from_flow_map(
                     }
                     None => val_raw,
                 };
-                let mut record = |val: String| {
-                    if is_append {
-                        append_found = Some(val);
-                    } else {
-                        plain_found = Some(val);
-                    }
-                };
                 if val_after_anchor.is_empty() {
-                    if !is_append {
-                        record(String::new());
-                    }
+                    values.record(&raw_key, (!is_append).then(String::new));
                 } else if val_after_anchor.starts_with('[') {
                     match parse_yaml_flow_sequence_last(val_after_anchor)? {
-                        Some(last) => record(last),
-                        None if !is_append => record(String::new()),
-                        None => {}
+                        Some(last) => values.record(&raw_key, Some(last)),
+                        None if !is_append => values.record(&raw_key, Some(String::new())),
+                        None => values.record(&raw_key, None),
                     }
                 } else {
                     let val = parse_yaml_flow_plain_or_quoted_scalar(val_after_anchor)?;
                     let is_yaml_null = val.is_empty() && !val_after_anchor.starts_with(['"', '\'']);
-                    if !(is_append && is_yaml_null) {
-                        record(val);
+                    if is_append && is_yaml_null {
+                        values.record(&raw_key, None);
+                    } else {
+                        values.record(&raw_key, Some(val));
                     }
                 }
                 i = val_end;
@@ -3953,7 +3972,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
         }
     }
 
-    resolve_file_proxy_values(plain_found, append_found)
+    values.resolve()
 }
 
 fn skip_yaml_block_scalar(
@@ -4143,26 +4162,6 @@ fn is_yaml_block_scalar_header(s: &str) -> Option<(char, char, Option<usize>)> {
     }
 }
 
-fn resolve_file_proxy_values(
-    plain_found: Option<String>,
-    append_found: Option<String>,
-) -> Result<Option<String>, ()> {
-    match (plain_found, append_found) {
-        (Some(plain), Some(app)) => {
-            // In k3s, `yaml.v2.Unmarshal` puts both `etcd-s3-proxy` and
-            // `etcd-s3-proxy+` in a Go map whose iteration order is random,
-            // so reject if either value is invalid.
-            if !is_valid_etcd_s3_proxy(&plain) || !is_valid_etcd_s3_proxy(&app) {
-                return Err(());
-            }
-            Ok(Some(app))
-        }
-        (Some(plain), None) => Ok(Some(plain)),
-        (None, Some(app)) => Ok(Some(app)),
-        (None, None) => Ok(None),
-    }
-}
-
 /// Extract the effective top-level `etcd-s3-proxy` value from one k3s YAML
 /// config file. Returns `Ok(None)` when the key is absent, `Ok(Some(val))`
 /// when present, and `Err(())` when the entry cannot be parsed safely.
@@ -4180,8 +4179,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
     };
 
     let lines = split_yaml_lines(text.get(start_offset..).ok_or(())?);
-    let mut plain_found: Option<String> = None;
-    let mut append_found: Option<String> = None;
+    let mut values = FileProxyValues::default();
     let mut root_indent: Option<usize> = None;
     let mut i = 0;
     while i < lines.len() {
@@ -4250,7 +4248,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         if key_slice.starts_with(['[', '{']) {
             return Err(());
         }
-        let Some((key, after_colon)) = parse_yaml_mapping_key(key_slice) else {
+        let Some((raw_key, after_colon)) = parse_yaml_mapping_key(key_slice) else {
             if key_slice.starts_with(['"', '\''])
                 && (key_slice.contains("etcd-s3-proxy")
                     || has_yaml_key_obfuscating_escape(key_slice))
@@ -4262,7 +4260,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         };
         // Match k3s `configfilearg.ToString` (`strings.TrimSpace`) before merge,
         // `+` suffix, and proxy-key checks.
-        let key = key.trim();
+        let key = raw_key.trim();
         if key == "<<" {
             // Fail closed on YAML merge keys when the file may merge an `etcd-s3-proxy` entry.
             if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
@@ -4293,18 +4291,11 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             Some((_, val_rest)) => (true, val_rest),
             None => (false, raw_rest),
         };
-        let mut record = |val: String| {
-            if is_append {
-                append_found = Some(val);
-            } else {
-                plain_found = Some(val);
-            }
-        };
 
         if let Some((style, chomp, explicit_indent)) = is_yaml_block_scalar_header(rest) {
             let (val, next_i) =
                 read_yaml_block_scalar(&lines, i + 1, root, style, chomp, explicit_indent)?;
-            record(val);
+            values.record(&raw_key, Some(val));
             i = next_i;
             continue;
         }
@@ -4314,9 +4305,9 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                 return Err(());
             }
             match parse_yaml_flow_sequence_last(rest)? {
-                Some(last) => record(last),
-                None if !is_append => record(String::new()),
-                None => {}
+                Some(last) => values.record(&raw_key, Some(last)),
+                None if !is_append => values.record(&raw_key, Some(String::new())),
+                None => values.record(&raw_key, None),
             }
             i += 1;
             continue;
@@ -4363,7 +4354,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                 j += 1;
             }
             if saw_seq {
-                record(last_seq.unwrap_or_default());
+                values.record(&raw_key, Some(last_seq.unwrap_or_default()));
             } else if let Some(line) = scalar_line {
                 let val = if has_anchor {
                     parse_yaml_plain_or_quoted_scalar(line)?
@@ -4376,11 +4367,13 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                     split_yaml_anchor(line).map_or(line, |(_, after)| after)
                 };
                 let is_yaml_null = val.is_empty() && !unanchored.starts_with(['"', '\'']);
-                if !(is_append && is_yaml_null) {
-                    record(val);
+                if is_append && is_yaml_null {
+                    values.record(&raw_key, None);
+                } else {
+                    values.record(&raw_key, Some(val));
                 }
-            } else if !is_append {
-                record(String::new());
+            } else {
+                values.record(&raw_key, (!is_append).then(String::new));
             }
             i = j;
             continue;
@@ -4393,13 +4386,15 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         // `&anchor`, malformed `&`, or `*alias` is rejected without recursion.
         let val = parse_yaml_plain_or_quoted_scalar(rest)?;
         let is_yaml_null = val.is_empty() && !rest.starts_with(['"', '\'']);
-        if !(is_append && is_yaml_null) {
-            record(val);
+        if is_append && is_yaml_null {
+            values.record(&raw_key, None);
+        } else {
+            values.record(&raw_key, Some(val));
         }
         i += 1;
     }
 
-    resolve_file_proxy_values(plain_found, append_found)
+    values.resolve()
 }
 
 fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
@@ -10434,6 +10429,24 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             (
                 "repeated root anchors across lines",
                 "&a\n&b\n  etcd-s3-proxy: http://proxy.example.com:8080\n".to_string(),
+            ),
+            (
+                "distinct normalized proxy keys in block map",
+                format!(
+                    "\"etcd-s3-proxy \": {bad_url}\netcd-s3-proxy: http://proxy.example.com:8080\n"
+                ),
+            ),
+            (
+                "distinct normalized proxy keys in flow map",
+                format!(
+                    "{{\"etcd-s3-proxy \": \"{bad_url}\", \"etcd-s3-proxy\": \"http://proxy.example.com:8080\"}}\n"
+                ),
+            ),
+            (
+                "two differently padded proxy keys in block map",
+                format!(
+                    "\"etcd-s3-proxy \": {bad_url}\n\"etcd-s3-proxy\\t\": http://proxy.example.com:8080\n"
+                ),
             ),
         ];
         for (label, yaml) in &bad_cases {
