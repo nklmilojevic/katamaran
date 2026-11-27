@@ -2366,6 +2366,11 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let bin = root.join("target/release/gvproxy");
         if !bin.is_file() {
+            assert!(
+                !env_flag("KATAMARAN_REQUIRE_GVPROXY"),
+                "KATAMARAN_REQUIRE_GVPROXY is set but {} is missing: run `cargo xtask gvproxy`",
+                bin.display()
+            );
             eprintln!("skipped: no gvproxy at {}", bin.display());
             return;
         }
@@ -2413,7 +2418,12 @@ mod tests {
         // Forward addresses beyond 127.0.0.1: gvproxy serves the guest port
         // on a Unix socket and the daemon listens on the Mac's addresses and
         // relays real payloads end-to-end, privileged ports included.
+        // Without an alias this only covers 127.0.0.1; CI sets
+        // KATAMARAN_REQUIRE_LO0_ALIAS so a missing alias fails instead.
         let alias = TestLo0Alias::acquire();
+        if alias.is_none() {
+            eprintln!("note: no lo0 alias configured; alias payloads through gvproxy not tested");
+        }
         let mut configured = vec![Ipv4Addr::LOCALHOST];
         if let Some(a) = &alias {
             configured.push(a.addr);
@@ -3785,8 +3795,20 @@ mod tests {
                     });
                 }
             }
+            assert!(
+                !env_flag("KATAMARAN_REQUIRE_LO0_ALIAS"),
+                "KATAMARAN_REQUIRE_LO0_ALIAS is set but no lo0 alias is available: set \
+                 KATAMARAN_TEST_LO0_ALIAS or run `sudo ifconfig lo0 alias 172.16.1.200`"
+            );
             None
         }
+    }
+
+    /// Whether an opt-in test requirement such as `KATAMARAN_REQUIRE_LO0_ALIAS`
+    /// is set. CI sets these so alias and real-gvproxy coverage fails loudly
+    /// instead of being skipped when its prerequisites are missing.
+    fn env_flag(name: &str) -> bool {
+        std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
     }
 
     impl Drop for TestLo0Alias {
