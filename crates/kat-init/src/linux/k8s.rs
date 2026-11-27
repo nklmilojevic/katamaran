@@ -42,6 +42,13 @@ const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
 const DATA_VERSION_FILE: &str = "/var/lib/katamaran/k3s/data/.katamaran-version";
+/// Copy of the datastore version kept inside `server/` itself, written before
+/// every launch of k3s against an existing `server/`. Unlike
+/// `.katamaran-version`, it travels with any backup or restore of `server/`, so
+/// an unmarked `server/` that a tracking-enabled release ever opened still
+/// records the newest k3s that may have opened it. Excluded from
+/// `snapshot_datastore`.
+const SERVER_VERSION_STAMP: &str = ".katamaran-k3s-version";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
@@ -299,6 +306,32 @@ fn datastore_exists(data_dir: &Path) -> Result<bool, String> {
     }
 }
 
+fn server_version_stamp(data_dir: &Path) -> PathBuf {
+    data_dir.join("server").join(SERVER_VERSION_STAMP)
+}
+
+/// Record `version` in `server/SERVER_VERSION_STAMP` when `server/` is an
+/// existing real directory (a fresh datastore gets its stamp on its next start).
+fn write_server_version_stamp(data_dir: &Path, version: &str) -> Result<(), String> {
+    let server_dir = data_dir.join("server");
+    match fs::symlink_metadata(&server_dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory; refusing to record its k3s version",
+                server_dir.display()
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("stat {}: {e}", server_dir.display())),
+    }
+    let stamp = server_version_stamp(data_dir);
+    if matches!(read_marker_file(&stamp)?, MarkerFile::Present(v) if v == version) {
+        return Ok(());
+    }
+    write_atomic(&stamp, format!("{version}\n").as_bytes())
+}
+
 fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
     match fs::read_to_string(path) {
         Ok(s) => {
@@ -332,7 +365,8 @@ const STATE_DB_MAX_BLOB_BYTES: usize = 4 << 20;
 /// could run: those releases always ran their pinned build and never wrote
 /// `.katamaran-version`, while every tracking-enabled release writes the
 /// marker before launching k3s. An unmarked datastore that katamaran itself
-/// created can therefore only have been opened by one of these builds, so a
+/// created, and whose `server/` carries no `SERVER_VERSION_STAMP` (written before
+/// every tracking-era launch), can therefore only have been opened by one of these builds, so a
 /// `state.db` node version matching one of them is corroborated by both the
 /// datastore and katamaran's release history. Any other detected version is
 /// only a lower bound (a newer server may have opened the datastore before its
@@ -1065,6 +1099,17 @@ fn mark_datastore_version_at_with(
             "refusing to mark datastore as {version}: server/db/state.db already records newer k3s {detected}"
         ));
     }
+    if let MarkerFile::Present(stamped) = read_marker_file(&server_version_stamp(data_dir))?
+        && let (Some(supplied_mm), Some(stamped_mm)) = (
+            parse_strict_k3s_tag(version),
+            parse_strict_k3s_tag(&stamped),
+        )
+        && supplied_mm < stamped_mm
+    {
+        return Err(format!(
+            "refusing to mark datastore as {version}: server/{SERVER_VERSION_STAMP} records newer k3s {stamped}"
+        ));
+    }
     write_atomic_new(data_version_file, format!("{version}\n").as_bytes())
 }
 
@@ -1073,8 +1118,9 @@ fn mark_datastore_version_at_with(
 /// Uses `data_version_file` inside `data_dir` when present, and never falls
 /// back to `VERSION_FILE` (the installed binary's version). When
 /// `data_version_file` is absent (`NotFound`), inspects `server/db/state.db`
-/// read-only for the node's recorded `kubeletVersion` and accepts it only when
-/// it is one of `PRE_TRACKING_K3S_VERSIONS`, so clusters created by older
+/// first uses `server/SERVER_VERSION_STAMP`, and only when that is absent too
+/// inspects `server/db/state.db` read-only for the node's recorded
+/// `kubeletVersion`, accepting it only when it is one of `PRE_TRACKING_K3S_VERSIONS`, so clusters created by older
 /// katamaran releases upgrade seamlessly. Any other detected version is only a
 /// lower bound and is rejected. Only recommends `kat k8s mark-version` when
 /// `data_version_file` is absent (`NotFound`), never when an empty or
@@ -1091,6 +1137,24 @@ fn effective_datastore_version_with(
     match read_marker_file(data_version_file)? {
         MarkerFile::Present(v) => Ok(Some(v)),
         MarkerFile::Missing => {
+            let stamp = server_version_stamp(data_dir);
+            match read_marker_file(&stamp)? {
+                // Written before every tracking-era launch, so it is at least the
+                // newest k3s that opened this `server/`.
+                MarkerFile::Present(v) => return Ok(Some(v)),
+                MarkerFile::Empty => {
+                    return Err(corrupt_datastore_version_error(&stamp, "is empty"));
+                }
+                MarkerFile::NonRegular => {
+                    return Err(corrupt_datastore_version_error(
+                        &stamp,
+                        "is not a regular file",
+                    ));
+                }
+                // No tracking-enabled release ever launched k3s against this
+                // `server/`, so only a pre-tracking pinned build can have opened it.
+                MarkerFile::Missing => {}
+            }
             match detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd) {
                 Some(detected) if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) => {
                     Ok(Some(detected))
@@ -1299,6 +1363,15 @@ fn snapshot_datastore(data_dir: &Path) -> io::Result<DatastoreSnapshot> {
             let canonical_root = fs::canonicalize(&server_dir)?;
             let mut entries = Vec::new();
             collect_datastore_entries(&server_dir, &canonical_root, PathBuf::new(), &mut entries)?;
+            // Writing SERVER_VERSION_STAMP is katamaran's own bookkeeping, not a
+            // change by k3s: drop the stamp and the times it bumps on `server/`.
+            entries.retain(|e| e.rel_path != Path::new(SERVER_VERSION_STAMP));
+            for e in &mut entries {
+                if e.rel_path.as_os_str().is_empty() {
+                    e.mtime = (0, 0);
+                    e.ctime = (0, 0);
+                }
+            }
             Ok(DatastoreSnapshot::Present(entries))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DatastoreSnapshot::Absent),
@@ -1329,11 +1402,19 @@ fn rollback_data_version_if_untouched(
     }
 }
 
+/// Restore `.katamaran-version` at `path` to `prev`. When `prev` is a version,
+/// the `server/` stamp is restored with it; otherwise the stamp is left in
+/// place, which can only over-state the newest k3s that opened `server/`.
 fn restore_data_version(path: &Path, prev: Option<&str>) {
     match prev {
         Some(v) => {
             if let Err(e) = write_atomic(path, format!("{v}\n").as_bytes()) {
                 log(&format!("restore {}: {e}", path.display()));
+            }
+            if let Some(data_dir) = path.parent()
+                && let Err(e) = write_server_version_stamp(data_dir, v)
+            {
+                log(&format!("restore server version stamp: {e}"));
             }
         }
         None => {
@@ -1939,6 +2020,12 @@ impl K8s {
                 Path::new(DATA_VERSION_FILE),
                 format!("{installed_version}\n").as_bytes(),
             )?;
+        }
+        if let Err(e) = write_server_version_stamp(Path::new(DATA_DIR), &installed_version) {
+            if wrote_data_version {
+                restore_data_version(Path::new(DATA_VERSION_FILE), prev_data_version.as_deref());
+            }
+            return Err(e);
         }
         if let Err(e) = enable_bridge_netfilter() {
             if wrote_data_version {
@@ -4588,5 +4675,57 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         }
         assert_eq!(validate_k3s_release_tag("v1.31.0+k3s1"), Ok(()));
         assert!(validate_k3s_release_tag("v1.30.9+k3s1").is_err());
+    }
+
+    #[test]
+    fn server_stamp_outranks_stale_node_record_and_is_ignored_by_snapshots() {
+        assert!(Path::new(SQLITE3_BIN).is_file());
+        let dir = temp_dir("server-stamp");
+        let data_dir = dir.join("data");
+        let marker = data_dir.join(".katamaran-version");
+        let db_dir = data_dir.join("server/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let v37 = hex_upper(&encode_k8s_node_proto("v1.37.2+k3s1"));
+        sqlite_exec(
+            &db_dir.join("state.db"),
+            &format!(
+                "CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+
+        // Writing the stamp does not count as a datastore change for rollback.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_server_version_stamp(&data_dir, "v1.38.0+k3s1").unwrap();
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+
+        // A server/ backup without its marker, taken after a v1.38 server opened it but
+        // before its kubelet reported status: the node record still says the pre-tracking
+        // pin, but the stamp that travels with server/ blocks the older build.
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        let err = mark_datastore_version_at(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("records newer k3s v1.38.0+k3s1"), "{err}");
+        assert!(!marker.exists());
+
+        // Restoring a previous marker version rolls the stamp back with it.
+        restore_data_version(&marker, Some("v1.37.2+k3s1"));
+        assert_eq!(
+            fs::read_to_string(server_version_stamp(&data_dir)).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+
+        // An empty stamp fails closed instead of falling back to the node record.
+        fs::remove_file(&marker).unwrap();
+        fs::write(server_version_stamp(&data_dir), "").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        // Without server/, nothing is stamped.
+        let fresh = dir.join("fresh");
+        write_server_version_stamp(&fresh, "v1.37.2+k3s1").unwrap();
+        assert!(!fresh.join("server").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
