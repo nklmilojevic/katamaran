@@ -1144,7 +1144,7 @@ fn effective_datastore_version_with(
         return Ok(None);
     }
     match read_marker_file(data_version_file)? {
-        MarkerFile::Present(v) => Ok(Some(v)),
+        MarkerFile::Present(v) => newer_of_marker_and_stamp(data_dir, v).map(Some),
         MarkerFile::Missing => {
             let stamp = server_version_stamp(data_dir);
             match read_marker_file(&stamp)? {
@@ -1184,6 +1184,34 @@ fn effective_datastore_version_with(
         )),
         MarkerFile::NonRegular => Err(corrupt_datastore_version_error(
             data_version_file,
+            "is not a regular file",
+        )),
+    }
+}
+
+/// Katamaran always writes `.katamaran-version` and the `server/db/` stamp
+/// together, so they only disagree when one was restored without the other
+/// (for example `server/db/` from a newer backup beside a stale outer marker).
+/// Use whichever records the newer minor so the downgrade guard still holds.
+fn newer_of_marker_and_stamp(data_dir: &Path, marker: String) -> Result<String, String> {
+    let stamp_path = server_version_stamp(data_dir);
+    match read_marker_file(&stamp_path)? {
+        MarkerFile::Missing => Ok(marker),
+        MarkerFile::Present(stamp) => {
+            let Some(stamp_mm) = parse_k3s_minor(&stamp) else {
+                return Err(corrupt_datastore_version_error(
+                    &stamp_path,
+                    &format!("records an invalid k3s version {stamp:?}"),
+                ));
+            };
+            match parse_k3s_minor(&marker) {
+                Some(marker_mm) if marker_mm >= stamp_mm => Ok(marker),
+                _ => Ok(stamp),
+            }
+        }
+        MarkerFile::Empty => Err(corrupt_datastore_version_error(&stamp_path, "is empty")),
+        MarkerFile::NonRegular => Err(corrupt_datastore_version_error(
+            &stamp_path,
             "is not a regular file",
         )),
     }
@@ -4767,6 +4795,18 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         });
         assert!(check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").is_err());
         fs::remove_file(db_dir.join("state.db-touched")).unwrap();
+
+        // With both files present, the newer minor wins either way round.
+        restore_server_version_stamp(&data_dir, Some("v1.38.0+k3s1"));
+        fs::write(&marker, "v1.37.2+k3s1\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        fs::write(&marker, "v1.38.0+k3s1\n").unwrap();
+        restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        assert!(check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").is_err());
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        fs::remove_file(&marker).unwrap();
 
         // An empty stamp fails closed instead of falling back to the node record.
         fs::write(server_version_stamp(&data_dir), "").unwrap();
