@@ -251,16 +251,13 @@ impl Config {
                 }
             }
             "k8s_disable" => next.k8s_disable = parse_k8s_disable(value)?,
-            "k8s_args" => {
-                next.k8s_args = parse_k8s_args(value)?;
-                // Same check the guest applies before starting k3s, so `kat
-                // config set` refuses (and never saves) arguments it would reject.
-                kat_proto::k8s::validate_k3s_extra_args(&next.k8s_args)
-                    .map_err(anyhow::Error::msg)?;
-            }
+            "k8s_args" => next.k8s_args = parse_k8s_args(value)?,
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
+        if matches!(key, "k8s_disable" | "k8s_args") {
+            next.validate_k8s_settings()?;
+        }
         *self = next;
         Ok(())
     }
@@ -309,21 +306,24 @@ impl Config {
         if let Some(v) = &self.k8s_version {
             validate_k8s_version(v)?;
         }
+        // `k8s_disable` / `k8s_args` are deliberately not checked here: this
+        // runs on every load, and a bad Kubernetes setting in a hand-edited
+        // config.toml must fail only the Kubernetes start, not the VM.
+        Ok(())
+    }
+
+    /// Full check of `k8s_disable` and `k8s_args`, the same one the guest
+    /// applies before starting k3s. Run by `set` for those keys (so `kat
+    /// config set` never saves values the guest would reject, such as an
+    /// inline token) and at every Kubernetes start.
+    pub fn validate_k8s_settings(&self) -> anyhow::Result<()> {
         let mut total_k8s_bytes = 0usize;
         for component in &self.k8s_disable {
             validate_k8s_disable_item(component)?;
             total_k8s_bytes = total_k8s_bytes.saturating_add("--disable=".len() + component.len());
         }
-        // Only structural checks here: this also runs when loading
-        // config.toml, and a reserved flag must not stop the whole VM from
-        // starting. `set` and Kubernetes start apply the full check.
+        kat_proto::k8s::validate_k3s_extra_args(&self.k8s_args).map_err(anyhow::Error::msg)?;
         for arg in &self.k8s_args {
-            if arg.is_empty() {
-                bail!("k8s_args must not contain empty arguments");
-            }
-            if arg.contains('\0') {
-                bail!("k8s_args must not contain NUL bytes");
-            }
             total_k8s_bytes = total_k8s_bytes.saturating_add(arg.len());
         }
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
@@ -898,8 +898,12 @@ mod tests {
         assert!(cfg.set("k8s_args", "--foo=\"unterminated", &HOST).is_err());
         assert!(cfg.set("k8s_args", "--foo\\", &HOST).is_err());
         assert!(cfg.set("k8s_args", "''", &HOST).is_err());
-        assert!(Config::parse("k8s_args = [\"\"]\n").is_err());
-        assert!(Config::parse("k8s_disable = [\"--traefik\"]\n").is_err());
+        // Hand-edited values load (the VM must still start) but fail the
+        // Kubernetes-start check.
+        for text in ["k8s_args = [\"\"]\n", "k8s_disable = [\"--traefik\"]\n"] {
+            let loaded = Config::parse(text).unwrap();
+            assert!(loaded.validate_k8s_settings().is_err(), "{text}");
+        }
         assert_eq!(cfg, Config::default());
     }
 
@@ -939,9 +943,16 @@ mod tests {
 
         // A hand-edited config.toml with a reserved flag still loads (so the
         // VM and Docker start) and can be repaired with `config set`.
-        let mut loaded = Config::parse("k8s_args = [\"--token=x\"]\n").unwrap();
-        loaded.set("k8s_args", "", &host).unwrap();
-        assert!(loaded.k8s_args.is_empty());
+        let mut loaded =
+            Config::parse("k8s_args = [\"--token=x\", \"\"]\nk8s_disable = [\"traefik \"]\n")
+                .unwrap();
+        assert!(loaded.validate_k8s_settings().is_err());
+        loaded.set("cpus", "2", &host).unwrap();
+        loaded.set("k8s_args", "", &host).unwrap_err(); // k8s_disable is still bad
+        loaded.set("k8s_disable", "traefik", &host).unwrap_err(); // k8s_args still bad
+        loaded.k8s_args.clear();
+        loaded.set("k8s_disable", "traefik", &host).unwrap();
+        loaded.validate_k8s_settings().unwrap();
     }
 
     #[test]

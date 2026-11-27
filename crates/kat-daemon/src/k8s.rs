@@ -126,9 +126,9 @@ pub fn read_k3s_config(home: &Path) -> anyhow::Result<Option<String>> {
 /// Build the guest `K8sMsg::Start` request from `config.toml` and optional `<home>/k3s-config.yaml`.
 pub fn build_start_msg(home: &Path) -> anyhow::Result<K8sMsg> {
     let cfg = crate::config::Config::load(home)?;
-    // config.toml may have been edited by hand: report reserved or
-    // credential-bearing k8s_args here, before anything reaches the guest.
-    k8s::validate_k3s_extra_args(&cfg.k8s_args).map_err(anyhow::Error::msg)?;
+    // config.toml may have been edited by hand: report invalid k8s_disable /
+    // k8s_args here, before anything reaches the guest.
+    cfg.validate_k8s_settings()?;
     let extra_args = cfg.k8s_server_extra_args();
     let config_yaml = read_k3s_config(home)?;
     Ok(K8sMsg::Start {
@@ -213,34 +213,45 @@ pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
 
 /// Query the guest Kubernetes service's capability bitmask (see `kat_proto::k8s::CAP_*`).
 /// Older guests fail to decode `Capabilities` and close the connection without
-/// replying; only that signal (clean close, EOF or reset after the request),
-/// confirmed by a working `Status` call, maps to `Ok(0)`. Write failures and
-/// `Error` replies are real errors.
+/// replying. Only that signal (clean close, EOF or reset after the request),
+/// seen on two separate probes with a working `Status` call in between, maps
+/// to `Ok(0)`, so one transient connection drop is not mistaken for an old
+/// guest. Write failures and `Error` replies are real errors.
 pub fn guest_capabilities(home: &Path) -> anyhow::Result<u32> {
+    for attempt in 0..2 {
+        match probe_capabilities(home)? {
+            Some(caps) => return Ok(caps),
+            None if guest_status(home).is_err() => {
+                bail!("the guest closed the Kubernetes connection")
+            }
+            None if attempt == 0 => continue,
+            None => {}
+        }
+    }
+    Ok(0)
+}
+
+/// One `Capabilities` round trip: `Ok(Some(caps))` on a reply, `Ok(None)` when
+/// the guest closed the connection the way older guests do.
+fn probe_capabilities(home: &Path) -> anyhow::Result<Option<u32>> {
     let mut s = connect(home)?;
     k8s::write(&mut s, &K8sMsg::Capabilities)?;
     match k8s::read(&mut s) {
-        Ok(Some(K8sMsg::CapabilitiesInfo(caps))) => Ok(caps),
+        Ok(Some(K8sMsg::CapabilitiesInfo(caps))) => Ok(Some(caps)),
         Ok(Some(K8sMsg::Error(e))) => bail!("{e}"),
-        Ok(None) => {
-            if guest_status(home).is_ok() {
-                return Ok(0);
-            }
-            bail!("the guest closed the Kubernetes connection");
-        }
         Ok(Some(other)) => bail!("unexpected capabilities response {other:?}"),
-        Err(e) => {
+        Ok(None) => Ok(None),
+        Err(e)
             if matches!(
                 e.kind(),
                 io::ErrorKind::ConnectionReset
                     | io::ErrorKind::BrokenPipe
                     | io::ErrorKind::UnexpectedEof
-            ) && guest_status(home).is_ok()
-            {
-                return Ok(0);
-            }
-            Err(e.into())
+            ) =>
+        {
+            Ok(None)
         }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -254,9 +265,9 @@ pub fn ensure_start_supported(home: &Path, msg: &K8sMsg) -> anyhow::Result<()> {
     let caps = guest_capabilities(home)?;
     if caps & k8s::CAP_START_CONFIG == 0 {
         bail!(
-            "the running guest initramfs does not support custom k8s_disable, k8s_args, or \
-             k3s-config.yaml; update or rebuild the guest initramfs (or clear those settings) \
-             and restart the VM"
+            "the running guest did not report support for custom k8s_disable, k8s_args, or \
+             k3s-config.yaml, which usually means its initramfs predates them; update or \
+             rebuild the guest initramfs (or clear those settings) and restart the VM"
         );
     }
     Ok(())
@@ -2080,14 +2091,16 @@ users:
         // 1. Old guest: closes connection on unknown Capabilities, answers Status.
         let listener = UnixListener::bind(&sock).unwrap();
         let old_guest = thread::spawn(move || {
-            // First connection: Capabilities -> close immediately (simulating UnknownKind).
-            let (mut c1, _) = listener.accept().unwrap();
-            assert_eq!(k8s::read(&mut c1).unwrap(), Some(K8sMsg::Capabilities));
-            drop(c1);
-            // Second connection: Status -> StatusInfo.
-            let (mut c2, _) = listener.accept().unwrap();
-            assert_eq!(k8s::read(&mut c2).unwrap(), Some(K8sMsg::Status));
-            k8s::write(&mut c2, &K8sMsg::StatusInfo(K8sInfo::default())).unwrap();
+            // Each probe: Capabilities -> close immediately (simulating
+            // UnknownKind), then Status -> StatusInfo. The host probes twice.
+            for _ in 0..2 {
+                let (mut c1, _) = listener.accept().unwrap();
+                assert_eq!(k8s::read(&mut c1).unwrap(), Some(K8sMsg::Capabilities));
+                drop(c1);
+                let (mut c2, _) = listener.accept().unwrap();
+                assert_eq!(k8s::read(&mut c2).unwrap(), Some(K8sMsg::Status));
+                k8s::write(&mut c2, &K8sMsg::StatusInfo(K8sInfo::default())).unwrap();
+            }
         });
         let err = ensure_start_supported(&home, &extended).unwrap_err();
         assert!(
@@ -2095,6 +2108,24 @@ users:
             "expected initramfs update guidance, got: {err:#}"
         );
         old_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 1b. A current guest whose first probe connection drops is not
+        // mistaken for an old guest: the retry sees CAP_START_CONFIG.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let flaky_guest = thread::spawn(move || {
+            let (mut c1, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c1).unwrap(), Some(K8sMsg::Capabilities));
+            drop(c1);
+            let (mut c2, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c2).unwrap(), Some(K8sMsg::Status));
+            k8s::write(&mut c2, &K8sMsg::StatusInfo(K8sInfo::default())).unwrap();
+            let (mut c3, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c3).unwrap(), Some(K8sMsg::Capabilities));
+            k8s::write(&mut c3, &K8sMsg::CapabilitiesInfo(k8s::CAP_START_CONFIG)).unwrap();
+        });
+        ensure_start_supported(&home, &extended).unwrap();
+        flaky_guest.join().unwrap();
         let _ = fs::remove_file(&sock);
 
         // 2. New guest advertising CAP_START_CONFIG succeeds.

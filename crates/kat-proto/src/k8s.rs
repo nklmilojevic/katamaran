@@ -345,13 +345,46 @@ const MANAGED_K3S_FLAGS: &[&str] = &[
     "disable-kube-proxy",
 ];
 
-/// Component settings the guest passes (or relies on) via `--kubelet-arg` /
-/// `--kube-proxy-arg`: stop/reset unmount the managed kubelet root and delete
-/// only kube-proxy's nftables table, and kubelet must use the shared
-/// containerd.
+/// Component settings that would override something katamaran manages,
+/// directly or through the component's own config file: the kubelet root
+/// that stop/reset unmount, the shared containerd, the node name, the pod and
+/// service CIDRs and cluster DNS, kube-proxy's nftables mode (stop/reset only
+/// delete its nftables table), and the API server address the relay uses.
+/// Other component arguments pass through unchecked.
 const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
-    ("kubelet-arg", &["root-dir", "container-runtime-endpoint"]),
-    ("kube-proxy-arg", &["proxy-mode"]),
+    (
+        "kubelet-arg",
+        &[
+            "root-dir",
+            "container-runtime-endpoint",
+            "hostname-override",
+            "cluster-dns",
+            "config",
+            "config-dir",
+        ],
+    ),
+    (
+        "kube-proxy-arg",
+        &[
+            "proxy-mode",
+            "cluster-cidr",
+            "hostname-override",
+            "config",
+            "write-config-to",
+        ],
+    ),
+    (
+        "kube-apiserver-arg",
+        &["secure-port", "bind-address", "service-cluster-ip-range"],
+    ),
+    (
+        "kube-controller-manager-arg",
+        &[
+            "cluster-cidr",
+            "service-cluster-ip-range",
+            "allocate-node-cidrs",
+        ],
+    ),
 ];
 
 /// Flags whose value can carry credentials. `k8s_args` end up on the k3s
@@ -442,6 +475,11 @@ mod tests {
         v(&["--disable=traefik", "--debug", "--kubelet-arg=max-pods=200"]).unwrap();
         v(&["--kubelet-arg", "max-pods=200", "--node-label", "a=b"]).unwrap();
         v(&["--kube-proxy-arg=metrics-bind-address=0.0.0.0:10249"]).unwrap();
+        v(&[
+            "--kube-apiserver-arg=audit-log-path=-",
+            "--kubelet-arg=max-pods=200",
+        ])
+        .unwrap();
         // Positional values that merely look like names are not flags.
         v(&["--node-label", "token=x"]).unwrap();
 
@@ -498,6 +536,15 @@ mod tests {
             vec!["--kubelet-arg=root-dir"],
             vec!["--kube-proxy-arg=proxy-mode=iptables"],
             vec!["--kube-proxy-arg", "proxy_mode=ipvs"],
+            vec!["--kube-proxy-arg=config=/var/lib/kp.yaml"],
+            vec!["--kube-proxy-arg=write-config-to=/tmp/x"],
+            vec!["--kubelet-arg=config=/etc/kubelet.yaml"],
+            vec!["--kubelet-arg=config-dir=/etc/kubelet.d"],
+            vec!["--kubelet-arg=hostname-override=x"],
+            vec!["--kube-apiserver-arg=secure-port=7443"],
+            vec!["--kube-apiserver-arg=service-cluster-ip-range=10.9.0.0/16"],
+            vec!["--kube-controller-manager-arg=cluster-cidr=10.8.0.0/16"],
+            vec!["--kube-controller-manager-arg=allocate_node_cidrs=false"],
         ] {
             assert!(v(&kubelet).is_err(), "{kubelet:?}");
         }
