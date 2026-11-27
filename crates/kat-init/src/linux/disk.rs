@@ -97,16 +97,21 @@ pub fn grow_if_needed(
 
 fn open_dir(mount_point: &str) -> io::Result<OwnedFd> {
     let path = CString::new(mount_point)?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+    loop {
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn block_device_bytes(dev_path: &str) -> io::Result<u64> {
@@ -127,9 +132,15 @@ fn block_device_bytes(dev_path: &str) -> io::Result<u64> {
 
 fn btrfs_fs_info(fd: libc::c_int) -> io::Result<FsInfo> {
     let mut args: BtrfsIoctlFsInfoArgs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_FS_INFO as _, &mut args) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
+    loop {
+        let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_FS_INFO as _, &mut args) };
+        if rc >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
     Ok(FsInfo {
         max_id: args.max_id,
@@ -142,9 +153,15 @@ fn btrfs_fs_info(fd: libc::c_int) -> io::Result<FsInfo> {
 fn btrfs_dev_info(fd: libc::c_int, devid: u64) -> io::Result<Option<DevInfo>> {
     let mut args: BtrfsIoctlDevInfoArgs = unsafe { std::mem::zeroed() };
     args.devid = devid;
-    let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_DEV_INFO as _, &mut args) };
-    if rc < 0 {
+    loop {
+        let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_DEV_INFO as _, &mut args) };
+        if rc >= 0 {
+            break;
+        }
         let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
         if err.raw_os_error() == Some(libc::ENODEV) {
             return Ok(None);
         }
@@ -168,10 +185,16 @@ fn btrfs_resize(fd: libc::c_int, devid: u64, plan: ResizePlan) -> io::Result<()>
     let Some(args) = resize_args(devid, plan) else {
         return Ok(());
     };
-    let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_RESIZE as _, &args) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let rc = loop {
+        let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_RESIZE as _, &args) };
+        if rc >= 0 {
+            break rc;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    };
     if rc > 0 {
         return Err(io::Error::other(format!(
             "btrfs resize returned error code {rc}"

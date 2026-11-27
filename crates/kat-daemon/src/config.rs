@@ -817,14 +817,19 @@ fn lock_blocking(home: &Path, name: &str) -> anyhow::Result<File> {
 
 fn try_lock_nonblocking(home: &Path, name: &str) -> anyhow::Result<Option<File>> {
     let (path, file) = open_lock_file(home, name)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
     }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(None);
-    }
-    Err(err).with_context(|| format!("lock {}", path.display()))
 }
 
 /// Acquire the cross-process lock protecting `config.toml` updates.
