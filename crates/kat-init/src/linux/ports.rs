@@ -28,7 +28,9 @@ use crate::autofwd::Listener;
 const INTERVAL: Duration = Duration::from_millis(200);
 const TCP_LISTEN: &str = "0A";
 
-/// With `auto`, container ports are auto-forwarded too (linux/autofwd.rs).
+/// `auto` is the vsock relay (linux/autofwd.rs): it forwards ports Docker
+/// published on the VM's loopback, and container ports unless auto-forwarding
+/// is off. `None` only if the relay could not start.
 pub fn watch(notifier: Notifier, mut auto: Option<AutoForward>) {
     let spawned = thread::Builder::new().name("ports".into()).spawn(move || {
         let mut known = BTreeSet::new();

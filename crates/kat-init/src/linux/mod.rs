@@ -360,7 +360,11 @@ fn start_network(notifier: &Notifier) {
             // Started even with auto-forwarding off: it also carries the
             // ports Docker publishes on the VM's loopback (`-p 127.0.0.1:...`).
             let auto = autofwd::AutoForward::start(autofwd::enabled(&cmdline))
-                .inspect_err(|e| log(&format!("no auto-forward: {e}")))
+                .inspect_err(|e| {
+                    log(&format!(
+                        "no vsock port forwarding (auto-forward and loopback -p ports): {e}"
+                    ))
+                })
                 .ok();
             ports::watch(notifier.clone(), auto)
         }

@@ -325,7 +325,7 @@ impl AutoForwardTracker {
             self.unbound[idx].retry_at = None;
             if !std::mem::replace(&mut self.unbound[idx].wait_logged, true) {
                 eprintln!(
-                    "katamaran: auto-forward {}:{port}/{} waits for the published forward to release the port",
+                    "katamaran: vsock forward {}:{port}/{} waits for the published forward to release the port",
                     self.forwards.label(),
                     proto.as_str()
                 );
@@ -342,7 +342,7 @@ impl AutoForwardTracker {
                         .map(<[std::net::Ipv4Addr]>::to_vec)
                         .unwrap_or_else(|| vec![std::net::Ipv4Addr::LOCALHOST]);
                     println!(
-                        "katamaran: auto-forwarding {}:{port}/{}",
+                        "katamaran: forwarding {}:{port}/{} over vsock",
                         net::addrs_label(&addrs),
                         proto.as_str()
                     );
@@ -364,7 +364,7 @@ impl AutoForwardTracker {
         };
         if !self.unbound[idx].reported.contains(&err) {
             eprintln!(
-                "katamaran: cannot auto-forward {}:{port}/{} yet ({err}); will retry",
+                "katamaran: cannot forward {}:{port}/{} over vsock yet ({err}); will retry",
                 self.forwards.label(),
                 proto.as_str()
             );
@@ -418,7 +418,7 @@ impl AutoForwardTracker {
         let label = self.forwards.bound_label(port);
         if self.forwards.remove(port) {
             println!(
-                "katamaran: stopped auto-forwarding {label}:{port}/{}",
+                "katamaran: stopped forwarding {label}:{port}/{} over vsock",
                 proto.as_str()
             );
             on_event(Event::PortRemove(PortOrigin::Automatic, proto, port));
