@@ -41,7 +41,13 @@ jobs:
       - name: Build gvproxy
         run: |
           go version
+          # Swatinem/rust-cache caches target/ and prunes non-Cargo files on
+          # save, which can leave an empty module dir under target/go/mod that
+          # tricks `go mod download` into skipping extraction. Clear target/go
+          # and target/gvproxy-src before and after building gvproxy.
+          rm -rf target/go target/gvproxy-src
           cargo xtask gvproxy
+          rm -rf target/go target/gvproxy-src
           test -x target/release/gvproxy
           test -f target/release/libgvproxy.dylib
       - name: Add lo0 alias for forwarding tests
