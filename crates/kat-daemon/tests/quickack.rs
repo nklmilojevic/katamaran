@@ -64,6 +64,14 @@ PUSHED_HDR = (
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
+THREE_MID = b"m" * 2048
+THREE_TAIL = b"t" * 8192
+THREE_HDR = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: " + str(len(THREE_MID) + len(THREE_TAIL)).encode() + b"\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
 
 def handle(conn):
     try:
@@ -100,6 +108,14 @@ def handle(conn):
                     conn.sendall(PUSHED_CHUNK)
                     time.sleep(0.0005)
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+            elif req_hdr.startswith(b"GET /three "):
+                # Three sub-MSS writes with TCP_NODELAY=0: let write 1's ACK
+                # arrive before sending write 2 (hdr + 2 KiB < 4 KiB lowat),
+                # then immediately queue write 3 (8 KiB) behind Nagle.
+                conn.sendall(THREE_HDR)
+                time.sleep(0.002)
+                conn.sendall(THREE_MID)
+                conn.sendall(THREE_TAIL)
             else:
                 conn.sendall(HDR)
                 conn.sendall(BODY)
@@ -129,6 +145,7 @@ import select, socket, sys, time
 
 host = sys.argv[1]
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+three_req = b"GET /three HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
@@ -192,13 +209,13 @@ cur_lowat = 1
 use_poll = False
 buf = b""
 
-def run_burst(count):
+def run_burst(count, req_bytes=req):
     global buf
     times_ms = []
     t_all = time.monotonic()
     for _ in range(count):
         t0 = time.monotonic()
-        sock.sendall(req)
+        sock.sendall(req_bytes)
         if use_poll and not buf:
             events = poller.poll(10000)
             if not events:
@@ -259,6 +276,8 @@ else:
             run_stream(paced_req, 32 * 4096)
         elif line == "pushed":
             run_stream(pushed_req, 48 * 60000)
+        elif line.startswith("three "):
+            run_burst(int(line.split()[1]), three_req)
         elif line.startswith("rcvlowat "):
             cur_lowat = int(line.split()[1])
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
@@ -951,6 +970,21 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "SO_RCVLOWAT=4096 poll keep-alive stalled with quickack=Y (p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms)"
     );
 
+    // Three-write response with SO_RCVLOWAT=4096 (70B hdr + 2 KiB mid < 4 KiB,
+    // followed by 8 KiB tail behind Nagle): write 1 is ACKed immediately and
+    // write 2's delayed ACK is capped to a short deadline rather than 40-50 ms.
+    let (three_on_p50, three_on_total) = send_cmd(
+        "three 10",
+        "SO_RCVLOWAT=4096 three-write keep-alive (quickack=Y)",
+    );
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=4096 three-write keep-alive (quickack=Y): p50={three_on_p50:.2}ms total={three_on_total:.2}ms"
+    );
+    assert!(
+        three_on_p50 < 25.0,
+        "SO_RCVLOWAT=4096 three-write hit stock delayed-ACK stall with quickack=Y (p50={three_on_p50:.2}ms total={three_on_total:.2}ms)"
+    );
+
     // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments):
     // !after(rcv_wup, copied_seq) ensures the override fires at most once per
     // unread batch rather than ACKing every pushed segment below SO_RCVLOWAT.
@@ -1003,6 +1037,17 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         assert!(
             lowat_off_p50 >= 25.0,
             "expected SO_RCVLOWAT=4096 poll stall with quickack=0 (got p50={lowat_off_p50:.2}ms total={lowat_off_total:.2}ms)"
+        );
+        let (three_off_p50, three_off_total) = send_cmd(
+            "three 6",
+            "SO_RCVLOWAT=4096 three-write keep-alive (quickack=N)",
+        );
+        eprintln!(
+            "pod-to-pod SO_RCVLOWAT=4096 three-write keep-alive (quickack=N): p50={three_off_p50:.2}ms total={three_off_total:.2}ms"
+        );
+        assert!(
+            three_off_p50 >= 35.0,
+            "expected SO_RCVLOWAT=4096 three-write stall with quickack=0 (got p50={three_off_p50:.2}ms total={three_off_total:.2}ms)"
         );
 
         send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144 (quickack=N)");
