@@ -8,7 +8,7 @@
 //! `moby` namespace into `k8s.io`.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hash::Hasher;
@@ -72,7 +72,11 @@ static SERVICE: OnceLock<Arc<K8s>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-static IMAGE_SYNC_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes image syncs and holds publications whose post-create source
+/// check was inconclusive (name -> published `k8s.io` digest). Entries
+/// persist across sync calls until the source is re-evaluated or the
+/// published digest is confirmed retired, replaced, or gone.
+static IMAGE_SYNC_LOCK: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A k3s child that survived SIGKILL after its `Running` handle was dropped,
 /// tracked by its own exit notification (never by a reusable pid lookup).
@@ -3545,20 +3549,23 @@ enum EmulationMode {
 const MAX_SYNC_RETRIES: usize = 2;
 
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
-    let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Pending inconclusive publications, kept in the lock so they survive
+    // early returns and later sync calls.
+    let unverified: &mut BTreeMap<String, String> = &mut sync_guard;
     let mut failures: Vec<String> = Vec::new();
     let mut only_refs: Option<HashSet<String>> = None;
-    // Publications whose post-create source check was inconclusive:
-    // name -> published k8s.io digest, reconciled on the next pass even if
-    // the name has disappeared from `moby`.
-    let mut unverified: HashMap<String, String> = HashMap::new();
 
     for attempt in 0..=MAX_SYNC_RETRIES {
         // Re-read the emulation state on every pass so a retry never acts on
         // a stale "disabled" reading.
         let emulation = current_emulation_mode(&mut failures);
         let moby = list_ctr_images(reaper, "moby")?;
-        if moby.is_empty() && emulation != EmulationMode::Disabled && only_refs.is_none() {
+        if moby.is_empty()
+            && emulation != EmulationMode::Disabled
+            && only_refs.is_none()
+            && unverified.is_empty()
+        {
             break;
         }
         let k8s = list_ctr_images(reaper, "k8s.io")?;
@@ -3574,26 +3581,44 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
 
         let mut retry_refs: HashSet<String> = HashSet::new();
 
-        // Reconcile inconclusive publications from the previous pass. A name
-        // still in `moby` is re-evaluated as a regular candidate (it is in
-        // `only_refs`); if Docker removed it, retire exactly the digest that
-        // was published, guarded on `moby` still lacking the name and
-        // `k8s.io` still pointing to that digest.
-        for (uname, udigest) in std::mem::take(&mut unverified) {
+        // Reconcile inconclusive publications (from an earlier pass or an
+        // earlier sync call). A name still in `moby` and in scope for this
+        // pass is re-evaluated as a regular candidate below, so its entry is
+        // dropped. If Docker removed it, retire exactly the published digest,
+        // guarded on `moby` still lacking the name and `k8s.io` still
+        // pointing to that digest. An entry is kept (and retried within the
+        // budget, then on the next sync) until that outcome is definite.
+        let pending: Vec<(String, String)> = unverified
+            .iter()
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect();
+        for (uname, udigest) in pending {
             if moby.contains_key(&uname) {
+                if only_refs.as_ref().is_none_or(|f| f.contains(&uname)) {
+                    unverified.remove(&uname);
+                } else {
+                    retry_refs.insert(uname);
+                }
                 continue;
             }
-            match retire_rewritten_image(&uname, None, &udigest) {
-                Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
-                    "retired amd64 mirror {uname}: its Docker source was removed during publication"
-                )),
-                Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => {}
+            match retire_rewritten_image(reaper, &uname, None, &udigest) {
+                Ok(containerd_grpc::RetireOutcome::Deleted) => {
+                    unverified.remove(&uname);
+                    log(&format!(
+                        "retired amd64 mirror {uname}: its Docker source was removed during publication"
+                    ));
+                }
+                Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => {
+                    unverified.remove(&uname);
+                }
                 Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                    // Reappeared in `moby`: re-evaluated on the next pass.
                     retry_refs.insert(uname);
                 }
                 Err(e) => {
                     log(&format!("retire unverified amd64 mirror {uname}: {e}"));
                     failures.push(format!("{uname}: {e}"));
+                    retry_refs.insert(uname);
                 }
             }
         }
@@ -3664,7 +3689,7 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         continue;
                     }
                     if let Some(k) = k8s_img {
-                        match retire_rewritten_image(&name, Some(&img.digest), &k.digest) {
+                        match retire_rewritten_image(reaper, &name, Some(&img.digest), &k.digest) {
                             Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                                 "retired Katamaran amd64 mirror {name} from k8s.io"
                             )),
@@ -3743,7 +3768,12 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                                 // retire the existing k8s.io mirror if `moby`
                                 // still points to `img.digest` AND `k8s.io`
                                 // still points to `k.digest`.
-                                match retire_rewritten_image(&name, Some(&img.digest), &k.digest) {
+                                match retire_rewritten_image(
+                                    reaper,
+                                    &name,
+                                    Some(&img.digest),
+                                    &k.digest,
+                                ) {
                                     Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                                         "retired Katamaran amd64 mirror {name} from k8s.io"
                                     )),
@@ -3837,7 +3867,7 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         retry_refs.insert(name.clone());
                         continue;
                     }
-                    match retire_rewritten_image(name, None, &k8s_img.digest) {
+                    match retire_rewritten_image(reaper, name, None, &k8s_img.digest) {
                         Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                             "retired orphaned Katamaran amd64 mirror {name} from k8s.io"
                         )),
@@ -4212,11 +4242,35 @@ fn probe_native_complete(
 /// `moby` still matches `expected_moby_digest` (`Some(digest)` when retiring
 /// for a known source digest, or `None` for orphan cleanup) AND atomically
 /// deletes `k8s.io` only if its target still matches `expected_k8s_digest`.
+///
+/// The source-digest label alone is not proof of ownership (a native import
+/// whose label clearing failed still carries it), so the `k8s.io` target
+/// manifest must also carry Katamaran's per-publication annotation. Content
+/// is immutable per digest and the delete is conditional on that digest, so
+/// this check cannot race. A labelled tag without it is left untouched and
+/// reported as `NotFoundOrChanged`.
 fn retire_rewritten_image(
+    reaper: &Reaper,
     name: &str,
     expected_moby_digest: Option<&str>,
     expected_k8s_digest: &str,
 ) -> Result<containerd_grpc::RetireOutcome, String> {
+    // Katamaran-published manifests are small; an oversized target is not one.
+    let owned = match get_ctr_content_blob(reaper, "k8s.io", expected_k8s_digest, 4 << 20) {
+        Ok(manifest) => is_published_mirror_manifest(&manifest),
+        Err(oci_rewrite::BlobReadError::TooLarge(_)) => false,
+        Err(oci_rewrite::BlobReadError::Other(e)) => {
+            return Err(format!(
+                "read k8s.io manifest {expected_k8s_digest} of {name}: {e}"
+            ));
+        }
+    };
+    if !owned {
+        log(&format!(
+            "not retiring {name}: k8s.io target {expected_k8s_digest} is not a katamaran-published mirror"
+        ));
+        return Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged);
+    }
     containerd_grpc::retire_image_if_unchanged(
         Path::new(CONTAINERD_SOCKET),
         name,
@@ -4224,6 +4278,16 @@ fn retire_rewritten_image(
         expected_k8s_digest,
         Duration::from_secs(15),
     )
+}
+
+/// True when `manifest` carries [`containerd_grpc::PUBLICATION_ANNOTATION`],
+/// which only `publish_rewritten_image` ever writes.
+fn is_published_mirror_manifest(manifest: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(manifest).is_ok_and(|v| {
+        v.get("annotations")
+            .and_then(|a| a.get(containerd_grpc::PUBLICATION_ANNOTATION))
+            .is_some_and(serde_json::Value::is_string)
+    })
 }
 
 fn clear_source_digest_label(reaper: &Reaper, name: &str) -> Result<(), String> {
@@ -5363,6 +5427,11 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             unowned_destination_message("app:dev").contains("docker tag app:dev"),
             "conflict message must tell the user how to resolve it"
         );
+        assert!(is_published_mirror_manifest(
+            br#"{"annotations":{"io.katamaran.k8s.publication":"lease-1"}}"#
+        ));
+        assert!(!is_published_mirror_manifest(br#"{"schemaVersion":2}"#));
+        assert!(!is_published_mirror_manifest(b"not json"));
         // Upgrade from 0.10.0 (#41): the amd64 image was mirrored unchanged, so
         // the unlabelled k8s.io tag is an exact copy of the moby source -> adopt.
         let k8s_unchanged_copy = ctr_img(&amd64_idx.digest, "linux/amd64", &[]);
