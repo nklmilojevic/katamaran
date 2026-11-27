@@ -3748,8 +3748,7 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     let expected_k8s = k8s_img.map(|k| containerd_grpc::ExpectedK8sTarget {
                         digest: k.digest.as_str(),
                         is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
-                        adopt_source_copy: k.label(SOURCE_DIGEST_LABEL).is_none()
-                            && k.digest == img.digest,
+                        adopt_source_copy: is_adoptable_source_copy(k, &img, NATIVE_ARCH),
                     });
                     match containerd_grpc::publish_rewritten_image(
                         Path::new(CONTAINERD_SOCKET),
@@ -3766,6 +3765,12 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             containerd_grpc::PublishError::SourceChanged { .. }
                             | containerd_grpc::PublishError::DestinationChanged { .. },
                         ) => {
+                            retry_refs.insert(name);
+                        }
+                        Err(containerd_grpc::PublishError::SourceUnverified(e)) => {
+                            // Published but not re-verified: keep the tag and
+                            // re-check this reference on the next pass.
+                            log(&format!("mirror image {name}: {e}; re-listing"));
                             retry_refs.insert(name);
                         }
                         Err(containerd_grpc::PublishError::Failed(e)) => {
@@ -3862,6 +3867,22 @@ enum SyncAction {
     /// swap cannot be made atomic, and an interrupted swap could lose a tag
     /// Katamaran cannot rebuild); the user is told how to resolve the conflict.
     ReportUnownedDestination,
+}
+
+/// True when an unlabelled `k8s.io` tag can be adopted (replaced by the
+/// emulated mirror): its target is exactly the `moby` source digest, so the
+/// next sync can always rebuild it from Docker if the Delete→Create swap is
+/// interrupted, and its listed platforms advertise no native platform, so a
+/// concurrent kubelet pull can never give that digest usable native content
+/// (CRI rejects a manifest without a native match before creating any image
+/// record) and the conditional delete cannot remove a native tag.
+fn is_adoptable_source_copy(k8s: &CtrImage, moby: &CtrImage, native_arch: &str) -> bool {
+    k8s.label(SOURCE_DIGEST_LABEL).is_none()
+        && k8s.digest == moby.digest
+        && k8s
+            .platforms
+            .as_deref()
+            .is_some_and(|p| !oci_rewrite::has_native_platform(p, native_arch))
 }
 
 fn unowned_destination_message(name: &str) -> String {
@@ -4032,15 +4053,17 @@ fn plan_sync_action(
                         // Unlabelled `k8s.io` image. Stay quiet when its local
                         // native arm64 content is verified complete (not merely
                         // advertised in `ctr images ls`). Otherwise adopt it only
-                        // if it is an exact copy of the `moby` source (an amd64
-                        // image mirrored unchanged by an earlier release), which
-                        // the next sync can always rebuild if the guarded swap is
-                        // interrupted. Anything else (e.g. a `ctr` or kubelet
-                        // pull) is never replaced; tell the user how to resolve
-                        // the name conflict.
+                        // if it is an exact amd64-only copy of the `moby` source
+                        // (mirrored unchanged by an earlier release; see
+                        // `is_adoptable_source_copy`). Anything else (e.g. a `ctr`
+                        // or kubelet pull, or a multi-platform index kubelet could
+                        // complete natively under the same digest) is never
+                        // replaced; tell the user how to resolve the conflict.
                         match dest_native {
                             NativeAvailability::Present => SyncAction::Skip,
-                            NativeAvailability::Absent if k.digest == moby.digest => {
+                            NativeAvailability::Absent
+                                if is_adoptable_source_copy(k, moby, native_arch) =>
+                            {
                                 SyncAction::MirrorRewrite
                             }
                             NativeAvailability::Absent => SyncAction::ReportUnownedDestination,
@@ -5281,6 +5304,27 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 "arm64"
             ),
             SyncAction::MirrorRewrite
+        );
+        // A legacy copy of a multi-platform index that advertises arm64 (only
+        // amd64 blobs local) is NOT adopted: kubelet could complete arm64 under
+        // the same registry digest, which a digest-only delete would then hit.
+        let k8s_unchanged_multi = ctr_img(&amd64_idx.digest, "linux/amd64,linux/arm64/v8", &[]);
+        assert!(!is_adoptable_source_copy(
+            &k8s_unchanged_multi,
+            &amd64_idx,
+            "arm64"
+        ));
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unchanged_multi),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportUnownedDestination
         );
 
         // Emulation disabled for an amd64-only index: retire Katamaran's rewritten

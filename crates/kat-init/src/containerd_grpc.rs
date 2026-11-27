@@ -144,6 +144,11 @@ pub enum PublishError {
     /// or replaced by a native kubelet pull); the existing `k8s.io` tag was
     /// left untouched.
     DestinationChanged { expected: String, actual: String },
+    /// The mirror was published, but re-reading the `moby` source right after
+    /// publication failed, so it is unknown whether Docker changed the source
+    /// concurrently. The new tag is kept (a read error never deletes a working
+    /// tag); the caller should re-list and re-check this reference.
+    SourceUnverified(String),
     /// Any other containerd gRPC, content, or I/O error.
     Failed(String),
 }
@@ -159,6 +164,9 @@ impl fmt::Display for PublishError {
                 f,
                 "k8s.io destination digest changed before publish (expected {expected}, got {actual})"
             ),
+            Self::SourceUnverified(msg) => {
+                write!(f, "published, but could not re-verify the source: {msg}")
+            }
             Self::Failed(msg) => f.write_str(msg),
         }
     }
@@ -355,7 +363,10 @@ pub fn retire_image_if_unchanged(
 pub struct ExpectedK8sTarget<'a> {
     pub digest: &'a str,
     pub is_cri_managed: bool,
-    /// The tag is unlabelled and `digest` equals the `moby` source digest.
+    /// The tag is unlabelled, `digest` equals the `moby` source digest, and
+    /// (verified by the caller from the listed platforms) the target
+    /// advertises no native platform, so no kubelet pull can ever give that
+    /// digest usable native content or recreate it as a native tag.
     pub adopt_source_copy: bool,
 }
 
@@ -701,11 +712,11 @@ fn recover_uncertain_delete(
 }
 
 /// After creating `image` in `k8s.io`, confirm that `moby` still points to
-/// `expected_moby_digest`. If Docker removed or retagged the source in the
-/// meantime, or the source can no longer be verified, conditionally retire
-/// exactly the mirror just created (a competing writer's tag has a different
-/// digest and is left untouched). A retired mirror of a source that still
-/// exists is recreated by the next sync.
+/// `expected_moby_digest`. Only when a successful lookup shows that Docker
+/// removed or retagged the source in the meantime is exactly the mirror just
+/// created retired (a competing writer's tag has a different digest and is
+/// left untouched). An inconclusive lookup never deletes anything: it returns
+/// [`PublishError::SourceUnverified`] so the caller re-lists and re-checks.
 fn confirm_source_after_create(
     conn: &mut GrpcConn,
     namespace: &str,
@@ -728,16 +739,10 @@ fn confirm_source_after_create(
                 })?;
             Err(PublishError::SourceChanged { expected, actual })
         }
-        Err(PublishError::Failed(e)) => {
-            let retire = conn
-                .delete_image_if_target_matches(namespace, &image.name, &image.target.digest)
-                .map(|_| "retired the new mirror".to_string())
-                .unwrap_or_else(|re| format!("failed to retire the new mirror: {re}"));
-            Err(PublishError::Failed(format!(
-                "verify moby source of {} after publish: {e}; {retire}",
-                image.name
-            )))
-        }
+        Err(PublishError::Failed(e)) => Err(PublishError::SourceUnverified(format!(
+            "verify moby source of {} after publish: {e}",
+            image.name
+        ))),
         Err(other) => Err(other),
     }
 }
@@ -3657,6 +3662,9 @@ mod tests {
         /// Optional hook: remove this `moby` image right after the next
         /// successful `k8s.io` `Images.Create`.
         remove_moby_after_k8s_create: Option<String>,
+        /// Optional hook: fail every `moby` `Images.Get` once a `k8s.io`
+        /// `Images.Create` has been received.
+        fail_moby_get_after_k8s_create: bool,
         k8s_create_calls: usize,
         k8s_delete_committed: bool,
         k8s_delete_calls: usize,
@@ -3941,6 +3949,9 @@ mod tests {
                                         || (ns == "k8s.io"
                                             && st.fail_k8s_get_after_delete
                                             && st.k8s_delete_committed)
+                                        || (ns == "moby"
+                                            && st.fail_moby_get_after_k8s_create
+                                            && st.k8s_create_calls > 0)
                                     {
                                         send_grpc_err(&mut conn, sid, "13", "bolt%20get%20error");
                                     } else if let Some(img) = st.images.get(&(ns.clone(), name)) {
@@ -6057,6 +6068,69 @@ mod tests {
                 .map(String::as_str),
             Some("sha256:source-amd64")
         );
+        assert!(st.leases.is_empty());
+        drop(st);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: a transient `moby` read error right after a
+    /// successful `Images.Create` must never delete the working tag; the
+    /// result is `SourceUnverified` so the caller re-lists.
+    #[test]
+    fn publish_rewritten_image_keeps_tag_when_post_create_verification_fails() {
+        let (dir, sock) = temp_sock("post-create-err");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "6".repeat(64));
+        let old_digest = format!("sha256:{}", "7".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let name = "docker.io/library/app:dev";
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([
+                moby_source(name, "sha256:source-amd64"),
+                (
+                    ("k8s.io".into(), name.into()),
+                    katamaran_mirror(name, &old_digest, "sha256:prev-source"),
+                ),
+            ]),
+            remaining_disk_bytes: 1 << 20,
+            fail_moby_get_after_k8s_create: true,
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
+        let err = publish_rewritten_image(
+            &sock,
+            name,
+            "io.katamaran.k8s.source-digest",
+            Some(expected_mirror(&old_digest)),
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PublishError::SourceUnverified(_)),
+            "expected SourceUnverified, got {err:?}"
+        );
+
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.k8s_delete_calls, 1,
+            "only the guarded replacement delete may run"
+        );
+        let cur = st
+            .images
+            .get(&("k8s.io".into(), name.into()))
+            .expect("published tag must survive an inconclusive verification read");
+        assert_ne!(cur.target.digest, old_digest);
         assert!(st.leases.is_empty());
         drop(st);
 
