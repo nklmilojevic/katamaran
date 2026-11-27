@@ -12,13 +12,13 @@ ignore:
   - "THIRD_PARTY_NOTICES.md"
 
 review:
-  model: cliproxyapi/gpt-6-luna
-  fallback: openrouter/openai/gpt-6-luna
+  model: meridian/claude-sonnet-5-5
+  fallback: cliproxyapi/gpt-6-luna
   effort: medium
   agents:
     - name: kernel-vmm
-      model: cliproxyapi/gpt-6.2-sol
-      fallback: openrouter/openai/gpt-6.2-sol
+      model: meridian/claude-sonnet-5-5
+      fallback: cliproxyapi/gpt-6.2-sol
       effort: high
       when:
         - name: kernel-or-vmm
@@ -27,8 +27,8 @@ review:
             - "vendor/patches/**"
             - "crates/kat-vmm/**"
     - name: systems
-      model: cliproxyapi/gpt-6.2-sol
-      fallback: openrouter/openai/gpt-6-luna
+      model: meridian/claude-sonnet-5-5
+      fallback: cliproxyapi/gpt-6-luna
       effort: medium
       when:
         - name: core-systems
@@ -44,8 +44,8 @@ review:
             - "crates/kat-daemon/src/ssh.rs"
 
 confidence:
-  model: cliproxyapi/gpt-6-luna
-  fallback: openrouter/openai/gpt-6-luna
+  model: meridian/claude-sonnet-5-5
+  fallback: cliproxyapi/gpt-6-luna
   effort: low
 
 context:
