@@ -2759,6 +2759,23 @@ fn read_regular_dropin(path: &Path) -> Result<String, String> {
 /// Validate the effective `etcd-s3-proxy` setting across the managed YAML and
 /// any `.d/*.{yaml,yml}` drop-ins that k3s loads, before launching k3s.
 ///
+/// File selection and precedence mirror k3s `pkg/configfilearg/parser.go`
+/// (`dotDFiles` / `readConfigFile` / `toSlice`), whose logic is unchanged from
+/// v1.27 through v1.37:
+///
+/// - k3s loads `$K3S_CONFIG_FILE` first, then every non-directory entry of
+///   `$K3S_CONFIG_FILE.d` whose name ends in `.yaml`/`.yml` (ASCII
+///   case-insensitive), in `os.ReadDir` order: byte-wise by file name, which
+///   is what sorting the raw `OsString` names gives here. `DirEntry::IsDir`
+///   does not follow symlinks, so a symlink to a directory is loaded (and
+///   fails) in k3s; here it fails the regular-file check.
+/// - A plain `etcd-s3-proxy` key in a later file replaces the earlier value.
+///   `etcd-s3-proxy+` appends to it; an empty/null append contributes no
+///   flag. k3s then emits one `--etcd-s3-proxy=` flag per list element and
+///   the last one wins, so the effective value is the last element of the
+///   last file that contributed one. A `null`/`[]` replacement emits an empty
+///   value or no flag at all, both of which are safe.
+///
 /// Rejects malformed proxy URLs with [`INVALID_ETCD_S3_PROXY_ERR`] (never
 /// echoing the configured value or parser diagnostics) so mistyped
 /// credential-bearing URLs cannot be logged by k3s's S3 client.
@@ -11301,6 +11318,81 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 .get_envs()
                 .any(|(k, v)| k == OsStr::new("K3S_CONFIG_FILE") && v.is_none())
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Drop-in selection and precedence must match k3s `readConfigFile`, so the
+    /// value validated here is the value k3s hands to its S3 client.
+    #[test]
+    fn validate_k3s_config_yaml_dropin_precedence_matches_k3s() {
+        let base = temp_dir("k3s-proxy-dropin-order");
+        let cfg_path = base.join("config.yaml");
+        let dropin_dir = base.join("config.yaml.d");
+        fs::create_dir_all(&dropin_dir).unwrap();
+        // Malformed (non-numeric port); leak checks live in the test below.
+        let bad_url = "http://proxy.invalid.example:badport";
+        let bad = format!("etcd-s3-proxy: {bad_url}\n");
+        let reject = |main: &str, label: &str| {
+            assert_eq!(
+                validate_k3s_config_yaml(&cfg_path, main),
+                Err(INVALID_ETCD_S3_PROXY_ERR.to_string()),
+                "{label}"
+            );
+        };
+        let accept = |main: &str, label: &str| {
+            validate_k3s_config_yaml(&cfg_path, main).unwrap_or_else(|e| panic!("{label}: {e}"));
+        };
+        let set = |name: &str, body: &str| fs::write(dropin_dir.join(name), body).unwrap();
+        let clear = || {
+            for e in fs::read_dir(&dropin_dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    fs::remove_dir_all(p).unwrap();
+                } else {
+                    fs::remove_file(p).unwrap();
+                }
+            }
+        };
+
+        // os.ReadDir order is byte-wise: uppercase sorts before lowercase, so
+        // `a-bad.yaml` is applied after `Z-fix.yaml` and its value wins.
+        set("Z-fix.yaml", "etcd-s3-proxy: none\n");
+        set("a-bad.yaml", &bad);
+        reject(
+            "etcd-s3-proxy: none\n",
+            "byte-order: later lowercase drop-in wins",
+        );
+        clear();
+        set("a-bad.yaml", &bad);
+        set("b-fix.yaml", "etcd-s3-proxy: none\n");
+        accept(&bad, "later drop-in replaces earlier values");
+        clear();
+
+        // A directory whose name ends in .yaml is skipped by dotDFiles.
+        fs::create_dir_all(dropin_dir.join("50-dir.yaml")).unwrap();
+        accept("etcd-s3-proxy: none\n", "directory named *.yaml is ignored");
+        clear();
+
+        // Plain replacement with an empty list emits no flag in k3s.
+        set("10.yaml", "etcd-s3-proxy: []\n");
+        accept(&bad, "plain [] replacement drops the earlier value");
+        clear();
+
+        // Append extends the earlier value; the last element is effective.
+        set("10.yaml", "etcd-s3-proxy+: [none]\n");
+        accept(&bad, "append whose last element is none");
+        clear();
+        set("10.yaml", &format!("etcd-s3-proxy+: [\"{bad_url}\"]\n"));
+        reject(
+            "etcd-s3-proxy: none\n",
+            "append whose last element is malformed",
+        );
+        clear();
+        // A null append contributes nothing, so the earlier value stays effective.
+        set("10.yaml", "etcd-s3-proxy+:\n");
+        reject(&bad, "null append keeps earlier malformed value");
+        clear();
 
         let _ = fs::remove_dir_all(&base);
     }
