@@ -2712,19 +2712,6 @@ impl K8s {
     }
 }
 
-/// Parse a single Go `flag` / `urfave/cli` style flag token (`-flag`, `--flag`,
-/// `-flag=val`, or `--flag=val`) into `(name, Option<inline_value>)`.
-fn parse_k3s_flag(arg: &str) -> Option<(&str, Option<&str>)> {
-    let stripped = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
-    if stripped.is_empty() || stripped.starts_with('-') {
-        return None;
-    }
-    match stripped.split_once('=') {
-        Some((name, val)) => Some((name, Some(val))),
-        None => Some((stripped, None)),
-    }
-}
-
 /// k3s also loads every `<config>.d/*.{yaml,yml}` next to the file it is
 /// given, and would read those raw. The managed config lives in a
 /// katamaran-owned directory where nothing else should create drop-ins, so
@@ -2750,101 +2737,7 @@ fn configure_k3s_config_env(cmd: &mut Command, managed_config: Option<&Path>) {
 }
 
 fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
-    for arg in extra_args {
-        if arg.is_empty() {
-            return Err("k8s_args must not contain empty arguments".into());
-        }
-        if arg.contains('\0') {
-            return Err("k8s_args must not contain NUL bytes".into());
-        }
-    }
-    let mut i = 0;
-    while i < extra_args.len() {
-        if let Some((name, inline_val)) = parse_k3s_flag(&extra_args[i]) {
-            let (val, consumed) = match inline_val {
-                Some(v) => (Some(v), 1),
-                None => match extra_args.get(i + 1) {
-                    Some(next) => (Some(next.as_str()), 2),
-                    None => (None, 1),
-                },
-            };
-            match name {
-                "data-dir" | "d" => {
-                    if val != Some(DATA_DIR) {
-                        return Err(format!(
-                            "k8s_args cannot override --data-dir (-d); Katamaran manages cluster data at {DATA_DIR}"
-                        ));
-                    }
-                    i += consumed;
-                    continue;
-                }
-                "write-kubeconfig" | "o" => {
-                    if val != Some(KUBECONFIG) {
-                        return Err(format!(
-                            "k8s_args cannot override --write-kubeconfig (-o); Katamaran reads kubeconfig from {KUBECONFIG}"
-                        ));
-                    }
-                    i += consumed;
-                    continue;
-                }
-                "write-kubeconfig-mode" => {
-                    if val != Some(KUBECONFIG_MODE) {
-                        return Err(format!(
-                            "k8s_args cannot override --write-kubeconfig-mode; Katamaran keeps {KUBECONFIG} private ({KUBECONFIG_MODE})"
-                        ));
-                    }
-                    i += consumed;
-                    continue;
-                }
-                "https-listen-port" => {
-                    if val != Some(API_PORT) {
-                        return Err(format!(
-                            "k8s_args cannot override --https-listen-port; Katamaran relays the Kubernetes API server on {API_ADDR}"
-                        ));
-                    }
-                    i += consumed;
-                    continue;
-                }
-                "config" | "c" => {
-                    return Err(
-                        "k8s_args cannot set --config (-c); place k3s YAML settings in ~/.katamaran/k3s-config.yaml instead"
-                            .into(),
-                    );
-                }
-                "token" | "t" | "cluster-secret" => {
-                    return Err(format!(
-                        "k8s_args cannot pass inline cluster tokens (--{name}), which appear in the process command line and {LOG_FILE} with --debug; set `token:` in ~/.katamaran/k3s-config.yaml or use --token-file instead"
-                    ));
-                }
-                "agent-token" => {
-                    return Err(format!(
-                        "k8s_args cannot pass inline agent tokens (--agent-token), which appear in the process command line and {LOG_FILE} with --debug; set `agent-token:` in ~/.katamaran/k3s-config.yaml or use --agent-token-file instead"
-                    ));
-                }
-                "datastore-endpoint" => {
-                    return Err(format!(
-                        "k8s_args cannot pass --datastore-endpoint, which may embed credentials and appears in the process command line and {LOG_FILE} with --debug; set `datastore-endpoint:` in ~/.katamaran/k3s-config.yaml instead"
-                    ));
-                }
-                "etcd-s3-access-key"
-                | "etcd-s3-secret-key"
-                | "etcd-s3-session-token"
-                | "etcd-s3-proxy" => {
-                    return Err(format!(
-                        "k8s_args cannot pass --{name}, which can carry credentials and appears in the process command line and {LOG_FILE} with --debug; set `{name}:` in ~/.katamaran/k3s-config.yaml instead"
-                    ));
-                }
-                "vpn-auth" => {
-                    return Err(format!(
-                        "k8s_args cannot pass inline VPN credentials (--vpn-auth), which appear in the process command line and {LOG_FILE} with --debug; set `vpn-auth:` in ~/.katamaran/k3s-config.yaml or use --vpn-auth-file instead"
-                    ));
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-
+    k8s::validate_k3s_extra_args(extra_args)?;
     let mut args = vec![
         "server".to_string(),
         format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
@@ -8267,136 +8160,25 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let base = build_k3s_server_args(&[]).unwrap();
         assert_eq!(base[0], "server");
         assert!(base.iter().any(|a| a == "--https-listen-port=6443"));
+        assert!(base.iter().any(|a| a == &format!("--data-dir={DATA_DIR}")));
 
         let extra = vec!["--disable=traefik".to_string(), "--debug".to_string()];
         let with_extra = build_k3s_server_args(&extra).unwrap();
         assert_eq!(with_extra.len(), base.len() + 2);
         assert_eq!(&with_extra[base.len()..], extra.as_slice());
 
-        assert!(build_k3s_server_args(&[String::new()]).is_err());
-        assert!(build_k3s_server_args(&["--foo=\0bar".to_string()]).is_err());
-
-        // Managed --data-dir (-d) cannot be redirected.
-        for bad in [
-            vec!["--data-dir=/tmp/k3s".to_string()],
-            vec!["-data-dir=/tmp/k3s".to_string()],
-            vec!["--data-dir".to_string(), "/tmp/k3s".to_string()],
-            vec!["-d".to_string(), "/tmp/k3s".to_string()],
-            vec!["-d=/tmp/k3s".to_string()],
-            vec!["--data-dir".to_string()],
-        ] {
-            let err = build_k3s_server_args(&bad).unwrap_err();
-            assert!(err.contains(DATA_DIR), "case {bad:?}: {err}");
+        // Every flag the guest sets itself is rejected in k8s_args (full
+        // coverage lives in kat-proto's validate_k3s_extra_args tests).
+        for flag in &base[1..] {
+            let name = flag.split_once('=').map_or(flag.as_str(), |(n, _)| n);
+            if matches!(name, "--kubelet-arg" | "--tls-san" | "--kube-proxy-arg") {
+                continue;
+            }
+            let arg = format!("{name}=x");
+            assert!(build_k3s_server_args(&[arg]).is_err(), "{name}");
         }
-        build_k3s_server_args(&["--data-dir".to_string(), DATA_DIR.to_string()]).unwrap();
-
-        // Managed --write-kubeconfig (-o) and --write-kubeconfig-mode cannot be loosened/redirected.
-        for bad in [
-            vec!["--write-kubeconfig=/tmp/kc".to_string()],
-            vec!["--write-kubeconfig".to_string(), "/tmp/kc".to_string()],
-            vec!["-o".to_string(), "/tmp/kc".to_string()],
-            vec!["-o=/tmp/kc".to_string()],
-            vec!["-o".to_string()],
-            vec!["--write-kubeconfig-mode=0644".to_string()],
-            vec!["-write-kubeconfig-mode=0644".to_string()],
-            vec!["--write-kubeconfig-mode".to_string(), "0644".to_string()],
-            vec!["--write-kubeconfig-mode=0640".to_string()],
-            vec!["--write-kubeconfig-mode".to_string()],
-        ] {
-            let err = build_k3s_server_args(&bad).unwrap_err();
-            assert!(err.contains(KUBECONFIG), "case {bad:?}: {err}");
-        }
-        build_k3s_server_args(&["--write-kubeconfig-mode=0600".to_string()]).unwrap();
-        build_k3s_server_args(&["--write-kubeconfig-mode".to_string(), "0600".to_string()])
-            .unwrap();
-        build_k3s_server_args(&["--write-kubeconfig".to_string(), KUBECONFIG.to_string()]).unwrap();
-
-        // Managed --https-listen-port cannot change away from the fixed relay port.
-        for bad in [
-            vec!["--https-listen-port=7443".to_string()],
-            vec!["-https-listen-port=7443".to_string()],
-            vec!["--https-listen-port".to_string(), "7443".to_string()],
-            vec!["--https-listen-port=06443".to_string()],
-            vec!["--https-listen-port".to_string()],
-        ] {
-            let err = build_k3s_server_args(&bad).unwrap_err();
-            assert!(err.contains(API_ADDR), "case {bad:?}: {err}");
-        }
-        build_k3s_server_args(&["--https-listen-port=6443".to_string()]).unwrap();
-        build_k3s_server_args(&["--https-listen-port".to_string(), "6443".to_string()]).unwrap();
-
-        // Managed --config (-c) cannot bypass Katamaran's managed YAML and validation.
-        for bad in [
-            vec!["--config=/tmp/custom.yaml".to_string()],
-            vec!["-config=/tmp/custom.yaml".to_string()],
-            vec!["--config".to_string(), "/tmp/custom.yaml".to_string()],
-            vec!["-c".to_string(), "/tmp/custom.yaml".to_string()],
-            vec!["-c=/tmp/custom.yaml".to_string()],
-            vec!["--config".to_string()],
-        ] {
-            let err = build_k3s_server_args(&bad).unwrap_err();
-            assert!(err.contains("k3s-config.yaml"), "case {bad:?}: {err}");
-        }
-
-        // Credential-bearing or credential-capable flags cannot be passed via k8s_args
-        // (they would leak to the process command line and /var/log/k3s.log with --debug).
-        for bad in [
-            vec!["--token=mysecret".to_string()],
-            vec!["-token=mysecret".to_string()],
-            vec!["--token".to_string(), "mysecret".to_string()],
-            vec!["-t".to_string(), "mysecret".to_string()],
-            vec!["-t=mysecret".to_string()],
-            vec!["--cluster-secret=mysecret".to_string()],
-            vec!["--agent-token=mysecret".to_string()],
-            vec!["--agent-token".to_string(), "mysecret".to_string()],
-            vec!["--datastore-endpoint=https://etcd1:2379".to_string()],
-            vec![
-                "--datastore-endpoint".to_string(),
-                "https://etcd1:2379".to_string(),
-            ],
-            vec!["--datastore-endpoint=mysql://user:p/w@tcp(127.0.0.1:3306)/k3s".to_string()],
-            vec![
-                "-datastore-endpoint".to_string(),
-                "postgres://user:pass@db.local:5432/k3s".to_string(),
-            ],
-            vec!["--etcd-s3-secret-key=mysecret".to_string()],
-            vec!["--etcd-s3-access-key".to_string(), "mykey".to_string()],
-            vec!["--etcd-s3-session-token=mytok".to_string()],
-            vec!["--etcd-s3-proxy=http://user:pass@proxy.local:8080".to_string()],
-            vec![
-                "--etcd-s3-proxy".to_string(),
-                "http://proxy.local:8080".to_string(),
-            ],
-            vec!["-etcd-s3-proxy=http://proxy.local:8080".to_string()],
-            vec!["--vpn-auth=name=tailscale,joinKey=tskey-secret".to_string()],
-            vec![
-                "--vpn-auth".to_string(),
-                "name=tailscale,joinKey=tskey-secret".to_string(),
-            ],
-        ] {
-            let err = build_k3s_server_args(&bad).unwrap_err();
-            assert!(err.contains("k3s-config.yaml"), "case {bad:?}: {err}");
-        }
-
-        // Supported file-based auth references stay usable in k8s_args.
-        for ok in [
-            vec!["--token-file=/etc/rancher/k3s/token".to_string()],
-            vec![
-                "--token-file".to_string(),
-                "/etc/rancher/k3s/token".to_string(),
-            ],
-            vec!["--agent-token-file=/etc/rancher/k3s/agent-token".to_string()],
-            vec![
-                "--agent-token-file".to_string(),
-                "/etc/rancher/k3s/agent-token".to_string(),
-            ],
-            vec!["--vpn-auth-file=/etc/rancher/k3s/vpn-auth".to_string()],
-            vec!["--datastore-cafile=/etc/rancher/k3s/ca.pem".to_string()],
-            vec!["--datastore-certfile=/etc/rancher/k3s/client.pem".to_string()],
-            vec!["--datastore-keyfile=/etc/rancher/k3s/client.key".to_string()],
-        ] {
-            build_k3s_server_args(&ok).unwrap_or_else(|e| panic!("expected {ok:?} ok, got: {e}"));
-        }
+        assert!(build_k3s_server_args(&[format!("--kubelet-arg=root-dir={KUBELET_DIR}")]).is_err());
+        assert!(build_k3s_server_args(&["--token=x".to_string()]).is_err());
     }
 
     #[test]

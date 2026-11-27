@@ -724,6 +724,9 @@ fn is_valid_go_zone(s: &str) -> bool {
     true
 }
 
+/// Deliberately stricter than Go's `validOptionalPort` (which accepts an
+/// empty port and any digits): a port k3s could not dial would only fail
+/// later inside k3s, so require 1-65535 up front.
 fn is_valid_port(port: &str) -> bool {
     !port.is_empty()
         && port.bytes().all(|b| b.is_ascii_digit())
@@ -811,21 +814,13 @@ fn is_valid_go_proxy_url(s: &str) -> bool {
         }
     }
 
-    // Check path, query, and fragment for malformed percent escapes.
+    // Like Go, check path and fragment escapes but keep the raw query as is.
     let (before_frag, frag) = match tail.split_once('#') {
         Some((b, f)) => (b, Some(f)),
         None => (tail, None),
     };
-    let (path, query) = match before_frag.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (before_frag, None),
-    };
+    let path = before_frag.split_once('?').map_or(before_frag, |(p, _)| p);
     if !has_valid_percent_escapes(path) {
-        return false;
-    }
-    if let Some(q) = query
-        && !has_valid_percent_escapes(q)
-    {
         return false;
     }
     if let Some(f) = frag
@@ -1050,7 +1045,7 @@ mod tests {
     }
 
     /// Expectations match Go `net/url.Parse` plus k3s's need for a scheme and
-    /// host, except that out-of-range ports are also rejected.
+    /// host, except that empty, zero and out-of-range ports are also rejected.
     #[test]
     fn validates_proxy_urls_like_go() {
         for ok in [
@@ -1065,6 +1060,8 @@ mod tests {
             "socks5://ops@[fe80::1%25en%200]:1080",
             // Go splits userinfo at the last '@' and accepts a raw '@' in it.
             "http://ops@corp@proxy.example.com:8080",
+            // Go keeps the raw query unvalidated.
+            "http://proxy.example.com:8080/?a=%zz",
         ] {
             assert!(is_valid_etcd_s3_proxy(ok), "{ok}");
         }
@@ -1074,7 +1071,11 @@ mod tests {
             "socks5://ops@[fe80::1%25en%0a0]:1080",
             "http://ops%zz@proxy.invalid.example:8080",
             "proxy.invalid.example:8080",
+            // Ports are deliberately stricter than Go: 1-65535 and non-empty.
             "http://proxy.invalid.example:99999",
+            "http://proxy.invalid.example:0",
+            "http://proxy.invalid.example:/",
+            "http://proxy.invalid.example/#%zz",
             "http://ops@corp@proxy.invalid.example:badport",
             "not-a-url",
         ] {

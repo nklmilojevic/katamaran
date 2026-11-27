@@ -405,8 +405,10 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
         }
         ConfigCmd::Set { pairs } => {
             let values = parse_pairs(&pairs)?;
-            let k8s_opts_set =
-                values.contains_key("k8s_disable") || values.contains_key("k8s_args");
+            // Settings that apply at the next Kubernetes start.
+            let k8s_opts_set = ["k8s_disable", "k8s_args", "k8s_version"]
+                .iter()
+                .any(|k| values.contains_key(*k));
             let (restart, k8s_restart) = match daemon {
                 Some(mut c) => {
                     let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;

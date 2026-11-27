@@ -312,8 +312,167 @@ pub fn read<R: Read>(mut r: R) -> io::Result<Option<K8sMsg>> {
     Ok(Some(K8sMsg::decode(kind, &body[2..])?))
 }
 
+/// Parse one Go `flag` / `urfave/cli` style token (`-flag`, `--flag`,
+/// `-flag=val`, `--flag=val`) into `(name, inline value)`.
+fn parse_k3s_flag(arg: &str) -> Option<(&str, Option<&str>)> {
+    let stripped = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    if stripped.is_empty() || stripped.starts_with('-') {
+        return None;
+    }
+    match stripped.split_once('=') {
+        Some((name, val)) => Some((name, Some(val))),
+        None => Some((stripped, None)),
+    }
+}
+
+/// `k3s server` flags the guest sets itself. `k8s_args` are appended after
+/// them, so for single-value flags the user's value would win; katamaran's
+/// relay, image sync, stop/reset and pod routing all depend on these.
+const MANAGED_K3S_FLAGS: &[&str] = &[
+    "data-dir",
+    "d",
+    "write-kubeconfig",
+    "o",
+    "write-kubeconfig-mode",
+    "https-listen-port",
+    "container-runtime-endpoint",
+    "node-name",
+    "flannel-backend",
+    "cluster-cidr",
+    "service-cidr",
+    "cluster-dns",
+];
+
+/// kubelet settings the guest passes via `--kubelet-arg` that must not be
+/// overridden (stop/reset unmount the managed kubelet root; kubelet must use
+/// the shared containerd).
+const MANAGED_KUBELET_ARGS: &[&str] = &["root-dir", "container-runtime-endpoint"];
+
+/// Flags whose value can carry credentials. `k8s_args` end up on the k3s
+/// process command line, which `k3s --debug` also writes to its log.
+const CREDENTIAL_K3S_FLAGS: &[&str] = &[
+    "token",
+    "t",
+    "cluster-secret",
+    "agent-token",
+    "datastore-endpoint",
+    "etcd-s3-access-key",
+    "etcd-s3-secret-key",
+    "etcd-s3-session-token",
+    "etcd-s3-proxy",
+    "vpn-auth",
+];
+
+/// Validate `k8s_args` before they are saved (host) and before `k3s server`
+/// starts (guest). Errors never echo argument values.
+pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg.is_empty() {
+            return Err("k8s_args must not contain empty arguments".into());
+        }
+        if arg.contains('\0') {
+            return Err("k8s_args must not contain NUL bytes".into());
+        }
+        let Some((name, inline)) = parse_k3s_flag(arg) else {
+            continue;
+        };
+        if name == "config" || name == "c" {
+            return Err(
+                "k8s_args cannot set --config (-c); put k3s settings in ~/.katamaran/k3s-config.yaml instead"
+                    .into(),
+            );
+        }
+        if MANAGED_K3S_FLAGS.contains(&name) {
+            return Err(format!(
+                "k8s_args cannot set --{name}: katamaran manages it for the guest cluster"
+            ));
+        }
+        if CREDENTIAL_K3S_FLAGS.contains(&name) {
+            return Err(format!(
+                "k8s_args cannot pass --{name}, whose value can carry credentials and would appear in the k3s process command line and, with --debug, its log; set `{name}:` in ~/.katamaran/k3s-config.yaml (or use the matching *-file flag) instead"
+            ));
+        }
+        if name == "kubelet-arg" {
+            let Some(value) = inline.or_else(|| args.get(i + 1).map(String::as_str)) else {
+                continue;
+            };
+            let setting = value.trim_start_matches('-');
+            let key = setting.split_once('=').map_or(setting, |(k, _)| k);
+            if MANAGED_KUBELET_ARGS.contains(&key) {
+                return Err(format!(
+                    "k8s_args cannot set the kubelet {key}: katamaran manages it for the guest cluster"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn validate_k3s_extra_args_rejects_managed_and_credential_flags() {
+        let v = |a: &[&str]| {
+            super::validate_k3s_extra_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        v(&[]).unwrap();
+        v(&["--disable=traefik", "--debug", "--kubelet-arg=max-pods=200"]).unwrap();
+        v(&["--kubelet-arg", "max-pods=200", "--node-label", "a=b"]).unwrap();
+        // Positional values that merely look like names are not flags.
+        v(&["--node-label", "token=x"]).unwrap();
+
+        assert!(v(&[""]).is_err());
+        assert!(v(&["--foo=\0bar"]).is_err());
+
+        let marker = "placeholder-marker-3310";
+        for flag in [
+            "data-dir",
+            "d",
+            "write-kubeconfig",
+            "o",
+            "write-kubeconfig-mode",
+            "https-listen-port",
+            "container-runtime-endpoint",
+            "node-name",
+            "flannel-backend",
+            "cluster-cidr",
+            "service-cidr",
+            "cluster-dns",
+            "config",
+            "c",
+            "token",
+            "t",
+            "cluster-secret",
+            "agent-token",
+            "datastore-endpoint",
+            "etcd-s3-access-key",
+            "etcd-s3-secret-key",
+            "etcd-s3-session-token",
+            "etcd-s3-proxy",
+            "vpn-auth",
+        ] {
+            for args in [
+                vec![format!("--{flag}={marker}")],
+                vec![format!("-{flag}={marker}")],
+                vec![format!("--{flag}"), marker.to_string()],
+                vec![format!("-{flag}")],
+            ] {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let err = v(&args).expect_err(&format!("{args:?}"));
+                assert!(!err.contains(marker), "{args:?} echoed its value: {err}");
+            }
+        }
+        for kubelet in [
+            vec!["--kubelet-arg=root-dir=/x"],
+            vec!["--kubelet-arg=--root-dir=/x"],
+            vec!["--kubelet-arg", "root-dir=/x"],
+            vec!["-kubelet-arg=container-runtime-endpoint=unix:///x"],
+            vec!["--kubelet-arg=root-dir"],
+        ] {
+            assert!(v(&kubelet).is_err(), "{kubelet:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

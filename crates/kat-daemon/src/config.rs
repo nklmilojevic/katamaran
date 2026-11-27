@@ -305,13 +305,10 @@ impl Config {
             validate_k8s_disable_item(component)?;
             total_k8s_bytes = total_k8s_bytes.saturating_add("--disable=".len() + component.len());
         }
+        // Same check the guest applies before starting k3s, so `kat config
+        // set` refuses (and never saves) arguments the guest would reject.
+        kat_proto::k8s::validate_k3s_extra_args(&self.k8s_args).map_err(anyhow::Error::msg)?;
         for arg in &self.k8s_args {
-            if arg.is_empty() {
-                bail!("k8s_args must not contain empty arguments");
-            }
-            if arg.contains('\0') {
-                bail!("k8s_args must not contain NUL bytes");
-            }
             total_k8s_bytes = total_k8s_bytes.saturating_add(arg.len());
         }
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
