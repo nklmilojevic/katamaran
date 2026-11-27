@@ -681,13 +681,7 @@ fn session(
     let cfg = VmConfig {
         kernel: vm::absolute(&args.kernel)?,
         initramfs: vm::absolute(&args.initramfs)?,
-        cmdline_extra: if auto_forward {
-            args.cmdline.clone()
-        } else {
-            format!("{} kat.autoforward=0", args.cmdline)
-                .trim()
-                .to_string()
-        },
+        cmdline_extra: guest_cmdline_extra(args, auto_forward),
         cpus: args.cpus,
         memory_mib: args.memory_mib,
         console_log: console_log.clone(),
@@ -1281,6 +1275,26 @@ pub fn block_and_watch_signals() -> anyhow::Result<mpsc::Receiver<i32>> {
         }
     });
     Ok(rx)
+}
+
+/// Build extra Linux kernel command-line arguments from `RunArgs`.
+///
+/// Only passes `kat.disk_gib=<gib>` when `args.disk_gib` was explicitly
+/// requested (from `config.toml` or `--disk-gib`), so `kat-init` leaves an
+/// already-padded custom `data.img` untouched on boots without a disk target.
+fn guest_cmdline_extra(args: &RunArgs, auto_forward: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let base = args.cmdline.trim();
+    if !base.is_empty() {
+        parts.push(base.to_string());
+    }
+    if !auto_forward {
+        parts.push("kat.autoforward=0".into());
+    }
+    if let Some(gib) = args.disk_gib {
+        parts.push(format!("kat.disk_gib={gib}"));
+    }
+    parts.join(" ")
 }
 
 #[cfg(test)]
@@ -2059,5 +2073,47 @@ mod tests {
         assert_eq!(fs::metadata(&dest).unwrap().len(), 128u64 << 30);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guest_cmdline_extra_gates_disk_resize_on_explicit_target() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+
+        // Omitting disk_gib omits kat.disk_gib= so already-padded custom images
+        // are not expanded by kat-init on boot.
+        let unset = Wrapper::try_parse_from(["run", "--cmdline", "kat.nofile=1048576"])
+            .unwrap()
+            .run;
+        assert_eq!(guest_cmdline_extra(&unset, true), "kat.nofile=1048576");
+        assert_eq!(
+            guest_cmdline_extra(&unset, false),
+            "kat.nofile=1048576 kat.autoforward=0"
+        );
+
+        // Explicit disk_gib (including 64 GiB) forwards kat.disk_gib=<n>.
+        let explicit_64 = Wrapper::try_parse_from(["run", "--disk-gib", "64"])
+            .unwrap()
+            .run;
+        assert_eq!(guest_cmdline_extra(&explicit_64, true), "kat.disk_gib=64");
+
+        let explicit_500 = Wrapper::try_parse_from([
+            "run",
+            "--cmdline",
+            "kat.nofile=1048576 kat.k8s=1",
+            "--disk-gib",
+            "500",
+        ])
+        .unwrap()
+        .run;
+        assert_eq!(
+            guest_cmdline_extra(&explicit_500, false),
+            "kat.nofile=1048576 kat.k8s=1 kat.autoforward=0 kat.disk_gib=500"
+        );
     }
 }

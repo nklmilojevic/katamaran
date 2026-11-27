@@ -1,17 +1,22 @@
-//! Grow the btrfs data filesystem at boot when the host extended `data.img`.
+//! Grow the btrfs data filesystem at boot when the host requested a disk
+//! target via `kat.disk_gib=<gib>` on the kernel command line.
 //!
-//! Comparing `/sys/block/<dev>/size` against `BTRFS_IOC_DEV_INFO`'s recorded
-//! `total_bytes` (aligned down to `BTRFS_IOC_FS_INFO`'s `sectorsize`, matching
-//! `btrfs_ioctl_resize` in the kernel) avoids false positives on replicated
-//! profiles such as DUP where `statvfs` divides total blocks by the replication
-//! factor. When `/dev/vdb` is larger than the device's recorded size,
-//! `BTRFS_IOC_RESIZE` expands it online in a few milliseconds before
+//! Comparing `/sys/block/<dev>/size` and the requested target against
+//! `BTRFS_IOC_DEV_INFO`'s recorded `total_bytes` (aligned down to
+//! `BTRFS_IOC_FS_INFO`'s `sectorsize`, matching `btrfs_ioctl_resize` in the
+//! kernel) avoids false positives on replicated profiles such as DUP where
+//! `statvfs` divides total blocks by the replication factor. When growth is
+//! needed, `BTRFS_IOC_RESIZE` expands it online in a few milliseconds before
 //! containerd, dockerd, machines, or k3s start.
 
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+
+use crate::disk::{
+    DevInfo, FsInfo, ResizePlan, grow_if_needed_with, parse_sysfs_sectors, resize_spec,
+};
 
 /// `_IOW(0x94, 3, struct btrfs_ioctl_vol_args)` (4096-byte argument).
 const BTRFS_IOC_RESIZE: libc::c_ulong = 0x5000_9403;
@@ -64,80 +69,27 @@ const _: () = assert!(std::mem::offset_of!(BtrfsIoctlDevInfoArgs, path) == 3072)
 const _: () = assert!(std::mem::size_of::<BtrfsIoctlFsInfoArgs>() == 1024);
 const _: () = assert!(std::mem::offset_of!(BtrfsIoctlFsInfoArgs, sectorsize) == 36);
 
-#[derive(Debug, Clone, Copy)]
-struct FsInfo {
-    max_id: u64,
-    num_devices: u64,
-    sectorsize: u64,
-}
-
-#[derive(Debug, Clone)]
-struct DevInfo {
-    devid: u64,
-    total_bytes: u64,
-    path: Option<String>,
-}
-
-/// Grow the btrfs filesystem mounted at `mount_point` to fill `dev_path`
-/// (e.g. `/dev/vdb`) if the block device is larger than Btrfs's recorded
-/// device size. Returns `Ok(Some((before_bytes, after_bytes)))` when a resize
-/// ran.
-pub fn grow_if_needed(dev_path: &str, mount_point: &str) -> io::Result<Option<(u64, u64)>> {
+/// Grow the btrfs filesystem mounted at `mount_point` up to `requested_bytes`
+/// (capped at `dev_path`'s block-device size) if `requested_bytes` is `Some`
+/// and exceeds Btrfs's recorded device size. Returns
+/// `Ok(Some((before_bytes, after_bytes)))` when a resize ran.
+pub fn grow_if_needed(
+    dev_path: &str,
+    mount_point: &str,
+    requested_bytes: Option<u64>,
+) -> io::Result<Option<(u64, u64)>> {
+    if requested_bytes.is_none() {
+        return Ok(None);
+    }
     let fd = open_dir(mount_point)?;
     grow_if_needed_with(
         dev_path,
+        requested_bytes,
         || block_device_bytes(dev_path),
         || btrfs_fs_info(fd.as_raw_fd()),
         |devid| btrfs_dev_info(fd.as_raw_fd(), devid),
-        |devid| btrfs_resize_max(fd.as_raw_fd(), devid),
+        |devid, plan| btrfs_resize(fd.as_raw_fd(), devid, plan),
     )
-}
-
-fn grow_if_needed_with(
-    dev_path: &str,
-    mut read_dev_bytes: impl FnMut() -> io::Result<u64>,
-    mut read_fs_info: impl FnMut() -> io::Result<FsInfo>,
-    mut read_dev_info: impl FnMut(u64) -> io::Result<Option<DevInfo>>,
-    mut resize_max: impl FnMut(u64) -> io::Result<()>,
-) -> io::Result<Option<(u64, u64)>> {
-    let dev_bytes = read_dev_bytes()?;
-    let fs_info = read_fs_info()?;
-    let target = find_target_device(dev_path, fs_info, &mut read_dev_info)?;
-    if !needs_resize(dev_bytes, target.total_bytes, fs_info.sectorsize) {
-        return Ok(None);
-    }
-    resize_max(target.devid)?;
-    let after = read_dev_info(target.devid)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("btrfs devid {} disappeared after resize", target.devid),
-        )
-    })?;
-    Ok(Some((target.total_bytes, after.total_bytes)))
-}
-
-fn find_target_device(
-    dev_path: &str,
-    fs_info: FsInfo,
-    read_dev_info: &mut impl FnMut(u64) -> io::Result<Option<DevInfo>>,
-) -> io::Result<DevInfo> {
-    if let Some(info) = read_dev_info(1)?
-        && (fs_info.num_devices <= 1 || info.path.as_deref() == Some(dev_path))
-    {
-        return Ok(info);
-    }
-    let max_id = fs_info.max_id.min(1024);
-    for devid in 2..=max_id {
-        if let Some(info) = read_dev_info(devid)?
-            && (info.path.as_deref() == Some(dev_path) || fs_info.num_devices == 1)
-        {
-            return Ok(info);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("btrfs device {dev_path} not found"),
-    ))
 }
 
 fn open_dir(mount_point: &str) -> io::Result<OwnedFd> {
@@ -168,18 +120,6 @@ fn block_device_bytes(dev_path: &str) -> io::Result<u64> {
     let text = std::fs::read_to_string(&sysfs)
         .map_err(|e| io::Error::new(e.kind(), format!("read {sysfs}: {e}")))?;
     parse_sysfs_sectors(&text)
-}
-
-fn parse_sysfs_sectors(text: &str) -> io::Result<u64> {
-    let sectors: u64 = text.trim().parse().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("parse sector count {text:?}: {e}"),
-        )
-    })?;
-    sectors
-        .checked_mul(512)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block device size overflow"))
 }
 
 fn btrfs_fs_info(fd: libc::c_int) -> io::Result<FsInfo> {
@@ -220,14 +160,10 @@ fn btrfs_dev_info(fd: libc::c_int, devid: u64) -> io::Result<Option<DevInfo>> {
     }))
 }
 
-fn needs_resize(dev_bytes: u64, btrfs_dev_total_bytes: u64, sector_size: u64) -> bool {
-    let unit = sector_size.max(1);
-    let aligned_dev = dev_bytes - (dev_bytes % unit);
-    aligned_dev > btrfs_dev_total_bytes
-}
-
-fn btrfs_resize_max(fd: libc::c_int, devid: u64) -> io::Result<()> {
-    let args = resize_max_args(devid);
+fn btrfs_resize(fd: libc::c_int, devid: u64, plan: ResizePlan) -> io::Result<()> {
+    let Some(args) = resize_args(devid, plan) else {
+        return Ok(());
+    };
     let rc = unsafe { libc::ioctl(fd, BTRFS_IOC_RESIZE as _, &args) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
@@ -240,155 +176,40 @@ fn btrfs_resize_max(fd: libc::c_int, devid: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn resize_max_args(devid: u64) -> BtrfsIoctlVolArgs {
+fn resize_args(devid: u64, plan: ResizePlan) -> Option<BtrfsIoctlVolArgs> {
+    let spec = resize_spec(devid, plan)?;
     let mut args = BtrfsIoctlVolArgs {
         fd: 0,
         name: [0u8; 4088],
     };
-    let spec = if devid == 1 {
-        "max".to_string()
-    } else {
-        format!("{devid}:max")
-    };
     let bytes = spec.as_bytes();
     args.name[..bytes.len()].copy_from_slice(bytes);
-    args
+    Some(args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
-
-    #[test]
-    fn parses_sysfs_sector_counts() {
-        // 64 GiB = 134_217_728 sectors of 512 bytes.
-        assert_eq!(parse_sysfs_sectors("134217728\n").unwrap(), 64u64 << 30);
-        assert_eq!(parse_sysfs_sectors("  2048  ").unwrap(), 1u64 << 20);
-        assert!(parse_sysfs_sectors("not-a-number").is_err());
-        assert!(parse_sysfs_sectors(&u64::MAX.to_string()).is_err());
-    }
-
-    #[test]
-    fn detects_when_resize_is_needed() {
-        let gib = 1u64 << 30;
-        assert!(!needs_resize(64 * gib, 64 * gib, 4096));
-        assert!(!needs_resize(64 * gib + 2048, 64 * gib, 4096));
-        assert!(needs_resize(64 * gib + 4096, 64 * gib, 4096));
-        assert!(!needs_resize(64 * gib + 8192, 64 * gib, 16384));
-        assert!(needs_resize(64 * gib + 16384, 64 * gib, 16384));
-        assert!(needs_resize(500 * gib, 64 * gib, 4096));
-        assert!(!needs_resize(32 * gib, 64 * gib, 4096));
-        assert!(needs_resize(100, 99, 0));
-    }
 
     #[test]
     fn resize_args_carry_nul_terminated_spec() {
-        let args = resize_max_args(1);
+        assert!(resize_args(1, ResizePlan::None).is_none());
+
+        let args = resize_args(1, ResizePlan::Max).unwrap();
         assert_eq!(args.fd, 0);
         assert_eq!(&args.name[..4], b"max\0");
         assert!(args.name[3..].iter().all(|&b| b == 0));
 
-        let dev2 = resize_max_args(2);
+        let dev2 = resize_args(2, ResizePlan::Max).unwrap();
         assert_eq!(&dev2.name[..6], b"2:max\0");
         assert!(dev2.name[5..].iter().all(|&b| b == 0));
-    }
 
-    #[test]
-    fn full_size_device_with_replicated_data_skips_resize() {
-        // Regression test: on a single-device Btrfs filesystem with DUP data
-        // profile, statvfs reports half the device capacity, but
-        // BTRFS_IOC_DEV_INFO still reports the full 64 GiB device total_bytes.
-        // We must NOT issue BTRFS_IOC_RESIZE when total_bytes already matches
-        // the block device.
-        let gib = 1u64 << 30;
-        let resized = Cell::new(false);
-        let res = grow_if_needed_with(
-            "/dev/vdb",
-            || Ok(64 * gib),
-            || {
-                Ok(FsInfo {
-                    max_id: 1,
-                    num_devices: 1,
-                    sectorsize: 4096,
-                })
-            },
-            |devid| {
-                assert_eq!(devid, 1);
-                Ok(Some(DevInfo {
-                    devid: 1,
-                    total_bytes: 64 * gib,
-                    path: Some("/dev/vdb".into()),
-                }))
-            },
-            |_| {
-                resized.set(true);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(res, None);
-        assert!(!resized.get());
-    }
+        let exact = resize_args(1, ResizePlan::Bytes(100u64 << 30)).unwrap();
+        assert_eq!(&exact.name[..13], b"107374182400\0");
+        assert!(exact.name[12..].iter().all(|&b| b == 0));
 
-    #[test]
-    fn grows_device_and_reports_btrfs_dev_totals_before_and_after() {
-        let gib = 1u64 << 30;
-        let current_total = Cell::new(64 * gib);
-        let resized_devid = Cell::new(None);
-        let res = grow_if_needed_with(
-            "/dev/vdb",
-            || Ok(500 * gib),
-            || {
-                Ok(FsInfo {
-                    max_id: 2,
-                    num_devices: 1,
-                    sectorsize: 4096,
-                })
-            },
-            |devid| match devid {
-                1 => Ok(None),
-                2 => Ok(Some(DevInfo {
-                    devid: 2,
-                    total_bytes: current_total.get(),
-                    path: Some("/dev/vdb".into()),
-                })),
-                _ => Ok(None),
-            },
-            |devid| {
-                resized_devid.set(Some(devid));
-                current_total.set(500 * gib);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(resized_devid.get(), Some(2));
-        assert_eq!(res, Some((64 * gib, 500 * gib)));
-    }
-
-    #[test]
-    fn propagates_resize_ioctl_errors() {
-        let gib = 1u64 << 30;
-        let err = grow_if_needed_with(
-            "/dev/vdb",
-            || Ok(500 * gib),
-            || {
-                Ok(FsInfo {
-                    max_id: 1,
-                    num_devices: 1,
-                    sectorsize: 4096,
-                })
-            },
-            |_| {
-                Ok(Some(DevInfo {
-                    devid: 1,
-                    total_bytes: 64 * gib,
-                    path: Some("/dev/vdb".into()),
-                }))
-            },
-            |_| Err(io::Error::from_raw_os_error(libc::EROFS)),
-        )
-        .unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+        let exact_dev2 = resize_args(2, ResizePlan::Bytes(100u64 << 30)).unwrap();
+        assert_eq!(&exact_dev2.name[..15], b"2:107374182400\0");
+        assert!(exact_dev2.name[14..].iter().all(|&b| b == 0));
     }
 }

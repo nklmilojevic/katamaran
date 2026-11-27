@@ -87,8 +87,13 @@ fn setup() -> io::Result<SetupOutcome> {
         Some("mode=0755"),
     )?;
 
+    let cmdline = std::fs::read_to_string("/proc/cmdline")?;
     let system = sys::exists(SYSTEM_DISK);
-    let disk_error = if system { mount_system()? } else { None };
+    let disk_error = if system {
+        mount_system(&cmdline)?
+    } else {
+        None
+    };
 
     sys::mount(
         "devpts",
@@ -130,7 +135,6 @@ fn setup() -> io::Result<SetupOutcome> {
         std::fs::write("/etc/hostname", "katamaran\n")?;
         sys::link_up("lo")?;
     }
-    let cmdline = std::fs::read_to_string("/proc/cmdline")?;
     mount_shares(&cmdline)?;
     if let Err(e) = amd64::setup(&cmdline) {
         log(&format!("amd64 programs will not run: {e}"));
@@ -162,7 +166,7 @@ fn parse_shares(cmdline: &str) -> Vec<(&str, &str, Option<&str>)> {
 /// System image as an overlay (read-only EROFS lower, tmpfs upper), data disk
 /// subvolumes inside it, then switch root. Returns a nonfatal data-disk resize
 /// error (if any) so `serve` can surface it to the host after `Hello`.
-fn mount_system() -> io::Result<Option<String>> {
+fn mount_system(cmdline: &str) -> io::Result<Option<String>> {
     let ro = libc::MS_RDONLY | libc::MS_NODEV;
     sys::mount(SYSTEM_DISK, "/mnt/system", "erofs", ro, None)?;
     sys::mount(
@@ -194,20 +198,22 @@ fn mount_system() -> io::Result<Option<String>> {
                 Some(&opts),
             )?;
         }
-        let mount = format!("{NEW_ROOT}{}", DATA_MOUNTS[0].1);
-        match disk::grow_if_needed(DATA_DISK, &mount) {
-            Ok(Some((before, after))) => {
-                log(&format!(
-                    "resized data disk filesystem ({} GiB -> {} GiB)",
-                    before >> 30,
-                    after >> 30
-                ));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let msg = e.to_string();
-                log(&format!("data disk resize failed: {msg}"));
-                disk_error = Some(msg);
+        if let Some(target_bytes) = crate::disk::target_bytes_from_cmdline(cmdline) {
+            let mount = format!("{NEW_ROOT}{}", DATA_MOUNTS[0].1);
+            match disk::grow_if_needed(DATA_DISK, &mount, Some(target_bytes)) {
+                Ok(Some((before, after))) => {
+                    log(&format!(
+                        "resized data disk filesystem ({} GiB -> {} GiB)",
+                        before >> 30,
+                        after >> 30
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    log(&format!("data disk resize failed: {msg}"));
+                    disk_error = Some(msg);
+                }
             }
         }
     } else {

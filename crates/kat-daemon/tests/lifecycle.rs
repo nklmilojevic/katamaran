@@ -901,6 +901,30 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
         "echo keep-me > /v/sentinel && sync",
     ]);
 
+    // An already-padded data.img with no configured disk_gib target must NOT
+    // have its Btrfs filesystem expanded on boot.
+    cli(&d.home, &["stop"]);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&img)
+        .unwrap()
+        .set_len(100 * GIB)
+        .unwrap();
+    cli(&d.home, &["start"]);
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 100 * GIB);
+    assert_eq!(d.status()["vm"]["disk_gib"], 100);
+    let padded_console = std::fs::read_to_string(d.home.join("logs/console.log"))
+        .expect("read guest console after booting padded image without disk target");
+    assert!(
+        !padded_console.contains("resized data disk filesystem"),
+        "boot without disk_gib should leave padded image untouched:\n{padded_console}"
+    );
+    let padded_kib = fs_kib();
+    assert!(
+        (60 << 20..=66 << 20).contains(&padded_kib),
+        "expected ~64 GiB filesystem to remain untouched on padded image, got {padded_kib} KiB"
+    );
+
     let set_out = cli(&d.home, &["config", "set", "disk=500G"]);
     assert!(set_out.contains("restart"), "{set_out}");
     let pending = cli(&d.home, &["status"]);
