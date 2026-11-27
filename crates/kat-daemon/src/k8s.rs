@@ -302,7 +302,15 @@ pub fn read_reset_answer(
                 }
                 return Ok(());
             }
-            Some(K8sMsg::Error(e)) => bail!("{e}"),
+            Some(K8sMsg::Error(e)) => {
+                if let Some(reason) = e.strip_prefix(k8s::RESET_NOT_STARTED_PREFIX) {
+                    if !*data_deleted {
+                        *accepted = false;
+                    }
+                    bail!("{reason}");
+                }
+                bail!("{e}");
+            }
             Some(other) => bail!("unexpected k8s reset reply {other:?}"),
             None => {
                 if remove_images && !*accepted {
@@ -2972,5 +2980,50 @@ users:
         assert!(!accepted, "pre-acceptance progress must not mark accepted");
         assert!(!deleted);
         assert_eq!(deleted_calls, 0);
+
+        // 5. Plain reset receiving queued Progress followed by RESET_NOT_STARTED_PREFIX
+        //    Error clears `accepted` (which starts true for legacy plain resets) so the
+        //    daemon preserves host proxy/DNS/kubeconfig state.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Error(format!(
+                    "{}timed out waiting for active guest Kubernetes operation",
+                    k8s::RESET_NOT_STARTED_PREFIX
+                )),
+            )
+            .unwrap();
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let mut progress = Vec::new();
+        let err = read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |m| progress.push(m.to_string()),
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "timed out waiting for active guest Kubernetes operation"
+        );
+        assert!(!accepted, "explicit not-started error must clear accepted");
+        assert!(!deleted);
+        assert_eq!(deleted_calls, 0);
+        assert_eq!(
+            progress,
+            vec!["waiting for active guest Kubernetes operation"]
+        );
     }
 }

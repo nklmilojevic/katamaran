@@ -70,6 +70,7 @@ pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
+const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
 const IMAGE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2023,7 +2024,17 @@ impl K8s {
                 .start_inner(&mut conn, &extra_args, config_yaml.as_deref())
                 .map(K8sMsg::StatusInfo),
             K8sMsg::Stop => self.stop_inner(Some(&mut conn)).map(|()| K8sMsg::Done),
-            K8sMsg::Reset { images } => self.reset_inner(&mut conn, images).map(|()| K8sMsg::Done),
+            K8sMsg::Reset { images } => {
+                let writer = ResetConnWriter::new(&conn, RESET_WRITE_TIMEOUT);
+                let msg = match self.reset_inner(&writer, images) {
+                    Ok(()) => K8sMsg::Done,
+                    Err(e) => K8sMsg::Error(e),
+                };
+                if !writer.failed() {
+                    let _ = k8s::write(&conn, &msg);
+                }
+                return;
+            }
             K8sMsg::Kubeconfig => read_kubeconfig().map(K8sMsg::KubeconfigData),
             K8sMsg::Connect { addr, port } => {
                 self.connect(conn, &addr, port);
@@ -2678,31 +2689,35 @@ impl K8s {
         }
     }
 
-    fn reset_inner(&self, conn: &mut UnixStream, remove_images: bool) -> Result<(), String> {
+    fn reset_inner(&self, writer: &ResetConnWriter<'_>, remove_images: bool) -> Result<(), String> {
+        let not_started = |e: &str| format!("{}{e}", k8s::RESET_NOT_STARTED_PREFIX);
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
-            return Err("aborted: VM is shutting down".into());
+            return Err(not_started("aborted: VM is shutting down"));
         }
-        // Stream heartbeats while queued behind an in-flight guest Kubernetes
-        // operation so callers with idle timeouts stay alive, and bound the wait
-        // without sending `ResetAccepted` until this reset actually acquires
-        // `op_lock` and is ready to mutate cluster state.
+        // Stream bounded heartbeats while queued behind an in-flight guest
+        // Kubernetes operation so callers with idle timeouts stay alive, and
+        // bound the wait without sending `ResetAccepted` (or mutating state)
+        // until this reset actually acquires `op_lock`.
         let _guard = try_lock_with_deadline(
             &self.op_lock,
             OP_LOCK_WAIT_TIMEOUT,
             PROGRESS_HEARTBEAT_INTERVAL,
             "waiting for active guest Kubernetes operation",
-            || SHUTTING_DOWN.load(Ordering::SeqCst),
-            &mut |msg| {
-                let _ = k8s::write(&*conn, &K8sMsg::Progress(msg.into()));
-            },
-        )?;
+            || SHUTTING_DOWN.load(Ordering::SeqCst) || writer.failed(),
+            &mut |msg| writer.write_progress(msg),
+        )
+        .map_err(|e| not_started(&e))?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
-            return Err("aborted: VM is shutting down".into());
+            return Err(not_started("aborted: VM is shutting down"));
+        }
+        if writer.failed() {
+            return Err(not_started("client stream write failed while queued"));
         }
         ensure_no_unreaped_k3s()?;
         if remove_images {
-            k8s::write(&mut *conn, &K8sMsg::ResetAccepted)
-                .map_err(|e| format!("send reset ack: {e}"))?;
+            writer
+                .write_required(&K8sMsg::ResetAccepted)
+                .map_err(|e| not_started(&format!("send reset ack: {e}")))?;
         }
         let mut ack_err: Option<String> = None;
         let paths = ClusterDataPaths {
@@ -2717,9 +2732,7 @@ impl K8s {
             IMAGE_SYNC_WAIT_TIMEOUT,
             PROGRESS_HEARTBEAT_INTERVAL,
             || SHUTTING_DOWN.load(Ordering::SeqCst),
-            &mut |msg| {
-                let _ = k8s::write(&*conn, &K8sMsg::Progress(msg.into()));
-            },
+            &mut |msg| writer.write_progress(msg),
             |progress| {
                 self.stop_locked_with_progress(progress)?;
                 // stop_locked reports success even if k3s survived SIGKILL; never delete
@@ -2754,7 +2767,7 @@ impl K8s {
                     |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
                     &mut || {
                         if let Err(e) =
-                            k8s::write(&*conn, &K8sMsg::reset_data_cleared(remove_images))
+                            writer.write_required(&K8sMsg::reset_data_cleared(remove_images))
                         {
                             ack_err = Some(format!("send reset data-cleared ack: {e}"));
                         }
@@ -3446,6 +3459,47 @@ fn run_reaped_split(
 ) -> io::Result<(i32, String, String)> {
     let out = run_reaped_split_checked(reaper, cmd, timeout, 1 << 20, false, None)?;
     Ok((out.code, out.stdout, out.stderr))
+}
+
+/// Bounded writer for guest-side reset frames. Sets `SO_SNDTIMEO` and latches
+/// the first write error so a slow or unread direct guest-socket client cannot
+/// block a reset while holding `op_lock` or receive corrupted follow-up frames.
+struct ResetConnWriter<'a> {
+    conn: &'a UnixStream,
+    write_failed: AtomicBool,
+}
+
+impl<'a> ResetConnWriter<'a> {
+    fn new(conn: &'a UnixStream, timeout: Duration) -> Self {
+        let _ = conn.set_write_timeout(Some(timeout));
+        Self {
+            conn,
+            write_failed: AtomicBool::new(false),
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.write_failed.load(Ordering::Relaxed)
+    }
+
+    fn write_progress(&self, msg: &str) {
+        if self.failed() {
+            return;
+        }
+        if k8s::write(self.conn, &K8sMsg::Progress(msg.into())).is_err() {
+            self.write_failed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn write_required(&self, msg: &K8sMsg) -> Result<(), String> {
+        if self.failed() {
+            return Err("client stream write failed".into());
+        }
+        k8s::write(self.conn, msg).map_err(|e| {
+            self.write_failed.store(true, Ordering::Relaxed);
+            e.to_string()
+        })
+    }
 }
 
 struct ClusterDataPaths<'a> {
@@ -9984,6 +10038,31 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "must not acknowledge clearance while active data_dir still exists"
         );
         assert!(btrfs_intact_dir.exists());
+    }
+
+    #[test]
+    fn reset_conn_writer_bounds_unread_client_and_latches_failure() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let writer = ResetConnWriter::new(&server, Duration::from_millis(50));
+        let big = "x".repeat(32 << 10);
+        let started = Instant::now();
+        for _ in 0..128 {
+            writer.write_progress(&big);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "ResetConnWriter stalled on unread peer: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            writer.failed(),
+            "expected write_failed latch on unread peer"
+        );
+        assert!(
+            writer.write_required(&K8sMsg::ResetAccepted).is_err(),
+            "latched writer must not write further frames"
+        );
+        drop(client);
     }
 
     #[test]

@@ -3871,6 +3871,103 @@ mod tests {
     }
 
     #[test]
+    fn k8s_plain_reset_preserves_host_state_and_kubeconfig_when_guest_queue_times_out() {
+        let root = temp("k8s-qto");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        let kube_dir = user_home.join(".kube");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kube_dir).unwrap();
+        let user_cfg = kube_dir.join("config");
+        fs::write(
+            &user_cfg,
+            "apiVersion: v1\ncurrent-context: katamaran-qto\n",
+        )
+        .unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-qto");
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "standalone-kc").unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Progress(
+                    "waiting for active guest Kubernetes operation".into(),
+                ),
+            )
+            .unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error(format!(
+                    "{}timed out waiting for active guest Kubernetes operation",
+                    kat_proto::k8s::RESET_NOT_STARTED_PREFIX
+                )),
+            )
+            .unwrap();
+        });
+
+        let mut progress = Vec::new();
+        let err = d
+            .k8s_reset(false, &mut |m| progress.push(m.to_string()))
+            .unwrap_err();
+        guest.join().unwrap();
+
+        assert!(
+            err.message
+                .contains("timed out waiting for active guest Kubernetes operation"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "waiting for active guest Kubernetes operation"),
+            "expected queued progress heartbeat, got: {progress:?}"
+        );
+        assert_eq!(
+            d.k8s.lock().unwrap().state,
+            "running",
+            "runtime state must stay running when guest reset never started"
+        );
+        assert_eq!(
+            d.k8s.lock().unwrap().kubeconfig.as_ref(),
+            Some(&kc),
+            "kubeconfig runtime handle must remain intact"
+        );
+        assert!(kc.exists(), "standalone kubeconfig file must remain intact");
+        assert!(
+            fs::read_to_string(&user_cfg)
+                .unwrap()
+                .contains("katamaran-qto"),
+            "merged ~/.kube/config context must remain intact"
+        );
+        assert!(
+            Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must remain enabled"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn tracks_and_clears_port_forward_errors() {
         let home = temp("port-errors");
         let d = Daemon::new(home.clone());

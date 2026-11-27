@@ -9,7 +9,7 @@
 //! | `Install`              | the `k3s` binary as `Data`..., `DataEnd`                                    | `Progress`…, then `Done` / `Error`                                                                                              |
 //! | `Start`                | optional `extra_args`, `config_yaml`                                        | `Progress`…, then `StatusInfo` / `Error`                                                                                        |
 //! | `Stop`                 | –                                                                           | `Progress`…, then `Done` / `Error`                                                                                              |
-//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | plain (`0`): `Progress`… (with reserved [`RESET_DATA_CLEARED_PROGRESS`] on detach), then `Done` / `Error`; image reset (`1`): optional queued `Progress`…, `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` |
+//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | plain (`0`): `Progress`… (with reserved [`RESET_DATA_CLEARED_PROGRESS`] on detach), then `Done` / `Error` (prefixed with [`RESET_NOT_STARTED_PREFIX`] if rejected before mutating state); image reset (`1`): optional queued `Progress`…, `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` |
 //! | `Kubeconfig`           | –                                                                           | `KubeconfigData`, or `Error`                                                                                                    |
 //! | `Connect`              | `Data`… (`DataEnd` closes the write side)                                   | `Done` then `Data`…, `DataEnd`; or `Error`                                                                                      |
 //! | `SyncImages`           | –                                                                           | `Done`, or `Error`                                                                                                              |
@@ -37,6 +37,16 @@ pub const CAP_START_CONFIG: u32 = 1 << 0;
 /// while newer daemons match this exact string on plain resets to record
 /// confirmed deletion and disable Kubernetes auto-start immediately.
 pub const RESET_DATA_CLEARED_PROGRESS: &str = "cluster data deleted";
+
+/// Reserved prefix on [`K8sMsg::Error`] replies emitted by compatible guests
+/// when a reset fails before acquiring the guest operation lock (or before
+/// stopping k3s / touching cluster state), such as on a guest `op_lock` wait
+/// timeout or VM shutdown while queued.
+///
+/// Carrying this marker inside the legacy `Error` frame (`0x80f`) keeps replies
+/// readable by older daemons while letting newer daemons preserve host
+/// kubeconfig and runtime state on plain resets that never started.
+pub const RESET_NOT_STARTED_PREFIX: &str = "reset not started: ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K8sMsg {
@@ -1281,5 +1291,13 @@ mod tests {
             "got progress: {seen_progress:?}"
         );
         assert_eq!(K8sMsg::reset_data_cleared(true), K8sMsg::ResetDataCleared);
+
+        // Pre-acceptance rejection fits inside a legacy Error frame (0x80f).
+        let not_started = K8sMsg::Error(format!(
+            "{RESET_NOT_STARTED_PREFIX}timed out waiting for op_lock"
+        ));
+        let frame = not_started.encode();
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), kind::ERROR);
+        assert_eq!(read(frame.as_slice()).unwrap(), Some(not_started));
     }
 }
