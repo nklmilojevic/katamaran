@@ -23,6 +23,8 @@
 //!    the rewritten config and manifest blobs with GC child labels, re-checks
 //!    the `moby` source digest, and publishes the tag in `k8s.io`.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -35,6 +37,10 @@ pub const MAX_TOTAL_METADATA_BYTES: usize = 16 << 20;
 /// Cap on the number of metadata blobs inspected during a single image walk so
 /// pathological indexes cannot spin or exhaust PID 1 memory.
 const MAX_METADATA_BLOBS: usize = 64;
+
+/// Cap on the number of unique content-store stat lookups (`Content.Info`)
+/// performed while walking a single image's descriptor graph.
+const MAX_STAT_LOOKUPS: usize = 512;
 
 /// Maximum OCI index nesting depth traversed per branch. Hitting this cap fails
 /// only the overly deep branch so shallower sibling manifests remain usable.
@@ -57,8 +63,12 @@ pub enum BlobReadError {
 /// Read-only content-addressed blob lookup backed by containerd's `moby`
 /// content store (or an in-memory map in tests).
 pub trait BlobStore {
-    /// True if `digest` (`sha256:<hex>`) exists locally.
-    fn has_blob(&self, digest: &str) -> bool;
+    /// Look up the authoritative stored size (in bytes) of `digest`
+    /// (`sha256:<hex>`).
+    ///
+    /// Returns `Ok(Some(size))` when present locally, `Ok(None)` when absent
+    /// (`NOT_FOUND`), or `Err(...)` on store/RPC failure.
+    fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String>;
 
     /// Read a JSON metadata blob, failing with [`BlobReadError::TooLarge`]
     /// before fetching its payload when the blob's authoritative stored size
@@ -81,28 +91,17 @@ pub fn is_digest_reference(name: &str) -> bool {
     )
 }
 
-/// Platforms listed by `ctr images ls` that containerd's default platform
-/// matcher accepts without rewriting (matching `containerd/platforms`'s
-/// `Only(DefaultSpec())` rules, including compatible 32-bit ARM fallbacks
-/// `linux/arm/v5..=v8` on `arm64` and `linux/386` on `amd64`).
+/// Platforms listed by `ctr images ls` that the guest kernel and CRI can run
+/// natively without rewriting.
+///
+/// Katamaran's arm64 guest kernel disables `CONFIG_COMPAT` (no 32-bit ARM
+/// execution) and `ctr images export --local` defaults to `DefaultStrict()`, so
+/// 32-bit `linux/arm/*` variants are deliberately excluded rather than letting
+/// them suppress a usable `linux/amd64` rewrite.
 pub fn has_native_platform(platforms: &str, native_arch: &str) -> bool {
     let (want_arch, _) = normalize_arch_variant(native_arch, None);
-    platform_list(platforms).any(|(os, arch, variant)| {
-        if !os.eq_ignore_ascii_case("linux") {
-            return false;
-        }
-        let (norm_arch, norm_var) = normalize_arch_variant(arch, variant);
-        if norm_arch == want_arch {
-            return true;
-        }
-        match want_arch.as_str() {
-            "arm64" => {
-                norm_arch == "arm"
-                    && matches!(norm_var.as_deref(), None | Some("v5" | "v6" | "v7" | "v8"))
-            }
-            "amd64" => norm_arch == "386" && norm_var.is_none(),
-            _ => false,
-        }
+    platform_list(platforms).any(|(os, arch, _)| {
+        os.eq_ignore_ascii_case("linux") && normalize_arch_variant(arch, None).0 == want_arch
     })
 }
 
@@ -233,10 +232,17 @@ pub fn prepare_rewrite_from_store(
     native_arch: &str,
     store: &mut impl BlobStore,
 ) -> Result<PrepareRewrite, String> {
-    if !store.has_blob(root_digest) {
-        return Ok(PrepareRewrite::RootMissing);
+    let mut budget = BudgetedStore::new(
+        store,
+        MAX_TOTAL_METADATA_BYTES,
+        MAX_METADATA_BLOBS,
+        MAX_STAT_LOOKUPS,
+    );
+    match budget.blob_size(root_digest)? {
+        StatOutcome::Size(None) => return Ok(PrepareRewrite::RootMissing),
+        StatOutcome::Size(Some(_)) => {}
+        StatOutcome::BudgetExhausted(msg) => return Err(msg),
     }
-    let mut budget = BudgetedStore::new(store, MAX_TOTAL_METADATA_BYTES, MAX_METADATA_BLOBS);
     let mut walk_notes = WalkNotes::default();
     let candidate = walk_amd64_manifest(root_digest, None, None, &mut budget, 0, &mut walk_notes)?;
     let Some(cand) = candidate else {
@@ -323,6 +329,11 @@ fn build_rewrite_plan(
     })
 }
 
+enum StatOutcome {
+    Size(Option<u64>),
+    BudgetExhausted(String),
+}
+
 enum ReadOutcome {
     Data(Vec<u8>),
     BudgetExhausted(String),
@@ -334,30 +345,46 @@ struct WalkNotes {
     depth_err: Option<String>,
 }
 
-/// Wrapper enforcing an aggregate byte and blob-count cap across every metadata
-/// read performed while traversing an image's descriptor graph.
+/// Wrapper enforcing aggregate byte, metadata-blob, and stat-lookup caps across
+/// an image's descriptor graph walk, while caching per-digest stat results so
+/// each digest is queried at most once.
 struct BudgetedStore<'a, S: BlobStore> {
     inner: &'a mut S,
     remaining_bytes: usize,
     remaining_blobs: usize,
+    remaining_stats: usize,
     total_limit: usize,
+    size_cache: HashMap<String, Option<u64>>,
 }
 
 impl<'a, S: BlobStore> BudgetedStore<'a, S> {
-    fn new(inner: &'a mut S, byte_limit: usize, blob_limit: usize) -> Self {
+    fn new(inner: &'a mut S, byte_limit: usize, blob_limit: usize, stat_limit: usize) -> Self {
         Self {
             inner,
             remaining_bytes: byte_limit,
             remaining_blobs: blob_limit,
+            remaining_stats: stat_limit,
             total_limit: byte_limit,
+            size_cache: HashMap::new(),
         }
     }
 
-    fn has_blob(&self, digest: &str) -> bool {
-        self.inner.has_blob(digest)
+    fn blob_size(&mut self, digest: &str) -> Result<StatOutcome, String> {
+        if let Some(&cached) = self.size_cache.get(digest) {
+            return Ok(StatOutcome::Size(cached));
+        }
+        if self.remaining_stats == 0 {
+            return Ok(StatOutcome::BudgetExhausted(format!(
+                "metadata walk exceeded {MAX_STAT_LOOKUPS}-lookup stat limit while checking {digest}"
+            )));
+        }
+        self.remaining_stats -= 1;
+        let size = self.inner.blob_size(digest)?;
+        self.size_cache.insert(digest.to_string(), size);
+        Ok(StatOutcome::Size(size))
     }
 
-    fn is_exhausted(&self) -> bool {
+    fn is_read_exhausted(&self) -> bool {
         self.remaining_blobs == 0 || self.remaining_bytes == 0
     }
 
@@ -372,6 +399,22 @@ impl<'a, S: BlobStore> BudgetedStore<'a, S> {
                 "metadata walk exceeded {}-byte aggregate limit while reading {digest}",
                 self.total_limit
             )));
+        }
+        match self.blob_size(digest)? {
+            StatOutcome::BudgetExhausted(msg) => return Ok(ReadOutcome::BudgetExhausted(msg)),
+            StatOutcome::Size(None) => {
+                return Err(format!(
+                    "metadata blob {digest} disappeared during rewrite walk"
+                ));
+            }
+            StatOutcome::Size(Some(size)) if size > self.remaining_bytes as u64 => {
+                self.remaining_blobs -= 1;
+                return Ok(ReadOutcome::BudgetExhausted(format!(
+                    "metadata walk exceeded {}-byte aggregate limit while reading {digest} ({size} bytes)",
+                    self.total_limit
+                )));
+            }
+            StatOutcome::Size(Some(_)) => {}
         }
         self.remaining_blobs -= 1;
         let data = match self.inner.read_json_blob(digest, self.remaining_bytes) {
@@ -550,8 +593,15 @@ fn walk_amd64_manifest<S: BlobStore>(
     depth: usize,
     notes: &mut WalkNotes,
 ) -> Result<Option<Candidate>, String> {
-    if !store.has_blob(digest) {
-        return Ok(None);
+    match store.blob_size(digest)? {
+        StatOutcome::Size(None) => return Ok(None),
+        StatOutcome::Size(Some(_)) => {}
+        StatOutcome::BudgetExhausted(msg) => {
+            if notes.budget_err.is_none() {
+                notes.budget_err = Some(msg);
+            }
+            return Ok(None);
+        }
     }
     let raw = match store.read_json_blob(digest)? {
         ReadOutcome::Data(data) => data,
@@ -591,13 +641,20 @@ fn walk_amd64_manifest<S: BlobStore>(
             }
             let mut best: Option<Candidate> = None;
             for child in children {
-                if !store.has_blob(&child.digest) {
-                    continue;
-                }
                 if child.platform.as_ref().is_some_and(|p| !p.allows_amd64()) {
                     continue;
                 }
-                if store.is_exhausted() {
+                match store.blob_size(&child.digest)? {
+                    StatOutcome::Size(None) => continue,
+                    StatOutcome::Size(Some(_)) => {}
+                    StatOutcome::BudgetExhausted(msg) => {
+                        if notes.budget_err.is_none() {
+                            notes.budget_err = Some(msg);
+                        }
+                        break;
+                    }
+                }
+                if store.is_read_exhausted() {
                     if notes.budget_err.is_none() {
                         notes.budget_err = Some(if store.remaining_blobs == 0 {
                             format!(
@@ -670,15 +727,32 @@ fn resolve_leaf_manifest<S: BlobStore>(
     let Some(config_digest) = config_digest else {
         return Ok(None);
     };
-    if !store.has_blob(&config_digest) {
-        return Ok(None);
+    match store.blob_size(&config_digest)? {
+        StatOutcome::Size(None) => return Ok(None),
+        StatOutcome::Size(Some(_)) => {}
+        StatOutcome::BudgetExhausted(msg) => {
+            if notes.budget_err.is_none() {
+                notes.budget_err = Some(msg);
+            }
+            return Ok(None);
+        }
     }
     for layer in &layers {
         let Some(layer_digest) = layer.as_deref() else {
             return Ok(None);
         };
-        if !layer_digest.starts_with("sha256:") || !store.has_blob(layer_digest) {
+        if !layer_digest.starts_with("sha256:") {
             return Ok(None);
+        }
+        match store.blob_size(layer_digest)? {
+            StatOutcome::Size(None) => return Ok(None),
+            StatOutcome::Size(Some(_)) => {}
+            StatOutcome::BudgetExhausted(msg) => {
+                if notes.budget_err.is_none() {
+                    notes.budget_err = Some(msg);
+                }
+                return Ok(None);
+            }
         }
     }
 
@@ -758,8 +832,8 @@ mod tests {
     }
 
     impl BlobStore for MemStore {
-        fn has_blob(&self, digest: &str) -> bool {
-            self.blobs.contains_key(digest)
+        fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+            Ok(self.blobs.get(digest).map(|b| b.len() as u64))
         }
 
         fn read_json_blob(
@@ -1410,11 +1484,9 @@ mod tests {
         assert!(has_native_platform("linux/arm64", "arm64"));
         assert!(has_native_platform("linux/amd64,linux/arm64/v8", "arm64"));
         assert!(has_native_platform("linux/aarch64", "arm64"));
-        assert!(has_native_platform("linux/arm/v7", "arm64"));
-        assert!(has_native_platform("linux/arm/v6", "arm64"));
-        assert!(has_native_platform("linux/arm/v5", "arm64"));
-        assert!(has_native_platform("linux/arm", "arm64"));
-        assert!(!has_native_platform("linux/arm/v4", "arm64"));
+        assert!(!has_native_platform("linux/arm/v7", "arm64"));
+        assert!(!has_native_platform("linux/arm/v6", "arm64"));
+        assert!(!has_native_platform("linux/arm", "arm64"));
         assert!(!has_native_platform("linux/amd64", "arm64"));
         assert!(!has_native_platform("linux/s390x", "arm64"));
         assert!(!has_native_platform("", "arm64"));
@@ -1448,8 +1520,8 @@ mod tests {
             fetched: Vec<String>,
         }
         impl BlobStore for SizeGuardedStore {
-            fn has_blob(&self, digest: &str) -> bool {
-                self.sizes.contains_key(digest)
+            fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+                Ok(self.sizes.get(digest).copied())
             }
             fn read_json_blob(
                 &mut self,

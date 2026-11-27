@@ -160,43 +160,31 @@ pub fn list_images(
     decode_list_images_response(body)
 }
 
-/// List all committed content blobs in `namespace` via
-/// `/containerd.services.content.v1.Content/List`, returning authoritative
-/// `digest -> size` metadata so callers can reject over-budget blobs before
-/// fetching payloads. Fails explicitly if the stream exceeds `max_response_bytes`.
-pub fn list_content_sizes(
-    socket_path: &Path,
-    namespace: &str,
-    max_response_bytes: usize,
-    timeout: Duration,
-) -> Result<HashMap<String, u64>, String> {
-    let deadline = Instant::now() + timeout;
-    let mut conn = GrpcConn::connect(socket_path, deadline)?;
-    let resp = conn.unary_rpc(
-        "/containerd.services.content.v1.Content/List",
-        namespace,
-        None,
-        &[],
-        max_response_bytes,
-    )?;
-    if resp.grpc_status != GRPC_OK {
-        return Err(format!(
-            "containerd Content.List ({namespace}) failed (grpc-status {}): {}",
-            resp.grpc_status, resp.grpc_message
-        ));
+/// Reusable containerd gRPC client for lazy per-digest `Content.Info` metadata
+/// lookups over a single bounded Unix-socket HTTP/2 connection.
+pub struct ContentInfoClient {
+    conn: GrpcConn,
+}
+
+impl ContentInfoClient {
+    pub fn connect(socket_path: &Path, timeout: Duration) -> Result<Self, String> {
+        let deadline = Instant::now() + timeout;
+        Ok(Self {
+            conn: GrpcConn::connect(socket_path, deadline)?,
+        })
     }
-    let mut sizes = HashMap::new();
-    for msg in &resp.messages {
-        for info in decode_list_content_response(msg)? {
-            if info.digest.is_empty() {
-                continue;
-            }
-            let size = u64::try_from(info.size)
-                .map_err(|_| format!("invalid negative size {} for {}", info.size, info.digest))?;
-            sizes.insert(info.digest, size);
-        }
+
+    /// Look up the authoritative committed byte size of `digest` in `namespace`.
+    /// Returns `Ok(None)` when containerd reports gRPC `NOT_FOUND`, and `Err` on
+    /// transport or RPC failures.
+    pub fn blob_size(&mut self, namespace: &str, digest: &str) -> Result<Option<u64>, String> {
+        let Some(info) = self.conn.content_info(namespace, digest)? else {
+            return Ok(None);
+        };
+        let size = u64::try_from(info.size)
+            .map_err(|_| format!("invalid negative size {} for {digest}", info.size))?;
+        Ok(Some(size))
     }
-    Ok(sizes)
 }
 
 /// Call containerd's `/containerd.services.images.v1.Images/Delete` RPC in
@@ -1682,24 +1670,6 @@ fn decode_content_info_response(mut data: &[u8]) -> Result<Option<ContentInfo>, 
     Ok(info)
 }
 
-fn decode_list_content_response(mut data: &[u8]) -> Result<Vec<ContentInfo>, String> {
-    let mut infos = Vec::new();
-    while !data.is_empty() {
-        let (tag, rest) = decode_varint(data)?;
-        let field = tag >> 3;
-        let wt = tag & 0x7;
-        match (field, wt) {
-            (1, 2) => {
-                let (bytes, next) = decode_len_delimited(rest)?;
-                infos.push(decode_content_info(bytes)?);
-                data = next;
-            }
-            _ => data = skip_proto_field(wt, rest)?,
-        }
-    }
-    Ok(infos)
-}
-
 /// Decode `containerd.services.leases.v1.CreateResponse`:
 /// - field 1 (message `Lease`):
 ///   - field 1 (string): `id`
@@ -3171,7 +3141,9 @@ mod tests {
                                 }
                                 "/containerd.services.content.v1.Content/Info" => {
                                     let digest = decode_first_string(&req_proto);
-                                    if let Some(&(size, _)) =
+                                    if digest == "sha256:trigger-rpc-error" {
+                                        send_grpc_err(&mut conn, sid, "13", "bolt%20read%20error");
+                                    } else if let Some(&(size, _)) =
                                         st.ns_content.get(&(ns.clone(), digest.clone()))
                                     {
                                         let mut info = Vec::new();
@@ -3665,39 +3637,40 @@ mod tests {
     }
 
     #[test]
-    fn list_content_sizes_streams_multiple_batches_and_enforces_limit() {
-        let (dir, sock) = temp_sock("content-list");
+    fn content_info_client_distinguishes_found_not_found_and_rpc_error() {
+        let (dir, sock) = temp_sock("content-info");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let mut ns_content = HashMap::new();
-        for i in 0..5u64 {
+        // Populate thousands of unrelated blobs with large labels to mirror a
+        // busy `moby` store; per-digest `Content.Info` only touches queried keys.
+        for i in 0..500u64 {
             ns_content.insert(
                 ("moby".into(), format!("sha256:{i:064x}")),
-                (((i + 1) * 1024) as i64, HashMap::new()),
+                (
+                    ((i + 1) * 1024) as i64,
+                    HashMap::from([("pad".into(), "x".repeat(256))]),
+                ),
             );
         }
-        ns_content.insert(
-            ("k8s.io".into(), format!("sha256:{}", "9".repeat(64))),
-            (999, HashMap::new()),
-        );
+        let target = format!("sha256:{:064x}", 42u64);
+        let missing = format!("sha256:{}", "9".repeat(64));
         let state = Arc::new(Mutex::new(MockContainerdState {
             ns_content,
             ..Default::default()
         }));
 
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
 
-        let sizes = list_content_sizes(&sock, "moby", 1 << 20, Duration::from_secs(5)).unwrap();
-        assert_eq!(sizes.len(), 5);
-        for i in 0..5u64 {
-            assert_eq!(
-                sizes.get(&format!("sha256:{i:064x}")),
-                Some(&((i + 1) * 1024))
-            );
-        }
-
-        let err = list_content_sizes(&sock, "moby", 128, Duration::from_secs(5)).unwrap_err();
-        assert!(err.contains("exceeded"), "{err}");
+        let mut client = ContentInfoClient::connect(&sock, Duration::from_secs(5)).unwrap();
+        assert_eq!(client.blob_size("moby", &target).unwrap(), Some(43 * 1024));
+        assert_eq!(client.blob_size("moby", &missing).unwrap(), None);
+        let err = client
+            .blob_size("moby", "sha256:trigger-rpc-error")
+            .unwrap_err();
+        assert!(err.contains("grpc-status 13"), "{err}");
+        assert!(err.contains("bolt read error"), "{err}");
+        drop(client);
 
         server.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
