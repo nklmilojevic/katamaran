@@ -2807,6 +2807,9 @@ fn validate_k3s_config_yaml(config_path: &Path, config_yaml: &str) -> Result<(),
 }
 
 fn is_valid_etcd_s3_proxy(val: &str) -> bool {
+    // Match k3s `configfilearg.ToString`, which applies Go `strings.TrimSpace`
+    // (identical to Rust `str::trim`) before passing the flag to `s3.GetClient`.
+    let val = val.trim();
     if val.is_empty() || val == "none" {
         return true;
     }
@@ -3171,11 +3174,18 @@ fn parse_yaml_double_quoted(s: &str) -> Result<(String, &str), ()> {
                     '/' => out.push('/'),
                     ' ' => out.push(' '),
                     '0' => out.push('\0'),
+                    'a' => out.push('\x07'),
                     'b' => out.push('\x08'),
+                    'e' => out.push('\x1b'),
                     'f' => out.push('\x0c'),
                     'n' => out.push('\n'),
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
+                    'v' => out.push('\x0b'),
+                    'N' => out.push('\u{0085}'),
+                    '_' => out.push('\u{00a0}'),
+                    'L' => out.push('\u{2028}'),
+                    'P' => out.push('\u{2029}'),
                     '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
                         if esc == '\r' && matches!(chars.peek(), Some(&(_, '\n'))) {
                             chars.next();
@@ -3747,6 +3757,9 @@ fn extract_etcd_s3_proxy_from_flow_map(
             return Err(());
         };
 
+        // Normalize decoded keys with Go `strings.TrimSpace` semantics to match
+        // k3s `configfilearg.ToString` before merge, `+` suffix, and proxy checks.
+        let key = key.trim();
         if key == "<<" {
             if doc.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(doc) {
                 return Err(());
@@ -3756,7 +3769,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
             }
         } else {
             let is_append = key.ends_with('+');
-            let norm_key = key.strip_suffix('+').unwrap_or(&key);
+            let norm_key = key.strip_suffix('+').unwrap_or(key);
             if norm_key != "etcd-s3-proxy" {
                 if has_value {
                     i = skip_flow_value(doc, i)?;
@@ -4126,6 +4139,9 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             continue;
         }
         let (key_slice, _) = strip_yaml_key_properties(after_indent)?;
+        if key_slice.starts_with(['[', '{']) {
+            return Err(());
+        }
         let Some((key, after_colon)) = parse_yaml_mapping_key(key_slice) else {
             if key_slice.starts_with(['"', '\''])
                 && (key_slice.contains("etcd-s3-proxy")
@@ -4136,6 +4152,9 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             i += 1;
             continue;
         };
+        // Match k3s `configfilearg.ToString` (`strings.TrimSpace`) before merge,
+        // `+` suffix, and proxy-key checks.
+        let key = key.trim();
         if key == "<<" {
             // Fail closed on YAML merge keys when the file may merge an `etcd-s3-proxy` entry.
             if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
@@ -4145,7 +4164,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             continue;
         }
         let is_append = key.ends_with('+');
-        let norm_key = key.strip_suffix('+').unwrap_or(&key);
+        let norm_key = key.strip_suffix('+').unwrap_or(key);
         let raw_rest = after_colon.trim_start_matches([' ', '\t']);
         if norm_key != "etcd-s3-proxy" {
             // Skip unrelated block scalar bodies so indented lines inside them
@@ -10039,7 +10058,14 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "etcd-s3-proxy: &p http://proxy.example.com:8080\n",
             "etcd-s3-proxy: [&p http://proxy.example.com:8080]\n",
             "etcd-s3-proxy: |2-\n  http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: |\n  http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: |1-\n  http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: \"  http://proxy.example.com:8080  \"\n",
+            "etcd-s3-proxy: '  none  '\n",
+            "etcd-s3-proxy: \"   \"\n",
             "{\"etcd-s3-proxy\": \"none\"}\n",
+            "{\"etcd-s3-proxy\": \"  http://proxy.example.com:8080  \"}\n",
+            "{\"etcd-s3-proxy \": \"  http://proxy.example.com:8080  \"}\n",
             "{disable: [traefik], kube-apiserver-arg: [\"audit-policy=foo\\\\bar\"]}\n",
             "{disable: [traefik], note: \"a\\nb\", nested: {re: \"foo\\\\d+\"}}\n",
             "{disable: [traefik], note: it's a path\\foo, nested: {k:\"v\\\\}\"}}\n",
@@ -10181,8 +10207,32 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             ),
             ("unclosed quote", format!("etcd-s3-proxy: \"{bad_url}\n")),
             (
-                "explicit indent block scalar with leading space",
-                format!("etcd-s3-proxy: |1-\n  http://user:{secret_pw}@{bad_host}:8080\n"),
+                "explicit indent block scalar with malformed URL",
+                format!("etcd-s3-proxy: |1-\n  {bad_url}\n"),
+            ),
+            (
+                "quoted proxy key with trailing space in flow map",
+                format!("{{\"etcd-s3-proxy \": \"{bad_url}\"}}\n"),
+            ),
+            (
+                "quoted append proxy key with surrounding space in flow map",
+                format!("{{disable: [traefik], \" etcd-s3-proxy+ \": \"{bad_url}\"}}\n"),
+            ),
+            (
+                "quoted proxy key with trailing NBSP in flow map",
+                format!("{{\"etcd-s3-proxy\\u00a0\": \"{bad_url}\"}}\n"),
+            ),
+            (
+                "quoted proxy key with trailing space in block map",
+                format!("\"etcd-s3-proxy \": {bad_url}\n"),
+            ),
+            (
+                "space-padded malformed URL",
+                format!("etcd-s3-proxy: \"  {bad_url}  \"\n"),
+            ),
+            (
+                "flow sequence as top-level key in block map",
+                format!("[\"etcd-s3-proxy\"]: {bad_url}\n"),
             ),
             (
                 "merge key hiding bad proxy",
@@ -10220,9 +10270,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             ),
             (
                 "unicode NBSP leading block scalar line",
-                format!(
-                    "etcd-s3-proxy: |-\n \u{00a0}\n  http://user:{secret_pw}@{bad_host}:8080\n"
-                ),
+                format!("etcd-s3-proxy: |-\n \u{00a0}\n  {bad_url}\n"),
             ),
             (
                 "unicode NBSP under explicit block scalar indentation",
