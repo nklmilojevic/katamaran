@@ -925,6 +925,35 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
         "expected ~64 GiB filesystem to remain untouched on padded image, got {padded_kib} KiB"
     );
 
+    // Setting a target equal to the 100 GiB backing image must still prompt for
+    // a restart and expand the guest Btrfs filesystem from 64 GiB to 100 GiB.
+    let set_100 = cli(&d.home, &["config", "set", "disk=100G"]);
+    assert!(set_100.contains("restart"), "{set_100}");
+    let pending_100 = cli(&d.home, &["status"]);
+    assert!(
+        pending_100.contains("pending") && pending_100.contains("100 GiB disk"),
+        "{pending_100}"
+    );
+    cli(&d.home, &["restart"]);
+    assert_eq!(std::fs::metadata(&img).unwrap().len(), 100 * GIB);
+    assert_eq!(d.status()["vm"]["disk_gib"], 100);
+    let console_100 = std::fs::read_to_string(d.home.join("logs/console.log"))
+        .expect("read guest console after filesystem-only 100 GiB resize");
+    assert!(
+        console_100.contains("resized data disk filesystem (64 GiB -> 100 GiB)"),
+        "console log:\n{console_100}"
+    );
+    let after_100_kib = fs_kib();
+    assert!(
+        (96 << 20..=104 << 20).contains(&after_100_kib),
+        "expected ~100 GiB filesystem after equal-size target restart, got {after_100_kib} KiB"
+    );
+    assert!(
+        !cli(&d.home, &["status"]).contains("pending"),
+        "{}",
+        cli(&d.home, &["status"])
+    );
+
     let set_out = cli(&d.home, &["config", "set", "disk=500G"]);
     assert!(set_out.contains("restart"), "{set_out}");
     let pending = cli(&d.home, &["status"]);
@@ -947,7 +976,7 @@ fn data_disk_grows_and_resizes_btrfs_across_restart() {
     let console = std::fs::read_to_string(d.home.join("logs/console.log"))
         .expect("read guest console after resize");
     assert!(
-        console.contains("resized data disk filesystem (64 GiB -> 500 GiB)"),
+        console.contains("resized data disk filesystem (100 GiB -> 500 GiB)"),
         "console log:\n{console}"
     );
 

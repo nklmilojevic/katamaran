@@ -547,9 +547,11 @@ pub struct VmInfo {
     /// GiB rounding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_bytes: Option<u64>,
-    /// Requested `disk_gib` target from config when this VM started, kept
-    /// separate from `disk_gib` so a retained larger image does not appear
-    /// as perpetual pending work.
+    /// Explicitly configured `disk_gib` target from config when this VM
+    /// started (`None` when the VM booted with no explicit disk target). Kept
+    /// separate from `disk_gib` so a retained larger image does not appear as
+    /// perpetual pending work while a newly set or increased target (even equal
+    /// to the backing image size) still flags a restart for guest Btrfs growth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_disk_gib: Option<u32>,
     /// True when the guest reported a `data-disk` resize failure during boot,
@@ -1165,7 +1167,7 @@ mod tests {
                     memory_mib: cfg.memory_mib,
                     disk_gib: display_gib,
                     disk_bytes: Some(u64::from(display_gib) << 30),
-                    requested_disk_gib: Some(display_gib),
+                    requested_disk_gib: cfg.disk_gib,
                     disk_resize_failed: false,
                     pid: Some(9),
                     boot_ms: Some(120.0),

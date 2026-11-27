@@ -899,7 +899,7 @@ impl Daemon {
                 memory_mib: r.applied.memory_mib,
                 disk_gib: crate::config::bytes_to_gib(r.attached_disk_bytes),
                 disk_bytes: Some(r.attached_disk_bytes),
-                requested_disk_gib: Some(r.applied.disk_gib()),
+                requested_disk_gib: r.applied.disk_gib,
                 disk_resize_failed: r.disk_resize_failed,
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
@@ -4412,7 +4412,7 @@ mod tests {
         let status = d.status();
         let vm = status.vm.as_ref().expect("running VM info");
         assert_eq!(vm.disk_gib, 500);
-        assert_eq!(vm.requested_disk_gib, Some(crate::config::DEFAULT_DISK_GIB));
+        assert_eq!(vm.requested_disk_gib, None);
         assert_eq!(status.saved_disk_gib(), crate::config::DEFAULT_DISK_GIB);
 
         // Retaining the larger image does not cause perpetual pending work.
@@ -4917,6 +4917,88 @@ mod tests {
         d.stop(true).unwrap();
         start_sim(Some(64));
         assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&d.status()).contains("pending"));
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn padded_image_equal_target_flags_filesystem_only_restart_and_clears_after_restart() {
+        let home = temp("padded-equal-target");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        let bytes_100 = 100u64 << 30;
+        fs::File::create(&img).unwrap().set_len(bytes_100).unwrap();
+
+        let d = Daemon::new(home.clone());
+        let start_sim = |expected_target: Option<u32>| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let img_for_vm = img.clone();
+            d.start_with(
+                |cfg| Ok(test_run_args(cfg, &img)),
+                move |daemon, generation, args, rx, disk_lock| {
+                    assert_eq!(args.disk_gib, expected_target);
+                    thread::spawn(move || {
+                        let bytes =
+                            run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                                .unwrap();
+                        drop(disk_lock);
+                        daemon.on_event(generation, Event::DiskPrepared { bytes });
+                        daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                        let _ = done_tx.send(());
+                        let _ = rx.recv();
+                        daemon.on_exit(generation, Ok(()));
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+
+        // 1. Boot with a pre-padded 100 GiB backing image and no saved disk target.
+        start_sim(None);
+        let initial = d.status();
+        assert_eq!(initial.vm.as_ref().unwrap().disk_gib, 100);
+        assert_eq!(initial.vm.as_ref().unwrap().requested_disk_gib, None);
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&initial).contains("pending"));
+
+        // 2. Setting disk=100G (equal to the backing image) flags a pending
+        //    restart so kat-init can expand the guest Btrfs filesystem to 100 GiB.
+        let mut set_100 = BTreeMap::new();
+        set_100.insert("disk".into(), "100G".into());
+        let v = d.handle(&Call::ConfigSet(set_100)).unwrap();
+        assert_eq!(v["restart_required"], true);
+        let pending_text = crate::cli::summary(&d.status());
+        assert!(
+            pending_text.contains("pending")
+                && pending_text.contains("100 GiB disk after a restart"),
+            "{pending_text}"
+        );
+
+        // 3. Restarting passes Some(100) to the guest and clears pending.
+        d.stop(true).unwrap();
+        start_sim(Some(100));
+        let after = d.status();
+        assert_eq!(after.vm.as_ref().unwrap().requested_disk_gib, Some(100));
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&after).contains("pending"));
+
+        // 4. Lowering or removing disk_gib directly in config.toml does not flag pending.
+        Config {
+            disk_gib: Some(64),
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&d.status()).contains("pending"));
+
+        Config::default().save(&home).unwrap();
         assert!(!d.config_view().unwrap().restart_required);
         assert!(!crate::cli::summary(&d.status()).contains("pending"));
 

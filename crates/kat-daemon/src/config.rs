@@ -495,9 +495,14 @@ impl Config {
     }
 
     /// Like [`Self::needs_restart_for`], comparing an explicitly configured
-    /// `saved.disk_gib` against the VM's exact `attached_disk_bytes` so an
-    /// explicit `disk=64G` on an 8 GiB or 63.5 GiB image flags a pending
-    /// restart while an untouched default (`None`) does not.
+    /// `saved.disk_gib` against both the VM's exact `attached_disk_bytes` and
+    /// its applied explicit target `self.disk_gib`.
+    ///
+    /// A restart is required when a saved explicit target either exceeds the
+    /// attached backing image size or is newly set / increased relative to the
+    /// target this VM booted with (so filesystem-only growth on a pre-padded
+    /// image still prompts a restart for `kat-init` to expand Btrfs). Lowering
+    /// or removing `disk_gib` never triggers a restart.
     pub fn needs_restart_for_disk_bytes(&self, saved: &Config, attached_disk_bytes: u64) -> bool {
         let applied = Config {
             disk_gib: saved.disk_gib,
@@ -509,9 +514,10 @@ impl Config {
             ..self.clone()
         };
         applied != *saved
-            || saved
-                .disk_gib
-                .is_some_and(|target| (u64::from(target) << 30) > attached_disk_bytes)
+            || saved.disk_gib.is_some_and(|target| {
+                (u64::from(target) << 30) > attached_disk_bytes
+                    || self.disk_gib.is_none_or(|applied| target > applied)
+            })
     }
 
     pub fn validate(&self, host: &Host) -> anyhow::Result<()> {
@@ -1272,7 +1278,28 @@ mod tests {
             Config::default()
                 .needs_restart_for_disk_bytes(&explicit_default, (63u64 << 30) + (512u64 << 20),)
         );
-        assert!(!Config::default().needs_restart_for_disk_bytes(&explicit_default, 64u64 << 30));
+        // Newly setting an explicit target (even equal to the backing image size)
+        // requires a restart so kat-init can expand any pre-padded Btrfs filesystem;
+        // once applied, the same target does not require another restart.
+        assert!(Config::default().needs_restart_for_disk_bytes(&explicit_default, 64u64 << 30));
+        assert!(!explicit_default.needs_restart_for_disk_bytes(&explicit_default, 64u64 << 30));
+
+        // Pre-padded 100 GiB / 200 GiB images: setting disk=100G from unset or
+        // increasing 100G -> 150G requires a restart, while lowering or removing
+        // disk_gib does not.
+        let target_100 = Config {
+            disk_gib: Some(100),
+            ..Config::default()
+        };
+        let target_150 = Config {
+            disk_gib: Some(150),
+            ..Config::default()
+        };
+        assert!(Config::default().needs_restart_for_disk_bytes(&target_100, 100u64 << 30));
+        assert!(!target_100.needs_restart_for_disk_bytes(&target_100, 100u64 << 30));
+        assert!(target_100.needs_restart_for_disk_bytes(&target_150, 200u64 << 30));
+        assert!(!target_150.needs_restart_for_disk_bytes(&target_100, 200u64 << 30));
+        assert!(!target_150.needs_restart_for_disk_bytes(&Config::default(), 200u64 << 30));
 
         let started = cfg.clone();
         cfg.set("disk", "500G", &HOST).unwrap();

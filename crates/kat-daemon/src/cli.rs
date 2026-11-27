@@ -363,7 +363,10 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         let attached_bytes = vm.attached_disk_bytes();
         let explicit_disk = s.explicit_disk_target_gib();
         let disk_pending = vm.disk_resize_failed
-            || explicit_disk.is_some_and(|target| (u64::from(target) << 30) > attached_bytes);
+            || explicit_disk.is_some_and(|target| {
+                (u64::from(target) << 30) > attached_bytes
+                    || vm.requested_disk_gib.is_none_or(|applied| target > applied)
+            });
         if vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib || disk_pending {
             let next_disk_bytes = explicit_disk.map_or(attached_bytes, |target| {
                 (u64::from(target) << 30).max(attached_bytes)
@@ -670,7 +673,7 @@ mod tests {
                 memory_mib: 4096,
                 disk_gib: 64,
                 disk_bytes: None,
-                requested_disk_gib: Some(64),
+                requested_disk_gib: None,
                 disk_resize_failed: false,
                 pid: Some(2),
                 boot_ms: Some(100.0),
@@ -723,14 +726,14 @@ mod tests {
         );
 
         // Retaining a larger foreground-grown image reports 500 GiB attached
-        // without creating perpetual pending work when config stays at 64 GiB.
+        // without creating perpetual pending work when config stays unset.
         let mut retained = s.clone();
         retained.config.cpus = 4;
         retained.config.memory_mib = 4096;
         retained.disk_gib = Some(64);
         retained.disk_target_gib = None;
         retained.vm.as_mut().unwrap().disk_gib = 500;
-        retained.vm.as_mut().unwrap().requested_disk_gib = Some(64);
+        retained.vm.as_mut().unwrap().requested_disk_gib = None;
         let retained_text = summary(&retained);
         assert!(
             retained_text.contains("4 CPUs · 4096 MiB · 500 GiB disk"),
@@ -759,7 +762,7 @@ mod tests {
         retained_small.disk_gib = Some(64);
         retained_small.disk_target_gib = None;
         retained_small.vm.as_mut().unwrap().disk_gib = 8;
-        retained_small.vm.as_mut().unwrap().requested_disk_gib = Some(64);
+        retained_small.vm.as_mut().unwrap().requested_disk_gib = None;
         let retained_small_text = summary(&retained_small);
         assert!(
             retained_small_text.contains("2 CPUs · 4096 MiB · 8 GiB disk after a restart"),
@@ -774,11 +777,66 @@ mod tests {
         explicit_small.disk_gib = Some(64);
         explicit_small.disk_target_gib = Some(64);
         explicit_small.vm.as_mut().unwrap().disk_gib = 8;
-        explicit_small.vm.as_mut().unwrap().requested_disk_gib = Some(64);
+        explicit_small.vm.as_mut().unwrap().requested_disk_gib = None;
         let explicit_small_text = summary(&explicit_small);
         assert!(
             explicit_small_text.contains("4 CPUs · 4096 MiB · 64 GiB disk after a restart"),
             "{explicit_small_text}"
+        );
+
+        // Setting disk=100G on a running 100 GiB pre-padded image that booted
+        // without an explicit target flags pending filesystem-only growth;
+        // once restarted with requested_disk_gib = Some(100), pending clears.
+        let mut padded_100 = s.clone();
+        padded_100.config.cpus = 4;
+        padded_100.config.memory_mib = 4096;
+        padded_100.disk_gib = Some(100);
+        padded_100.disk_target_gib = Some(100);
+        padded_100.vm.as_mut().unwrap().disk_gib = 100;
+        padded_100.vm.as_mut().unwrap().disk_bytes = Some(100u64 << 30);
+        padded_100.vm.as_mut().unwrap().requested_disk_gib = None;
+        let padded_100_text = summary(&padded_100);
+        assert!(
+            padded_100_text.contains("4 CPUs · 4096 MiB · 100 GiB disk after a restart"),
+            "{padded_100_text}"
+        );
+        padded_100.vm.as_mut().unwrap().requested_disk_gib = Some(100);
+        assert!(
+            !summary(&padded_100).contains("pending"),
+            "{}",
+            summary(&padded_100)
+        );
+
+        // Raising an explicit target on a larger padded image (100G -> 150G on
+        // a 200 GiB backing image) flags pending, while lowering (150G -> 100G)
+        // or removing the target does not.
+        let mut padded_200 = s.clone();
+        padded_200.config.cpus = 4;
+        padded_200.config.memory_mib = 4096;
+        padded_200.disk_gib = Some(150);
+        padded_200.disk_target_gib = Some(150);
+        padded_200.vm.as_mut().unwrap().disk_gib = 200;
+        padded_200.vm.as_mut().unwrap().disk_bytes = Some(200u64 << 30);
+        padded_200.vm.as_mut().unwrap().requested_disk_gib = Some(100);
+        assert!(
+            summary(&padded_200).contains("4 CPUs · 4096 MiB · 200 GiB disk after a restart"),
+            "{}",
+            summary(&padded_200)
+        );
+        padded_200.vm.as_mut().unwrap().requested_disk_gib = Some(150);
+        padded_200.disk_gib = Some(100);
+        padded_200.disk_target_gib = Some(100);
+        assert!(
+            !summary(&padded_200).contains("pending"),
+            "{}",
+            summary(&padded_200)
+        );
+        padded_200.disk_gib = Some(64);
+        padded_200.disk_target_gib = None;
+        assert!(
+            !summary(&padded_200).contains("pending"),
+            "{}",
+            summary(&padded_200)
         );
 
         // A fractional 63.5 GiB image raised explicitly to 64 GiB still shows
@@ -802,7 +860,7 @@ mod tests {
         assert_eq!(format_disk_bytes((64u64 << 30) - 4096), "63.9 GiB");
 
         // A guest resize failure keeps a restart pending even when the host
-        // image already matches the saved target.
+        // image and applied target already match the saved target.
         let mut resize_failed = s.clone();
         resize_failed.config.cpus = 4;
         resize_failed.config.memory_mib = 4096;
@@ -810,6 +868,12 @@ mod tests {
         resize_failed.disk_target_gib = Some(500);
         resize_failed.vm.as_mut().unwrap().disk_gib = 500;
         resize_failed.vm.as_mut().unwrap().disk_bytes = Some(500u64 << 30);
+        resize_failed.vm.as_mut().unwrap().requested_disk_gib = Some(500);
+        assert!(
+            !summary(&resize_failed).contains("pending"),
+            "{}",
+            summary(&resize_failed)
+        );
         resize_failed.vm.as_mut().unwrap().disk_resize_failed = true;
         let resize_failed_text = summary(&resize_failed);
         assert!(

@@ -118,17 +118,32 @@ pub fn find_target_device(
     fs_info: FsInfo,
     read_dev_info: &mut impl FnMut(u64) -> io::Result<Option<DevInfo>>,
 ) -> io::Result<DevInfo> {
-    if let Some(info) = read_dev_info(1)?
-        && (fs_info.num_devices <= 1 || info.path.as_deref() == Some(dev_path))
+    let matches =
+        |info: &DevInfo| fs_info.num_devices <= 1 || info.path.as_deref() == Some(dev_path);
+    // `BTRFS_IOC_FS_INFO` sets `max_id` to the highest live devid in the
+    // filesystem. Checking `max_id` first handles standard devid=1 images AND
+    // single-device custom images whose sole remaining device has any devid
+    // (including > 1024) in a single ioctl without a hard-coded scan limit.
+    let mut seen = 0u64;
+    if fs_info.max_id > 0
+        && let Some(info) = read_dev_info(fs_info.max_id)?
     {
-        return Ok(info);
-    }
-    let max_id = fs_info.max_id.min(1024);
-    for devid in 2..=max_id {
-        if let Some(info) = read_dev_info(devid)?
-            && (info.path.as_deref() == Some(dev_path) || fs_info.num_devices == 1)
-        {
+        if matches(&info) {
             return Ok(info);
+        }
+        seen += 1;
+    }
+    if fs_info.max_id > 1 && seen < fs_info.num_devices {
+        for devid in 1..fs_info.max_id {
+            if let Some(info) = read_dev_info(devid)? {
+                if matches(&info) {
+                    return Ok(info);
+                }
+                seen += 1;
+                if seen >= fs_info.num_devices {
+                    break;
+                }
+            }
         }
     }
     Err(io::Error::new(
@@ -436,5 +451,114 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+    }
+
+    #[test]
+    fn grows_single_device_image_with_devid_above_1024_in_one_lookup() {
+        let high_devid = 5000u64;
+        let current_total = Cell::new(64 * GIB);
+        let lookups = Cell::new(0u32);
+        let resize_call = Cell::new(None);
+        let res = grow_if_needed_with(
+            "/dev/vdb",
+            Some(500 * GIB),
+            || Ok(500 * GIB),
+            || {
+                Ok(FsInfo {
+                    max_id: high_devid,
+                    num_devices: 1,
+                    sectorsize: 4096,
+                })
+            },
+            |devid| {
+                lookups.set(lookups.get() + 1);
+                if devid == high_devid {
+                    Ok(Some(DevInfo {
+                        devid: high_devid,
+                        total_bytes: current_total.get(),
+                        path: Some("/dev/vdb".into()),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            },
+            |devid, plan| {
+                resize_call.set(Some((devid, plan)));
+                current_total.set(500 * GIB);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(resize_call.get(), Some((high_devid, ResizePlan::Max)));
+        assert_eq!(res, Some((64 * GIB, 500 * GIB)));
+        // One lookup to find devid=5000, one lookup after resize to verify size.
+        assert_eq!(lookups.get(), 2);
+        assert_eq!(
+            resize_spec(high_devid, ResizePlan::Max).as_deref(),
+            Some("5000:max")
+        );
+    }
+
+    #[test]
+    fn finds_target_in_multi_device_filesystem_above_1024_and_stops_when_all_seen() {
+        let mut seen_ids = Vec::new();
+        let found = find_target_device(
+            "/dev/vdb",
+            FsInfo {
+                max_id: 2000,
+                num_devices: 2,
+                sectorsize: 4096,
+            },
+            &mut |devid| {
+                seen_ids.push(devid);
+                match devid {
+                    1500 => Ok(Some(DevInfo {
+                        devid: 1500,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdb".into()),
+                    })),
+                    2000 => Ok(Some(DevInfo {
+                        devid: 2000,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdc".into()),
+                    })),
+                    _ => Ok(None),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(found.devid, 1500);
+        assert_eq!(seen_ids[0], 2000);
+
+        // When /dev/vdb is absent, stops scanning once all `num_devices` live
+        // devices have been inspected (does not scan the whole gap 2..1999).
+        let mut missing_lookups = 0u32;
+        let err = find_target_device(
+            "/dev/vdb",
+            FsInfo {
+                max_id: 2000,
+                num_devices: 2,
+                sectorsize: 4096,
+            },
+            &mut |devid| {
+                missing_lookups += 1;
+                match devid {
+                    1 => Ok(Some(DevInfo {
+                        devid: 1,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdc".into()),
+                    })),
+                    2000 => Ok(Some(DevInfo {
+                        devid: 2000,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdd".into()),
+                    })),
+                    _ => Ok(None),
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(missing_lookups, 2);
     }
 }
