@@ -9372,13 +9372,35 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         );
     }
 
+    struct TempDirGuard(std::path::PathBuf);
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+            let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+            let mut bytes = template.into_os_string().into_vec();
+            bytes.push(0);
+            let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+            assert!(
+                !ptr.is_null(),
+                "mkdtemp failed: {}",
+                io::Error::last_os_error()
+            );
+            bytes.pop();
+            Self(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                bytes,
+            )))
+        }
+    }
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn remove_cluster_data_dirs_clears_legacy_kubelet_before_data_dir() {
-        let base = std::env::temp_dir().join(format!(
-            "kat-init-reset-order-{}-{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let tmp = TempDirGuard::create("kat-init-reset-order");
+        let base = &tmp.0;
         let data_dir = base.join("data");
         let legacy_dir = base.join("legacy-kubelet");
         let kubeconfig = base.join("kubeconfig.yaml");
@@ -9434,8 +9456,6 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(!data_dir.exists());
         assert!(!kubeconfig.exists());
         assert!(!k3s_cfg.exists());
-
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -9613,31 +9633,6 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             .expect("set KAT_TEST_CONTAINERD_BIN to the bundled containerd binary");
         let ctr_bin = std::env::var("KAT_TEST_CTR_BIN")
             .expect("set KAT_TEST_CTR_BIN to the bundled ctr binary");
-
-        struct TempDirGuard(std::path::PathBuf);
-        impl TempDirGuard {
-            fn create(prefix: &str) -> Self {
-                use std::os::unix::ffi::OsStringExt;
-                let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
-                let mut bytes = template.into_os_string().into_vec();
-                bytes.push(0);
-                let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
-                assert!(
-                    !ptr.is_null(),
-                    "mkdtemp failed: {}",
-                    io::Error::last_os_error()
-                );
-                bytes.pop();
-                Self(std::path::PathBuf::from(std::ffi::OsString::from_vec(
-                    bytes,
-                )))
-            }
-        }
-        impl Drop for TempDirGuard {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
 
         let tmp_guard = TempDirGuard::create("kat-init-live-ctr");
         let base = tmp_guard.0.clone();

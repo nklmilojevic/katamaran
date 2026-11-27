@@ -2305,10 +2305,18 @@ mod tests {
     use serde_json::json;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kat-daemon-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        use std::os::unix::ffi::OsStringExt;
+        let template = std::env::temp_dir().join(format!("kat-{name}-XXXXXX"));
+        let mut bytes = template.into_os_string().into_vec();
+        bytes.push(0);
+        let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+        assert!(
+            !ptr.is_null(),
+            "mkdtemp failed: {}",
+            io::Error::last_os_error()
+        );
+        bytes.pop();
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
     }
 
     #[test]

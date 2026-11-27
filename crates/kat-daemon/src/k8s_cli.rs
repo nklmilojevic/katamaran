@@ -496,6 +496,33 @@ mod tests {
         assert!(matches!(with_images.cmd, K8sCmd::Reset { images: true }));
     }
 
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+            let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+            let mut bytes = template.into_os_string().into_vec();
+            bytes.push(0);
+            let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+            assert!(
+                !ptr.is_null(),
+                "mkdtemp failed: {}",
+                std::io::Error::last_os_error()
+            );
+            bytes.pop();
+            Self(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                bytes,
+            )))
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn reset_images_fails_on_pre_feature_daemon_without_falling_back() {
         use std::io::{BufRead, BufReader, Write};
@@ -503,10 +530,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::thread;
 
-        let dir = std::env::temp_dir().join(format!("kat-cli-rc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let dir = TempDirGuard::create("kat-cli-rc");
+        let sock = dir.0.join("daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen_srv = seen.clone();
@@ -549,7 +574,6 @@ mod tests {
         srv.join().unwrap();
 
         assert_eq!(*seen.lock().unwrap(), vec!["k8s.reset_images".to_string()]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -558,10 +582,8 @@ mod tests {
         use std::os::unix::net::UnixListener;
         use std::thread;
 
-        let dir = std::env::temp_dir().join(format!("kat-cli-rp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("daemon.sock");
+        let dir = TempDirGuard::create("kat-cli-rp");
+        let sock = dir.0.join("daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let srv = thread::spawn(move || {
@@ -607,6 +629,5 @@ mod tests {
                 "stopping temporary VM",
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

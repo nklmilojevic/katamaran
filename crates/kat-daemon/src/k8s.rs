@@ -2564,18 +2564,39 @@ users:
 
     #[test]
     fn remove_kubeconfig_bounded_enforces_deadline_on_noisy_kubectl_and_inherited_pipes() {
+        use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::PermissionsExt;
 
-        let base = std::env::temp_dir().join(format!(
-            "kat-k8s-noisy-{}-{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        struct TempDirGuard(PathBuf);
+        impl TempDirGuard {
+            fn create(prefix: &str) -> Self {
+                let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+                let mut bytes = template.into_os_string().into_vec();
+                bytes.push(0);
+                let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+                assert!(
+                    !ptr.is_null(),
+                    "mkdtemp failed: {}",
+                    io::Error::last_os_error()
+                );
+                bytes.pop();
+                Self(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let tmp = TempDirGuard::create("kat-k8s-noisy");
+        let base = &tmp.0;
         let home = base.join("h");
         let user = base.join("u");
         let kube = user.join(".kube");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&kube).unwrap();
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&user).unwrap();
+        fs::create_dir(&kube).unwrap();
         let cfg = kube.join("config");
         fs::write(&cfg, "apiVersion: v1\nkind: Config\n").unwrap();
 
@@ -2688,7 +2709,5 @@ users:
             "inherited pipe descendant held cleanup open: {:?}",
             started.elapsed()
         );
-
-        let _ = fs::remove_dir_all(&base);
     }
 }
