@@ -2328,12 +2328,18 @@ mod tests {
         let again = api.expose(TCP, port).unwrap_err();
         assert!(again.to_string().contains("already running"), "{again}");
         api.unexpose(TCP, port).unwrap();
-        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+        assert_port_rebindable(port);
 
         // Privileged port (< 1024): exposes unprivileged on macOS via lo0-scoped wildcard.
-        let low = claim_test_low_port();
-        api.expose(TCP, low)
-            .expect("gvproxy should expose a free privileged port < 1024");
+        let mut low = None;
+        for _ in 0..16 {
+            let candidate = claim_test_low_port();
+            if api.expose(TCP, candidate).is_ok() {
+                low = Some(candidate);
+                break;
+            }
+        }
+        let low = low.expect("gvproxy should expose a free privileged port < 1024");
         assert!(
             LoopbackTcpListener::bind(low).is_err(),
             "duplicate bind on exposed low port {low} should fail"
@@ -2374,14 +2380,29 @@ mod tests {
             assert!(!sock.exists());
             assert_port_rebindable(p);
         }
-        // A port the Mac already uses is refused, and nothing is left behind.
-        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // When only localhost is busy and a real lo0 alias is configured, the
+        // alias still binds and delivers payloads while localhost is skipped.
+        if let Some(a) = &alias {
+            let busy_lo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let partial_port = busy_lo.local_addr().unwrap().port();
+            addrs.expose(TCP, partial_port).unwrap();
+            assert_eq!(addrs.port_addrs(TCP, partial_port), vec![a.addr]);
+            assert_eq!(tcp_echo(a.addr, partial_port, "partial"), "guest:partial");
+            addrs.unexpose(TCP, partial_port).unwrap();
+            assert!(!crate::autofwd::Upstream::socket(&gv_dir, partial_port).exists());
+            drop(busy_lo);
+        }
+        // When every configured address is already in use, the forward is
+        // refused and nothing is left behind in gvproxy.
+        let busy = LoopbackTcpListener::bind_on(&configured, 0).unwrap();
+        assert_eq!(busy.addrs(), configured.as_slice());
         let busy_port = busy.local_addr().unwrap().port();
         assert!(matches!(
             addrs.expose(TCP, busy_port),
             Err(ForwardError::Refused(_))
         ));
         assert!(!crate::autofwd::Upstream::socket(&gv_dir, busy_port).exists());
+        drop(busy);
         assert_eq!(addrs.port_label(TCP, port), addrs_label(&configured));
 
         // Dropping AddressesApi stops active listeners and removes their sockets.
