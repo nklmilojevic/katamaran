@@ -7,20 +7,17 @@
 //!    side-effect-free readiness probe before submitting a command.
 //! 2. Host sends `Exec(ExecSpec)` once.
 //! 3. Guest validates and spawns the process in the VM's root namespaces, then
-//!    answers `Started` (or `Error` if spawning failed).
-//! 4. Host streams stdin as `Data`, `DataEnd`, plus `Resize` and `Signal`.
-//!    `DataEnd` closes piped stdin. In a PTY session it triggers canonical EOF
-//!    using the terminal's configured `VEOF` character when the line discipline
-//!    is in canonical mode (`ICANON`) — flushing any pending partial line
-//!    before delivering EOF — and injects no control byte in noncanonical/raw
-//!    mode, where `DataEnd` cannot signal EOF to the guest process.
-//!    After reading a `Signal` frame and signaling the guest process group, the
-//!    guest queues `SignalAck` ahead of newly queued output frames on the
-//!    guest-to-host stream so the host knows a forwarded `SIGINT` crossed any
-//!    backpressured stdin queue. Because `SignalAck` still follows output frames
-//!    already in flight, the host should suspend its `SignalAck` delivery
-//!    timeout while blocked writing to local stdout/stderr so slow local output
-//!    is not mistaken for failed signal delivery.
+//!    answers `Started { token }` (or `Error` if spawning failed). `token` is a
+//!    128-bit per-session capability that lets the host deliver out-of-band
+//!    signals on a separate connection via `SignalSession { token, signal }` ->
+//!    `SignalAck`, completely independent of backpressure on the stdio stream.
+//! 4. Host streams stdin as `Data`, `DataEnd`, plus `Resize` (and optional
+//!    in-band `Signal`). `DataEnd` closes piped stdin. In a PTY session it
+//!    triggers canonical EOF using the terminal's configured `VEOF` character
+//!    when the line discipline is in canonical mode (`ICANON`) — flushing any
+//!    pending partial line before delivering EOF — and injects no control byte
+//!    in noncanonical/raw mode, where `DataEnd` cannot signal EOF to the guest
+//!    process.
 //! 5. Guest streams `Stdout` / `Stderr`, then `Exit { code }` (or `Error`).
 
 use std::io::{self, Read, Write};
@@ -43,7 +40,10 @@ pub enum VmExecMsg {
     Signal {
         signal: i32,
     },
-    Started,
+    Started {
+        /// Per-session 128-bit token for out-of-band [`VmExecMsg::SignalSession`].
+        token: [u8; 16],
+    },
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit {
@@ -56,9 +56,17 @@ pub enum VmExecMsg {
     /// no-op keepalive probe during backpressured sessions (ignored by the host
     /// output relay).
     Pong,
-    /// Guest acknowledgment sent after reading a [`VmExecMsg::Signal`] frame
-    /// and signaling the target process group.
+    /// Guest acknowledgment sent after signaling the target process group
+    /// (either in-band for [`VmExecMsg::Signal`] or out-of-band for
+    /// [`VmExecMsg::SignalSession`]).
     SignalAck,
+    /// Out-of-band signal delivery sent on a dedicated control connection so
+    /// signals and their [`VmExecMsg::SignalAck`] progress independently of
+    /// backpressure on either direction of the stdio stream.
+    SignalSession {
+        token: [u8; 16],
+        signal: i32,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -86,6 +94,7 @@ mod kind {
     pub const PING: u16 = 0x90b;
     pub const PONG: u16 = 0x90c;
     pub const SIGNAL_ACK: u16 = 0x90d;
+    pub const SIGNAL_SESSION: u16 = 0x90e;
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -134,7 +143,10 @@ impl VmExecMsg {
                 put_u32(b, *signal as u32);
                 kind::SIGNAL
             }
-            VmExecMsg::Started => kind::STARTED,
+            VmExecMsg::Started { token } => {
+                b.extend_from_slice(token);
+                kind::STARTED
+            }
             VmExecMsg::Stdout(d) => {
                 put_bytes(b, d);
                 kind::STDOUT
@@ -154,6 +166,11 @@ impl VmExecMsg {
             VmExecMsg::Ping => kind::PING,
             VmExecMsg::Pong => kind::PONG,
             VmExecMsg::SignalAck => kind::SIGNAL_ACK,
+            VmExecMsg::SignalSession { token, signal } => {
+                b.extend_from_slice(token);
+                put_u32(b, *signal as u32);
+                kind::SIGNAL_SESSION
+            }
         };
         let len = (buf.len() - 4) as u32;
         buf[0..4].copy_from_slice(&len.to_le_bytes());
@@ -214,7 +231,12 @@ impl VmExecMsg {
             kind::SIGNAL => VmExecMsg::Signal {
                 signal: r.u32()? as i32,
             },
-            kind::STARTED => VmExecMsg::Started,
+            kind::STARTED => {
+                let raw = r.take(16)?;
+                let mut token = [0u8; 16];
+                token.copy_from_slice(raw);
+                VmExecMsg::Started { token }
+            }
             kind::STDOUT => VmExecMsg::Stdout(bytes(r)?),
             kind::STDERR => VmExecMsg::Stderr(bytes(r)?),
             kind::EXIT => VmExecMsg::Exit {
@@ -224,6 +246,15 @@ impl VmExecMsg {
             kind::PING => VmExecMsg::Ping,
             kind::PONG => VmExecMsg::Pong,
             kind::SIGNAL_ACK => VmExecMsg::SignalAck,
+            kind::SIGNAL_SESSION => {
+                let raw = r.take(16)?;
+                let mut token = [0u8; 16];
+                token.copy_from_slice(raw);
+                VmExecMsg::SignalSession {
+                    token,
+                    signal: r.u32()? as i32,
+                }
+            }
             other => return Err(ProtoError::UnknownKind(other)),
         };
         if !r.buf.is_empty() {
@@ -295,7 +326,9 @@ mod tests {
             VmExecMsg::DataEnd,
             VmExecMsg::Resize { rows: 24, cols: 80 },
             VmExecMsg::Signal { signal: 15 },
-            VmExecMsg::Started,
+            VmExecMsg::Started {
+                token: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            },
             VmExecMsg::Stdout(b"out".to_vec()),
             VmExecMsg::Stderr(b"err".to_vec()),
             VmExecMsg::Exit { code: 42 },
@@ -304,6 +337,10 @@ mod tests {
             VmExecMsg::Ping,
             VmExecMsg::Pong,
             VmExecMsg::SignalAck,
+            VmExecMsg::SignalSession {
+                token: [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+                signal: 2,
+            },
         ]
     }
 
@@ -374,7 +411,7 @@ mod tests {
             Err(ProtoError::UnknownKind(0x91f))
         );
         assert_eq!(
-            VmExecMsg::decode(kind::STARTED, &[0]),
+            VmExecMsg::decode(kind::PING, &[0]),
             Err(ProtoError::TrailingBytes(1))
         );
     }

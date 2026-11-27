@@ -2,7 +2,6 @@
 //! the Linux VM's own namespaces (not an LXC machine), relayed over
 //! `<home>/run/vm-exec.sock` (see [`kat_proto::vm_exec`]).
 
-use std::collections::VecDeque;
 #[cfg(test)]
 use std::io::Write;
 use std::io::{self, IsTerminal};
@@ -10,9 +9,8 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -104,8 +102,8 @@ fn run_spec(
 ) -> anyhow::Result<()> {
     let spec = build_spec(workdir, extra_env, argv, allocate_pty)?;
     let initial_tty_size = spec.tty.as_ref().map(|t| (t.rows, t.cols));
-    let conn = connect_and_start(&spec)?;
-    match run_session(conn, initial_tty_size)? {
+    let (conn, session_token, sock_path) = connect_and_start(&spec)?;
+    match run_session(conn, session_token, sock_path, initial_tty_size)? {
         SessionExit::Code(code) => std::process::exit(code),
         SessionExit::Signal(sig) => {
             // Raw mode has already been restored; re-raise with default
@@ -205,64 +203,267 @@ impl Drop for RawMode {
     }
 }
 
-/// Temporarily enables `O_NONBLOCK` on `fd` so output writes can be paired with
-/// a termination wakeup in `poll`, and restores `O_NONBLOCK` on drop without
-/// clobbering unrelated kernel flags.
-struct NonblockGuard {
-    fd: RawFd,
-    had_nonblock: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperFinish {
+    Drained,
+    BrokenPipe,
+    Cancelled,
 }
 
-impl NonblockGuard {
-    fn enter(fd: RawFd) -> io::Result<Self> {
-        let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if orig_flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let had_nonblock = (orig_flags & libc::O_NONBLOCK) != 0;
-        if !had_nonblock
-            && unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags | libc::O_NONBLOCK) } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { fd, had_nonblock })
+fn dup_ge3(fd: RawFd) -> io::Result<OwnedFd> {
+    let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-impl Drop for NonblockGuard {
-    fn drop(&mut self) {
-        if !self.had_nonblock {
+struct HelperProc {
+    pid: Option<libc::pid_t>,
+}
+
+impl HelperProc {
+    /// Spawn `/bin/cat` via `posix_spawn` with `stdin_fd -> 0`, `stdout_fd -> 1`,
+    /// `/dev/null -> 2`, `POSIX_SPAWN_CLOEXEC_DEFAULT` (so no unrelated fd from
+    /// any concurrent thread can leak into the helper), `[SIGINT, SIGQUIT,
+    /// SIGHUP, SIGTERM]` blocked (preventing spurious terminal-signal EOF while
+    /// `SIGKILL` still terminates immediately), and `SIGPIPE` reset to `SIG_DFL`.
+    fn spawn_cat(stdin_fd: RawFd, stdout_fd: RawFd) -> io::Result<Self> {
+        // Duplicate both source fds to >= 3 so `dup2(..., 0)` and `dup2(..., 1)`
+        // can never clobber each other even if fd 0/1/2 was closed by caller.
+        let in_dup = dup_ge3(stdin_fd)?;
+        let out_dup = dup_ge3(stdout_fd)?;
+
+        struct ActionsGuard(libc::posix_spawn_file_actions_t);
+        impl Drop for ActionsGuard {
+            fn drop(&mut self) {
+                unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
+            }
+        }
+        struct AttrGuard(libc::posix_spawnattr_t);
+        impl Drop for AttrGuard {
+            fn drop(&mut self) {
+                unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
+            }
+        }
+
+        let mut actions_raw: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::posix_spawn_file_actions_init(&mut actions_raw) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        let mut actions = ActionsGuard(actions_raw);
+
+        for rc in [
             unsafe {
-                let cur = libc::fcntl(self.fd, libc::F_GETFL);
-                if cur >= 0 {
-                    let _ = libc::fcntl(self.fd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                libc::posix_spawn_file_actions_adddup2(&mut actions.0, in_dup.as_raw_fd(), 0)
+            },
+            unsafe {
+                libc::posix_spawn_file_actions_adddup2(&mut actions.0, out_dup.as_raw_fd(), 1)
+            },
+            unsafe {
+                libc::posix_spawn_file_actions_addopen(
+                    &mut actions.0,
+                    2,
+                    c"/dev/null".as_ptr(),
+                    libc::O_WRONLY,
+                    0,
+                )
+            },
+        ] {
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+        }
+
+        let mut attr_raw: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::posix_spawnattr_init(&mut attr_raw) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        let mut attr = AttrGuard(attr_raw);
+
+        let mut sigmask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut sigdef: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sigmask);
+            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM] {
+                libc::sigaddset(&mut sigmask, sig);
+            }
+            libc::sigemptyset(&mut sigdef);
+            libc::sigaddset(&mut sigdef, libc::SIGPIPE);
+        }
+        let mut flags: libc::c_short =
+            (libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF) as libc::c_short;
+        #[cfg(target_os = "macos")]
+        {
+            flags |= libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short;
+        }
+        for rc in [
+            unsafe { libc::posix_spawnattr_setsigmask(&mut attr.0, &sigmask) },
+            unsafe { libc::posix_spawnattr_setsigdefault(&mut attr.0, &sigdef) },
+            unsafe { libc::posix_spawnattr_setflags(&mut attr.0, flags) },
+        ] {
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+        }
+
+        let mut pid: libc::pid_t = 0;
+        let mut argv = [c"/bin/cat".as_ptr().cast_mut(), std::ptr::null_mut()];
+        let mut envp: [*mut libc::c_char; 1] = [std::ptr::null_mut()];
+        let rc = unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                c"/bin/cat".as_ptr(),
+                &actions.0,
+                &attr.0,
+                argv.as_mut_ptr(),
+                envp.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        Ok(Self { pid: Some(pid) })
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<libc::c_int>> {
+        let Some(pid) = self.pid else {
+            return Ok(Some(0));
+        };
+        let mut status: libc::c_int = 0;
+        loop {
+            let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if rc == 0 {
+                return Ok(None);
+            }
+            if rc > 0 {
+                self.pid = None;
+                return Ok(Some(status));
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            self.pid = None;
+            return Err(e);
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        let Some(pid) = self.pid.take() else {
+            return;
+        };
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+            let mut status: libc::c_int = 0;
+            while libc::waitpid(pid, &mut status, 0) < 0 {
+                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
                 }
             }
         }
     }
 }
 
-/// Drops multiple [`NonblockGuard`]s in strict LIFO order so shared open file
-/// descriptions (e.g. `stdin`/`stdout`/`stderr` on the same TTY or `2>&1`)
-/// always return to their original `O_NONBLOCK` state, even on early return.
-#[derive(Default)]
-struct NonblockGuards(Vec<NonblockGuard>);
-
-impl NonblockGuards {
-    fn enter(&mut self, fd: RawFd) {
-        if fd >= 0
-            && let Ok(g) = NonblockGuard::enter(fd)
-        {
-            self.0.push(g);
-        }
+impl Drop for HelperProc {
+    fn drop(&mut self) {
+        self.kill_and_wait();
     }
 }
 
-impl Drop for NonblockGuards {
-    fn drop(&mut self) {
-        while let Some(g) = self.0.pop() {
-            drop(g);
+/// Relays output written to a private nonblocking pipe into an inherited
+/// blocking output fd via a dedicated `/bin/cat` helper process so
+/// `run_session_io` NEVER sets `O_NONBLOCK` on any inherited descriptor (even
+/// when `stdin` and `stdout`/`stderr` share the same open file description,
+/// such as an interactive TTY or full-duplex socketpair), yet output writes
+/// remain immediately cancellable on termination signals.
+struct OutputHelper {
+    proc: HelperProc,
+    write_end: Option<OwnedFd>,
+}
+
+impl OutputHelper {
+    fn maybe_spawn(out_fd: RawFd) -> io::Result<Option<Self>> {
+        if out_fd < 0 {
+            return Ok(None);
         }
+        let fl = unsafe { libc::fcntl(out_fd, libc::F_GETFL) };
+        if fl < 0 || (fl & libc::O_NONBLOCK) != 0 {
+            return Ok(None);
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(out_fd, &mut st) } == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+        {
+            // Regular file writes do not block on pipes/sockets; no helper needed.
+            return Ok(None);
+        }
+        let (read_end, write_end) = pipe_cloexec(false)?;
+        unsafe {
+            let wfl = libc::fcntl(write_end.as_raw_fd(), libc::F_GETFL);
+            if wfl < 0
+                || libc::fcntl(write_end.as_raw_fd(), libc::F_SETFL, wfl | libc::O_NONBLOCK) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let proc = HelperProc::spawn_cat(read_end.as_raw_fd(), out_fd)?;
+        drop(read_end);
+        Ok(Some(Self {
+            proc,
+            write_end: Some(write_end),
+        }))
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.write_end
+            .as_ref()
+            .expect("OutputHelper already closed")
+            .as_raw_fd()
+    }
+
+    /// Close `write_end` and wait for `/bin/cat` to flush buffered output to
+    /// the inherited descriptor, aborting immediately if `term_wake_r` fires.
+    fn finish(&mut self, term_wake_r: RawFd) -> HelperFinish {
+        self.write_end.take();
+        let mut wait_ms = 1i32;
+        loop {
+            match self.proc.try_wait() {
+                Ok(Some(status)) => {
+                    return if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                        HelperFinish::Drained
+                    } else {
+                        HelperFinish::BrokenPipe
+                    };
+                }
+                Ok(None) => {}
+                Err(_) => return HelperFinish::Drained,
+            }
+            let mut pfd = libc::pollfd {
+                fd: term_wake_r,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+            if rc > 0 && pfd.revents != 0 {
+                self.proc.kill_and_wait();
+                return HelperFinish::Cancelled;
+            }
+            wait_ms = (wait_ms * 2).min(20);
+        }
+    }
+
+    fn abort(&mut self) {
+        self.write_end.take();
+        self.proc.kill_and_wait();
+    }
+}
+
+impl Drop for OutputHelper {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -272,7 +473,7 @@ impl Drop for NonblockGuards {
 /// still terminate and reap a blocked reader promptly even if another process
 /// drained the last ready byte.
 struct StdinHelper {
-    child: std::process::Child,
+    _proc: HelperProc,
     read_end: OwnedFd,
 }
 
@@ -292,11 +493,6 @@ impl StdinHelper {
             // Regular file reads never block; no helper needed.
             return Ok(None);
         }
-        let dup_raw = unsafe { libc::fcntl(stdin_fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if dup_raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let stdin_dup = unsafe { OwnedFd::from_raw_fd(dup_raw) };
         let (read_end, write_end) = pipe_cloexec(false)?;
         unsafe {
             let rfl = libc::fcntl(read_end.as_raw_fd(), libc::F_GETFL);
@@ -306,34 +502,16 @@ impl StdinHelper {
                 return Err(io::Error::last_os_error());
             }
         }
-        let mut cmd = std::process::Command::new("/bin/cat");
-        cmd.stdin(std::process::Stdio::from(stdin_dup))
-            .stdout(std::process::Stdio::from(write_end))
-            .stderr(std::process::Stdio::null());
-        // SAFETY: `signal` is async-signal-safe; ignoring foreground signals
-        // prevents terminal Ctrl-C from killing the helper and injecting a
-        // spurious EOF while the parent owns its lifecycle via SIGKILL on drop.
-        unsafe {
-            cmd.pre_exec(|| {
-                for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM] {
-                    libc::signal(sig, libc::SIG_IGN);
-                }
-                Ok(())
-            });
-        }
-        let child = cmd.spawn()?;
-        Ok(Some(Self { child, read_end }))
+        let proc = HelperProc::spawn_cat(stdin_fd, write_end.as_raw_fd())?;
+        drop(write_end);
+        Ok(Some(Self {
+            _proc: proc,
+            read_end,
+        }))
     }
 
     fn as_raw_fd(&self) -> RawFd {
         self.read_end.as_raw_fd()
-    }
-}
-
-impl Drop for StdinHelper {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -478,8 +656,34 @@ impl Drop for SignalGuard {
     }
 }
 
+fn fd_ready(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    rc > 0 && pfd.revents != 0
+}
+
 /// Connect to a Unix domain stream socket while honoring an absolute `deadline`.
 fn connect_with_deadline(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    connect_with_deadline_cancellable(path, deadline, None)
+}
+
+/// Connect to a Unix domain stream socket while honoring an absolute `deadline`
+/// and waking immediately if `stop_r` becomes readable/closed.
+fn connect_with_deadline_cancellable(
+    path: &Path,
+    deadline: Instant,
+    stop_r: Option<RawFd>,
+) -> io::Result<UnixStream> {
+    if stop_r.is_some_and(fd_ready) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "VM exec connect cancelled",
+        ));
+    }
     if deadline.saturating_duration_since(Instant::now()).is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -543,6 +747,12 @@ fn connect_with_deadline(path: &Path, deadline: Instant) -> io::Result<UnixStrea
         let e = io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::EINPROGRESS) || e.kind() == io::ErrorKind::WouldBlock {
             loop {
+                if stop_r.is_some_and(fd_ready) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "VM exec connect cancelled",
+                    ));
+                }
                 let rem = deadline.saturating_duration_since(Instant::now());
                 if rem.is_zero() {
                     return Err(io::Error::new(
@@ -550,13 +760,21 @@ fn connect_with_deadline(path: &Path, deadline: Instant) -> io::Result<UnixStrea
                         "VM exec connect timed out",
                     ));
                 }
-                let mut pfd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: fd.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: stop_r.unwrap_or(-1),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let nfds = if stop_r.is_some() { 2 } else { 1 };
                 let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as i32;
-                let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms) };
                 if prc < 0 {
                     let pe = io::Error::last_os_error();
                     if pe.kind() == io::ErrorKind::Interrupted {
@@ -568,6 +786,12 @@ fn connect_with_deadline(path: &Path, deadline: Instant) -> io::Result<UnixStrea
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "VM exec connect timed out",
+                    ));
+                }
+                if nfds == 2 && pfds[1].revents != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "VM exec connect cancelled",
                     ));
                 }
                 let mut so_err: libc::c_int = 0;
@@ -682,8 +906,8 @@ fn submit_exec(
     mut conn: UnixStream,
     spec: &ExecSpec,
     deadline: Instant,
-) -> anyhow::Result<UnixStream> {
-    {
+) -> anyhow::Result<(UnixStream, [u8; 16])> {
+    let token = {
         let mut ds = DeadlineStream::new(
             &mut conn,
             deadline,
@@ -701,7 +925,7 @@ fn submit_exec(
             );
         }
         match vm_exec::read(&mut ds) {
-            Ok(Some(VmExecMsg::Started)) => {}
+            Ok(Some(VmExecMsg::Started { token })) => token,
             Ok(Some(VmExecMsg::Error(e))) => bail!("{e}"),
             Ok(Some(other)) => bail!("unexpected guest response {other:?}"),
             Ok(None) => bail!(
@@ -721,12 +945,12 @@ fn submit_exec(
                 "lost connection to the guest after sending the command ({e}); execution outcome is unknown"
             ),
         }
-    }
+    };
     // Clear any socket timeouts before entering the untimed interactive session
     // (best-effort if the peer closed immediately after sending `Started`).
     let _ = conn.set_read_timeout(None);
     let _ = conn.set_write_timeout(None);
-    Ok(conn)
+    Ok((conn, token))
 }
 
 /// Poll `path` with side-effect-free readiness probes until `deadline`.
@@ -822,21 +1046,23 @@ fn wait_for_ready_socket(
 /// Connect to the guest's VM exec service (starting the VM if stopped without
 /// waiting for Docker readiness), perform a side-effect-free readiness check,
 /// then send `spec` once and wait for `Started`.
-fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<UnixStream> {
+fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], PathBuf)> {
     let home = crate::state_dir()?;
     let path = socket_path(&home);
 
     let fast_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     match probe_ready(&path, fast_deadline) {
         Probe::Ready(conn) => {
-            return submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT);
+            let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
+            return Ok((conn, token, path));
         }
         Probe::Failed(e) => return Err(e),
         Probe::ClosedBeforeReady => {
             // The VM process bound the Unix socket, but kat-init may still be
             // finishing boot before listening on VM_EXEC_PORT.
             let conn = wait_for_ready_socket(&path, fast_deadline, || Ok(None))?;
-            return submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT);
+            let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
+            return Ok((conn, token, path));
         }
         Probe::TimedOut(e) => {
             return Err(e).context(
@@ -854,7 +1080,8 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<UnixStream> {
     match s.state {
         VmState::Running => match probe_ready(&path, Instant::now() + HANDSHAKE_TIMEOUT) {
             Probe::Ready(conn) => {
-                return submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT);
+                let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
+                return Ok((conn, token, path));
             }
             Probe::Failed(e) => return Err(e),
             Probe::NoSocket(_) => bail!(
@@ -876,93 +1103,179 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<UnixStream> {
     let conn = wait_for_ready_socket(&path, Instant::now() + VM_START_TIMEOUT, || {
         c.status().map(Some)
     })?;
-    submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)
+    let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
+    Ok((conn, token, path))
 }
 
 enum WriterCtrl {
     Resize { rows: u16, cols: u16 },
-    Signal(i32),
-    SignalAck,
-    SinkBlocked(bool),
 }
 
-struct SigintWait {
-    /// Remaining wait budget for guest `SignalAck`.
-    remaining: Duration,
-    /// `Some(t)` while actively counting down; `None` while suspended because
-    /// the `Signal` frame has been flushed and the local output sink is blocked.
-    running_since: Option<Instant>,
-    /// True until the encoded `VmExecMsg::Signal` frame finishes flushing to
-    /// the socket; local output backpressure never pauses an unsent `Signal`.
-    unsent: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OobSignalResult {
+    Acked,
+    Cancelled,
+    Failed,
 }
 
-/// Nonblocking single-owner writer for stdin, resize, and signal frames.
+/// Deliver a non-PTY signal to the guest session on a dedicated out-of-band
+/// control connection (`VmExecMsg::SignalSession` -> `VmExecMsg::SignalAck`),
+/// completely decoupled from stdio backpressure and strictly bounded by
+/// `deadline`.
+fn send_signal_oob(
+    connect_ctrl: &(impl Fn(Instant, RawFd) -> io::Result<UnixStream> + ?Sized),
+    token: [u8; 16],
+    signal: i32,
+    deadline: Instant,
+    stop_r: RawFd,
+) -> OobSignalResult {
+    if fd_ready(stop_r) {
+        return OobSignalResult::Cancelled;
+    }
+    let conn = match connect_ctrl(deadline, stop_r) {
+        Ok(c) => c,
+        Err(_) => {
+            return if fd_ready(stop_r) {
+                OobSignalResult::Cancelled
+            } else {
+                OobSignalResult::Failed
+            };
+        }
+    };
+    if conn.set_nonblocking(true).is_err() {
+        return OobSignalResult::Failed;
+    }
+
+    let frame = VmExecMsg::SignalSession { token, signal }.encode();
+    let mut off = 0usize;
+    while off < frame.len() {
+        if fd_ready(stop_r) {
+            return OobSignalResult::Cancelled;
+        }
+        let rc = unsafe {
+            libc::send(
+                conn.as_raw_fd(),
+                frame[off..].as_ptr().cast(),
+                frame.len() - off,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if rc > 0 {
+            off += rc as usize;
+            continue;
+        }
+        if rc == 0 {
+            return OobSignalResult::Failed;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    return OobSignalResult::Failed;
+                }
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: conn.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: stop_r,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as i32;
+                let prc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
+                if prc < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return OobSignalResult::Failed;
+                }
+                if prc == 0 {
+                    return OobSignalResult::Failed;
+                }
+                if pfds[1].revents != 0 {
+                    return OobSignalResult::Cancelled;
+                }
+                if (pfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                    && (pfds[0].revents & libc::POLLOUT) == 0
+                {
+                    return OobSignalResult::Failed;
+                }
+            }
+            _ => return OobSignalResult::Failed,
+        }
+    }
+
+    let mut frames = FrameReader::default();
+    loop {
+        if fd_ready(stop_r) {
+            return OobSignalResult::Cancelled;
+        }
+        match frames.poll_frame(conn.as_raw_fd()) {
+            Ok(PollFrame::Msg(VmExecMsg::SignalAck)) => return OobSignalResult::Acked,
+            Ok(PollFrame::Msg(_)) | Ok(PollFrame::Eof) | Err(_) => return OobSignalResult::Failed,
+            Ok(PollFrame::WouldBlock) => {}
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return OobSignalResult::Failed;
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd: conn.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop_r,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout_ms = rem.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
+        if prc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return OobSignalResult::Failed;
+        }
+        if prc == 0 {
+            continue;
+        }
+        if pfds[1].revents != 0 {
+            return OobSignalResult::Cancelled;
+        }
+    }
+}
+
+/// Nonblocking single-owner writer for stdin and PTY resize frames.
 ///
 /// Using a single `poll` + nonblocking `send` loop eliminates any shared socket
-/// writer mutex, guarantees `Signal` and `Resize` take priority over further
-/// stdin reads, and keeps non-PTY `SIGINT` bounded until the guest acknowledges
-/// receipt (`VmExecMsg::SignalAck`) while suspending the first-`SIGINT`
-/// countdown when the local stdout/stderr sink is temporarily backpressured.
-#[allow(clippy::too_many_arguments)]
+/// writer mutex and guarantees `Resize` takes priority over further stdin reads.
 fn writer_worker(
     sock: UnixStream,
-    shutdown_sock: Arc<UnixStream>,
     stdin_fd: RawFd,
     stop_r: OwnedFd,
     ctrl_wake_r: OwnedFd,
     ctrl_rx: mpsc::Receiver<WriterCtrl>,
-    term_wake_w: Arc<OwnedFd>,
-    terminated_by: Arc<AtomicI32>,
-    sigint_timeout: Duration,
 ) {
     let mut out_buf: Vec<u8> = Vec::new();
     let mut out_off: usize = 0;
-    let mut sending_signal = false;
-    let mut pending_signals: VecDeque<i32> = VecDeque::new();
     let mut pending_resize: Option<(u16, u16)> = None;
     let mut stdin_open = stdin_fd >= 0;
     let mut stdin_buf = vec![0u8; CHUNK];
-    let mut sigint_wait: Option<SigintWait> = None;
-    let mut sink_blocked = false;
 
     loop {
-        // 1. Drain any pending high-priority control events without blocking.
+        // 1. Drain any pending high-priority resize events without blocking.
         while let Ok(ev) = ctrl_rx.try_recv() {
             match ev {
                 WriterCtrl::Resize { rows, cols } => pending_resize = Some((rows, cols)),
-                WriterCtrl::Signal(sig) => {
-                    if sigint_wait.is_some() {
-                        // A second SIGINT arrived while the previous one is
-                        // still unacknowledged by the guest (even if local
-                        // output is blocked): disconnect immediately.
-                        terminated_by.store(sig, Ordering::Release);
-                        let _ = shutdown_sock.shutdown(Shutdown::Both);
-                        notify_wake(&term_wake_w);
-                        return;
-                    }
-                    pending_signals.push_back(sig);
-                    sigint_wait = Some(SigintWait {
-                        remaining: sigint_timeout,
-                        running_since: Some(Instant::now()),
-                        unsent: true,
-                    });
-                }
-                WriterCtrl::SignalAck => {
-                    sigint_wait = None;
-                }
-                WriterCtrl::SinkBlocked(blocked) => {
-                    sink_blocked = blocked;
-                    if let Some(w) = sigint_wait.as_mut() {
-                        if blocked && !w.unsent {
-                            if let Some(since) = w.running_since.take() {
-                                w.remaining = w.remaining.saturating_sub(since.elapsed());
-                            }
-                        } else if !blocked && w.running_since.is_none() {
-                            w.running_since = Some(Instant::now());
-                        }
-                    }
-                }
             }
         }
 
@@ -970,12 +1283,8 @@ fn writer_worker(
         if out_off == out_buf.len() {
             out_buf.clear();
             out_off = 0;
-            if let Some(sig) = pending_signals.pop_front() {
-                out_buf = VmExecMsg::Signal { signal: sig }.encode();
-                sending_signal = true;
-            } else if let Some((rows, cols)) = pending_resize.take() {
+            if let Some((rows, cols)) = pending_resize.take() {
                 out_buf = VmExecMsg::Resize { rows, cols }.encode();
-                sending_signal = false;
             }
         }
 
@@ -996,15 +1305,6 @@ fn writer_worker(
                     if out_off == out_buf.len() {
                         out_buf.clear();
                         out_off = 0;
-                        if sending_signal {
-                            sending_signal = false;
-                            if let Some(w) = sigint_wait.as_mut() {
-                                w.unsent = false;
-                                if sink_blocked && let Some(since) = w.running_since.take() {
-                                    w.remaining = w.remaining.saturating_sub(since.elapsed());
-                                }
-                            }
-                        }
                         flush_done = true;
                         break;
                     }
@@ -1024,33 +1324,10 @@ fn writer_worker(
             }
         }
 
-        // 4. Enforce bounded SIGINT delivery until the guest acknowledges it,
-        //    suspending the countdown while the local output sink is blocked.
-        let poll_timeout_ms = if let Some(w) = sigint_wait.as_mut() {
-            if let Some(since) = w.running_since {
-                let rem = w.remaining.saturating_sub(since.elapsed());
-                if rem.is_zero() {
-                    terminated_by.store(libc::SIGINT, Ordering::Release);
-                    let _ = shutdown_sock.shutdown(Shutdown::Both);
-                    notify_wake(&term_wake_w);
-                    return;
-                }
-                rem.as_millis().clamp(1, i32::MAX as u128) as i32
-            } else {
-                -1
-            }
-        } else {
-            -1
-        };
-
-        // 5. Wait for stop, control wakeup, socket writability (if mid-frame),
-        //    or stdin readability (only when idle and no control/ack is pending).
+        // 4. Wait for stop, control wakeup, socket writability (if mid-frame),
+        //    or stdin readability (only when idle and no resize is pending).
         let need_write = out_off < out_buf.len();
-        let can_read_stdin = stdin_open
-            && !need_write
-            && pending_signals.is_empty()
-            && pending_resize.is_none()
-            && sigint_wait.is_none();
+        let can_read_stdin = stdin_open && !need_write && pending_resize.is_none();
 
         let mut pfds = [
             libc::pollfd {
@@ -1100,7 +1377,7 @@ fn writer_worker(
             None
         };
 
-        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout_ms) };
+        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
         if prc < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -1112,7 +1389,7 @@ fn writer_worker(
         }
         if pfds[1].revents != 0 {
             drain_wake(&ctrl_wake_r);
-            // Loop immediately so high-priority control frames run before stdin.
+            // Loop immediately so high-priority resize frames run before stdin.
             continue;
         }
         if let Some(i) = sock_idx
@@ -1145,7 +1422,6 @@ fn writer_worker(
                     out_buf = VmExecMsg::Data(stdin_buf[..n].to_vec()).encode();
                 }
                 out_off = 0;
-                sending_signal = false;
             }
         }
     }
@@ -1241,40 +1517,10 @@ enum WriteOutcome {
     Cancelled,
 }
 
-struct SinkBlockGuard<'a> {
-    ctrl: Option<(&'a mpsc::Sender<WriterCtrl>, &'a Arc<OwnedFd>)>,
-    blocked: bool,
-}
-
-impl SinkBlockGuard<'_> {
-    fn mark_blocked(&mut self) {
-        if !self.blocked {
-            self.blocked = true;
-            if let Some((tx, wake)) = self.ctrl
-                && tx.send(WriterCtrl::SinkBlocked(true)).is_ok()
-            {
-                notify_wake(wake);
-            }
-        }
-    }
-}
-
-impl Drop for SinkBlockGuard<'_> {
-    fn drop(&mut self) {
-        if self.blocked
-            && let Some((tx, wake)) = self.ctrl
-            && tx.send(WriterCtrl::SinkBlocked(false)).is_ok()
-        {
-            notify_wake(wake);
-        }
-    }
-}
-
 fn write_cancellable(
     sink: &mut OutputSink<'_>,
     data: &[u8],
     term_wake_r: Option<RawFd>,
-    ctrl: Option<(&mpsc::Sender<WriterCtrl>, &Arc<OwnedFd>)>,
 ) -> io::Result<WriteOutcome> {
     if data.is_empty() {
         return Ok(WriteOutcome::Written);
@@ -1290,21 +1536,10 @@ fn write_cancellable(
         OutputSink::_Marker(_) => unreachable!(),
         OutputSink::Fd(fd) => {
             let fd = *fd;
-            let mut block_guard = SinkBlockGuard {
-                ctrl,
-                blocked: false,
-            };
             let mut offset = 0usize;
             while offset < data.len() {
-                if let Some(wake) = term_wake_r {
-                    let mut wpfd = libc::pollfd {
-                        fd: wake,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    if unsafe { libc::poll(&mut wpfd, 1, 0) } > 0 && wpfd.revents != 0 {
-                        return Ok(WriteOutcome::Cancelled);
-                    }
+                if term_wake_r.is_some_and(fd_ready) {
+                    return Ok(WriteOutcome::Cancelled);
                 }
                 let rc =
                     unsafe { libc::write(fd, data[offset..].as_ptr().cast(), data.len() - offset) };
@@ -1320,7 +1555,6 @@ fn write_cancellable(
                     io::ErrorKind::Interrupted => continue,
                     io::ErrorKind::BrokenPipe => return Ok(WriteOutcome::BrokenPipe),
                     io::ErrorKind::WouldBlock => {
-                        block_guard.mark_blocked();
                         let mut pfds = [
                             libc::pollfd {
                                 fd,
@@ -1407,12 +1641,18 @@ fn read_frame_cancellable(
 /// session terminated.
 fn run_session(
     conn: UnixStream,
+    session_token: [u8; 16],
+    sock_path: PathBuf,
     initial_tty_size: Option<(u16, u16)>,
 ) -> anyhow::Result<SessionExit> {
     let mut out = OutputSink::Fd(1);
     let mut err = OutputSink::Fd(2);
     run_session_io(
         conn,
+        session_token,
+        move |deadline, stop_r| {
+            connect_with_deadline_cancellable(&sock_path, deadline, Some(stop_r))
+        },
         initial_tty_size,
         0,
         1,
@@ -1427,6 +1667,8 @@ fn run_session(
 #[allow(clippy::too_many_arguments)]
 fn run_session_io(
     conn: UnixStream,
+    session_token: [u8; 16],
+    connect_ctrl: impl Fn(Instant, RawFd) -> io::Result<UnixStream> + Send + 'static,
     initial_tty_size: Option<(u16, u16)>,
     stdin_fd: RawFd,
     stdout_fd: RawFd,
@@ -1441,9 +1683,9 @@ fn run_session_io(
     let stdout_is_tty = is_tty(stdout_fd);
     let want_raw = allocate_pty && stdin_is_tty;
 
-    // Install signal wakeups BEFORE entering raw mode or modifying inherited
-    // fd flags so catchable termination signals always unwind and restore both
-    // host termios and shared `O_NONBLOCK` state (including in non-PTY sessions).
+    // Install signal wakeups BEFORE entering raw mode or spawning I/O helpers
+    // so catchable termination signals always unwind cleanly and restore host
+    // termios.
     let sig_setup =
         SignalGuard::install(&[libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT]).ok();
 
@@ -1454,22 +1696,43 @@ fn run_session_io(
     };
     let raw_active = raw.is_some();
 
-    // Put output fd sinks into nonblocking mode while relaying so output writes
-    // can be cancelled by `term_wake` against a full pipe, restoring original
-    // `O_NONBLOCK` state in LIFO order on every exit path. Do NOT call F_SETFL
-    // on inherited `stdin_fd` (which may share an open file description with
-    // another blocking reader); relay blocking stdin via `StdinHelper` instead.
-    let mut nb_guards = NonblockGuards::default();
-    if let OutputSink::Fd(fd) = *out {
-        nb_guards.enter(fd);
-    }
-    if let OutputSink::Fd(fd) = *err {
-        nb_guards.enter(fd);
-    }
+    // NEVER call `F_SETFL(O_NONBLOCK)` on any inherited stdio descriptor
+    // (`stdin`, `stdout`, or `stderr`) because inherited descriptors frequently
+    // share an open file description (e.g. an interactive TTY, socketpair, or
+    // `2>&1`). Relay blocking stdin and blocking output sinks through private
+    // nonblocking pipes backed by `/bin/cat` helpers instead.
     let stdin_helper = StdinHelper::maybe_spawn(stdin_fd)?;
     let worker_stdin_fd = stdin_helper
         .as_ref()
         .map_or(stdin_fd, StdinHelper::as_raw_fd);
+
+    let out_raw_fd = match *out {
+        OutputSink::Fd(fd) => Some(fd),
+        #[cfg(test)]
+        OutputSink::Writer(_) => None,
+        #[cfg(not(test))]
+        OutputSink::_Marker(_) => None,
+    };
+    let err_raw_fd = match *err {
+        OutputSink::Fd(fd) => Some(fd),
+        #[cfg(test)]
+        OutputSink::Writer(_) => None,
+        #[cfg(not(test))]
+        OutputSink::_Marker(_) => None,
+    };
+    let mut out_helper = match out_raw_fd {
+        Some(fd) => OutputHelper::maybe_spawn(fd)?,
+        None => None,
+    };
+    let share_out_helper = out_raw_fd.is_some() && out_raw_fd == err_raw_fd && out_helper.is_some();
+    let mut err_helper = if share_out_helper {
+        None
+    } else {
+        match err_raw_fd {
+            Some(fd) => OutputHelper::maybe_spawn(fd)?,
+            None => None,
+        }
+    };
 
     // macOS XNU ignores MSG_DONTWAIT on AF_UNIX SOCK_STREAM sends; put the
     // shared socket open file description in nonblocking mode so writer_worker
@@ -1485,14 +1748,19 @@ fn run_session_io(
     let ctrl_wake_w = Arc::new(ctrl_wake_w);
     let (term_wake_r, term_wake_w) = pipe_cloexec(true)?;
     let term_wake_w = Arc::new(term_wake_w);
+    let (sigint_wake_r, sigint_wake_w) = pipe_cloexec(true)?;
+    let sigint_wake_w = Arc::new(sigint_wake_w);
     let (ctrl_tx, ctrl_rx) = mpsc::channel();
+    let (sigint_tx, sigint_rx) = mpsc::channel::<i32>();
+    let sigint_in_flight = Arc::new(AtomicBool::new(false));
     let terminated_by = Arc::new(AtomicI32::new(0));
 
     let mut sig_guard = sig_setup.map(|(mut guard, sig_r)| {
         let shutdown_sock = shutdown_sock.clone();
         let term_wake_w = term_wake_w.clone();
-        let ctrl_tx = ctrl_tx.clone();
-        let ctrl_wake_w = ctrl_wake_w.clone();
+        let sigint_tx = sigint_tx.clone();
+        let sigint_wake_w = sigint_wake_w.clone();
+        let sigint_in_flight = sigint_in_flight.clone();
         let terminated_by = terminated_by.clone();
         let handle = thread::spawn(move || {
             let mut b = [0u8; 1];
@@ -1511,18 +1779,31 @@ fn run_session_io(
                 if raw_active || sig != libc::SIGINT {
                     // Cancel lock-free: wake relay_output (both reads and
                     // blocked output writes) and unblock any socket writes so
-                    // RawMode and NonblockGuards always restore before re-raise.
-                    terminated_by.store(sig, Ordering::Release);
+                    // RawMode restores before re-raise.
+                    let _ =
+                        terminated_by.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire);
                     let _ = shutdown_sock.shutdown(Shutdown::Both);
                     notify_wake(&term_wake_w);
                     return;
                 }
-                // Non-raw SIGINT: queue to the nonblocking writer so it forwards
-                // VmExecMsg::Signal and stays bounded until guest SignalAck.
-                if ctrl_tx.send(WriterCtrl::Signal(sig)).is_err() {
+                // Non-raw SIGINT: a second SIGINT while the previous OOB
+                // delivery is still awaiting guest SignalAck cancels locally.
+                if sigint_in_flight.swap(true, Ordering::AcqRel) {
+                    let _ =
+                        terminated_by.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire);
+                    let _ = shutdown_sock.shutdown(Shutdown::Both);
+                    notify_wake(&term_wake_w);
                     return;
                 }
-                notify_wake(&ctrl_wake_w);
+                if sigint_tx.send(sig).is_err() {
+                    // Session is already tearing down (e.g. draining output);
+                    // interrupt any blocked OutputHelper drain promptly.
+                    let _ =
+                        terminated_by.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire);
+                    notify_wake(&term_wake_w);
+                    return;
+                }
+                notify_wake(&sigint_wake_w);
             }
         });
         guard.attach_dispatcher(handle);
@@ -1530,23 +1811,79 @@ fn run_session_io(
     });
 
     let writer_thread = {
-        let shutdown_sock = shutdown_sock.clone();
         let stop_fd = stop_r.try_clone()?;
+        thread::spawn(move || {
+            writer_worker(writer_sock, worker_stdin_fd, stop_fd, ctrl_wake_r, ctrl_rx);
+        })
+    };
+
+    let sigint_thread = if !raw_active {
+        let stop_fd = stop_r.try_clone()?;
+        let shutdown_sock = shutdown_sock.clone();
         let term_wake_w = term_wake_w.clone();
         let terminated_by = terminated_by.clone();
-        thread::spawn(move || {
-            writer_worker(
-                writer_sock,
-                shutdown_sock,
-                worker_stdin_fd,
-                stop_fd,
-                ctrl_wake_r,
-                ctrl_rx,
-                term_wake_w,
-                terminated_by,
-                sigint_timeout,
-            );
-        })
+        let sigint_in_flight = sigint_in_flight.clone();
+        Some(thread::spawn(move || {
+            loop {
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: stop_fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: sigint_wake_r.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let prc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                if prc < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if pfds[0].revents != 0 {
+                    return;
+                }
+                if pfds[1].revents != 0 {
+                    drain_wake(&sigint_wake_r);
+                    while let Ok(sig) = sigint_rx.try_recv() {
+                        let deadline = Instant::now() + sigint_timeout;
+                        match send_signal_oob(
+                            &connect_ctrl,
+                            session_token,
+                            sig,
+                            deadline,
+                            stop_fd.as_raw_fd(),
+                        ) {
+                            OobSignalResult::Acked => {
+                                sigint_in_flight.store(false, Ordering::Release);
+                            }
+                            OobSignalResult::Cancelled => {
+                                sigint_in_flight.store(false, Ordering::Release);
+                                return;
+                            }
+                            OobSignalResult::Failed => {
+                                let _ = terminated_by.compare_exchange(
+                                    0,
+                                    sig,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
+                                let _ = shutdown_sock.shutdown(Shutdown::Both);
+                                notify_wake(&term_wake_w);
+                                sigint_in_flight.store(false, Ordering::Release);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
     };
 
     let resize_thread = if let Some(mut last) = initial_tty_size
@@ -1592,35 +1929,74 @@ fn run_session_io(
         let _ = tx.send(());
     }
 
-    let res = relay_output_cancellable(
-        conn,
-        out,
-        err,
-        Some(term_wake_r.as_raw_fd()),
-        Some((&ctrl_tx, &ctrl_wake_w)),
-    );
+    let mut res = {
+        let mut relay_out_fd = out_helper.as_ref().map(|h| OutputSink::Fd(h.as_raw_fd()));
+        let mut relay_err_fd = if share_out_helper {
+            out_helper.as_ref().map(|h| OutputSink::Fd(h.as_raw_fd()))
+        } else {
+            err_helper.as_ref().map(|h| OutputSink::Fd(h.as_raw_fd()))
+        };
+        let relay_out = relay_out_fd.as_mut().unwrap_or(out);
+        let relay_err = relay_err_fd.as_mut().unwrap_or(err);
+        relay_output_cancellable(conn, relay_out, relay_err, Some(term_wake_r.as_raw_fd()))
+    };
 
     // Shut down the socket lock-free BEFORE joining relay workers so a blocked
     // writer cannot hang cleanup (e.g. after BrokenPipe on stdout) and the
     // guest observes disconnect promptly.
     let _ = shutdown_sock.shutdown(Shutdown::Both);
-    // Stop and join relay workers, terminate/reap any blocking-stdin helper so
-    // no reader remains on `stdin_fd`, then restore terminal mode and output fd
-    // flags before restoring signal dispositions or re-raising a signal.
+    // Stop and join relay workers and terminate/reap any blocking-stdin helper
+    // so no reader remains on `stdin_fd`.
     drop(stop_w);
     let _ = writer_thread.join();
     if let Some(h) = resize_thread {
         let _ = h.join();
     }
+    if let Some(h) = sigint_thread {
+        let _ = h.join();
+    }
     drop(stdin_helper);
+
+    // On clean exit, drain buffered output through any OutputHelper while
+    // remaining interruptible on termination signals; on signal cancellation,
+    // broken pipe, or error, abort output helpers immediately.
+    let mut drain_broken_pipe = false;
+    let should_drain = terminated_by.load(Ordering::Acquire) == 0
+        && matches!(res, Ok(code) if code != 128 + libc::SIGPIPE);
+    if should_drain {
+        if let Some(mut h) = out_helper.take()
+            && matches!(h.finish(term_wake_r.as_raw_fd()), HelperFinish::BrokenPipe)
+        {
+            drain_broken_pipe = true;
+        }
+        if terminated_by.load(Ordering::Acquire) == 0 {
+            if let Some(mut h) = err_helper.take()
+                && matches!(h.finish(term_wake_r.as_raw_fd()), HelperFinish::BrokenPipe)
+            {
+                drain_broken_pipe = true;
+            }
+        } else if let Some(mut h) = err_helper.take() {
+            h.abort();
+        }
+    } else {
+        if let Some(mut h) = out_helper.take() {
+            h.abort();
+        }
+        if let Some(mut h) = err_helper.take() {
+            h.abort();
+        }
+    }
+
     drop(raw);
-    drop(nb_guards);
     drop(stop_r);
     drop(sig_guard.take());
 
     let sig = terminated_by.load(Ordering::Acquire);
     if sig != 0 {
         return Ok(SessionExit::Signal(sig));
+    }
+    if drain_broken_pipe && matches!(res, Ok(0)) {
+        res = Ok(128 + libc::SIGPIPE);
     }
     res.map(SessionExit::Code)
 }
@@ -1632,30 +2008,22 @@ fn relay_output_cancellable(
     out: &mut OutputSink<'_>,
     err: &mut OutputSink<'_>,
     term_wake_r: Option<RawFd>,
-    ctrl: Option<(&mpsc::Sender<WriterCtrl>, &Arc<OwnedFd>)>,
 ) -> anyhow::Result<i32> {
     let mut frames = FrameReader::default();
     loop {
         match read_frame_cancellable(&conn, &mut frames, term_wake_r)? {
             ReadOutcome::Msg(VmExecMsg::Stdout(d)) => {
-                match write_cancellable(out, &d, term_wake_r, ctrl)? {
+                match write_cancellable(out, &d, term_wake_r)? {
                     WriteOutcome::Written => {}
                     WriteOutcome::BrokenPipe => return Ok(128 + libc::SIGPIPE),
                     WriteOutcome::Cancelled => return Ok(0),
                 }
             }
             ReadOutcome::Msg(VmExecMsg::Stderr(d)) => {
-                match write_cancellable(err, &d, term_wake_r, ctrl)? {
+                match write_cancellable(err, &d, term_wake_r)? {
                     WriteOutcome::Written => {}
                     WriteOutcome::BrokenPipe => return Ok(128 + libc::SIGPIPE),
                     WriteOutcome::Cancelled => return Ok(0),
-                }
-            }
-            ReadOutcome::Msg(VmExecMsg::SignalAck) => {
-                if let Some((tx, wake)) = ctrl
-                    && tx.send(WriterCtrl::SignalAck).is_ok()
-                {
-                    notify_wake(wake);
                 }
             }
             ReadOutcome::Msg(VmExecMsg::Exit { code }) => return Ok(code),
@@ -1884,6 +2252,13 @@ mod tests {
         assert!(parse_env(&["".into()], |_| None).is_err());
     }
 
+    fn no_ctrl(_deadline: Instant, _stop_r: RawFd) -> io::Result<UnixStream> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no control socket",
+        ))
+    }
+
     #[test]
     fn relays_stdout_stderr_and_exit_code() {
         let (host, mut guest) = UnixStream::pair().unwrap();
@@ -1897,7 +2272,7 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let code = relay_output_cancellable(host, &mut out, &mut err, None, None).unwrap();
+        let code = relay_output_cancellable(host, &mut out, &mut err, None).unwrap();
         peer.join().unwrap();
         assert_eq!(code, 7);
         assert_eq!(out_buf, b"hello vm\n");
@@ -1911,12 +2286,12 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let e = relay_output_cancellable(host, &mut out, &mut err, None, None).unwrap_err();
+        let e = relay_output_cancellable(host, &mut out, &mut err, None).unwrap_err();
         assert!(e.to_string().contains("boom"), "{e}");
 
         let (host, guest) = UnixStream::pair().unwrap();
         drop(guest);
-        let e = relay_output_cancellable(host, &mut out, &mut err, None, None).unwrap_err();
+        let e = relay_output_cancellable(host, &mut out, &mut err, None).unwrap_err();
         assert!(e.to_string().contains("closed"), "{e}");
     }
 
@@ -1948,7 +2323,7 @@ mod tests {
                 Some(VmExecMsg::Exec(_))
             ));
             exec_count_srv.fetch_add(1, Ordering::SeqCst);
-            vm_exec::write(&mut conn, &VmExecMsg::Started).unwrap();
+            vm_exec::write(&mut conn, &VmExecMsg::Started { token: [7; 16] }).unwrap();
         });
 
         let spec = ExecSpec {
@@ -1966,7 +2341,9 @@ mod tests {
         let ready =
             wait_for_ready_socket(&sock, Instant::now() + Duration::from_secs(2), || Ok(None))
                 .unwrap();
-        let conn = submit_exec(ready, &spec, Instant::now() + Duration::from_secs(2)).unwrap();
+        let (conn, token) =
+            submit_exec(ready, &spec, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert_eq!(token, [7; 16]);
         assert_eq!(conn.read_timeout().unwrap(), None);
         assert_eq!(conn.write_timeout().unwrap(), None);
         assert_eq!(exec_count.load(Ordering::SeqCst), 2);
@@ -2082,6 +2459,8 @@ mod tests {
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                [0; 16],
+                no_ctrl,
                 Some((24, 80)),
                 slave_fd,
                 slave_fd,
@@ -2183,6 +2562,8 @@ mod tests {
             let mut err = OutputSink::Fd(err_fd);
             run_session_io(
                 host,
+                [0; 16],
+                no_ctrl,
                 Some((24, 80)),
                 slave_fd,
                 out_fd,
@@ -2195,8 +2576,14 @@ mod tests {
         });
 
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Inherited output fd must stay blocking even during the active session.
+        assert_eq!(
+            unsafe { libc::fcntl(out_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
         // Keep `out_r` open without reading while the guest floods stdout so
-        // `relay_output_cancellable` blocks waiting on the full stdout pipe.
+        // both `out_w` and OutputHelper's private pipe saturate and
+        // `relay_output_cancellable` blocks waiting on the full pipe.
         let guest_flood = thread::spawn(move || {
             let chunk = vec![b'O'; 16 << 10];
             for _ in 0..32 {
@@ -2205,7 +2592,7 @@ mod tests {
                 }
             }
         });
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(120));
 
         let t = Instant::now();
         unsafe { libc::raise(libc::SIGTERM) };
@@ -2236,15 +2623,100 @@ mod tests {
     }
 
     #[test]
+    fn shared_stdin_and_output_fd_stays_blocking_during_session() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (master, slave) = open_test_pty(24, 80);
+        let slave_dup = slave.try_clone().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let slave_fd = slave.as_raw_fd();
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(slave_fd);
+            let mut err = OutputSink::Fd(slave_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                Some((24, 80)),
+                slave_fd,
+                slave_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // When stdin, stdout, and stderr share the SAME open file description
+        // (interactive TTY), `O_NONBLOCK` must NEVER be set on it.
+        assert_eq!(
+            unsafe { libc::fcntl(slave_dup.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+
+        vm_exec::write(&mut guest, &VmExecMsg::Stdout(b"pty-hello\n".to_vec())).unwrap();
+        vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 0 }).unwrap();
+
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let mut got = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !got.windows(9).any(|w| w == b"pty-hello") && Instant::now() < deadline {
+                let mut pfd = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, 50) } > 0 {
+                    let n = unsafe {
+                        libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                    };
+                    if n > 0 {
+                        got.extend_from_slice(&buf[..n as usize]);
+                    }
+                }
+            }
+            (got, master)
+        });
+
+        assert_eq!(session.join().unwrap().unwrap(), SessionExit::Code(0));
+        let (got, master) = reader.join().unwrap();
+        assert!(
+            got.windows(9).any(|w| w == b"pty-hello"),
+            "unexpected pty output: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(slave_dup.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        drop(master);
+        drop(slave_dup);
+        drop(slave);
+    }
+
+    #[test]
     fn non_pty_forwards_sigint_without_closing_session() {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let dir = test_dir("oob-sigint");
+        let ctrl_sock = dir.join("ctrl.sock");
+        let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
+        let token = [0x42; 16];
 
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (host, mut guest) = UnixStream::pair().unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let out_buf = Arc::new(Mutex::new(Vec::new()));
         let out_writer = SharedVec(out_buf.clone());
         let stdin_fd = stdin_r.as_raw_fd();
+        let ctrl_path = ctrl_sock.clone();
 
         let session = thread::spawn(move || {
             let mut out_w = out_writer;
@@ -2253,6 +2725,8 @@ mod tests {
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                token,
+                move |dl, stop_r| connect_with_deadline_cancellable(&ctrl_path, dl, Some(stop_r)),
                 None,
                 stdin_fd,
                 -1,
@@ -2267,15 +2741,17 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         unsafe { libc::raise(libc::SIGINT) };
 
+        let (mut ctrl_conn, _) = ctrl_listener.accept().unwrap();
         assert_eq!(
-            vm_exec::read(&mut guest).unwrap(),
-            Some(VmExecMsg::Signal {
-                signal: libc::SIGINT
+            vm_exec::read(&mut ctrl_conn).unwrap(),
+            Some(VmExecMsg::SignalSession {
+                token,
+                signal: libc::SIGINT,
             })
         );
-        // Acknowledge receipt; sleep past sigint_timeout to verify SignalAck
-        // disarms the timeout so a trapping guest command can finish cleanly.
-        vm_exec::write(&mut guest, &VmExecMsg::SignalAck).unwrap();
+        // Acknowledge receipt out-of-band; sleep past sigint_timeout to verify
+        // SignalAck disarms the timeout so a trapping guest command finishes.
+        vm_exec::write(&mut ctrl_conn, &VmExecMsg::SignalAck).unwrap();
         thread::sleep(Duration::from_millis(160));
         vm_exec::write(&mut guest, &VmExecMsg::Stdout(b"caught-int\n".to_vec())).unwrap();
         vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 77 }).unwrap();
@@ -2285,24 +2761,36 @@ mod tests {
         assert_eq!(&*out_buf.lock().unwrap(), b"caught-int\n");
         drop(stdin_w);
         drop(stdin_r);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn non_pty_sigint_times_out_when_buffered_locally_without_guest_ack() {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("oob-timeout");
+        let ctrl_sock = dir.join("ctrl.sock");
+        let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
+        let ctrl_server = thread::spawn(move || {
+            // Accept the OOB control connection so local `send(SignalSession)`
+            // succeeds immediately, yet never send `SignalAck`.
+            let (_c, _) = ctrl_listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(400));
+        });
+
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
-        // Default large socket buffer: local `send(Signal)` succeeds immediately
-        // without blocking, yet the guest never reads or acknowledges `Signal`.
         let (host, guest) = UnixStream::pair().unwrap();
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let stdin_fd = stdin_r.as_raw_fd();
+        let ctrl_path = ctrl_sock.clone();
         let session = thread::spawn(move || {
             let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
             let mut out = OutputSink::Writer(&mut out_buf);
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                [0x11; 16],
+                move |dl, stop_r| connect_with_deadline_cancellable(&ctrl_path, dl, Some(stop_r)),
                 None,
                 stdin_fd,
                 -1,
@@ -2321,9 +2809,11 @@ mod tests {
         assert_eq!(exit, SessionExit::Signal(libc::SIGINT));
         assert!(t.elapsed() < Duration::from_secs(2));
 
+        let _ = ctrl_server.join();
         drop(stdin_w);
         drop(stdin_r);
         drop(guest);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2350,6 +2840,8 @@ mod tests {
             let mut err = OutputSink::Fd(err_fd);
             run_session_io(
                 host,
+                [0; 16],
+                no_ctrl,
                 None,
                 stdin_fd,
                 out_fd,
@@ -2362,14 +2854,18 @@ mod tests {
         });
 
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        // Inherited stdin must stay blocking during the session (not switched
-        // to O_NONBLOCK); output sinks are temporarily nonblocking until exit.
+        // Every inherited stdio descriptor must stay blocking DURING the active
+        // session as well as after exit.
         assert_eq!(
             unsafe { libc::fcntl(stdin_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
             0
         );
-        assert_ne!(
+        assert_eq!(
             unsafe { libc::fcntl(out_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(err_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
             0
         );
 
@@ -2419,6 +2915,8 @@ mod tests {
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                [0; 16],
+                no_ctrl,
                 None,
                 stdin_fd,
                 -1,
@@ -2468,24 +2966,33 @@ mod tests {
     }
 
     #[test]
-    fn non_pty_sigint_survives_blocked_host_stdout_until_reader_resumes() {
+    fn non_pty_oob_sigint_succeeds_when_both_stdin_and_stdout_are_stalled() {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("oob-bidir-ok");
+        let ctrl_sock = dir.join("ctrl.sock");
+        let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
+        let token = [0x99; 16];
+
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
 
         let (host, mut guest) = UnixStream::pair().unwrap();
+        shrink_socket_pair(&host, &guest, 4096);
         let (ready_tx, ready_rx) = mpsc::channel();
         let stdin_fd = stdin_r.as_raw_fd();
         let out_fd = out_w.as_raw_fd();
         let err_fd = err_w.as_raw_fd();
-        let sigint_timeout = Duration::from_millis(100);
+        let ctrl_path = ctrl_sock.clone();
+        let sigint_timeout = Duration::from_millis(120);
 
         let session = thread::spawn(move || {
             let mut out = OutputSink::Fd(out_fd);
             let mut err = OutputSink::Fd(err_fd);
             run_session_io(
                 host,
+                token,
+                move |dl, stop_r| connect_with_deadline_cancellable(&ctrl_path, dl, Some(stop_r)),
                 None,
                 stdin_fd,
                 out_fd,
@@ -2499,37 +3006,55 @@ mod tests {
 
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        // Fill host stdout pipe so `relay_output_cancellable` blocks inside
-        // `write_cancellable` while the downstream reader is paused.
+        // 1. Saturate host -> guest stdin while guest never reads stdin.
+        let feeder = thread::spawn(move || {
+            let mut f = std::fs::File::from(stdin_w);
+            let chunk = vec![b'I'; 16 << 10];
+            for _ in 0..32 {
+                if f.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 2. Saturate guest -> host stdout while downstream `out_r` is paused.
         let chunk = vec![b'O'; 16 << 10];
-        let expected_chunks = 8usize;
+        let expected_chunks = 20usize;
         let expected_len = chunk.len() * expected_chunks;
+        let (acked_tx, acked_rx) = mpsc::channel();
         let guest_handle = thread::spawn(move || {
             for _ in 0..expected_chunks {
                 vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).unwrap();
             }
-            assert_eq!(
-                vm_exec::read(&mut guest).unwrap(),
-                Some(VmExecMsg::Signal {
-                    signal: libc::SIGINT
-                })
-            );
-            // Guest delivers SIGINT and queues SignalAck behind in-flight Stdout.
-            vm_exec::write(&mut guest, &VmExecMsg::SignalAck).unwrap();
-            // Wait well past sigint_timeout after reader resumes to confirm the
-            // delayed SignalAck genuinely disarmed the countdown.
-            thread::sleep(Duration::from_millis(450));
+            acked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 77 }).unwrap();
         });
 
-        // Allow stdout pipe to fill, then send first SIGINT while blocked.
-        thread::sleep(Duration::from_millis(80));
+        // 3. OOB control listener accepts SignalSession and sends SignalAck
+        //    even though BOTH stdin and stdout on the data socket are stalled.
+        let ctrl_server = thread::spawn(move || {
+            let (mut c, _) = ctrl_listener.accept().unwrap();
+            assert_eq!(
+                vm_exec::read(&mut c).unwrap(),
+                Some(VmExecMsg::SignalSession {
+                    token,
+                    signal: libc::SIGINT,
+                })
+            );
+            vm_exec::write(&mut c, &VmExecMsg::SignalAck).unwrap();
+            let _ = acked_tx.send(());
+        });
+
+        // Allow both pipes/socket directions to saturate, then raise SIGINT.
+        thread::sleep(Duration::from_millis(100));
         unsafe { libc::raise(libc::SIGINT) };
 
-        // Keep stdout reader paused WELL PAST `sigint_timeout` (100ms).
+        ctrl_server.join().unwrap();
+        // Keep stdout paused WELL PAST `sigint_timeout` to confirm the OOB
+        // SignalAck genuinely completed without timing out the session.
         thread::sleep(Duration::from_millis(240));
 
-        // Now resume draining stdout; all bytes and the guest's exit code must arrive.
+        // Now resume draining stdout; all bytes and guest exit 77 must arrive.
         let reader = thread::spawn(move || {
             let mut f = std::fs::File::from(out_r);
             let mut buf = Vec::new();
@@ -2544,28 +3069,42 @@ mod tests {
         let received = reader.join().unwrap();
         assert_eq!(received.len(), expected_len);
         guest_handle.join().unwrap();
-        drop(stdin_w);
         drop(stdin_r);
+        let _ = feeder.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn non_pty_second_sigint_cancels_even_when_host_stdout_is_blocked() {
+    fn non_pty_oob_sigint_aborts_when_both_sinks_stalled_and_guest_never_acks() {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("oob-bidir-abort");
+        let ctrl_sock = dir.join("ctrl.sock");
+        let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
+        let ctrl_server = thread::spawn(move || {
+            // Accept OOB connection so local send succeeds, but stay silent.
+            let (_c, _) = ctrl_listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
 
         let (host, mut guest) = UnixStream::pair().unwrap();
+        shrink_socket_pair(&host, &guest, 4096);
         let (ready_tx, ready_rx) = mpsc::channel();
         let stdin_fd = stdin_r.as_raw_fd();
         let out_fd = out_w.as_raw_fd();
         let err_fd = err_w.as_raw_fd();
+        let ctrl_path = ctrl_sock.clone();
 
         let session = thread::spawn(move || {
             let mut out = OutputSink::Fd(out_fd);
             let mut err = OutputSink::Fd(err_fd);
             run_session_io(
                 host,
+                [0x55; 16],
+                move |dl, stop_r| connect_with_deadline_cancellable(&ctrl_path, dl, Some(stop_r)),
                 None,
                 stdin_fd,
                 out_fd,
@@ -2578,20 +3117,98 @@ mod tests {
         });
 
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let feeder = thread::spawn(move || {
+            let mut f = std::fs::File::from(stdin_w);
+            let chunk = vec![b'I'; 16 << 10];
+            for _ in 0..32 {
+                if f.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
         let guest_flood = thread::spawn(move || {
-            let chunk = vec![b'P'; 16 << 10];
-            for _ in 0..16 {
+            let chunk = vec![b'O'; 16 << 10];
+            for _ in 0..32 {
                 if vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).is_err() {
                     return;
                 }
             }
         });
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(120));
 
-        // First SIGINT suspends while stdout is blocked; second SIGINT must
-        // cancel immediately and restore output fd flags.
+        // Even with BOTH stdin and stdout stalled, a single SIGINT MUST time
+        // out cleanly when the guest never acknowledges OOB SignalSession.
+        let t = Instant::now();
         unsafe { libc::raise(libc::SIGINT) };
-        thread::sleep(Duration::from_millis(50));
+        let exit = session.join().unwrap().unwrap();
+        assert_eq!(exit, SessionExit::Signal(libc::SIGINT));
+        assert!(t.elapsed() < Duration::from_secs(2));
+
+        let _ = guest_flood.join();
+        let _ = ctrl_server.join();
+        drop(out_r);
+        drop(out_w);
+        drop(err_w);
+        drop(stdin_r);
+        let _ = feeder.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_pty_second_sigint_cancels_even_when_host_stdout_is_blocked() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("oob-second-sigint");
+        let ctrl_sock = dir.join("ctrl.sock");
+        let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
+        let ctrl_server = thread::spawn(move || {
+            let (_c, _) = ctrl_listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (_err_r, err_w) = pipe_cloexec(false).unwrap();
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+        let ctrl_path = ctrl_sock.clone();
+
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0x33; 16],
+                move |dl, stop_r| connect_with_deadline_cancellable(&ctrl_path, dl, Some(stop_r)),
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                Duration::from_secs(5),
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let guest_flood = thread::spawn(move || {
+            let chunk = vec![b'P'; 16 << 10];
+            for _ in 0..32 {
+                if vm_exec::write(&mut guest, &VmExecMsg::Stdout(chunk.clone())).is_err() {
+                    return;
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(120));
+
+        // First SIGINT awaits OOB ack (5s timeout); second SIGINT must cancel
+        // immediately without waiting for the timeout.
+        unsafe { libc::raise(libc::SIGINT) };
+        thread::sleep(Duration::from_millis(60));
         let t = Instant::now();
         unsafe { libc::raise(libc::SIGINT) };
         let exit = session.join().unwrap().unwrap();
@@ -2603,28 +3220,41 @@ mod tests {
         );
 
         let _ = guest_flood.join();
+        let _ = ctrl_server.join();
         drop(out_r);
         drop(out_w);
         drop(err_w);
         drop(stdin_w);
         drop(stdin_r);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn non_pty_sigint_aborts_cleanly_when_stdin_is_backpressured() {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir("oob-stdin-bp");
+        let ctrl_sock = dir.join("ctrl.sock");
+        let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
+        let ctrl_server = thread::spawn(move || {
+            let (_c, _) = ctrl_listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(400));
+        });
+
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (host, guest) = UnixStream::pair().unwrap();
         shrink_socket_pair(&host, &guest, 4096);
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let stdin_fd = stdin_r.as_raw_fd();
+        let ctrl_path = ctrl_sock.clone();
         let session = thread::spawn(move || {
             let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
             let mut out = OutputSink::Writer(&mut out_buf);
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                [0x22; 16],
+                move |dl, stop_r| connect_with_deadline_cancellable(&ctrl_path, dl, Some(stop_r)),
                 None,
                 stdin_fd,
                 -1,
@@ -2655,9 +3285,11 @@ mod tests {
         assert_eq!(exit, SessionExit::Signal(libc::SIGINT));
         assert!(t.elapsed() < Duration::from_secs(2));
 
+        let _ = ctrl_server.join();
         drop(stdin_r);
         drop(guest);
         let _ = feeder.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2676,6 +3308,8 @@ mod tests {
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                [0; 16],
+                no_ctrl,
                 None,
                 stdin_fd,
                 -1,
@@ -2749,6 +3383,8 @@ mod tests {
             let mut err = OutputSink::Writer(&mut err_buf);
             run_session_io(
                 host,
+                [0; 16],
+                no_ctrl,
                 Some((24, 80)),
                 slave_fd,
                 slave_fd,

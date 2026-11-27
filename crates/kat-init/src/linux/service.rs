@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 use kat_proto::Msg;
 use kat_proto::backoff::Backoff;
 
+use super::machines::cmd;
 use super::sys;
 
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -96,6 +98,212 @@ impl Reaper {
     pub fn spawn(&self, cmd: &mut Command) -> io::Result<(i32, Receiver<i32>)> {
         let (target, rx) = self.spawn_pgrp(cmd)?;
         Ok((target.pid, rx))
+    }
+
+    /// Spawn `cmd` without holding PID 1's shared reaper lock across `fork`,
+    /// `fchdir`, or `execve`: the child reports its PID right after `fork` and
+    /// pauses on a `go` pipe while the parent briefly acquires `self.watched` to
+    /// register the PID (and optionally open a `pidfd`), then releases the lock
+    /// before `post_reg` and `execve` run. A stalled filesystem in `post_reg` or
+    /// `execve` can therefore never block child reaping across the VM.
+    pub fn spawn_pgrp_unlocked<F>(
+        &self,
+        cmd: Command,
+        post_reg: F,
+    ) -> io::Result<(PgrpTarget, Receiver<i32>)>
+    where
+        F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
+    {
+        let (_, pgrp, rx) = self.spawn_unlocked_inner(cmd, false, post_reg)?;
+        Ok((pgrp, rx))
+    }
+
+    /// Like [`Self::spawn_pgrp_unlocked`], also opening a `pidfd` under the
+    /// brief watch-table lock before `post_reg` and `execve` run.
+    pub fn spawn_pidfd_pgrp_unlocked<F>(
+        &self,
+        cmd: Command,
+        post_reg: F,
+    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)>
+    where
+        F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
+    {
+        self.spawn_unlocked_inner(cmd, true, post_reg)
+    }
+
+    fn spawn_unlocked_inner<F>(
+        &self,
+        mut cmd: Command,
+        open_pidfd: bool,
+        post_reg: F,
+    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)>
+    where
+        F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
+    {
+        let (pid_r, pid_w) = cmd::pipe()?;
+        let (go_r, go_w) = cmd::pipe()?;
+        let pid_w_raw = pid_w.as_raw_fd();
+        let go_r_raw = go_r.as_raw_fd();
+        let mut post_reg = Some(post_reg);
+        let got_pid = Arc::new(AtomicBool::new(false));
+        let got_pid_spawner = got_pid.clone();
+
+        // SAFETY: `getpid`, `write`, `read`, and caller's `post_reg` are
+        // async-signal-safe; no allocations or locks occur in the child.
+        unsafe {
+            cmd.pre_exec(move || {
+                let pid_bytes = libc::getpid().to_ne_bytes();
+                let mut off = 0usize;
+                while off < pid_bytes.len() {
+                    let rc = libc::write(
+                        pid_w_raw,
+                        pid_bytes[off..].as_ptr().cast(),
+                        pid_bytes.len() - off,
+                    );
+                    if rc > 0 {
+                        off += rc as usize;
+                    } else if rc < 0
+                        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    } else {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                let mut gate = [0u8; 1];
+                loop {
+                    let rc = libc::read(go_r_raw, gate.as_mut_ptr().cast(), 1);
+                    if rc >= 0 {
+                        break;
+                    }
+                    if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                if let Some(f) = post_reg.take() {
+                    f()?;
+                }
+                Ok(())
+            });
+        }
+
+        let spawner = thread::Builder::new()
+            .name("reaper-spawn".into())
+            .spawn(move || {
+                let res = cmd.spawn();
+                if res.is_err() && !got_pid_spawner.load(Ordering::Acquire) {
+                    // Wake the caller explicitly with sentinel pid 0 even if an
+                    // unrelated concurrent fork transiently inherited `pid_w`.
+                    let zero = 0i32.to_ne_bytes();
+                    let mut off = 0usize;
+                    while off < zero.len() {
+                        let rc = unsafe {
+                            libc::write(
+                                pid_w.as_raw_fd(),
+                                zero[off..].as_ptr().cast(),
+                                zero.len() - off,
+                            )
+                        };
+                        if rc > 0 {
+                            off += rc as usize;
+                        } else if rc < 0
+                            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                drop(pid_w);
+                drop(go_r);
+                res
+            })?;
+
+        let mut pid_bytes = [0u8; 4];
+        let mut read_off = 0usize;
+        while read_off < pid_bytes.len() {
+            let rc = unsafe {
+                libc::read(
+                    pid_r.as_raw_fd(),
+                    pid_bytes[read_off..].as_mut_ptr().cast(),
+                    pid_bytes.len() - read_off,
+                )
+            };
+            if rc > 0 {
+                read_off += rc as usize;
+            } else if rc == 0 {
+                // Fork failed before `pre_exec` wrote the PID; surface spawn error.
+                drop(go_w);
+                return match spawner.join() {
+                    Ok(Err(e)) => Err(e),
+                    Ok(Ok(_)) => Err(io::Error::other("child exited spawn handshake without pid")),
+                    Err(_) => Err(io::Error::other("spawner thread panicked")),
+                };
+            } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                let e = io::Error::last_os_error();
+                drop(go_w);
+                let _ = spawner.join();
+                return Err(e);
+            }
+        }
+        let pid = i32::from_ne_bytes(pid_bytes);
+        if pid <= 0 {
+            drop(pid_r);
+            drop(go_w);
+            return match spawner.join() {
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(_)) => Err(io::Error::other("child exited spawn handshake without pid")),
+                Err(_) => Err(io::Error::other("spawner thread panicked")),
+            };
+        }
+        got_pid.store(true, Ordering::Release);
+        drop(pid_r);
+
+        // Hold `self.watched` ONLY for the microsecond registration + pidfd_open,
+        // never across `fchdir` or `execve`.
+        let (target, pgrp, rx) = {
+            let mut table = self.watched.lock().unwrap();
+            let (token, rx) = table.register(pid);
+            let target = if open_pidfd {
+                match sys::pidfd_open(pid) {
+                    Ok(fd) => ChildTarget::PidFd(fd),
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => ChildTarget::Exited,
+                    Err(_) => ChildTarget::Pid { pid, token },
+                }
+            } else {
+                ChildTarget::Pid { pid, token }
+            };
+            (target, PgrpTarget { pid, token }, rx)
+        };
+
+        // Release the child with an explicit byte (not just EOF) so an
+        // unrelated concurrent fork transiently inheriting `go_w` cannot stall
+        // the child before `post_reg` and `execve`.
+        let go_byte: u8 = 1;
+        loop {
+            let rc = unsafe { libc::write(go_w.as_raw_fd(), (&go_byte as *const u8).cast(), 1) };
+            if rc >= 0 {
+                break;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        drop(go_w);
+        match spawner.join() {
+            Ok(Ok(_child)) => Ok((target, pgrp, rx)),
+            Ok(Err(e)) => {
+                // If `Command::spawn()` reaped the failed child before
+                // `reap_loop`, remove our token-matched watch entry now.
+                let mut table = self.watched.lock().unwrap();
+                if table.matches(pgrp.pid, pgrp.token) {
+                    table.children.remove(&pgrp.pid);
+                }
+                Err(e)
+            }
+            Err(_) => Err(io::Error::other("spawner thread panicked")),
+        }
     }
 
     /// Spawn `cmd` and return a token-pinned [`PgrpTarget`] plus a channel
@@ -1062,5 +1270,48 @@ mod tests {
         assert_ne!(tok1, tok2);
         assert!(!table.matches(4242, tok1));
         assert!(table.matches(4242, tok2));
+    }
+
+    #[test]
+    fn spawn_unlocked_does_not_hold_reaper_lock_during_post_reg() {
+        let reaper = Reaper::start();
+        let watched = reaper.watched.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (gate_r, gate_w) = cmd::pipe().unwrap();
+        let gate_r_raw = gate_r.as_raw_fd();
+        let (notify_r, notify_w) = cmd::pipe().unwrap();
+        let notify_w_raw = notify_w.as_raw_fd();
+
+        let r2 = reaper.clone();
+        let handle = thread::spawn(move || {
+            let cmd = Command::new("/bin/true");
+            let res = r2.spawn_pidfd_pgrp_unlocked(cmd, move || {
+                let b = [1u8];
+                let _ = unsafe { libc::write(notify_w_raw, b.as_ptr().cast(), 1) };
+                let mut g = [0u8; 1];
+                let _ = unsafe { libc::read(gate_r_raw, g.as_mut_ptr().cast(), 1) };
+                Ok(())
+            });
+            drop(gate_r);
+            drop(notify_w);
+            let _ = done_tx.send(res.is_ok());
+        });
+
+        let mut b = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(notify_r.as_raw_fd(), b.as_mut_ptr().cast(), 1) },
+            1
+        );
+
+        // While the child is paused inside `post_reg` (simulating a stalled
+        // filesystem during fchdir/execve), PID 1's reaper lock must be FREE.
+        assert!(
+            watched.try_lock().is_ok(),
+            "reaper watch lock was held across post_reg/execve"
+        );
+
+        drop(gate_w);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        handle.join().unwrap();
     }
 }

@@ -6,16 +6,15 @@
 //! rlimits, and guest logs without needing Kubernetes or an LXC machine.
 //! Idle overhead is a single vsock listener thread.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +32,10 @@ const VM_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/lib/katamaran/k3s/bin";
 const DEFAULT_PS1: &str = r"\h:\w\$ ";
 const MAX_CONNS: usize = 64;
+/// Separate cap for short-lived handshake / out-of-band control connections
+/// (`Ping`, `SignalSession`) so signals can still be delivered when all
+/// [`MAX_CONNS`] exec session slots are occupied.
+const MAX_PENDING_HANDSHAKES: usize = 64;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_ERROR_BYTES: usize = 64 << 10;
 /// Total wall-clock budget for reading the initial handshake (`Ping` / `Exec`).
@@ -58,8 +61,62 @@ const STDIN_BUF_CAP: usize = 128 << 10;
 const GUEST_OUT_QUEUE_CAP: usize = 2;
 const CGROUP_PARENT: &str = "/sys/fs/cgroup/kat-vm-exec";
 
+type SharedChildHandle = Arc<Mutex<Option<ChildHandle>>>;
+
 static NEXT_CGROUP_ID: AtomicUsize = AtomicUsize::new(1);
 static LIVE_CGROUPS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
+static SESSION_REGISTRY: LazyLock<Mutex<HashMap<[u8; 16], SharedChildHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn random_session_token() -> [u8; 16] {
+    let mut token = [0u8; 16];
+    let mut filled = 0usize;
+    while filled < token.len() {
+        let rc = unsafe {
+            libc::getrandom(token[filled..].as_mut_ptr().cast(), token.len() - filled, 0)
+        };
+        if rc > 0 {
+            filled += rc as usize;
+        } else if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+            token[..8].copy_from_slice(&seq.to_le_bytes());
+            token[8..12].copy_from_slice(&(std::process::id()).to_le_bytes());
+            break;
+        }
+    }
+    token
+}
+
+struct SessionRegGuard([u8; 16]);
+
+impl SessionRegGuard {
+    fn register(handle: Arc<Mutex<Option<ChildHandle>>>) -> Self {
+        let mut reg = SESSION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let token = random_session_token();
+            if let std::collections::hash_map::Entry::Vacant(e) = reg.entry(token) {
+                e.insert(handle);
+                return Self(token);
+            }
+        }
+    }
+
+    fn token(&self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl Drop for SessionRegGuard {
+    fn drop(&mut self) {
+        SESSION_REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
 
 struct ConnGuard(Arc<AtomicUsize>);
 
@@ -1438,7 +1495,8 @@ fn log(msg: &str) {
 /// Start listening on [`VM_EXEC_PORT`] for host VM shell/exec sessions.
 pub fn start(reaper: Reaper) -> io::Result<()> {
     let listener = sys::vsock_listen(VM_EXEC_PORT)?;
-    let active = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(AtomicUsize::new(0));
+    let active_sessions = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
         .name("vm-exec".into())
         .spawn(move || {
@@ -1453,19 +1511,26 @@ pub fn start(reaper: Reaper) -> io::Result<()> {
                             drop(fd);
                             continue;
                         }
-                        let Some(guard) = ConnGuard::try_acquire(&active, MAX_CONNS) else {
+                        let Some(pending_guard) =
+                            ConnGuard::try_acquire(&pending, MAX_PENDING_HANDSHAKES)
+                        else {
                             log(&format!(
-                                "connection limit ({MAX_CONNS}) reached on vsock {VM_EXEC_PORT}"
+                                "handshake limit ({MAX_PENDING_HANDSHAKES}) reached on vsock {VM_EXEC_PORT}"
                             ));
                             continue;
                         };
                         let reaper = reaper.clone();
+                        let active_sessions = active_sessions.clone();
                         if let Err(e) =
                             thread::Builder::new()
                                 .name("vm-exec-conn".into())
                                 .spawn(move || {
-                                    let _guard = guard;
-                                    serve(&reaper, UnixStream::from(fd));
+                                    serve(
+                                        &reaper,
+                                        UnixStream::from(fd),
+                                        pending_guard,
+                                        &active_sessions,
+                                    );
                                 })
                         {
                             log(&format!("spawn vm-exec-conn: {e}"));
@@ -1481,10 +1546,17 @@ pub fn start(reaper: Reaper) -> io::Result<()> {
     Ok(())
 }
 
-fn serve(reaper: &Reaper, conn: UnixStream) {
+fn serve(
+    reaper: &Reaper,
+    conn: UnixStream,
+    pending_guard: ConnGuard,
+    active_sessions: &Arc<AtomicUsize>,
+) {
     serve_with_timeouts(
         reaper,
         conn,
+        Some(pending_guard),
+        active_sessions,
         FIRST_FRAME_TIMEOUT,
         DISCONNECT_GRACE,
         POST_EXIT_IDLE,
@@ -1493,9 +1565,12 @@ fn serve(reaper: &Reaper, conn: UnixStream) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_with_timeouts(
     reaper: &Reaper,
     mut conn: UnixStream,
+    pending_guard: Option<ConnGuard>,
+    active_sessions: &Arc<AtomicUsize>,
     first_frame_timeout: Duration,
     disconnect_grace: Duration,
     post_exit_idle: Duration,
@@ -1517,6 +1592,33 @@ fn serve_with_timeouts(
                         return;
                     }
                 }
+                Ok(Some(VmExecMsg::SignalSession { token, signal })) => {
+                    if !valid_signal(signal) {
+                        let _ = vm_exec::write(
+                            &mut ds,
+                            &VmExecMsg::Error(format!("invalid signal {signal}")),
+                        );
+                        return;
+                    }
+                    let handle = SESSION_REGISTRY
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&token)
+                        .cloned();
+                    match handle {
+                        Some(h) => {
+                            signal_handle(reaper, &h, signal);
+                            let _ = vm_exec::write(&mut ds, &VmExecMsg::SignalAck);
+                        }
+                        None => {
+                            let _ = vm_exec::write(
+                                &mut ds,
+                                &VmExecMsg::Error("unknown session".into()),
+                            );
+                        }
+                    }
+                    return;
+                }
                 Ok(Some(VmExecMsg::Exec(s))) => break s,
                 Ok(None) => return,
                 Ok(Some(other)) => {
@@ -1535,6 +1637,22 @@ fn serve_with_timeouts(
             }
         }
     };
+
+    let Some(_session_guard) = ConnGuard::try_acquire(active_sessions, MAX_CONNS) else {
+        let mut ds = DeadlineStream {
+            conn: &mut conn,
+            deadline: Instant::now() + first_frame_timeout,
+        };
+        let _ = vm_exec::write(
+            &mut ds,
+            &VmExecMsg::Error(format!(
+                "connection limit ({MAX_CONNS}) reached on VM shell service"
+            )),
+        );
+        return;
+    };
+    // Release the handshake slot now that this connection holds a session slot.
+    drop(pending_guard);
 
     // Ensure no socket timeouts remain on the connection for interactive sessions.
     let _ = conn.set_read_timeout(None);
@@ -1558,26 +1676,38 @@ fn serve_with_timeouts(
     }
 }
 
-fn resolve_workdir(cwd: &str) -> Result<PathBuf, String> {
+fn open_workdir_fd(cwd: &str) -> Result<OwnedFd, String> {
     if !vm_exec::value_ok(cwd) {
         return Err("workdir contains NUL byte".into());
     }
-    if cwd.is_empty() {
-        return Ok(if Path::new(DEFAULT_HOME).is_dir() {
-            PathBuf::from(DEFAULT_HOME)
+    let path = if cwd.is_empty() {
+        if Path::new(DEFAULT_HOME).is_dir() {
+            DEFAULT_HOME
         } else {
-            PathBuf::from("/")
-        });
+            "/"
+        }
+    } else {
+        cwd
+    };
+    let c = CString::new(path).map_err(|_| "workdir contains NUL byte".to_string())?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOTDIR) {
+            return Err(format!("workdir {cwd:?}: not a directory"));
+        }
+        return Err(format!("workdir {cwd:?}: {e}"));
     }
-    match fs::metadata(cwd) {
-        Ok(m) if m.is_dir() => Ok(PathBuf::from(cwd)),
-        Ok(_) => Err(format!("workdir {cwd:?}: not a directory")),
-        Err(e) => Err(format!("workdir {cwd:?}: {e}")),
-    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn build_command(spec: &ExecSpec) -> Result<(Command, String), String> {
-    let cwd = resolve_workdir(&spec.cwd)?;
+fn build_command(spec: &ExecSpec) -> Result<(Command, String, OwnedFd), String> {
+    let cwd_fd = open_workdir_fd(&spec.cwd)?;
     for (k, v) in &spec.env {
         if !vm_exec::env_name_ok(k) {
             return Err(format!("invalid environment variable name {k:?}"));
@@ -1608,7 +1738,6 @@ fn build_command(spec: &ExecSpec) -> Result<(Command, String), String> {
 
     let mut c = Command::new(program);
     c.args(args)
-        .current_dir(&cwd)
         .env_clear()
         .env("PATH", VM_PATH)
         .env("HOME", DEFAULT_HOME)
@@ -1630,7 +1759,7 @@ fn build_command(spec: &ExecSpec) -> Result<(Command, String), String> {
     for (k, v) in &spec.env {
         c.env(k, v);
     }
-    Ok((c, program.to_string()))
+    Ok((c, program.to_string(), cwd_fd))
 }
 
 fn exit_code(status: i32) -> i32 {
@@ -1659,7 +1788,8 @@ fn exec_with_timeouts(
     cgroup_mode: CgroupMode<'_>,
 ) -> Result<(), String> {
     let mut conn = conn.map_err(|e| format!("clone stream: {e}"))?;
-    let (mut c, program) = build_command(spec)?;
+    let (mut c, program, cwd_fd) = build_command(spec)?;
+    let cwd_raw = cwd_fd.as_raw_fd();
 
     let reader = conn.try_clone().map_err(|e| format!("clone stream: {e}"))?;
 
@@ -1700,11 +1830,10 @@ fn exec_with_timeouts(
                 slave.try_clone().map_err(|e| format!("pty stdout: {e}"))?,
             ))
             .stderr(Stdio::from(slave));
-            // SAFETY: write, setsid, and ioctl(TIOCSCTTY) are async-signal-safe.
-            unsafe {
-                c.pre_exec(move || {
+            let (target, pgrp, exited) = reaper
+                .spawn_pidfd_pgrp_unlocked(c, move || {
                     if let Some(pfd) = procs_raw {
-                        let n = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                        let n = unsafe { libc::write(pfd, b"0\n".as_ptr().cast(), 2) };
                         if n != 2 {
                             return Err(if n < 0 {
                                 io::Error::last_os_error()
@@ -1716,16 +1845,16 @@ fn exec_with_timeouts(
                             });
                         }
                     }
-                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    if unsafe { libc::fchdir(cwd_raw) } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if unsafe { libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 } {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())
-                });
-            }
-            let (target, pgrp, exited) = reaper
-                .spawn_pidfd_pgrp(&mut c)
+                })
                 .map_err(|e| format!("exec {program:?}: {e}"))?;
-            drop(c);
+            drop(cwd_fd);
             drop(procs_fd);
             (
                 ChildHandle::Pty { target, pgrp },
@@ -1752,13 +1881,10 @@ fn exec_with_timeouts(
             c.stdin(Stdio::from(in_r))
                 .stdout(Stdio::from(out_w))
                 .stderr(Stdio::from(err_w));
-            // Put non-PTY commands in their own process group so host
-            // disconnect or signals reach descendant processes too.
-            // SAFETY: write and setpgid are async-signal-safe.
-            unsafe {
-                c.pre_exec(move || {
+            let (pgrp, exited) = reaper
+                .spawn_pgrp_unlocked(c, move || {
                     if let Some(pfd) = procs_raw {
-                        let n = libc::write(pfd, b"0\n".as_ptr().cast(), 2);
+                        let n = unsafe { libc::write(pfd, b"0\n".as_ptr().cast(), 2) };
                         if n != 2 {
                             return Err(if n < 0 {
                                 io::Error::last_os_error()
@@ -1770,16 +1896,16 @@ fn exec_with_timeouts(
                             });
                         }
                     }
-                    if libc::setpgid(0, 0) < 0 {
+                    if unsafe { libc::fchdir(cwd_raw) } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if unsafe { libc::setpgid(0, 0) } < 0 {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())
-                });
-            }
-            let (pgrp, exited) = reaper
-                .spawn_pgrp(&mut c)
+                })
                 .map_err(|e| format!("exec {program:?}: {e}"))?;
-            drop(c);
+            drop(cwd_fd);
             drop(procs_fd);
             (
                 ChildHandle::Pipe(pgrp),
@@ -1800,6 +1926,7 @@ fn exec_with_timeouts(
     };
 
     let handle = Arc::new(Mutex::new(Some(handle)));
+    let session_reg = SessionRegGuard::register(handle.clone());
     let host_disconnected = Arc::new(AtomicBool::new(false));
 
     {
@@ -1807,7 +1934,14 @@ fn exec_with_timeouts(
             conn: &mut conn,
             deadline: Instant::now() + first_frame_timeout,
         };
-        if vm_exec::write(&mut ds, &VmExecMsg::Started).is_err() {
+        if vm_exec::write(
+            &mut ds,
+            &VmExecMsg::Started {
+                token: session_reg.token(),
+            },
+        )
+        .is_err()
+        {
             signal_handle(reaper, &handle, libc::SIGKILL);
             if let Some(cg) = &cgroup {
                 cg.kill();
@@ -1983,7 +2117,7 @@ mod tests {
 
     #[test]
     fn builds_default_shell_and_exec_commands() {
-        let (cmd, prog) = build_command(&ExecSpec {
+        let (cmd, prog, _cwd_fd) = build_command(&ExecSpec {
             cwd: "/".into(),
             env: vec![("FOO".into(), "bar".into())],
             argv: vec![],
@@ -2017,7 +2151,7 @@ mod tests {
         );
         assert!(envs.iter().any(|(k, v)| k == "FOO" && v == "bar"));
 
-        let (cmd, prog) = build_command(&ExecSpec {
+        let (cmd, prog, _cwd_fd) = build_command(&ExecSpec {
             cwd: "/".into(),
             env: vec![],
             argv: vec!["sysctl".into(), "-n".into(), "kernel.ostype".into()],
@@ -2272,18 +2406,21 @@ mod tests {
 
     #[test]
     fn idle_first_frame_connection_releases_slot() {
-        let active = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let active_sessions = Arc::new(AtomicUsize::new(0));
         let reaper = Reaper::start();
         let (_client, server) = UnixStream::pair().unwrap();
-        let guard = ConnGuard::try_acquire(&active, 1).unwrap();
-        assert_eq!(active.load(Ordering::Acquire), 1);
+        let guard = ConnGuard::try_acquire(&pending, 1).unwrap();
+        assert_eq!(pending.load(Ordering::Acquire), 1);
 
         let t = Instant::now();
+        let active_bg = active_sessions.clone();
         let handle = thread::spawn(move || {
-            let _guard = guard;
             serve_with_timeouts(
                 &reaper,
                 server,
+                Some(guard),
+                &active_bg,
                 Duration::from_millis(120),
                 Duration::from_millis(100),
                 Duration::from_millis(50),
@@ -2293,13 +2430,15 @@ mod tests {
         });
         handle.join().unwrap();
         assert!(t.elapsed() < Duration::from_secs(2));
-        assert_eq!(active.load(Ordering::Acquire), 0);
-        assert!(ConnGuard::try_acquire(&active, 1).is_some());
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+        assert!(ConnGuard::try_acquire(&pending, 1).is_some());
     }
 
     #[test]
     fn required_cgroup_mode_fails_loudly_when_cgroup_unavailable() {
         let reaper = Reaper::start();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
         // `/dev/null/kat-vm-exec` cannot be created as a directory; Required
         // mode must return a guest Error instead of silently falling back to
@@ -2308,6 +2447,8 @@ mod tests {
             serve_with_timeouts(
                 &reaper,
                 guest,
+                None,
+                &active_sessions,
                 Duration::from_secs(2),
                 Duration::from_millis(100),
                 Duration::from_millis(50),
@@ -2338,12 +2479,15 @@ mod tests {
     #[test]
     fn signal_frame_emits_signal_ack() {
         let reaper = Reaper::start();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
 
         let server = thread::spawn(move || {
             serve_with_timeouts(
                 &reaper,
                 guest,
+                None,
+                &active_sessions,
                 Duration::from_secs(2),
                 Duration::from_millis(150),
                 Duration::from_millis(50),
@@ -2366,7 +2510,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Started));
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
         assert_eq!(
             vm_exec::read(&mut host).unwrap(),
             Some(VmExecMsg::Stdout(b"READY\n".to_vec()))
@@ -2640,12 +2787,15 @@ mod tests {
     #[test]
     fn disconnect_under_stdin_backpressure_detected_even_without_rdhup() {
         let reaper = Reaper::start();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
 
         let server = thread::spawn(move || {
             serve_with_timeouts(
                 &reaper,
                 guest,
+                None,
+                &active_sessions,
                 Duration::from_secs(2),
                 Duration::from_millis(150),
                 Duration::from_millis(50),
@@ -2670,7 +2820,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Started));
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
 
         // Fill guest stdin pipe + user-space buffer.
         let chunk = vec![b'x'; CHUNK];
@@ -2697,6 +2850,7 @@ mod tests {
     #[test]
     fn disconnect_detected_when_both_directions_are_backpressured() {
         let reaper = Reaper::start();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
         shrink_pair(&host, &guest, 8192);
 
@@ -2704,6 +2858,8 @@ mod tests {
             serve_with_timeouts(
                 &reaper,
                 guest,
+                None,
+                &active_sessions,
                 Duration::from_secs(2),
                 Duration::from_millis(150),
                 Duration::from_millis(50),
@@ -2726,7 +2882,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(vm_exec::read(&mut host).unwrap(), Some(VmExecMsg::Started));
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
 
         // Stop reading stdout (backpressuring guest->host) AND flood stdin
         // (backpressuring host->guest) so both directions stall simultaneously.
@@ -2750,6 +2909,100 @@ mod tests {
             t.elapsed()
         );
         drop(host);
+    }
+
+    #[test]
+    fn signal_session_oob_delivers_signal_even_under_bidirectional_backpressure() {
+        let reaper = Reaper::start();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        shrink_pair(&host, &guest, 8192);
+
+        let r1 = reaper.clone();
+        let active_bg = active_sessions.clone();
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &r1,
+                guest,
+                None,
+                &active_bg,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap 'exit 77' INT; while true; do printf '0123456789abcdef%.0s' 1 2 3 4 5 6 7 8 9 0; done".into(),
+                ],
+                tty: None,
+            }),
+        )
+        .unwrap();
+        let token = match vm_exec::read(&mut host).unwrap() {
+            Some(VmExecMsg::Started { token }) => token,
+            other => panic!("expected Started, got {other:?}"),
+        };
+
+        // Stall BOTH directions (do not read stdout, flood stdin).
+        let chunk = vec![b'x'; CHUNK];
+        for _ in 0..6 {
+            if vm_exec::write(&mut host, &VmExecMsg::Data(chunk.clone())).is_err() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(60));
+
+        // Deliver SIGINT out-of-band even when active_sessions is at MAX_CONNS.
+        let full_sessions = Arc::new(AtomicUsize::new(MAX_CONNS));
+        let (mut ctrl_host, ctrl_guest) = UnixStream::pair().unwrap();
+        let r2 = reaper.clone();
+        let ctrl_srv = thread::spawn(move || {
+            serve_with_timeouts(
+                &r2,
+                ctrl_guest,
+                None,
+                &full_sessions,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+        vm_exec::write(
+            &mut ctrl_host,
+            &VmExecMsg::SignalSession {
+                token,
+                signal: libc::SIGINT,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            vm_exec::read(&mut ctrl_host).unwrap(),
+            Some(VmExecMsg::SignalAck)
+        );
+        ctrl_srv.join().unwrap();
+
+        // Drain stdout until the trapped exit code 77 arrives.
+        let mut exit_code_seen = None;
+        while let Ok(Some(msg)) = vm_exec::read(&mut host) {
+            if let VmExecMsg::Exit { code } = msg {
+                exit_code_seen = Some(code);
+                break;
+            }
+        }
+        assert_eq!(exit_code_seen, Some(77));
+        server.join().unwrap();
     }
 
     #[test]

@@ -687,9 +687,9 @@ fn vm_shell_and_exec_run_as_root_in_vm_namespaces() {
 }
 
 /// Spawn the real `katamaran vm exec` binary against a mock `vm-exec.sock`
-/// inheriting shared blocking output and input pipes, terminate it with
-/// `SIGTERM`, and verify the parent's duplicate pipe descriptors still have
-/// `O_NONBLOCK` clear afterward.
+/// inheriting shared blocking output and input pipes, verify all inherited
+/// pipe descriptors remain blocking while active, terminate it with `SIGTERM`,
+/// and verify they are still blocking afterward.
 #[test]
 fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
     use kat_proto::vm_exec::{self, VmExecMsg};
@@ -712,7 +712,7 @@ fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
             vm_exec::read(&mut conn).unwrap(),
             Some(VmExecMsg::Exec(_))
         ));
-        vm_exec::write(&mut conn, &VmExecMsg::Started).unwrap();
+        vm_exec::write(&mut conn, &VmExecMsg::Started { token: [1; 16] }).unwrap();
         vm_exec::write(&mut conn, &VmExecMsg::Stdout(b"READY\n".to_vec())).unwrap();
         let _ = stop_srv_rx.recv_timeout(Duration::from_secs(5));
     });
@@ -741,6 +741,10 @@ fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
         0
     );
     assert_eq!(
+        unsafe { libc::fcntl(err_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0
+    );
+    assert_eq!(
         unsafe { libc::fcntl(in_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
         0
     );
@@ -753,18 +757,28 @@ fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
         .stderr(Stdio::from(err_w_child));
     let mut child = ChildGuard::new(cmd.spawn().expect("spawn katamaran vm exec"));
 
-    // Wait for `READY\n` so we know run_session_io has entered its relay loop
-    // and enabled O_NONBLOCK on the inherited output descriptors.
+    // Wait for `READY\n` so we know run_session_io has entered its relay loop.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut out = String::new();
     read_fd_until(out_r.as_raw_fd(), &mut out, "READY", deadline);
 
-    // Inherited stdin MUST remain blocking while the CLI is actively relaying
-    // so other readers sharing the pipe open file description never see EAGAIN.
+    // Every inherited stdio descriptor MUST remain blocking while the CLI is
+    // actively relaying so rival processes sharing any open file description
+    // never see spurious EAGAIN.
     assert_eq!(
         unsafe { libc::fcntl(in_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
         0,
         "shared stdin pipe was switched to O_NONBLOCK during active session"
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(out_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0,
+        "shared stdout pipe was switched to O_NONBLOCK during active session"
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(err_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0,
+        "shared stderr pipe was switched to O_NONBLOCK during active session"
     );
 
     let pid = child.as_mut().id() as libc::pid_t;
