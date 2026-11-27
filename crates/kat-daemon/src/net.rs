@@ -892,7 +892,14 @@ impl<A: ForwardApi> Forwards<A> {
             Ok(()) => {
                 self.active.remove(&key);
                 self.remove_failed.remove(&key);
-                self.cleanup_pending.remove(&key);
+                // The Mac side is gone, but gvproxy may still hold upstream
+                // state (its unexpose failed after the listeners closed):
+                // keep it for the worker's cleanup retry.
+                if self.api.has_pending_cleanup(proto, port) {
+                    self.cleanup_pending.insert(key);
+                } else {
+                    self.cleanup_pending.remove(&key);
+                }
                 Event::Removed(proto, port)
             }
             Err(e) => {
@@ -910,6 +917,12 @@ impl<A: ForwardApi> Forwards<A> {
     /// removal only cleans up gvproxy state).
     fn is_active(&self, proto: PortProto, port: u16) -> bool {
         self.active.contains(&(proto, port))
+    }
+
+    /// Whether a removed port still has gvproxy state to clean up.
+    fn needs_cleanup(&self, proto: PortProto, port: u16) -> bool {
+        let key = (proto, port);
+        !self.active.contains(&key) && self.cleanup_pending.contains(&key)
     }
 
     #[cfg(test)]
@@ -1050,9 +1063,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(WorkerMsg::Change(PortChange::Remove(proto, port, seq))) => {
                         let key = (proto, port);
                         pending.remove(&key);
-                        let before = capacity_wait.len();
                         capacity_wait.retain(|&k| k != key);
-                        let was_waiting = capacity_wait.len() != before;
                         let label = fwd.port_label(proto, port);
                         let was_active = fwd.is_active(proto, port);
                         match fwd.remove(proto, port) {
@@ -1067,11 +1078,17 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e) => {
                                 report(&e, &label);
                                 on_event(e);
+                                if fwd.needs_cleanup(proto, port) {
+                                    pending.insert(
+                                        key,
+                                        (PendingOp::Remove, Instant::now() + retry_base, 1),
+                                    );
+                                }
                             }
-                            None if was_waiting => {
-                                on_event(Event::RefusedCleared(proto, port));
-                            }
-                            None => {}
+                            // Nothing was forwarded (the add was still being
+                            // retried or waited for capacity): clear any
+                            // error the cancelled add reported.
+                            None => on_event(Event::RefusedCleared(proto, port)),
                         }
                         // The first attempt is done; failures keep retrying
                         // in the background and report `Removed` or
@@ -1173,6 +1190,16 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                 Some(e) => {
                                     report(&e, &label);
                                     on_event(e);
+                                    if fwd.needs_cleanup(proto, port) {
+                                        pending.insert(
+                                            key,
+                                            (
+                                                PendingOp::Remove,
+                                                Instant::now() + delay,
+                                                attempts + 1,
+                                            ),
+                                        );
+                                    }
                                 }
                                 None => {}
                             }
@@ -1932,7 +1959,11 @@ mod tests {
             Event::Transient(TCP, 8081, _)
         ));
         tx.send(PortChange::Remove(TCP, 8081, 1)).unwrap();
-        // The remove completes with no listener to close, and cancels the retry.
+        // The remove cancels the retry and clears the add's reported error.
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RefusedCleared(TCP, 8081)
+        );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveDone(TCP, 8081, 1)
