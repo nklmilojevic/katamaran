@@ -337,6 +337,10 @@ struct GuestWriterState {
     post_exit: bool,
     finish: bool,
     closed: bool,
+    /// Write end of the pump abort pipe; dropped whenever `closed` becomes
+    /// `true` so every output pump wakes immediately via `POLLHUP` and closes
+    /// its pipe/PTY master descriptor on host disconnect.
+    abort_w: Option<OwnedFd>,
 }
 
 /// Nonblocking single-owner writer for all guest-to-host frames (`Stdout`,
@@ -363,20 +367,24 @@ impl GuestWriter {
         host_disconnected: Arc<AtomicBool>,
         disconnect_w: OwnedFd,
         backpressure_probe: Duration,
-    ) -> io::Result<(Arc<Self>, OwnedFd, thread::JoinHandle<()>)> {
-        Self::start_with_window(
+    ) -> io::Result<(Arc<Self>, OwnedFd, OwnedFd, thread::JoinHandle<()>)> {
+        let (abort_r, abort_w) = pipe_nonblock()?;
+        let (writer, ctrl_space_r, handle) = Self::start_with_window(
             stream,
             host_disconnected,
             disconnect_w,
+            abort_w,
             backpressure_probe,
             0,
-        )
+        )?;
+        Ok((writer, ctrl_space_r, abort_r, handle))
     }
 
     fn start_with_window(
         stream: UnixStream,
         host_disconnected: Arc<AtomicBool>,
         disconnect_w: OwnedFd,
+        abort_w: OwnedFd,
         backpressure_probe: Duration,
         output_window: u32,
     ) -> io::Result<(Arc<Self>, OwnedFd, thread::JoinHandle<()>)> {
@@ -394,6 +402,7 @@ impl GuestWriter {
         let writer = Arc::new(Self {
             state: Mutex::new(GuestWriterState {
                 windows,
+                abort_w: Some(abort_w),
                 ..GuestWriterState::default()
             }),
             cv: Condvar::new(),
@@ -576,6 +585,7 @@ impl GuestWriter {
         st.queues[0].clear();
         st.queues[1].clear();
         st.final_frame = None;
+        st.abort_w.take();
         self.cv.notify_all();
         drop(st);
         notify_wake(&self.wake_w);
@@ -757,6 +767,7 @@ fn guest_writer_worker(
         st.queues[0].clear();
         st.queues[1].clear();
         st.final_frame = None;
+        st.abort_w.take();
         writer.cv.notify_all();
         drop(st);
         notify_wake(&disconnect_w);
@@ -769,9 +780,11 @@ enum ChildHandle {
     Pty {
         target: ChildTarget,
         pgrp: PgrpTarget,
-        /// Dup of the PTY master, used to find the terminal's foreground
-        /// process group for out-of-band signals.
-        tty: OwnedFd,
+        /// Dup of the PTY master, used to deliver terminal signals (`TIOCSIG`)
+        /// to the foreground process group via the kernel's `struct pid *`
+        /// reference. Dropped immediately on host disconnect so `pty_close`
+        /// hangs up the slave without waiting for `DISCONNECT_GRACE`.
+        tty: Option<OwnedFd>,
     },
     /// Non-PTY process group leader spawned with `setpgid(0, 0)`, guarded by
     /// a token-pinned [`PgrpTarget`] inside [`Reaper`].
@@ -787,15 +800,25 @@ impl ChildHandle {
                     let _ = reaper.signal_pgrp_target(*pgrp, sig);
                     return;
                 }
-                // Like a terminal: deliver to the foreground process group
-                // (e.g. `sleep` under a non-interactive `bash -c`, or a job
-                // an interactive shell put in its own group), never outside
-                // this session.
-                let fg = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
-                if fg == pgrp.id() {
+                // For terminal job-control signals, use Linux `TIOCSIG` on the
+                // PTY master: the kernel delivers directly to the foreground
+                // process group's `struct pid *`, working even when a pipeline
+                // leader has exited (where `getsid(fg)` returns `ESRCH`) and
+                // with zero PID-reuse race.
+                if matches!(sig, libc::SIGINT | libc::SIGQUIT | libc::SIGTSTP)
+                    && let Some(tty) = tty.as_ref()
+                    && unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } > 0
+                    && unsafe {
+                        libc::ioctl(tty.as_raw_fd(), libc::TIOCSIG as _, sig as libc::c_int)
+                    } == 0
+                {
+                    return;
+                }
+                if tty
+                    .as_ref()
+                    .is_some_and(|t| unsafe { libc::tcgetpgrp(t.as_raw_fd()) } == pgrp.id())
+                {
                     let _ = reaper.signal_pgrp_target(*pgrp, sig);
-                } else if fg > 0 && unsafe { libc::getsid(fg) } == pgrp.id() {
-                    unsafe { libc::kill(-fg, sig) };
                 } else {
                     reaper.signal_target(target, sig);
                 }
@@ -811,6 +834,16 @@ fn signal_handle(reaper: &Reaper, handle: &Mutex<Option<ChildHandle>>, sig: i32)
     let guard = handle.lock().unwrap();
     if let Some(h) = guard.as_ref() {
         h.signal(reaper, sig);
+    }
+}
+
+/// Drop the PTY master dup held by [`ChildHandle::Pty`] on host disconnect so
+/// all master descriptors close immediately and Linux `pty_close` hangs up the
+/// slave (delivering EOF/EIO and `SIGHUP` to the foreground process group).
+fn close_pty_master(handle: &Mutex<Option<ChildHandle>>) {
+    let mut guard = handle.lock().unwrap();
+    if let Some(ChildHandle::Pty { tty, .. }) = guard.as_mut() {
+        tty.take();
     }
 }
 
@@ -1649,9 +1682,12 @@ fn stdin_worker(
 
     if disconnected {
         host_disconnected.store(true, Ordering::Release);
-        // Unblock writer_thread and any output pumps immediately before
+        // Unblock writer_thread and every output pump immediately (dropping
+        // each pump's pipe/PTY master dup), and release the handle's own PTY
+        // master dup so the kernel hangs up the slave right away before
         // running the disconnect grace period.
         writer.abort();
+        close_pty_master(&handle);
         // If the leader already exited (`post_exit`), `exec_with_timeouts`
         // performs post-exit cgroup descendant cleanup once pumps join.
         if !post_exit {
@@ -1702,6 +1738,7 @@ fn enter_post_exit(stdin_cancel_w: &OwnedFd, writer: &GuestWriter) {
 fn pump(
     from: OwnedFd,
     wake_r: OwnedFd,
+    abort_r: OwnedFd,
     writer: Arc<GuestWriter>,
     stream: OutputStream,
     post_exit_idle: Duration,
@@ -1786,12 +1823,17 @@ fn pump(
                 revents: 0,
             },
             libc::pollfd {
+                fd: abort_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
                 fd: wake_r.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
         ];
-        let nfds = if child_exited { 1 } else { 2 };
+        let nfds = if child_exited { 2 } else { 3 };
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms) };
         if rc < 0 {
             let e = io::Error::last_os_error();
@@ -1807,7 +1849,10 @@ fn pump(
             }
             return Ok(());
         }
-        if !child_exited && pfds[1].revents != 0 {
+        if pfds[1].revents != 0 {
+            return Ok(());
+        }
+        if !child_exited && pfds[2].revents != 0 {
             child_exited = true;
             idle_deadline = on_leader_exit(&mut exit_backlog);
         }
@@ -2256,6 +2301,7 @@ fn exec_with_timeouts(
     // after spawn.
     let (stdin_cancel_r, stdin_cancel_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
     let (disconnect_r, disconnect_w) = pipe_nonblock().map_err(|e| format!("pipe: {e}"))?;
+    let (pump_abort_r, pump_abort_w) = pipe_nonblock().map_err(|e| format!("pipe: {e}"))?;
     let (cgroup, procs_fd) = match cgroup_mode {
         CgroupMode::Required(parent) => {
             let (cg, pfd) =
@@ -2305,11 +2351,21 @@ fn exec_with_timeouts(
                 }
             };
             (
-                ChildHandle::Pty { target, pgrp, tty },
+                ChildHandle::Pty {
+                    target,
+                    pgrp,
+                    tty: Some(tty),
+                },
                 exited,
                 Some(stdin),
                 Some(master),
-                vec![(out, out_wake_r, out_wake_w, OutputStream::Stdout)],
+                vec![(
+                    out,
+                    out_wake_r,
+                    out_wake_w,
+                    pump_abort_r,
+                    OutputStream::Stdout,
+                )],
             )
         }
         None => {
@@ -2321,6 +2377,9 @@ fn exec_with_timeouts(
             set_nonblocking(&err_r).map_err(|e| format!("stderr nonblocking: {e}"))?;
             let (out_wake_r, out_wake_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
             let (err_wake_r, err_wake_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
+            let err_abort_r = pump_abort_r
+                .try_clone()
+                .map_err(|e| format!("abort pipe dup: {e}"))?;
             let spawn_spec = UnlockedSpawnSpec {
                 program: built.program,
                 args: built.args,
@@ -2348,8 +2407,20 @@ fn exec_with_timeouts(
                 Some(in_w),
                 None,
                 vec![
-                    (out_r, out_wake_r, out_wake_w, OutputStream::Stdout),
-                    (err_r, err_wake_r, err_wake_w, OutputStream::Stderr),
+                    (
+                        out_r,
+                        out_wake_r,
+                        out_wake_w,
+                        pump_abort_r,
+                        OutputStream::Stdout,
+                    ),
+                    (
+                        err_r,
+                        err_wake_r,
+                        err_wake_w,
+                        err_abort_r,
+                        OutputStream::Stderr,
+                    ),
                 ],
             )
         }
@@ -2391,6 +2462,7 @@ fn exec_with_timeouts(
         conn,
         host_disconnected.clone(),
         disconnect_w,
+        pump_abort_w,
         backpressure_probe,
         output_window,
     ) {
@@ -2451,12 +2523,12 @@ fn exec_with_timeouts(
 
     let mut outputs = Vec::with_capacity(out_specs.len());
     let mut out_wakes = Vec::with_capacity(out_specs.len());
-    for (out, wake_r, wake_w, stream) in out_specs {
+    for (out, wake_r, wake_w, abort_r, stream) in out_specs {
         let w2 = writer.clone();
         let disc = host_disconnected.clone();
         match thread::Builder::new()
             .name("vm-exec-out".into())
-            .spawn(move || pump(out, wake_r, w2, stream, post_exit_idle, disc))
+            .spawn(move || pump(out, wake_r, abort_r, w2, stream, post_exit_idle, disc))
         {
             Ok(h) => {
                 outputs.push(h);
@@ -3020,7 +3092,7 @@ mod tests {
         shrink_pair(&host, &guest, 8192);
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, _ctrl_space_r, writer_thread) =
+        let (writer, _ctrl_space_r, abort_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let payload = vec![b'A'; 48 << 10];
@@ -3032,6 +3104,7 @@ mod tests {
             pump(
                 r,
                 wake_r,
+                abort_r,
                 writer_clone,
                 OutputStream::Stdout,
                 Duration::from_millis(50),
@@ -3087,7 +3160,7 @@ mod tests {
         shrink_pair(&host, &guest, 4096);
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, _ctrl_space_r, writer_thread) =
+        let (writer, _ctrl_space_r, abort_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let writer_clone = writer.clone();
@@ -3095,6 +3168,7 @@ mod tests {
             pump(
                 r,
                 wake_r,
+                abort_r,
                 writer_clone,
                 OutputStream::Stdout,
                 Duration::from_millis(80),
@@ -3161,7 +3235,7 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, _ctrl_space_r, writer_thread) =
+        let (writer, _ctrl_space_r, abort_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let mut wf = std::fs::File::from(w_pipe);
@@ -3174,6 +3248,7 @@ mod tests {
             pump(
                 r,
                 wake_r,
+                abort_r,
                 writer_clone,
                 OutputStream::Stdout,
                 Duration::from_millis(80),
@@ -3200,7 +3275,7 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, _ctrl_space_r, writer_thread) =
+        let (writer, _ctrl_space_r, abort_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
         let stop_spam = Arc::new(AtomicBool::new(false));
         let stop_spam_w = stop_spam.clone();
@@ -3221,6 +3296,7 @@ mod tests {
             pump(
                 r,
                 wake_r,
+                abort_r,
                 writer_clone,
                 OutputStream::Stdout,
                 Duration::from_millis(80),
@@ -3485,7 +3561,7 @@ mod tests {
         let (host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, _ctrl_space_r, writer_thread) =
+        let (writer, _ctrl_space_r, _abort_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(40)).unwrap();
 
         // Simulate leader exit handing disconnect monitoring to the writer
@@ -3504,7 +3580,7 @@ mod tests {
         let (_host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, _ctrl_space_r, writer_thread) =
+        let (writer, _ctrl_space_r, _abort_r, writer_thread) =
             GuestWriter::start(guest, disc, disc_w, Duration::from_millis(50)).unwrap();
 
         // Enqueue far more SignalAck frames than GUEST_CTRL_QUEUE_CAP while
@@ -3779,6 +3855,151 @@ mod tests {
         assert!(text.contains("TRAPPED") && text.contains("DONE"), "{text}");
         assert_eq!(code, 0);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn pty_signal_reaches_foreground_pipeline_after_pgrp_leader_exits() {
+        let reaper = Reaper::shared_for_tests();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                None,
+                &active_sessions,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+        // With job control (`-m`), the pipeline runs in its own foreground
+        // pgrp led by `true`. Once `true` exits, `getsid(fg)` returns ESRCH
+        // even though `sleep 30` is still alive in `fg`; `TIOCSIG` must still
+        // interrupt `sleep 30` promptly.
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-m".into(),
+                    "-c".into(),
+                    "true | { echo PIPEREADY; sleep 30; }".into(),
+                ],
+                tty: Some(Tty {
+                    term: "xterm".into(),
+                    rows: 24,
+                    cols: 80,
+                }),
+                output_window: 0,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        while !out.windows(9).any(|w| w == b"PIPEREADY") {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => out.extend_from_slice(&d),
+                Some(VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+        let t = Instant::now();
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Signal {
+                signal: libc::SIGINT,
+            },
+        )
+        .unwrap();
+        let code = loop {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => out.extend_from_slice(&d),
+                Some(VmExecMsg::Exit { code }) => break code,
+                Some(VmExecMsg::SignalAck | VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        };
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "SIGINT never reached foreground pipeline after pgrp leader exited"
+        );
+        assert_ne!(code, 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pty_disconnect_closes_master_immediately_even_when_child_ignores_sighup() {
+        let reaper = Reaper::shared_for_tests();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let grace = Duration::from_secs(5);
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                None,
+                &active_sessions,
+                Duration::from_secs(2),
+                grace,
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+        // The child ignores SIGHUP and blocks reading from the PTY slave.
+        // Disconnecting the host must close EVERY PTY master dup immediately
+        // (including `ChildHandle::Pty.tty` and `pump`'s `from`) so `read`
+        // gets EOF/EIO right away instead of waiting 5 s for `SIGKILL`.
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap '' HUP; echo READY; read _; exit 0".into(),
+                ],
+                tty: Some(Tty {
+                    term: "xterm".into(),
+                    rows: 24,
+                    cols: 80,
+                }),
+                output_window: 0,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        while !out.windows(5).any(|w| w == b"READY") {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => out.extend_from_slice(&d),
+                Some(VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        let t = Instant::now();
+        drop(host);
+        server.join().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "PTY master stayed open until disconnect grace expired ({:?})",
+            t.elapsed()
+        );
     }
 
     #[test]

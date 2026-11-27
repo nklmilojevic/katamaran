@@ -382,6 +382,32 @@ fn verify_host_pty_shell_and_resize(home: &Path) {
     }
 }
 
+/// Reset `signals` to `SIG_DFL` and unblock them in a spawned child so
+/// signal-forwarding tests do not depend on the parent shell's dispositions
+/// (e.g., POSIX non-interactive background shells set `SIGINT` to `SIG_IGN`,
+/// which `kat vm exec` intentionally respects).
+fn reset_signals_in_child(cmd: &mut Command, signals: &'static [libc::c_int]) {
+    unsafe {
+        cmd.pre_exec(move || {
+            let mut unblock: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut unblock);
+            for &sig in signals {
+                libc::sigaddset(&mut unblock, sig);
+                let mut dfl: libc::sigaction = std::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut dfl.sa_mask);
+                if libc::sigaction(sig, &dfl, std::ptr::null_mut()) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut()) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Exercise non-PTY `SIGINT` forwarding: the guest traps `INT` and `HUP`
 /// differently and must receive `SIGINT`, not a disconnect-induced `SIGHUP`.
 fn verify_non_pty_sigint_forwarding(home: &Path) {
@@ -398,6 +424,7 @@ fn verify_non_pty_sigint_forwarding(home: &Path) {
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+    reset_signals_in_child(&mut cmd, &[libc::SIGINT]);
     let mut child = ChildGuard::new(cmd.spawn().expect("spawn kat vm exec for sigint"));
 
     let mut stdout_pipe = child.as_mut().stdout.take().unwrap();
@@ -781,6 +808,7 @@ fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
         .stdin(Stdio::from(in_r_child))
         .stdout(Stdio::from(out_w_child))
         .stderr(Stdio::from(err_w_child));
+    reset_signals_in_child(&mut cmd, &[libc::SIGTERM]);
     let mut child = ChildGuard::new(cmd.spawn().expect("spawn katamaran vm exec"));
 
     // Wait for `READY\n` so we know run_session_io has entered its relay loop.

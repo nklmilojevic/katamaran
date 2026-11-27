@@ -1541,7 +1541,7 @@ impl OutputRelays {
                     continue;
                 }
                 let base = 1 + 3 * i;
-                if pfds[base + 2].revents != 0
+                if (pfds[base + 2].revents & libc::POLLIN) != 0
                     && let Some(p) = chans[i].progress_fd()
                 {
                     drain_wake(p);
@@ -1753,12 +1753,25 @@ fn is_tty(fd: RawFd) -> bool {
 /// Self-pipe write fd used by the async-signal-safe `sigaction` handler.
 static SIGNAL_PIPE_FD: AtomicI32 = AtomicI32::new(-1);
 
+#[cfg(target_os = "macos")]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
 extern "C" fn signal_handler(sig: libc::c_int) {
     let fd = SIGNAL_PIPE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let b = sig as u8;
         unsafe {
+            let err_p = errno_ptr();
+            let saved = *err_p;
             let _ = libc::write(fd, (&b as *const u8).cast(), 1);
+            *err_p = saved;
         }
     }
 }
@@ -2197,7 +2210,10 @@ fn wait_for_ready_socket(
                                     saw_closed = true;
                                     last_no_socket = None;
                                 }
-                                Probe::TimedOut => last_no_socket = None,
+                                Probe::TimedOut => {
+                                    last_no_socket = None;
+                                    saw_closed = false;
+                                }
                             }
                         }
                         VmState::Starting | VmState::Stopping => {}
@@ -2215,6 +2231,8 @@ fn wait_for_ready_socket(
                 }
             }
             Probe::TimedOut => {
+                last_no_socket = None;
+                saw_closed = false;
                 if let Some(s) = poll_status()? {
                     if matches!(s.state, VmState::Error | VmState::Stopped) {
                         bail!("the VM did not start: {}", s.error.unwrap_or_default());
@@ -2258,26 +2276,16 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
     let mut c = crate::cli::ensure_daemon()?;
     let s = c.status()?;
     match s.state {
-        VmState::Running => match probe_ready(&path, Instant::now() + HANDSHAKE_TIMEOUT) {
-            Probe::Ready(conn) => {
-                let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
-                return Ok((conn, token, path));
-            }
-            Probe::Failed(e) => return Err(e),
-            Probe::NoSocket(_) => bail!(
-                "VM shell service is not available on the running VM ({}); run `kat restart` to upgrade",
-                path.display()
-            ),
+        VmState::Running => {
             // A VM that is already running gets only the short handshake
-            // bound: a guest whose exec listener is down must fail fast, not
-            // after the full boot timeout.
-            Probe::ClosedBeforeReady | Probe::TimedOut => {
-                let conn =
-                    wait_for_ready_socket(&path, Instant::now() + HANDSHAKE_TIMEOUT, || Ok(None))?;
-                let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
-                return Ok((conn, token, path));
-            }
-        },
+            // bound (and keeps polling daemon status so a stop/crash fails
+            // fast and a missing socket reports `kat restart` immediately).
+            let conn = wait_for_ready_socket(&path, Instant::now() + HANDSHAKE_TIMEOUT, || {
+                c.status().map(Some)
+            })?;
+            let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
+            return Ok((conn, token, path));
+        }
         VmState::Stopped | VmState::Error => {
             eprintln!("katamaran: starting the VM");
             c.call(&Call::Start)?;
@@ -3696,6 +3704,62 @@ mod tests {
     /// Serializes unit tests that install process-wide signal handlers.
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Holds [`SIGNAL_TEST_LOCK`] and temporarily resets `SIGINT`/`SIGTERM` to
+    /// `SIG_DFL` (and unblocks them on this thread) so signal tests work even
+    /// when `cargo test` is launched from a non-interactive background shell
+    /// (where POSIX sets `SIGINT` to `SIG_IGN`). Restores prior dispositions
+    /// and mask on drop.
+    struct SignalTestGuard {
+        saved: Vec<(libc::c_int, libc::sigaction)>,
+        prev_mask: libc::sigset_t,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SignalTestGuard {
+        fn lock() -> Self {
+            let lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut prev_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let mut unblock: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut unblock);
+                for sig in [libc::SIGINT, libc::SIGTERM] {
+                    libc::sigaddset(&mut unblock, sig);
+                }
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, &mut prev_mask);
+            }
+            let mut saved = Vec::with_capacity(2);
+            for sig in [libc::SIGINT, libc::SIGTERM] {
+                let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+                let mut dfl: libc::sigaction = unsafe { std::mem::zeroed() };
+                dfl.sa_sigaction = libc::SIG_DFL;
+                unsafe {
+                    libc::sigemptyset(&mut dfl.sa_mask);
+                    if libc::sigaction(sig, &dfl, &mut old) == 0 {
+                        saved.push((sig, old));
+                    }
+                }
+            }
+            Self {
+                saved,
+                prev_mask,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for SignalTestGuard {
+        fn drop(&mut self) {
+            for &(sig, ref old) in &self.saved {
+                unsafe {
+                    let _ = libc::sigaction(sig, old, std::ptr::null_mut());
+                }
+            }
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.prev_mask, std::ptr::null_mut());
+            }
+        }
+    }
+
     #[derive(Parser)]
     struct Cli {
         #[command(subcommand)]
@@ -4114,7 +4178,7 @@ mod tests {
 
     #[test]
     fn host_pty_restores_termios_on_sigterm_under_socket_backpressure() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (master, slave) = open_test_pty(24, 80);
 
         let mut before: libc::termios = unsafe { std::mem::zeroed() };
@@ -4215,7 +4279,7 @@ mod tests {
 
     #[test]
     fn host_pty_restores_termios_on_sigterm_with_full_stdout_pipe() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (master, slave) = open_test_pty(24, 80);
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -4300,7 +4364,7 @@ mod tests {
 
     #[test]
     fn shared_stdin_and_output_fd_stays_blocking_during_session() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (master, slave) = open_test_pty(24, 80);
         let slave_dup = slave.try_clone().unwrap();
         assert_eq!(
@@ -4380,7 +4444,7 @@ mod tests {
 
     #[test]
     fn non_pty_forwards_sigint_without_closing_session() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let dir = test_dir("oob-sigint");
         let ctrl_sock = dir.join("ctrl.sock");
         let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
@@ -4442,7 +4506,7 @@ mod tests {
 
     #[test]
     fn non_pty_sigint_times_out_when_buffered_locally_without_guest_ack() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let dir = test_dir("oob-timeout");
         let ctrl_sock = dir.join("ctrl.sock");
         let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
@@ -4494,7 +4558,7 @@ mod tests {
 
     #[test]
     fn non_pty_sigterm_cancels_and_restores_output_and_stdin_flags() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -4574,7 +4638,7 @@ mod tests {
 
     #[test]
     fn stdin_worker_exits_promptly_when_shared_stdin_is_drained_and_keeps_stdin_blocking() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let dup_r = stdin_r.try_clone().unwrap();
         assert_eq!(
@@ -4654,7 +4718,7 @@ mod tests {
 
     #[test]
     fn non_pty_oob_sigint_succeeds_when_both_stdin_and_stdout_are_stalled() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let dir = test_dir("oob-bidir-ok");
         let ctrl_sock = dir.join("ctrl.sock");
         let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
@@ -4763,7 +4827,7 @@ mod tests {
 
     #[test]
     fn non_pty_oob_sigint_aborts_when_both_sinks_stalled_and_guest_never_acks() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let dir = test_dir("oob-bidir-abort");
         let ctrl_sock = dir.join("ctrl.sock");
         let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
@@ -4843,7 +4907,7 @@ mod tests {
 
     #[test]
     fn non_pty_second_sigint_cancels_even_when_host_stdout_is_blocked() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let dir = test_dir("oob-second-sigint");
         let ctrl_sock = dir.join("ctrl.sock");
         let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
@@ -4918,7 +4982,7 @@ mod tests {
 
     #[test]
     fn non_pty_sigint_aborts_cleanly_when_stdin_is_backpressured() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let dir = test_dir("oob-stdin-bp");
         let ctrl_sock = dir.join("ctrl.sock");
         let ctrl_listener = UnixListener::bind(&ctrl_sock).unwrap();
@@ -4981,7 +5045,7 @@ mod tests {
 
     #[test]
     fn broken_pipe_shuts_down_socket_and_joins_backpressured_stdin_worker() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (host, mut guest) = UnixStream::pair().unwrap();
         shrink_socket_pair(&host, &guest, 4096);
@@ -5059,7 +5123,7 @@ mod tests {
 
     #[test]
     fn resize_watcher_compares_first_check_against_initial_spec_size() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (master, slave) = open_test_pty(40, 120);
         let (host, mut guest) = UnixStream::pair().unwrap();
         let slave_fd = slave.as_raw_fd();
@@ -5112,7 +5176,7 @@ mod tests {
 
     #[test]
     fn merged_stdout_and_stderr_preserve_frame_order_across_distinct_fds() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (merged_r, out_w) = pipe_cloexec(false).unwrap();
         // Distinct descriptor number pointing to the exact same pipe writer (2>&1).
@@ -5182,7 +5246,7 @@ mod tests {
 
     #[test]
     fn broken_downstream_pipe_wakes_idle_session_without_further_guest_frames() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -5238,7 +5302,7 @@ mod tests {
 
     #[test]
     fn guest_exit_141_drains_buffered_output_to_slow_reader() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -5301,7 +5365,7 @@ mod tests {
 
     #[test]
     fn guest_disconnect_flushes_received_output_before_returning_error() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (_err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -5363,7 +5427,7 @@ mod tests {
 
     #[test]
     fn independent_stderr_flows_while_stdout_pipe_is_blocked() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -5481,7 +5545,7 @@ mod tests {
 
     #[test]
     fn split_drain_aborts_blocked_peer_on_epipe_and_preserves_nonzero_exit() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         for (guest_code, expected) in [(42, 42), (0, 128 + libc::SIGPIPE)] {
             let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
             let (out_r, out_w) = pipe_cloexec(false).unwrap();
@@ -5554,7 +5618,7 @@ mod tests {
 
     #[test]
     fn nonzero_guest_exit_is_preserved_when_drain_hits_epipe() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         for (guest_code, expected) in [(42, 42), (0, 128 + libc::SIGPIPE)] {
             let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
             let (out_r, out_w) = pipe_cloexec(false).unwrap();
@@ -5644,7 +5708,7 @@ mod tests {
     }
 
     fn split_drain_after_stdout_epipe(chunks: usize, read_size: usize, pause: Duration) {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -5728,7 +5792,7 @@ mod tests {
 
     #[test]
     fn windowed_split_reads_stderr_past_host_queue_cap_and_returns_stdout_credit() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -6068,7 +6132,7 @@ mod tests {
 
     #[test]
     fn mid_session_stdout_epipe_still_delivers_received_stderr() {
-        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SignalTestGuard::lock();
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
         let (err_r, err_w) = pipe_cloexec(false).unwrap();
@@ -6129,6 +6193,57 @@ mod tests {
         assert_eq!(got.len(), chunk * chunks, "stderr lost after stdout EPIPE");
         drop(stdin_w);
         drop(stdin_r);
+    }
+
+    #[test]
+    fn signal_guard_preserves_ignored_sigint_from_background_job() {
+        let _lock = SignalTestGuard::lock();
+        let mut ign: libc::sigaction = unsafe { std::mem::zeroed() };
+        ign.sa_sigaction = libc::SIG_IGN;
+        unsafe {
+            libc::sigemptyset(&mut ign.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGINT, &ign, std::ptr::null_mut()), 0);
+        }
+        let (_guard, _sig_r) = SignalGuard::install(&[libc::SIGINT]).unwrap();
+        let mut cur: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut cur) },
+            0
+        );
+        assert_eq!(cur.sa_sigaction, libc::SIG_IGN);
+    }
+
+    #[test]
+    fn wait_for_ready_socket_reports_timeout_not_stale_no_socket() {
+        let dir = test_dir("stale-nosock");
+        let sock = dir.join("vm-exec.sock");
+        let sock_bg = sock.clone();
+        // First probe sees NoSocket (socket not yet bound); shortly after,
+        // the socket is bound by a silent listener so subsequent probes time
+        // out. The final error must report timeout, not the stale NoSocket.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            let listener = UnixListener::bind(&sock_bg).unwrap();
+            let _accepted = listener.accept().ok();
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+        });
+        let err = wait_for_ready_socket(&sock, Instant::now() + Duration::from_millis(350), || {
+            Ok(Some(dummy_status(
+                VmState::Starting,
+                DockerState::Starting,
+                None,
+            )))
+        })
+        .unwrap_err();
+        let _ = done_tx.send(());
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out waiting for the VM shell service"),
+            "expected timeout message, got: {msg}"
+        );
     }
 
     struct SharedVec(Arc<Mutex<Vec<u8>>>);
