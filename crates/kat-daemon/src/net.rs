@@ -398,7 +398,12 @@ impl ForwardApi for GvproxyApi {
             r#"{{"local":"127.0.0.1:{port}","protocol":"{}"}}"#,
             proto.as_str()
         );
-        post(&self.socket, "/services/forwarder/unexpose", &body)
+        // gvproxy reports "proxy not found" when the listener is already gone,
+        // e.g. a retry after the reply to a successful unexpose was lost.
+        match post(&self.socket, "/services/forwarder/unexpose", &body) {
+            Err(e) if is_proxy_not_found(&e) => Ok(()),
+            other => other,
+        }
     }
 }
 
@@ -759,10 +764,12 @@ pub enum Event {
     CapacityWait(PortProto, u16, String),
     Removed(PortProto, u16),
     RemoveFailed(PortProto, u16, String),
-    /// A remove found no listener for the port (never forwarded, or its add
-    /// was still being retried). Like `Removed` and `RefusedCleared`, it tells
-    /// the session the published side no longer holds the port.
-    RemoveNoop(PortProto, u16),
+    /// The worker finished handling `PortChange::Remove` number `.2` for the
+    /// port: emitted exactly once per remove, after its other events, whether
+    /// it closed a listener, found none, gave up after retries, or was
+    /// superseded by a later change for the same port. The session matches it
+    /// against the latest remove it sent to know the published side is done.
+    RemoveDone(PortProto, u16, u64),
 }
 
 impl<A: ForwardApi> Forwards<A> {
@@ -888,7 +895,9 @@ impl<A: ForwardApi> Forwards<A> {
 
 pub enum PortChange {
     Add(PortProto, u16),
-    Remove(PortProto, u16),
+    /// Remove the port; `.2` is a caller-chosen sequence number echoed back
+    /// in [`Event::RemoveDone`].
+    Remove(PortProto, u16, u64),
 }
 
 enum WorkerMsg {
@@ -942,7 +951,8 @@ const MAX_TRANSIENT_RETRIES: u32 = 30;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingOp {
     Add,
-    Remove,
+    /// A remove being retried, with its [`PortChange::Remove`] sequence number.
+    Remove(u64),
 }
 
 /// Apply guest port changes on a worker thread, so a slow gvproxy call never
@@ -992,7 +1002,9 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                 match got {
                     Ok(WorkerMsg::Change(PortChange::Add(proto, port))) => {
                         let key = (proto, port);
-                        pending.remove(&key);
+                        if let Some((PendingOp::Remove(seq), ..)) = pending.remove(&key) {
+                            on_event(Event::RemoveDone(proto, port, seq));
+                        }
                         capacity_wait.retain(|&k| k != key);
                         match fwd.add(proto, port) {
                             Some(e @ Event::Transient(..)) => {
@@ -1013,9 +1025,11 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             None => {}
                         }
                     }
-                    Ok(WorkerMsg::Change(PortChange::Remove(proto, port))) => {
+                    Ok(WorkerMsg::Change(PortChange::Remove(proto, port, seq))) => {
                         let key = (proto, port);
-                        pending.remove(&key);
+                        if let Some((PendingOp::Remove(old), ..)) = pending.remove(&key) {
+                            on_event(Event::RemoveDone(proto, port, old));
+                        }
                         let before = capacity_wait.len();
                         capacity_wait.retain(|&k| k != key);
                         let was_waiting = capacity_wait.len() != before;
@@ -1024,7 +1038,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e @ Event::RemoveFailed(..)) => {
                                 pending.insert(
                                     key,
-                                    (PendingOp::Remove, Instant::now() + retry_base, 1),
+                                    (PendingOp::Remove(seq), Instant::now() + retry_base, 1),
                                 );
                                 report(&e, &label);
                                 on_event(e);
@@ -1032,11 +1046,13 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e) => {
                                 report(&e, &label);
                                 on_event(e);
+                                on_event(Event::RemoveDone(proto, port, seq));
                             }
                             None if was_waiting => {
                                 on_event(Event::RefusedCleared(proto, port));
+                                on_event(Event::RemoveDone(proto, port, seq));
                             }
-                            None => on_event(Event::RemoveNoop(proto, port)),
+                            None => on_event(Event::RemoveDone(proto, port, seq)),
                         }
                     }
                     Ok(WorkerMsg::CapacityAvailable) => {
@@ -1112,7 +1128,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             }
                             None => {}
                         },
-                        PendingOp::Remove => {
+                        PendingOp::Remove(seq) => {
                             let label = fwd.port_label(proto, port);
                             match fwd.remove(proto, port) {
                                 Some(e @ Event::RemoveFailed(..)) => {
@@ -1120,7 +1136,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                         pending.insert(
                                             key,
                                             (
-                                                PendingOp::Remove,
+                                                PendingOp::Remove(seq),
                                                 Instant::now() + delay,
                                                 attempts + 1,
                                             ),
@@ -1128,13 +1144,15 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     } else {
                                         report(&e, &label);
                                         on_event(e);
+                                        on_event(Event::RemoveDone(proto, port, seq));
                                     }
                                 }
                                 Some(e) => {
                                     report(&e, &label);
                                     on_event(e);
+                                    on_event(Event::RemoveDone(proto, port, seq));
                                 }
-                                None => {}
+                                None => on_event(Event::RemoveDone(proto, port, seq)),
                             }
                         }
                     }
@@ -1162,7 +1180,7 @@ fn report(e: &Event, addrs: &str) {
             "katamaran: cannot forward {addrs}:{port}/{} ({why}); skipped",
             proto.as_str()
         ),
-        Event::RefusedCleared(..) | Event::RemoveNoop(..) => {}
+        Event::RefusedCleared(..) | Event::RemoveDone(..) => {}
         Event::Transient(proto, port, why) => eprintln!(
             "katamaran: transient error forwarding {addrs}:{port}/{} ({why})",
             proto.as_str()
@@ -1869,11 +1887,11 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Transient(TCP, 8081, _)
         ));
-        tx.send(PortChange::Remove(TCP, 8081)).unwrap();
+        tx.send(PortChange::Remove(TCP, 8081, 1)).unwrap();
         // The remove completes with no listener to close, and cancels the retry.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveNoop(TCP, 8081)
+            Event::RemoveDone(TCP, 8081, 1)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1923,7 +1941,7 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Forwarded(TCP, 9100, vec![Ipv4Addr::LOCALHOST])
         );
-        tx.send(PortChange::Remove(TCP, 9100)).unwrap();
+        tx.send(PortChange::Remove(TCP, 9100, 1)).unwrap();
         assert!(matches!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveFailed(TCP, 9100, _)
@@ -1932,6 +1950,12 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Removed(TCP, 9100)
         );
+        // The retried remove completes exactly once.
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, 9100, 1)
+        );
+        assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 2);
         drop(tx);
 
@@ -1954,15 +1978,36 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Forwarded(TCP, 9101, vec![Ipv4Addr::LOCALHOST])
         );
-        tx.send(PortChange::Remove(TCP, 9101)).unwrap();
+        tx.send(PortChange::Remove(TCP, 9101, 1)).unwrap();
         assert!(matches!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveFailed(TCP, 9101, _)
         ));
         tx.send(PortChange::Add(TCP, 9101)).unwrap();
+        // The superseded remove still completes, exactly once.
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, 9101, 1)
+        );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 1);
         drop(tx);
+    }
+
+    #[test]
+    fn direct_unexpose_treats_proxy_not_found_as_removed() {
+        let dir = std::env::temp_dir().join(format!("kat-gv-notfound-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+        let mut api = GvproxyApi {
+            socket: fake.api_sock.clone(),
+            guest: GUEST,
+        };
+        // gvproxy already closed the listener (e.g. the first reply was lost).
+        assert_eq!(api.unexpose(TCP, 18_080), Ok(()));
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2413,6 +2458,9 @@ mod tests {
         assert!(again.to_string().contains("already running"), "{again}");
         api.unexpose(TCP, port).unwrap();
         assert_port_rebindable(port);
+        // A retried unexpose after a lost reply finds no proxy; that is a
+        // completed removal, not an error.
+        api.unexpose(TCP, port).unwrap();
 
         // Privileged port (< 1024): exposes unprivileged on macOS via lo0-scoped wildcard.
         let (low, ()) = try_test_low_port(|candidate| api.expose(TCP, candidate));
@@ -2634,7 +2682,7 @@ mod tests {
         // Queue additional operations behind the in-flight call.
         fwd.send(PortChange::Add(TCP, 8002)).unwrap();
         fwd.send(PortChange::Add(TCP, 8003)).unwrap();
-        fwd.send(PortChange::Remove(TCP, 8001)).unwrap();
+        fwd.send(PortChange::Remove(TCP, 8001, 1)).unwrap();
 
         let shutdown_flag = fwd.shutdown.clone();
         let dropper = thread::spawn(move || drop(fwd));
@@ -3071,7 +3119,7 @@ mod tests {
 
         fake.fail_next_unexpose_before_remove
             .store(true, Ordering::SeqCst);
-        worker.send(PortChange::Remove(TCP, busy2_port)).unwrap();
+        worker.send(PortChange::Remove(TCP, busy2_port, 1)).unwrap();
         assert!(matches!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveFailed(TCP, p, _) if p == busy2_port
@@ -3520,18 +3568,26 @@ mod tests {
             Event::CapacityWait(TCP, p, _) if p == p4
         ));
         // Guest cancels p4 before capacity returns.
-        worker.send(PortChange::Remove(TCP, p4)).unwrap();
+        worker.send(PortChange::Remove(TCP, p4, 1)).unwrap();
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RefusedCleared(TCP, p4)
         );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, p4, 1)
+        );
 
         // Removing p1 releases 3 descriptors and automatically forwards p3
         // without any second PortChange::Add from the guest.
-        worker.send(PortChange::Remove(TCP, p1)).unwrap();
+        worker.send(PortChange::Remove(TCP, p1, 2)).unwrap();
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Removed(TCP, p1)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, p1, 2)
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -3542,10 +3598,14 @@ mod tests {
 
         // Cross-forwarder release: an automatic listener sharing the same
         // RelayBudget frees a slot and wakes the published worker for p5.
-        worker.send(PortChange::Remove(TCP, p2)).unwrap();
+        worker.send(PortChange::Remove(TCP, p2, 3)).unwrap();
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::Removed(TCP, p2)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, p2, 3)
         );
         let mut auto = crate::autofwd::AutoForwards::with_limits_and_budget(
             crate::autofwd::Upstream::PerPort(dir.clone()),
@@ -3734,8 +3794,23 @@ mod tests {
         s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let _ = s.write_all(b"lan-probe");
         let _ = s.shutdown(std::net::Shutdown::Write);
+        // The filter closes the accepted connection: EOF or a reset. A timeout
+        // means the connection stayed open, which is not a rejection.
         let mut resp = Vec::new();
-        let _ = s.read_to_end(&mut resp);
+        match s.read_to_end(&mut resp) {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(e) => panic!(
+                "non-loopback source {src} to {dst}:{port} was not dropped: {e} ({:?})",
+                e.kind()
+            ),
+        }
         assert!(
             resp.is_empty(),
             "non-loopback source {src} unexpectedly received {resp:?} from {dst}:{port}"
