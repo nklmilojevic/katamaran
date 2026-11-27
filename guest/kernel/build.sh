@@ -170,6 +170,9 @@ true
 [ "$missing" = 0 ] || { echo "config check failed" >&2; exit 1; }
 echo ">> config check passed"
 
+# Drop the stamp before anything can replace the Image, so an interrupted build never leaves a
+# new Image paired with the previous inputs' stamp.
+rm -f /out/Image.stamp
 echo ">> building Image ($(nproc) jobs)"
 ccache -z >/dev/null
 start=$(date +%s)

@@ -73,6 +73,21 @@ THREE_HDR = (
     b"\r\n"
 )
 FULL_CHUNKS = 48
+TWO_WRITE = 2048
+_two_hdr = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: XXXX\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
+# Two separate 2 KiB writes (header + body start, then the body rest): both
+# far below the sender's MSS, so Nagle holds the second until the first is
+# ACKed. Repeating it settles the receiver's adaptive rcv_mss at 2 KiB.
+TWO_BODY = 2 * TWO_WRITE - len(_two_hdr)
+TWO_HDR = _two_hdr.replace(b"XXXX", str(TWO_BODY).encode())
+assert len(TWO_HDR) == len(_two_hdr)
+TWO_FIRST = TWO_HDR + b"w" * (TWO_WRITE - len(TWO_HDR))
+TWO_SECOND = b"w" * TWO_WRITE
 # Linux SIOCOUTQ (== TIOCOUTQ): bytes not yet ACKed by the peer (unsent + in
 # flight). SIOCOUTQNSD: bytes not yet sent.
 SIOCOUTQ = termios.TIOCOUTQ
@@ -131,6 +146,9 @@ def handle(conn):
                 conn.sendall(THREE_MID)
                 wait_outq_empty(conn, SIOCOUTQNSD, "three-write middle chunk to be sent")
                 conn.sendall(THREE_TAIL)
+            elif req_hdr.startswith(b"GET /two2k "):
+                conn.sendall(TWO_FIRST)
+                conn.sendall(TWO_SECOND)
             elif req_hdr.startswith(b"GET /fullmss "):
                 # Full-sized PSH segments (exactly one MSS per write) paced
                 # 12 ms apart: longer than the shortened delayed-ACK cap, shorter
@@ -173,9 +191,11 @@ while True:
 /// `fullmss` for 48 exactly-one-MSS PSH segments paced 12 ms apart, or
 /// `rcvlowat <N>` to set `SO_RCVLOWAT` and gate reads on `select.poll()`),
 /// and prints two space-separated floats flushed after each workload command.
-/// Passing an optional count on argv runs a single burst and exits.
+/// Passing an optional count on argv runs a single burst and exits; adding
+/// `two2k` instead warms a fresh connection with repeated two-write 2 KiB
+/// responses and then times `<count>` of them under `SO_RCVLOWAT=3072`.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
-import select, socket, sys, time
+import os, select, socket, sys, time
 
 host = sys.argv[1]
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
@@ -184,6 +204,7 @@ bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 pushed_req = b"GET /pushed HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+two2k_req = b"GET /two2k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 fullmss_req = b"GET /fullmss HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
 def tcp_out_segs():
@@ -244,7 +265,7 @@ cur_lowat = 1
 use_poll = False
 buf = b""
 
-def run_burst(count, req_bytes=req):
+def run_burst(count, req_bytes=req, body_len=10240):
     global buf
     times_ms = []
     t_all = time.monotonic()
@@ -262,8 +283,8 @@ def run_burst(count, req_bytes=req):
             buf += chunk
         hdr, buf = buf.split(b"\r\n\r\n", 1)
         assert b"200 OK" in hdr, hdr
-        body, buf = recv_exact(sock, 10240, buf)
-        assert len(body) == 10240
+        body, buf = recv_exact(sock, body_len, buf)
+        assert len(body) == body_len
         times_ms.append((time.monotonic() - t0) * 1000.0)
     total_ms = (time.monotonic() - t_all) * 1000.0
     times_ms.sort()
@@ -296,7 +317,24 @@ def run_stream(req_bytes, expected_len):
     after = tcp_out_segs()
     print(f"{after - before} {elapsed_ms:.3f}", flush=True)
 
-if len(sys.argv) > 2:
+def set_lowat(n):
+    global cur_lowat, use_poll
+    cur_lowat = n
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
+    use_poll = cur_lowat > 1
+
+if len(sys.argv) > 3 and sys.argv[3] == "two2k":
+    # Fresh connection: warm it with repeated two-write 2 KiB responses (rcv_mss
+    # settles at 2 KiB, pingpong mode, quickack budget spent), then measure them
+    # with SO_RCVLOWAT=3072 so the first write alone cannot wake poll().
+    two_body = 2 * 2048 - len(b"HTTP/1.1 200 OK\r\nContent-Length: XXXX\r\nConnection: keep-alive\r\n\r\n")
+    with open(os.devnull, "w") as devnull:
+        stdout, sys.stdout = sys.stdout, devnull
+        run_burst(30, two2k_req, two_body)
+        sys.stdout = stdout
+    set_lowat(3072)
+    run_burst(int(sys.argv[2]), two2k_req, two_body)
+elif len(sys.argv) > 2:
     run_burst(int(sys.argv[2]))
 else:
     for line in sys.stdin:
@@ -316,9 +354,7 @@ else:
         elif line.startswith("three "):
             run_burst(int(line.split()[1]), three_req)
         elif line.startswith("rcvlowat "):
-            cur_lowat = int(line.split()[1])
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
-            use_poll = cur_lowat > 1
+            set_lowat(int(line.split()[1]))
             print(f"{cur_lowat} 0.000", flush=True)
         else:
             run_burst(int(line))
@@ -1142,10 +1178,42 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "SO_RCVLOWAT=4096 three-write hit stock delayed-ACK stall with quickack=Y (p50={three_on_p50:.2}ms total={three_on_total:.2}ms)"
     );
 
-    // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments): only
-    // short pushed segments take the SO_RCVLOWAT override (the repeated 60000B
-    // size becomes rcv_mss after the first), and !after(rcv_wup, copied_seq)
-    // limits it to one immediate ACK per unread batch.
+    // Repeated two-write 2 KiB responses on a fresh connection whose adaptive
+    // rcv_mss settles at 2 KiB, polled with SO_RCVLOWAT=3072: the first write
+    // is still a short push (judged against the advertised MSS, not rcv_mss),
+    // so it is ACKed early and Nagle releases the second write.
+    let two2k = |what: &str| -> (f64, f64) {
+        let out = ok(
+            &kubectl(
+                &kubeconfig,
+                &[
+                    "exec",
+                    "qa-probe",
+                    "--",
+                    "python3",
+                    "-c",
+                    KEEP_ALIVE_CLIENT_PY,
+                    &peer_ip,
+                    "15",
+                    "two2k",
+                ],
+            ),
+            what,
+        );
+        parse_latencies(&out, what)
+    };
+    let (two_on_p50, two_on_total) = two2k("SO_RCVLOWAT=3072 two-write 2KiB (quickack=Y)");
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=3072 two-write 2KiB keep-alive (quickack=Y): p50={two_on_p50:.2}ms total={two_on_total:.2}ms"
+    );
+    assert!(
+        two_on_p50 < 15.0,
+        "SO_RCVLOWAT=3072 two-write 2KiB stalled with quickack=Y (p50={two_on_p50:.2}ms total={two_on_total:.2}ms)"
+    );
+
+    // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments):
+    // 60000B segments exceed the 16 KiB short-push ceiling, so the SO_RCVLOWAT
+    // override stays out and stock pacing applies (compared with quickack=N).
     send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144");
     let (pushed_acks_on, pushed_ms_on) = median_of_3(
         &mut send_cmd,
@@ -1218,6 +1286,15 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         assert!(
             three_off_p50 >= 35.0,
             "expected SO_RCVLOWAT=4096 three-write stall with quickack=0 (got p50={three_off_p50:.2}ms total={three_off_total:.2}ms)"
+        );
+
+        let (two_off_p50, two_off_total) = two2k("SO_RCVLOWAT=3072 two-write 2KiB (quickack=N)");
+        eprintln!(
+            "pod-to-pod SO_RCVLOWAT=3072 two-write 2KiB keep-alive (quickack=N): p50={two_off_p50:.2}ms total={two_off_total:.2}ms"
+        );
+        assert!(
+            two_off_p50 >= 25.0,
+            "expected SO_RCVLOWAT=3072 two-write 2KiB stall with quickack=0 (got p50={two_off_p50:.2}ms total={two_off_total:.2}ms)"
         );
 
         send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144 (quickack=N)");

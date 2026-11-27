@@ -35,10 +35,12 @@ __tcp_cleanup_rbuf() when userspace drains a small or PSH-terminated
 segment (ICSK_ACK_PUSHED && !sk_rmem_alloc) on an eligible non-uplink
 socket with READ_ONCE(kat_quickack_enabled), and handle the matching
 SO_RCVLOWAT case in __tcp_ack_snd_check() when a short pushed segment
-(sub-MSS and not a repeated stable size, recorded as kat_short_push in
-tcp_measure_rcv_mss(); full-sized PSH segments keep stock delayed-ACK
-batching and timers) leaves in-order data queued below sk_rcvlowat and
-tcp_epollin_ready() is false: send an
+(a PSH segment whose payload is below both 16 KiB and the advertised MSS
+minus negotiated TCP options, recorded as kat_short_push in
+tcp_measure_rcv_mss() independently of the adaptive rcv_mss estimate;
+full-sized PSH segments keep stock delayed-ACK batching and timers) leaves
+in-order data queued below sk_rcvlowat and tcp_epollin_ready() is false:
+send an
 immediate ACK if the previous cumulative ACK has not already covered
 unread data (!after(tp->rcv_wup, tp->copied_seq)), and otherwise let
 stock ACK checks run while capping any armed delayed-ACK timer to a
@@ -89,7 +91,7 @@ diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_soc
 -				  unused:3;
 +				  kat_quick_ack:1, /* eligible local container/bridge dst  */
 +				  kat_from_uplink:1, /* last rx segment came via virtio_net */
-+				  kat_short_push:1; /* last rx data segment was short	   */
++				  kat_short_push:1; /* last rx data: short PSH write	   */
  		__u32		  lrcvtime;	 /* timestamp of last received data packet */
  		__u16		  last_seg_size; /* Size of last incoming segment	   */
  		__u16		  rcv_mss;	 /* MSS used for delayed ACK decisions	   */
@@ -203,27 +205,43 @@ diff -ruN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -231,6 +231,7 @@
- 	unsigned int len;
- 
- 	icsk->icsk_ack.last_seg_size = 0;
-+	icsk->icsk_ack.kat_short_push = 0;
- 
- 	/* skb->len may jitter because of SACKs, even if peer
+@@ -224,6 +224,27 @@
+ /* Adapt the MSS value used to make delayed ack decision to the
+  * real world.
+  */
++/* Largest payload of a PSH segment that kat_short_push treats as the end of
++ * a short application write (headers, small bodies) whose remainder the
++ * peer's Nagle may be holding. Full-sized segments are judged against the
++ * MSS we advertised minus negotiated TCP options, not the adaptive rcv_mss
++ * estimate: repeated small writes can settle rcv_mss at their own size, yet
++ * still be sub-MSS for the sender, while paced full-MSS segments never
++ * qualify and keep stock delayed-ACK batching.
++ */
++#define KAT_SHORT_PUSH_MAX	16384U
++
++static bool kat_is_short_push(const struct sock *sk, const struct sk_buff *skb,
++			      unsigned int seg_len)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	unsigned int opts = tp->tcp_header_len - sizeof(struct tcphdr);
++	unsigned int full = tp->advmss > opts ? tp->advmss - opts : tp->advmss;
++
++	return (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_PSH) &&
++	       seg_len < min_t(unsigned int, full, KAT_SHORT_PUSH_MAX);
++}
++
+ static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+@@ -236,6 +257,7 @@
  	 * sends good full-sized frames.
-@@ -305,6 +306,11 @@
- 		if (icsk->icsk_ack.pending & ICSK_ACK_PUSHED)
- 			icsk->icsk_ack.pending |= ICSK_ACK_PUSHED2;
- 		icsk->icsk_ack.pending |= ICSK_ACK_PUSHED;
-+		/* Short segment (below rcv_mss and not a repeated stable
-+		 * size): the end of a sub-MSS write Nagle may hold the
-+		 * rest of. Full-sized PSH segments leave this clear.
-+		 */
-+		icsk->icsk_ack.kat_short_push = 1;
- 	}
- }
- 
-@@ -1017,6 +1023,7 @@
+ 	 */
+ 	len = skb_shinfo(skb)->gso_size ? : skb->len;
++	icsk->icsk_ack.kat_short_push = kat_is_short_push(sk, skb, len);
+ 	if (len >= icsk->icsk_ack.rcv_mss) {
+ 		/* Note: divides are still a bit expensive.
+ 		 * For the moment, only adjust scaling_ratio
+@@ -1017,6 +1039,7 @@
  		}
  	}
  	icsk->icsk_ack.lrcvtime = now;
@@ -231,28 +249,28 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -5926,7 +5933,20 @@
+@@ -5926,8 +5949,20 @@
  static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
 +	bool kat_lowat_pushed;
  	unsigned long rtt, delay;
-+
-+	/* Only a short pushed segment (see tcp_measure_rcv_mss()) can be a
+ 
++	/* Only a short pushed segment (see kat_is_short_push()) can be a
 +	 * sub-MSS write the peer's Nagle is waiting on; full-sized PSH
 +	 * segments keep stock delayed-ACK batching and timers.
 +	 */
-+	kat_lowat_pushed = (inet_csk(sk)->icsk_ack.pending & ICSK_ACK_PUSHED) &&
-+			   inet_csk(sk)->icsk_ack.kat_short_push &&
++	kat_lowat_pushed = inet_csk(sk)->icsk_ack.kat_short_push &&
 +			   sk->sk_rcvlowat > 1 &&
 +			   after(tp->rcv_nxt, tp->copied_seq) &&
 +			   (int)(tp->rcv_nxt - tp->copied_seq) < sk->sk_rcvlowat &&
 +			   !tcp_epollin_ready(sk, sk->sk_rcvlowat) &&
 +			   kat_sk_wants_quickack(sk);
- 
++
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
-@@ -5940,7 +5960,12 @@
+ 	     /* ... and right edge of window advances far enough.
+@@ -5940,7 +5975,12 @@
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
@@ -266,7 +284,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		/* If we are running from __release_sock() in user context,
  		 * Defer the ack until tcp_release_cb().
  		 */
-@@ -5956,6 +5981,16 @@
+@@ -5956,6 +5996,16 @@
  
  	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
  		tcp_send_delayed_ack(sk);
@@ -283,7 +301,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		return;
  	}
  
-@@ -6543,6 +6578,7 @@
+@@ -6543,6 +6593,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {
