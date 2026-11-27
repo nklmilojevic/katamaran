@@ -104,6 +104,22 @@ fn sys_sigaction(
     Ok(())
 }
 
+/// Unblock [`PAUSE_SIGNAL`] and [`RESUME_SIGNAL`] on the calling thread.
+fn unblock_control_signals() -> io::Result<()> {
+    // SAFETY: the set is initialized by sigemptyset before use.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, PAUSE_SIGNAL);
+        libc::sigaddset(&mut set, RESUME_SIGNAL);
+        let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    Ok(())
+}
+
 fn init_signals_with(
     installed: &AtomicBool,
     read_slot: &AtomicI32,
@@ -147,6 +163,18 @@ fn init_signals_with(
         return Err(e);
     }
     if let Err(e) = set_action(RESUME_SIGNAL, &sa, None) {
+        let _ = set_action(PAUSE_SIGNAL, &old_pause, None);
+        close_pipe();
+        return Err(e);
+    }
+
+    // The supervisor blocks the control signals in its own threads so its
+    // watcher can take them, and the spawned VM process inherits that mask:
+    // with both signals blocked in every thread the handlers above could never
+    // run, so pause and resume (and `pause_on_sleep`) silently did nothing.
+    // This runs on the main thread before any other thread starts, so every
+    // later thread inherits the unblocked mask.
+    if let Err(e) = unblock_control_signals() {
         let _ = set_action(PAUSE_SIGNAL, &old_pause, None);
         close_pipe();
         return Err(e);
@@ -240,6 +268,26 @@ pub fn serve_signals(handle: VmmHandle) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_signals_unblocks_inherited_control_signals() {
+        // Simulate the mask a spawned VM process inherits from the supervisor.
+        let t = thread::spawn(|| unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, PAUSE_SIGNAL);
+            libc::sigaddset(&mut set, RESUME_SIGNAL);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            unblock_control_signals().unwrap();
+            let mut cur: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+            (
+                libc::sigismember(&cur, PAUSE_SIGNAL),
+                libc::sigismember(&cur, RESUME_SIGNAL),
+            )
+        });
+        assert_eq!(t.join().unwrap(), (0, 0));
+    }
 
     #[test]
     fn balloon_defaults_to_replace() {
