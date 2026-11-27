@@ -1441,11 +1441,37 @@ impl Daemon {
         Ok(())
     }
 
-    fn k8s_mark_version(self: &Arc<Self>, version: &str) -> Result<(), RpcError> {
+    fn k8s_mark_version(&self, version: &str) -> Result<(), RpcError> {
         crate::config::validate_k8s_version(version)
             .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
         let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
         let failed = |m: String| RpcError::new(api::FAILED, m);
+        match self.lock().state {
+            VmState::Running => {}
+            VmState::Starting => {
+                return Err(failed(
+                    "the VM is still starting; wait for it to finish starting with Kubernetes \
+                     stopped, then retry `kat k8s mark-version`"
+                        .into(),
+                ));
+            }
+            VmState::Stopping => {
+                return Err(failed(
+                    "the VM is stopping; disable Kubernetes auto-start \
+                     (`kat config set kubernetes=off`) if enabled, start the VM (`kat start`), \
+                     then retry `kat k8s mark-version`"
+                        .into(),
+                ));
+            }
+            state @ (VmState::Stopped | VmState::Error) => {
+                return Err(failed(format!(
+                    "the VM is {} — `kat k8s mark-version` requires a running VM with Kubernetes \
+                     stopped; disable Kubernetes auto-start (`kat config set kubernetes=off`) if \
+                     enabled, start the VM (`kat start`), then retry",
+                    state.as_str()
+                )));
+            }
+        }
         {
             let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(k.state.as_str(), "starting" | "running" | "stopping") {
@@ -1455,53 +1481,19 @@ impl Daemon {
                 ));
             }
         }
-        let initial_state = self.lock().state;
-        let was_stopped = !initial_state.is_active();
-        let needs_wait_docker = was_stopped || initial_state == VmState::Starting;
-        if needs_wait_docker {
-            self.k8s
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .suppress_autostart = true;
+        let mut noop = |_: &str| {};
+        match crate::k8s::request(
+            &self.home,
+            &kat_proto::k8s::K8sMsg::MarkDatastoreVersion {
+                version: version.to_string(),
+            },
+            &mut noop,
+        )
+        .map_err(|e| failed(format!("{e:#}")))?
+        {
+            kat_proto::k8s::K8sMsg::Done => {}
+            other => return Err(failed(format!("unexpected mark-version reply {other:?}"))),
         }
-        let mark_res = (|| -> Result<(), RpcError> {
-            if needs_wait_docker {
-                self.wait_for_docker_ready(was_stopped)?;
-            }
-            let mut noop = |_: &str| {};
-            match crate::k8s::request(
-                &self.home,
-                &kat_proto::k8s::K8sMsg::MarkDatastoreVersion {
-                    version: version.to_string(),
-                },
-                &mut noop,
-            )
-            .map_err(|e| failed(format!("{e:#}")))?
-            {
-                kat_proto::k8s::K8sMsg::Done => Ok(()),
-                other => Err(failed(format!("unexpected mark-version reply {other:?}"))),
-            }
-        })();
-
-        let stop_res = if was_stopped {
-            let res = self.stop(true).map_err(failed);
-            self.k8s
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .suppress_autostart = false;
-            res
-        } else {
-            if needs_wait_docker {
-                self.k8s
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .suppress_autostart = false;
-            }
-            Ok(())
-        };
-
-        mark_res?;
-        stop_res?;
         {
             let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
             if k.state == "failed" {
@@ -2229,7 +2221,28 @@ mod tests {
         let err = d.k8s_mark_version("v1.30.9+k3s1").unwrap_err();
         assert_eq!(err.code, api::INVALID_PARAMS);
 
-        // 2. Running Kubernetes cluster is rejected before contacting the guest.
+        // 2. Non-running VM states are rejected without booting or toggling auto-start suppression.
+        for (state, expected_hint) in [
+            (VmState::Stopped, "kat config set kubernetes=off"),
+            (VmState::Error, "kat start"),
+            (VmState::Starting, "still starting"),
+            (VmState::Stopping, "stopping"),
+        ] {
+            d.lock().state = state;
+            let err = d.k8s_mark_version("v1.37.2+k3s1").unwrap_err();
+            assert_eq!(err.code, api::FAILED, "state={state:?}");
+            assert!(
+                err.message.contains(expected_hint),
+                "state={state:?}: {}",
+                err.message
+            );
+            let g = d.lock();
+            assert_eq!(g.state, state, "mark-version must not mutate VM state");
+            assert!(g.run.is_none(), "mark-version must not boot the VM");
+            assert!(!d.k8s.lock().unwrap().suppress_autostart);
+        }
+
+        // 3. Running Kubernetes cluster is rejected before contacting the guest.
         {
             let mut g = d.lock();
             g.state = VmState::Running;
@@ -2240,7 +2253,7 @@ mod tests {
         assert_eq!(err.code, api::FAILED);
         assert!(err.message.contains("kat k8s stop"), "{}", err.message);
 
-        // 3. Stopped/failed cluster forwards MarkDatastoreVersion and clears stale error.
+        // 4. Stopped/failed cluster on a running VM forwards MarkDatastoreVersion and clears stale error.
         {
             let mut k = d.k8s.lock().unwrap();
             k.state = "failed".into();
@@ -2260,6 +2273,7 @@ mod tests {
         });
         d.k8s_mark_version("v1.37.2+k3s1").unwrap();
         guest.join().unwrap();
+        assert_eq!(d.lock().state, VmState::Running);
         {
             let k = d.k8s.lock().unwrap();
             assert_eq!(k.state, "stopped");

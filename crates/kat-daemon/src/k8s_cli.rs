@@ -161,7 +161,11 @@ fn reset() -> anyhow::Result<()> {
 
 fn mark_version(version: &str) -> anyhow::Result<()> {
     crate::config::validate_k8s_version(version)?;
-    let mut c = cli::ensure_daemon()?;
+    let mut c = Client::connect_default().context(
+        "`kat k8s mark-version` requires a running VM with Kubernetes stopped; \
+         disable Kubernetes auto-start (`kat config set kubernetes=off`) if enabled, \
+         start the VM (`kat start`), then retry",
+    )?;
     c.call(&Call::K8sMarkVersion {
         version: version.to_string(),
     })?;
