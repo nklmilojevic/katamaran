@@ -2760,13 +2760,17 @@ fn read_regular_dropin(path: &Path) -> Result<String, String> {
 /// any `.d/*.{yaml,yml}` drop-ins that k3s loads, before launching k3s.
 ///
 /// File selection and precedence mirror k3s `pkg/configfilearg/parser.go`
-/// (`dotDFiles` / `readConfigFile` / `toSlice`), whose logic is unchanged from
-/// v1.27 through v1.37:
+/// (`dotDFiles` / `readConfigFile` / `toSlice`) and `pkg/agent/util`
+/// `HasSuffixI`. That logic is identical in every k3s release from v1.31.0
+/// (the oldest `k8s_version` katamaran accepts) through v1.37.x, so the rules
+/// below hold for any release a user can select:
 ///
 /// - k3s loads `$K3S_CONFIG_FILE` first, then every non-directory entry of
-///   `$K3S_CONFIG_FILE.d` whose name ends in `.yaml`/`.yml` (ASCII
-///   case-insensitive), in `os.ReadDir` order: byte-wise by file name, which
-///   is what sorting the raw `OsString` names gives here. `DirEntry::IsDir`
+///   `$K3S_CONFIG_FILE.d` whose name ends in `.yaml`/`.yml`
+///   case-insensitively (Go's Unicode `strings.ToLower` maps no non-ASCII
+///   character onto `y`/`a`/`m`/`l`, so ASCII folding is equivalent), in
+///   `os.ReadDir` order: byte-wise by file name, which is what sorting the raw
+///   `OsString` names gives here. `DirEntry::IsDir`
 ///   does not follow symlinks, so a symlink to a directory is loaded (and
 ///   fails) in k3s; here it fails the regular-file check.
 /// - A plain `etcd-s3-proxy` key in a later file replaces the earlier value.
@@ -2913,6 +2917,9 @@ fn is_valid_go_userinfo(s: &str) -> bool {
                     | b';'
                     | b'='
                     | b'%'
+                    // Go's validUserinfo accepts a raw '@' (go.dev/issue/22655);
+                    // parseAuthority splits userinfo from host at the last '@'.
+                    | b'@'
             )
     })
 }
@@ -11426,6 +11433,8 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "etcd-s3-proxy: https://user:p%40ss@proxy.example.com:8443 # comment\n",
             "etcd-s3-proxy: http://user:pass@proxy%c3%a9.example.com:8080\n",
             "etcd-s3-proxy: socks5://user:pass@[::1]:1080\n",
+            // Go splits userinfo at the last '@' and accepts a raw '@' inside it.
+            "etcd-s3-proxy: http://ops@corp@proxy.example.com:8080\n",
             "etcd-s3-proxy: socks5://user:pass@[fe80::1%25eth0]:1080\n",
             "etcd-s3-proxy: socks5://user:pass@[fe80::1%25en%200]:1080\n",
             "  disable:\n    - traefik\n  etcd-s3-proxy: none\n",
@@ -11627,6 +11636,10 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 format!("etcd-s3-proxy: !!str {bad_url}\n"),
             ),
             (
+                "raw '@' in userinfo does not hide a malformed port",
+                "etcd-s3-proxy: http://ops@corp@proxy.invalid.example:badport\n".to_string(),
+            ),
+            (
                 "verbatim str tag on malformed URL",
                 format!("etcd-s3-proxy: !<tag:yaml.org,2002:str> {bad_url}\n"),
             ),
@@ -11824,10 +11837,6 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 format!("{{\"etcd-s3-proxy\": \"{bad_url}\"}}\n"),
             ),
             ("block scalar", format!("etcd-s3-proxy: |-\n  {bad_url}\n")),
-            (
-                "raw @ in password",
-                format!("etcd-s3-proxy: http://user:{secret_pw}@extra@{bad_host}:8080\n"),
-            ),
             (
                 "bad percent escape in password",
                 format!("etcd-s3-proxy: http://user:{secret_pw}%zz@{bad_host}:8080\n"),
