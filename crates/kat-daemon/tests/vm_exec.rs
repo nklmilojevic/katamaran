@@ -754,10 +754,18 @@ fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
     let mut child = ChildGuard::new(cmd.spawn().expect("spawn katamaran vm exec"));
 
     // Wait for `READY\n` so we know run_session_io has entered its relay loop
-    // and enabled O_NONBLOCK on the inherited descriptors.
+    // and enabled O_NONBLOCK on the inherited output descriptors.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut out = String::new();
     read_fd_until(out_r.as_raw_fd(), &mut out, "READY", deadline);
+
+    // Inherited stdin MUST remain blocking while the CLI is actively relaying
+    // so other readers sharing the pipe open file description never see EAGAIN.
+    assert_eq!(
+        unsafe { libc::fcntl(in_r.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        0,
+        "shared stdin pipe was switched to O_NONBLOCK during active session"
+    );
 
     let pid = child.as_mut().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);

@@ -15,8 +15,12 @@
 //!    before delivering EOF — and injects no control byte in noncanonical/raw
 //!    mode, where `DataEnd` cannot signal EOF to the guest process.
 //!    After reading a `Signal` frame and signaling the guest process group, the
-//!    guest replies with `SignalAck` so the host knows a forwarded `SIGINT`
-//!    crossed any backpressured stdin stream.
+//!    guest queues `SignalAck` ahead of newly queued output frames on the
+//!    guest-to-host stream so the host knows a forwarded `SIGINT` crossed any
+//!    backpressured stdin queue. Because `SignalAck` still follows output frames
+//!    already in flight, the host should suspend its `SignalAck` delivery
+//!    timeout while blocked writing to local stdout/stderr so slow local output
+//!    is not mistaken for failed signal delivery.
 //! 5. Guest streams `Stdout` / `Stderr`, then `Exit { code }` (or `Error`).
 
 use std::io::{self, Read, Write};

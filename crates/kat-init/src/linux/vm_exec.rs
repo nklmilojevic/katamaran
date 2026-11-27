@@ -243,6 +243,7 @@ struct GuestWriterState {
     ctrl: VecDeque<Vec<u8>>,
     queue: VecDeque<Vec<u8>>,
     probe_pending: bool,
+    post_exit: bool,
     finish: bool,
     closed: bool,
 }
@@ -252,8 +253,9 @@ struct GuestWriterState {
 ///
 /// Decoupling socket writes from `pump` threads eliminates blocking I/O under a
 /// shared mutex, lets `SignalAck` and `Pong` probes preempt queued output without
-/// blocking `stdin_worker`, and detects host disconnect immediately on `POLLOUT` /
-/// `EPIPE` even when both vsock directions are simultaneously backpressured.
+/// blocking `stdin_worker`, and periodically retries stalled nonblocking sends
+/// so Linux `AF_VSOCK` `SEND_SHUTDOWN` (`EPIPE`) is detected even when
+/// `vsock_poll()` reports neither `POLLOUT` nor `POLLHUP`.
 struct GuestWriter {
     state: Mutex<GuestWriterState>,
     cv: Condvar,
@@ -265,6 +267,7 @@ impl GuestWriter {
         stream: UnixStream,
         host_disconnected: Arc<AtomicBool>,
         disconnect_w: OwnedFd,
+        backpressure_probe: Duration,
     ) -> io::Result<(Arc<Self>, thread::JoinHandle<()>)> {
         stream.set_nonblocking(true)?;
         let (wake_r, wake_w) = pipe_nonblock()?;
@@ -277,7 +280,14 @@ impl GuestWriter {
         let handle = thread::Builder::new()
             .name("vm-exec-tx".into())
             .spawn(move || {
-                guest_writer_worker(stream, writer_bg, wake_r, host_disconnected, disconnect_w);
+                guest_writer_worker(
+                    stream,
+                    writer_bg,
+                    wake_r,
+                    host_disconnected,
+                    disconnect_w,
+                    backpressure_probe,
+                );
             })?;
         Ok((writer, handle))
     }
@@ -316,6 +326,18 @@ impl GuestWriter {
         notify_wake(&self.wake_w);
     }
 
+    /// Take over peer-disconnect monitoring (`POLLRDHUP` + periodic probes)
+    /// once `stdin_worker` has stopped after the command leader exited.
+    fn mark_post_exit(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        st.post_exit = true;
+        drop(st);
+        notify_wake(&self.wake_w);
+    }
+
     fn finish_with(&self, final_frame: Option<Vec<u8>>) {
         let mut st = self.state.lock().unwrap();
         if st.closed {
@@ -346,6 +368,7 @@ fn guest_writer_worker(
     wake_r: OwnedFd,
     host_disconnected: Arc<AtomicBool>,
     disconnect_w: OwnedFd,
+    backpressure_probe: Duration,
 ) {
     let mut out_buf: Vec<u8> = Vec::new();
     let mut out_off: usize = 0;
@@ -415,6 +438,27 @@ fn guest_writer_worker(
         }
 
         let need_write = out_off < out_buf.len();
+        let (post_exit, finishing) = {
+            let st = writer.state.lock().unwrap();
+            if st.closed {
+                return;
+            }
+            (st.post_exit, st.finish)
+        };
+        // On Linux AF_VSOCK, peer `VSOCK_FLAGS_SHUTDOWN_RCV` sets
+        // `SEND_SHUTDOWN` without raising `POLLOUT` or `POLLHUP` in
+        // `vsock_poll()`. Bound `poll` by `backpressure_probe` whenever a send
+        // is stalled (or while draining output after leader exit) so `send()`
+        // is retried directly and surfaces `EPIPE` promptly.
+        let poll_timeout_ms = if need_write || (post_exit && !finishing) {
+            backpressure_probe.as_millis().clamp(1, i32::MAX as u128) as i32
+        } else {
+            -1
+        };
+        let mut sock_events = if need_write { libc::POLLOUT } else { 0 };
+        if post_exit {
+            sock_events |= libc::POLLRDHUP;
+        }
         let mut pfds = [
             libc::pollfd {
                 fd: wake_r.as_raw_fd(),
@@ -423,11 +467,11 @@ fn guest_writer_worker(
             },
             libc::pollfd {
                 fd: stream.as_raw_fd(),
-                events: if need_write { libc::POLLOUT } else { 0 },
+                events: sock_events,
                 revents: 0,
             },
         ];
-        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, poll_timeout_ms) };
         if rc < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -435,14 +479,22 @@ fn guest_writer_worker(
             failed = true;
             break;
         }
+        if rc == 0 {
+            if !need_write && post_exit && !finishing {
+                out_buf = VmExecMsg::Pong.encode();
+                out_off = 0;
+            }
+            continue;
+        }
         if pfds[0].revents != 0 {
             drain_wake(&wake_r);
             if writer.state.lock().unwrap().closed {
                 return;
             }
         }
-        if (pfds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-            && (pfds[1].revents & libc::POLLOUT) == 0
+        if (post_exit && (pfds[1].revents & libc::POLLRDHUP) != 0)
+            || ((pfds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                && (pfds[1].revents & libc::POLLOUT) == 0)
         {
             failed = true;
             break;
@@ -1766,20 +1818,24 @@ fn exec_with_timeouts(
         }
     }
 
-    let (writer, writer_thread) =
-        match GuestWriter::start(conn, host_disconnected.clone(), disconnect_w) {
-            Ok(pair) => pair,
-            Err(e) => {
-                log(&format!("start writer thread: {e}"));
-                signal_handle(reaper, &handle, libc::SIGKILL);
-                if let Some(cg) = &cgroup {
-                    cg.kill();
-                }
-                *handle.lock().unwrap() = None;
-                let _ = exited.recv_timeout(Duration::from_secs(2));
-                return Ok(());
+    let (writer, writer_thread) = match GuestWriter::start(
+        conn,
+        host_disconnected.clone(),
+        disconnect_w,
+        backpressure_probe,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log(&format!("start writer thread: {e}"));
+            signal_handle(reaper, &handle, libc::SIGKILL);
+            if let Some(cg) = &cgroup {
+                cg.kill();
             }
-        };
+            *handle.lock().unwrap() = None;
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Ok(());
+        }
+    };
 
     let tty = spec.tty.is_some();
     let handle_in = handle.clone();
@@ -1860,10 +1916,13 @@ fn exec_with_timeouts(
 
     let status = exited.recv().unwrap_or(-1);
     // Clear the handle and wake stdin_worker via its dedicated cancel pipe so
-    // normal child exit is never confused with host disconnect.
+    // normal child exit is never confused with host disconnect. Hand off peer
+    // disconnect detection to `writer` while post-exit output drains so any
+    // disconnect during drain still cleans up surviving descendants in `cgroup`.
     *handle.lock().unwrap() = None;
     drop(stdin_cancel_w);
     let _ = stdin_thread.join();
+    writer.mark_post_exit();
 
     // Signal output pumps that the main child has exited, then join every
     // pump so buffered output is preserved across host backpressure while
@@ -1886,9 +1945,19 @@ fn exec_with_timeouts(
         }
     }
 
+    let cleanup_post_exit_descendants = |cg: &Option<Arc<SessionCgroup>>| {
+        if let Some(cg) = cg
+            && cg.is_populated()
+        {
+            cg.kill();
+            let _ = cg.wait_empty(Duration::from_millis(500));
+        }
+    };
+
     if host_disconnected.load(Ordering::Acquire) {
         writer.abort();
         let _ = writer_thread.join();
+        cleanup_post_exit_descendants(&cgroup);
         return Ok(());
     }
     let final_msg = if let Some(e) = output_err {
@@ -1900,6 +1969,9 @@ fn exec_with_timeouts(
     };
     writer.finish_with(Some(final_msg.encode()));
     let _ = writer_thread.join();
+    if host_disconnected.load(Ordering::Acquire) {
+        cleanup_post_exit_descendants(&cgroup);
+    }
     Ok(())
 }
 
@@ -2335,7 +2407,8 @@ mod tests {
         shrink_pair(&host, &guest, 8192);
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
+        let (writer, writer_thread) =
+            GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let payload = vec![b'A'; 48 << 10];
         let payload_w = payload.clone();
@@ -2395,7 +2468,8 @@ mod tests {
         shrink_pair(&host, &guest, 4096);
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
+        let (writer, writer_thread) =
+            GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let writer_clone = writer.clone();
         let pump_handle = thread::spawn(move || {
@@ -2468,7 +2542,8 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
+        let (writer, writer_thread) =
+            GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let mut wf = std::fs::File::from(w_pipe);
         wf.write_all(b"hi\n").unwrap();
@@ -2506,7 +2581,8 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) = GuestWriter::start(guest, disc.clone(), disc_w).unwrap();
+        let (writer, writer_thread) =
+            GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
         let stop_spam = Arc::new(AtomicBool::new(false));
         let stop_spam_w = stop_spam.clone();
 
@@ -2673,6 +2749,25 @@ mod tests {
             "disconnect cleanup under bidirectional backpressure took {:?}",
             t.elapsed()
         );
+        drop(host);
+    }
+
+    #[test]
+    fn post_exit_writer_detects_disconnect_during_drain() {
+        let (host, guest) = UnixStream::pair().unwrap();
+        let disc = Arc::new(AtomicBool::new(false));
+        let (_disc_r, disc_w) = pipe_nonblock().unwrap();
+        let (writer, writer_thread) =
+            GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(40)).unwrap();
+
+        // Simulate leader exit handing disconnect monitoring to the writer
+        // while output pumps are still open (before finish_with).
+        writer.mark_post_exit();
+        let t = Instant::now();
+        host.shutdown(Shutdown::Read).unwrap();
+        writer_thread.join().unwrap();
+        assert!(disc.load(Ordering::Acquire));
+        assert!(t.elapsed() < Duration::from_secs(2));
         drop(host);
     }
 
