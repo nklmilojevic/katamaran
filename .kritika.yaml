@@ -1,0 +1,80 @@
+# yaml-language-server: $schema=https://kritika.home-operations.com/kritika.schema.json
+trigger:
+  exclude:
+    - name: drafts
+      expr: pr.draft
+
+ignore:
+  - "docs/bun.lock"
+  - "docs/dist/**"
+  - "vendor/libkrun/**"
+  - "CHANGELOG.md"
+  - "THIRD_PARTY_NOTICES.md"
+
+review:
+  model: cliproxyapi/gpt-6-luna
+  fallback: openrouter/openai/gpt-6-luna
+  effort: medium
+  agents:
+    - name: kernel-vmm
+      model: cliproxyapi/gpt-6.2-sol
+      fallback: openrouter/openai/gpt-6.2-sol
+      effort: high
+      when:
+        - name: kernel-or-vmm
+          paths:
+            - "guest/kernel/**"
+            - "vendor/patches/**"
+            - "crates/kat-vmm/**"
+    - name: systems
+      model: cliproxyapi/gpt-6.2-sol
+      fallback: openrouter/openai/gpt-6-luna
+      effort: medium
+      when:
+        - name: core-systems
+          paths:
+            - "crates/kat-init/**"
+            - "crates/kat-nfs/**"
+            - "crates/kat-daemon/src/net.rs"
+            - "crates/kat-daemon/src/autofwd.rs"
+            - "crates/kat-daemon/src/daemon.rs"
+            - "crates/kat-daemon/src/vm.rs"
+            - "crates/kat-daemon/src/run.rs"
+            - "crates/kat-daemon/src/nfs.rs"
+            - "crates/kat-daemon/src/ssh.rs"
+
+confidence:
+  model: cliproxyapi/gpt-6-luna
+  fallback: openrouter/openai/gpt-6-luna
+  effort: low
+
+context:
+  - path: docs/src/content/docs/architecture.md
+    description: Host/guest architecture (kat-daemon, kat-vmm/libkrun, kat-proto, kat-init, vsock).
+  - path: docs/src/content/docs/networking.md
+    description: Host/guest networking, port forwarding, and loopback/lo0 behavior.
+    paths:
+      - "crates/kat-daemon/src/net.rs"
+      - "crates/kat-daemon/src/autofwd.rs"
+      - "crates/kat-vmm/**"
+      - "crates/kat-init/**"
+  - path: docs/src/content/docs/kubernetes.md
+    description: Embedded k3s/containerd lifecycle and amd64 emulation design.
+    paths:
+      - "crates/kat-init/**"
+      - "crates/kat-daemon/src/k8s.rs"
+      - "crates/kat-daemon/src/k8s_cli.rs"
+
+rules:
+  - id: nonblocking-io
+    paths:
+      - "crates/kat-vmm/**"
+      - "crates/kat-daemon/src/net.rs"
+      - "crates/kat-daemon/src/autofwd.rs"
+    rule: "Proxy and EventManager paths must stay non-blocking and handle WouldBlock/partial writes without deadlocking."
+  - id: syscall-safety
+    paths:
+      - "crates/kat-init/**"
+      - "crates/kat-vmm/**"
+      - "crates/kat-nfs/**"
+    rule: "Check raw syscall/libc/FFI error returns, EINTR retries, fd ownership/close on error paths, and child process reaping."
