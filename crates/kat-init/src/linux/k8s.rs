@@ -3566,13 +3566,6 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
             None => moby.iter().map(|(n, i)| (n.clone(), i.clone())).collect(),
         };
 
-        let need_probe = candidates.iter().any(|(name, img)| {
-            !name.starts_with("sha256:")
-                && !name.contains("<none>")
-                && needs_native_probe(name, img, k8s.get(name), emulation, NATIVE_ARCH)
-        });
-        let checks = need_probe.then(|| check_ctr_native_complete(reaper, "moby"));
-
         let mut retry_refs: HashSet<String> = HashSet::new();
 
         for (name, img) in candidates {
@@ -3580,15 +3573,34 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 continue;
             }
             let k8s_img = k8s.get(&name);
+            let source_probe = needs_native_probe(&name, &img, k8s_img, emulation, NATIVE_ARCH)
+                .then(|| probe_native_complete(reaper, "moby", &name, &img.digest, NATIVE_ARCH));
             let native = classify_native_availability(
                 &name,
                 &img,
                 k8s_img,
-                checks.as_ref(),
+                source_probe.as_ref(),
                 emulation,
                 NATIVE_ARCH,
             );
-            match plan_sync_action(&name, &img, k8s_img, native, emulation, NATIVE_ARCH) {
+            let dest_probe =
+                needs_dest_native_probe(&name, &img, k8s_img, native, emulation, NATIVE_ARCH).then(
+                    || {
+                        let k = k8s_img.expect("destination probe requires k8s_img");
+                        probe_native_complete(reaper, "k8s.io", &name, &k.digest, NATIVE_ARCH)
+                    },
+                );
+            let dest_native =
+                classify_dest_native_availability(k8s_img, dest_probe.as_ref(), NATIVE_ARCH);
+            match plan_sync_action(
+                &name,
+                &img,
+                k8s_img,
+                native,
+                dest_native,
+                emulation,
+                NATIVE_ARCH,
+            ) {
                 SyncAction::Skip => {}
                 SyncAction::SkipDigestAmd64 => {
                     log(&format!(
@@ -3596,9 +3608,10 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     ));
                 }
                 SyncAction::ReportProbeError => {
-                    let detail = checks
+                    let detail = source_probe
                         .as_ref()
                         .and_then(|r| r.as_ref().err())
+                        .or_else(|| dest_probe.as_ref().and_then(|r| r.as_ref().err()))
                         .map(String::as_str)
                         .unwrap_or("native platform check unavailable");
                     log(&format!("preserving existing mirror for {name}: {detail}"));
@@ -3659,8 +3672,9 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     };
                     let prepare_res = {
                         let mut store = MobyContentStore::new(
-                            GrpcMobyMeta {
+                            GrpcNamespaceMeta {
                                 client: &mut info_client,
+                                namespace: "moby",
                             },
                             |digest: &str, max_bytes: usize| {
                                 get_ctr_content_blob(reaper, "moby", digest, max_bytes)
@@ -3817,9 +3831,10 @@ enum SyncAction {
     ReportProbeError,
 }
 
-/// True when `ctr images check` is needed to tell whether `moby` actually has
-/// complete native-platform content locally (rather than merely advertising a
-/// native descriptor in a multi-platform index).
+/// True when a strict native-content probe is needed to tell whether `moby`
+/// actually has complete `linux/<native_arch>` content locally (rather than
+/// merely advertising a native descriptor in a multi-platform index, or only
+/// having 32-bit `linux/arm/*` blobs).
 fn needs_native_probe(
     _name: &str,
     moby: &CtrImage,
@@ -3837,38 +3852,84 @@ fn needs_native_probe(
     oci_rewrite::has_amd64_platform(platforms) || k8s_is_rewritten
 }
 
+/// True when a strict native-content probe on `k8s.io` is needed before
+/// deciding whether to preserve an unlabelled destination tag (an unlabelled
+/// multi-platform index can advertise `linux/arm64` in `ctr images ls` even
+/// when only its `amd64` blobs are cached locally).
+fn needs_dest_native_probe(
+    name: &str,
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    source_native: NativeAvailability,
+    emulation: bool,
+    native_arch: &str,
+) -> bool {
+    if !emulation
+        || source_native != NativeAvailability::Absent
+        || oci_rewrite::is_digest_reference(name)
+    {
+        return false;
+    }
+    let Some(moby_platforms) = moby.platforms.as_deref() else {
+        return false;
+    };
+    if !oci_rewrite::has_amd64_platform(moby_platforms) {
+        return false;
+    }
+    let Some(k) = k8s else {
+        return false;
+    };
+    if k.label(SOURCE_DIGEST_LABEL).is_some() {
+        return false;
+    }
+    k.platforms
+        .as_deref()
+        .is_some_and(|p| oci_rewrite::has_native_platform(p, native_arch))
+}
+
 fn classify_native_availability(
     name: &str,
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
-    checks: Option<&Result<HashMap<String, CtrCheck>, String>>,
+    probe: Option<&Result<NativeAvailability, String>>,
     emulation: bool,
     native_arch: &str,
 ) -> NativeAvailability {
     let Some(platforms) = moby.platforms.as_deref() else {
         return NativeAvailability::Stale;
     };
-    // `ctr images check` reports `complete` for single-manifest amd64 images
-    // even on arm64 (containerd's `images.Manifest` does not filter root
-    // manifests by platform), so require a declared native platform first.
     if !oci_rewrite::has_native_platform(platforms, native_arch) {
         return NativeAvailability::Absent;
     }
     if !needs_native_probe(name, moby, k8s, emulation, native_arch) {
         return NativeAvailability::Present;
     }
-    let Some(Ok(table)) = checks else {
-        return NativeAvailability::ProbeFailed;
+    match probe {
+        Some(Ok(avail)) => *avail,
+        Some(Err(_)) | None => NativeAvailability::ProbeFailed,
+    }
+}
+
+fn classify_dest_native_availability(
+    k8s: Option<&CtrImage>,
+    probe: Option<&Result<NativeAvailability, String>>,
+    native_arch: &str,
+) -> NativeAvailability {
+    let Some(k) = k8s else {
+        return NativeAvailability::Absent;
     };
-    match table.get(name) {
-        Some(row) if row.digest == moby.digest => {
-            if row.complete {
-                NativeAvailability::Present
-            } else {
-                NativeAvailability::Absent
-            }
-        }
-        _ => NativeAvailability::Stale,
+    if k.label(SOURCE_DIGEST_LABEL).is_some() {
+        return NativeAvailability::Absent;
+    }
+    let Some(platforms) = k.platforms.as_deref() else {
+        return NativeAvailability::Stale;
+    };
+    if !oci_rewrite::has_native_platform(platforms, native_arch) {
+        return NativeAvailability::Absent;
+    }
+    match probe {
+        Some(Ok(avail)) => *avail,
+        Some(Err(_)) | None => NativeAvailability::ProbeFailed,
     }
 }
 
@@ -3878,6 +3939,7 @@ fn plan_sync_action(
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
     native: NativeAvailability,
+    dest_native: NativeAvailability,
     emulation: bool,
     native_arch: &str,
 ) -> SyncAction {
@@ -3925,15 +3987,13 @@ fn plan_sync_action(
                         SyncAction::MirrorRewrite
                     } else {
                         // Unlabelled `k8s.io` image (e.g. pulled natively by kubelet):
-                        // preserve it whenever it already provides the native platform
-                        // so automatic sync never replaces a native Kubernetes tag with
-                        // an emulated amd64 rewrite.
-                        match k.platforms.as_deref() {
-                            None => SyncAction::Relist,
-                            Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
-                                SyncAction::Skip
-                            }
-                            Some(_) => SyncAction::MirrorRewrite,
+                        // only preserve it when local native arm64 content is verified
+                        // complete (not merely advertised in `ctr images ls`).
+                        match dest_native {
+                            NativeAvailability::Present => SyncAction::Skip,
+                            NativeAvailability::Absent => SyncAction::MirrorRewrite,
+                            NativeAvailability::Stale => SyncAction::Relist,
+                            NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
                         }
                     }
                 } else {
@@ -3956,71 +4016,42 @@ fn plan_sync_action(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CtrCheck {
-    digest: String,
-    complete: bool,
-}
-
-/// Bounded stdout cap for `ctr images ls`, `ctr images check`, and
-/// `ctr content ls -q`. Exceeding this cap returns an explicit error instead of
-/// silently truncating the inventory (which could otherwise misclassify images
-/// past the cutoff as orphaned).
+/// Bounded stdout cap for `ctr images ls` and `Images.List`. Exceeding this
+/// cap returns an explicit error instead of silently truncating the inventory
+/// (which could otherwise misclassify images past the cutoff as orphaned).
 const IMAGE_LIST_LIMIT: usize = 16 << 20;
 
-/// Returns `REF -> CtrCheck { digest, complete }` from `ctr images check`, or
-/// an error if `ctr` failed/timed out, exceeded `IMAGE_LIST_LIMIT`, or produced
-/// no status table.
-///
-/// Note: `ctr images check` exits non-zero whenever any image in the namespace
-/// lacks a native manifest (its unpack check errors on that image), while still
-/// printing the full status table to stdout, so we key on the stdout table
-/// rather than the exit status.
-fn check_ctr_native_complete(
+/// Strictly verify whether `name` in `namespace` (expected to still point to
+/// `expected_digest`) has a locally complete `linux/<native_arch>` manifest
+/// (manifest, config, and all layers present locally; never accepting 32-bit
+/// `linux/arm/*` fallbacks).
+fn probe_native_complete(
     reaper: &Reaper,
-    ns: &str,
-) -> Result<HashMap<String, CtrCheck>, String> {
-    let mut cmd = Command::new("/usr/bin/ctr");
-    cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "check"]);
-    let (_code, stdout_bytes, stderr) =
-        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), IMAGE_LIST_LIMIT)
-            .map_err(|e| format!("ctr images check ({ns}): {e}"))?;
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    parse_ctr_check(&stdout).ok_or_else(|| {
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        format!("ctr images check ({ns}) produced no status table: {detail}")
-    })
-}
-
-/// Parse `ctr images check` output (`REF TYPE DIGEST STATUS SIZE UNPACKED`)
-/// and return each image ref's digest and native completeness.
-fn parse_ctr_check(stdout: &str) -> Option<HashMap<String, CtrCheck>> {
-    let mut lines = stdout.lines();
-    let header = lines.next()?;
-    if !header.starts_with("REF") {
-        return None;
+    namespace: &str,
+    name: &str,
+    expected_digest: &str,
+    native_arch: &str,
+) -> Result<NativeAvailability, String> {
+    let mut client = containerd_grpc::ContentInfoClient::connect(
+        Path::new(CONTAINERD_SOCKET),
+        Duration::from_secs(30),
+    )?;
+    match client.image_digest(namespace, name)? {
+        Some(cur) if cur == expected_digest => {}
+        _ => return Ok(NativeAvailability::Stale),
     }
-    let mut rows = HashMap::new();
-    for line in lines {
-        let mut fields = line.split_whitespace();
-        let (Some(name), Some(_media_type), Some(digest), Some(status)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        rows.insert(
-            name.to_string(),
-            CtrCheck {
-                digest: digest.to_string(),
-                complete: status == "complete",
-            },
-        );
+    let mut store = MobyContentStore::new(
+        GrpcNamespaceMeta {
+            client: &mut client,
+            namespace,
+        },
+        |digest: &str, max_bytes: usize| get_ctr_content_blob(reaper, namespace, digest, max_bytes),
+    );
+    match oci_rewrite::has_complete_native_manifest(expected_digest, native_arch, &mut store)? {
+        oci_rewrite::NativeManifestCheck::Complete => Ok(NativeAvailability::Present),
+        oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
+        oci_rewrite::NativeManifestCheck::RootMissing => Ok(NativeAvailability::Stale),
     }
-    Some(rows)
 }
 
 /// Guarded retirement of a Katamaran-rewritten `k8s.io` image: verifies that
@@ -4071,17 +4102,18 @@ trait MobyContentMeta {
     fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String>;
 }
 
-struct GrpcMobyMeta<'a> {
+struct GrpcNamespaceMeta<'a> {
     client: &'a mut containerd_grpc::ContentInfoClient,
+    namespace: &'a str,
 }
 
-impl MobyContentMeta for GrpcMobyMeta<'_> {
+impl MobyContentMeta for GrpcNamespaceMeta<'_> {
     fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
-        self.client.blob_size("moby", digest)
+        self.client.blob_size(self.namespace, digest)
     }
 
     fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
-        self.client.batch_blob_sizes("moby", digests)
+        self.client.batch_blob_sizes(self.namespace, digests)
     }
 }
 
@@ -4651,6 +4683,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                     media_type: "application/vnd.oci.image.index.v1+json".into(),
                     digest: format!("sha256:{}", "a".repeat(64)),
                     size: 128,
+                    ..Default::default()
                 },
             },
             containerd_grpc::ContainerdImage {
@@ -4666,6 +4699,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                     media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                     digest: format!("sha256:{}", "b".repeat(64)),
                     size: 256,
+                    ..Default::default()
                 },
             },
             containerd_grpc::ContainerdImage {
@@ -4675,6 +4709,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                     media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                     digest: format!("sha256:{}", "c".repeat(64)),
                     size: 256,
+                    ..Default::default()
                 },
             },
         ];
@@ -4696,6 +4731,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                 app,
                 Some(web),
                 NativeAvailability::Absent,
+                NativeAvailability::Present,
                 false,
                 "arm64"
             ),
@@ -4719,47 +4755,10 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
     }
 
     #[test]
-    fn parse_ctr_check_retains_digest_and_completeness() {
-        let out = "\
-REF                              TYPE                                    DIGEST                                                                  STATUS            SIZE            UNPACKED
-docker.io/amd64/busybox:latest   application/vnd.oci.image.index.v1+json sha256:74f051e325bb26f6a8781ee08fa97a5950aae8af6b9b809ed79eea2749c22f3c unavailable (0/?) 0.0 B/?         false
-docker.io/library/alpine:3.22    application/vnd.oci.image.index.v1+json sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f incomplete (1/2)  627.0 B/3.9 MiB false
-docker.io/library/busybox:latest application/vnd.oci.image.index.v1+json sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4 complete (2/2)    1.8 MiB/1.8 MiB true
-";
-        let rows = parse_ctr_check(out).unwrap();
-        assert_eq!(
-            rows["docker.io/library/busybox:latest"],
-            CtrCheck {
-                digest: "sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
-                    .into(),
-                complete: true,
-            }
-        );
-        assert_eq!(
-            rows["docker.io/library/alpine:3.22"],
-            CtrCheck {
-                digest: "sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f"
-                    .into(),
-                complete: false,
-            }
-        );
-        assert!(!rows["docker.io/amd64/busybox:latest"].complete);
-        assert_eq!(parse_ctr_check(""), None);
-        assert_eq!(parse_ctr_check("ctr: connection refused\n"), None);
-    }
-
-    #[test]
     fn rewrites_complete_single_manifest_amd64_image() {
-        // Containerd's `ctr images check` reports `complete` for single-manifest
-        // amd64 images even on arm64 because `images.Manifest` does not filter
-        // root manifests by platform. Sync must still rewrite it.
         let ls_out = "\
 REF                          TYPE                                            DIGEST                                                                  SIZE     PLATFORMS   LABELS
 docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+json sha256:1111111111111111111111111111111111111111111111111111111111111111 4.0 MiB linux/amd64 -
-";
-        let check_out = "\
-REF                          TYPE                                            DIGEST                                                                  STATUS         SIZE            UNPACKED
-docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+json sha256:1111111111111111111111111111111111111111111111111111111111111111 complete (2/2) 4.0 MiB/4.0 MiB true
 ";
         let name = "docker.io/library/app:single";
         let digest = format!("sha256:{}", "1".repeat(64));
@@ -4771,16 +4770,24 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                     media_type: "application/vnd.docker.distribution.manifest.v2+json".into(),
                     digest,
                     size: 128,
+                    ..Default::default()
                 },
             }],
             &parse_ctr_platforms(ls_out),
         );
-        let checks = Ok(parse_ctr_check(check_out).unwrap());
         let img = &moby[name];
-        let native = classify_native_availability(name, img, None, Some(&checks), true, "arm64");
+        let native = classify_native_availability(name, img, None, None, true, "arm64");
         assert_eq!(native, NativeAvailability::Absent);
         assert_eq!(
-            plan_sync_action(name, img, None, native, true, "arm64"),
+            plan_sync_action(
+                name,
+                img,
+                None,
+                native,
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
             SyncAction::MirrorRewrite
         );
     }
@@ -4795,8 +4802,8 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             "linux/arm64",
             &[(SOURCE_DIGEST_LABEL, "sha256:multi")],
         );
-        let failed_probe: Result<HashMap<String, CtrCheck>, String> =
-            Err("ctr images check timed out".into());
+        let failed_probe: Result<NativeAvailability, String> =
+            Err("containerd Content.Info timed out".into());
 
         // Ambiguous multi-arch image: probe failure leaves existing mirror untouched and reports error.
         let n_multi = classify_native_availability(
@@ -4814,6 +4821,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &multi,
                 Some(&k8s_rewritten),
                 n_multi,
+                NativeAvailability::Absent,
                 true,
                 "arm64"
             ),
@@ -4830,7 +4838,15 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             "arm64",
         );
         assert_eq!(
-            plan_sync_action("app:amd", &amd64_only, None, n_amd, true, "arm64"),
+            plan_sync_action(
+                "app:amd",
+                &amd64_only,
+                None,
+                n_amd,
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
             SyncAction::MirrorRewrite
         );
         let n_arm = classify_native_availability(
@@ -4842,7 +4858,15 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             "arm64",
         );
         assert_eq!(
-            plan_sync_action("app:arm", &arm64_only, None, n_arm, true, "arm64"),
+            plan_sync_action(
+                "app:arm",
+                &arm64_only,
+                None,
+                n_arm,
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
             SyncAction::MirrorNative {
                 clear_source_label: false
             }
@@ -4852,20 +4876,125 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
     #[test]
     fn check_digest_mismatch_requests_relist() {
         let multi = ctr_img("sha256:old", "linux/amd64,linux/arm64/v8", &[]);
-        let mut table = HashMap::new();
-        table.insert(
-            "app:dev".into(),
-            CtrCheck {
-                digest: "sha256:new".into(),
-                complete: true,
-            },
+        let stale_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Stale);
+        let native = classify_native_availability(
+            "app:dev",
+            &multi,
+            None,
+            Some(&stale_probe),
+            true,
+            "arm64",
         );
-        let checks = Ok(table);
-        let native =
-            classify_native_availability("app:dev", &multi, None, Some(&checks), true, "arm64");
         assert_eq!(native, NativeAvailability::Stale);
         assert_eq!(
-            plan_sync_action("app:dev", &multi, None, native, true, "arm64"),
+            plan_sync_action(
+                "app:dev",
+                &multi,
+                None,
+                native,
+                NativeAvailability::Absent,
+                true,
+                "arm64"
+            ),
+            SyncAction::Relist
+        );
+    }
+
+    /// Regression test: an unlabelled `k8s.io` multi-platform index advertising
+    /// `linux/arm64` in `ctr images ls` MUST NOT suppress an amd64 rewrite
+    /// unless local `linux/arm64` content is verified complete in `k8s.io`.
+    /// Distinguishes incomplete arm64 (allows guarded rewrite), verified arm64
+    /// (preserves destination), probe error (preserves destination and reports
+    /// error), and stale digest (requests relist).
+    #[test]
+    fn unlabelled_destination_index_requires_verified_local_arm64_content() {
+        let moby_amd64 = ctr_img("sha256:moby-amd64", "linux/amd64", &[]);
+        let k8s_multi_index = ctr_img("sha256:k8s-multi", "linux/amd64,linux/arm64/v8", &[]);
+
+        assert!(needs_dest_native_probe(
+            "app:dev",
+            &moby_amd64,
+            Some(&k8s_multi_index),
+            NativeAvailability::Absent,
+            true,
+            "arm64"
+        ));
+
+        // 1. Only amd64 blobs cached under k8s.io's multi-arch index -> Absent -> MirrorRewrite!
+        let incomplete_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Absent);
+        let dest_incomplete = classify_dest_native_availability(
+            Some(&k8s_multi_index),
+            Some(&incomplete_probe),
+            "arm64",
+        );
+        assert_eq!(dest_incomplete, NativeAvailability::Absent);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_incomplete,
+                true,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+
+        // 2. Verified complete local arm64 content in k8s.io -> Present -> Skip (preserve!).
+        let complete_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Present);
+        let dest_complete = classify_dest_native_availability(
+            Some(&k8s_multi_index),
+            Some(&complete_probe),
+            "arm64",
+        );
+        assert_eq!(dest_complete, NativeAvailability::Present);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_complete,
+                true,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+
+        // 3. Probe error on k8s.io -> ProbeFailed -> ReportProbeError (preserve!).
+        let err_probe: Result<NativeAvailability, String> = Err("k8s.io probe failed".into());
+        let dest_err =
+            classify_dest_native_availability(Some(&k8s_multi_index), Some(&err_probe), "arm64");
+        assert_eq!(dest_err, NativeAvailability::ProbeFailed);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_err,
+                true,
+                "arm64"
+            ),
+            SyncAction::ReportProbeError
+        );
+
+        // 4. Stale / concurrently retagged k8s.io digest -> Stale -> Relist!
+        let stale_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Stale);
+        let dest_stale =
+            classify_dest_native_availability(Some(&k8s_multi_index), Some(&stale_probe), "arm64");
+        assert_eq!(dest_stale, NativeAvailability::Stale);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_stale,
+                true,
+                "arm64"
+            ),
             SyncAction::Relist
         );
     }
@@ -4902,6 +5031,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 None,
                 NativeAvailability::Absent,
+                NativeAvailability::Absent,
                 true,
                 "arm64"
             ),
@@ -4912,6 +5042,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 "app:dev",
                 &amd64_idx,
                 Some(&k8s_rewritten),
+                NativeAvailability::Absent,
                 NativeAvailability::Absent,
                 true,
                 "arm64"
@@ -4924,6 +5055,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 Some(&k8s_stale_rewritten),
                 NativeAvailability::Absent,
+                NativeAvailability::Absent,
                 true,
                 "arm64"
             ),
@@ -4931,14 +5063,15 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         );
 
         // Emulation on: preserve an existing unlabelled native Kubernetes image
-        // (e.g. pulled natively by kubelet), re-list if its platform row drifted,
-        // and still upgrade an unlabelled amd64-only tag in k8s.io.
+        // when its local arm64 content is verified complete, re-list if drifted,
+        // and rewrite an unlabelled amd64-only tag in k8s.io.
         assert_eq!(
             plan_sync_action(
                 "app:dev",
                 &amd64_idx,
                 Some(&k8s_unrelated),
                 NativeAvailability::Absent,
+                NativeAvailability::Present,
                 true,
                 "arm64"
             ),
@@ -4950,11 +5083,16 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             labels: HashMap::new(),
         };
         assert_eq!(
+            classify_dest_native_availability(Some(&k8s_unlabelled_drifted), None, "arm64"),
+            NativeAvailability::Stale
+        );
+        assert_eq!(
             plan_sync_action(
                 "app:dev",
                 &amd64_idx,
                 Some(&k8s_unlabelled_drifted),
                 NativeAvailability::Absent,
+                NativeAvailability::Stale,
                 true,
                 "arm64"
             ),
@@ -4962,10 +5100,15 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         );
         let k8s_unlabelled_amd64 = ctr_img("sha256:legacy-amd64", "linux/amd64", &[]);
         assert_eq!(
+            classify_dest_native_availability(Some(&k8s_unlabelled_amd64), None, "arm64"),
+            NativeAvailability::Absent
+        );
+        assert_eq!(
             plan_sync_action(
                 "app:dev",
                 &amd64_idx,
                 Some(&k8s_unlabelled_amd64),
+                NativeAvailability::Absent,
                 NativeAvailability::Absent,
                 true,
                 "arm64"
@@ -4982,6 +5125,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 Some(&k8s_rewritten),
                 NativeAvailability::Absent,
+                NativeAvailability::Absent,
                 false,
                 "arm64"
             ),
@@ -4993,6 +5137,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 Some(&k8s_unrelated),
                 NativeAvailability::Absent,
+                NativeAvailability::Present,
                 false,
                 "arm64"
             ),
@@ -5003,6 +5148,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 "app:dev",
                 &amd64_idx,
                 None,
+                NativeAvailability::Absent,
                 NativeAvailability::Absent,
                 false,
                 "arm64"
@@ -5018,6 +5164,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 Some(&k8s_rewritten),
                 NativeAvailability::Present,
+                NativeAvailability::Absent,
                 false,
                 "arm64"
             ),
@@ -5035,6 +5182,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 None,
                 NativeAvailability::Absent,
+                NativeAvailability::Absent,
                 true,
                 "arm64"
             ),
@@ -5045,6 +5193,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 digest_ref,
                 &amd64_idx,
                 Some(&k8s_rewritten),
+                NativeAvailability::Absent,
                 NativeAvailability::Absent,
                 true,
                 "arm64"
@@ -5057,6 +5206,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &amd64_idx,
                 None,
                 NativeAvailability::Present,
+                NativeAvailability::Absent,
                 true,
                 "arm64"
             ),
@@ -5065,26 +5215,11 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             }
         );
 
-        // Mixed 32-bit ARM + amd64 tag with NO arm64 variant: even if
-        // `ctr images check` reports `complete` (due to containerd's arm/v7
-        // matcher), Katamaran's arm64 guest kernel disables CONFIG_COMPAT, so
-        // sync must rewrite amd64 instead of taking the native path.
+        // Mixed 32-bit ARM + amd64 tag with NO arm64 variant: Katamaran's arm64
+        // guest kernel disables CONFIG_COMPAT, so sync must rewrite amd64.
         let arm32_and_amd64 = ctr_img("sha256:mixed", "linux/arm/v7,linux/amd64", &[]);
-        let mixed_checks = Ok(HashMap::from([(
-            "app:mixed".to_string(),
-            CtrCheck {
-                digest: "sha256:mixed".into(),
-                complete: true,
-            },
-        )]));
-        let native_mixed = classify_native_availability(
-            "app:mixed",
-            &arm32_and_amd64,
-            None,
-            Some(&mixed_checks),
-            true,
-            "arm64",
-        );
+        let native_mixed =
+            classify_native_availability("app:mixed", &arm32_and_amd64, None, None, true, "arm64");
         assert_eq!(native_mixed, NativeAvailability::Absent);
         assert_eq!(
             plan_sync_action(
@@ -5092,6 +5227,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 &arm32_and_amd64,
                 None,
                 native_mixed,
+                NativeAvailability::Absent,
                 true,
                 "arm64"
             ),

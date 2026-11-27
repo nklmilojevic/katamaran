@@ -82,6 +82,7 @@ pub struct Descriptor {
     pub media_type: String,
     pub digest: String,
     pub size: i64,
+    pub annotations: HashMap<String, String>,
 }
 
 /// Structured image record (`containerd.services.images.v1.Image`).
@@ -261,6 +262,15 @@ impl ContentInfoClient {
         }
         Ok(out)
     }
+
+    /// Look up the current target digest of `name` in `namespace` via
+    /// `Images.Get`, returning `Ok(None)` when absent.
+    pub fn image_digest(&mut self, namespace: &str, name: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .conn
+            .get_image(namespace, name)?
+            .map(|img| img.target.digest))
+    }
 }
 
 /// Call containerd's `/containerd.services.images.v1.Images/Delete` RPC in
@@ -405,7 +415,8 @@ pub fn publish_rewritten_image(
         .create_lease("k8s.io", &[(LEASE_EXPIRE_LABEL, &expire)])
         .map_err(PublishError::Failed)?;
 
-    let publish_res = publish_under_lease(
+    let mut restore_candidate: Option<ContainerdImage> = None;
+    let mut publish_res = publish_under_lease(
         &mut conn,
         name,
         source_digest_label,
@@ -413,7 +424,24 @@ pub fn publish_rewritten_image(
         plan,
         &unique_layers,
         &lease_id,
+        &mut restore_candidate,
     );
+
+    // If replacing an existing destination failed after `Images.Delete` was
+    // attempted (or its outcome was uncertain), drop the possibly broken/expired
+    // publish connection and recover BEFORE deleting the lease (which pins the
+    // old target content) using a fresh bounded connection and create-only
+    // `Images.Create` when the tag is absent.
+    if let Some(old_image) = restore_candidate {
+        drop(conn);
+        if let Err(restore_err) =
+            restore_deleted_image_and_cleanup_lease(socket_path, "k8s.io", &lease_id, &old_image)
+            && let Err(PublishError::Failed(ref mut msg)) = publish_res
+        {
+            msg.push_str(&format!("; failed to restore previous tag: {restore_err}"));
+        }
+        return publish_res;
+    }
 
     // Best-effort lease cleanup: try on the active connection first, falling
     // back to a fresh bounded dial if the connection broke mid-publish.
@@ -427,6 +455,36 @@ pub fn publish_rewritten_image(
     publish_res
 }
 
+fn restore_deleted_image_and_cleanup_lease(
+    socket_path: &Path,
+    namespace: &str,
+    lease_id: &str,
+    old_image: &ContainerdImage,
+) -> Result<(), String> {
+    let mut recovery_conn =
+        GrpcConn::connect(socket_path, Instant::now() + Duration::from_secs(5))?;
+    let restore_res = match recovery_conn.get_image(namespace, &old_image.name) {
+        Ok(Some(_)) => {
+            // Either the delete never committed, the replacement actually
+            // landed, or a competing writer created a new tag — leave it alone.
+            Ok(())
+        }
+        Ok(None) => match recovery_conn.create_image(namespace, Some(lease_id), old_image) {
+            Ok(CreateOutcome::Created | CreateOutcome::AlreadyExists) => Ok(()),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    if recovery_conn.delete_lease(namespace, lease_id).is_err()
+        && let Ok(mut cleanup_conn) =
+            GrpcConn::connect(socket_path, Instant::now() + Duration::from_secs(2))
+    {
+        let _ = cleanup_conn.delete_lease(namespace, lease_id);
+    }
+    restore_res
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_under_lease(
     conn: &mut GrpcConn,
     name: &str,
@@ -435,6 +493,7 @@ fn publish_under_lease(
     plan: &RewritePlan,
     unique_layers: &[(&str, i64)],
     lease_id: &str,
+    restore_candidate: &mut Option<ContainerdImage>,
 ) -> Result<Rewritten, PublishError> {
     // 4. Zero-copy link every existing layer blob into `k8s.io`.
     for (idx, &(digest, size)) in unique_layers.iter().enumerate() {
@@ -522,6 +581,7 @@ fn publish_under_lease(
             media_type: plan.manifest_media_type.clone(),
             digest: manifest_digest.clone(),
             size: manifest_size,
+            annotations: HashMap::new(),
         },
     };
     match expected_k8s_digest {
@@ -538,7 +598,7 @@ fn publish_under_lease(
             }
         },
         Some(expected_k8s) => {
-            match conn
+            let old_image = match conn
                 .get_image("k8s.io", name)
                 .map_err(PublishError::Failed)?
             {
@@ -564,8 +624,24 @@ fn publish_under_lease(
                         actual: "<deleted>".into(),
                     });
                 }
-                Some(_) => {}
-            }
+                Some(cur) => cur,
+            };
+
+            // Pin the existing image's target content under `lease_id` before
+            // deleting so containerd GC cannot collect it if replacement
+            // creation fails and recovery needs to restore `old_image`.
+            conn.add_lease_resource("k8s.io", lease_id, &old_image.target.digest, "content")
+                .map_err(|e| {
+                    PublishError::Failed(format!(
+                        "pin existing target {} under lease: {e}",
+                        old_image.target.digest
+                    ))
+                })?;
+
+            // Record `old_image` BEFORE sending `Images.Delete` so recovery
+            // runs even if `Images.Delete`'s outcome is uncertain (e.g.
+            // connection drop or deadline expiry mid-RPC).
+            *restore_candidate = Some(old_image);
 
             // Atomic BoltDB compare-and-delete on `expected_k8s`, followed by
             // `Images.Create` under `lease_id`.
@@ -575,6 +651,7 @@ fn publish_under_lease(
             {
                 DeleteOutcome::Deleted => {}
                 DeleteOutcome::NotFoundOrChanged => {
+                    *restore_candidate = None;
                     return Err(PublishError::DestinationChanged {
                         expected: expected_k8s.to_string(),
                         actual: "<changed>".into(),
@@ -585,8 +662,11 @@ fn publish_under_lease(
                 .create_image("k8s.io", Some(lease_id), &image)
                 .map_err(PublishError::Failed)?
             {
-                CreateOutcome::Created => {}
+                CreateOutcome::Created => {
+                    *restore_candidate = None;
+                }
                 CreateOutcome::AlreadyExists => {
+                    *restore_candidate = None;
                     return Err(PublishError::DestinationChanged {
                         expected: expected_k8s.to_string(),
                         actual: "<exists>".into(),
@@ -1098,6 +1178,30 @@ impl GrpcConn {
         }
     }
 
+    fn add_lease_resource(
+        &mut self,
+        namespace: &str,
+        lease_id: &str,
+        resource_id: &str,
+        resource_type: &str,
+    ) -> Result<(), String> {
+        let req = encode_add_lease_resource_request(lease_id, resource_id, resource_type);
+        let resp = self.unary_rpc(
+            "/containerd.services.leases.v1.Leases/AddResource",
+            namespace,
+            None,
+            &req,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK | GRPC_ALREADY_EXISTS => Ok(()),
+            code => Err(format!(
+                "containerd Leases.AddResource {resource_type}/{resource_id} ({namespace}) failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
+    }
+
     fn delete_lease(&mut self, namespace: &str, id: &str) -> Result<(), String> {
         let mut req = Vec::with_capacity(id.len() + 4);
         encode_proto_bytes(&mut req, 1, id.as_bytes());
@@ -1514,6 +1618,11 @@ fn encode_descriptor(desc: &Descriptor) -> Vec<u8> {
     if desc.size != 0 {
         encode_proto_varint(&mut out, 3, desc.size as u64);
     }
+    let mut annotations: Vec<(&String, &String)> = desc.annotations.iter().collect();
+    annotations.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in annotations {
+        encode_proto_map_entry(&mut out, 5, k, v);
+    }
     out
 }
 
@@ -1538,6 +1647,29 @@ fn encode_create_image_request(img: &ContainerdImage) -> Vec<u8> {
     let mut out = Vec::new();
     let encoded_img = encode_image(img);
     encode_proto_bytes(&mut out, 1, &encoded_img);
+    out
+}
+
+/// `containerd.services.leases.v1.AddResourceRequest`:
+/// - field 1 (string): `id`
+/// - field 2 (message `Resource`): `id = 1`, `type = 2`
+fn encode_add_lease_resource_request(
+    lease_id: &str,
+    resource_id: &str,
+    resource_type: &str,
+) -> Vec<u8> {
+    let mut res = Vec::with_capacity(resource_id.len() + resource_type.len() + 8);
+    if !resource_id.is_empty() {
+        encode_proto_bytes(&mut res, 1, resource_id.as_bytes());
+    }
+    if !resource_type.is_empty() {
+        encode_proto_bytes(&mut res, 2, resource_type.as_bytes());
+    }
+    let mut out = Vec::with_capacity(lease_id.len() + res.len() + 8);
+    if !lease_id.is_empty() {
+        encode_proto_bytes(&mut out, 1, lease_id.as_bytes());
+    }
+    encode_proto_bytes(&mut out, 2, &res);
     out
 }
 
@@ -1732,6 +1864,12 @@ fn decode_descriptor(mut data: &[u8]) -> Result<Descriptor, String> {
             (3, 0) => {
                 let (v, next) = decode_varint(rest)?;
                 desc.size = v as i64;
+                data = next;
+            }
+            (5, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                let (k, v) = decode_string_map_entry(bytes)?;
+                desc.annotations.insert(k, v);
                 data = next;
             }
             _ => data = skip_proto_field(wt, rest)?,
@@ -2546,6 +2684,46 @@ mod tests {
         out
     }
 
+    fn decode_add_lease_resource_req(mut data: &[u8]) -> (String, String, String) {
+        let mut lease_id = String::new();
+        let mut res_id = String::new();
+        let mut res_type = String::new();
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            match (field, wt) {
+                (1, 2) => {
+                    let (v, next) = decode_len_delimited(rest).unwrap();
+                    lease_id = String::from_utf8(v.to_vec()).unwrap();
+                    data = next;
+                }
+                (2, 2) => {
+                    let (mut res, next) = decode_len_delimited(rest).unwrap();
+                    while !res.is_empty() {
+                        let (rt, rr) = decode_varint(res).unwrap();
+                        match (rt >> 3, rt & 0x7) {
+                            (1, 2) => {
+                                let (v, n) = decode_len_delimited(rr).unwrap();
+                                res_id = String::from_utf8(v.to_vec()).unwrap();
+                                res = n;
+                            }
+                            (2, 2) => {
+                                let (v, n) = decode_len_delimited(rr).unwrap();
+                                res_type = String::from_utf8(v.to_vec()).unwrap();
+                                res = n;
+                            }
+                            _ => res = skip_proto_field(rt & 0x7, rr).unwrap(),
+                        }
+                    }
+                    data = next;
+                }
+                _ => data = skip_proto_field(wt, rest).unwrap(),
+            }
+        }
+        (lease_id, res_id, res_type)
+    }
+
     fn decode_create_lease_req(mut data: &[u8]) -> (String, HashMap<String, String>) {
         let mut id = String::new();
         let mut labels = HashMap::new();
@@ -2895,6 +3073,7 @@ mod tests {
                 media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:1111".into(),
                 size: 512,
+                ..Default::default()
             },
         };
         let genuine = ContainerdImage {
@@ -2910,6 +3089,7 @@ mod tests {
                 media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:2222".into(),
                 size: 768,
+                ..Default::default()
             },
         };
         encode_proto_bytes(&mut list_resp, 1, &encode_image(&unrelated));
@@ -2923,6 +3103,7 @@ mod tests {
                     media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                     digest: format!("sha256:{i:064x}"),
                     size: 100,
+                    ..Default::default()
                 },
             };
             encode_proto_bytes(&mut list_resp, 1, &encode_image(&filler));
@@ -3028,6 +3209,8 @@ mod tests {
         images: HashMap<(String, String), ContainerdImage>,
         /// Active leases: (ns, lease_id) -> labels.
         leases: HashMap<(String, String), HashMap<String, String>>,
+        /// Pinned resources recorded via `Leases.AddResource`: (ns, lease_id, resource_type, resource_id).
+        lease_resources: Vec<(String, String, String, String)>,
         /// Server-side counter for generating unique lease IDs when `CreateRequest.id` is omitted.
         next_lease_seq: u64,
         /// Simulated remaining disk headroom on the shared data disk (bytes).
@@ -3038,6 +3221,12 @@ mod tests {
         mutate_moby_after_manifest: Option<(String, String)>,
         /// Optional hook: insert or replace a `k8s.io` image right after manifest write commits.
         mutate_k8s_after_manifest: Option<ContainerdImage>,
+        /// Optional hook: fail the next `k8s.io` `Images.Create` RPC with gRPC INTERNAL.
+        fail_next_k8s_create: bool,
+        /// Optional hook: after committing a `k8s.io` `Images.Delete`, drop the
+        /// connection without replying (making Delete outcome uncertain) and
+        /// optionally insert a competing `k8s.io` image.
+        drop_after_k8s_delete: Option<Option<ContainerdImage>>,
         /// Count of `Images.Update` RPCs received (must remain 0 under CAS publish).
         images_update_calls: usize,
         /// Optional image name that triggers a gRPC INTERNAL error on `Images.Get`.
@@ -3336,6 +3525,19 @@ mod tests {
                                     };
                                     if matched {
                                         st.images.remove(&key);
+                                        if ns == "k8s.io"
+                                            && let Some(competing) = st.drop_after_k8s_delete.take()
+                                        {
+                                            if let Some(img) = competing {
+                                                st.images.insert(
+                                                    ("k8s.io".into(), img.name.clone()),
+                                                    img,
+                                                );
+                                            }
+                                            drop(st);
+                                            // Drop socket without replying so client sees uncertain delete outcome.
+                                            break;
+                                        }
                                         send_grpc_ok(&mut conn, sid, &[]);
                                     } else {
                                         send_grpc_err(
@@ -3348,6 +3550,16 @@ mod tests {
                                 }
                                 "/containerd.services.images.v1.Images/Create" => {
                                     let (img, _) = decode_image_and_mask(&req_proto);
+                                    if ns == "k8s.io" && st.fail_next_k8s_create {
+                                        st.fail_next_k8s_create = false;
+                                        send_grpc_err(
+                                            &mut conn,
+                                            sid,
+                                            "13",
+                                            "simulated%20create%20failure",
+                                        );
+                                        continue;
+                                    }
                                     let key = (ns.clone(), img.name.clone());
                                     if let std::collections::hash_map::Entry::Vacant(e) =
                                         st.images.entry(key)
@@ -3571,6 +3783,21 @@ mod tests {
                                         send_grpc_err(&mut conn, sid, "6", "lease%20exists");
                                     }
                                 }
+                                "/containerd.services.leases.v1.Leases/AddResource" => {
+                                    let (lease_id, res_id, res_type) =
+                                        decode_add_lease_resource_req(&req_proto);
+                                    if st.leases.contains_key(&(ns.clone(), lease_id.clone())) {
+                                        st.lease_resources.push((
+                                            ns.clone(),
+                                            lease_id,
+                                            res_type,
+                                            res_id,
+                                        ));
+                                        send_grpc_ok(&mut conn, sid, &[]);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "5", "lease%20not%20found");
+                                    }
+                                }
                                 "/containerd.services.leases.v1.Leases/Delete" => {
                                     let id = decode_first_string(&req_proto);
                                     st.leases.remove(&(ns.clone(), id));
@@ -3650,6 +3877,7 @@ mod tests {
                         media_type: "application/vnd.oci.image.index.v1+json".into(),
                         digest: "sha256:source-amd64".into(),
                         size: 256,
+                        ..Default::default()
                     },
                 },
             )]),
@@ -3787,6 +4015,7 @@ mod tests {
                 media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:native-kubelet-arm64".into(),
                 size: 512,
+                ..Default::default()
             },
         };
 
@@ -3802,6 +4031,7 @@ mod tests {
                         media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                         digest: "sha256:source-amd64".into(),
                         size: 128,
+                        ..Default::default()
                     },
                 },
             )]),
@@ -3899,6 +4129,7 @@ mod tests {
                         media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                         digest: "sha256:source-amd64".into(),
                         size: 128,
+                        ..Default::default()
                     },
                 },
             )]),
@@ -3969,6 +4200,7 @@ mod tests {
                         media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                         digest: "sha256:source-amd64".into(),
                         size: 128,
+                        ..Default::default()
                     },
                 },
             )]),
@@ -4040,6 +4272,7 @@ mod tests {
                         media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                         digest: "sha256:source-amd64".into(),
                         size: 128,
+                        ..Default::default()
                     },
                 },
             )]),
@@ -4252,6 +4485,7 @@ mod tests {
                 media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: digest.into(),
                 size: 128,
+                ..Default::default()
             },
         };
 
@@ -4432,6 +4666,209 @@ mod tests {
                     .contains_key(&("k8s.io".into(), "docker.io/library/err:dev".into()))
             );
         }
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: when replacing an existing `k8s.io` mirror and
+    /// `Images.Delete` commits but the following `Images.Create` fails,
+    /// `publish_rewritten_image` pins the old target under the lease before
+    /// deleting and restores the full previous image record (target,
+    /// annotations, and all labels) over a fresh bounded create-only connection
+    /// so pods never lose a previously working tag.
+    #[test]
+    fn publish_rewritten_image_restores_old_tag_when_replacement_create_fails() {
+        let (dir, sock) = temp_sock("restore");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "7".repeat(64));
+        let old_digest = format!("sha256:{}", "8".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let old_image = ContainerdImage {
+            name: "docker.io/library/app:dev".into(),
+            labels: HashMap::from([
+                ("io.cri-containerd.image".into(), "managed".into()),
+                (
+                    "io.katamaran.k8s.source-digest".into(),
+                    "sha256:prev-source".into(),
+                ),
+            ]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: old_digest.clone(),
+                size: 640,
+                annotations: HashMap::from([(
+                    "org.opencontainers.image.ref.name".into(),
+                    "dev".into(),
+                )]),
+            },
+        };
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([
+                (
+                    ("moby".into(), "docker.io/library/app:dev".into()),
+                    ContainerdImage {
+                        name: "docker.io/library/app:dev".into(),
+                        labels: HashMap::new(),
+                        target: Descriptor {
+                            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                            digest: "sha256:source-amd64".into(),
+                            size: 128,
+                            ..Default::default()
+                        },
+                    },
+                ),
+                (
+                    ("k8s.io".into(), "docker.io/library/app:dev".into()),
+                    old_image.clone(),
+                ),
+            ]),
+            remaining_disk_bytes: 1 << 20,
+            fail_next_k8s_create: true,
+            ..Default::default()
+        }));
+
+        // Connection 1: publish_rewritten_image (delete commits, create fails)
+        // Connection 2: recovery fresh dial (Images.Get -> NOT_FOUND -> Images.Create restores old_image)
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+
+        let err = publish_rewritten_image(
+            &sock,
+            "docker.io/library/app:dev",
+            "io.katamaran.k8s.source-digest",
+            Some(&old_digest),
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PublishError::Failed(ref msg) if msg.contains("simulated create failure")),
+            "expected simulated create failure, got {err:?}"
+        );
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.images_update_calls, 0);
+        assert!(
+            st.leases.is_empty(),
+            "temporary lease must be deleted after recovery completes"
+        );
+        assert!(
+            st.lease_resources
+                .iter()
+                .any(|(ns, _, typ, id)| ns == "k8s.io" && typ == "content" && id == &old_digest),
+            "old target content must be pinned under lease before deleting: {:?}",
+            st.lease_resources
+        );
+        assert_eq!(
+            st.images
+                .get(&("k8s.io".into(), "docker.io/library/app:dev".into())),
+            Some(&old_image),
+            "previous k8s.io tag (full target, annotations, and labels) must be restored"
+        );
+        drop(st);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: if `Images.Delete`'s outcome is uncertain (connection
+    /// drops after delete commits) AND a competing writer (e.g. a native
+    /// kubelet pull) creates a new tag in `k8s.io`, recovery checks `k8s.io`
+    /// over a fresh connection and leaves the competing tag untouched.
+    #[test]
+    fn publish_rewritten_image_recovery_preserves_competing_writer_after_uncertain_delete() {
+        let (dir, sock) = temp_sock("uncertain");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "5".repeat(64));
+        let old_digest = format!("sha256:{}", "6".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let old_image = ContainerdImage {
+            name: "docker.io/library/app:dev".into(),
+            labels: HashMap::from([(
+                "io.katamaran.k8s.source-digest".into(),
+                "sha256:prev-source".into(),
+            )]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: old_digest.clone(),
+                size: 512,
+                ..Default::default()
+            },
+        };
+        let competing = ContainerdImage {
+            name: "docker.io/library/app:dev".into(),
+            labels: HashMap::from([("io.cri-containerd.image".into(), "managed".into())]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:competing-native-arm64".into(),
+                size: 768,
+                ..Default::default()
+            },
+        };
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([
+                (
+                    ("moby".into(), "docker.io/library/app:dev".into()),
+                    ContainerdImage {
+                        name: "docker.io/library/app:dev".into(),
+                        labels: HashMap::new(),
+                        target: Descriptor {
+                            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                            digest: "sha256:source-amd64".into(),
+                            size: 128,
+                            ..Default::default()
+                        },
+                    },
+                ),
+                (
+                    ("k8s.io".into(), "docker.io/library/app:dev".into()),
+                    old_image,
+                ),
+            ]),
+            remaining_disk_bytes: 1 << 20,
+            drop_after_k8s_delete: Some(Some(competing.clone())),
+            ..Default::default()
+        }));
+
+        // Connection 1: publish (drops after delete commits, inserting competing image)
+        // Connection 2: fresh recovery connection (Images.Get sees competing image, leaves untouched, deletes lease)
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+
+        let err = publish_rewritten_image(
+            &sock,
+            "docker.io/library/app:dev",
+            "io.katamaran.k8s.source-digest",
+            Some(&old_digest),
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PublishError::Failed(_)), "{err:?}");
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.images_update_calls, 0);
+        assert!(st.leases.is_empty());
+        assert_eq!(
+            st.images
+                .get(&("k8s.io".into(), "docker.io/library/app:dev".into())),
+            Some(&competing),
+            "recovery must never overwrite a competing writer's tag"
+        );
+        drop(st);
 
         server.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
