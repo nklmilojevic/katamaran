@@ -3742,12 +3742,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     };
                     let selected_platform = plan.selected_platform.clone();
                     // `plan_sync_action` only chooses `MirrorRewrite` over an
-                    // existing `k8s.io` tag when it is a Katamaran mirror;
-                    // `publish_rewritten_image` re-verifies that ownership
-                    // before deleting anything.
+                    // existing `k8s.io` tag when it is a Katamaran mirror or an
+                    // unlabelled exact copy of the `moby` source;
+                    // `publish_rewritten_image` re-verifies that before deleting.
                     let expected_k8s = k8s_img.map(|k| containerd_grpc::ExpectedK8sTarget {
                         digest: k.digest.as_str(),
                         is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
+                        adopt_source_copy: k.label(SOURCE_DIGEST_LABEL).is_none()
+                            && k.digest == img.digest,
                     });
                     match containerd_grpc::publish_rewritten_image(
                         Path::new(CONTAINERD_SOCKET),
@@ -3854,11 +3856,11 @@ enum SyncAction {
     RetireRewritten,
     Relist,
     ReportProbeError,
-    /// `k8s.io` already has an unlabelled tag (not a Katamaran mirror) under
-    /// this name without complete local native content. It is never replaced
-    /// (a Delete→Create swap cannot be made atomic, and an interrupted swap
-    /// could lose a tag Katamaran cannot rebuild); the user is told how to
-    /// resolve the conflict instead.
+    /// `k8s.io` already has an unlabelled tag under this name that is neither
+    /// a Katamaran mirror nor an exact copy of the `moby` source, and has no
+    /// complete local native content. It is never replaced (a Delete→Create
+    /// swap cannot be made atomic, and an interrupted swap could lose a tag
+    /// Katamaran cannot rebuild); the user is told how to resolve the conflict.
     ReportUnownedDestination,
 }
 
@@ -3866,9 +3868,9 @@ fn unowned_destination_message(name: &str) -> String {
     format!(
         "{name}: not mirroring amd64 image under emulation because Kubernetes already has \
          an image with this name that katamaran did not create and that has no local \
-         linux/{NATIVE_ARCH} content; katamaran never replaces it. Tag the Docker image \
-         under a different local name (`docker tag {name} <new-name>`) and use that name \
-         in the pod spec"
+         linux/{NATIVE_ARCH} content; katamaran never replaces it. Give the Docker image \
+         a different local name (`docker tag {name} <new-name> && docker rmi {name}`) and \
+         use that name in the pod spec"
     )
 }
 
@@ -4027,13 +4029,20 @@ fn plan_sync_action(
                         // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
                         SyncAction::MirrorRewrite
                     } else {
-                        // Unlabelled `k8s.io` image (e.g. pulled natively by kubelet
-                        // or `ctr`, or a native mirror): never replaced. Stay quiet
-                        // when its local native arm64 content is verified complete
-                        // (not merely advertised in `ctr images ls`); otherwise tell
-                        // the user how to resolve the name conflict.
+                        // Unlabelled `k8s.io` image. Stay quiet when its local
+                        // native arm64 content is verified complete (not merely
+                        // advertised in `ctr images ls`). Otherwise adopt it only
+                        // if it is an exact copy of the `moby` source (an amd64
+                        // image mirrored unchanged by an earlier release), which
+                        // the next sync can always rebuild if the guarded swap is
+                        // interrupted. Anything else (e.g. a `ctr` or kubelet
+                        // pull) is never replaced; tell the user how to resolve
+                        // the name conflict.
                         match dest_native {
                             NativeAvailability::Present => SyncAction::Skip,
+                            NativeAvailability::Absent if k.digest == moby.digest => {
+                                SyncAction::MirrorRewrite
+                            }
                             NativeAvailability::Absent => SyncAction::ReportUnownedDestination,
                             NativeAvailability::Stale => SyncAction::Relist,
                             NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
@@ -5257,6 +5266,21 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         assert!(
             unowned_destination_message("app:dev").contains("docker tag app:dev"),
             "conflict message must tell the user how to resolve it"
+        );
+        // Upgrade from 0.10.0 (#41): the amd64 image was mirrored unchanged, so
+        // the unlabelled k8s.io tag is an exact copy of the moby source -> adopt.
+        let k8s_unchanged_copy = ctr_img(&amd64_idx.digest, "linux/amd64", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unchanged_copy),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
         );
 
         // Emulation disabled for an amd64-only index: retire Katamaran's rewritten
