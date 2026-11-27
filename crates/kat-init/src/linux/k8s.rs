@@ -4531,86 +4531,81 @@ fn extract_etcd_s3_proxy_from_flow_map(
 
         // Normalize decoded keys with Go `strings.TrimSpace` semantics to match
         // k3s `configfilearg.ToString` before merge, `+` suffix, and proxy checks.
+        // A top-level `<<` merge key needs no special case: k3s decodes into
+        // `yaml.MapSlice`, and go-yaml v2.4.0 `mappingSlice` discards merged
+        // entries (see `extract_etcd_s3_proxy_from_yaml`). It is scanned like any
+        // unrelated key so anchors defined in its value stay tracked.
         let key = raw_key.trim();
-        if key == "<<" {
-            if may_contain_obfuscated_proxy_key(doc) {
-                return Err(());
-            }
+        let is_append = key.ends_with('+');
+        let norm_key = key.strip_suffix('+').unwrap_or(key);
+        if norm_key != "etcd-s3-proxy" {
             if has_value {
                 i = scan_flow_value_anchors(doc, i, Some(&mut anchors), true)?;
             }
+        } else if !has_value {
+            values.record(&raw_key, (!is_append).then(|| Arc::from("")));
         } else {
-            let is_append = key.ends_with('+');
-            let norm_key = key.strip_suffix('+').unwrap_or(key);
-            if norm_key != "etcd-s3-proxy" {
-                if has_value {
-                    i = scan_flow_value_anchors(doc, i, Some(&mut anchors), true)?;
-                }
-            } else if !has_value {
-                values.record(&raw_key, (!is_append).then(|| Arc::from("")));
-            } else {
-                let val_start = skip_flow_ws_and_comments(doc, i);
-                // Locate the value span without mutating `anchors` yet; we parse
-                // the proxy value directly below so anchors update once in order.
-                let val_end = scan_flow_value_anchors(doc, val_start, None, true)?;
-                let val_raw = trim_yaml_flow_ws(doc.get(val_start..val_end).ok_or(())?);
-                let (val_anchor, forced_str, val_after_anchor, _) =
-                    strip_yaml_proxy_scalar_properties(val_raw)?;
-                if val_after_anchor.is_empty() {
-                    let scalar = if forced_str {
-                        AnchorScalar {
-                            value: Arc::from(""),
-                            is_null: false,
-                        }
-                    } else {
-                        AnchorScalar::null()
-                    };
-                    if let Some(a) = val_anchor {
-                        anchors.insert(a.to_string(), Some(scalar.clone()));
-                    }
-                    if is_append && scalar.is_null {
-                        values.record(&raw_key, None);
-                    } else {
-                        values.record(&raw_key, Some(scalar.value));
-                    }
-                } else if val_after_anchor.starts_with('[') {
-                    if forced_str {
-                        return Err(());
-                    }
-                    if let Some(a) = val_anchor {
-                        anchors.insert(a.to_string(), None);
-                    }
-                    match parse_yaml_flow_sequence_last(val_after_anchor, &mut anchors)? {
-                        Some(last) => values.record(&raw_key, Some(last.value)),
-                        None if !is_append => values.record(&raw_key, Some(Arc::from(""))),
-                        None => values.record(&raw_key, None),
-                    }
-                } else if val_after_anchor.starts_with('*') {
-                    if val_anchor.is_some() || forced_str {
-                        return Err(());
-                    }
-                    let (resolved, rem) = resolve_yaml_alias(val_after_anchor, &anchors)?;
-                    if skip_flow_ws_and_comments(rem, 0) != rem.len() {
-                        return Err(());
-                    }
-                    if is_append && resolved.is_null {
-                        values.record(&raw_key, None);
-                    } else {
-                        values.record(&raw_key, Some(resolved.value));
+            let val_start = skip_flow_ws_and_comments(doc, i);
+            // Locate the value span without mutating `anchors` yet; we parse
+            // the proxy value directly below so anchors update once in order.
+            let val_end = scan_flow_value_anchors(doc, val_start, None, true)?;
+            let val_raw = trim_yaml_flow_ws(doc.get(val_start..val_end).ok_or(())?);
+            let (val_anchor, forced_str, val_after_anchor, _) =
+                strip_yaml_proxy_scalar_properties(val_raw)?;
+            if val_after_anchor.is_empty() {
+                let scalar = if forced_str {
+                    AnchorScalar {
+                        value: Arc::from(""),
+                        is_null: false,
                     }
                 } else {
-                    let val = parse_yaml_flow_plain_or_quoted_scalar(val_after_anchor, forced_str)?;
-                    if let Some(a) = val_anchor {
-                        anchors.insert(a.to_string(), Some(val.clone()));
-                    }
-                    if is_append && val.is_null {
-                        values.record(&raw_key, None);
-                    } else {
-                        values.record(&raw_key, Some(val.value));
-                    }
+                    AnchorScalar::null()
+                };
+                if let Some(a) = val_anchor {
+                    anchors.insert(a.to_string(), Some(scalar.clone()));
                 }
-                i = val_end;
+                if is_append && scalar.is_null {
+                    values.record(&raw_key, None);
+                } else {
+                    values.record(&raw_key, Some(scalar.value));
+                }
+            } else if val_after_anchor.starts_with('[') {
+                if forced_str {
+                    return Err(());
+                }
+                if let Some(a) = val_anchor {
+                    anchors.insert(a.to_string(), None);
+                }
+                match parse_yaml_flow_sequence_last(val_after_anchor, &mut anchors)? {
+                    Some(last) => values.record(&raw_key, Some(last.value)),
+                    None if !is_append => values.record(&raw_key, Some(Arc::from(""))),
+                    None => values.record(&raw_key, None),
+                }
+            } else if val_after_anchor.starts_with('*') {
+                if val_anchor.is_some() || forced_str {
+                    return Err(());
+                }
+                let (resolved, rem) = resolve_yaml_alias(val_after_anchor, &anchors)?;
+                if skip_flow_ws_and_comments(rem, 0) != rem.len() {
+                    return Err(());
+                }
+                if is_append && resolved.is_null {
+                    values.record(&raw_key, None);
+                } else {
+                    values.record(&raw_key, Some(resolved.value));
+                }
+            } else {
+                let val = parse_yaml_flow_plain_or_quoted_scalar(val_after_anchor, forced_str)?;
+                if let Some(a) = val_anchor {
+                    anchors.insert(a.to_string(), Some(val.clone()));
+                }
+                if is_append && val.is_null {
+                    values.record(&raw_key, None);
+                } else {
+                    values.record(&raw_key, Some(val.value));
+                }
             }
+            i = val_end;
         }
 
         i = skip_flow_ws_and_comments(doc, i);
@@ -5122,6 +5117,15 @@ fn scan_block_value_anchors<'a>(
 /// Extract the effective top-level `etcd-s3-proxy` value from one k3s YAML
 /// config file. Returns `Ok(None)` when the key is absent, `Ok(Some(val))`
 /// when present, and `Err(())` when the entry cannot be parsed safely.
+///
+/// Top-level YAML merge keys (`<<: *anchor`, `<<: [...]`) never contribute
+/// settings to k3s. `configfilearg.readConfigFile` decodes each file into a
+/// `yaml.MapSlice` with `gopkg.in/yaml.v2` v2.4.0 (every k3s release from
+/// v1.31 through v1.37), and that version's `decoder.mappingSlice` applies
+/// the merge into `out` and then overwrites `out` with only the explicitly
+/// listed entries. A merged `etcd-s3-proxy` is therefore dropped, so the
+/// validator treats `<<` as an unrelated key and scans its value only to keep
+/// anchor bindings in sync with go-yaml.
 fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
 
@@ -5318,15 +5322,9 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         }
         // Match k3s `configfilearg.ToString` (`strings.TrimSpace`) before merge,
         // `+` suffix, and proxy-key checks.
+        // A top-level `<<` merge key falls through as an unrelated key; see the
+        // merge-key note on `extract_etcd_s3_proxy_from_yaml`.
         let key = raw_key.trim();
-        if key == "<<" {
-            // Fail closed on YAML merge keys when the file may merge an `etcd-s3-proxy` entry.
-            if may_contain_obfuscated_proxy_key(text) {
-                return Err(());
-            }
-            i += 1;
-            continue;
-        }
         let is_append = key.ends_with('+');
         let norm_key = key.strip_suffix('+').unwrap_or(key);
         let raw_rest = after_colon.trim_start_matches([' ', '\t']);
@@ -11640,6 +11638,22 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 "etcd-s3-proxy: http://ops@corp@proxy.invalid.example:badport\n".to_string(),
             ),
             (
+                "alias bound to anchor redefined inside a block merge value",
+                format!(
+                    "x: &p http://proxy.example.com:8080\n<<:\n  k: &p \"{bad_url}\"\netcd-s3-proxy: *p\n"
+                ),
+            ),
+            (
+                "alias bound to anchor redefined inside a flow merge value",
+                format!(
+                    "{{x: &p \"http://proxy.example.com:8080\", <<: {{k: &p \"{bad_url}\"}}, etcd-s3-proxy: *p}}\n"
+                ),
+            ),
+            (
+                "explicit malformed proxy next to an unrelated merge key",
+                format!("d: &d {{disable: [traefik]}}\n<<: *d\netcd-s3-proxy: {bad_url}\n"),
+            ),
+            (
                 "verbatim str tag on malformed URL",
                 format!("etcd-s3-proxy: !<tag:yaml.org,2002:str> {bad_url}\n"),
             ),
@@ -11707,16 +11721,6 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             (
                 "top-level block-map explicit binary proxy key",
                 format!("? !!binary \"ZXtjZC1zMy1wcm94eQ==\"\n: \"{bad_url}\"\n"),
-            ),
-            (
-                "top-level block-map merge of binary proxy key",
-                format!("base: &b\n  !!binary \"ZXtjZC1zMy1wcm94eQ==\": \"{bad_url}\"\n<<: *b\n"),
-            ),
-            (
-                "top-level flow-map merge of binary proxy key",
-                format!(
-                    "{{base: &b {{!!binary \"ZXtjZC1zMy1wcm94eQ==\": \"{bad_url}\"}}, <<: *b}}\n"
-                ),
             ),
             (
                 "nested binary key anchor cannot spoof valid literal",
@@ -11879,10 +11883,6 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 format!("[\"etcd-s3-proxy\"]: {bad_url}\n"),
             ),
             (
-                "merge key hiding bad proxy",
-                format!("defaults: &d\n  etcd-s3-proxy: {bad_url}\n<<: *d\n"),
-            ),
-            (
                 "anchored top-level key",
                 format!("&k etcd-s3-proxy: {bad_url}\n"),
             ),
@@ -11989,6 +11989,45 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         ];
         for (label, yaml) in &bad_cases {
             assert_safe_reject(yaml, label);
+        }
+
+        // k3s decodes each file into a gopkg.in/yaml.v2 v2.4.0 `MapSlice`, whose
+        // decoder discards top-level `<<` merged entries, so merges never supply
+        // `etcd-s3-proxy` and must not block otherwise valid configs.
+        for (label, yaml) in [
+            (
+                "unrelated merge key next to a valid proxy",
+                "x-common: &c\n  disable: [traefik]\n<<: *c\netcd-s3-proxy: http://proxy.example.com:8080\n"
+                    .to_string(),
+            ),
+            (
+                "unrelated flow merge key next to a valid proxy",
+                "{c: &c {disable: [traefik]}, <<: *c, etcd-s3-proxy: \"http://proxy.example.com:8080\"}\n"
+                    .to_string(),
+            ),
+            (
+                "merge sequence next to a valid proxy",
+                "a: &a {x: 1}\nb: &b {y: 2}\n<<: [*a, *b]\netcd-s3-proxy: none\n".to_string(),
+            ),
+            (
+                "merged malformed proxy is dropped by MapSlice decoding",
+                format!("defaults: &d\n  etcd-s3-proxy: {bad_url}\n<<: *d\n"),
+            ),
+            (
+                "merged binary proxy key is dropped by MapSlice decoding",
+                format!(
+                    "base: &b\n  !!binary \"ZXtjZC1zMy1wcm94eQ==\": \"{bad_url}\"\n<<: *b\n"
+                ),
+            ),
+            (
+                "flow-merged binary proxy key is dropped by MapSlice decoding",
+                format!(
+                    "{{base: &b {{!!binary \"ZXtjZC1zMy1wcm94eQ==\": \"{bad_url}\"}}, <<: *b}}\n"
+                ),
+            ),
+        ] {
+            validate_k3s_config_yaml(&cfg_path, &yaml)
+                .unwrap_or_else(|e| panic!("{label} should be accepted: {e}"));
         }
 
         // Drop-in files in `<config>.d/*.{yaml,yml}` are applied in lexical order.
