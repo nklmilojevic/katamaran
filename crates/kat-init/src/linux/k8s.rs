@@ -3660,9 +3660,21 @@ fn split_yaml_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-fn find_root_flow_map_start(text: &str) -> Option<usize> {
+enum YamlRootStart {
+    Empty,
+    FlowMap(usize),
+    BlockMap(usize),
+}
+
+/// Skip YAML directives, comments, blank lines, an optional `---` document
+/// start marker, and any standalone root `&anchor` / `!tag` properties so that
+/// root properties on their own line cannot skew `root_indent` or hide a
+/// following flow or block mapping.
+fn scan_yaml_root_prologue(text: &str) -> Result<YamlRootStart, ()> {
     let mut offset = 0;
     let mut saw_doc_start = false;
+    let mut saw_root_anchor = false;
+    let mut saw_root_tag = false;
     let mut rest = text;
     while !rest.is_empty() {
         let (line, next_rest, line_len) = split_first_yaml_line(rest);
@@ -3672,12 +3684,16 @@ fn find_root_flow_map_start(text: &str) -> Option<usize> {
             rest = next_rest;
             continue;
         }
-        if !saw_doc_start && line.starts_with('%') {
+        if !saw_doc_start && !saw_root_anchor && !saw_root_tag && line.starts_with('%') {
             offset += line_len;
             rest = next_rest;
             continue;
         }
         if is_yaml_doc_marker(line) {
+            if saw_root_anchor || saw_root_tag {
+                // Standalone root property followed by a document boundary is an empty root node.
+                return Ok(YamlRootStart::Empty);
+            }
             if line.starts_with("---") {
                 saw_doc_start = true;
             }
@@ -3685,20 +3701,107 @@ fn find_root_flow_map_start(text: &str) -> Option<usize> {
             rest = next_rest;
             continue;
         }
+
         let mut col = 0;
-        if let Some(after_doc) = line
-            .strip_prefix("--- ")
-            .or_else(|| line.strip_prefix("---\t"))
+        let had_inline_doc_start = if !saw_doc_start
+            && !saw_root_anchor
+            && !saw_root_tag
+            && let Some(after_doc) = line
+                .strip_prefix("--- ")
+                .or_else(|| line.strip_prefix("---\t"))
         {
+            saw_doc_start = true;
             col = line.len() - after_doc.len();
-        }
-        let after_ws = line[col..].trim_start_matches([' ', '\t']);
+            true
+        } else {
+            false
+        };
+
+        let after_ws = if had_inline_doc_start {
+            line[col..].trim_start_matches([' ', '\t'])
+        } else {
+            let spaces = line[col..].bytes().take_while(|&b| b == b' ').count();
+            let s = &line[col + spaces..];
+            if s.starts_with('\t') {
+                return if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
+                    Err(())
+                } else {
+                    Ok(YamlRootStart::BlockMap(offset))
+                };
+            }
+            s
+        };
         col = line.len() - after_ws.len();
-        let (after_props, prop_consumed) = strip_yaml_key_properties(after_ws).ok()?;
-        col += prop_consumed;
-        return after_props.starts_with('{').then_some(offset + col);
+        if after_ws.starts_with('{') {
+            return Ok(YamlRootStart::FlowMap(offset + col));
+        }
+
+        if after_ws.starts_with(['&', '!']) {
+            let mut cur = after_ws;
+            let mut line_anchor = false;
+            let mut line_tag = false;
+            let mut props_ok = true;
+            loop {
+                if cur.starts_with('&') {
+                    if line_anchor {
+                        props_ok = false;
+                        break;
+                    }
+                    let Some((_, after)) = split_yaml_anchor(cur) else {
+                        props_ok = false;
+                        break;
+                    };
+                    line_anchor = true;
+                    cur = after.trim_start_matches([' ', '\t']);
+                } else if cur.starts_with('!') {
+                    if line_tag {
+                        props_ok = false;
+                        break;
+                    }
+                    let Some((_, after)) = split_yaml_tag(cur) else {
+                        props_ok = false;
+                        break;
+                    };
+                    line_tag = true;
+                    cur = after.trim_start_matches([' ', '\t']);
+                } else {
+                    break;
+                }
+            }
+            if !props_ok {
+                return Err(());
+            }
+            if cur.starts_with('{') {
+                if (line_anchor && saw_root_anchor) || (line_tag && saw_root_tag) {
+                    return Err(());
+                }
+                let brace_col = line.len() - cur.len();
+                return Ok(YamlRootStart::FlowMap(offset + brace_col));
+            }
+            if trailing_is_yaml_comment_or_empty(cur) {
+                if (line_anchor && saw_root_anchor) || (line_tag && saw_root_tag) {
+                    return Err(());
+                }
+                saw_root_anchor |= line_anchor;
+                saw_root_tag |= line_tag;
+                offset += line_len;
+                rest = next_rest;
+                continue;
+            }
+            // Otherwise the property belongs to the first mapping key on this
+            // line (e.g. `&k etcd-s3-proxy: ...`); fall through to block map.
+        }
+
+        if had_inline_doc_start {
+            if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
+                return Err(());
+            }
+            return Ok(YamlRootStart::Empty);
+        }
+
+        return Ok(YamlRootStart::BlockMap(offset));
     }
-    None
+    Ok(YamlRootStart::Empty)
 }
 
 fn extract_etcd_s3_proxy_from_flow_map(
@@ -4066,12 +4169,17 @@ fn resolve_file_proxy_values(
 fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
 
-    // Handle flow-style JSON/YAML top-level mapping documents (`{...}`, including `--- {...}`).
-    if let Some(open_brace_idx) = find_root_flow_map_start(text) {
-        return extract_etcd_s3_proxy_from_flow_map(text, open_brace_idx);
-    }
+    // Handle leading directives, document markers, standalone root `&anchor` /
+    // `!tag` lines, and flow-style top-level mappings (`{...}`).
+    let start_offset = match scan_yaml_root_prologue(text)? {
+        YamlRootStart::Empty => return Ok(None),
+        YamlRootStart::FlowMap(open_brace_idx) => {
+            return extract_etcd_s3_proxy_from_flow_map(text, open_brace_idx);
+        }
+        YamlRootStart::BlockMap(offset) => offset,
+    };
 
-    let lines = split_yaml_lines(text);
+    let lines = split_yaml_lines(text.get(start_offset..).ok_or(())?);
     let mut plain_found: Option<String> = None;
     let mut append_found: Option<String> = None;
     let mut root_indent: Option<usize> = None;
@@ -10072,6 +10180,9 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "--- {disable: [traefik], etcd-s3-proxy: http://proxy.example.com:8080, note: \"a\\\\b\"}\n...\n",
             "defaults: &d\n  note: \"a\\\\b\"\n<<: *d\n",
             "&k disable:\n  - traefik\nnote: \"a\\\\b\"\n",
+            "&root\n  disable:\n    - traefik\n  etcd-s3-proxy: http://proxy.example.com:8080\n",
+            "--- &root\n  disable:\n    - traefik\n",
+            "&root\n  {disable: [traefik], etcd-s3-proxy: http://proxy.example.com:8080}\n",
         ] {
             validate_k3s_config_yaml(&cfg_path, ok_yaml)
                 .unwrap_or_else(|e| panic!("expected {ok_yaml:?} ok, got: {e}"));
@@ -10293,6 +10404,36 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             (
                 "single-quoted proxy key inside YAML flow map",
                 format!("{{disable: [traefik], 'etcd-s3-proxy': '{bad_url}'}}\n"),
+            ),
+            (
+                "root anchor on its own line before indented block mapping",
+                format!("&root\n  etcd-s3-proxy: {bad_url}\n"),
+            ),
+            (
+                "root anchor with comment before indented block mapping",
+                format!(
+                    "&root # top-level anchor\n  disable:\n    - traefik\n  etcd-s3-proxy: {bad_url}\n"
+                ),
+            ),
+            (
+                "root tag on its own line before indented block mapping",
+                format!("!!map\n  etcd-s3-proxy: {bad_url}\n"),
+            ),
+            (
+                "root anchor and tag on separate lines before indented block mapping",
+                format!("&root\n!!map\n  etcd-s3-proxy: {bad_url}\n"),
+            ),
+            (
+                "inline doc marker with root anchor before indented block mapping",
+                format!("--- &root\n  etcd-s3-proxy: {bad_url}\n"),
+            ),
+            (
+                "root anchor on its own line before indented flow mapping",
+                format!("&root\n  {{etcd-s3-proxy: \"{bad_url}\"}}\n"),
+            ),
+            (
+                "repeated root anchors across lines",
+                "&a\n&b\n  etcd-s3-proxy: http://proxy.example.com:8080\n".to_string(),
             ),
         ];
         for (label, yaml) in &bad_cases {
