@@ -52,6 +52,9 @@ fn make_full_pipe() -> (File, File) {
         let n = unsafe { libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
             break;
         }

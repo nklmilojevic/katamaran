@@ -3961,14 +3961,20 @@ fn destroy_btrfs_subvolume(path: &Path) -> io::Result<bool> {
     // NUL-terminated and `dir` is a live descriptor.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstatat(
-            dir.as_raw_fd(),
-            c_name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
+        loop {
+            if libc::fstatat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+            {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
         }
         if st.st_mode & libc::S_IFMT != libc::S_IFDIR
             || st.st_ino as u64 != BTRFS_FIRST_FREE_OBJECTID
@@ -3976,7 +3982,16 @@ fn destroy_btrfs_subvolume(path: &Path) -> io::Result<bool> {
             return Ok(false);
         }
         let mut fs: libc::statfs = std::mem::zeroed();
-        if libc::fstatfs(dir.as_raw_fd(), &mut fs) != 0 || fs.f_type as i64 != BTRFS_SUPER_MAGIC {
+        loop {
+            if libc::fstatfs(dir.as_raw_fd(), &mut fs) == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+        }
+        if fs.f_type as i64 != BTRFS_SUPER_MAGIC {
             return Ok(false);
         }
         let mut args = VolArgs {
@@ -3984,8 +3999,14 @@ fn destroy_btrfs_subvolume(path: &Path) -> io::Result<bool> {
             name: [0; 4088],
         };
         args.name[..name.len()].copy_from_slice(name);
-        if libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_SNAP_DESTROY as _, &mut args) != 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            if libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_SNAP_DESTROY as _, &mut args) == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
         }
     }
     Ok(true)
@@ -4164,16 +4185,22 @@ fn open_dir_nofollow(
     name: &std::ffi::CStr,
 ) -> io::Result<std::ptr::NonNull<libc::DIR>> {
     // SAFETY: `name` is NUL-terminated; the fd is owned by the stream on success.
-    let fd = unsafe {
-        libc::openat(
-            parent,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let fd = loop {
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
     };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
     // SAFETY: `fd` is a valid directory descriptor we own.
     match std::ptr::NonNull::new(unsafe { libc::fdopendir(fd) }) {
         Some(dir) => Ok(dir),
@@ -4193,14 +4220,18 @@ fn unlinkat_checked(
     flags: libc::c_int,
 ) -> io::Result<()> {
     // SAFETY: `name` is NUL-terminated.
-    if unsafe { libc::unlinkat(parent, name.as_ptr(), flags) } == 0 {
-        return Ok(());
-    }
-    let e = io::Error::last_os_error();
-    if e.kind() == io::ErrorKind::NotFound {
-        Ok(())
-    } else {
-        Err(e)
+    loop {
+        if unsafe { libc::unlinkat(parent, name.as_ptr(), flags) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if e.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(e);
     }
 }
 
@@ -4297,16 +4328,23 @@ fn remove_tree_nofollow_with(
         }
         let top = &mut stack[top_idx];
         let dir = top.dir.expect("top frame is open");
-        // SAFETY: errno is thread-local; reset it so a NULL return can be
-        // distinguished between end-of-stream and an error.
-        unsafe { *libc::__errno_location() = 0 };
-        // SAFETY: `dir` is a live stream owned by `top`.
-        let ent = unsafe { libc::readdir(dir.as_ptr()) };
-        if ent.is_null() {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error().unwrap_or(0) != 0 {
-                return Err(format!("read {}: {e}", top.path.display()));
+        let ent = loop {
+            // SAFETY: errno is thread-local; reset it before each attempt so a
+            // NULL return distinguishes end-of-stream from an error.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: `dir` is a live stream owned by `top`.
+            let ent = unsafe { libc::readdir(dir.as_ptr()) };
+            if !ent.is_null() {
+                break ent;
             }
+            let e = io::Error::last_os_error();
+            match e.raw_os_error().unwrap_or(0) {
+                0 => break ent,
+                libc::EINTR => continue,
+                _ => return Err(format!("read {}: {e}", top.path.display())),
+            }
+        };
+        if ent.is_null() {
             if top.saw_entry {
                 // Rescan: unlinking during iteration can make readdir skip
                 // entries, so only rmdir after a pass that saw nothing.
