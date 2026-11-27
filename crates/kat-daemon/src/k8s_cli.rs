@@ -267,6 +267,14 @@ impl ProgressPrinter {
     }
 
     fn finish(mut self, terminal: Option<String>, flush_timeout: Duration) {
+        if self.worker.is_none() {
+            // The worker thread could not be spawned, so nothing would ever
+            // print the terminal line: write it directly, bounded by `poll`.
+            if let Some(line) = terminal {
+                write_stderr_bounded(line.as_bytes(), flush_timeout);
+            }
+            return;
+        }
         if let Some(line) = terminal {
             let _ = self.terminal_tx.try_send(line);
         }
@@ -276,6 +284,33 @@ impl ProgressPrinter {
         {
             let _ = worker.join();
         }
+    }
+}
+
+/// Write `buf` to stderr without blocking past `timeout` (an undrained pipe
+/// just loses the rest of the line).
+fn write_stderr_bounded(mut buf: &[u8], timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !buf.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pfd = libc::pollfd {
+            fd: libc::STDERR_FILENO,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ms = left.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
+        if left.is_zero() || unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+            return;
+        }
+        // SAFETY: POLLOUT guarantees at least PIPE_BUF bytes can be written
+        // atomically without blocking; writing at most that many never blocks.
+        let chunk = buf.len().min(libc::PIPE_BUF);
+        let n = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), chunk) };
+        if n <= 0 {
+            return;
+        }
+        buf = &buf[n as usize..];
     }
 }
 

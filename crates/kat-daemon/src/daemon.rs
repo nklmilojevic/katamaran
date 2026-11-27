@@ -1778,6 +1778,13 @@ impl Daemon {
             _ => Ok(()),
         };
 
+        // A plain reset counts as attempted only once the guest answered with
+        // any frame (progress or a final Done/Error): a guest that dropped the
+        // request unread (e.g. at its connection limit) sends nothing, so host
+        // kubeconfig/proxy/DNS state is left untouched.
+        if !remove_images && !guest_replied && !guest_reply_terminal && !guest_data_deleted {
+            guest_reset_attempted = false;
+        }
         let mut kubeconfig_err: Option<anyhow::Error> = None;
         if guest_reset_attempted {
             {
@@ -2977,6 +2984,7 @@ mod tests {
             ),
         ];
         for (frames, expect_disabled) in cases {
+            let no_reply = frames.is_empty();
             Config {
                 kubernetes: true,
                 ..Config::default()
@@ -3012,6 +3020,13 @@ mod tests {
                 "{}",
                 err.message
             );
+            if no_reply {
+                assert_eq!(
+                    d.k8s.lock().unwrap().state,
+                    "running",
+                    "host state must be kept when the guest never answered"
+                );
+            }
         }
     }
 

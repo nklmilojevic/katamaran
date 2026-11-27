@@ -37,6 +37,7 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
     // `SHUTDOWN_K8S_BUDGET`, so nothing in the guest Kubernetes service (a
     // reset still holding its lock, a slow k3s exit, serial `ctr` cleanup)
     // can delay the Docker stop, process sweep, or data-disk sync.
+    super::k8s::begin_shutdown();
     let k8s_budget = Instant::now() + super::k8s::SHUTDOWN_K8S_BUDGET;
     let (k8s_tx, k8s_rx) = std::sync::mpsc::channel();
     let k8s_stop = thread::Builder::new()
@@ -66,12 +67,18 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
                 Ok(took) => {
                     super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
                 }
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     super::k8s::abandon_shutdown_stop();
                     super::log(&format!(
                         "shutdown: k8s stop still running after {} s; cutting off Kubernetes cleanup and continuing",
                         super::k8s::SHUTDOWN_K8S_BUDGET.as_secs()
                     ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    super::k8s::abandon_shutdown_stop();
+                    super::log(
+                        "shutdown: k8s stop thread failed; leaving k3s to the process sweep",
+                    );
                 }
             }
         }

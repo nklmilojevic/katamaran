@@ -312,6 +312,32 @@ pub fn start_service(
 }
 
 /// Stop k3s cleanly during VM shutdown.
+/// Lazily detach (`MNT_DETACH`) every mount under `prefixes`, deepest first.
+/// Unlike a plain `umount`, a lazy detach never blocks on a busy or
+/// unreachable filesystem (for example a stale NFS pod volume), so reset can
+/// never hang here while holding `op_lock`. Fails if any mount remains.
+fn detach_paths_under(prefixes: &[&str]) -> Result<(), String> {
+    let text = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
+    let mut failures = Vec::new();
+    for mp in mounts_under_prefixes(&text, prefixes) {
+        if let Err(e) = umount_detach(&mp) {
+            failures.push(e.to_string());
+        }
+    }
+    let after = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("re-read /proc/self/mountinfo: {e}"))?;
+    let remaining = mounts_under_prefixes(&after, prefixes);
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "mounts still active ({}): {}",
+        remaining.join(", "),
+        failures.join("; ")
+    ))
+}
+
 /// Lazily detach any mounts left under the k3s data and legacy kubelet
 /// directories (for example pod volume mounts whose cleanup was cut off by
 /// [`abandon_shutdown_stop`]) so the data disk can unmount cleanly.
@@ -338,8 +364,16 @@ pub fn detach_mounts_for_shutdown() -> String {
 /// helpers that abort on shutdown, so `op_lock` is normally released quickly.
 /// The shutdown sequence runs this on its own thread and waits at most
 /// [`SHUTDOWN_K8S_BUDGET`]; see [`abandon_shutdown_stop`].
-pub fn stop_for_shutdown() {
+/// Mark the VM as shutting down so every guest Kubernetes operation (reset,
+/// start, helpers with `abort_on_shutdown`) stops at its next check and no new
+/// one starts. The shutdown sequence calls this first, before anything that
+/// could fail (such as spawning the stop thread).
+pub fn begin_shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
+}
+
+pub fn stop_for_shutdown() {
+    begin_shutdown();
     if let Some(svc) = SERVICE.get() {
         let _ = svc.stop_inner(None);
     }
@@ -2818,7 +2852,7 @@ impl K8s {
                 // been destroyed yet and the reset error is accurate.
                 sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
                 progress("removing cluster data");
-                unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
+                detach_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
                 let warning = remove_cluster_data_dirs(
                     &paths,
                     &may_destroy,
@@ -3892,7 +3926,7 @@ pub fn rmtree_main() -> ! {
                 let prefix = p
                     .to_str()
                     .ok_or_else(|| format!("non-UTF-8 path {}", p.display()))?;
-                unmount_paths_under(&[prefix])?;
+                detach_paths_under(&[prefix])?;
                 // A detached datastore that is a btrfs subvolume (the usual
                 // case) is deleted in one step; anything left (or any plain
                 // directory) is removed by the no-follow walk.
