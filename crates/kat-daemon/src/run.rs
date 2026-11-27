@@ -323,15 +323,19 @@ impl AutoForwardTracker {
         self.published_held.remove(&(proto, port));
     }
 
-    /// The worker finished published remove `seq` for `port`. If it is the
-    /// latest one dispatched, the published side is done with the port, so
-    /// retry an automatic forward that was waiting for it. Completions of
-    /// superseded removes are ignored.
+    /// The worker finished published remove `seq` for `port`. Completions of
+    /// superseded removes are ignored. If the published side `released` the
+    /// port, retry an automatic forward that was waiting for it. Otherwise a
+    /// listener may still be bound (retries ran out, or a re-add superseded
+    /// the remove), so the port is treated as held: the automatic forward
+    /// keeps waiting rather than risk a failed or partial bind, and its status
+    /// says why.
     fn published_remove_done(
         &mut self,
         proto: PortProto,
         port: u16,
         seq: u64,
+        released: bool,
         on_event: &mut dyn FnMut(Event),
     ) {
         let key = (proto, port);
@@ -339,6 +343,18 @@ impl AutoForwardTracker {
             return;
         }
         self.published_removing.remove(&key);
+        if !released {
+            self.published_held.insert(key);
+            if self.pending_release.contains(&key) {
+                on_event(Event::PortFailed(
+                    PortOrigin::Automatic,
+                    proto,
+                    port,
+                    "the published forward still holds this port".into(),
+                ));
+            }
+            return;
+        }
         self.published_held.remove(&key);
         if self.pending_release.contains(&key) {
             self.pending_release.retain(|&k| k != key);
@@ -834,8 +850,8 @@ fn session(
             Ok(Input::Forward(_, net::Event::RefusedCleared(proto, port))) => {
                 on_event(Event::PortErrorClear(PortOrigin::Published, proto, port));
             }
-            Ok(Input::Forward(_, net::Event::RemoveDone(proto, port, seq))) => {
-                auto_forwards.published_remove_done(proto, port, seq, on_event);
+            Ok(Input::Forward(_, net::Event::RemoveDone(proto, port, seq, released))) => {
+                auto_forwards.published_remove_done(proto, port, seq, released, on_event);
             }
             Ok(Input::Forward(_, net::Event::Transient(..) | net::Event::RemoveFailed(..))) => {}
             Ok(Input::ListenerCapacityAvailable(_)) => {
@@ -1109,7 +1125,7 @@ mod tests {
         drop(published);
         tracker.published_closed(tcp, port);
         assert!(events.is_empty());
-        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
         assert!(bound_auto(&events, port), "{events:?}");
         assert!(tracker.pending_release.is_empty());
         events.clear();
@@ -1130,14 +1146,14 @@ mod tests {
         drop(first);
         tracker.published_closed(tcp, port);
         let second = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        tracker.published_remove_done(tcp, port, seq1, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq1, true, &mut |e| events.push(e));
         assert!(events.is_empty(), "stale completion acted on: {events:?}");
         assert_eq!(tracker.pending_release, vec![(tcp, port)]);
         assert!(!tracker.forwards.contains(port));
         tracker.published_forwarded(tcp, port);
         drop(second);
         tracker.published_closed(tcp, port);
-        tracker.published_remove_done(tcp, port, seq2, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq2, true, &mut |e| events.push(e));
         assert!(bound_auto(&events, port), "{events:?}");
         events.clear();
         tracker.remove(tcp, port, &mut |e| events.push(e));
@@ -1155,7 +1171,7 @@ mod tests {
         tracker.add(tcp, port, &mut |e| events.push(e));
         assert!(events.is_empty());
         assert!(!tracker.forwards.contains(port));
-        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
         assert!(bound_auto(&events, port), "{events:?}");
         events.clear();
         tracker.remove(tcp, port, &mut |e| events.push(e));
@@ -1174,9 +1190,39 @@ mod tests {
         events.clear();
         drop(published);
         tracker.published_closed(tcp, port);
-        tracker.published_remove_done(tcp, port, seq, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
         assert!(events.is_empty());
         assert!(!tracker.forwards.contains(port));
+
+        // A remove that ends without releasing the port (retries ran out, or
+        // a re-add superseded it) leaves the listener bound: the automatic
+        // forward keeps waiting, reports why, and binds on a later release.
+        let stuck = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = stuck.local_addr().unwrap().port();
+        tracker.published_forwarded(tcp, port);
+        let seq = tracker.next_remove_seq();
+        tracker.published_removing(tcp, port, seq);
+        tracker.add(tcp, port, &mut |e| events.push(e));
+        tracker.published_remove_done(tcp, port, seq, false, &mut |e| events.push(e));
+        assert!(matches!(
+            events.as_slice(),
+            [Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)] if *p == port
+        ));
+        assert_eq!(tracker.pending_release, vec![(tcp, port)]);
+        assert!(!tracker.forwards.contains(port));
+        events.clear();
+        // Later adds keep deferring while the listener is held.
+        tracker.add(tcp, port, &mut |e| events.push(e));
+        assert!(events.is_empty());
+        drop(stuck);
+        tracker.published_closed(tcp, port);
+        let seq = tracker.next_remove_seq();
+        tracker.published_removing(tcp, port, seq);
+        tracker.published_remove_done(tcp, port, seq, true, &mut |e| events.push(e));
+        assert!(bound_auto(&events, port), "{events:?}");
+        events.clear();
+        tracker.remove(tcp, port, &mut |e| events.push(e));
+        events.clear();
 
         // Without a published forward on the port, a bind conflict is still a
         // permanent failure.

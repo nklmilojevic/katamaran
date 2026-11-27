@@ -767,9 +767,11 @@ pub enum Event {
     /// The worker finished handling `PortChange::Remove` number `.2` for the
     /// port: emitted exactly once per remove, after its other events, whether
     /// it closed a listener, found none, gave up after retries, or was
-    /// superseded by a later change for the same port. The session matches it
-    /// against the latest remove it sent to know the published side is done.
-    RemoveDone(PortProto, u16, u64),
+    /// superseded by a later change for the same port. `.3` says whether the
+    /// published side released the port (`false` when retries ran out or a
+    /// later change superseded the remove, so a listener may still be bound).
+    /// The session matches it against the latest remove it sent.
+    RemoveDone(PortProto, u16, u64, bool),
 }
 
 impl<A: ForwardApi> Forwards<A> {
@@ -1003,7 +1005,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(WorkerMsg::Change(PortChange::Add(proto, port))) => {
                         let key = (proto, port);
                         if let Some((PendingOp::Remove(seq), ..)) = pending.remove(&key) {
-                            on_event(Event::RemoveDone(proto, port, seq));
+                            on_event(Event::RemoveDone(proto, port, seq, false));
                         }
                         capacity_wait.retain(|&k| k != key);
                         match fwd.add(proto, port) {
@@ -1028,7 +1030,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     Ok(WorkerMsg::Change(PortChange::Remove(proto, port, seq))) => {
                         let key = (proto, port);
                         if let Some((PendingOp::Remove(old), ..)) = pending.remove(&key) {
-                            on_event(Event::RemoveDone(proto, port, old));
+                            on_event(Event::RemoveDone(proto, port, old, false));
                         }
                         let before = capacity_wait.len();
                         capacity_wait.retain(|&k| k != key);
@@ -1046,13 +1048,13 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e) => {
                                 report(&e, &label);
                                 on_event(e);
-                                on_event(Event::RemoveDone(proto, port, seq));
+                                on_event(Event::RemoveDone(proto, port, seq, true));
                             }
                             None if was_waiting => {
                                 on_event(Event::RefusedCleared(proto, port));
-                                on_event(Event::RemoveDone(proto, port, seq));
+                                on_event(Event::RemoveDone(proto, port, seq, true));
                             }
-                            None => on_event(Event::RemoveDone(proto, port, seq)),
+                            None => on_event(Event::RemoveDone(proto, port, seq, true)),
                         }
                     }
                     Ok(WorkerMsg::CapacityAvailable) => {
@@ -1144,15 +1146,15 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     } else {
                                         report(&e, &label);
                                         on_event(e);
-                                        on_event(Event::RemoveDone(proto, port, seq));
+                                        on_event(Event::RemoveDone(proto, port, seq, false));
                                     }
                                 }
                                 Some(e) => {
                                     report(&e, &label);
                                     on_event(e);
-                                    on_event(Event::RemoveDone(proto, port, seq));
+                                    on_event(Event::RemoveDone(proto, port, seq, true));
                                 }
-                                None => on_event(Event::RemoveDone(proto, port, seq)),
+                                None => on_event(Event::RemoveDone(proto, port, seq, true)),
                             }
                         }
                     }
@@ -1891,7 +1893,7 @@ mod tests {
         // The remove completes with no listener to close, and cancels the retry.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, 8081, 1)
+            Event::RemoveDone(TCP, 8081, 1, true)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1953,7 +1955,7 @@ mod tests {
         // The retried remove completes exactly once.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, 9100, 1)
+            Event::RemoveDone(TCP, 9100, 1, true)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 2);
@@ -1987,7 +1989,7 @@ mod tests {
         // The superseded remove still completes, exactly once.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, 9101, 1)
+            Event::RemoveDone(TCP, 9101, 1, false)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 1);
@@ -3575,7 +3577,7 @@ mod tests {
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, p4, 1)
+            Event::RemoveDone(TCP, p4, 1, true)
         );
 
         // Removing p1 releases 3 descriptors and automatically forwards p3
@@ -3587,7 +3589,7 @@ mod tests {
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, p1, 2)
+            Event::RemoveDone(TCP, p1, 2, true)
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -3605,7 +3607,7 @@ mod tests {
         );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveDone(TCP, p2, 3)
+            Event::RemoveDone(TCP, p2, 3, true)
         );
         let mut auto = crate::autofwd::AutoForwards::with_limits_and_budget(
             crate::autofwd::Upstream::PerPort(dir.clone()),
