@@ -35,11 +35,17 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       # The forwarding tests deliver payloads through a real gvproxy and an
       # lo0 alias on regular and privileged ports; require both so that
-      # coverage cannot silently skip.
+      # coverage cannot silently skip. setup-go and `cargo xtask gvproxy` match
+      # the macos-26 release job, which builds the same gvproxy.
       - name: Build gvproxy
-        run: cargo xtask gvproxy
+        run: |
+          go version
+          cargo xtask gvproxy
+          test -x target/release/gvproxy
       - name: Add lo0 alias for forwarding tests
-        run: sudo ifconfig lo0 alias 172.16.254.200
+        run: |
+          sudo ifconfig lo0 alias 172.16.254.200
+          ifconfig lo0 | grep -q 'inet 172\.16\.254\.200 '
       - name: Rust unit tests
         env:
           KATAMARAN_TEST_LO0_ALIAS: 172.16.254.200
