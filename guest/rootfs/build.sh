@@ -49,12 +49,13 @@ EROFS_LABEL=katamaran-root
 # busybox (+ /bin/sh) is the debug shell; iptables ships ip6tables and defaults to the nft backend;
 # nftables provides the nft binary needed by kube-proxy in nftables mode (k3s v1.31.0-v1.31.5 bundle
 # k3s-root v0.14.0 without nft, and stop_k8s_workloads invokes nft directly);
+# sqlite provides sqlite3 for read-only version detection on existing unmarked k3s state.db datastores;
 # mount/umount are util-linux; shadow is for the userns-remap subuid/subgid files later.
 # e2fsprogs is left out: nothing in the guest uses ext4.
 # Linux machines: lxc runs them, dnsmasq is their DHCP server on the machine bridge, and GNU tar
 # unpacks their images with xattrs (file capabilities) intact.
 PACKAGES="alpine-baselayout alpine-release busybox busybox-binsh musl-utils ca-certificates
-  iptables nftables iproute2 btrfs-progs xz pigz procps-ng mount umount shadow lxc dnsmasq tar"
+  iptables nftables sqlite iproute2 btrfs-progs xz pigz procps-ng mount umount shadow lxc dnsmasq tar"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=$(cd "$HERE/../.." && pwd)/guest/out
@@ -184,6 +185,7 @@ c runc --version | head -1
 c iptables --version
 c ip6tables --version
 c nft --version
+c sqlite3 --version
 c qemu-x86_64 --version | head -1
 c lxc-start --version
 c dnsmasq --version | head -1

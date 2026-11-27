@@ -10,11 +10,13 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hash::Hasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -309,16 +311,26 @@ fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Oldest supported Kubernetes minor. k3s is launched with
+/// `--kube-proxy-arg=proxy-mode=nftables`, and kube-proxy's nftables mode
+/// (`NFTablesProxyMode`) is beta and enabled by default only from v1.31, so
+/// older releases would fail to start kube-proxy. k3s v1.31.0–v1.31.5 bundle
+/// k3s-root v0.14.0 without `nft`; kube-proxy then resolves the rootfs
+/// `nftables` package's `/usr/sbin/nft` through `PATH` (see `guest/rootfs/build.sh`
+/// and `path_resolves_rootfs_nft_for_oldest_supported_k3s`).
 const MIN_K8S_MINOR: u32 = 31;
+const SQLITE3_BIN: &str = "/usr/bin/sqlite3";
+const STATE_DB_MAX_NODE_ROWS: usize = 64;
+const STATE_DB_MAX_BLOB_BYTES: usize = 4 << 20;
+const FICLONE: libc::Ioctl = 0x4004_9409u32 as libc::Ioctl;
 
-/// Validate a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>` with
-/// `major == 1` and `minor >= MIN_K8S_MINOR`), matching the host daemon's config check.
-fn validate_k3s_release_tag(v: &str) -> Result<(), String> {
-    let bad = || format!("k3s version {v:?} is not a valid release tag such as v1.37.2+k3s1");
-    let rest = v.strip_prefix('v').ok_or_else(bad)?;
-    let (kube, build) = rest.split_once("+k3s").ok_or_else(bad)?;
+/// Strictly parse a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>`)
+/// with no surrounding whitespace, returning `(major, minor)`.
+fn parse_strict_k3s_tag(v: &str) -> Option<(u32, u32)> {
+    let rest = v.strip_prefix('v')?;
+    let (kube, build) = rest.split_once("+k3s")?;
     if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad());
+        return None;
     }
     let (core, pre) = match kube.split_once('-') {
         Some((c, p)) => (c, Some(p)),
@@ -327,19 +339,30 @@ fn validate_k3s_release_tag(v: &str) -> Result<(), String> {
     if let Some(p) = pre
         && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'))
     {
-        return Err(bad());
+        return None;
     }
     let parts: Vec<u32> = core
         .split('.')
         .map(|n| {
             if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(bad());
+                return None;
             }
-            n.parse().map_err(|_| bad())
+            n.parse().ok()
         })
-        .collect::<Result<_, _>>()?;
+        .collect::<Option<_>>()?;
     let [major, minor, _patch] = parts[..] else {
-        return Err(bad());
+        return None;
+    };
+    Some((major, minor))
+}
+
+/// Validate a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>` with
+/// `major == 1` and `minor >= MIN_K8S_MINOR`), matching the host daemon's config check.
+fn validate_k3s_release_tag(v: &str) -> Result<(), String> {
+    let Some((major, minor)) = parse_strict_k3s_tag(v) else {
+        return Err(format!(
+            "k3s version {v:?} is not a valid release tag such as v1.37.2+k3s1"
+        ));
     };
     if major != 1 || minor < MIN_K8S_MINOR {
         return Err(format!(
@@ -435,26 +458,507 @@ fn corrupt_datastore_version_error(data_version_file: &Path, reason: &str) -> St
 
 fn missing_datastore_version_error(data_dir: &Path, data_version_file: &Path) -> String {
     format!(
-        "existing cluster data under {} has no version marker ({}); \
-         cannot verify minor-version compatibility. While Kubernetes is stopped, \
-         if you have independently verified the k3s release tag that last opened \
-         this datastore (for example from a backup or an older katamaran release), \
-         run `kat k8s mark-version <version>` to record it (see the Kubernetes \
-         guide's unmarked-cluster migration steps). Otherwise, back up any state \
-         you need and run `kat k8s reset` to delete cluster data and persistent \
-         volumes before starting fresh.",
+        "existing cluster data under {} has no version marker ({}) and its k3s version \
+         could not be determined from server/db/state.db; cannot verify minor-version \
+         compatibility. While the VM is running and Kubernetes is stopped, if you have \
+         independently verified the k3s release tag that last opened this datastore \
+         (for example from a backup or an older katamaran release), run \
+         `kat k8s mark-version <version>` to record it (see the Kubernetes guide's \
+         unmarked-cluster migration steps). Otherwise, back up any state you need and \
+         run `kat k8s reset` to delete cluster data and persistent volumes before \
+         starting fresh.",
         data_dir.display(),
         data_version_file.display(),
     )
 }
 
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn encode_sqlite_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'~' | b'+' | b':')
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn clone_or_copy_regular_file(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut src_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(src)?;
+    if !src_file.metadata()?.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            src.display()
+        )));
+    }
+    let mut dst_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)?;
+    // Use O(1) copy-on-write reflink on btrfs when available; fall back to streaming copy.
+    if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    io::copy(&mut src_file, &mut dst_file)?;
+    Ok(())
+}
+
+fn inspect_regular_companion(path: &Path) -> Result<Option<u64>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(Some(meta.len())),
+        Ok(_) => Err(format!("{} is not a regular file", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let hex_val = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = hex_val(pair[0])?;
+        let lo = hex_val(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn read_proto_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        if shift == 63 && b > 1 {
+            return None;
+        }
+        val |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(val);
+        }
+        shift += 7;
+    }
+    None
+}
+
+enum ProtoValue<'a> {
+    Varint,
+    Fixed64,
+    Bytes(&'a [u8]),
+    Fixed32,
+}
+
+fn for_each_proto_field<'a>(
+    buf: &'a [u8],
+    mut f: impl FnMut(u32, ProtoValue<'a>) -> Option<()>,
+) -> Option<()> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let tag = read_proto_varint(buf, &mut pos)?;
+        let field_num = u32::try_from(tag >> 3).ok()?;
+        if field_num == 0 {
+            return None;
+        }
+        let wire_type = (tag & 0x7) as u8;
+        let val = match wire_type {
+            0 => {
+                let _ = read_proto_varint(buf, &mut pos)?;
+                ProtoValue::Varint
+            }
+            1 => {
+                let end = pos.checked_add(8)?;
+                if end > buf.len() {
+                    return None;
+                }
+                pos = end;
+                ProtoValue::Fixed64
+            }
+            2 => {
+                let len = usize::try_from(read_proto_varint(buf, &mut pos)?).ok()?;
+                let end = pos.checked_add(len)?;
+                let slice = buf.get(pos..end)?;
+                pos = end;
+                ProtoValue::Bytes(slice)
+            }
+            5 => {
+                let end = pos.checked_add(4)?;
+                if end > buf.len() {
+                    return None;
+                }
+                pos = end;
+                ProtoValue::Fixed32
+            }
+            _ => return None,
+        };
+        f(field_num, val)?;
+    }
+    Some(())
+}
+
+fn extract_kubelet_version_from_node_json(buf: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(buf).ok()?;
+    if let Some(kind) = v.get("kind").and_then(serde_json::Value::as_str)
+        && !kind.is_empty()
+        && kind != "Node"
+    {
+        return None;
+    }
+    if let Some(api_version) = v.get("apiVersion").and_then(serde_json::Value::as_str)
+        && !api_version.is_empty()
+        && api_version != "v1"
+    {
+        return None;
+    }
+    v.get("status")?
+        .get("nodeInfo")?
+        .get("kubeletVersion")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract `status.nodeInfo.kubeletVersion` from a serialized Kubernetes
+/// `core/v1.Node` protobuf message (`Node.status = 3`, `NodeStatus.nodeInfo = 7`,
+/// `NodeSystemInfo.kubeletVersion = 7`).
+fn extract_kubelet_version_from_node_proto(buf: &[u8]) -> Option<String> {
+    let mut kubelet_version: Option<String> = None;
+    for_each_proto_field(buf, |field, val| {
+        if field == 3 {
+            let ProtoValue::Bytes(status_buf) = val else {
+                return None;
+            };
+            for_each_proto_field(status_buf, |sfield, sval| {
+                if sfield == 7 {
+                    let ProtoValue::Bytes(info_buf) = sval else {
+                        return None;
+                    };
+                    for_each_proto_field(info_buf, |ifield, ival| {
+                        if ifield == 7 {
+                            let ProtoValue::Bytes(ver_bytes) = ival else {
+                                return None;
+                            };
+                            let s = std::str::from_utf8(ver_bytes).ok()?;
+                            kubelet_version = Some(s.to_string());
+                        }
+                        Some(())
+                    })?;
+                }
+                Some(())
+            })?;
+        }
+        Some(())
+    })?;
+    kubelet_version.filter(|s| !s.is_empty())
+}
+
+/// Extract `status.nodeInfo.kubeletVersion` from a Kubernetes `Node` object
+/// stored in kine's `value` column (either `k8s\0` + `runtime.Unknown` protobuf
+/// envelope or plain JSON).
+fn extract_kubelet_version_from_node_blob(blob: &[u8]) -> Option<String> {
+    if let Some(body) = blob.strip_prefix(b"k8s\0") {
+        let mut api_version = "";
+        let mut kind = "";
+        let mut raw: Option<&[u8]> = None;
+        let mut content_encoding = "";
+        let mut content_type = "";
+        for_each_proto_field(body, |field, val| {
+            match field {
+                1 => {
+                    let ProtoValue::Bytes(tm_buf) = val else {
+                        return None;
+                    };
+                    for_each_proto_field(tm_buf, |tfield, tval| {
+                        match tfield {
+                            1 => {
+                                let ProtoValue::Bytes(b) = tval else {
+                                    return None;
+                                };
+                                api_version = std::str::from_utf8(b).ok()?;
+                            }
+                            2 => {
+                                let ProtoValue::Bytes(b) = tval else {
+                                    return None;
+                                };
+                                kind = std::str::from_utf8(b).ok()?;
+                            }
+                            _ => {}
+                        }
+                        Some(())
+                    })?;
+                }
+                2 => {
+                    let ProtoValue::Bytes(b) = val else {
+                        return None;
+                    };
+                    raw = Some(b);
+                }
+                3 => {
+                    let ProtoValue::Bytes(b) = val else {
+                        return None;
+                    };
+                    content_encoding = std::str::from_utf8(b).ok()?;
+                }
+                4 => {
+                    let ProtoValue::Bytes(b) = val else {
+                        return None;
+                    };
+                    content_type = std::str::from_utf8(b).ok()?;
+                }
+                _ => {}
+            }
+            Some(())
+        })?;
+        if !content_encoding.is_empty() {
+            return None;
+        }
+        if !api_version.is_empty() && api_version != "v1" {
+            return None;
+        }
+        if !kind.is_empty() && kind != "Node" {
+            return None;
+        }
+        let raw = raw.filter(|r| !r.is_empty())?;
+        return match content_type {
+            "" | "application/vnd.kubernetes.protobuf" => {
+                extract_kubelet_version_from_node_proto(raw)
+            }
+            "application/json" => extract_kubelet_version_from_node_json(raw),
+            _ => None,
+        };
+    }
+    let trimmed = blob.trim_ascii_start();
+    if trimmed.starts_with(b"{") {
+        return extract_kubelet_version_from_node_json(trimmed);
+    }
+    None
+}
+
+/// Inspect `data_dir/server/db/state.db` read-only (never modifying any file in
+/// `data_dir/server/`) to detect the k3s version recorded in live Kubernetes
+/// `Node` objects (`/registry/minions/*`).
+///
+/// Fails closed (returns `None`) if `sqlite3` is unavailable, any path component
+/// is a symlink or non-regular file, `kine` is not a plain table, output is
+/// truncated, or live node versions are missing, unparseable, or disagree on
+/// `(major, minor)`.
+fn detect_datastore_version_from_state_db_with(
+    data_dir: &Path,
+    sqlite3_bin: &Path,
+    mut run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
+) -> Option<String> {
+    if !sqlite3_bin.is_file() {
+        log(&format!(
+            "cannot inspect unmarked state.db: {} is not available",
+            sqlite3_bin.display()
+        ));
+        return None;
+    }
+    let server_dir = data_dir.join("server");
+    if !fs::symlink_metadata(&server_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return None;
+    }
+    let db_dir = server_dir.join("db");
+    if !fs::symlink_metadata(&db_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return None;
+    }
+    let db_path = db_dir.join("state.db");
+    if !fs::symlink_metadata(&db_path).is_ok_and(|m| m.file_type().is_file()) {
+        return None;
+    }
+    let wal_path = db_dir.join("state.db-wal");
+    let shm_path = db_dir.join("state.db-shm");
+    let journal_path = db_dir.join("state.db-journal");
+    let wal_len = match inspect_regular_companion(&wal_path) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("skip state.db detection: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = inspect_regular_companion(&shm_path) {
+        log(&format!("skip state.db detection: {e}"));
+        return None;
+    }
+    let journal_len = match inspect_regular_companion(&journal_path) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("skip state.db detection: {e}"));
+            return None;
+        }
+    };
+
+    let (_scratch, sqlite_target) = if wal_len.unwrap_or(0) == 0 && journal_len.unwrap_or(0) == 0 {
+        if !db_path.is_absolute() {
+            return None;
+        }
+        (
+            None,
+            format!("file:{}?immutable=1", encode_sqlite_uri_path(&db_path)),
+        )
+    } else {
+        let parent = data_dir.parent()?;
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let scratch_path = parent.join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
+        if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
+            log(&format!(
+                "create state.db scratch dir {}: {e}",
+                scratch_path.display()
+            ));
+            return None;
+        }
+        let guard = ScratchDir(scratch_path);
+        let scratch_db = guard.0.join("state.db");
+        if let Err(e) = clone_or_copy_regular_file(&db_path, &scratch_db) {
+            log(&format!("copy state.db for inspection: {e}"));
+            return None;
+        }
+        if wal_len.is_some()
+            && let Err(e) = clone_or_copy_regular_file(&wal_path, &guard.0.join("state.db-wal"))
+        {
+            log(&format!("copy state.db-wal for inspection: {e}"));
+            return None;
+        }
+        if journal_len.is_some()
+            && let Err(e) =
+                clone_or_copy_regular_file(&journal_path, &guard.0.join("state.db-journal"))
+        {
+            log(&format!("copy state.db-journal for inspection: {e}"));
+            return None;
+        }
+        let uri = format!("file:{}", encode_sqlite_uri_path(&scratch_db));
+        (Some(guard), uri)
+    };
+
+    let mut query = |sql: &str| -> Option<String> {
+        let mut cmd = Command::new(sqlite3_bin);
+        cmd.args([
+            "-bail",
+            "-batch",
+            "-noheader",
+            "-list",
+            "-safe",
+            "-cmd",
+            ".timeout 5000",
+            &sqlite_target,
+            sql,
+        ]);
+        match run_cmd(&mut cmd) {
+            Ok((0, out)) => Some(out),
+            Ok((code, _)) => {
+                log(&format!("sqlite3 inspection exited {code}"));
+                None
+            }
+            Err(e) => {
+                log(&format!("sqlite3 inspection failed: {e}"));
+                None
+            }
+        }
+    };
+
+    const SCHEMA_SQL: &str = "\
+PRAGMA trusted_schema = OFF;
+SELECT CASE
+    WHEN type = 'table' AND upper(ltrim(coalesce(sql, ''))) NOT LIKE 'CREATE VIRTUAL %'
+    THEN 'OK'
+    ELSE 'BAD'
+END
+FROM main.sqlite_master
+WHERE name = 'kine';";
+    if query(SCHEMA_SQL)?.trim() != "OK" {
+        return None;
+    }
+
+    let nodes_sql = format!(
+        "\
+PRAGMA trusted_schema = OFF;
+SELECT CASE
+    WHEN k.value IS NULL OR length(k.value) = 0 THEN 'EMPTY'
+    WHEN length(k.value) > {STATE_DB_MAX_BLOB_BYTES} THEN 'OVERSIZED'
+    ELSE length(k.value) || ':' || hex(k.value)
+END
+FROM main.kine k
+INNER JOIN (
+    SELECT name, MAX(id) AS max_id
+    FROM main.kine
+    WHERE name >= '/registry/minions/'
+      AND name < '/registry/minions0'
+    GROUP BY name
+) latest ON k.name = latest.name AND k.id = latest.max_id
+WHERE k.deleted = 0
+ORDER BY k.id DESC
+LIMIT {};
+SELECT 'END';",
+        STATE_DB_MAX_NODE_ROWS + 1
+    );
+    let raw_out = query(&nodes_sql)?;
+    let lines: Vec<&str> = raw_out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let (&last, rows) = lines.split_last()?;
+    if last != "END" || rows.is_empty() || rows.len() > STATE_DB_MAX_NODE_ROWS {
+        return None;
+    }
+
+    let mut chosen: Option<(String, (u32, u32))> = None;
+    for row in rows {
+        let (len_str, hex_str) = row.split_once(':')?;
+        let expected_len: usize = len_str.parse().ok()?;
+        if expected_len == 0
+            || expected_len > STATE_DB_MAX_BLOB_BYTES
+            || hex_str.len() != expected_len.checked_mul(2)?
+        {
+            return None;
+        }
+        let blob = decode_hex(hex_str)?;
+        let version = extract_kubelet_version_from_node_blob(&blob)?;
+        let mm = parse_strict_k3s_tag(&version)?;
+        match &chosen {
+            None => chosen = Some((version, mm)),
+            Some((_, prev_mm)) if *prev_mm == mm => {}
+            Some(_) => return None,
+        }
+    }
+    chosen.map(|(v, _)| v)
+}
+
 /// Record an independently verified k3s release tag in `data_version_file` for
 /// an existing unmarked datastore under `data_dir`. Refuses to run when no
-/// datastore exists and refuses to overwrite any existing marker.
-fn mark_datastore_version_at(
+/// datastore exists, refuses to overwrite any existing marker, and refuses to
+/// mark a lower minor than `server/db/state.db` already records.
+fn mark_datastore_version_at_with(
     data_dir: &Path,
     data_version_file: &Path,
     version: &str,
+    sqlite3_bin: &Path,
+    run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Result<(), String> {
     validate_k3s_release_tag(version)?;
     if !datastore_exists(data_dir)? {
@@ -486,26 +990,50 @@ fn mark_datastore_version_at(
             return Err(format!("stat {}: {e}", data_version_file.display()));
         }
     }
+    if let Some(detected) =
+        detect_datastore_version_from_state_db_with(data_dir, sqlite3_bin, run_cmd)
+        && let (Some(supplied_mm), Some(detected_mm)) = (
+            parse_strict_k3s_tag(version),
+            parse_strict_k3s_tag(&detected),
+        )
+        && supplied_mm < detected_mm
+    {
+        return Err(format!(
+            "refusing to mark datastore as {version}: server/db/state.db already records newer k3s {detected}"
+        ));
+    }
     write_atomic_new(data_version_file, format!("{version}\n").as_bytes())
 }
 
 /// Return the k3s version associated with an existing datastore under `data_dir`.
 ///
-/// Uses only `data_version_file` inside `data_dir` (never falling back to
-/// `VERSION_FILE`), so `reset` clears it together with cluster data and an
-/// unmarked restored datastore can never inherit an unrelated installed binary's
-/// version. Only recommends `kat k8s mark-version` when `data_version_file` is
-/// absent (`NotFound`), never when an empty or non-regular marker already exists.
-fn effective_datastore_version(
+/// Uses `data_version_file` inside `data_dir` when present, and never falls
+/// back to `VERSION_FILE` (the installed binary's version). When
+/// `data_version_file` is absent (`NotFound`), inspects `server/db/state.db`
+/// read-only for the node's recorded `kubeletVersion` so existing clusters
+/// from older Katamaran releases upgrade seamlessly while still rejecting
+/// unmarked newer backups. Only recommends `kat k8s mark-version` when
+/// `data_version_file` is absent (`NotFound`) and `state.db` cannot determine
+/// the version, never when an empty or non-regular marker already exists.
+fn effective_datastore_version_with(
     data_dir: &Path,
     data_version_file: &Path,
+    sqlite3_bin: &Path,
+    run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Result<Option<String>, String> {
     if !datastore_exists(data_dir)? {
         return Ok(None);
     }
     match read_marker_file(data_version_file)? {
         MarkerFile::Present(v) => Ok(Some(v)),
-        MarkerFile::Missing => Err(missing_datastore_version_error(data_dir, data_version_file)),
+        MarkerFile::Missing => {
+            if let Some(detected) =
+                detect_datastore_version_from_state_db_with(data_dir, sqlite3_bin, run_cmd)
+            {
+                return Ok(Some(detected));
+            }
+            Err(missing_datastore_version_error(data_dir, data_version_file))
+        }
         MarkerFile::Empty => Err(corrupt_datastore_version_error(
             data_version_file,
             "is empty",
@@ -519,12 +1047,16 @@ fn effective_datastore_version(
 
 /// Refuse to install or start a lower Kubernetes minor or skip one or more
 /// intermediate minors against an existing datastore without modifying `data_dir`.
-fn check_datastore_compatible(
+fn check_datastore_compatible_with(
     data_dir: &Path,
     data_version_file: &Path,
     target_version: &str,
+    sqlite3_bin: &Path,
+    run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Result<(), String> {
-    let Some(existing) = effective_datastore_version(data_dir, data_version_file)? else {
+    let Some(existing) =
+        effective_datastore_version_with(data_dir, data_version_file, sqlite3_bin, run_cmd)?
+    else {
         return Ok(());
     };
     let target_mm = parse_k3s_minor(target_version)
@@ -1127,6 +1659,15 @@ impl K8s {
         }
     }
 
+    fn run_sqlite_cmd(&self, cmd: &mut Command) -> Result<(i32, String), String> {
+        let (code, stdout, stderr) = run_reaped_split(&self.reaper, cmd, Duration::from_secs(10))
+            .map_err(|e| format!("sqlite3: {e}"))?;
+        if code != 0 && !stderr.trim().is_empty() {
+            log(&format!("sqlite3 stderr: {}", stderr.trim()));
+        }
+        Ok((code, stdout))
+    }
+
     fn mark_datastore_version(&self, version: &str) -> Result<(), String> {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
@@ -1146,7 +1687,13 @@ impl K8s {
                 );
             }
         }
-        mark_datastore_version_at(Path::new(DATA_DIR), Path::new(DATA_VERSION_FILE), version)?;
+        mark_datastore_version_at_with(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            version,
+            Path::new(SQLITE3_BIN),
+            |cmd| self.run_sqlite_cmd(cmd),
+        )?;
         log(&format!("recorded datastore version {version}"));
         Ok(())
     }
@@ -1162,7 +1709,13 @@ impl K8s {
         if self.state.lock().unwrap().running.is_some() {
             return Err("stop Kubernetes before installing a new k3s binary".into());
         }
-        check_datastore_compatible(Path::new(DATA_DIR), Path::new(DATA_VERSION_FILE), version)?;
+        check_datastore_compatible_with(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            version,
+            Path::new(SQLITE3_BIN),
+            |cmd| self.run_sqlite_cmd(cmd),
+        )?;
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress(format!("installing k3s {version}")),
@@ -1240,10 +1793,12 @@ impl K8s {
             "k3s installation is incomplete (missing version marker); restart Kubernetes to reinstall"
                 .to_string()
         })?;
-        check_datastore_compatible(
+        check_datastore_compatible_with(
             Path::new(DATA_DIR),
             Path::new(DATA_VERSION_FILE),
             &installed_version,
+            Path::new(SQLITE3_BIN),
+            |cmd| self.run_sqlite_cmd(cmd),
         )?;
         let _ = k8s::write(
             &mut *conn,
@@ -3499,5 +4054,419 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(!target.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn run_test_cmd(cmd: &mut Command) -> Result<(i32, String), String> {
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        let code = out.status.code().unwrap_or(-1);
+        Ok((code, String::from_utf8_lossy(&out.stdout).into_owned()))
+    }
+
+    fn check_datastore_compatible(
+        data_dir: &Path,
+        data_version_file: &Path,
+        target_version: &str,
+    ) -> Result<(), String> {
+        check_datastore_compatible_with(
+            data_dir,
+            data_version_file,
+            target_version,
+            Path::new(SQLITE3_BIN),
+            run_test_cmd,
+        )
+    }
+
+    fn mark_datastore_version_at(
+        data_dir: &Path,
+        data_version_file: &Path,
+        version: &str,
+    ) -> Result<(), String> {
+        mark_datastore_version_at_with(
+            data_dir,
+            data_version_file,
+            version,
+            Path::new(SQLITE3_BIN),
+            run_test_cmd,
+        )
+    }
+
+    fn push_proto_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_proto_bytes(out: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+        push_proto_varint(out, (u64::from(field) << 3) | 2);
+        push_proto_varint(out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+    }
+
+    fn encode_k8s_node_proto(kubelet_version: &str) -> Vec<u8> {
+        let mut node_info = Vec::new();
+        push_proto_bytes(&mut node_info, 1, b"machine-id-123");
+        push_proto_bytes(&mut node_info, 4, b"6.18.64");
+        push_proto_bytes(&mut node_info, 6, b"containerd://2.0.0");
+        push_proto_bytes(&mut node_info, 7, kubelet_version.as_bytes());
+        push_proto_bytes(&mut node_info, 9, b"linux");
+        push_proto_bytes(&mut node_info, 10, b"arm64");
+
+        let mut node_status = Vec::new();
+        push_proto_bytes(&mut node_status, 3, b"Running");
+        push_proto_bytes(&mut node_status, 7, &node_info);
+
+        let mut node = Vec::new();
+        push_proto_bytes(&mut node, 1, b"\x0a\x09katamaran");
+        push_proto_bytes(&mut node, 3, &node_status);
+
+        let mut type_meta = Vec::new();
+        push_proto_bytes(&mut type_meta, 1, b"v1");
+        push_proto_bytes(&mut type_meta, 2, b"Node");
+
+        let mut unknown = Vec::new();
+        push_proto_bytes(&mut unknown, 1, &type_meta);
+        push_proto_bytes(&mut unknown, 2, &node);
+
+        let mut out = Vec::with_capacity(4 + unknown.len());
+        out.extend_from_slice(b"k8s\0");
+        out.extend_from_slice(&unknown);
+        out
+    }
+
+    fn hex_upper(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            s.push_str(&format!("{b:02X}"));
+        }
+        s
+    }
+
+    fn sqlite_exec(db: &Path, sql: &str) {
+        let out = Command::new(SQLITE3_BIN)
+            .args(["-bail", "-batch"])
+            .arg(db)
+            .arg(sql)
+            .output()
+            .expect("run sqlite3");
+        assert!(
+            out.status.success(),
+            "sqlite3 failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn extracts_kubelet_version_from_k8s_protobuf_and_json_nodes() {
+        let proto = encode_k8s_node_proto("v1.37.2+k3s1");
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&proto).as_deref(),
+            Some("v1.37.2+k3s1")
+        );
+
+        // Explicit protobuf contentType inside runtime.Unknown.
+        let mut with_ct = proto.clone();
+        push_proto_bytes(&mut with_ct, 4, b"application/vnd.kubernetes.protobuf");
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&with_ct).as_deref(),
+            Some("v1.37.2+k3s1")
+        );
+
+        // Plain JSON Node.
+        let json = br#"{"apiVersion":"v1","kind":"Node","status":{"nodeInfo":{"kubeletVersion":"v1.32.5+k3s1"}}}"#;
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(json).as_deref(),
+            Some("v1.32.5+k3s1")
+        );
+
+        // JSON wrapped inside k8s\0 runtime.Unknown envelope.
+        let mut unknown_json = b"k8s\0".to_vec();
+        push_proto_bytes(&mut unknown_json, 2, json);
+        push_proto_bytes(&mut unknown_json, 4, b"application/json");
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&unknown_json).as_deref(),
+            Some("v1.32.5+k3s1")
+        );
+
+        // Non-empty contentEncoding, wrong kind, truncated protobuf, or missing field fail closed.
+        let mut compressed = proto.clone();
+        push_proto_bytes(&mut compressed, 3, b"gzip");
+        assert_eq!(extract_kubelet_version_from_node_blob(&compressed), None);
+
+        let wrong_kind =
+            br#"{"apiVersion":"v1","kind":"Pod","status":{"nodeInfo":{"kubeletVersion":"v1.37.2+k3s1"}}}"#;
+        assert_eq!(extract_kubelet_version_from_node_blob(wrong_kind), None);
+
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&proto[..proto.len() - 3]),
+            None
+        );
+        assert_eq!(extract_kubelet_version_from_node_blob(b"not-k8s"), None);
+    }
+
+    #[test]
+    fn unmarked_state_db_enables_seamless_upgrade_and_blocks_downgrade_without_mutation() {
+        assert!(
+            Path::new(SQLITE3_BIN).is_file(),
+            "{SQLITE3_BIN} must be installed in the Linux test environment"
+        );
+
+        let dir = temp_dir("state-db-detection");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let db_dir = data_dir.join("server/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("state.db");
+
+        let v32 = hex_upper(&encode_k8s_node_proto("v1.32.5+k3s1"));
+        let v37 = hex_upper(&encode_k8s_node_proto("v1.37.2+k3s1"));
+        let v38 = hex_upper(&encode_k8s_node_proto("v1.38.0+k3s1"));
+
+        // 1. Pre-tracking v1.37.2+k3s1 datastore (no .katamaran-version), plus an older
+        // deleted node row that must be ignored because its head revision has deleted=1.
+        sqlite_exec(
+            &db_path,
+            &format!(
+                "CREATE TABLE kine (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    created INTEGER,
+                    deleted INTEGER,
+                    create_revision INTEGER,
+                    prev_revision INTEGER,
+                    lease INTEGER,
+                    value BLOB,
+                    old_value BLOB
+                );
+                CREATE INDEX kine_name_id_index ON kine (name, id);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/old-node', 0, X'{v32}');
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/old-node', 1, X'');
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+
+        let before = snapshot_datastore(&data_dir).unwrap();
+        // Seamless start on the unchanged pinned build and 1-minor upgrade both pass.
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap();
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.38.0+k3s1").unwrap();
+        // Downgrade and skipped-minor jump are both blocked without modifying server/.
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
+        assert!(err.contains("v1.32.5+k3s1"), "{err}");
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.39.0+k3s1").unwrap_err();
+        assert!(err.contains("skipping minor versions"), "{err}");
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+        assert!(!data_version_file.exists());
+
+        // 2. Unmarked newer (v1.38.0+k3s1) datastore blocks starting pinned v1.37.2+k3s1
+        // and blocks `mark-version` with a lower minor.
+        sqlite_exec(
+            &db_path,
+            &format!(
+                "INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v38}');"
+            ),
+        );
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(
+            err.contains("state.db already records newer k3s v1.38.0+k3s1"),
+            "{err}"
+        );
+
+        // 3. WAL-mode state.db with uncheckpointed v1.38.0+k3s1 ONLY in state.db-wal:
+        // detection reads the WAL without modifying server/db/ and cleans up its scratch dir.
+        let wal_src = dir.join("wal-src");
+        fs::create_dir_all(&wal_src).unwrap();
+        let wal_src_db = wal_src.join("state.db");
+        sqlite_exec(
+            &wal_src_db,
+            &format!(
+                "PRAGMA journal_mode=WAL;
+                CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                CREATE INDEX kine_name_id_index ON kine (name, id);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+        // Hold an open read transaction while appending v1.38 so it remains uncheckpointed in -wal.
+        let mut reader = Command::new(SQLITE3_BIN)
+            .arg(&wal_src_db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        {
+            let stdin = reader.stdin.as_mut().unwrap();
+            writeln!(stdin, "BEGIN;").unwrap();
+            writeln!(stdin, "SELECT count(*) FROM kine;").unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            let mut stdout = BufReader::new(reader.stdout.take().unwrap());
+            stdout.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "1");
+        }
+        sqlite_exec(
+            &wal_src_db,
+            &format!(
+                "PRAGMA wal_autocheckpoint=0;
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v38}');"
+            ),
+        );
+
+        let wal_root = dir.join("wal-case");
+        let wal_data = wal_root.join("data");
+        let wal_marker = wal_data.join(".katamaran-version");
+        let wal_db_dir = wal_data.join("server/db");
+        fs::create_dir_all(&wal_db_dir).unwrap();
+        fs::copy(&wal_src_db, wal_db_dir.join("state.db")).unwrap();
+        fs::copy(
+            wal_src.join("state.db-wal"),
+            wal_db_dir.join("state.db-wal"),
+        )
+        .unwrap();
+        drop(reader.stdin.take());
+        let _ = reader.wait();
+        assert!(
+            fs::metadata(wal_db_dir.join("state.db-wal")).unwrap().len() > 0,
+            "state.db-wal must be non-empty"
+        );
+
+        // Confirm main state.db alone (immutable=1) still has only v1.37, proving v1.38
+        // lives strictly in state.db-wal.
+        let imm_out = Command::new(SQLITE3_BIN)
+            .args([
+                "-bail",
+                "-batch",
+                "-noheader",
+                "-list",
+                "-safe",
+                &format!(
+                    "file:{}?immutable=1",
+                    encode_sqlite_uri_path(&wal_db_dir.join("state.db"))
+                ),
+                "SELECT hex(value) FROM kine ORDER BY id DESC LIMIT 1;",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&imm_out.stdout).trim(),
+            v37,
+            "v1.38 row must reside solely in uncheckpointed state.db-wal"
+        );
+
+        let wal_before = snapshot_datastore(&wal_data).unwrap();
+        let err = check_datastore_compatible(&wal_data, &wal_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        check_datastore_compatible(&wal_data, &wal_marker, "v1.38.0+k3s1").unwrap();
+        assert_eq!(snapshot_datastore(&wal_data).unwrap(), wal_before);
+        assert!(!wal_db_dir.join("state.db-shm").exists());
+        let leftover_scratch: Vec<_> = fs::read_dir(&wal_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".state-db-inspect.")
+            })
+            .collect();
+        assert!(leftover_scratch.is_empty(), "{leftover_scratch:?}");
+
+        // 4. JSON-encoded Node row is also detected accurately.
+        let json_data = dir.join("json-case/data");
+        let json_marker = json_data.join(".katamaran-version");
+        fs::create_dir_all(json_data.join("server/db")).unwrap();
+        let json_blob = hex_upper(
+            br#"{"apiVersion":"v1","kind":"Node","status":{"nodeInfo":{"kubeletVersion":"v1.36.4+k3s1"}}}"#,
+        );
+        sqlite_exec(
+            &json_data.join("server/db/state.db"),
+            &format!(
+                "CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{json_blob}');"
+            ),
+        );
+        check_datastore_compatible(&json_data, &json_marker, "v1.36.4+k3s1").unwrap();
+        check_datastore_compatible(&json_data, &json_marker, "v1.37.2+k3s1").unwrap();
+        assert!(check_datastore_compatible(&json_data, &json_marker, "v1.35.0+k3s1").is_err());
+
+        // 5. Fail-closed cases (conflicting live node minors, malicious VIEW kine,
+        // symlinked state.db, missing sqlite3) fall back to missing_datastore_version_error.
+        sqlite_exec(
+            &json_data.join("server/db/state.db"),
+            &format!(
+                "INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/node2', 0, X'{v37}');"
+            ),
+        );
+        let err = check_datastore_compatible(&json_data, &json_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+        assert!(err.contains("kat k8s mark-version"), "{err}");
+
+        let view_data = dir.join("view-case/data");
+        let view_marker = view_data.join(".katamaran-version");
+        fs::create_dir_all(view_data.join("server/db")).unwrap();
+        sqlite_exec(
+            &view_data.join("server/db/state.db"),
+            &format!(
+                "CREATE TABLE backing (id INTEGER PRIMARY KEY, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO backing VALUES (1, '/registry/minions/katamaran', 0, X'{v37}');
+                CREATE VIEW kine AS SELECT * FROM backing;"
+            ),
+        );
+        let err = check_datastore_compatible(&view_data, &view_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        let sym_data = dir.join("sym-case/data");
+        let sym_marker = sym_data.join(".katamaran-version");
+        fs::create_dir_all(sym_data.join("server/db")).unwrap();
+        symlink(&db_path, sym_data.join("server/db/state.db")).unwrap();
+        let err = check_datastore_compatible(&sym_data, &sym_marker, "v1.38.0+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        let err = check_datastore_compatible_with(
+            &data_dir,
+            &data_version_file,
+            "v1.38.0+k3s1",
+            Path::new("/nonexistent/sqlite3"),
+            run_test_cmd,
+        )
+        .unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_resolves_rootfs_nft_for_oldest_supported_k3s() {
+        // k3s prepends its own bin dir; when that lacks `nft` (k3s v1.31.0-v1.31.5),
+        // kube-proxy's nftables mode must find the rootfs nftables package's binary.
+        assert!(PATH.split(':').any(|d| d == "/usr/sbin"), "{PATH}");
+        let rootfs = include_str!("../../../../guest/rootfs/build.sh");
+        let packages = rootfs
+            .split("PACKAGES=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("PACKAGES list in guest/rootfs/build.sh");
+        for pkg in ["nftables", "sqlite"] {
+            assert!(
+                packages.split_whitespace().any(|p| p == pkg),
+                "guest rootfs must ship {pkg}: {packages}"
+            );
+        }
+        assert_eq!(validate_k3s_release_tag("v1.31.0+k3s1"), Ok(()));
+        assert!(validate_k3s_release_tag("v1.30.9+k3s1").is_err());
     }
 }

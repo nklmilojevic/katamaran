@@ -53,6 +53,9 @@ jobs:
         with:
           go-version: '1.27.x'
           cache: false
+      # kat-init's state.db version-detection tests drive /usr/bin/sqlite3, as the guest does.
+      - name: Install sqlite3
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
       - name: Clippy (kat-init, kat-proto)
         run: |
           cargo clippy --locked -p kat-init -p kat-proto \
