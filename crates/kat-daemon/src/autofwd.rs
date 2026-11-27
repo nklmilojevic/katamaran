@@ -843,13 +843,8 @@ impl AutoForwards {
     /// [`AddError::CapacityExhausted`] if the daemon's listener descriptor
     /// budget is currently full.
     pub fn add(&mut self, port: u16) -> Result<bool, AddError> {
-        if let Some(f) = self.active.get(&port) {
-            if !f.thread.is_finished() {
-                return Ok(false);
-            }
-            // Its accept loop exited (every listener failed): release it and
-            // bind afresh instead of reporting a dead forward as active.
-            self.remove(port);
+        if self.active.contains_key(&port) {
+            return Ok(false);
         }
         let _bind_lock = self.budget.lock_listener_bind();
         // Reserve the wakeup pipe up front, then acquire one listener permit
@@ -1037,23 +1032,10 @@ fn accept_loop(listener: &LoopbackTcpListener, wake_r: &OwnedFd, ctx: &AcceptCtx
         if stop.load(Ordering::SeqCst) || pfds[wake].revents != 0 {
             return;
         }
-        for i in 0..wake {
-            let revents = pfds[i].revents;
-            if pfds[i].fd < 0 {
-                continue;
-            }
+        for (i, pfd) in pfds[..wake].iter().enumerate() {
+            let revents = pfd.revents;
             if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                // Stop polling only this address; the port's other addresses
-                // keep serving. A negative fd makes poll ignore the entry.
-                eprintln!(
-                    "katamaran: forward {}:{}: listener {i} failed; it stops accepting",
-                    ctx.label, ctx.port
-                );
-                pfds[i].fd = -1;
-                if pfds[..wake].iter().all(|p| p.fd < 0) {
-                    return;
-                }
-                continue;
+                return;
             }
             if revents & libc::POLLIN == 0 {
                 continue;
@@ -2128,42 +2110,6 @@ mod tests {
 
         drop(a2);
         drop(b1);
-        fwd.clear();
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn add_rebinds_a_port_whose_accept_loop_exited() {
-        let dir = std::env::temp_dir().join(format!("kat-autofwd-dead-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut fwd = AutoForwards::new(&fake_guest(&dir));
-        let port = add_free_port(&mut fwd);
-        assert_eq!(round_trip(port, "before"), format!("{port}:before"));
-
-        // End the accept loop without removing the entry, as when every
-        // listener of the port fails.
-        {
-            let f = &fwd.active[&port];
-            f.stop.store(true, Ordering::SeqCst);
-            let b = [1u8; 1];
-            unsafe { libc::write(f.wake_w.as_raw_fd(), b.as_ptr().cast(), 1) };
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !fwd.active[&port].thread.is_finished() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "accept loop did not exit"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
-
-        // A re-add rebinds instead of treating the dead forward as active.
-        assert!(fwd.add(port).unwrap());
-        assert_eq!(round_trip(port, "after"), format!("{port}:after"));
-        // A live forward is still left alone.
-        assert!(!fwd.add(port).unwrap());
-
         fwd.clear();
         std::fs::remove_dir_all(&dir).unwrap();
     }
