@@ -7,6 +7,8 @@
 #                                    then run moby's check-config.sh -> guest/out/check-config.txt
 #   guest/kernel/build.sh clean      drop the object tree (keeps the source and ccache volumes)
 #   guest/kernel/build.sh shell CMD  run CMD in the build container, cwd = prepared source tree
+#                                    (guest/out is read-only there; edits to the cached tree are
+#                                    kept and built by the next build until the patch set changes)
 #   guest/kernel/build.sh stamp      print the input stamp (no Docker); a build records it in
 #                                    guest/out/Image.stamp so `cargo xtask test-vm` can reject
 #                                    an Image built from older patches or config
@@ -143,9 +145,6 @@ MAKE=(make -C "/work/$tree" O="/work/$obj" ARCH=arm64 CC="ccache gcc" -j"$(nproc
 
 case "$MODE" in
 shell)
-	# A shell may replace /out/Image or edit the cached tree by hand; never leave a stamp
-	# vouching for either, and make the next build re-extract a pristine patched tree.
-	rm -f /out/Image.stamp src/stamp
 	cd "/work/$tree"
 	exec bash -c "$SHELL_CMD"
 	;;
@@ -244,10 +243,14 @@ ensure_toolchain
 "${DOCKER[@]}" volume create "$CCACHE_VOL" >/dev/null
 
 tty=()
+# A shell can inspect or edit the cached tree but never replace guest/out/Image (or its stamp):
+# only a full build installs an Image.
+out_mode=
+[ "$MODE" = shell ] && out_mode=:ro
 [ "$MODE" = shell ] && [ -t 0 ] && [ -t 1 ] && tty=(-it)
 "${DOCKER[@]}" run --rm "${tty[@]}" --name "katamaran-kbuild-$$" \
 	-v "$SRC_VOL":/work -v "$CCACHE_VOL":/ccache \
-	-v "$HERE":/in:ro -v "$OUT":/out \
+	-v "$HERE":/in:ro -v "$OUT":/out"$out_mode" \
 	--sysctl net.ipv4.ip_forward=1 --sysctl net.ipv6.conf.all.forwarding=1 \
 	--sysctl net.ipv6.conf.default.forwarding=1 \
 	-e MODE="$MODE" -e SHELL_CMD="$SHELL_CMD" \
