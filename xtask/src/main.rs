@@ -153,6 +153,8 @@ fn main() -> anyhow::Result<()> {
                     "machines",
                     "--test",
                     "amd64",
+                    "--test",
+                    "k8s_config",
                     "--",
                     "--ignored",
                     "--test-threads",
