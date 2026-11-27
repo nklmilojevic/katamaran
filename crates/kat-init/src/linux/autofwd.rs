@@ -12,7 +12,7 @@
 //!
 //! Ports Docker published on a loopback address of the VM
 //! (`-p 127.0.0.1:8080:80`) take the same path: their route stays in the
-//! root namespace and dials docker-proxy's loopback address there. Only the
+//! root namespace and dials the container target, as docker-proxy does. Only the
 //! Mac reaches the relay (over vsock), so such a port is never exposed on the
 //! VM's interfaces. This needs Docker's userland proxy, which the guest image
 //! leaves on: without it, a loopback `-p` is an iptables DNAT that only
@@ -77,9 +77,6 @@ struct Dial {
     /// relay already runs.
     ns: Option<Arc<OwnedFd>>,
     target: SocketAddr,
-    /// For a loopback `-p` port: docker-proxy's listening socket, which must
-    /// still be the one on `target` when a connection comes in.
-    listener: Option<u32>,
 }
 
 type Routes = Arc<Mutex<HashMap<u16, Dial>>>;
@@ -90,9 +87,9 @@ struct Proxies {
     /// `-container-ip`/`-container-port`.
     targets: BTreeSet<(IpAddr, u16)>,
     /// Every socket a proxy with a loopback `-host-ip` holds, as a
-    /// listener on its `-host-ip`/`-host-port`: the one that is really
-    /// listening there is the proxy's.
-    loopback: BTreeSet<Listener>,
+    /// listener on its `-host-ip`/`-host-port` (the one that is really
+    /// listening there is the proxy's), with its container target.
+    loopback: BTreeMap<Listener, SocketAddr>,
 }
 
 pub struct AutoForward {
@@ -108,8 +105,10 @@ pub struct AutoForward {
     loopback: Vec<Listener>,
     /// Loopback listeners no docker-proxy held yet, with when they appeared.
     unmatched: BTreeMap<Listener, Instant>,
-    /// How long new loopback listeners are matched against docker-proxy.
+    /// How long new loopback listeners are matched against docker-proxy on
+    /// every tick; after that, every [`SETTLED_INTERVAL`].
     settling: Duration,
+    proxies_read_at: Instant,
     next_seen: u64,
     seq: u32,
     buf: Vec<u8>,
@@ -144,6 +143,7 @@ impl AutoForward {
             loopback: Vec::new(),
             unmatched: BTreeMap::new(),
             settling: SETTLING,
+            proxies_read_at: Instant::now(),
             next_seen: 0,
             seq: 0,
             buf: vec![0; 32 << 10],
@@ -195,13 +195,17 @@ impl AutoForward {
         }
         // dockerd binds a `-p` port itself and only then starts docker-proxy
         // (`-use-listen-fd`), so a new loopback listener may have no proxy
-        // yet: look again on every tick for a while, but only for listeners
-        // that appeared lately. The VM's own loopback services never get a
-        // proxy, so they stop being looked at after SETTLING.
-        let settling = self.settling;
-        self.unmatched
-            .retain(|_, seen| t.duration_since(*seen) < settling);
-        let proxy_pending = !self.unmatched.is_empty();
+        // yet: look again on every tick while it is new, then every
+        // SETTLED_INTERVAL in case the proxy was very late. The VM's own
+        // loopback services never get one; a /proc scan every 2 s is what
+        // they cost.
+        let fresh_unmatched = self
+            .unmatched
+            .values()
+            .any(|seen| t.duration_since(*seen) < self.settling);
+        let proxy_pending = fresh_unmatched
+            || (!self.unmatched.is_empty()
+                && t.duration_since(self.proxies_read_at) >= SETTLED_INTERVAL);
         if !namespaces_changed
             && !listeners_changed
             && !loopback_changed
@@ -213,8 +217,9 @@ impl AutoForward {
         // The proxies are read on every change, by which time a container
         // that listens has its proxy running.
         self.proxies = (self.read_proxies)();
+        self.proxies_read_at = t;
         self.unmatched
-            .retain(|l, _| !self.proxies.loopback.contains(l));
+            .retain(|l, _| !self.proxies.loopback.contains_key(l));
         self.last_root = root.clone();
 
         let mut order: Vec<&Netns> = self.by_path.values().collect();
@@ -235,24 +240,17 @@ impl AutoForward {
         *self.shared.lock().unwrap() = next
             .iter()
             .filter_map(|(p, r)| {
-                let dial = match r.ns {
-                    ROOT_NS => Dial {
-                        ns: None,
-                        target: r.target,
-                        listener: Some(
-                            self.loopback
-                                .iter()
-                                .find(|l| SocketAddr::new(l.addr, l.port) == r.target)?
-                                .inode,
-                        ),
-                    },
-                    key => Dial {
-                        ns: Some(files.get(&key)?.clone()),
-                        target: r.target,
-                        listener: None,
-                    },
+                let ns = match r.ns {
+                    ROOT_NS => None,
+                    key => Some(files.get(&key)?.clone()),
                 };
-                Some((*p, dial))
+                Some((
+                    *p,
+                    Dial {
+                        ns,
+                        target: r.target,
+                    },
+                ))
             })
             .collect();
         self.routes = next;
@@ -479,15 +477,17 @@ fn docker_proxies() -> Proxies {
         let Ok(cmdline) = fs::read(dir.join("cmdline")) else {
             continue;
         };
-        if let Some((proto, ip, port)) = autofwd::docker_proxy_target(&cmdline)
-            && proto == "tcp"
-        {
-            out.targets.insert((ip, port));
+        let Some((proto, ip, target_port)) = autofwd::docker_proxy_target(&cmdline) else {
+            continue;
+        };
+        if proto != "tcp" {
+            continue;
         }
-        if let Some((proto, addr, port)) = autofwd::docker_proxy_host(&cmdline)
-            && proto == "tcp"
+        out.targets.insert((ip, target_port));
+        if let Some((_, addr, port)) = autofwd::docker_proxy_host(&cmdline)
             && addr.is_loopback()
         {
+            let target = SocketAddr::new(ip, target_port);
             // The sockets it holds: the listener it was handed
             // (`-use-listen-fd`) is one of them.
             let Ok(fds) = fs::read_dir(dir.join("fd")) else {
@@ -498,22 +498,12 @@ fn docker_proxies() -> Proxies {
                     .ok()
                     .and_then(|l| autofwd::socket_inode(l.as_os_str().as_encoded_bytes()))
                 {
-                    out.loopback.insert(Listener { addr, port, inode });
+                    out.loopback.insert(Listener { addr, port, inode }, target);
                 }
             }
         }
     }
     out
-}
-
-/// The inode of the socket listening on `addr` in this thread's namespace.
-fn listener_inode(addr: SocketAddr) -> io::Result<Option<u32>> {
-    let diag = diag_socket()?;
-    let mut buf = vec![0u8; 32 << 10];
-    let found = listeners(&diag, &mut 0, &mut buf)?
-        .into_iter()
-        .find(|l| l.addr == addr.ip() && l.port == addr.port());
-    Ok(found.map(|l| l.inode))
 }
 
 struct ConnGuard(Arc<AtomicUsize>);
@@ -582,29 +572,9 @@ fn relay(conn: OwnedFd, routes: &Routes) {
         return;
     }
     let port = u16::from_le_bytes(header);
-    let Some(Dial {
-        ns: netns,
-        target,
-        listener,
-    }) = routes.lock().unwrap().get(&port).cloned()
-    else {
+    let Some(Dial { ns: netns, target }) = routes.lock().unwrap().get(&port).cloned() else {
         return;
     };
-    // docker-proxy may have let the port go since the last poll, and a VM
-    // service bound it: never hand that one to the Mac.
-    if let Some(inode) = listener {
-        match listener_inode(target) {
-            Ok(Some(now)) if now == inode => {}
-            Ok(_) => {
-                eprintln!("kat-init: auto-forward {port} -> {target}: docker-proxy is gone");
-                return;
-            }
-            Err(e) => {
-                eprintln!("kat-init: auto-forward {port} -> {target}: {e}");
-                return;
-            }
-        }
-    }
     let joined = netns.as_deref().map_or(Ok(()), setns);
     let upstream = match joined.and_then(|()| TcpStream::connect_timeout(&target, DIAL_TIMEOUT)) {
         Ok(s) => s,
@@ -672,7 +642,7 @@ mod tests {
     use std::net::TcpListener;
 
     thread_local! {
-        static PROXY_SOCKETS: RefCell<BTreeSet<Listener>> = RefCell::default();
+        static PROXY_SOCKETS: RefCell<BTreeMap<Listener, SocketAddr>> = RefCell::default();
         static SCANS: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -684,8 +654,13 @@ mod tests {
         }
     }
 
-    fn set_proxies(sockets: &[Listener]) {
-        PROXY_SOCKETS.with(|p| *p.borrow_mut() = sockets.iter().copied().collect());
+    /// docker-proxy sockets and the container each forwards to.
+    fn set_proxies(sockets: &[(Listener, &str)]) {
+        let map = sockets
+            .iter()
+            .map(|(l, t)| (*l, t.parse().unwrap()))
+            .collect();
+        PROXY_SOCKETS.with(|p| *p.borrow_mut() = map);
     }
 
     fn scans() -> usize {
@@ -700,12 +675,10 @@ mod tests {
         }
     }
 
-    /// (dials in the root namespace, target, docker-proxy's socket).
-    fn route(shared: &Routes, port: u16) -> Option<(bool, SocketAddr, Option<u32>)> {
+    /// (dials in the root namespace, target).
+    fn route(shared: &Routes, port: u16) -> Option<(bool, SocketAddr)> {
         let routes = shared.lock().unwrap();
-        routes
-            .get(&port)
-            .map(|d| (d.ns.is_none(), d.target, d.listener))
+        routes.get(&port).map(|d| (d.ns.is_none(), d.target))
     }
 
     fn quiet(c: &Changes) -> bool {
@@ -724,14 +697,14 @@ mod tests {
         assert!(quiet(&fwd.tick(&root, &bound)));
 
         // The proxy starts with the socket: the next tick finds it although
-        // nothing else changed, and the relay dials the loopback address in
-        // the root namespace, checking it is still that socket.
-        set_proxies(&[lo("127.0.0.1", 18098, 1)]);
+        // nothing else changed, and the relay dials its container from the
+        // root namespace.
+        set_proxies(&[(bound[0], "172.17.0.2:80")]);
         let c = fwd.tick(&root, &bound);
         assert_eq!((c.added, c.removed), (vec![18098], vec![]));
         assert_eq!(
             route(&shared, 18098),
-            Some((true, "127.0.0.1:18098".parse().unwrap(), Some(1)))
+            Some((true, "172.17.0.2:80".parse().unwrap()))
         );
         assert!(quiet(&fwd.tick(&root, &bound)));
 
@@ -751,7 +724,7 @@ mod tests {
         let mut fwd = AutoForward::new(shared.clone(), false, fake_proxies);
         // k3s and kubelet on loopback. Something named docker-proxy claims
         // kubelet's address, but holds another socket.
-        set_proxies(&[lo("127.0.0.1", 10248, 99)]);
+        set_proxies(&[(lo("::1", 10248, 99), "172.17.0.9:80")]);
         let listeners = [lo("127.0.0.1", 6444, 1), lo("::1", 10248, 2)];
         for _ in 0..3 {
             assert!(quiet(&fwd.tick(&BTreeSet::new(), &listeners)));
@@ -760,30 +733,39 @@ mod tests {
     }
 
     #[test]
-    fn old_unmatched_listeners_stop_proxy_scans() {
+    fn unmatched_listeners_are_looked_up_rarely_once_settled() {
         let shared = Routes::default();
         let mut fwd = AutoForward::new(shared.clone(), false, fake_proxies);
         fwd.settling = Duration::ZERO;
         set_proxies(&[]);
-        let listeners = [lo("127.0.0.1", 6444, 1)];
+        let listeners = [lo("127.0.0.1", 6444, 1), lo("127.0.0.1", 5432, 2)];
         let before = scans();
-        fwd.tick(&BTreeSet::new(), &listeners);
+        assert!(quiet(&fwd.tick(&BTreeSet::new(), &listeners)));
         assert_eq!(scans(), before + 1, "a new listener is looked up");
         for _ in 0..3 {
             fwd.tick(&BTreeSet::new(), &listeners);
         }
-        assert_eq!(scans(), before + 1, "and then left alone");
+        assert_eq!(scans(), before + 1, "then not on every tick");
 
-        // Within the settling time only new, unmatched listeners keep the
-        // lookups going: once matched, nothing is looked up again.
-        fwd.settling = SETTLING;
+        // A proxy that started very late is still found, a settled
+        // interval later.
+        set_proxies(&[(listeners[1], "172.17.0.2:5432")]);
+        fwd.proxies_read_at -= SETTLED_INTERVAL;
+        assert_eq!(fwd.tick(&BTreeSet::new(), &listeners).added, [5432]);
+        assert_eq!(scans(), before + 2);
+    }
+
+    #[test]
+    fn matched_listeners_stop_the_lookups() {
+        let shared = Routes::default();
+        let mut fwd = AutoForward::new(shared.clone(), false, fake_proxies);
         let published = lo("127.0.0.1", 18098, 2);
-        set_proxies(&[published]);
-        let both = [listeners[0], published];
-        assert_eq!(fwd.tick(&BTreeSet::new(), &both).added, [18098]);
+        set_proxies(&[(published, "172.17.0.2:80")]);
+        assert_eq!(fwd.tick(&BTreeSet::new(), &[published]).added, [18098]);
         let matched = scans();
+        fwd.proxies_read_at -= SETTLED_INTERVAL;
         for _ in 0..3 {
-            assert!(quiet(&fwd.tick(&BTreeSet::new(), &both)));
+            assert!(quiet(&fwd.tick(&BTreeSet::new(), &[published])));
         }
         assert_eq!(scans(), matched);
     }
@@ -793,11 +775,11 @@ mod tests {
         let shared = Routes::default();
         let mut fwd = AutoForward::new(shared.clone(), false, fake_proxies);
         let listeners = [lo("::1", 8080, 1)];
-        set_proxies(&listeners);
+        set_proxies(&[(listeners[0], "[fd00::2]:80")]);
         assert_eq!(fwd.tick(&BTreeSet::new(), &listeners).added, [8080]);
         assert_eq!(
             route(&shared, 8080),
-            Some((true, "[::1]:8080".parse().unwrap(), Some(1)))
+            Some((true, "[fd00::2]:80".parse().unwrap()))
         );
         // The published forward (gvproxy) has it now.
         let c = fwd.tick(&BTreeSet::from([8080]), &listeners);
@@ -805,12 +787,9 @@ mod tests {
         assert_eq!(route(&shared, 8080), None);
     }
 
-    /// An echo server on loopback: its address and socket inode.
-    fn echo_server() -> (SocketAddr, u32) {
+    fn echo_server() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::fstat(listener.as_raw_fd(), &mut st) }, 0);
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let mut conn = conn.unwrap();
@@ -821,15 +800,11 @@ mod tests {
                 });
             }
         });
-        (addr, st.st_ino as u32)
+        addr
     }
 
-    fn root_dial(target: SocketAddr, listener: Option<u32>) -> Dial {
-        Dial {
-            ns: None,
-            target,
-            listener,
-        }
+    fn root_dial(target: SocketAddr) -> Dial {
+        Dial { ns: None, target }
     }
 
     /// A connection from the Mac for `port`, relayed on its own thread.
@@ -850,13 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn relays_to_docker_proxys_socket_in_the_root_namespace() {
+    fn relays_root_namespace_routes_without_joining_a_namespace() {
         let routes = Routes::default();
-        let (addr, inode) = echo_server();
         routes
             .lock()
             .unwrap()
-            .insert(18098, root_dial(addr, Some(inode)));
+            .insert(18098, root_dial(echo_server()));
         let (mut mac, relay) = connect(&routes, 18098);
         mac.write_all(b"hello").unwrap();
         mac.shutdown(Shutdown::Write).unwrap();
@@ -867,35 +841,16 @@ mod tests {
     }
 
     #[test]
-    fn refuses_another_socket_on_the_proxys_address() {
-        // docker-proxy let the port go and a VM service bound it before the
-        // next poll: the relay must not reach it.
-        let routes = Routes::default();
-        let (addr, inode) = echo_server();
-        routes
-            .lock()
-            .unwrap()
-            .insert(18098, root_dial(addr, Some(inode.wrapping_add(1))));
-        assert_closed(&routes, 18098);
-    }
-
-    #[test]
     fn closes_connections_with_no_route_or_no_listener() {
         let routes = Routes::default();
         // Not forwarded (any more).
         assert_closed(&routes, 18098);
         // The container stopped between the forward and this connection.
         // Port 1 is never handed out as an ephemeral port.
-        let nothing = "127.0.0.1:1".parse().unwrap();
         routes
             .lock()
             .unwrap()
-            .insert(18098, root_dial(nothing, None));
-        assert_closed(&routes, 18098);
-        routes
-            .lock()
-            .unwrap()
-            .insert(18098, root_dial(nothing, Some(1)));
+            .insert(18098, root_dial("127.0.0.1:1".parse().unwrap()));
         assert_closed(&routes, 18098);
     }
 }

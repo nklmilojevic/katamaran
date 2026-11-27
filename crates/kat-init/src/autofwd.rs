@@ -75,17 +75,22 @@ fn is_v4_mapped_loopback(a: &IpAddr) -> bool {
 /// Routes for the ports Docker published on a loopback address of the VM
 /// (`-p 127.0.0.1:8080:80`, `-p '[::1]:8080:80'`). docker-proxy listens on
 /// that address in the root namespace, which the gvproxy forward cannot
-/// reach, so the relay dials it from inside the VM instead.
+/// reach, so the relay dials from inside the VM instead.
 ///
 /// `listeners` are the root namespace's loopback listeners and `held` the
-/// sockets running TCP docker-proxy processes hold, each with the proxy's
-/// `-host-ip`/`-host-port`. A listener counts only if a docker-proxy holds
-/// that very socket (same inode) for that very address: a process merely
-/// named docker-proxy (in a container, or Docker-in-Docker's own) cannot
-/// hold a root namespace socket it did not get, so the VM's own loopback
-/// services (containerd, k3s, kubelet) stay private to the VM. docker-proxy
-/// is what Docker runs for a published port with the userland proxy on
-/// (the default, which the guest image keeps).
+/// sockets running TCP docker-proxy processes hold, each as a listener on
+/// the proxy's `-host-ip`/`-host-port`, with the proxy's
+/// `-container-ip`/`-container-port`. A listener counts only if a
+/// docker-proxy holds that very socket (same inode) for that very address:
+/// a process merely named docker-proxy (in a container, or
+/// Docker-in-Docker's own) cannot hold a root namespace socket it did not
+/// get, so the VM's own loopback services (containerd, k3s, kubelet) stay
+/// private to the VM. docker-proxy is what Docker runs for a published port
+/// with the userland proxy on (the default, which the guest image keeps).
+///
+/// The route dials the container target, as docker-proxy itself does, not
+/// the loopback address: if the container stops and a VM service binds the
+/// loopback port before the next poll, a connection still never reaches it.
 ///
 /// A port the root namespace also listens on for every address is the
 /// published forward's (`root`). The Mac has one 127.0.0.1:<port>, so if
@@ -94,19 +99,19 @@ fn is_v4_mapped_loopback(a: &IpAddr) -> bool {
 pub fn published_loopback(
     root: &BTreeSet<u16>,
     listeners: &[Listener],
-    held: &BTreeSet<Listener>,
+    held: &BTreeMap<Listener, SocketAddr>,
 ) -> BTreeMap<u16, Route> {
-    let mut sorted: Vec<&Listener> = listeners
+    let mut sorted: Vec<(&Listener, SocketAddr)> = listeners
         .iter()
-        .filter(|l| l.addr.is_loopback() && held.contains(l))
-        .filter(|l| !root.contains(&l.port))
+        .filter(|l| l.addr.is_loopback() && !root.contains(&l.port))
+        .filter_map(|l| Some((l, *held.get(l)?)))
         .collect();
     sorted.sort();
     let mut out = BTreeMap::new();
-    for l in sorted {
+    for (l, target) in sorted {
         out.entry(l.port).or_insert(Route {
             ns: ROOT_NS,
-            target: SocketAddr::new(l.addr, l.port),
+            target,
         });
     }
     out
@@ -477,6 +482,11 @@ mod tests {
         }
     }
 
+    /// docker-proxy sockets with the container target each forwards to.
+    fn proxies(list: &[(Listener, &str)]) -> BTreeMap<Listener, SocketAddr> {
+        list.iter().map(|(l, t)| (*l, sa(t))).collect()
+    }
+
     fn root_route(target: &str) -> Route {
         Route {
             ns: ROOT_NS,
@@ -496,18 +506,19 @@ mod tests {
             held("127.0.0.1", 10248, 4),
             held("192.168.127.2", 5000, 5),
         ];
-        let proxies = BTreeSet::from([
-            held("127.0.0.1", 18098, 1),
-            held("::1", 18097, 2),
-            held("192.168.127.2", 5000, 5),
+        let proxies = proxies(&[
+            (held("127.0.0.1", 18098, 1), "172.17.0.2:80"),
+            (held("::1", 18097, 2), "172.17.0.3:80"),
+            (held("192.168.127.2", 5000, 5), "172.17.0.4:5000"),
             // A proxy whose listener is gone (or not bound yet): nothing.
-            held("127.0.0.1", 18096, 6),
+            (held("127.0.0.1", 18096, 6), "172.17.0.5:80"),
         ]);
+        // The relay dials the container, as docker-proxy does.
         assert_eq!(
             published_loopback(&BTreeSet::new(), &listeners, &proxies),
             BTreeMap::from([
-                (18097, root_route("[::1]:18097")),
-                (18098, root_route("127.0.0.1:18098")),
+                (18097, root_route("172.17.0.3:80")),
+                (18098, root_route("172.17.0.2:80")),
             ])
         );
     }
@@ -518,11 +529,11 @@ mod tests {
         // (Docker-in-Docker's proxy, or any process in a container) but
         // does not hold its socket: kubelet stays private.
         let kubelet = [held("127.0.0.1", 10248, 7)];
-        let impostor = BTreeSet::from([held("127.0.0.1", 10248, 99)]);
+        let impostor = proxies(&[(held("127.0.0.1", 10248, 99), "172.17.0.9:80")]);
         assert!(published_loopback(&BTreeSet::new(), &kubelet, &impostor).is_empty());
         // A proxy for 127.0.0.1:8080 says nothing about [::1]:8080 or
         // 127.0.0.2:8080, which another VM process may hold.
-        let proxies = BTreeSet::from([held("127.0.0.1", 8080, 1)]);
+        let proxies = proxies(&[(held("127.0.0.1", 8080, 1), "172.17.0.2:80")]);
         let listeners = [held("::1", 8080, 1), held("127.0.0.2", 8080, 1)];
         assert!(published_loopback(&BTreeSet::new(), &listeners, &proxies).is_empty());
     }
@@ -534,10 +545,14 @@ mod tests {
             held("127.0.0.2", 80, 2),
             held("127.0.0.1", 80, 3),
         ];
-        let proxies = listeners.iter().copied().collect();
+        let proxies = proxies(&[
+            (listeners[0], "172.17.0.2:80"),
+            (listeners[1], "172.17.0.3:80"),
+            (listeners[2], "172.17.0.4:80"),
+        ]);
         assert_eq!(
             published_loopback(&BTreeSet::new(), &listeners, &proxies),
-            BTreeMap::from([(80, root_route("127.0.0.1:80"))])
+            BTreeMap::from([(80, root_route("172.17.0.4:80"))])
         );
         // The port is also published on every address: gvproxy has it.
         assert!(published_loopback(&BTreeSet::from([80]), &listeners, &proxies).is_empty());
@@ -558,7 +573,7 @@ mod tests {
             &BTreeMap::new(),
         );
         assert_eq!(before[&8080].ns, 1);
-        let lo = BTreeMap::from([(8080, root_route("127.0.0.1:8080"))]);
+        let lo = BTreeMap::from([(8080, root_route("172.17.0.3:80"))]);
         let during = plan(
             &none,
             &BTreeSet::new(),
@@ -577,7 +592,7 @@ mod tests {
     fn published_loopback_routes_go_with_their_proxy() {
         // The container stops: docker-proxy exits and the route goes, even
         // if the planner's previous routes still hold it.
-        let lo = BTreeMap::from([(18098, root_route("127.0.0.1:18098"))]);
+        let lo = BTreeMap::from([(18098, root_route("172.17.0.2:80"))]);
         let none = BTreeSet::new();
         let during = plan(&none, &BTreeSet::new(), &lo, &[], &BTreeMap::new());
         assert_eq!(during, lo);
