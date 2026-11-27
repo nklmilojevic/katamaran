@@ -41,6 +41,14 @@ BULK_HDR = (
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
+SHORT_CHUNK = b"s" * 4096
+SHORT_CHUNKS = 512
+SHORT_HDR = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: " + str(len(SHORT_CHUNK) * SHORT_CHUNKS).encode() + b"\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
 
 def handle(conn):
     try:
@@ -57,6 +65,12 @@ def handle(conn):
                 conn.sendall(BULK_HDR)
                 for _ in range(BULK_CHUNKS):
                     conn.sendall(BULK_CHUNK)
+            elif req_hdr.startswith(b"GET /short "):
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.sendall(SHORT_HDR)
+                for _ in range(SHORT_CHUNKS):
+                    conn.sendall(SHORT_CHUNK)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             else:
                 conn.sendall(HDR)
                 conn.sendall(BODY)
@@ -74,16 +88,18 @@ while True:
 "#;
 
 /// Keep-alive client that opens ONE persistent TCP connection to `host:8080`,
-/// reads commands from stdin (`<count>` for split-write bursts or `bulk` for a
-/// 32 MiB sustained download measuring `Tcp: OutSegs` and elapsed time), and
-/// prints two space-separated floats flushed after each command. Passing an
-/// optional count on argv runs a single burst and exits.
+/// reads commands from stdin (`<count>` for split-write bursts, `bulk` for a
+/// 32 MiB sustained download, `short` for a 512x4 KiB short-write stream, or
+/// `rcvlowat <N>` to set `SO_RCVLOWAT` and gate each read on `select.poll()`),
+/// and prints two space-separated floats flushed after each workload command.
+/// Passing an optional count on argv runs a single burst and exits.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
-import socket, sys, time
+import select, socket, sys, time
 
 host = sys.argv[1]
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
 def tcp_out_segs():
     with open("/proc/net/snmp") as f:
@@ -97,7 +113,7 @@ def tcp_out_segs():
 
 def recv_exact(sock, n, buf):
     while len(buf) < n:
-        chunk = sock.recv(65536)
+        chunk = sock.recv(min(n - len(buf), 65536))
         if not chunk:
             raise RuntimeError("unexpected EOF")
         buf += chunk
@@ -110,12 +126,15 @@ def drain_exact(sock, n, buf):
     while rem > 0:
         chunk = sock.recv(min(rem, 262144))
         if not chunk:
-            raise RuntimeError("unexpected EOF in bulk body")
+            raise RuntimeError("unexpected EOF in stream body")
         rem -= len(chunk)
     return b""
 
 sock = socket.create_connection((host, 8080), timeout=10)
 sock.settimeout(10)
+poller = select.poll()
+poller.register(sock, select.POLLIN)
+use_poll = False
 buf = b""
 
 def run_burst(count):
@@ -125,6 +144,10 @@ def run_burst(count):
     for _ in range(count):
         t0 = time.monotonic()
         sock.sendall(req)
+        if use_poll and not buf:
+            events = poller.poll(10000)
+            if not events:
+                raise RuntimeError("poll timed out waiting for SO_RCVLOWAT")
         while b"\r\n\r\n" not in buf:
             chunk = sock.recv(65536)
             if not chunk:
@@ -140,15 +163,15 @@ def run_burst(count):
     p50 = times_ms[len(times_ms) // 2]
     print(f"{p50:.3f} {total_ms:.3f}", flush=True)
 
-def run_bulk():
+def run_stream(req_bytes, expected_len):
     global buf
     before = tcp_out_segs()
     t0 = time.monotonic()
-    sock.sendall(bulk_req)
+    sock.sendall(req_bytes)
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(65536)
         if not chunk:
-            raise RuntimeError("unexpected EOF in bulk headers")
+            raise RuntimeError("unexpected EOF in stream headers")
         buf += chunk
     hdr, buf = buf.split(b"\r\n\r\n", 1)
     assert b"200 OK" in hdr, hdr
@@ -156,7 +179,7 @@ def run_bulk():
     for line in hdr.split(b"\r\n")[1:]:
         if line.lower().startswith(b"content-length:"):
             cl = int(line.split(b":", 1)[1].strip())
-    assert cl == 32 * 1024 * 1024, cl
+    assert cl == expected_len, cl
     buf = drain_exact(sock, cl, buf)
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     after = tcp_out_segs()
@@ -170,7 +193,14 @@ else:
         if not line:
             continue
         if line == "bulk":
-            run_bulk()
+            run_stream(bulk_req, 32 * 1024 * 1024)
+        elif line == "short":
+            run_stream(short_req, 512 * 4096)
+        elif line.startswith("rcvlowat "):
+            lowat = int(line.split()[1])
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
+            use_poll = lowat > 1
+            print(f"{lowat} 0.000", flush=True)
         else:
             run_burst(int(line))
 sock.close()
@@ -826,13 +856,33 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "pod-to-pod keep-alive stalled (p50={pod_p50:.2}ms total={pod_total:.2}ms)"
     );
 
-    // Sustained 32 MiB bulk download on the same established pingpong-mode
-    // keep-alive socket with quickack=Y, to compare ACK pacing against
-    // quickack=N below.
+    // Sustained 32 MiB bulk download and 512x4 KiB short-write stream on the
+    // same established pingpong-mode keep-alive socket with quickack=Y, to
+    // compare ACK pacing against quickack=N below.
     let (bulk_acks_on, bulk_ms_on) = send_cmd("bulk", "sustained 32MiB bulk (quickack=Y)");
     eprintln!(
         "pod-to-pod sustained 32MiB bulk (quickack=Y): out_segs={bulk_acks_on:.0} elapsed={bulk_ms_on:.2}ms"
     );
+    let (short_acks_on, short_ms_on) =
+        send_cmd("short", "short-write 512x4KiB stream (quickack=Y)");
+    eprintln!(
+        "pod-to-pod short-write 512x4KiB stream (quickack=Y): out_segs={short_acks_on:.0} elapsed={short_ms_on:.2}ms"
+    );
+
+    // Poll-driven split-write keep-alive with SO_RCVLOWAT=4096 (above ~80B
+    // headers, below 10 KiB body): poll() cannot wake on the short header, so
+    // __tcp_ack_snd_check() must ACK the pushed header below SO_RCVLOWAT.
+    send_cmd("rcvlowat 4096", "set SO_RCVLOWAT=4096");
+    let (lowat_on_p50, lowat_on_total) =
+        send_cmd("15", "SO_RCVLOWAT=4096 poll keep-alive (quickack=Y)");
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=4096 poll keep-alive (quickack=Y): p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms"
+    );
+    assert!(
+        lowat_on_p50 < 15.0 && lowat_on_total < 300.0,
+        "SO_RCVLOWAT=4096 poll keep-alive stalled with quickack=Y (p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms)"
+    );
+    send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1");
 
     {
         let restore = QuickackRestoreGuard {
@@ -864,13 +914,34 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected delayed-ACK stall on established socket with quickack=0 (got p50={off_p50:.2}ms total={off_total:.2}ms)"
         );
 
+        send_cmd("rcvlowat 4096", "set SO_RCVLOWAT=4096 (quickack=N)");
+        let (lowat_off_p50, lowat_off_total) =
+            send_cmd("6", "SO_RCVLOWAT=4096 poll keep-alive (quickack=N)");
+        eprintln!(
+            "pod-to-pod SO_RCVLOWAT=4096 poll keep-alive (quickack=N): p50={lowat_off_p50:.2}ms total={lowat_off_total:.2}ms"
+        );
+        assert!(
+            lowat_off_p50 >= 25.0,
+            "expected SO_RCVLOWAT=4096 poll stall with quickack=0 (got p50={lowat_off_p50:.2}ms total={lowat_off_total:.2}ms)"
+        );
+        send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1 (quickack=N)");
+
         let (bulk_acks_off, bulk_ms_off) = send_cmd("bulk", "sustained 32MiB bulk (quickack=N)");
         eprintln!(
             "pod-to-pod sustained 32MiB bulk (quickack=N): out_segs={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
         );
         assert!(
-            bulk_acks_on <= bulk_acks_off * 1.5 + 32.0,
+            bulk_acks_on < 350.0 && bulk_acks_on <= bulk_acks_off * 2.0 + 64.0,
             "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}, off={bulk_acks_off:.0})"
+        );
+        let (short_acks_off, short_ms_off) =
+            send_cmd("short", "short-write 512x4KiB stream (quickack=N)");
+        eprintln!(
+            "pod-to-pod short-write 512x4KiB stream (quickack=N): out_segs={short_acks_off:.0} elapsed={short_ms_off:.2}ms"
+        );
+        assert!(
+            short_acks_on < 256.0 && short_acks_on <= short_acks_off * 2.0 + 64.0,
+            "quickack=Y inflated short-write stream ACK traffic (on={short_acks_on:.0}, off={short_acks_off:.0})"
         );
 
         restore.restore();

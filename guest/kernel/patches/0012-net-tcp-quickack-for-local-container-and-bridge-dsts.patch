@@ -33,14 +33,17 @@ for the lifetime of every flow (which would double pure ACK traffic on
 sustained bulk transfers), lift only the pingpong suppression in
 __tcp_cleanup_rbuf() when userspace drains a small or PSH-terminated
 segment (ICSK_ACK_PUSHED && !sk_rmem_alloc) on an eligible non-uplink
-socket with READ_ONCE(kat_quickack_enabled). Sustained bulk streams keep
-stock Linux once-per-two-segments ACK pacing and quickack budgets
-untouched, while split-write keep-alive exchanges ACK immediately on read
-drain. Toggling /sys/module/kat/parameters/quickack at runtime takes
-effect immediately for already-established sockets as well as new ones
-without affecting routes that explicitly set RTAX_QUICKACK=1. Explicit
-locked route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected. Disable
-at boot with kat.quickack=0.
+socket with READ_ONCE(kat_quickack_enabled), and handle the matching
+SO_RCVLOWAT case in __tcp_ack_snd_check() when pushed in-order data is
+queued below sk_rcvlowat and tcp_epollin_ready() is false (so a polling
+client cannot wake up to reach __tcp_cleanup_rbuf()). Sustained bulk
+streams keep stock Linux once-per-two-segments ACK pacing and quickack
+budgets untouched, while split-write keep-alive exchanges ACK promptly.
+Toggling /sys/module/kat/parameters/quickack at runtime takes effect
+immediately for already-established sockets as well as new ones without
+affecting routes that explicitly set RTAX_QUICKACK=1. Explicit locked
+route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected. Disable at
+boot with kat.quickack=0.
 
 SPDX-License-Identifier: GPL-2.0
 ---
@@ -80,11 +83,20 @@ diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_soc
  		__u32		  lrcvtime;	 /* timestamp of last received data packet */
  		__u16		  last_seg_size; /* Size of last incoming segment	   */
  		__u16		  rcv_mss;	 /* MSS used for delayed ACK decisions	   */
-@@ -273,6 +275,8 @@
+@@ -273,6 +275,17 @@
  struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
  				      struct request_sock *req,
  				      struct sock *child);
 +extern bool kat_quickack_enabled;
++
++static inline bool kat_sk_wants_quickack(const struct sock *sk)
++{
++	const struct inet_connection_sock *icsk = inet_csk(sk);
++
++	return icsk->icsk_ack.kat_quick_ack &&
++	       !icsk->icsk_ack.kat_from_uplink &&
++	       READ_ONCE(kat_quickack_enabled);
++}
 +
  bool inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
  				   unsigned long timeout);
@@ -168,15 +180,13 @@ diff -ruN a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
 diff -ruN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
-@@ -1531,7 +1531,10 @@
+@@ -1531,7 +1531,8 @@
  		    (copied > 0 &&
  		     ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED2) ||
  		      ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED) &&
 -		       !inet_csk_in_pingpong_mode(sk))) &&
 +		       (!inet_csk_in_pingpong_mode(sk) ||
-+			(icsk->icsk_ack.kat_quick_ack &&
-+			 !icsk->icsk_ack.kat_from_uplink &&
-+			 READ_ONCE(kat_quickack_enabled))))) &&
++			kat_sk_wants_quickack(sk)))) &&
  		      !atomic_read(&sk->sk_rmem_alloc)))
  			time_to_ack = true;
  	}
@@ -191,7 +201,25 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -6543,6 +6544,7 @@
+@@ -5940,7 +5941,16 @@
+ 	    /* We ACK each frame or... */
+ 	    tcp_in_quickack_mode(sk) ||
+ 	    /* Protocol state mandates a one-time immediate ACK */
+-	    inet_csk(sk)->icsk_ack.pending & ICSK_ACK_NOW) {
++	    inet_csk(sk)->icsk_ack.pending & ICSK_ACK_NOW ||
++	    /* Pushed in-order data below SO_RCVLOWAT cannot wake poll() to
++	     * reach __tcp_cleanup_rbuf().
++	     */
++	    ((inet_csk(sk)->icsk_ack.pending & ICSK_ACK_PUSHED) &&
++	     sk->sk_rcvlowat > 1 &&
++	     after(tp->rcv_nxt, tp->copied_seq) &&
++	     (int)(tp->rcv_nxt - tp->copied_seq) < sk->sk_rcvlowat &&
++	     !tcp_epollin_ready(sk, sk->sk_rcvlowat) &&
++	     kat_sk_wants_quickack(sk))) {
+ 		/* If we are running from __release_sock() in user context,
+ 		 * Defer the ack until tcp_release_cb().
+ 		 */
+@@ -6543,6 +6553,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {
