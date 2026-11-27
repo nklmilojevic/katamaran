@@ -59,6 +59,10 @@ pub struct VmExecArgs {
     /// Allocate a pseudo-terminal.
     #[arg(short = 't', long)]
     pub tty: bool,
+    /// Do not forward stdin: the command reads end-of-file immediately and
+    /// none of the caller's input is consumed (like `ssh -n`).
+    #[arg(short = 'n', long = "no-stdin")]
+    pub no_stdin: bool,
     /// Working directory inside the VM (default: /root).
     #[arg(short = 'w', long)]
     pub workdir: Option<String>,
@@ -83,11 +87,33 @@ pub fn run(cmd: VmCmd) -> anyhow::Result<()> {
 
 fn shell(args: VmShellArgs) -> anyhow::Result<()> {
     let allocate_pty = io::stdin().is_terminal() && io::stdout().is_terminal();
-    run_spec(args.workdir, &args.env, args.cmd, allocate_pty)
+    run_spec(args.workdir, &args.env, args.cmd, allocate_pty, false)
 }
 
 fn exec_cmd(args: VmExecArgs) -> anyhow::Result<()> {
-    run_spec(args.workdir, &args.env, args.cmd, args.tty)
+    run_spec(args.workdir, &args.env, args.cmd, args.tty, args.no_stdin)
+}
+
+/// Reopen any closed standard descriptor (`kat vm exec ... >&-`) on
+/// `/dev/null`, so it can neither fail local I/O setup nor be silently reused
+/// by a later `open`/`pipe` and mistaken for the caller's stdio.
+fn ensure_stdio_open() {
+    for fd in 0..3 {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            let flags = if fd == 0 {
+                libc::O_RDONLY
+            } else {
+                libc::O_WRONLY
+            };
+            let nfd = unsafe { libc::open(c"/dev/null".as_ptr(), flags) };
+            if nfd >= 0 && nfd != fd {
+                unsafe {
+                    libc::dup2(nfd, fd);
+                    libc::close(nfd);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,9 +127,16 @@ fn run_spec(
     extra_env: &[String],
     argv: Vec<String>,
     allocate_pty: bool,
+    no_stdin: bool,
 ) -> anyhow::Result<()> {
+    ensure_stdio_open();
     let spec = build_spec(workdir, extra_env, argv, allocate_pty)?;
     let initial_tty_size = spec.tty.as_ref().map(|t| (t.rows, t.cols));
+    // Every fallible local setup step (helper processes, pipes) happens BEFORE
+    // the command is submitted, so a local failure never leaves a root command
+    // running in the VM with an unknown outcome.
+    let local = LocalIo::prepare(Some(1), Some(2), no_stdin)
+        .context("cannot set up local terminal I/O for the VM session")?;
     let (conn, session_token, sock_path) = connect_and_start(&spec)?;
     match run_session(
         conn,
@@ -111,6 +144,7 @@ fn run_spec(
         sock_path,
         initial_tty_size,
         spec.output_window,
+        local,
     )? {
         SessionExit::Code(code) => std::process::exit(code),
         SessionExit::Signal(sig) => {
@@ -151,13 +185,22 @@ fn build_spec(
     } else {
         0
     };
-    Ok(ExecSpec {
+    let spec = ExecSpec {
         cwd,
         env,
         argv,
         tty,
         output_window,
-    })
+    };
+    // Reject an oversized command line/environment locally, before anything
+    // is sent, so the outcome is never ambiguous.
+    if vm_exec::write(&mut io::sink(), &VmExecMsg::Exec(spec.clone())).is_err() {
+        bail!(
+            "the command and environment are too large to send to the VM (limit {} KiB)",
+            kat_proto::MAX_FRAME >> 10
+        );
+    }
+    Ok(spec)
 }
 
 fn parse_env(
@@ -261,6 +304,77 @@ pub fn run_io_relay_helper() -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// Entrypoint for the hidden `katamaran vm-stdin-relay` helper process
+/// (fds: 3 = caller's blocking stdin, 4 = private pipe to the session,
+/// 5 = death pipe whose write end only the session holds).
+pub fn run_stdin_relay_helper() -> ! {
+    let code = run_stdin_relay_fds(3, 4, 5);
+    unsafe { libc::_exit(code) }
+}
+
+/// Copy `in_fd` to `out_fd` without ever touching `in_fd`'s file flags. Reads
+/// only when `in_fd` is readable AND the session is still alive: once
+/// `death_fd` reports hangup (the session ended or was killed, even by
+/// `SIGKILL`), the helper exits without consuming any more of the caller's
+/// input.
+fn run_stdin_relay_fds(in_fd: RawFd, out_fd: RawFd, death_fd: RawFd) -> i32 {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let mut pfds = [
+            libc::pollfd {
+                fd: death_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: in_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+        if rc < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return 1;
+        }
+        if pfds[0].revents != 0 {
+            return 0;
+        }
+        if pfds[1].revents == 0 {
+            continue;
+        }
+        // Read at most what is available right now, so a concurrent reader of
+        // a shared stdin draining it first can leave this helper blocked in
+        // `read` (and blind to `death_fd`) for at most one byte's worth of
+        // input. Readable-with-0-available (EOF, terminal ^D) reads 1 byte,
+        // which returns at once.
+        let mut avail: libc::c_int = 0;
+        let want = if unsafe { libc::ioctl(in_fd, libc::FIONREAD, &mut avail) } == 0 {
+            (avail.max(1) as usize).min(buf.len())
+        } else {
+            buf.len()
+        };
+        let n = unsafe { libc::read(in_fd, buf.as_mut_ptr().cast(), want) };
+        if n < 0 {
+            match io::Error::last_os_error().kind() {
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => continue,
+                _ => return 1,
+            }
+        }
+        if n == 0 {
+            return 0;
+        }
+        if relay_write_all(out_fd, &buf[..n as usize], -1).is_err() {
+            return 0;
+        }
+    }
+}
+
 fn relay_read_exact(fd: RawFd, buf: &mut [u8]) -> io::Result<bool> {
     let mut off = 0usize;
     while off < buf.len() {
@@ -291,8 +405,11 @@ fn relay_note_progress(progress_fd: RawFd) {
 }
 
 /// Upper bound per downstream `write` in the relay helper. A blocking pipe
-/// write returns only once its whole buffer is accepted, so slicing bounds how
-/// much a slow reader must consume between progress notes.
+/// write returns only once its whole buffer is accepted, so every
+/// `RELAY_WRITE_SLICE` bytes a reader consumes produce a progress note. The
+/// split-drain survivor therefore treats a reader as stalled only if it
+/// consumes less than one slice (4 KiB) within `SPLIT_DRAIN_SURVIVOR_IDLE`
+/// (2 s), while bulk relaying stays at 16 writes per 64 KiB frame.
 const RELAY_WRITE_SLICE: usize = 4 << 10;
 
 fn relay_write_all(fd: RawFd, data: &[u8], progress_fd: RawFd) -> Result<(), libc::c_int> {
@@ -458,66 +575,9 @@ struct HelperProc {
 }
 
 impl HelperProc {
-    /// Spawn `/bin/cat` via `posix_spawn` with `stdin_fd -> 0`, `stdout_fd -> 1`,
-    /// `/dev/null -> 2`, `POSIX_SPAWN_CLOEXEC_DEFAULT`, `[SIGINT, SIGQUIT,
-    /// SIGHUP, SIGTERM]` blocked, and `SIGPIPE` reset to `SIG_DFL`.
-    fn spawn_cat(stdin_fd: RawFd, stdout_fd: RawFd) -> io::Result<Self> {
-        let in_dup = dup_ge(stdin_fd, 3)?;
-        let out_dup = dup_ge(stdout_fd, 3)?;
-
-        let mut actions_raw: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::posix_spawn_file_actions_init(&mut actions_raw) };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-        let mut actions = SpawnActionsGuard(actions_raw);
-
-        for rc in [
-            unsafe {
-                libc::posix_spawn_file_actions_adddup2(&mut actions.0, in_dup.as_raw_fd(), 0)
-            },
-            unsafe {
-                libc::posix_spawn_file_actions_adddup2(&mut actions.0, out_dup.as_raw_fd(), 1)
-            },
-            unsafe {
-                libc::posix_spawn_file_actions_addopen(
-                    &mut actions.0,
-                    2,
-                    c"/dev/null".as_ptr(),
-                    libc::O_WRONLY,
-                    0,
-                )
-            },
-        ] {
-            if rc != 0 {
-                return Err(io::Error::from_raw_os_error(rc));
-            }
-        }
-
-        let attr = init_helper_spawn_attr(true)?;
-        let mut pid: libc::pid_t = 0;
-        let mut argv = [c"/bin/cat".as_ptr().cast_mut(), std::ptr::null_mut()];
-        let mut envp: [*mut libc::c_char; 1] = [std::ptr::null_mut()];
-        let rc = unsafe {
-            libc::posix_spawn(
-                &mut pid,
-                c"/bin/cat".as_ptr(),
-                &actions.0,
-                &attr.0,
-                argv.as_mut_ptr(),
-                envp.as_mut_ptr(),
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-        Ok(Self { pid: Some(pid) })
-    }
-
-    /// Spawn the single ordered output relay helper via `posix_spawn` with
-    /// `0/1/2 -> /dev/null`, `3 -> cmd_r`, `4 -> out_fd` (or `/dev/null`),
-    /// `5 -> err_fd` (or `/dev/null`), `6 -> status_w`, `7 -> progress_w`, and
-    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+    /// Spawn the single ordered output relay helper with `3 -> cmd_r`,
+    /// `4 -> out_fd` (or `/dev/null`), `5 -> err_fd` (or `/dev/null`),
+    /// `6 -> status_w`, `7 -> progress_w`.
     fn spawn_output_relay(
         cmd_r: RawFd,
         out_fd: Option<RawFd>,
@@ -525,22 +585,52 @@ impl HelperProc {
         status_w: RawFd,
         progress_w: RawFd,
     ) -> io::Result<Self> {
+        Self::spawn_self_helper(
+            c"vm-io-relay",
+            c"KATAMARAN_TEST_IO_RELAY=output",
+            &[
+                Some(cmd_r),
+                out_fd.filter(|&fd| fd >= 0),
+                err_fd.filter(|&fd| fd >= 0),
+                Some(status_w),
+                Some(progress_w),
+            ],
+        )
+    }
+
+    /// Spawn the stdin relay helper with `3 -> stdin_fd`, `4 -> pipe_w`,
+    /// `5 -> death_r` (see [`run_stdin_relay_fds`]).
+    fn spawn_stdin_relay(stdin_fd: RawFd, pipe_w: RawFd, death_r: RawFd) -> io::Result<Self> {
+        Self::spawn_self_helper(
+            c"vm-stdin-relay",
+            c"KATAMARAN_TEST_IO_RELAY=stdin",
+            &[Some(stdin_fd), Some(pipe_w), Some(death_r)],
+        )
+    }
+
+    /// Spawn this executable as a hidden helper (`<exe> <mode>`) via
+    /// `posix_spawn` with `0/1/2 -> /dev/null`, `fds[i] -> 3 + i` (`None` ->
+    /// `/dev/null`), an empty environment, termination signals blocked, and
+    /// `POSIX_SPAWN_CLOEXEC_DEFAULT` so nothing else is inherited.
+    fn spawn_self_helper(
+        mode: &std::ffi::CStr,
+        test_env: &std::ffi::CStr,
+        fds: &[Option<RawFd>],
+    ) -> io::Result<Self> {
         let exe = std::env::current_exe()?;
         let exe_c = CString::new(exe.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in executable path"))?;
 
-        // Relocate every source descriptor to >= 8 so target fds 0..=7 never collide.
-        let in_dup = dup_ge(cmd_r, 8)?;
-        let out_dup = match out_fd.filter(|&fd| fd >= 0) {
-            Some(fd) => Some(dup_ge(fd, 8)?),
-            None => None,
-        };
-        let err_dup = match err_fd.filter(|&fd| fd >= 0) {
-            Some(fd) => Some(dup_ge(fd, 8)?),
-            None => None,
-        };
-        let status_dup = dup_ge(status_w, 8)?;
-        let progress_dup = dup_ge(progress_w, 8)?;
+        // Relocate every source descriptor above all target fds so no
+        // `dup2` can clobber a source that is still to be mapped.
+        let first_free = 3 + fds.len() as RawFd;
+        let mut dups: Vec<Option<OwnedFd>> = Vec::with_capacity(fds.len());
+        for fd in fds {
+            dups.push(match fd {
+                Some(fd) => Some(dup_ge(*fd, first_free)?),
+                None => None,
+            });
+        }
 
         let mut actions_raw: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::posix_spawn_file_actions_init(&mut actions_raw) };
@@ -548,7 +638,6 @@ impl HelperProc {
             return Err(io::Error::from_raw_os_error(rc));
         }
         let mut actions = SpawnActionsGuard(actions_raw);
-
         let add_devnull = |actions: &mut libc::posix_spawn_file_actions_t,
                            dst: RawFd,
                            flags: libc::c_int|
@@ -563,33 +652,24 @@ impl HelperProc {
                 )
             }
         };
-
-        for rc in [
-            add_devnull(&mut actions.0, 0, libc::O_RDONLY),
-            add_devnull(&mut actions.0, 1, libc::O_WRONLY),
-            add_devnull(&mut actions.0, 2, libc::O_WRONLY),
-            unsafe {
-                libc::posix_spawn_file_actions_adddup2(&mut actions.0, in_dup.as_raw_fd(), 3)
-            },
-            match &out_dup {
-                Some(fd) => unsafe {
-                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, fd.as_raw_fd(), 4)
-                },
-                None => add_devnull(&mut actions.0, 4, libc::O_WRONLY),
-            },
-            match &err_dup {
-                Some(fd) => unsafe {
-                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, fd.as_raw_fd(), 5)
-                },
-                None => add_devnull(&mut actions.0, 5, libc::O_WRONLY),
-            },
-            unsafe {
-                libc::posix_spawn_file_actions_adddup2(&mut actions.0, status_dup.as_raw_fd(), 6)
-            },
-            unsafe {
-                libc::posix_spawn_file_actions_adddup2(&mut actions.0, progress_dup.as_raw_fd(), 7)
-            },
+        for (dst, flags) in [
+            (0, libc::O_RDONLY),
+            (1, libc::O_WRONLY),
+            (2, libc::O_WRONLY),
         ] {
+            let rc = add_devnull(&mut actions.0, dst, flags);
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+        }
+        for (i, dup) in dups.iter().enumerate() {
+            let dst = 3 + i as RawFd;
+            let rc = match dup {
+                Some(fd) => unsafe {
+                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, fd.as_raw_fd(), dst)
+                },
+                None => add_devnull(&mut actions.0, dst, libc::O_RDWR),
+            };
             if rc != 0 {
                 return Err(io::Error::from_raw_os_error(rc));
             }
@@ -600,9 +680,10 @@ impl HelperProc {
 
         #[cfg(not(test))]
         let rc = {
+            let _ = test_env;
             let mut argv = [
                 exe_c.as_ptr().cast_mut(),
-                c"vm-io-relay".as_ptr().cast_mut(),
+                mode.as_ptr().cast_mut(),
                 std::ptr::null_mut(),
             ];
             let mut envp: [*mut libc::c_char; 1] = [std::ptr::null_mut()];
@@ -620,6 +701,7 @@ impl HelperProc {
 
         #[cfg(test)]
         let rc = {
+            let _ = mode;
             let mut argv = [
                 exe_c.as_ptr().cast_mut(),
                 c"--exact".as_ptr().cast_mut(),
@@ -631,10 +713,7 @@ impl HelperProc {
                 c"--test-threads=1".as_ptr().cast_mut(),
                 std::ptr::null_mut(),
             ];
-            let mut envp = [
-                c"KATAMARAN_TEST_IO_RELAY=1".as_ptr().cast_mut(),
-                std::ptr::null_mut(),
-            ];
+            let mut envp = [test_env.as_ptr().cast_mut(), std::ptr::null_mut()];
             unsafe {
                 libc::posix_spawn(
                     &mut pid,
@@ -1513,14 +1592,69 @@ impl OutputRelays {
     }
 }
 
+/// Local stdio plumbing for a session, created BEFORE `Exec` is submitted.
+///
+/// NEVER calls `F_SETFL(O_NONBLOCK)` on any inherited stdio descriptor: blocking
+/// stdin is relayed via [`StdinHelper`], blocking stdout/stderr via
+/// [`OutputRelays`] (one shared FIFO for merged or ambiguous sinks so `2>&1`
+/// preserves frame order; independent relays for provably distinct sinks so a
+/// full stdout pipe never blocks stderr).
+///
+/// The stdin relay is deliberately NOT part of it: it starts only once the
+/// session is live and the host terminal is in raw mode (see
+/// [`LocalIo::start_stdin`]), so typeahead during VM boot stays in the tty
+/// buffer instead of being consumed (and echoed) early.
+struct LocalIo {
+    output_relays: OutputRelays,
+    /// Read end of an already-closed pipe that stands in for stdin (immediate
+    /// EOF, so the guest sees `DataEnd`) with `--no-stdin`, or as a fallback.
+    eof_stdin: Option<OwnedFd>,
+}
+
+impl LocalIo {
+    fn prepare(out_fd: Option<RawFd>, err_fd: Option<RawFd>, no_stdin: bool) -> io::Result<Self> {
+        Ok(Self {
+            output_relays: OutputRelays::maybe_spawn(out_fd, err_fd)?,
+            eof_stdin: if no_stdin { Some(eof_pipe()?) } else { None },
+        })
+    }
+
+    fn forwards_stdin(&self) -> bool {
+        self.eof_stdin.is_none()
+    }
+
+    /// Start relaying `stdin_fd` (after `Started`, after raw mode). Returns the
+    /// helper (if one is needed) and the fd `writer_worker` reads. On failure
+    /// the caller ends the session (the guest then hangs up the command): an
+    /// interactive session without input could not even be interrupted.
+    fn start_stdin(&mut self, stdin_fd: RawFd) -> io::Result<(Option<StdinHelper>, RawFd)> {
+        if let Some(r) = &self.eof_stdin {
+            return Ok((None, r.as_raw_fd()));
+        }
+        let helper = StdinHelper::maybe_spawn(stdin_fd)?;
+        let fd = helper.as_ref().map_or(stdin_fd, StdinHelper::as_raw_fd);
+        Ok((helper, fd))
+    }
+}
+
+/// Nonblocking read end of a pipe whose write end is already closed.
+fn eof_pipe() -> io::Result<OwnedFd> {
+    let (r, w) = pipe_cloexec(true)?;
+    drop(w);
+    Ok(r)
+}
+
 /// Relays an inherited blocking `stdin_fd` into a private nonblocking pipe via
-/// a dedicated `/bin/cat` helper process so `run_session_io` never modifies
+/// a dedicated `vm-stdin-relay` helper process so `run_session_io` never modifies
 /// `stdin_fd`'s shared open file description (`O_NONBLOCK`), yet teardown can
 /// still terminate and reap a blocked reader promptly even if another process
 /// drained the last ready byte.
 struct StdinHelper {
     _proc: HelperProc,
     read_end: OwnedFd,
+    /// Held only by this process; its hangup (on drop or process death) makes
+    /// the helper exit without reading more of the caller's input.
+    _death_w: OwnedFd,
 }
 
 impl StdinHelper {
@@ -1537,11 +1671,15 @@ impl StdinHelper {
                 return Err(io::Error::last_os_error());
             }
         }
-        let proc = HelperProc::spawn_cat(stdin_fd, write_end.as_raw_fd())?;
+        let (death_r, death_w) = pipe_cloexec(false)?;
+        let proc =
+            HelperProc::spawn_stdin_relay(stdin_fd, write_end.as_raw_fd(), death_r.as_raw_fd())?;
         drop(write_end);
+        drop(death_r);
         Ok(Some(Self {
             _proc: proc,
             read_end,
+            _death_w: death_w,
         }))
     }
 
@@ -1993,9 +2131,17 @@ fn submit_exec(
 /// older VM lacking `vm-exec.sock`, never gating on `DockerState`.
 fn wait_for_ready_socket(
     path: &Path,
-    deadline: Instant,
+    mut deadline: Instant,
     mut poll_status: impl FnMut() -> anyhow::Result<Option<Status>>,
 ) -> anyhow::Result<UnixStream> {
+    // Once the daemon reports the VM `Running`, its exec listener only gets
+    // the short handshake bound (a guest whose listener is down must fail
+    // fast instead of after the whole boot timeout).
+    let running_cap = |deadline: &mut Instant, s: &Status| {
+        if matches!(s.state, VmState::Running) {
+            *deadline = (*deadline).min(Instant::now() + HANDSHAKE_TIMEOUT);
+        }
+    };
     let mut last_no_socket: Option<io::Error> = None;
     let mut saw_closed = false;
     loop {
@@ -2055,17 +2201,19 @@ fn wait_for_ready_socket(
             Probe::ClosedBeforeReady => {
                 saw_closed = true;
                 last_no_socket = None;
-                if let Some(s) = poll_status()?
-                    && matches!(s.state, VmState::Error | VmState::Stopped)
-                {
-                    bail!("the VM did not start: {}", s.error.unwrap_or_default());
+                if let Some(s) = poll_status()? {
+                    if matches!(s.state, VmState::Error | VmState::Stopped) {
+                        bail!("the VM did not start: {}", s.error.unwrap_or_default());
+                    }
+                    running_cap(&mut deadline, &s);
                 }
             }
             Probe::TimedOut(_) => {
-                if let Some(s) = poll_status()?
-                    && matches!(s.state, VmState::Error | VmState::Stopped)
-                {
-                    bail!("the VM did not start: {}", s.error.unwrap_or_default());
+                if let Some(s) = poll_status()? {
+                    if matches!(s.state, VmState::Error | VmState::Stopped) {
+                        bail!("the VM did not start: {}", s.error.unwrap_or_default());
+                    }
+                    running_cap(&mut deadline, &s);
                 }
             }
         }
@@ -2092,19 +2240,15 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
             return Ok((conn, token, path));
         }
         Probe::Failed(e) => return Err(e),
-        Probe::ClosedBeforeReady => {
-            // The VM process bound the Unix socket, but kat-init may still be
-            // finishing boot before listening on VM_EXEC_PORT.
-            let conn = wait_for_ready_socket(&path, fast_deadline, || Ok(None))?;
-            let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
-            return Ok((conn, token, path));
-        }
         Probe::TimedOut(e) => {
             return Err(e).context(
                 "timed out waiting for the VM shell service; check `kat logs --console` or run `kat restart`",
             );
         }
-        Probe::NoSocket(_) => {}
+        // `ClosedBeforeReady`: the VM process bound the Unix socket but kat-init
+        // may still be booting; like a missing socket, wait under the daemon's
+        // VM state (up to `VM_START_TIMEOUT` while it is starting).
+        Probe::ClosedBeforeReady | Probe::NoSocket(_) => {}
     }
 
     // Socket is absent: consult the daemon, start the VM if needed, and poll
@@ -2123,7 +2267,15 @@ fn connect_and_start(spec: &ExecSpec) -> anyhow::Result<(UnixStream, [u8; 16], P
                 "VM shell service is not available on the running VM ({}); run `kat restart` to upgrade",
                 path.display()
             ),
-            Probe::ClosedBeforeReady | Probe::TimedOut(_) => {}
+            // A VM that is already running gets only the short handshake
+            // bound: a guest whose exec listener is down must fail fast, not
+            // after the full boot timeout.
+            Probe::ClosedBeforeReady | Probe::TimedOut(_) => {
+                let conn =
+                    wait_for_ready_socket(&path, Instant::now() + HANDSHAKE_TIMEOUT, || Ok(None))?;
+                let (conn, token) = submit_exec(conn, spec, Instant::now() + HANDSHAKE_TIMEOUT)?;
+                return Ok((conn, token, path));
+            }
         },
         VmState::Stopped | VmState::Error => {
             eprintln!("katamaran: starting the VM");
@@ -2665,6 +2817,18 @@ enum OutputSink<'a> {
     _Marker(std::marker::PhantomData<&'a ()>),
 }
 
+impl OutputSink<'_> {
+    fn raw_fd(&self) -> Option<RawFd> {
+        match *self {
+            OutputSink::Fd(fd) => Some(fd),
+            #[cfg(test)]
+            OutputSink::Writer(_) => None,
+            #[cfg(not(test))]
+            OutputSink::_Marker(_) => None,
+        }
+    }
+}
+
 enum WriteOutcome {
     Written,
     BrokenPipe,
@@ -2850,6 +3014,7 @@ fn run_session(
     sock_path: PathBuf,
     initial_tty_size: Option<(u16, u16)>,
     output_window: u32,
+    local: LocalIo,
 ) -> anyhow::Result<SessionExit> {
     let mut out = OutputSink::Fd(1);
     let mut err = OutputSink::Fd(2);
@@ -2868,6 +3033,7 @@ fn run_session(
         SIGINT_DELIVERY_TIMEOUT,
         None,
         output_window,
+        Some(local),
     )
 }
 
@@ -2900,11 +3066,14 @@ fn run_session_io(
         sigint_timeout,
         on_ready,
         0,
+        None,
     )
 }
 
 /// `output_window` must equal the `ExecSpec::output_window` the guest accepted
-/// (nonzero enables bidirectional flow control for non-PTY sessions).
+/// (nonzero enables bidirectional flow control for non-PTY sessions). `local`
+/// is the I/O prepared before `Exec` was sent (production); `None` prepares it
+/// here from `stdin_fd`/`out`/`err` (tests with in-process fake guests).
 #[allow(clippy::too_many_arguments)]
 fn run_session_io_windowed(
     conn: UnixStream,
@@ -2919,17 +3088,21 @@ fn run_session_io_windowed(
     sigint_timeout: Duration,
     on_ready: Option<mpsc::Sender<()>>,
     output_window: u32,
+    local: Option<LocalIo>,
 ) -> anyhow::Result<SessionExit> {
     let allocate_pty = initial_tty_size.is_some();
     // The guest ignores `output_window` for PTY sessions; mirror that here.
     let output_window = if allocate_pty { 0 } else { output_window };
-    let stdin_is_tty = is_tty(stdin_fd);
+    // With `--no-stdin` the terminal is not forwarded, so it must never be put
+    // in raw mode (which would also disable local Ctrl-C).
+    let forwards_stdin = local.as_ref().is_none_or(LocalIo::forwards_stdin);
+    let stdin_is_tty = forwards_stdin && is_tty(stdin_fd);
     let stdout_is_tty = is_tty(stdout_fd);
     let want_raw = allocate_pty && stdin_is_tty;
 
-    // Install signal wakeups BEFORE entering raw mode or spawning I/O helpers
-    // so catchable termination signals always unwind cleanly and restore host
-    // termios.
+    // Install signal wakeups BEFORE entering raw mode or starting the stdin
+    // relay so catchable termination signals always unwind cleanly and
+    // restore host termios.
     let sig_setup =
         SignalGuard::install(&[libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT]).ok();
 
@@ -2940,31 +3113,24 @@ fn run_session_io_windowed(
     };
     let raw_active = raw.is_some();
 
-    // NEVER call `F_SETFL(O_NONBLOCK)` on any inherited stdio descriptor
-    // (`stdin`, `stdout`, or `stderr`). Relay blocking stdin via `StdinHelper`
-    // and blocking stdout/stderr via `OutputRelays` (one shared FIFO for merged
-    // or ambiguous sinks so `2>&1` preserves frame order; independent relays
-    // for provably distinct sinks so a full stdout pipe never blocks stderr).
-    let stdin_helper = StdinHelper::maybe_spawn(stdin_fd)?;
-    let worker_stdin_fd = stdin_helper
-        .as_ref()
-        .map_or(stdin_fd, StdinHelper::as_raw_fd);
-
-    let out_raw_fd = match *out {
-        OutputSink::Fd(fd) => Some(fd),
-        #[cfg(test)]
-        OutputSink::Writer(_) => None,
-        #[cfg(not(test))]
-        OutputSink::_Marker(_) => None,
+    let mut local = match local {
+        Some(l) => l,
+        None => LocalIo::prepare(out.raw_fd(), err.raw_fd(), false)?,
     };
-    let err_raw_fd = match *err {
-        OutputSink::Fd(fd) => Some(fd),
-        #[cfg(test)]
-        OutputSink::Writer(_) => None,
-        #[cfg(not(test))]
-        OutputSink::_Marker(_) => None,
+    let (stdin_helper, worker_stdin_fd) = match local.start_stdin(stdin_fd) {
+        Ok(v) => v,
+        Err(e) => {
+            // Disconnecting makes the guest hang up the command; raw mode and
+            // signal handlers are restored as this frame unwinds.
+            let _ = conn.shutdown(Shutdown::Both);
+            return Err(anyhow::Error::new(e)
+                .context("cannot relay stdin to the VM command; the command was hung up"));
+        }
     };
-    let mut output_relays = OutputRelays::maybe_spawn(out_raw_fd, err_raw_fd)?;
+    let LocalIo {
+        mut output_relays,
+        eof_stdin: _eof_stdin,
+    } = local;
 
     // macOS XNU ignores MSG_DONTWAIT on AF_UNIX SOCK_STREAM sends; put the
     // shared socket open file description in nonblocking mode so writer_worker
@@ -3192,11 +3358,15 @@ fn run_session_io_windowed(
     // while keeping the drain interruptible on termination signals. Abort
     // immediately only on local sink failure or signal cancellation.
     let mut drain_outcome: Option<RelayFinish> = None;
+    // A broken split stream mid-session (e.g. `| head` closed stdout) still
+    // delivers what the other stream already received: `finish` aborts only
+    // the failed channel and drains the survivor under its idle bound.
     let should_drain = terminated_by.load(Ordering::Acquire) == 0
-        && matches!(
-            outcome,
-            RelayOutcome::GuestExit(_) | RelayOutcome::GuestError(_)
-        );
+        && match outcome {
+            RelayOutcome::GuestExit(_) | RelayOutcome::GuestError(_) => true,
+            RelayOutcome::LocalBrokenPipe => matches!(output_relays, OutputRelays::Split { .. }),
+            _ => false,
+        };
     if should_drain {
         drain_outcome = Some(output_relays.finish(term_wake_r.as_raw_fd()));
     } else {
@@ -3639,7 +3809,11 @@ mod tests {
         let VmCmd::Exec(e) = parse(&["vm", "exec", "--", "uname", "-a"]) else {
             panic!()
         };
-        assert!(!e.tty && e.workdir.is_none() && e.cmd == ["uname", "-a"]);
+        assert!(!e.tty && !e.no_stdin && e.workdir.is_none() && e.cmd == ["uname", "-a"]);
+        let VmCmd::Exec(e) = parse(&["vm", "exec", "-n", "uname"]) else {
+            panic!()
+        };
+        assert!(e.no_stdin && e.cmd == ["uname"]);
 
         let VmCmd::Exec(e) = parse(&["vm", "exec", "ls", "-t", "-la"]) else {
             panic!()
@@ -4907,10 +5081,12 @@ mod tests {
     #[test]
     #[ignore = "internal OutputRelay helper entrypoint invoked by unit tests"]
     fn io_relay_helper_entrypoint() {
-        if std::env::var_os("KATAMARAN_TEST_IO_RELAY").is_some() {
-            let code = run_output_relay_fds(3, 4, 5, 6, 7);
-            unsafe { libc::_exit(code) };
-        }
+        let code = match std::env::var("KATAMARAN_TEST_IO_RELAY").as_deref() {
+            Ok("output") => run_output_relay_fds(3, 4, 5, 6, 7),
+            Ok("stdin") => run_stdin_relay_fds(3, 4, 5),
+            _ => return,
+        };
+        unsafe { libc::_exit(code) };
     }
 
     #[test]
@@ -5435,6 +5611,17 @@ mod tests {
         split_drain_after_stdout_epipe(chunks, read, pause);
     }
 
+    #[test]
+    fn split_drain_survivor_tolerates_reader_consuming_less_than_a_slice_per_read() {
+        // Each read takes a quarter of a relay write slice; one slice is
+        // consumed well within the idle period, the whole drain is not.
+        let pause = Duration::from_millis(60);
+        let read = RELAY_WRITE_SLICE / 4;
+        assert!(pause * 6 < SPLIT_DRAIN_SURVIVOR_IDLE);
+        assert!(pause * ((16 << 10) / read) as u32 > SPLIT_DRAIN_SURVIVOR_IDLE * 2);
+        split_drain_after_stdout_epipe(1, read, pause);
+    }
+
     fn split_drain_after_stdout_epipe(chunks: usize, read_size: usize, pause: Duration) {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
@@ -5550,6 +5737,7 @@ mod tests {
                 SIGINT_DELIVERY_TIMEOUT,
                 Some(ready_tx),
                 window,
+                None,
             )
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -5796,6 +5984,130 @@ mod tests {
         drop(stdin_r);
         drop(guest);
         feeder.join().unwrap();
+    }
+
+    #[test]
+    fn no_stdin_reads_eof_immediately_and_spec_size_is_checked_locally() {
+        let mut local = LocalIo::prepare(None, None, true).unwrap();
+        assert!(!local.forwards_stdin());
+        let (helper, fd) = local.start_stdin(0).unwrap();
+        assert!(helper.is_none());
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+        assert_eq!(n, 0, "--no-stdin must present immediate EOF");
+
+        let huge = "x".repeat(kat_proto::MAX_FRAME);
+        let err = build_spec(None, &[], vec!["echo".into(), huge], false).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(!err.to_string().contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn stdin_relay_exits_without_reading_once_session_is_gone() {
+        let (in_r, in_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (death_r, death_w) = pipe_cloexec(false).unwrap();
+        // Input is pending AND the session is gone: nothing may be consumed.
+        assert_eq!(
+            unsafe { libc::write(in_w.as_raw_fd(), b"typed".as_ptr().cast(), 5) },
+            5
+        );
+        drop(death_w);
+        let code = run_stdin_relay_fds(in_r.as_raw_fd(), out_w.as_raw_fd(), death_r.as_raw_fd());
+        assert_eq!(code, 0);
+        let mut b = [0u8; 8];
+        assert_eq!(
+            unsafe { libc::read(in_r.as_raw_fd(), b.as_mut_ptr().cast(), 8) },
+            5
+        );
+        assert_eq!(&b[..5], b"typed");
+        drop(out_w);
+        assert_eq!(
+            unsafe { libc::read(out_r.as_raw_fd(), b.as_mut_ptr().cast(), 8) },
+            0
+        );
+
+        // While the session is alive it relays, and exits on stdin EOF.
+        let (in_r, in_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (death_r, _death_w) = pipe_cloexec(false).unwrap();
+        assert_eq!(
+            unsafe { libc::write(in_w.as_raw_fd(), b"hello".as_ptr().cast(), 5) },
+            5
+        );
+        drop(in_w);
+        let code = run_stdin_relay_fds(in_r.as_raw_fd(), out_w.as_raw_fd(), death_r.as_raw_fd());
+        assert_eq!(code, 0);
+        drop(out_w);
+        let mut f = std::fs::File::from(out_r);
+        let mut got = Vec::new();
+        io::Read::read_to_end(&mut f, &mut got).unwrap();
+        assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn mid_session_stdout_epipe_still_delivers_received_stderr() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (err_r, err_w) = pipe_cloexec(false).unwrap();
+        drop(out_r); // `| head` already gone: the first stdout write fails.
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // More stderr than the pipe holds is received BEFORE stdout breaks.
+        let chunk = 16usize << 10;
+        let chunks = 8usize;
+        for i in 0..chunks {
+            vm_exec::write(&mut guest, &VmExecMsg::Stderr(vec![b'a' + i as u8; chunk])).unwrap();
+        }
+        vm_exec::write(&mut guest, &VmExecMsg::Stdout(b"line\n".to_vec())).unwrap();
+
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut f = std::fs::File::from(err_r);
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 4 << 10];
+            loop {
+                thread::sleep(Duration::from_millis(5));
+                match io::Read::read(&mut f, &mut buf) {
+                    Ok(0) => return got,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        });
+        let exit = session.join().unwrap().unwrap();
+        assert_eq!(exit, SessionExit::Code(128 + libc::SIGPIPE));
+        drop(out_w);
+        drop(err_w);
+        drop(guest);
+        let got = reader.join().unwrap();
+        assert_eq!(got.len(), chunk * chunks, "stderr lost after stdout EPIPE");
+        drop(stdin_w);
+        drop(stdin_r);
     }
 
     struct SharedVec(Arc<Mutex<Vec<u8>>>);

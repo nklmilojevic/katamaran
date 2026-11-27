@@ -113,7 +113,7 @@ impl Reaper {
 
 /// Specification for [`Reaper::spawn_unlocked`], which spawns a child directly
 /// via `fork` + `execve` without holding PID 1's shared reaper lock across
-/// `fork`, `fchdir`, `cgroup.procs`, or `execve`, and leaves `reap_loop` as the
+/// `fork`, `chdir`, `cgroup.procs`, or `execve`, and leaves `reap_loop` as the
 /// sole child-reaping owner on both success and failure.
 pub struct UnlockedSpawnSpec {
     pub program: String,
@@ -122,7 +122,9 @@ pub struct UnlockedSpawnSpec {
     pub stdin: OwnedFd,
     pub stdout: OwnedFd,
     pub stderr: OwnedFd,
-    pub cwd_fd: OwnedFd,
+    /// Working directory entered by the child (after `fork`, while the parent
+    /// monitors `cancel_fd`), so a stalled filesystem never blocks the caller.
+    pub cwd: CString,
     pub cgroup_procs_fd: Option<OwnedFd>,
     /// True for PTY sessions (`setsid` + `TIOCSCTTY` + `pidfd_open`); false
     /// for piped sessions (`setpgid(0, 0)`).
@@ -153,6 +155,9 @@ fn last_errno() -> libc::c_int {
         .raw_os_error()
         .unwrap_or(libc::EIO)
 }
+
+/// Tag OR-ed into the child's reported errno when `chdir(cwd)` failed.
+const CHILD_ERR_CHDIR: libc::c_int = 1 << 24;
 
 unsafe fn fail_child(err_fd: RawFd, errno: libc::c_int) -> ! {
     let bytes = errno.to_ne_bytes();
@@ -311,10 +316,10 @@ fn prepare_exec_tables(
 
 impl Reaper {
     /// Spawn a child from `spec` without holding PID 1's shared reaper lock
-    /// across `fork`, `fchdir`, `cgroup.procs`, or `execve`.
+    /// across `fork`, `chdir`, `cgroup.procs`, or `execve`.
     ///
     /// Immediately after `fork`, the child packs only its owned descriptors
-    /// into `0..=6` and closes all other inherited descriptors (preventing
+    /// into `0..=5` and closes all other inherited descriptors (preventing
     /// deadlocks with concurrent `Command::spawn` exec-status sockets) before
     /// pausing on the registration gate. The parent briefly acquires
     /// `self.watched` to register the PID (and open a `pidfd` for PTY
@@ -368,7 +373,8 @@ impl Reaper {
         let stderr_raw = spec.stderr.as_raw_fd();
         let go_r_raw = go_r.as_raw_fd();
         let err_w_raw = err_w.as_raw_fd();
-        let cwd_raw = spec.cwd_fd.as_raw_fd();
+        let cwd_ptr = spec.cwd.as_ptr();
+        let cwd_display = spec.cwd.to_string_lossy().into_owned();
         let procs_raw = spec.cgroup_procs_fd.as_ref().map(AsRawFd::as_raw_fd);
         let pty = spec.pty;
 
@@ -385,7 +391,6 @@ impl Reaper {
                 let r_out = dup_ge7(stdout_raw, r_err);
                 let r_stderr = dup_ge7(stderr_raw, r_err);
                 let r_go = dup_ge7(go_r_raw, r_err);
-                let r_cwd = dup_ge7(cwd_raw, r_err);
                 let r_procs = procs_raw.map(|fd| dup_ge7(fd, r_err));
 
                 dup2_retry(r_in, 0, r_err);
@@ -393,12 +398,11 @@ impl Reaper {
                 dup2_retry(r_stderr, 2, r_err);
                 dup2_cloexec(r_go, 3, r_err);
                 dup2_cloexec(r_err, 4, r_err);
-                dup2_cloexec(r_cwd, 5, 4);
                 let close_from: u32 = if let Some(rp) = r_procs {
-                    dup2_cloexec(rp, 6, 4);
-                    7
-                } else {
+                    dup2_cloexec(rp, 5, 4);
                     6
+                } else {
+                    5
                 };
 
                 // Close EVERY unrelated inherited descriptor (including any
@@ -432,15 +436,17 @@ impl Reaper {
                 let _ = libc::close(3);
 
                 if r_procs.is_some() {
-                    if let Err(e) = write_all_raw(6, b"0\n") {
+                    if let Err(e) = write_all_raw(5, b"0\n") {
                         fail_child(4, e);
                     }
-                    let _ = libc::close(6);
+                    let _ = libc::close(5);
                 }
-                if libc::fchdir(5) < 0 {
-                    fail_child(4, last_errno());
+                // Path lookups on user-controlled filesystems (`chdir`, the
+                // `PATH` search, `execve`) all happen here in the child, where
+                // the parent is watching `cancel_fd`.
+                if libc::chdir(cwd_ptr) < 0 {
+                    fail_child(4, CHILD_ERR_CHDIR | last_errno());
                 }
-                let _ = libc::close(5);
 
                 if pty {
                     if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
@@ -521,7 +527,7 @@ impl Reaper {
         }
 
         // Hold `self.watched` ONLY for the microsecond registration + pidfd_open,
-        // never across `fchdir`, `cgroup.procs`, or `execve`.
+        // never across `chdir`, `cgroup.procs`, or `execve`.
         let (target, pgrp, rx) = {
             let mut table = self.watched.lock().unwrap();
             let (token, rx) = table.register(pid);
@@ -644,7 +650,16 @@ impl Reaper {
 
         self.finish_failed_unlocked_child(pgrp, &target, &rx);
         if err_off == 4 {
-            Err(io::Error::from_raw_os_error(i32::from_ne_bytes(err_buf)))
+            let raw = i32::from_ne_bytes(err_buf);
+            if raw & CHILD_ERR_CHDIR != 0 {
+                let e = io::Error::from_raw_os_error(raw & !CHILD_ERR_CHDIR);
+                Err(io::Error::new(
+                    e.kind(),
+                    format!("workdir {cwd_display:?}: {e}"),
+                ))
+            } else {
+                Err(io::Error::from_raw_os_error(raw))
+            }
         } else {
             Err(io::Error::other("child terminated before completing exec"))
         }
@@ -1636,18 +1651,6 @@ mod tests {
         assert!(table.matches(4242, tok2));
     }
 
-    fn open_dir_fd(path: &str) -> OwnedFd {
-        let c = CString::new(path).unwrap();
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        assert!(fd >= 0);
-        unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }
-    }
-
     fn open_devnull_fd() -> OwnedFd {
         let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         assert!(fd >= 0);
@@ -1674,7 +1677,7 @@ mod tests {
                 stdin: open_devnull_fd(),
                 stdout: out_w,
                 stderr: open_devnull_fd(),
-                cwd_fd: open_dir_fd("/"),
+                cwd: c"/".into(),
                 cgroup_procs_fd: None,
                 pty: false,
                 cancel_fd: None,
@@ -1729,7 +1732,7 @@ mod tests {
                 stdin: open_devnull_fd(),
                 stdout: open_devnull_fd(),
                 stderr: open_devnull_fd(),
-                cwd_fd: open_dir_fd("/"),
+                cwd: c"/".into(),
                 cgroup_procs_fd: None,
                 pty: false,
                 cancel_fd: None,
@@ -1770,12 +1773,44 @@ mod tests {
             stdin: open_devnull_fd(),
             stdout: open_devnull_fd(),
             stderr: open_devnull_fd(),
-            cwd_fd: open_dir_fd("/"),
+            cwd: c"/".into(),
             cgroup_procs_fd: None,
             pty: false,
             cancel_fd: None,
         };
         let (_, _, rx) = reaper.spawn_unlocked(spec).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn spawn_unlocked_enters_workdir_in_child_and_reports_failures() {
+        let reaper = Reaper::shared_for_tests();
+        let spawn = |cwd: &std::ffi::CStr| {
+            reaper.spawn_unlocked(UnlockedSpawnSpec {
+                program: "/bin/true".into(),
+                args: vec![],
+                env: vec![("PATH".into(), PATH.into())],
+                stdin: open_devnull_fd(),
+                stdout: open_devnull_fd(),
+                stderr: open_devnull_fd(),
+                cwd: cwd.into(),
+                cgroup_procs_fd: None,
+                pty: false,
+                cancel_fd: None,
+            })
+        };
+        let err = spawn(c"/nonexistent-kat-workdir").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert!(
+            err.to_string()
+                .contains("workdir \"/nonexistent-kat-workdir\""),
+            "{err}"
+        );
+        let err = spawn(c"/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("workdir"), "{err}");
+        assert_eq!(err.raw_os_error(), None);
+        assert!(err.to_string().contains("ot a directory"), "{err}");
+        let (_, _, rx) = spawn(c"/tmp").unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
     }
 
@@ -1793,7 +1828,7 @@ mod tests {
             stdin: open_devnull_fd(),
             stdout: open_devnull_fd(),
             stderr: open_devnull_fd(),
-            cwd_fd: open_dir_fd("/"),
+            cwd: c"/".into(),
             cgroup_procs_fd: None,
             pty: false,
             cancel_fd: Some(peer_b.as_raw_fd()),
@@ -1826,7 +1861,7 @@ mod tests {
                 stdin: open_devnull_fd(),
                 stdout: open_devnull_fd(),
                 stderr: open_devnull_fd(),
-                cwd_fd: open_dir_fd("/"),
+                cwd: c"/".into(),
                 cgroup_procs_fd: Some(stall_w),
                 pty: false,
                 cancel_fd: Some(cancel_raw),

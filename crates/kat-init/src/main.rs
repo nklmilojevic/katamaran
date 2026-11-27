@@ -18,8 +18,12 @@ mod unix_connect;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    if std::process::id() != 1 && std::env::args().nth(1).as_deref() == Some("nfsd") {
-        linux::nfs::main()
+    if std::process::id() != 1 {
+        match std::env::args().nth(1).as_deref() {
+            Some("nfsd") => linux::nfs::main(),
+            Some("vm-exec-probe") => linux::vm_exec::probe_main(),
+            _ => {}
+        }
     }
     linux::run()
 }

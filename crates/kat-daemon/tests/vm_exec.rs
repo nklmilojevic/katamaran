@@ -261,8 +261,12 @@ fn verify_host_pty_shell_and_resize(home: &Path) {
     assert_ne!(before.c_lflag & libc::ICANON, 0);
     assert_ne!(before.c_lflag & libc::ECHO, 0);
 
-    let mut cmd = Command::new(katamaran());
-    cmd.args(["vm", "shell"])
+    // A wrapper shell is the session leader (as a login shell would be), so
+    // kat's exit neither revokes the controlling tty (letting us inspect the
+    // restored termios afterwards) nor waits for its output to drain.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "\"$0\" vm shell; echo KAT_EXIT=$?; read _"])
+        .arg(katamaran())
         .env("KATAMARAN_HOME", home)
         .env("TERM", "xterm-256color")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -344,19 +348,10 @@ fn verify_host_pty_shell_and_resize(home: &Path) {
         );
     }
 
-    // 4. Exit cleanly and confirm host termios was restored.
+    // 4. Exit cleanly (the wrapper reports kat's status) and confirm host
+    // termios was restored.
     write_all_fd(master.as_raw_fd(), b"exit 0\n");
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break s;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "kat vm shell did not exit cleanly; output:\n{output}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    };
-    assert!(status.success(), "kat vm shell exited with {status}");
+    read_fd_until(master.as_raw_fd(), &mut output, "KAT_EXIT=0", deadline);
 
     let mut after: libc::termios = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut after) }, 0);
@@ -369,6 +364,22 @@ fn verify_host_pty_shell_and_resize(home: &Path) {
     assert_eq!(after.c_iflag, before.c_iflag, "host c_iflag not restored");
     assert_eq!(after.c_oflag, before.c_oflag, "host c_oflag not restored");
     assert_eq!(after.c_cflag, before.c_cflag, "host c_cflag not restored");
+    // Let the wrapper's `read` return, and keep reading the master until it is
+    // reaped: on macOS an exiting session leader waits (`ttywait`) for its
+    // controlling tty's output (here, the echoed newline) to drain.
+    write_all_fd(master.as_raw_fd(), b"\n");
+    let mut buf = [0u8; 4096];
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "wrapper shell did not exit");
+        let mut pfd = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 25) } > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let _ = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        }
+    }
 }
 
 /// Exercise non-PTY `SIGINT` forwarding: the guest traps `INT` and `HUP`
@@ -576,6 +587,21 @@ fn vm_shell_and_exec_run_as_root_in_vm_namespaces() {
         "rlimits",
     );
     assert!(limits.contains("Max open files"), "{limits}");
+
+    // Only the host can open exec sessions: guest root (strictly more capable
+    // than any container workload) gets no session via vsock loopback, the
+    // guest's own CID, or the host CID on the exec port.
+    let probe = cli(&home, &["vm", "exec", "--", "/proc/1/exe", "vm-exec-probe"]);
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    eprintln!("{probe_out}");
+    assert!(probe.status.success(), "{probe:?}");
+    for target in ["loopback", "host", "own-cid"] {
+        assert!(
+            probe_out.contains(&format!("vm-exec-probe {target} ")),
+            "{probe_out}"
+        );
+    }
+    assert!(!probe_out.contains("ACCEPTED"), "{probe_out}");
 
     // Stdout and stderr stay separate without a PTY, and exit codes propagate.
     let split = cli(

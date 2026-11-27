@@ -90,12 +90,15 @@ kat vm shell [-w <DIR>] [-e <KEY=VALUE>]... [-- <CMD>...]
 Run a command as `root` directly in the Linux VM's own namespaces. Designed for scripting: no pseudo-terminal is allocated by default, keeping `stdout` and `stderr` separate and preserving the command's exit code. Starts the VM automatically if it is stopped.
 
 ```sh
-kat vm exec [-t] [-w <DIR>] [-e <KEY=VALUE>]... [--] <CMD>...
+kat vm exec [-t] [-n] [-w <DIR>] [-e <KEY=VALUE>]... [--] <CMD>...
 ```
+
+Like `ssh`, `kat vm exec` forwards your stdin to the command. Use `-n` when stdin belongs to something else, such as a `while read` loop, so the command reads end-of-file and none of your input is consumed.
 
 | Option | Default | Description |
 |---|---|---|
 | `-t`, `--tty` | off | Allocate a pseudo-terminal and combine the command's stdout and stderr on stdout |
+| `-n`, `--no-stdin` | off | Do not forward stdin; the command reads end-of-file immediately |
 | `-w`, `--workdir <DIR>` | `/root` | Working directory inside the VM |
 | `-e`, `--env <KEY=VALUE>` | none | Extra environment variable (`KEY=VALUE`, or `KEY` to copy from the host); repeatable |
 

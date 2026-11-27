@@ -77,6 +77,9 @@ enum Command {
     /// Internal ordered blocking-output relay helper for `kat vm shell`/`exec`.
     #[command(hide = true)]
     VmIoRelay,
+    /// Internal stdin relay helper for `kat vm exec`.
+    #[command(hide = true)]
+    VmStdinRelay,
     /// Open a shell (or run a command) in a Linux machine.
     Shell(machine_cli::ShellArgs),
     /// SSH into a Linux machine through the katamaran SSH config.
@@ -100,8 +103,14 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     // Fast-path the internal ordered I/O relay helper before clap parsing so
     // it adds minimal startup overhead and never touches stdout/stderr (0/1/2).
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("vm-io-relay")) {
-        vm_cli::run_io_relay_helper();
+    match std::env::args_os()
+        .nth(1)
+        .as_deref()
+        .and_then(|a| a.to_str())
+    {
+        Some("vm-io-relay") => vm_cli::run_io_relay_helper(),
+        Some("vm-stdin-relay") => vm_cli::run_stdin_relay_helper(),
+        _ => {}
     }
     match Cli::parse().command {
         Command::Start(args) => cli::start(args),
@@ -118,6 +127,7 @@ fn main() -> anyhow::Result<()> {
         Command::K8s(cmd) => k8s_cli::run(cmd),
         Command::Vm(cmd) => vm_cli::run(cmd),
         Command::VmIoRelay => vm_cli::run_io_relay_helper(),
+        Command::VmStdinRelay => vm_cli::run_stdin_relay_helper(),
         Command::Shell(args) => machine_cli::shell(args),
         Command::Ssh(args) => machine_cli::ssh(args),
         Command::SshProxy => ssh::proxy(),

@@ -1014,8 +1014,9 @@ impl Drop for SessionCgroup {
     }
 }
 
+/// Linux signals are `1..=64` (`_NSIG - 1`, i.e. up to `SIGRTMAX`).
 fn valid_signal(sig: i32) -> bool {
-    (1..64).contains(&sig)
+    (1..=64).contains(&sig)
 }
 
 fn truncate_error(s: &str) -> String {
@@ -1848,6 +1849,51 @@ fn log(msg: &str) {
     eprintln!("kat-init: vm-exec: {msg}");
 }
 
+/// `kat-init vm-exec-probe` (never as PID 1): from inside the guest, try to
+/// open an exec session the way a guest workload could — via vsock loopback,
+/// the guest's own CID, and the host CID — and exit 0 only if every attempt is
+/// refused or never answers a `Ping`. The real-VM integration test runs this
+/// as guest root (strictly more capable than any container) to prove that only
+/// the host can reach the listener (see [`peer_is_host`]).
+pub fn probe_main() -> ! {
+    const IOCTL_VM_SOCKETS_GET_LOCAL_CID: libc::c_ulong = 0x7b9;
+    let own_cid = fs::File::open("/dev/vsock").ok().and_then(|f| {
+        let mut cid: u32 = 0;
+        let rc =
+            unsafe { libc::ioctl(f.as_raw_fd(), IOCTL_VM_SOCKETS_GET_LOCAL_CID as _, &mut cid) };
+        (rc == 0).then_some(cid)
+    });
+    let mut targets = vec![
+        ("loopback", libc::VMADDR_CID_LOCAL),
+        ("host", libc::VMADDR_CID_HOST),
+    ];
+    if let Some(cid) = own_cid {
+        targets.push(("own-cid", cid));
+    }
+    let mut accepted = false;
+    for (name, cid) in targets {
+        let outcome = match sys::vsock_connect(cid, VM_EXEC_PORT) {
+            Err(e) => format!("refused ({e})"),
+            Ok(fd) => {
+                let mut s = UnixStream::from(fd);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+                let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
+                match vm_exec::write(&mut s, &VmExecMsg::Ping).and_then(|()| vm_exec::read(&mut s))
+                {
+                    Ok(Some(VmExecMsg::Pong)) => {
+                        accepted = true;
+                        "ACCEPTED (answered Ping)".to_string()
+                    }
+                    Ok(other) => format!("rejected (closed: {other:?})"),
+                    Err(e) => format!("rejected ({e})"),
+                }
+            }
+        };
+        println!("vm-exec-probe {name} cid={cid}: {outcome}");
+    }
+    std::process::exit(i32::from(accepted));
+}
+
 /// Start listening on [`VM_EXEC_PORT`] for host VM shell/exec sessions.
 pub fn start(reaper: Reaper) -> io::Result<()> {
     let listener = sys::vsock_listen(VM_EXEC_PORT)?;
@@ -2032,10 +2078,12 @@ fn serve_with_timeouts(
     }
 }
 
-fn open_workdir_fd(cwd: &str) -> Result<OwnedFd, String> {
-    if !vm_exec::value_ok(cwd) {
-        return Err("workdir contains NUL byte".into());
-    }
+/// Validate and resolve the session working directory WITHOUT touching the
+/// target filesystem: the child enters it with `chdir` after `fork`, while
+/// `spawn_unlocked` watches the host connection, so a stalled mount (e.g. the
+/// `/Users` share) can never hold a session slot after the host disconnects.
+/// Only the default (`/root` on the local rootfs, else `/`) is checked here.
+fn resolve_workdir(cwd: &str) -> Result<CString, String> {
     let path = if cwd.is_empty() {
         if Path::new(DEFAULT_HOME).is_dir() {
             DEFAULT_HOME
@@ -2045,32 +2093,18 @@ fn open_workdir_fd(cwd: &str) -> Result<OwnedFd, String> {
     } else {
         cwd
     };
-    let c = CString::new(path).map_err(|_| "workdir contains NUL byte".to_string())?;
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ENOTDIR) {
-            return Err(format!("workdir {cwd:?}: not a directory"));
-        }
-        return Err(format!("workdir {cwd:?}: {e}"));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    CString::new(path).map_err(|_| "workdir contains NUL byte".to_string())
 }
 
 struct BuiltCommand {
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
-    cwd_fd: OwnedFd,
+    cwd: CString,
 }
 
 fn build_command(spec: &ExecSpec) -> Result<BuiltCommand, String> {
-    let cwd_fd = open_workdir_fd(&spec.cwd)?;
+    let cwd = resolve_workdir(&spec.cwd)?;
     for (k, v) in &spec.env {
         if !vm_exec::env_name_ok(k) {
             return Err(format!("invalid environment variable name {k:?}"));
@@ -2116,7 +2150,7 @@ fn build_command(spec: &ExecSpec) -> Result<BuiltCommand, String> {
         .map(|t| t.term.as_str())
         .filter(|t| !t.is_empty())
     {
-        env.push(("TERM".into(), term.into()));
+        env.push(("TERM".into(), guest_term(term, TERMINFO_DIRS).into()));
     }
     for (k, v) in &spec.env {
         env.push((k.clone(), v.clone()));
@@ -2125,8 +2159,49 @@ fn build_command(spec: &ExecSpec) -> Result<BuiltCommand, String> {
         program: program.to_string(),
         args: args.to_vec(),
         env,
-        cwd_fd,
+        cwd,
     })
+}
+
+const TERMINFO_DIRS: &[&str] = &["/etc/terminfo", "/usr/share/terminfo", "/lib/terminfo"];
+const FALLBACK_TERM: &str = "xterm-256color";
+
+/// The host's `TERM` when the guest has a terminfo entry for it (or has no
+/// terminfo database at all, so nothing can be checked); otherwise
+/// [`FALLBACK_TERM`], so a modern host terminal name (e.g. `xterm-ghostty`)
+/// unknown to the minimal rootfs does not break line editing or full-screen
+/// tools. Only local rootfs directories are consulted.
+fn guest_term<'a>(term: &'a str, dirs: &[&str]) -> &'a str {
+    let Some(first) = term.chars().next() else {
+        return term;
+    };
+    if term.contains('/') || term.starts_with('.') {
+        return FALLBACK_TERM;
+    }
+    let mut have_db = false;
+    for dir in dirs {
+        let dir = Path::new(dir);
+        if !dir.is_dir() {
+            continue;
+        }
+        have_db = true;
+        let hex = format!("{:x}", u32::from(first));
+        if dir.join(first.to_string()).join(term).is_file() || dir.join(hex).join(term).is_file() {
+            return term;
+        }
+    }
+    if have_db { FALLBACK_TERM } else { term }
+}
+
+/// User-facing spawn failure: workdir errors (reported by the child's `chdir`
+/// as `workdir "<path>": ...`) stand alone; everything else names the command.
+fn spawn_error(program: &str, e: &io::Error) -> String {
+    let msg = e.to_string();
+    if msg.starts_with("workdir ") {
+        msg
+    } else {
+        format!("exec {program:?}: {msg}")
+    }
 }
 
 fn exit_code(status: i32) -> i32 {
@@ -2196,7 +2271,7 @@ fn exec_with_timeouts(
                 stdin: slave.try_clone().map_err(|e| format!("pty stdin: {e}"))?,
                 stdout: slave.try_clone().map_err(|e| format!("pty stdout: {e}"))?,
                 stderr: slave,
-                cwd_fd: built.cwd_fd,
+                cwd: built.cwd,
                 cgroup_procs_fd: procs_fd,
                 pty: true,
                 cancel_fd: Some(conn.as_raw_fd()),
@@ -2207,7 +2282,7 @@ fn exec_with_timeouts(
                     if let Some(cg) = &cgroup {
                         cg.kill();
                     }
-                    return Err(format!("exec {program:?}: {e}"));
+                    return Err(spawn_error(&program, &e));
                 }
             };
             (
@@ -2234,7 +2309,7 @@ fn exec_with_timeouts(
                 stdin: in_r,
                 stdout: out_w,
                 stderr: err_w,
-                cwd_fd: built.cwd_fd,
+                cwd: built.cwd,
                 cgroup_procs_fd: procs_fd,
                 pty: false,
                 cancel_fd: Some(conn.as_raw_fd()),
@@ -2245,7 +2320,7 @@ fn exec_with_timeouts(
                     if let Some(cg) = &cgroup {
                         cg.kill();
                     }
-                    return Err(format!("exec {program:?}: {e}"));
+                    return Err(spawn_error(&program, &e));
                 }
             };
             (
@@ -2516,14 +2591,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_spec_inputs() {
-        assert!(
-            build_command(&ExecSpec {
-                cwd: "/no/such/dir/katamaran-test".into(),
-                ..Default::default()
-            })
-            .is_err()
+    fn unknown_term_falls_back_when_guest_has_terminfo() {
+        let base = std::env::temp_dir().join(format!("kat-terminfo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("x")).unwrap();
+        fs::write(base.join("x/xterm-256color"), b"").unwrap();
+        let dirs = [base.to_str().unwrap()];
+        assert_eq!(guest_term("xterm-256color", &dirs), "xterm-256color");
+        assert_eq!(guest_term("xterm-ghostty", &dirs), FALLBACK_TERM);
+        assert_eq!(guest_term("../../etc/passwd", &dirs), FALLBACK_TERM);
+        // No terminfo database at all: nothing to check, keep the host value.
+        assert_eq!(
+            guest_term("xterm-ghostty", &["/nonexistent-terminfo"]),
+            "xterm-ghostty"
         );
+        assert!(valid_signal(64) && valid_signal(1) && !valid_signal(0) && !valid_signal(65));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rejects_invalid_spec_inputs() {
+        // The workdir is never touched before spawn (the child enters it while
+        // the host connection is monitored); a missing directory is reported
+        // by `spawn_unlocked` instead.
+        let built = build_command(&ExecSpec {
+            cwd: "/no/such/dir/katamaran-test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(built.cwd.as_bytes(), b"/no/such/dir/katamaran-test");
         assert!(
             build_command(&ExecSpec {
                 cwd: "/\0bad".into(),
@@ -2584,7 +2680,8 @@ mod tests {
         assert!(valid_signal(libc::SIGHUP));
         assert!(!valid_signal(0));
         assert!(!valid_signal(-1));
-        assert!(!valid_signal(64));
+        assert!(valid_signal(64));
+        assert!(!valid_signal(65));
         assert_eq!(exit_code(7 << 8), 7);
         assert_eq!(exit_code(libc::SIGKILL), 128 + libc::SIGKILL);
     }
@@ -2960,6 +3057,12 @@ mod tests {
     fn pump_drains_buffered_output_when_descendant_closes_during_backpressured_send() {
         let (r, w_pipe) = cmd::pipe().unwrap();
         set_nonblocking(&r).unwrap();
+        // Room for all 256 KiB, so the producer deterministically finishes and
+        // closes the pipe WHILE the host is stalled (instead of racing the
+        // descendant idle deadline on a full 64 KiB pipe).
+        assert!(
+            unsafe { libc::fcntl(w_pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 1 << 20) } >= 256 << 10
+        );
         let (wake_r, wake_w) = cmd::pipe().unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();
         shrink_pair(&host, &guest, 4096);

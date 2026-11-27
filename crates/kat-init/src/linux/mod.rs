@@ -15,7 +15,7 @@ mod shutdown;
 mod stats;
 mod sys;
 mod trim;
-mod vm_exec;
+pub mod vm_exec;
 
 use std::fs::File;
 use std::io;

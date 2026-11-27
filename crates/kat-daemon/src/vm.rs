@@ -259,8 +259,10 @@ fn handshake_io(
         },
     )?;
     drop(ds);
-    conn.set_read_timeout(None)?;
-    conn.set_write_timeout(None)?;
+    // `DeadlineStream` sets no socket timeouts; clearing them is best-effort
+    // (macOS `setsockopt` fails with `EINVAL` once the peer has closed).
+    let _ = conn.set_read_timeout(None);
+    let _ = conn.set_write_timeout(None);
     Ok(hello)
 }
 
