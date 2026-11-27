@@ -93,6 +93,15 @@ impl Reaper {
         r
     }
 
+    /// Process-wide shared [`Reaper`] for unit tests so concurrent tests in
+    /// the same binary never run multiple `waitid(P_ALL)` loops that steal
+    /// each other's child exit statuses.
+    #[cfg(test)]
+    pub fn shared_for_tests() -> Reaper {
+        static TEST_REAPER: std::sync::LazyLock<Reaper> = std::sync::LazyLock::new(Reaper::start);
+        TEST_REAPER.clone()
+    }
+
     /// Spawn `cmd` and return its pid plus a channel that yields its wait
     /// status. The lock is held across spawn and registration so an
     /// immediate exit cannot be reaped before it is watched.
@@ -201,11 +210,27 @@ unsafe fn write_all_raw(fd: RawFd, data: &[u8]) -> Result<(), libc::c_int> {
     Ok(())
 }
 
+const EXEC_NAME_MAX: usize = 255;
+const EXEC_PATH_MAX: usize = 4096;
+
+struct PreparedExec {
+    /// Executable name/path as a NUL-terminated C string.
+    program: CString,
+    /// When `program` is a bare basename (contains no `/`), the raw `PATH`
+    /// value to scan in the child without pre-expanding candidates.
+    path_env: Option<Vec<u8>>,
+    /// Single fixed-size `PATH_MAX` scratch buffer reused per `PATH` entry in
+    /// the child, bounding memory to O(input) regardless of `PATH` entry count.
+    scratch: Vec<u8>,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+}
+
 fn prepare_exec_tables(
     program: &str,
     args: &[String],
     env: &[(String, String)],
-) -> io::Result<(Vec<CString>, Vec<CString>, Vec<CString>)> {
+) -> io::Result<PreparedExec> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in exec spec");
     if program.is_empty() {
         return Err(io::Error::new(
@@ -213,6 +238,12 @@ fn prepare_exec_tables(
             "empty executable",
         ));
     }
+    let bare = !program.contains('/');
+    if bare && program.len() > EXEC_NAME_MAX {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+
+    let program_c = CString::new(program).map_err(|_| invalid())?;
 
     // Deduplicate env entries preserving order (last value wins), matching `Command::env`.
     let mut dedup_env: Vec<(&str, &str)> = Vec::with_capacity(env.len());
@@ -224,25 +255,17 @@ fn prepare_exec_tables(
         }
     }
 
-    let mut candidates = Vec::new();
-    if program.contains('/') {
-        candidates.push(CString::new(program).map_err(|_| invalid())?);
-    } else if let Some((_, path)) = dedup_env.iter().find(|(k, _)| *k == "PATH") {
-        for dir in path.split(':') {
-            let full = if dir.is_empty() {
-                program.to_string()
-            } else {
-                format!("{dir}/{program}")
-            };
-            candidates.push(CString::new(full).map_err(|_| invalid())?);
-        }
-    }
-    if candidates.is_empty() {
-        candidates.push(CString::new(program).map_err(|_| invalid())?);
-    }
+    let path_env = if bare {
+        dedup_env
+            .iter()
+            .find(|(k, _)| *k == "PATH")
+            .map(|(_, v)| v.as_bytes().to_vec())
+    } else {
+        None
+    };
 
     let mut argv = Vec::with_capacity(1 + args.len());
-    argv.push(CString::new(program).map_err(|_| invalid())?);
+    argv.push(program_c.clone());
     for a in args {
         argv.push(CString::new(a.as_str()).map_err(|_| invalid())?);
     }
@@ -252,7 +275,19 @@ fn prepare_exec_tables(
         envp.push(CString::new(format!("{k}={v}")).map_err(|_| invalid())?);
     }
 
-    Ok((candidates, argv, envp))
+    let scratch = if path_env.is_some() {
+        vec![0u8; EXEC_PATH_MAX]
+    } else {
+        Vec::new()
+    };
+
+    Ok(PreparedExec {
+        program: program_c,
+        path_env,
+        scratch,
+        argv,
+        envp,
+    })
 }
 
 impl Reaper {
@@ -279,12 +314,12 @@ impl Reaper {
         spec: UnlockedSpawnSpec,
         before_reg: Option<Box<dyn FnOnce()>>,
     ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)> {
-        let (candidates, argv, envp) = prepare_exec_tables(&spec.program, &spec.args, &spec.env)?;
-        let candidate_ptrs: Vec<*const libc::c_char> =
-            candidates.iter().map(|c| c.as_ptr()).collect();
-        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+        let mut prepared = prepare_exec_tables(&spec.program, &spec.args, &spec.env)?;
+        let mut argv_ptrs: Vec<*const libc::c_char> =
+            prepared.argv.iter().map(|c| c.as_ptr()).collect();
         argv_ptrs.push(std::ptr::null());
-        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
+        let mut envp_ptrs: Vec<*const libc::c_char> =
+            prepared.envp.iter().map(|c| c.as_ptr()).collect();
         envp_ptrs.push(std::ptr::null());
 
         let (go_r, go_w) = cmd::pipe()?;
@@ -383,20 +418,61 @@ impl Reaper {
                     fail_child(4, last_errno());
                 }
 
+                let Some(path_bytes) = prepared.path_env.as_deref() else {
+                    libc::execve(
+                        prepared.program.as_ptr(),
+                        argv_ptrs.as_ptr(),
+                        envp_ptrs.as_ptr(),
+                    );
+                    fail_child(4, last_errno());
+                };
+
+                let prog_bytes = prepared.program.as_bytes();
+                let scratch = &mut prepared.scratch;
                 let mut saved_eacces: Option<libc::c_int> = None;
                 let mut final_err = libc::ENOENT;
-                for &cand in &candidate_ptrs {
-                    libc::execve(cand, argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+                let mut tried_any = false;
+                let mut saw_too_long = false;
+
+                for dir in path_bytes.split(|&b| b == b':') {
+                    let cand_ptr = if dir.is_empty() {
+                        prepared.program.as_ptr()
+                    } else {
+                        let need_slash = !dir.ends_with(b"/");
+                        let total = dir
+                            .len()
+                            .checked_add(usize::from(need_slash))
+                            .and_then(|n| n.checked_add(prog_bytes.len()))
+                            .and_then(|n| n.checked_add(1));
+                        if total.is_none_or(|n| n > scratch.len()) {
+                            saw_too_long = true;
+                            continue;
+                        }
+                        let mut pos = dir.len();
+                        scratch[..pos].copy_from_slice(dir);
+                        if need_slash {
+                            scratch[pos] = b'/';
+                            pos += 1;
+                        }
+                        scratch[pos..pos + prog_bytes.len()].copy_from_slice(prog_bytes);
+                        scratch[pos + prog_bytes.len()] = 0;
+                        scratch.as_ptr().cast::<libc::c_char>()
+                    };
+                    tried_any = true;
+                    libc::execve(cand_ptr, argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
                     let e = last_errno();
                     match e {
-                        libc::ENOENT | libc::ENOTDIR => final_err = e,
-                        libc::EACCES | libc::EPERM => saved_eacces = Some(e),
+                        libc::ENOENT | libc::ENOTDIR | libc::ENAMETOOLONG => final_err = e,
+                        libc::EACCES | libc::EPERM | libc::EISDIR => saved_eacces = Some(e),
                         other => {
                             final_err = other;
                             saved_eacces = None;
                             break;
                         }
                     }
+                }
+                if !tried_any && saw_too_long {
+                    fail_child(4, libc::ENAMETOOLONG);
                 }
                 fail_child(4, saved_eacces.unwrap_or(final_err));
             }
@@ -1483,7 +1559,7 @@ mod tests {
 
     #[test]
     fn spawn_unlocked_closes_unrelated_fds_before_gate_avoiding_deadlock() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let (at_gate_tx, at_gate_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
 
@@ -1546,7 +1622,7 @@ mod tests {
 
     #[test]
     fn spawn_unlocked_exec_failure_reaps_without_panicking_and_reaper_continues() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         for _ in 0..8 {
             let spec = UnlockedSpawnSpec {
                 program: "/no/such/binary-kat-test".into(),
@@ -1564,6 +1640,42 @@ mod tests {
         }
         // Reaper continues handling ordinary spawns cleanly after failed execs.
         let (_, rx) = reaper.spawn(&mut Command::new("/bin/true")).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn prepare_exec_tables_bounds_path_lookup_memory_and_rejects_overlong_basename() {
+        let huge_path = "/no-such-dir:".repeat(20_000);
+        let overlong = "a".repeat(EXEC_NAME_MAX + 1);
+        let err = prepare_exec_tables(&overlong, &[], &[("PATH".into(), huge_path.clone())])
+            .err()
+            .expect("overlong bare basename should be rejected");
+        assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+        // Max-length bare basename with many PATH entries keeps a single
+        // fixed-size PATH_MAX scratch buffer instead of multiplying candidates.
+        let max_name = "b".repeat(EXEC_NAME_MAX);
+        let prepared =
+            prepare_exec_tables(&max_name, &[], &[("PATH".into(), huge_path.clone())]).unwrap();
+        assert_eq!(prepared.scratch.len(), EXEC_PATH_MAX);
+        assert_eq!(prepared.path_env.as_deref(), Some(huge_path.as_bytes()));
+
+        // Overlong PATH entry (> PATH_MAX) is skipped cleanly in the child,
+        // allowing a subsequent valid entry (`/bin`) to execute.
+        let reaper = Reaper::shared_for_tests();
+        let path_with_overlong = format!("{}:/bin:/usr/bin", "/x".repeat(EXEC_PATH_MAX));
+        let spec = UnlockedSpawnSpec {
+            program: "true".into(),
+            args: vec![],
+            env: vec![("PATH".into(), path_with_overlong)],
+            stdin: open_devnull_fd(),
+            stdout: open_devnull_fd(),
+            stderr: open_devnull_fd(),
+            cwd_fd: open_dir_fd("/"),
+            cgroup_procs_fd: None,
+            pty: false,
+        };
+        let (_, _, rx) = reaper.spawn_unlocked(spec).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
     }
 }

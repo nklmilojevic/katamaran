@@ -2414,7 +2414,7 @@ mod tests {
     fn idle_first_frame_connection_releases_slot() {
         let pending = Arc::new(AtomicUsize::new(0));
         let active_sessions = Arc::new(AtomicUsize::new(0));
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let (_client, server) = UnixStream::pair().unwrap();
         let guard = ConnGuard::try_acquire(&pending, 1).unwrap();
         assert_eq!(pending.load(Ordering::Acquire), 1);
@@ -2443,7 +2443,7 @@ mod tests {
 
     #[test]
     fn required_cgroup_mode_fails_loudly_when_cgroup_unavailable() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
         // `/dev/null/kat-vm-exec` cannot be created as a directory; Required
@@ -2484,7 +2484,7 @@ mod tests {
 
     #[test]
     fn signal_frame_emits_signal_ack() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
 
@@ -2792,7 +2792,7 @@ mod tests {
 
     #[test]
     fn disconnect_under_stdin_backpressure_detected_even_without_rdhup() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
 
@@ -2855,7 +2855,7 @@ mod tests {
 
     #[test]
     fn disconnect_detected_when_both_directions_are_backpressured() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
         shrink_pair(&host, &guest, 8192);
@@ -2919,7 +2919,7 @@ mod tests {
 
     #[test]
     fn signal_session_oob_delivers_signal_even_under_bidirectional_backpressure() {
-        let reaper = Reaper::start();
+        let reaper = Reaper::shared_for_tests();
         let active_sessions = Arc::new(AtomicUsize::new(0));
         let (mut host, guest) = UnixStream::pair().unwrap();
         shrink_pair(&host, &guest, 8192);
