@@ -334,7 +334,9 @@ fn write_server_version_stamp(data_dir: &Path, version: &str) -> Result<(), Stri
     }
     let stamp = server_version_stamp(data_dir);
     if matches!(read_marker_file(&stamp)?, MarkerFile::Present(v) if v == version) {
-        return Ok(());
+        // Already visible, but an earlier rename may not have been made durable
+        // (its directory sync failed), so sync again rather than trusting it.
+        return sync_dir(&data_dir.join("server/db"));
     }
     write_atomic(&stamp, format!("{version}\n").as_bytes())
 }
@@ -1233,9 +1235,17 @@ fn publish_version_files(
     let res = (|| {
         if write_marker_file {
             write_marker(data_version_file, format!("{version}\n").as_bytes())?;
+        } else if let Some(parent) = data_version_file.parent()
+            && matches!(read_marker_file(data_version_file)?, MarkerFile::Present(_))
+        {
+            // The marker already records this version, possibly from an attempt
+            // whose directory sync failed: make it durable before k3s starts.
+            sync_dir(parent)?;
         }
         if write_stamp {
             write_server_version_stamp(data_dir, version)?;
+        } else if server_db_dir_exists(data_dir)? {
+            sync_dir(&data_dir.join("server/db"))?;
         }
         Ok(())
     })();
