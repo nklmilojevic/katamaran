@@ -87,6 +87,17 @@ SPLIT20_HDR = _split20_hdr.replace(
 )
 assert len(SPLIT20_HDR) == len(_split20_hdr)
 SPLIT20_FIRST = SPLIT20_HDR + b"u" * (SPLIT20_FIRST_LEN - len(SPLIT20_HDR))
+# 100000-byte first write spanning more than one 64 KiB MSS (it may arrive as
+# one GSO/GRO skb whose short last segment carries PSH), then a 4 KiB tail
+# Nagle holds behind the unacknowledged short remainder.
+SPLIT100_FIRST_LEN = 100000
+SPLIT100_SECOND = b"v" * 4096
+SPLIT100_HDR = _split20_hdr.replace(
+    b"XXXXX",
+    str(SPLIT100_FIRST_LEN - len(_split20_hdr) + len(SPLIT100_SECOND) - 1).encode(),
+)
+assert len(SPLIT100_HDR) == len(_split20_hdr) + 1
+SPLIT100_FIRST = SPLIT100_HDR + b"v" * (SPLIT100_FIRST_LEN - len(SPLIT100_HDR))
 TWO_WRITE = 2048
 _two_hdr = (
     b"HTTP/1.1 200 OK\r\n"
@@ -166,6 +177,9 @@ def handle(conn):
                 # below the 64 KiB MSS but above any fixed small-write cutoff.
                 conn.sendall(SPLIT20_FIRST)
                 conn.sendall(SPLIT20_SECOND)
+            elif req_hdr.startswith(b"GET /split100k "):
+                conn.sendall(SPLIT100_FIRST)
+                conn.sendall(SPLIT100_SECOND)
             elif req_hdr.startswith(b"GET /two2k "):
                 conn.sendall(TWO_FIRST)
                 conn.sendall(TWO_SECOND)
@@ -193,14 +207,23 @@ def handle(conn):
     finally:
         conn.close()
 
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", 8080))
-srv.listen(32)
+def serve(port, window_clamp=None):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if window_clamp:
+        # Inherited by accepted sockets before the handshake: the server
+        # advertises at most this receive window, which bounds the CLIENT's
+        # send MSS (tcp_bound_to_half_wnd) but not the server's responses.
+        srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, window_clamp)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(32)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+threading.Thread(target=serve, args=(8082, 32768), daemon=True).start()
 print("READY", flush=True)
-while True:
-    c, _ = srv.accept()
-    threading.Thread(target=handle, args=(c,), daemon=True).start()
+serve(8080)
 "#;
 
 /// Keep-alive client that opens ONE persistent TCP connection to `host:8080`,
@@ -209,12 +232,15 @@ while True:
 /// stream, `paced` for a 32x4 KiB paced short-write stream that lets the reader
 /// drain between writes, `pushed` for a 48x60000B pushed multi-segment stream,
 /// `fullmss` for 48 exactly-one-MSS PSH segments paced 12 ms apart,
-/// `split20k <count>` for 20 KiB + 4 KiB split-write responses, or
+/// `split20k <count>` / `split100k <count>` for 20 KiB or 100000 B first
+/// writes followed by a 4 KiB tail, or
 /// `rcvlowat <N>` to set `SO_RCVLOWAT` and gate reads on `select.poll()`),
 /// and prints two space-separated floats flushed after each workload command.
-/// Passing an optional count on argv runs a single burst and exits; adding
-/// `two2k` instead warms a fresh connection with repeated two-write 2 KiB
-/// responses and then times `<count>` of them under `SO_RCVLOWAT=3072`.
+/// Passing an optional count on argv runs a single burst and exits; passing
+/// `<count> <path> <lowat> [port]` (path `two2k` or `split20k`) instead warms a
+/// fresh connection with 30 of those responses and then times `<count>` of
+/// them under `SO_RCVLOWAT=<lowat>`. Port 8082 of the split-write server clamps
+/// its receive window to 32 KiB.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
 import os, select, socket, sys, time
 
@@ -226,6 +252,7 @@ short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\
 paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 pushed_req = b"GET /pushed HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 split20k_req = b"GET /split20k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+split100k_req = b"GET /split100k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 two2k_req = b"GET /two2k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 fullmss_req = b"GET /fullmss HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
@@ -285,7 +312,8 @@ def drain_exact(sock, n, buf):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
     return b""
 
-sock = socket.create_connection((host, 8080), timeout=10)
+port = int(sys.argv[5]) if len(sys.argv) > 5 else 8080
+sock = socket.create_connection((host, port), timeout=10)
 sock.settimeout(10)
 poller = select.poll()
 poller.register(sock, select.POLLIN)
@@ -352,16 +380,18 @@ def set_lowat(n):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
     use_poll = cur_lowat > 1
 
-if len(sys.argv) > 3 and sys.argv[3] == "two2k":
-    # Fresh connection: warm it with repeated two-write 2 KiB responses (rcv_mss
-    # settles at 2 KiB, pingpong mode, quickack budget spent), then measure them
-    # with SO_RCVLOWAT=3072 so the first write alone cannot wake poll().
+if len(sys.argv) > 4:
+    # Fresh connection: warm it with 30 responses of the given path at
+    # SO_RCVLOWAT=1 (rcv_mss settles at the response's write size, pingpong
+    # mode, quickack budget spent), then time <count> of them with the given
+    # SO_RCVLOWAT so the first write alone cannot wake poll().
+    path_req = {"two2k": two2k_req, "split20k": split20k_req}[sys.argv[3]]
     with open(os.devnull, "w") as devnull:
         stdout, sys.stdout = sys.stdout, devnull
-        run_burst(30, two2k_req)
+        run_burst(30, path_req)
         sys.stdout = stdout
-    set_lowat(3072)
-    run_burst(int(sys.argv[2]), two2k_req)
+    set_lowat(int(sys.argv[4]))
+    run_burst(int(sys.argv[2]), path_req)
 elif len(sys.argv) > 2:
     run_burst(int(sys.argv[2]))
 else:
@@ -383,6 +413,8 @@ else:
             run_burst(int(line.split()[1]), three_req)
         elif line.startswith("split20k "):
             run_burst(int(line.split()[1]), split20k_req)
+        elif line.startswith("split100k "):
+            run_burst(int(line.split()[1]), split100k_req)
         elif line.startswith("rcvlowat "):
             set_lowat(int(line.split()[1]))
             print(f"{cur_lowat} 0.000", flush=True)
@@ -1374,11 +1406,30 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "SO_RCVLOWAT=22528 20KiB+4KiB split write stalled with quickack=Y (p50={split20_on_p50:.2}ms total={split20_on_total:.2}ms)"
     );
 
+    // 100000 B first write spanning one MSS: the receiver classifies the
+    // short, PSH-carrying last segment (not the GSO skb's gso_size), so it
+    // never holds back the ACK Nagle's 4 KiB tail waits for. Stock Linux also
+    // ACKs immediately here once more than one full frame is unacknowledged
+    // and the window advances, so there is no quickack=N stall to contrast;
+    // this guards against the policy delaying it.
+    send_cmd("rcvlowat 102400", "set SO_RCVLOWAT=102400");
+    let (split100_on_p50, split100_on_total) = send_cmd(
+        "split100k 10",
+        "SO_RCVLOWAT=102400 100000B+4KiB split write (quickack=Y)",
+    );
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=102400 100000B+4KiB split write (quickack=Y): p50={split100_on_p50:.2}ms total={split100_on_total:.2}ms"
+    );
+    assert!(
+        split100_on_p50 < 15.0,
+        "SO_RCVLOWAT=102400 100000B+4KiB split write stalled with quickack=Y (p50={split100_on_p50:.2}ms total={split100_on_total:.2}ms)"
+    );
+
     // Repeated two-write 2 KiB responses on a fresh connection whose adaptive
     // rcv_mss settles at 2 KiB, polled with SO_RCVLOWAT=3072: the first write
     // is still a short push (judged against the advertised MSS, not rcv_mss),
     // so it is ACKed early and Nagle releases the second write.
-    let two2k = |what: &str| -> (f64, f64) {
+    let one_shot = |path: &str, lowat: &str, port: &str, what: &str| -> (f64, f64) {
         let out = ok(
             &kubectl(
                 &kubeconfig,
@@ -1391,13 +1442,30 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                     KEEP_ALIVE_CLIENT_PY,
                     &peer_ip,
                     "15",
-                    "two2k",
+                    path,
+                    lowat,
+                    port,
                 ],
             ),
             what,
         );
         parse_latencies(&out, what)
     };
+    let two2k = |what: &str| one_shot("two2k", "3072", "8080", what);
+    // The response sender (server) clamps its own receive window to 32 KiB,
+    // which caps the reader's send MSS at 16 KiB. That limit only governs the
+    // reader's sends, so the server's 20 KiB first write must still count as
+    // short and be ACKed early.
+    let split20k_clamped = |what: &str| one_shot("split20k", "22528", "8082", what);
+    let (clamp_on_p50, clamp_on_total) =
+        split20k_clamped("window-clamped server 20KiB+4KiB split write (quickack=Y)");
+    eprintln!(
+        "pod-to-pod window-clamped server SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=Y): p50={clamp_on_p50:.2}ms total={clamp_on_total:.2}ms"
+    );
+    assert!(
+        clamp_on_p50 < 15.0,
+        "window-clamped server 20KiB+4KiB split write stalled with quickack=Y (p50={clamp_on_p50:.2}ms total={clamp_on_total:.2}ms)"
+    );
     let (two_on_p50, two_on_total) = two2k("SO_RCVLOWAT=3072 two-write 2KiB (quickack=Y)");
     eprintln!(
         "pod-to-pod SO_RCVLOWAT=3072 two-write 2KiB keep-alive (quickack=Y): p50={two_on_p50:.2}ms total={two_on_total:.2}ms"
@@ -1507,6 +1575,15 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected accepted-socket near-MSS split-write stall with quickack=0 (got p50={near_off_p50:.2}ms total={near_off_total:.2}ms)"
         );
 
+        let (clamp_off_p50, clamp_off_total) =
+            split20k_clamped("window-clamped server 20KiB+4KiB split write (quickack=N)");
+        eprintln!(
+            "pod-to-pod window-clamped server SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=N): p50={clamp_off_p50:.2}ms total={clamp_off_total:.2}ms"
+        );
+        assert!(
+            clamp_off_p50 >= 25.0,
+            "expected window-clamped server 20KiB+4KiB split-write stall with quickack=0 (got p50={clamp_off_p50:.2}ms total={clamp_off_total:.2}ms)"
+        );
         let (two_off_p50, two_off_total) = two2k("SO_RCVLOWAT=3072 two-write 2KiB (quickack=N)");
         eprintln!(
             "pod-to-pod SO_RCVLOWAT=3072 two-write 2KiB keep-alive (quickack=N): p50={two_off_p50:.2}ms total={two_off_total:.2}ms"

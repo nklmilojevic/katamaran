@@ -56,21 +56,30 @@ TOOL_IMAGE=katamaran-kbuild-toolchain:$TOOL_TAG
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-# Identity of everything the Image is built from: kernel version, patch set (in name order)
-# and config fragment. Written next to the Image as Image.stamp.
+# Identity of everything the Image is built from: kernel version, patch set (in name order),
+# config fragment, and this script (pinned toolchain, tarball hash, build steps). Written next to
+# the Image as Image.stamp once the whole build, including check-config, has passed.
+# Fails (no output) if any input is missing or unreadable, so a stamp never silently covers
+# fewer files than the build applies.
 image_stamp() {
 	(
 		export LC_ALL=C
-		{
-			echo "$KVER"
-			cat "$HERE"/patches/*.patch 2>/dev/null || true
-			cat "$HERE/katamaran.config"
-		} | sha256 | cut -c1-64
+		shopt -s nullglob
+		local inputs=("$HERE"/patches/*.patch "$HERE/katamaran.config" "$HERE/build.sh") f data
+		for f in "${inputs[@]}"; do
+			if [[ ! -f $f || ! -r $f ]]; then
+				echo "kernel build input missing or unreadable: $f" >&2
+				exit 1
+			fi
+		done
+		data=$({ echo "$KVER"; cat -- "${inputs[@]}"; } | sha256 | cut -c1-64) || exit 1
+		[[ ${#data} == 64 ]] || { echo "could not hash kernel build inputs" >&2; exit 1; }
+		echo "$data"
 	)
 }
 if [[ ${1:-} == stamp ]]; then
 	image_stamp
-	exit 0
+	exit
 fi
 IMAGE_STAMP=$(image_stamp)
 
@@ -180,7 +189,6 @@ start=$(date +%s)
 echo ">> built in $(( $(date +%s) - start ))s; ccache: $(ccache -s | grep -iE 'hits:' | head -1 | tr -s ' ')"
 install -m 0644 "$obj/arch/arm64/boot/Image" /out/Image
 install -m 0644 "$obj/.config" /out/kernel.config
-printf '%s\n' "$IMAGE_STAMP" > /out/Image.stamp
 echo ">> $(cat "$obj/include/config/kernel.release"): Image $(stat -c %s /out/Image) bytes"
 
 checker=cache/check-config-$MOBY_COMMIT.sh
@@ -210,6 +218,7 @@ if [ -n "$bad" ]; then
 	exit 1
 fi
 echo ">> check-config: Generally Necessary, overlay and bridge passed (guest/out/check-config.txt)"
+printf '%s\n' "$IMAGE_STAMP" > /out/Image.stamp
 EOF
 )
 

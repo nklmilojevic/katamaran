@@ -38,15 +38,15 @@ SO_RCVLOWAT case in __tcp_ack_snd_check() when a short pushed segment
 leaves in-order data queued below sk_rcvlowat and tcp_epollin_ready() is
 false. A segment is short (kat_short_push, recorded in
 tcp_measure_rcv_mss() independently of the adaptive rcv_mss estimate) when
-it carries PSH and its payload is below the peer's full-sized payload,
-bounded by min(MSS we advertised minus negotiated options, our mss_cache);
-our mss_cache already folds in the MSS the peer advertised and our path
-MTU toward it. Accepted sockets record in tcp_sock.kat_advmss_ts that the
-handshake already deducted the timestamp option from tp->advmss, so
-options are counted once on both sides. Full-sized PSH segments keep stock
-delayed-ACK batching and timers; on paths whose forward MTU alone is
-narrower than both advertised MSS values, peer full-sized segments may be
-classified short, which only shortens ACK delay below SO_RCVLOWAT. Then
+it carries PSH and its payload (for a GSO/GRO skb, that of the last,
+PSH-carrying segment) is below min(tp->advmss, the peer's
+advertised MSS minus negotiated options): both bound what the peer may
+send, and tp->advmss already excludes the timestamp option after the
+handshake on active and passive opens. Reverse-direction send state
+(mss_cache) is not used. Full-sized PSH segments keep stock delayed-ACK
+batching and timers; on paths where an intermediate hop is narrower than
+both advertised MSS values, peer full-sized segments may be classified
+short, which only shortens ACK delay below SO_RCVLOWAT. Then
 send an immediate ACK if the previous cumulative ACK has not already covered
 unread data (!after(tp->rcv_wup, tp->copied_seq)), and otherwise let
 stock ACK checks run while capping any armed delayed-ACK timer to a
@@ -87,19 +87,6 @@ diff -ruN a/include/linux/skbuff.h b/include/linux/skbuff.h
  #if defined(CONFIG_NET_SCHED) || defined(CONFIG_NET_XGRESS)
  	__u16			tc_index;	/* traffic control index */
  #endif
-diff -ruN a/include/linux/tcp.h b/include/linux/tcp.h
---- a/include/linux/tcp.h
-+++ b/include/linux/tcp.h
-@@ -294,7 +294,8 @@
- 	u8	nonagle     : 4,/* Disable Nagle algorithm?             */
- 		rate_app_limited:1;  /* rate_{delivered,interval_us} limited? */
- 	u8	received_ce_pending:4, /* Not yet transmit cnt of received_ce */
--		unused2:4;
-+		kat_advmss_ts:1, /* advmss already excludes TCP timestamps */
-+		unused2:3;
- 	u8	accecn_minlen:2,/* Minimum length of AccECN option sent */
- 		est_ecnfield:2,/* ECN field for AccECN delivered estimates */
- 		accecn_opt_demand:2,/* Demand AccECN option for n next ACKs */
 diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
 --- a/include/net/inet_connection_sock.h
 +++ b/include/net/inet_connection_sock.h
@@ -224,7 +211,7 @@ diff -ruN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -224,6 +224,47 @@
+@@ -224,6 +224,59 @@
  /* Adapt the MSS value used to make delayed ack decision to the
   * real world.
   */
@@ -232,55 +219,67 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 + * the end of a sub-MSS application write whose remainder the peer's Nagle
 + * may be holding until we ACK?
 + *
-+ * The peer sends full-sized segments of its mss_cache payload, which is
-+ * min(MSS we advertised, its path MSS toward us) minus TCP options. The
-+ * adaptive rcv_mss estimate cannot stand in for it: repeated small writes
++ * The adaptive rcv_mss estimate cannot answer this: repeated small writes
 + * settle rcv_mss at their own size although they are still sub-MSS for the
-+ * sender. Instead bound the peer's full payload from both sides:
++ * sender. Instead use only values that bound what the peer may send:
 + *
-+ *  - the MSS we advertised in our SYN/SYN-ACK, minus negotiated options.
-+ *    Accepted connections already had the timestamp option deducted from
-+ *    tp->advmss when entering ESTABLISHED (kat_advmss_ts); connections we
-+ *    opened did not. Add it back so options are counted exactly once.
-+ *  - tp->mss_cache: our own send MSS, already min(MSS the peer advertised,
-+ *    our path MSS toward the peer) minus options. The peer's advertised MSS
-+ *    reflects its interface MTU, and on the symmetric in-VM paths this
-+ *    policy covers (veth/bridge hops inside the guest, never the virtio-net
-+ *    uplink) our path MTU toward the peer equals its path MTU toward us.
++ *  - tp->advmss, the MSS we advertised. Once the handshake completes it
++ *    already excludes the timestamp option on both active
++ *    (tcp_rcv_synsent_state_process) and passive (TCP_SYN_RECV in
++ *    tcp_rcv_state_process) opens; only data arriving before that point
++ *    (TCP Fast Open) still needs the deduction here.
++ *  - tp->rx_opt.mss_clamp, the MSS the peer advertised, minus negotiated
++ *    options. The peer normally derives it from its route MTU toward us, which
++ *    also caps its send MSS, so a peer behind a narrower interface is handled.
 + *
-+ * Asymmetric MTU: if the peer's outbound path is narrower than both what we
-+ * advertised and what it advertised (e.g. its interface MTU exceeds that of
-+ * a forward-only hop), its full-sized segments fall below this limit unless
-+ * the reverse path shares that hop, and are treated as short. The cost is
-+ * bounded: only while data sits below SO_RCVLOWAT, at most one immediate
-+ * ACK per unread batch, otherwise the delayed-ACK timer is only shortened,
-+ * so ACK frequency is at most one per timer tick for such segments.
++ * Reverse-direction send state (mss_cache, half-window bounds, MTU probing)
++ * constrains only our own sends and is deliberately not used.
++ *
++ * Asymmetric MTU: if a hop on the peer's forward path is narrower than both
++ * advertised values (e.g. an intermediate link neither endpoint's MSS
++ * reflects), its full-sized segments fall below this limit and are treated
++ * as short. The cost is bounded and never delays data: only while unread
++ * data sits below SO_RCVLOWAT, at most one immediate ACK per unread batch,
++ * otherwise a delayed-ACK deadline shortened to the next timer tick. If
++ * either value underestimates the peer's segments instead, the result is
++ * stock Linux behaviour.
 + */
-+static bool kat_is_short_push(const struct sock *sk, const struct sk_buff *skb,
-+			      unsigned int seg_len)
++static bool kat_is_short_push(const struct sock *sk, const struct sk_buff *skb)
 +{
 +	const struct tcp_sock *tp = tcp_sk(sk);
++	unsigned int gso_size = skb_shinfo(skb)->gso_size;
++	unsigned int seg_len = skb->len;
 +	unsigned int opts = tp->tcp_header_len - sizeof(struct tcphdr);
-+	unsigned int adv = tp->advmss +
-+			   (tp->kat_advmss_ts ? TCPOLEN_TSTAMP_ALIGNED : 0);
-+	unsigned int full = adv > opts ? adv - opts : 0;
++	unsigned int ours = tp->advmss;
++	unsigned int peers = tp->rx_opt.mss_clamp;
 +
-+	full = min_t(unsigned int, full, tp->mss_cache);
-+	return (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_PSH) && seg_len < full;
++	if (tp->rx_opt.tstamp_ok &&
++	    ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)))
++		ours = ours > TCPOLEN_TSTAMP_ALIGNED ?
++		       ours - TCPOLEN_TSTAMP_ALIGNED : 0;
++	peers = peers > opts ? peers - opts : 0;
++	/* A GSO/GRO skb (local veth/bridge paths pass TSO skbs through whole)
++	 * carries PSH on its last segment, which ends the write: judge that
++	 * segment, not gso_size, so a write of 1.x MSS still counts as short.
++	 */
++	if (gso_size && seg_len > gso_size)
++		seg_len = (seg_len - 1) % gso_size + 1;
++	return (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_PSH) &&
++	       seg_len < min(ours, peers);
 +}
 +
  static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
  {
  	struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -236,6 +277,7 @@
+@@ -236,6 +289,7 @@
  	 * sends good full-sized frames.
  	 */
  	len = skb_shinfo(skb)->gso_size ? : skb->len;
-+	icsk->icsk_ack.kat_short_push = kat_is_short_push(sk, skb, len);
++	icsk->icsk_ack.kat_short_push = kat_is_short_push(sk, skb);
  	if (len >= icsk->icsk_ack.rcv_mss) {
  		/* Note: divides are still a bit expensive.
  		 * For the moment, only adjust scaling_ratio
-@@ -1017,6 +1059,7 @@
+@@ -1017,6 +1071,7 @@
  		}
  	}
  	icsk->icsk_ack.lrcvtime = now;
@@ -288,28 +287,28 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -5926,8 +5969,20 @@
+@@ -5926,7 +5981,20 @@
  static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
++	int kat_lowat = READ_ONCE(sk->sk_rcvlowat);
 +	bool kat_lowat_pushed;
  	unsigned long rtt, delay;
- 
++
 +	/* Only a short pushed segment (see kat_is_short_push()) can be a
 +	 * sub-MSS write the peer's Nagle is waiting on; full-sized PSH
 +	 * segments keep stock delayed-ACK batching and timers.
 +	 */
 +	kat_lowat_pushed = inet_csk(sk)->icsk_ack.kat_short_push &&
-+			   sk->sk_rcvlowat > 1 &&
++			   kat_lowat > 1 &&
 +			   after(tp->rcv_nxt, tp->copied_seq) &&
-+			   (int)(tp->rcv_nxt - tp->copied_seq) < sk->sk_rcvlowat &&
-+			   !tcp_epollin_ready(sk, sk->sk_rcvlowat) &&
++			   (int)(tp->rcv_nxt - tp->copied_seq) < kat_lowat &&
++			   !tcp_epollin_ready(sk, kat_lowat) &&
 +			   kat_sk_wants_quickack(sk);
-+
+ 
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
- 	     /* ... and right edge of window advances far enough.
-@@ -5940,7 +5995,12 @@
+@@ -5940,7 +6008,12 @@
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
@@ -323,7 +322,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		/* If we are running from __release_sock() in user context,
  		 * Defer the ack until tcp_release_cb().
  		 */
-@@ -5956,6 +6016,16 @@
+@@ -5956,6 +6029,16 @@
  
  	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
  		tcp_send_delayed_ack(sk);
@@ -340,7 +339,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		return;
  	}
  
-@@ -6543,6 +6613,7 @@
+@@ -6543,6 +6626,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {
@@ -348,18 +347,6 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		icsk->icsk_af_ops->sk_rx_dst_set(sk, skb);
  		security_inet_conn_established(sk, skb);
  		sk_mark_napi_id(sk, skb);
-@@ -7054,8 +7125,10 @@
- 		if (!tp->srtt_us)
- 			tcp_synack_rtt_meas(sk, req);
- 
--		if (tp->rx_opt.tstamp_ok)
-+		if (tp->rx_opt.tstamp_ok) {
- 			tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
-+			tp->kat_advmss_ts = 1;
-+		}
- 
- 		if (req) {
- 			tcp_rcv_synrecv_state_fastopen(sk);
 diff -ruN a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
 --- a/net/ipv4/tcp_minisocks.c
 +++ b/net/ipv4/tcp_minisocks.c
