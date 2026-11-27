@@ -33,6 +33,14 @@ HDR = (
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
+BULK_CHUNK = b"b" * (1024 * 1024)
+BULK_CHUNKS = 32
+BULK_HDR = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: " + str(len(BULK_CHUNK) * BULK_CHUNKS).encode() + b"\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
 
 def handle(conn):
     try:
@@ -44,9 +52,14 @@ def handle(conn):
                 if not chunk:
                     return
                 buf += chunk
-            _, buf = buf.split(b"\r\n\r\n", 1)
-            conn.sendall(HDR)
-            conn.sendall(BODY)
+            req_hdr, buf = buf.split(b"\r\n\r\n", 1)
+            if req_hdr.startswith(b"GET /bulk "):
+                conn.sendall(BULK_HDR)
+                for _ in range(BULK_CHUNKS):
+                    conn.sendall(BULK_CHUNK)
+            else:
+                conn.sendall(HDR)
+                conn.sendall(BODY)
     finally:
         conn.close()
 
@@ -61,15 +74,26 @@ while True:
 "#;
 
 /// Keep-alive client that opens ONE persistent TCP connection to `host:8080`,
-/// reads burst counts from stdin (one integer per line), runs that many
-/// consecutive split-write requests on the SAME established socket, and prints
-/// `<p50_ms> <total_ms>` flushed after each burst. Passing an optional count
-/// on argv runs a single burst and exits.
+/// reads commands from stdin (`<count>` for split-write bursts or `bulk` for a
+/// 32 MiB sustained download measuring `Tcp: OutSegs` and elapsed time), and
+/// prints two space-separated floats flushed after each command. Passing an
+/// optional count on argv runs a single burst and exits.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
 import socket, sys, time
 
 host = sys.argv[1]
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+
+def tcp_out_segs():
+    with open("/proc/net/snmp") as f:
+        lines = f.read().splitlines()
+    for i in range(0, len(lines) - 1, 2):
+        keys = lines[i].split()
+        vals = lines[i + 1].split()
+        if keys and keys[0] == "Tcp:" and "OutSegs" in keys:
+            return int(vals[keys.index("OutSegs")])
+    raise RuntimeError("OutSegs not found in /proc/net/snmp")
 
 def recv_exact(sock, n, buf):
     while len(buf) < n:
@@ -78,6 +102,17 @@ def recv_exact(sock, n, buf):
             raise RuntimeError("unexpected EOF")
         buf += chunk
     return buf[:n], buf[n:]
+
+def drain_exact(sock, n, buf):
+    if len(buf) >= n:
+        return buf[n:]
+    rem = n - len(buf)
+    while rem > 0:
+        chunk = sock.recv(min(rem, 262144))
+        if not chunk:
+            raise RuntimeError("unexpected EOF in bulk body")
+        rem -= len(chunk)
+    return b""
 
 sock = socket.create_connection((host, 8080), timeout=10)
 sock.settimeout(10)
@@ -105,6 +140,28 @@ def run_burst(count):
     p50 = times_ms[len(times_ms) // 2]
     print(f"{p50:.3f} {total_ms:.3f}", flush=True)
 
+def run_bulk():
+    global buf
+    before = tcp_out_segs()
+    t0 = time.monotonic()
+    sock.sendall(bulk_req)
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("unexpected EOF in bulk headers")
+        buf += chunk
+    hdr, buf = buf.split(b"\r\n\r\n", 1)
+    assert b"200 OK" in hdr, hdr
+    cl = 0
+    for line in hdr.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            cl = int(line.split(b":", 1)[1].strip())
+    assert cl == 32 * 1024 * 1024, cl
+    buf = drain_exact(sock, cl, buf)
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    after = tcp_out_segs()
+    print(f"{after - before} {elapsed_ms:.3f}", flush=True)
+
 if len(sys.argv) > 2:
     run_burst(int(sys.argv[2]))
 else:
@@ -112,7 +169,10 @@ else:
         line = line.strip()
         if not line:
             continue
-        run_burst(int(line))
+        if line == "bulk":
+            run_bulk()
+        else:
+            run_burst(int(line))
 sock.close()
 "#;
 
@@ -750,22 +810,28 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             }
         }
     });
-    let mut burst = |count: usize, what: &str| -> (f64, f64) {
-        writeln!(client_in, "{count}").expect("write burst count");
-        client_in.flush().expect("flush burst count");
+    let mut send_cmd = |cmd: &str, what: &str| -> (f64, f64) {
+        writeln!(client_in, "{cmd}").expect("write client command");
+        client_in.flush().expect("flush client command");
         let line = line_rx
             .recv_timeout(Duration::from_secs(30))
-            .unwrap_or_else(|e| {
-                panic!("{what}: timed out or closed waiting for burst result: {e}")
-            });
+            .unwrap_or_else(|e| panic!("{what}: timed out or closed waiting for result: {e}"));
         parse_latencies(&line, what)
     };
 
-    let (pod_p50, pod_total) = burst(25, "pod-to-pod keep-alive (quickack=Y)");
+    let (pod_p50, pod_total) = send_cmd("25", "pod-to-pod keep-alive (quickack=Y)");
     eprintln!("pod-to-pod keep-alive (quickack=Y): p50={pod_p50:.2}ms total={pod_total:.2}ms");
     assert!(
         pod_p50 < 15.0 && pod_total < 400.0,
         "pod-to-pod keep-alive stalled (p50={pod_p50:.2}ms total={pod_total:.2}ms)"
+    );
+
+    // Sustained 32 MiB bulk download on the same established pingpong-mode
+    // keep-alive socket with quickack=Y, to compare ACK pacing against
+    // quickack=N below.
+    let (bulk_acks_on, bulk_ms_on) = send_cmd("bulk", "sustained 32MiB bulk (quickack=Y)");
+    eprintln!(
+        "pod-to-pod sustained 32MiB bulk (quickack=Y): out_segs={bulk_acks_on:.0} elapsed={bulk_ms_on:.2}ms"
     );
 
     {
@@ -789,7 +855,7 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "disable kat.quickack",
         );
         // Same already-established socket immediately observes quickack=0.
-        let (off_p50, off_total) = burst(8, "established pod keep-alive (quickack=N)");
+        let (off_p50, off_total) = send_cmd("8", "established pod keep-alive (quickack=N)");
         eprintln!(
             "pod-to-pod established keep-alive (quickack=N): p50={off_p50:.2}ms total={off_total:.2}ms"
         );
@@ -798,9 +864,18 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected delayed-ACK stall on established socket with quickack=0 (got p50={off_p50:.2}ms total={off_total:.2}ms)"
         );
 
+        let (bulk_acks_off, bulk_ms_off) = send_cmd("bulk", "sustained 32MiB bulk (quickack=N)");
+        eprintln!(
+            "pod-to-pod sustained 32MiB bulk (quickack=N): out_segs={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
+        );
+        assert!(
+            bulk_acks_on <= bulk_acks_off * 1.5 + 32.0,
+            "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}, off={bulk_acks_off:.0})"
+        );
+
         restore.restore();
         // Same already-established socket immediately observes quickack=1 again.
-        let (on_p50, on_total) = burst(15, "established pod keep-alive restored (quickack=Y)");
+        let (on_p50, on_total) = send_cmd("15", "established pod keep-alive restored (quickack=Y)");
         eprintln!(
             "pod-to-pod established keep-alive restored (quickack=Y): p50={on_p50:.2}ms total={on_total:.2}ms"
         );

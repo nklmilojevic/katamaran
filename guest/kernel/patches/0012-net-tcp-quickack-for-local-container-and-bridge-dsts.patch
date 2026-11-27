@@ -1,4 +1,4 @@
-Subject: [PATCH] net: enable TCP quickack for in-VM container and bridge traffic
+Subject: [PATCH] net: avoid pingpong delayed-ACK stalls on in-VM container and bridge traffic
 
 Keep-alive request/response traffic inside the guest can stall for a
 delayed-ACK timeout (~40-50 ms at HZ=100) when a server writes response
@@ -16,7 +16,7 @@ uses a non-init network namespace (Docker containers, Kubernetes pods,
 LXC machines) or a local bridge/veth device in init_net (cni0, docker0,
 br-*, katbr0), leaving all routing tables untouched.
 
-To avoid forcing quick ACKs on Internet-bound or host-bound container and
+To avoid forcing extra ACKs on Internet-bound or host-bound container and
 pod connections whose packets leave/enter the guest through virtio-net
 (eth0), tag skbs received in virtnet_receive_done() with
 skb->kat_from_uplink (preserved across __copy_skb_header,
@@ -28,13 +28,19 @@ tcp_event_data_recv(). In-VM traffic (pod-to-pod, ClusterIP Service DNAT,
 container-to-container, root-to-bridge) never crosses virtio-net, so
 kat_from_uplink stays 0.
 
-tcp_in_quickack_mode() checks (icsk_ack.kat_quick_ack &&
-!icsk_ack.kat_from_uplink && READ_ONCE(kat_quickack_enabled)) alongside
-dst_quick_ack, so toggling /sys/module/kat/parameters/quickack at runtime
-takes effect immediately for already-established sockets as well as new
-ones without affecting routes that explicitly set RTAX_QUICKACK=1.
-Explicit locked route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected.
-Disable at boot with kat.quickack=0.
+Rather than bypassing Linux's quickack budget in tcp_in_quickack_mode()
+for the lifetime of every flow (which would double pure ACK traffic on
+sustained bulk transfers), lift only the pingpong suppression in
+__tcp_cleanup_rbuf() when userspace drains a small or PSH-terminated
+segment (ICSK_ACK_PUSHED && !sk_rmem_alloc) on an eligible non-uplink
+socket with READ_ONCE(kat_quickack_enabled). Sustained bulk streams keep
+stock Linux once-per-two-segments ACK pacing and quickack budgets
+untouched, while split-write keep-alive exchanges ACK immediately on read
+drain. Toggling /sys/module/kat/parameters/quickack at runtime takes
+effect immediately for already-established sockets as well as new ones
+without affecting routes that explicitly set RTAX_QUICKACK=1. Explicit
+locked route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected. Disable
+at boot with kat.quickack=0.
 
 SPDX-License-Identifier: GPL-2.0
 ---
@@ -159,20 +165,25 @@ diff -ruN a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
  	skb_dst_drop(to);
  	skb_dst_copy(to, from);
  	to->dev = from->dev;
+diff -ruN a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1531,7 +1531,10 @@
+ 		    (copied > 0 &&
+ 		     ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED2) ||
+ 		      ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED) &&
+-		       !inet_csk_in_pingpong_mode(sk))) &&
++		       (!inet_csk_in_pingpong_mode(sk) ||
++			(icsk->icsk_ack.kat_quick_ack &&
++			 !icsk->icsk_ack.kat_from_uplink &&
++			 READ_ONCE(kat_quickack_enabled))))) &&
+ 		      !atomic_read(&sk->sk_rmem_alloc)))
+ 			time_to_ack = true;
+ 	}
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -338,6 +338,9 @@
- 	const struct inet_connection_sock *icsk = inet_csk(sk);
- 
- 	return icsk->icsk_ack.dst_quick_ack ||
-+		(icsk->icsk_ack.kat_quick_ack &&
-+		 !icsk->icsk_ack.kat_from_uplink &&
-+		 READ_ONCE(kat_quickack_enabled)) ||
- 		(icsk->icsk_ack.quick && !inet_csk_in_pingpong_mode(sk));
- }
- 
-@@ -1017,6 +1020,7 @@
+@@ -1017,6 +1017,7 @@
  		}
  	}
  	icsk->icsk_ack.lrcvtime = now;
@@ -180,7 +191,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -6543,6 +6547,7 @@
+@@ -6543,6 +6544,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {

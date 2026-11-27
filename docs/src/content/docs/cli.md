@@ -338,7 +338,7 @@ katamaran run [OPTIONS]
 | `--no-auto-forward` | off | Disable forwarding of unpublished container ports |
 | `--amd64 <MODE>` | `auto` | x86-64 emulation (`auto`, `rosetta`, `qemu`, or `off`) |
 
-By default, the guest kernel enables TCP quick ACK for in-VM TCP traffic routed inside container and Kubernetes pod network namespaces and over local bridges or `veth` devices in the guest root namespace (`cni0`, `docker0`, `br-*`, `katbr0`), leaving traffic crossing the `eth0` uplink and all routing tables untouched. This avoids 40–50 ms Nagle + delayed-ACK stalls on split-write keep-alive traffic with the 65520-byte MTU. To disable it for a foreground VM, pass `--cmdline kat.quickack=0` to `katamaran run` (the daemon-managed VM started by `kat start` does not currently expose this option).
+By default (`kat.quickack=1`), when userspace drains a small or `PSH`-terminated TCP segment on in-VM traffic routed inside container and Kubernetes pod network namespaces or over local bridges/`veth` devices in the guest root namespace (`cni0`, `docker0`, `br-*`, `katbr0`), the guest kernel sends the ACK immediately instead of waiting on ping-pong delayed ACK. Sustained bulk transfers keep stock Linux ACK pacing, and traffic crossing the `eth0` uplink and all routing tables remain untouched. This avoids 40–50 ms Nagle + delayed-ACK stalls on split-write keep-alive traffic with the 65520-byte MTU. To disable it for a foreground VM, pass `--cmdline kat.quickack=0` to `katamaran run` (the daemon-managed VM started by `kat start` does not currently expose this option).
 
 ### `katamaran daemon`
 
