@@ -420,7 +420,9 @@ const DATASTORE_K3S_FLAGS: &[&str] = &[
 
 /// Component settings that would override something katamaran manages,
 /// directly or through the component's own config file: the kubelet root
-/// that stop/reset unmount, the shared containerd, the node name, the pod and
+/// that stop/reset unmount, swap tolerance (the guest runs zram swap), the
+/// kubelet and API server credentials k3s generates, the shared containerd,
+/// the node name, the pod and
 /// service CIDRs and cluster DNS, kube-proxy's nftables mode (stop/reset only
 /// delete its nftables table), and the API server address the relay uses.
 /// Other component arguments pass through unchecked.
@@ -432,6 +434,10 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
             "container-runtime-endpoint",
             "hostname-override",
             "cluster-dns",
+            "fail-swap-on",
+            "kubeconfig",
+            "bootstrap-kubeconfig",
+            "cert-dir",
             "config",
             "config-dir",
         ],
@@ -448,7 +454,15 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
     ),
     (
         "kube-apiserver-arg",
-        &["secure-port", "bind-address", "service-cluster-ip-range"],
+        &[
+            "secure-port",
+            "bind-address",
+            "advertise-address",
+            "service-cluster-ip-range",
+            "tls-cert-file",
+            "tls-private-key-file",
+            "client-ca-file",
+        ],
     ),
     (
         "kube-controller-manager-arg",
@@ -516,6 +530,31 @@ fn check_k3s_setting(name: &str, values: &[&str], in_args: bool) -> Result<(), S
     Ok(())
 }
 
+/// Allowlisted k3s flags that are booleans (k3s `cli.BoolFlag`): they never
+/// consume the next argument as their value.
+const BOOL_K3S_FLAGS: &[&str] = &[
+    "debug",
+    "alsologtostderr",
+    "disable-cloud-controller",
+    "disable-helm-controller",
+    "disable-network-policy",
+    "disable-default-registry-endpoint",
+    "secrets-encryption",
+    "embedded-registry",
+    "protect-kernel-defaults",
+    "enable-pprof",
+    "supervisor-metrics",
+    "nonroot-devices",
+    "tls-san-security",
+    "cluster-init",
+    "etcd-disable-snapshots",
+    "etcd-expose-metrics",
+    "etcd-snapshot-compress",
+    "etcd-s3",
+    "etcd-s3-insecure",
+    "etcd-s3-skip-ssl-verify",
+];
+
 /// Check one `k3s-config.yaml` key and its values (see [`check_k3s_setting`]).
 pub fn check_k3s_config_setting(name: &str, values: &[&str]) -> Result<(), String> {
     check_k3s_setting(name, values, false)
@@ -524,18 +563,28 @@ pub fn check_k3s_config_setting(name: &str, values: &[&str]) -> Result<(), Strin
 /// Validate `k8s_args` before they are saved (host) and before `k3s server`
 /// starts (guest). Errors never echo argument values.
 pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
-    for (i, arg) in args.iter().enumerate() {
-        if arg.is_empty() {
-            return Err("k8s_args must not contain empty arguments".into());
-        }
-        if arg.contains('\0') {
-            return Err("k8s_args must not contain NUL bytes".into());
-        }
-        let Some((name, inline)) = parse_k3s_flag(arg) else {
+    if args.iter().any(String::is_empty) {
+        return Err("k8s_args must not contain empty arguments".into());
+    }
+    if args.iter().any(|a| a.contains('\0')) {
+        return Err("k8s_args must not contain NUL bytes".into());
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let Some((name, inline)) = parse_k3s_flag(&args[i]) else {
+            i += 1;
             continue;
         };
-        let value = inline.or_else(|| args.get(i + 1).map(String::as_str));
+        // Like Go's flag parser, a non-boolean flag without `=value` takes
+        // the next argument as its value even if it starts with `-`.
+        let takes_next = inline.is_none() && !BOOL_K3S_FLAGS.contains(&name);
+        let value = if takes_next {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            inline
+        };
         check_k3s_setting(name, value.as_slice(), true).map_err(|e| format!("k8s_args: {e}"))?;
+        i += if takes_next { 2 } else { 1 };
     }
     Ok(())
 }
@@ -558,6 +607,11 @@ mod tests {
         .unwrap();
         // Positional values that merely look like names are not flags.
         v(&["--node-label", "token=x"]).unwrap();
+        // A split value may start with a dash; it is checked as the value.
+        v(&["--kubelet-arg", "--max-pods=200"]).unwrap();
+        v(&["--kubelet-arg", "--root-dir=/x"]).unwrap_err();
+        // A boolean flag does not consume the next argument.
+        v(&["--debug", "--bind-address=0.0.0.0"]).unwrap_err();
 
         assert!(v(&[""]).is_err());
         assert!(v(&["--foo=\0bar"]).is_err());
@@ -640,6 +694,11 @@ mod tests {
             vec!["--kube-controller-manager-arg=cluster-cidr=10.8.0.0/16"],
             vec!["--kube-controller-manager-arg=allocate_node_cidrs=false"],
             vec!["--kube-controller-arg=cluster-cidr=10.8.0.0/16"],
+            vec!["--kubelet-arg=fail-swap-on=true"],
+            vec!["--kubelet-arg=fail_swap_on=true"],
+            vec!["--kubelet-arg=cert-dir=/x"],
+            vec!["--kube-apiserver-arg=tls-cert-file=/x"],
+            vec!["--kube-apiserver-arg=advertise-address=10.0.0.1"],
         ] {
             assert!(v(&kubelet).is_err(), "{kubelet:?}");
         }

@@ -175,8 +175,12 @@ pub fn forwarded_ports() -> BTreeSet<u16> {
     FORWARDED.lock().unwrap().clone()
 }
 
+/// The `k8s_args` and raw `k3s-config.yaml` a k3s instance was started with.
+type StartSettings = (Vec<String>, Option<String>);
+
 struct Running {
     pid: i32,
+    settings: StartSettings,
     exit_rx: Receiver<()>,
     exited: Arc<Mutex<Option<i32>>>,
     sync_stop: Arc<AtomicBool>,
@@ -2161,7 +2165,17 @@ impl K8s {
         {
             let st = self.state.lock().unwrap();
             if st.phase == "running" && st.api_ready {
+                // Never report success while silently ignoring new settings.
+                let same = st.running.as_ref().is_some_and(|r| {
+                    r.settings.0 == extra_args && r.settings.1.as_deref() == config_yaml
+                });
                 drop(st);
+                if !same {
+                    return Err(
+                        "Kubernetes is already running with different k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
+                            .into(),
+                    );
+                }
                 return Ok(self.info());
             }
         }
@@ -2316,6 +2330,7 @@ impl K8s {
             st.error.clear();
             st.running = Some(Running {
                 pid,
+                settings: (extra_args.to_vec(), config_yaml.map(str::to_string)),
                 exit_rx,
                 exited: exited.clone(),
                 sync_stop: sync_stop.clone(),
