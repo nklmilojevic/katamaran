@@ -1052,19 +1052,28 @@ fn remove_kubeconfig_in(
 /// Minimal UDP DNS responder for `k8s.kat.local` and `*.k8s.kat.local` -> `127.0.0.1`.
 pub struct DnsServer {
     pub port: u16,
+    pub isolated: bool,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
-        if std::env::var_os(ISOLATED_DNS_ENV).is_some_and(|v| v == "1") {
+        let env = std::env::var_os(ISOLATED_DNS_ENV);
+        Self::start_with_mode(env.as_deref(), installed_dns_port)
+    }
+
+    fn start_with_mode(
+        isolated_env: Option<&std::ffi::OsStr>,
+        installed: impl FnOnce() -> Option<u16>,
+    ) -> io::Result<DnsServer> {
+        if isolated_env.is_some_and(|v| v == "1") {
             eprintln!(
                 "warning: {ISOLATED_DNS_ENV}=1: serving *.{DNS_DOMAIN} on an ephemeral port; {RESOLVER_PATH} is not used"
             );
             return Self::start_ephemeral();
         }
-        Self::start_with_installed_port(installed_dns_port())
+        Self::start_with_installed_port(installed())
     }
 
     /// Bind an ephemeral loopback port, ignoring `/etc/resolver/k8s.kat.local`
@@ -1077,7 +1086,7 @@ impl DnsServer {
                 format!("bind 127.0.0.1:0 for isolated *.{DNS_DOMAIN} DNS: {e}"),
             )
         })?;
-        Self::serve(sock)
+        Self::serve(sock, true)
     }
 
     fn start_with_installed_port(installed: Option<u16>) -> io::Result<DnsServer> {
@@ -1097,10 +1106,10 @@ impl DnsServer {
                     )
                 })?,
         };
-        Self::serve(sock)
+        Self::serve(sock, false)
     }
 
-    fn serve(sock: UdpSocket) -> io::Result<DnsServer> {
+    fn serve(sock: UdpSocket, isolated: bool) -> io::Result<DnsServer> {
         let port = sock.local_addr()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(250)))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -1132,6 +1141,7 @@ impl DnsServer {
             })?;
         Ok(DnsServer {
             port,
+            isolated,
             stop,
             thread: Some(thread),
         })
@@ -1548,22 +1558,53 @@ users:
 
     #[test]
     fn dns_server_ephemeral_ignores_installed_port() {
+        use std::ffi::OsStr;
+
         let holder = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let held = holder.local_addr().unwrap().port();
-        // The installed-port path must fail on a held port...
-        assert!(DnsServer::start_with_installed_port(Some(held)).is_err());
-        // ...while the isolated path binds a fresh one.
-        let mut srv = DnsServer::start_ephemeral().unwrap();
+
+        // Exact "1" skips the installed-port lookup and binds an ephemeral port in isolated mode.
+        let mut looked_up = false;
+        let mut srv = DnsServer::start_with_mode(Some(OsStr::new("1")), || {
+            looked_up = true;
+            Some(held)
+        })
+        .unwrap();
+        assert!(!looked_up, "isolated mode must skip installed-port lookup");
+        assert!(srv.isolated);
         assert_ne!(srv.port, 0);
         assert_ne!(srv.port, held);
         srv.stop();
+
+        // Unset env still consults the installed port and fails when it is held.
+        let mut looked_up = false;
+        assert!(
+            DnsServer::start_with_mode(None, || {
+                looked_up = true;
+                Some(held)
+            })
+            .is_err()
+        );
+        assert!(looked_up);
+
+        // Non-"1" values (e.g. "0") still consult the installed port and fail when it is held.
+        let mut looked_up = false;
+        assert!(
+            DnsServer::start_with_mode(Some(OsStr::new("0")), || {
+                looked_up = true;
+                Some(held)
+            })
+            .is_err()
+        );
+        assert!(looked_up);
     }
 
     #[test]
     fn dns_server_falls_back_when_default_port_busy() {
         // Hold DEFAULT_DNS_PORT if available, or verify fallback when another server binds first.
         let holder = UdpSocket::bind(("127.0.0.1", DEFAULT_DNS_PORT)).ok();
-        let mut srv = DnsServer::start_with_installed_port(None).unwrap();
+        let mut srv = DnsServer::start_with_mode(None, || None).unwrap();
+        assert!(!srv.isolated);
         assert_ne!(srv.port, 0);
         if holder.is_some() {
             assert_ne!(srv.port, DEFAULT_DNS_PORT);

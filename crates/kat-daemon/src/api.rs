@@ -474,6 +474,8 @@ pub struct K8sStatus {
     pub dns_port: Option<u16>,
     #[serde(default)]
     pub dns_installed: bool,
+    #[serde(default)]
+    pub dns_isolated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -492,6 +494,7 @@ impl Default for K8sStatus {
             dns_domain: String::new(),
             dns_port: None,
             dns_installed: false,
+            dns_isolated: false,
             error: None,
         }
     }
@@ -766,5 +769,17 @@ mod tests {
         assert_eq!(v["port_errors"][0]["port"], 80);
         let back: Status = serde_json::from_value(v).unwrap();
         assert_eq!(back, with_err);
+
+        // Older daemons omit `dns_isolated`; serde must default it to false.
+        let legacy: K8sStatus = serde_json::from_value(json!({
+            "enabled": true,
+            "state": "running",
+            "installed": true,
+            "dns_domain": "k8s.kat.local",
+            "dns_port": 15353,
+            "dns_installed": true
+        }))
+        .unwrap();
+        assert!(!legacy.dns_isolated);
     }
 }

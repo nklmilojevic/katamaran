@@ -1022,6 +1022,7 @@ impl Daemon {
     fn k8s_status(&self, enabled: bool) -> K8sStatus {
         let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
         let dns_port = k.dns.as_ref().map(|d| d.port);
+        let dns_isolated = k.dns.as_ref().is_some_and(|d| d.isolated);
         K8sStatus {
             enabled,
             state: k.state.clone(),
@@ -1038,7 +1039,8 @@ impl Daemon {
             kubeconfig: k.kubeconfig.clone(),
             dns_domain: crate::k8s::DNS_DOMAIN.into(),
             dns_port,
-            dns_installed: crate::k8s::dns_resolver_installed(dns_port),
+            dns_installed: !dns_isolated && crate::k8s::dns_resolver_installed(dns_port),
+            dns_isolated,
             error: k.error.clone(),
         }
     }

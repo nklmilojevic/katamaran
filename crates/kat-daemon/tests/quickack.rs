@@ -24,7 +24,7 @@ const QUICKACK_PARAM: &str = "/sys/module/kat/parameters/quickack";
 /// Without quick ACK, the client's delayed-ACK timer stalls every keep-alive
 /// request for ~40–50 ms.
 const SPLIT_WRITE_SERVER_PY: &str = r#"
-import fcntl, socket, struct, termios, threading, time
+import fcntl, socket, struct, sys, termios, threading, time
 
 BODY = b"x" * 10240
 HDR = (
@@ -33,8 +33,10 @@ HDR = (
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
-BULK_CHUNK = b"b" * (1024 * 1024)
-BULK_CHUNKS = 32
+# 32 MiB sent in 4 x 8 MiB chunks (only 4 write/PSH boundaries) so sustained
+# bulk measurements have tightly bounded drain-path ACK overhead.
+BULK_CHUNK = b"b" * (8 * 1024 * 1024)
+BULK_CHUNKS = 4
 BULK_HDR = (
     b"HTTP/1.1 200 OK\r\n"
     b"Content-Length: " + str(len(BULK_CHUNK) * BULK_CHUNKS).encode() + b"\r\n"
@@ -53,6 +55,14 @@ PACED_CHUNKS = 32
 PACED_HDR = (
     b"HTTP/1.1 200 OK\r\n"
     b"Content-Length: " + str(len(SHORT_CHUNK) * PACED_CHUNKS).encode() + b"\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
+PACED_SHORT_CHUNK = b"q" * 6000
+PACED_SHORT_CHUNKS = 48
+PACED_SHORT_HDR = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: " + str(len(PACED_SHORT_CHUNK) * PACED_SHORT_CHUNKS).encode() + b"\r\n"
     b"Connection: keep-alive\r\n"
     b"\r\n"
 )
@@ -186,6 +196,27 @@ def handle(conn):
             elif req_hdr.startswith(b"GET /two2k "):
                 conn.sendall(TWO_FIRST)
                 conn.sendall(TWO_SECOND)
+            elif req_hdr.startswith(b"GET /mss "):
+                mss = str(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)).encode()
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Length: " + str(len(mss)).encode() + b"\r\n"
+                    b"Connection: keep-alive\r\n"
+                    b"\r\n" + mss
+                )
+            elif req_hdr.startswith(b"GET /pacedshort "):
+                # Short, non-full-MSS PSH writes with TCP_NODELAY paced 12 ms
+                # apart (between the capped timer and the stock 40 ms timer):
+                # once the single per-batch capped timer is spent, stock
+                # delayed-ACK batching must remain intact.
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                mss = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
+                assert len(PACED_SHORT_CHUNK) < mss, (len(PACED_SHORT_CHUNK), mss)
+                conn.sendall(PACED_SHORT_HDR)
+                for _ in range(PACED_SHORT_CHUNKS):
+                    time.sleep(0.012)
+                    conn.sendall(PACED_SHORT_CHUNK)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             elif req_hdr.startswith(b"GET /fullmss "):
                 # Full-sized PSH segments (exactly one MSS per write) paced
                 # 12 ms apart: longer than the shortened delayed-ACK cap, shorter
@@ -196,6 +227,7 @@ def handle(conn):
                 chunk = b"f" * mss
                 conn.sendall(
                     b"HTTP/1.1 200 OK\r\n"
+                    b"X-Kat-Mss: " + str(mss).encode() + b"\r\n"
                     b"Content-Length: " + str(mss * FULL_CHUNKS).encode() + b"\r\n"
                     b"Connection: keep-alive\r\n"
                     b"\r\n"
@@ -210,15 +242,20 @@ def handle(conn):
     finally:
         conn.close()
 
+IPV6 = len(sys.argv) > 1 and sys.argv[1] == "--ipv6"
+
 def serve(port, window_clamp=None):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    fam = socket.AF_INET6 if IPV6 else socket.AF_INET
+    srv = socket.socket(fam, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if IPV6:
+        srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     if window_clamp:
         # Inherited by accepted sockets before the handshake: the server
         # advertises at most this receive window, which bounds the CLIENT's
         # send MSS (tcp_bound_to_half_wnd) but not the server's responses.
         srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_WINDOW_CLAMP, window_clamp)
-    srv.bind(("0.0.0.0", port))
+    srv.bind(("::" if IPV6 else "0.0.0.0", port))
     srv.listen(32)
     while True:
         c, _ = srv.accept()
@@ -245,7 +282,7 @@ serve(8080)
 /// them under `SO_RCVLOWAT=<lowat>`. Port 8082 of the split-write server clamps
 /// its receive window to 32 KiB.
 const KEEP_ALIVE_CLIENT_PY: &str = r#"
-import os, select, socket, sys, time
+import os, select, socket, struct, sys, time
 
 host = sys.argv[1]
 req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
@@ -253,27 +290,58 @@ three_req = b"GET /three HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\
 bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+paced_short_req = b"GET /pacedshort HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 pushed_req = b"GET /pushed HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 split20k_req = b"GET /split20k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 split100k_req = b"GET /split100k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 two2k_req = b"GET /two2k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 fullmss_req = b"GET /fullmss HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+mss_req = b"GET /mss HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
-def tcp_out_segs():
-    with open("/proc/net/snmp") as f:
+def tcp_info_stats(sock):
+    # Linux UAPI struct tcp_info (64-bit natural alignment):
+    #   offset  16: __u32 tcpi_snd_mss
+    #   offset 128: __u64 tcpi_bytes_received
+    #   offset 136: __u32 tcpi_segs_out, __u32 tcpi_segs_in
+    #   offset 152: __u32 tcpi_data_segs_in, __u32 tcpi_data_segs_out
+    info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 160)
+    snd_mss = struct.unpack_from("=I", info, 16)[0]
+    bytes_rx = struct.unpack_from("=Q", info, 128)[0]
+    segs_out, _segs_in = struct.unpack_from("=II", info, 136)
+    _data_segs_in, data_segs_out = struct.unpack_from("=II", info, 152)
+    return snd_mss, bytes_rx, segs_out - data_segs_out
+
+def delayed_acks():
+    with open("/proc/net/netstat") as f:
         lines = f.read().splitlines()
     for i in range(0, len(lines) - 1, 2):
         keys = lines[i].split()
         vals = lines[i + 1].split()
-        if keys and keys[0] == "Tcp:" and "OutSegs" in keys:
-            return int(vals[keys.index("OutSegs")])
-    raise RuntimeError("OutSegs not found in /proc/net/snmp")
+        if keys and keys[0] == "TcpExt:" and "DelayedACKs" in keys:
+            return int(vals[keys.index("DelayedACKs")])
+    raise RuntimeError("DelayedACKs not found in /proc/net/netstat")
+
+def header_value(hdr, name_lower):
+    prefix = name_lower + b":"
+    for line in hdr.split(b"\r\n")[1:]:
+        if line.lower().startswith(prefix):
+            return line.split(b":", 1)[1].strip()
+    return None
 
 def content_length(hdr):
-    for line in hdr.split(b"\r\n")[1:]:
-        if line.lower().startswith(b"content-length:"):
-            return int(line.split(b":", 1)[1].strip())
-    raise RuntimeError("missing Content-Length")
+    v = header_value(hdr, b"content-length")
+    if v is None:
+        raise RuntimeError("missing Content-Length")
+    return int(v)
+
+def apply_lowat(sock, n):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, n)
+    eff = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT)
+    if eff != n:
+        raise RuntimeError(
+            f"SO_RCVLOWAT clamped by kernel: requested {n}, effective {eff}"
+        )
+    return eff
 
 def recv_exact(sock, n, buf):
     lowered = False
@@ -281,7 +349,7 @@ def recv_exact(sock, n, buf):
         while len(buf) < n:
             rem = n - len(buf)
             if cur_lowat > 1 and rem < cur_lowat and not lowered:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                apply_lowat(sock, 1)
                 lowered = True
             chunk = sock.recv(min(rem, 65536))
             if not chunk:
@@ -289,7 +357,7 @@ def recv_exact(sock, n, buf):
             buf += chunk
     finally:
         if lowered:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
+            apply_lowat(sock, cur_lowat)
     return buf[:n], buf[n:]
 
 def drain_exact(sock, n, buf):
@@ -300,7 +368,7 @@ def drain_exact(sock, n, buf):
     try:
         while rem > 0:
             if cur_lowat > 1 and rem < cur_lowat and not lowered:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                apply_lowat(sock, 1)
                 lowered = True
             elif use_poll and rem >= cur_lowat:
                 events = poller.poll(10000)
@@ -312,48 +380,78 @@ def drain_exact(sock, n, buf):
             rem -= len(chunk)
     finally:
         if lowered:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
+            apply_lowat(sock, cur_lowat)
     return b""
 
-port = int(sys.argv[5]) if len(sys.argv) > 5 else 8080
-sock = socket.create_connection((host, port), timeout=10)
-sock.settimeout(10)
+def connect_sock(host, port, rcvbuf=None):
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    last_err = None
+    for af, socktype, proto, _, sa in infos:
+        s = socket.socket(af, socktype, proto)
+        try:
+            s.settimeout(10)
+            if rcvbuf is not None:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+            s.connect(sa)
+            if ":" in host:
+                assert s.family == socket.AF_INET6, f"expected AF_INET6 for {host}, got {s.family}"
+            return s
+        except OSError as e:
+            last_err = e
+            s.close()
+    raise last_err
+
+is_bulkbench = len(sys.argv) > 2 and sys.argv[2] == "bulkbench"
+rcvbuf = int(sys.argv[3]) if is_bulkbench else None
+port = int(sys.argv[4]) if (is_bulkbench and len(sys.argv) > 4) else (
+    int(sys.argv[5]) if (not is_bulkbench and len(sys.argv) > 5) else 8080
+)
+sock = connect_sock(host, port, rcvbuf=rcvbuf)
 poller = select.poll()
 poller.register(sock, select.POLLIN)
 cur_lowat = 1
 use_poll = False
 buf = b""
 
-def run_burst(count, req_bytes=req):
+def recv_one_response(req_bytes):
     global buf
+    sock.sendall(req_bytes)
+    if use_poll and not buf:
+        events = poller.poll(10000)
+        if not events:
+            raise RuntimeError("poll timed out waiting for SO_RCVLOWAT")
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("unexpected EOF in headers")
+        buf += chunk
+    hdr, buf = buf.split(b"\r\n\r\n", 1)
+    assert b"200 OK" in hdr, hdr
+    body_len = content_length(hdr)
+    body, buf = recv_exact(sock, body_len, buf)
+    assert len(body) == body_len
+    return hdr, body
+
+def run_burst(count, req_bytes=req, report_delacks=False):
     times_ms = []
+    delacks_before = delayed_acks() if report_delacks else 0
     t_all = time.monotonic()
     for _ in range(count):
         t0 = time.monotonic()
-        sock.sendall(req_bytes)
-        if use_poll and not buf:
-            events = poller.poll(10000)
-            if not events:
-                raise RuntimeError("poll timed out waiting for SO_RCVLOWAT")
-        while b"\r\n\r\n" not in buf:
-            chunk = sock.recv(65536)
-            if not chunk:
-                raise RuntimeError("unexpected EOF in headers")
-            buf += chunk
-        hdr, buf = buf.split(b"\r\n\r\n", 1)
-        assert b"200 OK" in hdr, hdr
-        body_len = content_length(hdr)
-        body, buf = recv_exact(sock, body_len, buf)
-        assert len(body) == body_len
+        recv_one_response(req_bytes)
         times_ms.append((time.monotonic() - t0) * 1000.0)
     total_ms = (time.monotonic() - t_all) * 1000.0
+    delacks_delta = (delayed_acks() - delacks_before) if report_delacks else 0
     times_ms.sort()
     p50 = times_ms[len(times_ms) // 2]
-    print(f"{p50:.3f} {total_ms:.3f}", flush=True)
+    if report_delacks:
+        print(f"{p50:.3f} {total_ms:.3f} {delacks_delta}", flush=True)
+    else:
+        print(f"{p50:.3f} {total_ms:.3f}", flush=True)
 
-def run_stream(req_bytes, expected_len):
+def measure_stream(req_bytes, expected_len, require_fullmss=False):
     global buf
-    before = tcp_out_segs()
+    _, rx0, acks0 = tcp_info_stats(sock)
     t0 = time.monotonic()
     sock.sendall(req_bytes)
     if use_poll and not buf:
@@ -367,32 +465,66 @@ def run_stream(req_bytes, expected_len):
         buf += chunk
     hdr, buf = buf.split(b"\r\n\r\n", 1)
     assert b"200 OK" in hdr, hdr
-    cl = 0
-    for line in hdr.split(b"\r\n")[1:]:
-        if line.lower().startswith(b"content-length:"):
-            cl = int(line.split(b":", 1)[1].strip())
-    assert expected_len is None or cl == expected_len, cl
+    cl = content_length(hdr)
+    if require_fullmss:
+        mss_hdr = header_value(hdr, b"x-kat-mss")
+        if mss_hdr is None:
+            raise RuntimeError(f"missing X-Kat-Mss header in /fullmss response: {hdr!r}")
+        mss = int(mss_hdr)
+        assert mss > 0, f"invalid X-Kat-Mss header: {mss}"
+        assert cl == 48 * mss, f"/fullmss Content-Length {cl} != 48 * {mss}"
+    else:
+        assert expected_len is not None and cl == expected_len, (cl, expected_len)
     buf = drain_exact(sock, cl, buf)
     elapsed_ms = (time.monotonic() - t0) * 1000.0
-    after = tcp_out_segs()
-    print(f"{after - before} {elapsed_ms:.3f}", flush=True)
+    _, rx1, acks1 = tcp_info_stats(sock)
+    assert rx1 - rx0 >= cl, f"TCP_INFO bytes_received delta {rx1 - rx0} < {cl}"
+    return acks1 - acks0, elapsed_ms
+
+def run_stream(req_bytes, expected_len, require_fullmss=False):
+    acks, elapsed_ms = measure_stream(req_bytes, expected_len, require_fullmss=require_fullmss)
+    print(f"{acks} {elapsed_ms:.3f}", flush=True)
 
 def set_lowat(n):
     global cur_lowat, use_poll
-    cur_lowat = n
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, cur_lowat)
+    cur_lowat = apply_lowat(sock, n)
     use_poll = cur_lowat > 1
 
-if len(sys.argv) > 4:
+if is_bulkbench:
+    # Fresh connection with fixed SO_RCVBUF: enter pingpong mode and exhaust
+    # initial quickack budget, warm up once with a bulk transfer, then report
+    # median-of-3 per-socket pure ACK count and elapsed ms.
+    for _ in range(25):
+        recv_one_response(req)
+    measure_stream(bulk_req, 32 * 1024 * 1024)
+    samples = [measure_stream(bulk_req, 32 * 1024 * 1024) for _ in range(3)]
+    samples.sort(key=lambda s: s[0])
+    med_acks, med_ms = samples[1]
+    print(f"{med_acks} {med_ms:.3f}", flush=True)
+elif len(sys.argv) > 4:
     # Fresh connection: warm it with 30 responses of the given path at
     # SO_RCVLOWAT=1 (rcv_mss settles at the response's write size, pingpong
     # mode, quickack budget spent), then time <count> of them with the given
     # SO_RCVLOWAT so the first write alone cannot wake poll().
-    path_req = {"two2k": two2k_req, "split20k": split20k_req}[sys.argv[3]]
+    mode = sys.argv[3]
+    path_req = {
+        "two2k": two2k_req,
+        "split20k": split20k_req,
+        "split20k_asym": split20k_req,
+    }[mode]
     with open(os.devnull, "w") as devnull:
         stdout, sys.stdout = sys.stdout, devnull
         run_burst(30, path_req)
         sys.stdout = stdout
+    if mode == "split20k_asym":
+        # Verify the asymmetric condition on this exact socket: the response
+        # sender has a jumbo send MSS (>= 65000) while advertising a low
+        # receive MSS (<= 1460) in its SYN-ACK (seen here as tcpi_snd_mss).
+        _, mss_body = recv_one_response(mss_req)
+        sender_mss = int(mss_body.strip())
+        client_snd_mss, _, _ = tcp_info_stats(sock)
+        assert sender_mss >= 65000, f"expected jumbo sender MSS >= 65000, got {sender_mss}"
+        assert client_snd_mss <= 1460, f"expected low peer advmss <= 1460, got client snd_mss={client_snd_mss}"
     set_lowat(int(sys.argv[4]))
     run_burst(int(sys.argv[2]), path_req)
 elif len(sys.argv) > 2:
@@ -408,10 +540,16 @@ else:
             run_stream(short_req, 512 * 4096)
         elif line == "paced":
             run_stream(paced_req, 32 * 4096)
+        elif line == "pacedshort":
+            run_stream(paced_short_req, 48 * 6000)
         elif line == "pushed":
             run_stream(pushed_req, 48 * 60000)
         elif line == "fullmss":
-            run_stream(fullmss_req, None)
+            run_stream(fullmss_req, None, require_fullmss=True)
+        elif line.startswith("three_delack "):
+            run_burst(int(line.split()[1]), three_req, report_delacks=True)
+        elif line.startswith("delack "):
+            run_burst(int(line.split()[1]), req, report_delacks=True)
         elif line.startswith("three "):
             run_burst(int(line.split()[1]), three_req)
         elif line.startswith("split20k "):
@@ -436,6 +574,14 @@ sock.close()
 const NEAR_MSS_RECEIVER_PY: &str = r#"
 import select, socket, threading
 
+def set_lowat(conn, n):
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, n)
+    eff = conn.getsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT)
+    if eff != n:
+        raise RuntimeError(
+            f"SO_RCVLOWAT clamped by kernel: requested {n}, effective {eff}"
+        )
+
 def recv_line(conn):
     line = b""
     while not line.endswith(b"\n"):
@@ -451,27 +597,36 @@ def handle(conn):
         poller.register(conn, select.POLLIN)
         while True:
             # Each phase starts with "<first> <tail> <count>\n" at
-            # SO_RCVLOWAT=1, acknowledged with one byte.
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+            # SO_RCVLOWAT=1. Arm the phase watermark before sending the
+            # acknowledgment that releases message 0.
+            set_lowat(conn, 1)
             meta = recv_line(conn)
             if meta is None:
                 return
             first, tail, count = (int(x) for x in meta.split())
             total = first + tail
             lowat = first + tail // 2
+            if count > 0:
+                set_lowat(conn, lowat)
             conn.sendall(b"k")
-            for _ in range(count):
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
+            for i in range(count):
                 if not poller.poll(10000):
                     raise RuntimeError("poll timed out")
                 got = 0
+                lowered = False
                 while got < total:
-                    if total - got < lowat:
-                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                    if total - got < lowat and not lowered:
+                        set_lowat(conn, 1)
+                        lowered = True
                     chunk = conn.recv(total - got)
                     if not chunk:
                         return
                     got += len(chunk)
+                if i + 1 < count:
+                    if lowered:
+                        set_lowat(conn, lowat)
+                elif not lowered:
+                    set_lowat(conn, 1)
                 conn.sendall(b"k")
     finally:
         conn.close()
@@ -825,6 +980,7 @@ impl Daemon {
             // the one in /etc/resolver/k8s.kat.local, which the developer's own
             // daemon may hold (ISOLATED_DNS_ENV in src/k8s.rs).
             .env("KATAMARAN_ISOLATED_DNS", "1")
+            .env("KATAMARAN_GUEST_DIR", root().join("guest/out"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -878,6 +1034,21 @@ impl Drop for ContainerGuard {
         let _ = docker_timeout(
             &self.docker_host,
             &["rm", "-f", &self.id],
+            Duration::from_secs(15),
+        );
+    }
+}
+
+struct NetworkGuard {
+    docker_host: String,
+    name: String,
+}
+
+impl Drop for NetworkGuard {
+    fn drop(&mut self) {
+        let _ = docker_timeout(
+            &self.docker_host,
+            &["network", "rm", &self.name],
             Duration::from_secs(15),
         );
     }
@@ -1068,6 +1239,28 @@ fn parse_latencies(out: &str, what: &str) -> (f64, f64) {
     (p50, total)
 }
 
+fn parse_latencies_delacks(out: &str, what: &str) -> (f64, f64, u64) {
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("{what}: empty output"));
+    let mut parts = line.split_whitespace();
+    let p50: f64 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("{what}: bad p50 in {line:?}"));
+    let total: f64 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("{what}: bad total in {line:?}"));
+    let delacks: u64 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("{what}: bad delacks in {line:?}"));
+    (p50, total, delacks)
+}
+
 /// Reuse a locally cached k3s binary from the user's real `~/.katamaran/cache/k3s`
 /// if present so repeated test runs avoid re-downloading ~60 MiB.
 fn seed_k3s_cache(home: &Path) {
@@ -1111,7 +1304,14 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         &cli(
             &home,
             &user_home,
-            &["config", "set", "cpus=2", "memory=4G", "mount=off"],
+            &[
+                "config",
+                "set",
+                "cpus=2",
+                "memory=4G",
+                "mount=off",
+                "auto_forward=off",
+            ],
         ),
         "config set",
     );
@@ -1273,7 +1473,22 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     wait_until(
         "qa-peer near-MSS receiver ready",
         Duration::from_secs(30),
-        |left| near_mss("1", left.min(Duration::from_secs(10))).is_ok_and(|o| o.status.success()),
+        |left| {
+            kubectl_timeout(
+                &kubeconfig,
+                &[
+                    "exec",
+                    "qa-probe",
+                    "--",
+                    "python3",
+                    "-c",
+                    "import socket, sys; socket.create_connection((sys.argv[1], 8081), timeout=2).close()",
+                    &peer_ip,
+                ],
+                left.min(Duration::from_secs(5)),
+            )
+            .is_ok_and(|o| o.status.success())
+        },
     );
     // Accepted socket receiving a write just below the full-sized payload
     // (MSS - 8) under SO_RCVLOWAT: the handshake already deducted the TCP
@@ -1336,93 +1551,146 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             }
         }
     });
-    let mut send_cmd = |cmd: &str, what: &str| -> (f64, f64) {
+    let mut send_raw = |cmd: &str, what: &str| -> String {
         writeln!(client_in, "{cmd}").expect("write client command");
         client_in.flush().expect("flush client command");
-        let line = line_rx
+        line_rx
             .recv_timeout(Duration::from_secs(30))
-            .unwrap_or_else(|e| panic!("{what}: timed out or closed waiting for result: {e}"));
-        parse_latencies(&line, what)
+            .unwrap_or_else(|e| panic!("{what}: timed out or closed waiting for result: {e}"))
     };
+    fn send_cmd(
+        send_raw: &mut impl FnMut(&str, &str) -> String,
+        cmd: &str,
+        what: &str,
+    ) -> (f64, f64) {
+        let line = send_raw(cmd, what);
+        parse_latencies(&line, what)
+    }
+    fn send_cmd_delacks(
+        send_raw: &mut impl FnMut(&str, &str) -> String,
+        cmd: &str,
+        what: &str,
+    ) -> (f64, f64, u64) {
+        let line = send_raw(cmd, what);
+        parse_latencies_delacks(&line, what)
+    }
     fn median_of_3(
-        send_cmd: &mut impl FnMut(&str, &str) -> (f64, f64),
+        send_raw: &mut impl FnMut(&str, &str) -> String,
         cmd: &str,
         what: &str,
     ) -> (f64, f64) {
         let mut samples = [
-            send_cmd(cmd, what),
-            send_cmd(cmd, what),
-            send_cmd(cmd, what),
+            send_cmd(send_raw, cmd, what),
+            send_cmd(send_raw, cmd, what),
+            send_cmd(send_raw, cmd, what),
         ];
         samples.sort_by(|a, b| a.0.total_cmp(&b.0));
         samples[1]
     }
+    let bulk_bench = |what: &str| -> (f64, f64) {
+        let out = ok(
+            &kubectl(
+                &kubeconfig,
+                &[
+                    "exec",
+                    "qa-probe",
+                    "--",
+                    "python3",
+                    "-c",
+                    KEEP_ALIVE_CLIENT_PY,
+                    &peer_ip,
+                    "bulkbench",
+                    "262144",
+                ],
+            ),
+            what,
+        );
+        parse_latencies(&out, what)
+    };
 
-    let (pod_p50, pod_total) = send_cmd("25", "pod-to-pod keep-alive (quickack=Y)");
+    let (pod_p50, pod_total) = send_cmd(&mut send_raw, "25", "pod-to-pod keep-alive (quickack=Y)");
     eprintln!("pod-to-pod keep-alive (quickack=Y): p50={pod_p50:.2}ms total={pod_total:.2}ms");
     assert!(
         pod_p50 < 15.0 && pod_total < 400.0,
         "pod-to-pod keep-alive stalled (p50={pod_p50:.2}ms total={pod_total:.2}ms)"
     );
 
-    // Warm up TCP receive-buffer auto-tuning once, then take median-of-3
-    // sustained 32 MiB bulk and 512x4 KiB short-write measurements on the same
-    // established pingpong-mode keep-alive socket to compare tightly against
-    // quickack=N below.
-    send_cmd("bulk", "warmup 32MiB bulk");
-    let (bulk_acks_on, bulk_ms_on) =
-        median_of_3(&mut send_cmd, "bulk", "sustained 32MiB bulk (quickack=Y)");
+    // Measure sustained 32 MiB bulk on a fresh connection with fixed SO_RCVBUF,
+    // matched pingpong+bulk warm-up, and per-socket TCP_INFO pure ACK counts,
+    // plus warm up the persistent connection before short-write streams.
+    let (bulk_acks_on, bulk_ms_on) = bulk_bench("sustained 32MiB bulk (quickack=Y)");
     eprintln!(
-        "pod-to-pod sustained 32MiB bulk median (quickack=Y): out_segs={bulk_acks_on:.0} elapsed={bulk_ms_on:.2}ms"
+        "pod-to-pod sustained 32MiB bulk median (quickack=Y): pure_acks={bulk_acks_on:.0} elapsed={bulk_ms_on:.2}ms"
     );
+    send_cmd(&mut send_raw, "bulk", "warmup persistent connection");
     let (short_acks_on, short_ms_on) = median_of_3(
-        &mut send_cmd,
+        &mut send_raw,
         "short",
         "short-write 512x4KiB stream (quickack=Y)",
     );
     eprintln!(
-        "pod-to-pod short-write 512x4KiB stream median (quickack=Y): out_segs={short_acks_on:.0} elapsed={short_ms_on:.2}ms"
+        "pod-to-pod short-write 512x4KiB stream median (quickack=Y): pure_acks={short_acks_on:.0} elapsed={short_ms_on:.2}ms"
     );
-    let (paced_acks_on, paced_ms_on) =
-        send_cmd("paced", "paced short-write 32x4KiB stream (quickack=Y)");
+    let (paced_acks_on, paced_ms_on) = send_cmd(
+        &mut send_raw,
+        "paced",
+        "paced short-write 32x4KiB stream (quickack=Y)",
+    );
     eprintln!(
-        "pod-to-pod paced short-write 32x4KiB stream (quickack=Y): out_segs={paced_acks_on:.0} elapsed={paced_ms_on:.2}ms"
+        "pod-to-pod paced short-write 32x4KiB stream (quickack=Y): pure_acks={paced_acks_on:.0} elapsed={paced_ms_on:.2}ms"
     );
 
     // Poll-driven split-write keep-alive with SO_RCVLOWAT=4096 (above ~80B
     // headers, below 10 KiB body): poll() cannot wake on the short header, so
     // __tcp_ack_snd_check() must ACK the pushed header below SO_RCVLOWAT.
-    send_cmd("rcvlowat 4096", "set SO_RCVLOWAT=4096");
-    let (lowat_on_p50, lowat_on_total) =
-        send_cmd("15", "SO_RCVLOWAT=4096 poll keep-alive (quickack=Y)");
+    // Also record DelayedACKs delta so we prove draining the 10 KiB tail does
+    // not fire delayed ACKs (establishing a clean baseline for `three_delack`).
+    send_cmd(&mut send_raw, "rcvlowat 4096", "set SO_RCVLOWAT=4096");
+    let (lowat_on_p50, lowat_on_total, lowat_on_delacks) = send_cmd_delacks(
+        &mut send_raw,
+        "delack 15",
+        "SO_RCVLOWAT=4096 poll keep-alive (quickack=Y)",
+    );
     eprintln!(
-        "pod-to-pod SO_RCVLOWAT=4096 poll keep-alive (quickack=Y): p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms"
+        "pod-to-pod SO_RCVLOWAT=4096 poll keep-alive (quickack=Y): p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms delacks={lowat_on_delacks}"
     );
     assert!(
         lowat_on_p50 < 15.0 && lowat_on_total < 300.0,
         "SO_RCVLOWAT=4096 poll keep-alive stalled with quickack=Y (p50={lowat_on_p50:.2}ms total={lowat_on_total:.2}ms)"
     );
+    assert!(
+        lowat_on_delacks <= 1,
+        "two-write SO_RCVLOWAT=4096 burst unexpectedly triggered DelayedACKs (delacks={lowat_on_delacks})"
+    );
 
     // Three-write response with SO_RCVLOWAT=4096 (70B hdr + 2 KiB mid < 4 KiB,
     // followed by 8 KiB tail behind Nagle): write 1 is ACKed immediately and
     // write 2's delayed ACK is capped to a short deadline rather than 40-50 ms.
-    let (three_on_p50, three_on_total) = send_cmd(
-        "three 10",
+    // Assert DelayedACKs increments (middle write was ACKed by the capped timer,
+    // not an immediate ACK) while staying well under the stock 40-50 ms stall.
+    let (three_on_p50, three_on_total, three_on_delacks) = send_cmd_delacks(
+        &mut send_raw,
+        "three_delack 10",
         "SO_RCVLOWAT=4096 three-write keep-alive (quickack=Y)",
     );
     eprintln!(
-        "pod-to-pod SO_RCVLOWAT=4096 three-write keep-alive (quickack=Y): p50={three_on_p50:.2}ms total={three_on_total:.2}ms"
+        "pod-to-pod SO_RCVLOWAT=4096 three-write keep-alive (quickack=Y): p50={three_on_p50:.2}ms total={three_on_total:.2}ms delacks={three_on_delacks}"
     );
     assert!(
         three_on_p50 < 25.0,
         "SO_RCVLOWAT=4096 three-write hit stock delayed-ACK stall with quickack=Y (p50={three_on_p50:.2}ms total={three_on_total:.2}ms)"
     );
+    assert!(
+        three_on_delacks >= 8 && three_on_delacks > lowat_on_delacks + 5,
+        "SO_RCVLOWAT=4096 three-write did not ACK the middle write via delayed-ACK timer (three_delacks={three_on_delacks}, two_write_delacks={lowat_on_delacks})"
+    );
 
     // 20 KiB + 4 KiB split write with SO_RCVLOWAT=22528 on the warmed
     // connection (rcv_mss ~64 KiB): the 20 KiB first write is short relative
     // to the peer's MSS, so it is ACKed early and Nagle releases the tail.
-    send_cmd("rcvlowat 22528", "set SO_RCVLOWAT=22528");
+    send_cmd(&mut send_raw, "rcvlowat 22528", "set SO_RCVLOWAT=22528");
     let (split20_on_p50, split20_on_total) = send_cmd(
+        &mut send_raw,
         "split20k 10",
         "SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=Y)",
     );
@@ -1440,8 +1708,9 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     // ACKs immediately here once more than one full frame is unacknowledged
     // and the window advances, so there is no quickack=N stall to contrast;
     // this guards against the policy delaying it.
-    send_cmd("rcvlowat 102400", "set SO_RCVLOWAT=102400");
+    send_cmd(&mut send_raw, "rcvlowat 102400", "set SO_RCVLOWAT=102400");
     let (split100_on_p50, split100_on_total) = send_cmd(
+        &mut send_raw,
         "split100k 10",
         "SO_RCVLOWAT=102400 100000B+4KiB split write (quickack=Y)",
     );
@@ -1507,27 +1776,39 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     // 60000B pushes are short relative to the ~64 KiB MSS, but
     // !after(rcv_wup, copied_seq) limits immediate ACKs to one per unread
     // batch and the capped timer batches the rest (compared with quickack=N).
-    send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144");
+    send_cmd(&mut send_raw, "rcvlowat 262144", "set SO_RCVLOWAT=262144");
     let (pushed_acks_on, pushed_ms_on) = median_of_3(
-        &mut send_cmd,
+        &mut send_raw,
         "pushed",
         "SO_RCVLOWAT=262144 pushed 48x60000B stream (quickack=Y)",
     );
     eprintln!(
-        "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=Y): out_segs={pushed_acks_on:.0} elapsed={pushed_ms_on:.2}ms"
+        "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=Y): pure_acks={pushed_acks_on:.0} elapsed={pushed_ms_on:.2}ms"
     );
     // Full-sized PSH segments paced 12 ms apart below SO_RCVLOWAT: neither the
     // immediate ACK nor the shortened delayed-ACK cap may apply, so ACK
     // batching must match stock (compared against quickack=N below).
     let (fullmss_acks_on, fullmss_ms_on) = median_of_3(
-        &mut send_cmd,
+        &mut send_raw,
         "fullmss",
         "SO_RCVLOWAT=262144 paced full-MSS stream (quickack=Y)",
     );
     eprintln!(
-        "pod-to-pod SO_RCVLOWAT=262144 paced 48xMSS median (quickack=Y): out_segs={fullmss_acks_on:.0} elapsed={fullmss_ms_on:.2}ms"
+        "pod-to-pod SO_RCVLOWAT=262144 paced 48xMSS median (quickack=Y): pure_acks={fullmss_acks_on:.0} elapsed={fullmss_ms_on:.2}ms"
     );
-    send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1");
+    // Short, non-full-MSS TCP_NODELAY stream (48 x 6000 B) paced 12 ms apart
+    // below SO_RCVLOWAT=262144: once the bounded per-batch capped timer is
+    // spent, stock delayed-ACK batching must remain intact instead of ACKing
+    // every push.
+    let (paced_short_acks_on, paced_short_ms_on) = median_of_3(
+        &mut send_raw,
+        "pacedshort",
+        "SO_RCVLOWAT=262144 paced short 48x6000B stream (quickack=Y)",
+    );
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=262144 paced short 48x6000B median (quickack=Y): pure_acks={paced_short_acks_on:.0} elapsed={paced_short_ms_on:.2}ms"
+    );
+    send_cmd(&mut send_raw, "rcvlowat 1", "reset SO_RCVLOWAT=1");
 
     {
         let restore = QuickackRestoreGuard {
@@ -1550,7 +1831,11 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "disable kat.quickack",
         );
         // Same already-established socket immediately observes quickack=0.
-        let (off_p50, off_total) = send_cmd("8", "established pod keep-alive (quickack=N)");
+        let (off_p50, off_total) = send_cmd(
+            &mut send_raw,
+            "8",
+            "established pod keep-alive (quickack=N)",
+        );
         eprintln!(
             "pod-to-pod established keep-alive (quickack=N): p50={off_p50:.2}ms total={off_total:.2}ms"
         );
@@ -1559,9 +1844,16 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected delayed-ACK stall on established socket with quickack=0 (got p50={off_p50:.2}ms total={off_total:.2}ms)"
         );
 
-        send_cmd("rcvlowat 4096", "set SO_RCVLOWAT=4096 (quickack=N)");
-        let (lowat_off_p50, lowat_off_total) =
-            send_cmd("6", "SO_RCVLOWAT=4096 poll keep-alive (quickack=N)");
+        send_cmd(
+            &mut send_raw,
+            "rcvlowat 4096",
+            "set SO_RCVLOWAT=4096 (quickack=N)",
+        );
+        let (lowat_off_p50, lowat_off_total) = send_cmd(
+            &mut send_raw,
+            "6",
+            "SO_RCVLOWAT=4096 poll keep-alive (quickack=N)",
+        );
         eprintln!(
             "pod-to-pod SO_RCVLOWAT=4096 poll keep-alive (quickack=N): p50={lowat_off_p50:.2}ms total={lowat_off_total:.2}ms"
         );
@@ -1570,6 +1862,7 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected SO_RCVLOWAT=4096 poll stall with quickack=0 (got p50={lowat_off_p50:.2}ms total={lowat_off_total:.2}ms)"
         );
         let (three_off_p50, three_off_total) = send_cmd(
+            &mut send_raw,
             "three 6",
             "SO_RCVLOWAT=4096 three-write keep-alive (quickack=N)",
         );
@@ -1581,8 +1874,13 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected SO_RCVLOWAT=4096 three-write stall with quickack=0 (got p50={three_off_p50:.2}ms total={three_off_total:.2}ms)"
         );
 
-        send_cmd("rcvlowat 22528", "set SO_RCVLOWAT=22528 (quickack=N)");
+        send_cmd(
+            &mut send_raw,
+            "rcvlowat 22528",
+            "set SO_RCVLOWAT=22528 (quickack=N)",
+        );
         let (split20_off_p50, split20_off_total) = send_cmd(
+            &mut send_raw,
             "split20k 6",
             "SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=N)",
         );
@@ -1621,71 +1919,100 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "expected SO_RCVLOWAT=3072 two-write 2KiB stall with quickack=0 (got p50={two_off_p50:.2}ms total={two_off_total:.2}ms)"
         );
 
-        send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144 (quickack=N)");
+        send_cmd(
+            &mut send_raw,
+            "rcvlowat 262144",
+            "set SO_RCVLOWAT=262144 (quickack=N)",
+        );
         let (pushed_acks_off, pushed_ms_off) = median_of_3(
-            &mut send_cmd,
+            &mut send_raw,
             "pushed",
             "SO_RCVLOWAT=262144 pushed 48x60000B stream (quickack=N)",
         );
         eprintln!(
-            "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=N): out_segs={pushed_acks_off:.0} elapsed={pushed_ms_off:.2}ms"
+            "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=N): pure_acks={pushed_acks_off:.0} elapsed={pushed_ms_off:.2}ms"
         );
         // 48 pushed segments: ACKing each one below 262144 would give ~48+
-        // OutSegs; stock pacing must handle subsequent segments in each batch.
+        // pure ACKs; stock pacing must handle subsequent segments in each batch.
         assert!(
             pushed_acks_on < 40.0 && pushed_acks_on <= pushed_acks_off * 1.4 + 6.0,
             "SO_RCVLOWAT=262144 pushed stream inflated ACKs (on={pushed_acks_on:.0}, off={pushed_acks_off:.0})"
         );
         let (fullmss_acks_off, fullmss_ms_off) = median_of_3(
-            &mut send_cmd,
+            &mut send_raw,
             "fullmss",
             "SO_RCVLOWAT=262144 paced full-MSS stream (quickack=N)",
         );
         eprintln!(
-            "pod-to-pod SO_RCVLOWAT=262144 paced 48xMSS median (quickack=N): out_segs={fullmss_acks_off:.0} elapsed={fullmss_ms_off:.2}ms"
+            "pod-to-pod SO_RCVLOWAT=262144 paced 48xMSS median (quickack=N): pure_acks={fullmss_acks_off:.0} elapsed={fullmss_ms_off:.2}ms"
         );
         // ACKing every full-sized segment (immediately or via the capped
-        // timer) would give ~48 OutSegs, while stock batches the 12 ms-paced
+        // timer) would give ~48 pure ACKs, while stock batches the 12 ms-paced
         // segments; the small slack covers the final sub-SO_RCVLOWAT drain.
         assert!(
             fullmss_acks_on <= fullmss_acks_off * 1.25 + 6.0,
             "SO_RCVLOWAT=262144 paced full-MSS stream lost ACK batching (on={fullmss_acks_on:.0}, off={fullmss_acks_off:.0})"
         );
-        send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1 (quickack=N)");
-
-        let (bulk_acks_off, bulk_ms_off) =
-            median_of_3(&mut send_cmd, "bulk", "sustained 32MiB bulk (quickack=N)");
+        let (paced_short_acks_off, paced_short_ms_off) = median_of_3(
+            &mut send_raw,
+            "pacedshort",
+            "SO_RCVLOWAT=262144 paced short 48x6000B stream (quickack=N)",
+        );
         eprintln!(
-            "pod-to-pod sustained 32MiB bulk median (quickack=N): out_segs={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
+            "pod-to-pod SO_RCVLOWAT=262144 paced short 48x6000B median (quickack=N): pure_acks={paced_short_acks_off:.0} elapsed={paced_short_ms_off:.2}ms"
+        );
+        // 48 short TCP_NODELAY writes paced 12 ms apart below SO_RCVLOWAT:
+        // ACKing every push via repeated capped timers would give ~48 pure ACKs;
+        // bounded capping keeps batching close to stock Linux.
+        assert!(
+            paced_short_acks_on < 38.0 && paced_short_acks_on <= paced_short_acks_off * 1.25 + 6.0,
+            "SO_RCVLOWAT=262144 paced short 48x6000B stream lost delayed-ACK batching (on={paced_short_acks_on:.0}, off={paced_short_acks_off:.0})"
+        );
+        send_cmd(
+            &mut send_raw,
+            "rcvlowat 1",
+            "reset SO_RCVLOWAT=1 (quickack=N)",
+        );
+
+        let (bulk_acks_off, bulk_ms_off) = bulk_bench("sustained 32MiB bulk (quickack=N)");
+        eprintln!(
+            "pod-to-pod sustained 32MiB bulk median (quickack=N): pure_acks={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
         );
         let (short_acks_off, short_ms_off) = median_of_3(
-            &mut send_cmd,
+            &mut send_raw,
             "short",
             "short-write 512x4KiB stream (quickack=N)",
         );
         eprintln!(
-            "pod-to-pod short-write 512x4KiB stream median (quickack=N): out_segs={short_acks_off:.0} elapsed={short_ms_off:.2}ms"
+            "pod-to-pod short-write 512x4KiB stream median (quickack=N): pure_acks={short_acks_off:.0} elapsed={short_ms_off:.2}ms"
         );
         // 2 MiB fits inside the warmed receive buffer so stock Linux itself
-        // varies from ~3 to ~50 OutSegs with vCPU scheduling; ensure quickack=Y
-        // stays far below 1-ACK-per-write (512 writes).
+        // varies with vCPU scheduling; ensure quickack=Y stays far below
+        // 1-ACK-per-write (512 writes).
         assert!(
             short_acks_on < 128.0,
             "quickack=Y inflated short-write stream ACK traffic (on={short_acks_on:.0}, off={short_acks_off:.0})"
         );
-        let (paced_acks_off, paced_ms_off) =
-            send_cmd("paced", "paced short-write 32x4KiB stream (quickack=N)");
+        let (paced_acks_off, paced_ms_off) = send_cmd(
+            &mut send_raw,
+            "paced",
+            "paced short-write 32x4KiB stream (quickack=N)",
+        );
         eprintln!(
-            "pod-to-pod paced short-write 32x4KiB stream (quickack=N): out_segs={paced_acks_off:.0} elapsed={paced_ms_off:.2}ms"
+            "pod-to-pod paced short-write 32x4KiB stream (quickack=N): pure_acks={paced_acks_off:.0} elapsed={paced_ms_off:.2}ms"
         );
         assert!(
             paced_acks_on <= 40.0 && paced_ms_on < 500.0,
-            "paced short-write stream misbehaved (on={paced_acks_on:.0} segs in {paced_ms_on:.2}ms, off={paced_acks_off:.0} segs in {paced_ms_off:.2}ms)"
+            "paced short-write stream misbehaved (on={paced_acks_on:.0} acks in {paced_ms_on:.2}ms, off={paced_acks_off:.0} acks in {paced_ms_off:.2}ms)"
         );
 
         restore.restore();
         // Same already-established socket immediately observes quickack=1 again.
-        let (on_p50, on_total) = send_cmd("15", "established pod keep-alive restored (quickack=Y)");
+        let (on_p50, on_total) = send_cmd(
+            &mut send_raw,
+            "15",
+            "established pod keep-alive restored (quickack=Y)",
+        );
         eprintln!(
             "pod-to-pod established keep-alive restored (quickack=Y): p50={on_p50:.2}ms total={on_total:.2}ms"
         );
@@ -1694,21 +2021,15 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             "established socket stayed stalled after restoring quickack=1 (p50={on_p50:.2}ms total={on_total:.2}ms)"
         );
 
-        // Stock bulk ACK counts swing widely with vCPU scheduling and receive
-        // buffer state (tens to ~100 OutSegs per 32 MiB), so sample quickack=Y
-        // on both sides of the quickack=N sample and compare the smaller
-        // median. The server writes 32 x 1 MiB chunks, each ending in PSH, so
-        // the drain-path quick ACK may legitimately add up to one ACK per
-        // write (+32). A real regression (ACKing every segment of the
-        // ~512-segment stream, or doubling stock pacing) means hundreds of
-        // extra ACKs and trips the absolute bound.
-        let (bulk_acks_on2, bulk_ms_on2) = median_of_3(
-            &mut send_cmd,
-            "bulk",
-            "sustained 32MiB bulk restored (quickack=Y)",
-        );
+        // Matched fresh-connection bulk benchmark: fixed SO_RCVBUF (256 KiB),
+        // identical pingpong + warm-up sequence, 4 x 8 MiB server writes (at
+        // most 4 drain-path PSH boundaries), and per-connection TCP_INFO pure
+        // ACK counts. Sample quickack=Y on both sides of quickack=N and check
+        // that enabled pure ACKs stay tightly bounded and strictly reject a
+        // doubled stock baseline (< 1.8x stock and <= 1.35x stock + 8).
+        let (bulk_acks_on2, bulk_ms_on2) = bulk_bench("sustained 32MiB bulk restored (quickack=Y)");
         eprintln!(
-            "pod-to-pod sustained 32MiB bulk median restored (quickack=Y): out_segs={bulk_acks_on2:.0} elapsed={bulk_ms_on2:.2}ms"
+            "pod-to-pod sustained 32MiB bulk median restored (quickack=Y): pure_acks={bulk_acks_on2:.0} elapsed={bulk_ms_on2:.2}ms"
         );
         // Coarse throughput guard for the per-packet receive-path hooks: a
         // 32 MiB transfer takes a few ms either way, so only a gross slowdown
@@ -1720,8 +2041,12 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         );
         let bulk_on = bulk_acks_on.min(bulk_acks_on2);
         assert!(
-            bulk_on < 260.0 && bulk_on <= bulk_acks_off * 1.4 + 48.0,
-            "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}/{bulk_acks_on2:.0}, off={bulk_acks_off:.0})"
+            bulk_acks_off >= 40.0,
+            "unexpectedly small stock 32MiB bulk pure-ACK baseline ({bulk_acks_off:.0}); cannot calibrate doubling guard"
+        );
+        assert!(
+            bulk_on < bulk_acks_off * 1.8 && bulk_on <= bulk_acks_off * 1.35 + 8.0,
+            "quickack=Y inflated sustained bulk pure-ACK traffic (on={bulk_acks_on:.0}/{bulk_acks_on2:.0}, off={bulk_acks_off:.0})"
         );
     }
     drop(client_in);
@@ -1885,6 +2210,276 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         br_p50 < 15.0 && br_total < 400.0,
         "root-to-bridge keep-alive stalled (p50={br_p50:.2}ms total={br_total:.2}ms)"
     );
+
+    // 3b) IPv6 Docker bridge functional probe (`AF_INET6` listener and client
+    //     on a custom IPv6-enabled bridge) plus asymmetric low-`advmss` jumbo
+    //     path probe (server advertises `advmss 1460` only on its route back to
+    //     the root client while keeping the 65520 MTU path, sending 20 KiB +
+    //     4 KiB below SO_RCVLOWAT=22528). Both are contrasted under
+    //     quickack=Y vs quickack=N.
+    let v6_net = format!("kat-qa-v6-{}", std::process::id());
+    ok(
+        &docker(
+            &docker_host,
+            &[
+                "network",
+                "create",
+                "--ipv6",
+                "--subnet",
+                "fd00:db8:6a::/64",
+                &v6_net,
+            ],
+        ),
+        "create IPv6 docker bridge network",
+    );
+    let _v6_net_guard = NetworkGuard {
+        docker_host: docker_host.clone(),
+        name: v6_net.clone(),
+    };
+    let srv_v6_id = ok(
+        &docker(
+            &docker_host,
+            &[
+                "run",
+                "-d",
+                "--rm",
+                "--network",
+                &v6_net,
+                TEST_IMAGE,
+                "python3",
+                "-c",
+                SPLIT_WRITE_SERVER_PY,
+                "--ipv6",
+            ],
+        ),
+        "start IPv6 bridged docker server",
+    )
+    .trim()
+    .to_string();
+    let _srv_v6_guard = ContainerGuard {
+        docker_host: docker_host.clone(),
+        id: srv_v6_id.clone(),
+    };
+    let srv_v6_ip = ok(
+        &docker(
+            &docker_host,
+            &[
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}",
+                &srv_v6_id,
+            ],
+        ),
+        "inspect IPv6 bridged docker server address",
+    )
+    .trim()
+    .to_string();
+    assert!(
+        srv_v6_ip.contains(':'),
+        "expected IPv6 address for bridged container, got {srv_v6_ip:?}"
+    );
+    wait_until(
+        "IPv6 bridged docker server ready",
+        Duration::from_secs(15),
+        |left| {
+            docker_timeout(
+                &docker_host,
+                &[
+                    "run",
+                    "--rm",
+                    "--network",
+                    "host",
+                    TEST_IMAGE,
+                    "python3",
+                    "-c",
+                    "import socket, sys; socket.create_connection((sys.argv[1], 8080), timeout=2).close()",
+                    &srv_v6_ip,
+                ],
+                left.min(Duration::from_secs(5)),
+            )
+            .is_ok_and(|o| o.status.success())
+        },
+    );
+
+    // Server with a low `advmss 1460` metric only on its route toward the root
+    // `docker0` gateway, without lowering interface or route MTU (still 65520):
+    // it advertises MSS=1460 in SYN-ACK while sending jumbo segments.
+    let asym_srv_id = ok(
+        &docker(
+            &docker_host,
+            &[
+                "run",
+                "-d",
+                "--rm",
+                "--cap-add",
+                "NET_ADMIN",
+                "-e",
+                &format!("SRV_PY={SPLIT_WRITE_SERVER_PY}"),
+                TEST_IMAGE,
+                "sh",
+                "-euc",
+                r#"gw=$(ip route show default | awk '{print $3; exit}')
+ip route replace "$gw/32" dev eth0 advmss 1460
+ip route show "$gw/32" >&2
+exec python3 -c "$SRV_PY""#,
+            ],
+        ),
+        "start asymmetric-advmss bridged docker server",
+    )
+    .trim()
+    .to_string();
+    let _asym_srv_guard = ContainerGuard {
+        docker_host: docker_host.clone(),
+        id: asym_srv_id.clone(),
+    };
+    let asym_srv_ip = ok(
+        &docker(
+            &docker_host,
+            &[
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                &asym_srv_id,
+            ],
+        ),
+        "inspect asymmetric-advmss server IP",
+    )
+    .trim()
+    .to_string();
+    assert!(!asym_srv_ip.is_empty(), "empty asymmetric-advmss server IP");
+    wait_until(
+        "asymmetric-advmss server ready",
+        Duration::from_secs(15),
+        |left| {
+            docker_timeout(
+                &docker_host,
+                &[
+                    "run",
+                    "--rm",
+                    "--network",
+                    "host",
+                    TEST_IMAGE,
+                    "python3",
+                    "-c",
+                    "import socket, sys; socket.create_connection((sys.argv[1], 8080), timeout=2).close()",
+                    &asym_srv_ip,
+                ],
+                left.min(Duration::from_secs(5)),
+            )
+            .is_ok_and(|o| o.status.success())
+        },
+    );
+
+    let run_v6_bridge = |count: &str, what: &str| -> (f64, f64) {
+        let out = ok(
+            &docker(
+                &docker_host,
+                &[
+                    "run",
+                    "--rm",
+                    "--network",
+                    "host",
+                    TEST_IMAGE,
+                    "python3",
+                    "-c",
+                    KEEP_ALIVE_CLIENT_PY,
+                    &srv_v6_ip,
+                    count,
+                ],
+            ),
+            what,
+        );
+        parse_latencies(&out, what)
+    };
+    let run_asym_split20k = |count: &str, what: &str| -> (f64, f64) {
+        let out = ok(
+            &docker(
+                &docker_host,
+                &[
+                    "run",
+                    "--rm",
+                    "--network",
+                    "host",
+                    TEST_IMAGE,
+                    "python3",
+                    "-c",
+                    KEEP_ALIVE_CLIENT_PY,
+                    &asym_srv_ip,
+                    count,
+                    "split20k_asym",
+                    "22528",
+                    "8080",
+                ],
+            ),
+            what,
+        );
+        parse_latencies(&out, what)
+    };
+
+    let (v6_on_p50, v6_on_total) =
+        run_v6_bridge("25", "IPv6 root-to-bridge keep-alive (quickack=Y)");
+    eprintln!(
+        "IPv6 root-to-bridge keep-alive (quickack=Y): p50={v6_on_p50:.2}ms total={v6_on_total:.2}ms"
+    );
+    assert!(
+        v6_on_p50 < 15.0 && v6_on_total < 400.0,
+        "IPv6 root-to-bridge keep-alive stalled (p50={v6_on_p50:.2}ms total={v6_on_total:.2}ms)"
+    );
+
+    let (asym_on_p50, asym_on_total) = run_asym_split20k(
+        "15",
+        "asymmetric-advmss 20KiB+4KiB split write (quickack=Y)",
+    );
+    eprintln!(
+        "asymmetric-advmss jumbo-path SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=Y): p50={asym_on_p50:.2}ms total={asym_on_total:.2}ms"
+    );
+    assert!(
+        asym_on_p50 < 25.0,
+        "asymmetric-advmss 20KiB+4KiB split write stalled with quickack=Y (p50={asym_on_p50:.2}ms total={asym_on_total:.2}ms)"
+    );
+
+    {
+        let restore = QuickackRestoreGuard {
+            docker_host: docker_host.clone(),
+            restored: false,
+        };
+        ok(
+            &docker(
+                &docker_host,
+                &[
+                    "run",
+                    "--rm",
+                    "--privileged",
+                    TEST_IMAGE,
+                    "sh",
+                    "-c",
+                    &format!("echo 0 > {QUICKACK_PARAM}"),
+                ],
+            ),
+            "disable kat.quickack for IPv6 and asymmetric-advmss contrast",
+        );
+        let (v6_off_p50, v6_off_total) =
+            run_v6_bridge("8", "IPv6 root-to-bridge keep-alive (quickack=N)");
+        eprintln!(
+            "IPv6 root-to-bridge keep-alive (quickack=N): p50={v6_off_p50:.2}ms total={v6_off_total:.2}ms"
+        );
+        assert!(
+            v6_off_p50 >= 25.0,
+            "expected IPv6 root-to-bridge delayed-ACK stall with quickack=0 (p50={v6_off_p50:.2}ms total={v6_off_total:.2}ms)"
+        );
+
+        let (asym_off_p50, asym_off_total) =
+            run_asym_split20k("6", "asymmetric-advmss 20KiB+4KiB split write (quickack=N)");
+        eprintln!(
+            "asymmetric-advmss jumbo-path SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=N): p50={asym_off_p50:.2}ms total={asym_off_total:.2}ms"
+        );
+        assert!(
+            asym_off_p50 >= 25.0,
+            "expected asymmetric-advmss 20KiB+4KiB delayed-ACK stall with quickack=0 (p50={asym_off_p50:.2}ms total={asym_off_total:.2}ms)"
+        );
+
+        restore.restore();
+    }
 
     // A route that locks RTAX_QUICKACK (here locked at 0) overrides
     // Katamaran's default: a bridged container client on such a route sees the

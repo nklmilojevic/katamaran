@@ -107,7 +107,20 @@ pub fn format_status(k: &K8sStatus) -> String {
     if let Some(path) = &k.kubeconfig {
         line("kubeconfig", path.display().to_string());
     }
-    let dns_state = if k.dns_installed {
+    let dns_state = if k.dns_isolated {
+        match k.dns_port {
+            Some(p) => format!(
+                "*.{} (127.0.0.1:{p}, isolated; {} not used)",
+                k.dns_domain,
+                k8s::RESOLVER_PATH
+            ),
+            None => format!(
+                "*.{} (isolated; {} not used)",
+                k.dns_domain,
+                k8s::RESOLVER_PATH
+            ),
+        }
+    } else if k.dns_installed {
         match k.dns_port {
             Some(p) => format!("*.{} (127.0.0.1:{p}, active)", k.dns_domain),
             None => format!("*.{} (installed, waiting for k8s)", k.dns_domain),
@@ -202,26 +215,70 @@ fn sync_images() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn dns_status_line(
+    k8s_status: Option<&K8sStatus>,
+    resolver_installed: impl FnOnce(Option<u16>) -> bool,
+) -> String {
+    if let Some(st) = k8s_status
+        && st.dns_isolated
+    {
+        return match st.dns_port {
+            Some(port) => format!(
+                "*.{} DNS responder is running in isolated mode on 127.0.0.1:{port} ({}=1); {} is not used",
+                k8s::DNS_DOMAIN,
+                k8s::ISOLATED_DNS_ENV,
+                k8s::RESOLVER_PATH
+            ),
+            None => format!(
+                "*.{} DNS responder is running in isolated mode ({}=1); {} is not used",
+                k8s::DNS_DOMAIN,
+                k8s::ISOLATED_DNS_ENV,
+                k8s::RESOLVER_PATH
+            ),
+        };
+    }
+    let active_port = k8s_status.and_then(|s| s.dns_port);
+    if resolver_installed(active_port) {
+        format!(
+            "*.{} resolver installed at {}",
+            k8s::DNS_DOMAIN,
+            k8s::RESOLVER_PATH
+        )
+    } else {
+        format!(
+            "*.{} resolver not installed ({}); run `kat k8s dns install`",
+            k8s::DNS_DOMAIN,
+            k8s::RESOLVER_PATH
+        )
+    }
+}
+
+fn dns_install_port(k8s_status: &K8sStatus) -> anyhow::Result<u16> {
+    if k8s_status.dns_isolated {
+        bail!(
+            "refusing to install {} for an isolated DNS responder ({}=1); \
+             run against a non-isolated daemon instead",
+            k8s::RESOLVER_PATH,
+            k8s::ISOLATED_DNS_ENV
+        );
+    }
+    let Some(port) = k8s_status.dns_port else {
+        bail!("Kubernetes DNS responder is not running; run `kat k8s start` first");
+    };
+    Ok(port)
+}
+
 fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
     match cmd {
         DnsCmd::Status => {
-            let active_port = Client::connect_default()
+            let k8s_status = Client::connect_default()
                 .ok()
                 .and_then(|mut c| c.status().ok())
-                .and_then(|s| s.k8s.dns_port);
-            if k8s::dns_resolver_installed(active_port) {
-                println!(
-                    "*.{} resolver installed at {}",
-                    k8s::DNS_DOMAIN,
-                    k8s::RESOLVER_PATH
-                );
-            } else {
-                println!(
-                    "*.{} resolver not installed ({}); run `kat k8s dns install`",
-                    k8s::DNS_DOMAIN,
-                    k8s::RESOLVER_PATH
-                );
-            }
+                .map(|s| s.k8s);
+            println!(
+                "{}",
+                dns_status_line(k8s_status.as_ref(), k8s::dns_resolver_installed)
+            );
             Ok(())
         }
         DnsCmd::Install => {
@@ -229,9 +286,7 @@ fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
                 "start Kubernetes first (`kat k8s start`) before installing DNS resolution",
             )?;
             let st = c.status()?;
-            let Some(port) = st.k8s.dns_port else {
-                bail!("Kubernetes DNS responder is not running; run `kat k8s start` first");
-            };
+            let port = dns_install_port(&st.k8s)?;
             let content = k8s::dns_resolver_content(port);
             let script = format!(
                 "mkdir -p /etc/resolver && printf '%s' '{}' > {}",
@@ -306,5 +361,72 @@ mod tests {
         assert!(parse_forward_target("not-an-ip:80").is_err());
         assert!(parse_forward_target("10.43.0.1").is_err());
         assert!(parse_forward_target("::1:80").is_err());
+    }
+
+    #[test]
+    fn dns_install_rejects_isolated_responder_before_sudo() {
+        let isolated = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(54321),
+            dns_isolated: true,
+            ..K8sStatus::default()
+        };
+        let err = dns_install_port(&isolated).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("isolated"), "{msg}");
+        assert!(msg.contains(k8s::RESOLVER_PATH), "{msg}");
+
+        let normal = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(15353),
+            dns_isolated: false,
+            ..K8sStatus::default()
+        };
+        assert_eq!(dns_install_port(&normal).unwrap(), 15353);
+
+        let stopped = K8sStatus::default();
+        assert!(dns_install_port(&stopped).is_err());
+    }
+
+    #[test]
+    fn dns_status_reports_isolation_without_recommending_install() {
+        let isolated = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(54321),
+            dns_isolated: true,
+            ..K8sStatus::default()
+        };
+        let line = dns_status_line(Some(&isolated), |_| {
+            panic!("isolated DNS status should not check host resolver installation")
+        });
+        assert!(line.contains("isolated"), "{line}");
+        assert!(line.contains("54321"), "{line}");
+        assert!(!line.contains("kat k8s dns install"), "{line}");
+
+        let formatted = format_status(&isolated);
+        assert!(formatted.contains("isolated"), "{formatted}");
+        assert!(!formatted.contains("kat k8s dns install"), "{formatted}");
+
+        let normal = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(15353),
+            dns_isolated: false,
+            ..K8sStatus::default()
+        };
+        let not_installed = dns_status_line(Some(&normal), |p| {
+            assert_eq!(p, Some(15353));
+            false
+        });
+        assert!(
+            not_installed.contains("kat k8s dns install"),
+            "{not_installed}"
+        );
+
+        let installed = dns_status_line(Some(&normal), |p| {
+            assert_eq!(p, Some(15353));
+            true
+        });
+        assert!(installed.contains("resolver installed"), "{installed}");
+        assert!(!installed.contains("kat k8s dns install"), "{installed}");
     }
 }
