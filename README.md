@@ -178,23 +178,28 @@ Open **Settings** in the app or use `kat config`:
 
 ```sh
 kat config get
-kat config set cpus=8 memory=12G pause_on_sleep=on
+kat config set cpus=8 memory=12G disk=500G pause_on_sleep=on
 kat restart
 ```
 
-Settings live in `~/.katamaran/config.toml` and take effect at the next VM start (except `launch_at_login` and `kubernetes`, which apply immediately).
+Settings live in `~/.katamaran/config.toml` and take effect at the next VM start, except `launch_at_login` and `kubernetes` (which apply immediately) and `k8s_version`, `k8s_disable`, and `k8s_args` (which apply at the next Kubernetes start without a VM restart; `k8s_disable`, `k8s_args`, and `k3s-config.yaml` need a VM running a current guest image).
 
 | Key | Default | Description |
 |---|---|---|
 | `cpus` | All host cores | Number of vCPUs assigned to the VM |
 | `memory_mib` | Half of host RAM, clamped to 2 GiB to 16 GiB | Upper memory ceiling (`memory=8G` is accepted by `config set`) |
+| `disk_gib` | `64` | Sparse data-disk ceiling in GiB (`disk=500G` or `disk=1T` is accepted by `config set`; grows at next start, never shrinks) |
 | `amd64` | `auto` | How `linux/amd64` containers run (`auto`, `rosetta`, `qemu`, or `off`) |
-| `auto_forward` | `true` | Forward unpublished container ports to `127.0.0.1` on macOS |
+| `auto_forward` | `true` | Forward unpublished container TCP ports to the configured `forward_addresses` |
+| `forward_addresses` | `["127.0.0.1"]` | macOS loopback addresses for forwarded TCP ports; for example, `kat config set forward_addresses=127.0.0.1,172.16.1.200` if the alias is assigned to `lo0` |
 | `mount` | `true` | Mount Linux files on macOS over NFS |
 | `mount_path` | `~/Katamaran` | Absolute path for the macOS NFS mount |
 | `launch_at_login` | `true` | Start the daemon and VM when you log in |
 | `pause_on_sleep` | `false` | Freeze vCPUs while the Mac sleeps |
 | `kubernetes` | `false` | Enable the optional single-node Kubernetes (`k3s`) cluster |
+| `k8s_version` | Pinned build | k3s release to run, e.g. `v1.32.5+k3s1` (applies at the next Kubernetes start) |
+| `k8s_disable` | `[]` | Bundled `k3s` components to disable, e.g. `k8s_disable=traefik` (applies at the next Kubernetes start) |
+| `k8s_args` | `[]` | Extra arguments appended to `k3s server`, limited to settings that cannot conflict with how katamaran runs the cluster (see the Kubernetes docs; applies at the next Kubernetes start; or place a `k3s` config at `~/.katamaran/k3s-config.yaml`) |
 | `nofile` | `1048576` | Open-files limit (`ulimit -n`) set at guest boot; containerd, dockerd, and workloads inherit it unless they set their own |
 
 ### Browse Linux files in Finder
@@ -240,9 +245,10 @@ kat k8s dns install
 kat k8s forward 10.43.0.1:443 --local 8443
 kat k8s stop
 kat k8s reset
+# Optional: use `kat k8s reset --images` instead to also clear cached Kubernetes images.
 ```
 
-### Inspect logs
+### Inspect logs and shell into the VM
 
 ```sh
 kat logs
@@ -250,7 +256,11 @@ kat logs -f
 kat logs --console
 kat logs --source vm
 kat logs --source gvproxy
+kat vm shell
+kat vm exec -- sysctl fs.nr_open
 ```
+
+`kat vm shell` and `kat vm exec` run as `root` directly in the Linux VM's own namespaces (not an LXC machine), which is useful for inspecting `containerd`, `dockerd`, `k3s`, sysctls, rlimits, and `/var/log/*`.
 
 ### Coding-agent skill
 

@@ -4,8 +4,9 @@
 //! Ignored by default; `cargo xtask test-vm` builds everything and runs it.
 
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -212,4 +213,248 @@ fn amd64_images_run_under_rosetta() {
 #[ignore = "boots the system VM; run with `cargo xtask test-vm`"]
 fn amd64_images_run_under_qemu() {
     amd64_images_run("qemu");
+}
+
+struct K8sDaemon {
+    child: Child,
+    home: PathBuf,
+}
+
+impl K8sDaemon {
+    fn spawn(home: &Path, user_home: &Path) -> Self {
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::create_dir_all(user_home).unwrap();
+        let child = Command::new(root().join("target/release/katamaran"))
+            .arg("daemon")
+            .env("KATAMARAN_HOME", home)
+            .env("HOME", user_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn katamaran daemon");
+        let sock = home.join("run/daemon.sock");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(&sock).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for daemon socket {}",
+                sock.display()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        Self {
+            child,
+            home: home.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for K8sDaemon {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            for _ in 0..600 {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+fn run_ok(cmd: &mut Command, what: &str) -> String {
+    let out: Output = cmd.output().unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{what} failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+}
+
+/// Regression test for single-manifest `linux/amd64` Docker-to-CRI mirroring:
+/// `kat k8s sync-images` must publish the emulated rewrite (config platform
+/// `arm64`, unchanged layers) for a local amd64 image with no native variant.
+/// Running the pod with `imagePullPolicy=Never` guarantees kubelet resolves the
+/// synced tag locally through CRI (failing with `ErrImageNeverPull` if sync
+/// took the unchanged native path) and executes the x86-64 binary under emulation.
+#[test]
+#[ignore = "boots the system VM with k3s; run with `cargo xtask test-vm`"]
+fn k8s_runs_synced_single_manifest_amd64_image() {
+    let kat = root().join("target/release/katamaran");
+    let home = root().join(format!("target/test-home-k8s-amd64-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let user_home = home.join("fake-home");
+    std::fs::create_dir_all(&user_home).unwrap();
+
+    let kat_cmd = |args: &[&str]| {
+        let mut c = Command::new(&kat);
+        c.args(args)
+            .env("KATAMARAN_HOME", &home)
+            .env("HOME", &user_home)
+            .stdin(Stdio::null());
+        c
+    };
+
+    run_ok(
+        &mut kat_cmd(&[
+            "config",
+            "set",
+            "cpus=2",
+            "memory=2G",
+            "mount=off",
+            "amd64=auto",
+        ]),
+        "config set",
+    );
+    let _daemon = K8sDaemon::spawn(&home, &user_home);
+    run_ok(&mut kat_cmd(&["start"]), "kat start");
+    run_ok(&mut kat_cmd(&["k8s", "start"]), "kat k8s start");
+
+    let docker_host = format!("unix://{}", home.join("run/docker.sock").display());
+    let docker_cmd = |args: &[&str]| {
+        let mut c = Command::new("docker");
+        c.args(args)
+            .env("DOCKER_HOST", &docker_host)
+            .env_remove("DOCKER_CONTEXT")
+            .stdin(Stdio::null());
+        c
+    };
+
+    // Build and `docker load` a local single-manifest linux/amd64 image (not a
+    // multi-arch OCI index, and not present in any registry).
+    run_ok(
+        &mut docker_cmd(&["pull", "--platform", "linux/amd64", "alpine:3.24.4"]),
+        "docker pull amd64 alpine",
+    );
+    let cid = run_ok(
+        &mut docker_cmd(&[
+            "create",
+            "--platform",
+            "linux/amd64",
+            "alpine:3.24.4",
+            "/bin/sh",
+        ]),
+        "docker create amd64",
+    )
+    .trim()
+    .to_string();
+    let tag = "kat-single-amd64-test:dev";
+    run_ok(
+        &mut docker_cmd(&["commit", &cid, tag]),
+        "docker commit single-manifest amd64",
+    );
+    run_ok(&mut docker_cmd(&["rm", &cid]), "docker rm");
+    let tar_path = home.join("single-amd64.tar");
+    let tar_str = tar_path.to_str().unwrap();
+    run_ok(
+        &mut docker_cmd(&["save", "-o", tar_str, tag]),
+        "docker save single-manifest amd64",
+    );
+    run_ok(&mut docker_cmd(&["rmi", tag]), "docker rmi");
+    run_ok(
+        &mut docker_cmd(&["load", "-i", tar_str]),
+        "docker load single-manifest amd64",
+    );
+    let arch = run_ok(
+        &mut docker_cmd(&["image", "inspect", "--format", "{{.Architecture}}", tag]),
+        "docker image inspect architecture",
+    );
+    assert_eq!(arch.trim(), "amd64");
+
+    // Sync into k8s.io explicitly.
+    run_ok(&mut kat_cmd(&["k8s", "sync-images"]), "kat k8s sync-images");
+
+    // Resolve the tag through CRI with imagePullPolicy=Never and assert x86_64.
+    let kubeconfig = run_ok(
+        &mut kat_cmd(&["k8s", "kubeconfig", "--path"]),
+        "kat k8s kubeconfig --path",
+    )
+    .trim()
+    .to_string();
+    let kubectl_cmd = |args: &[&str]| {
+        let mut c = Command::new("kubectl");
+        c.args(["--kubeconfig", &kubeconfig])
+            .args(args)
+            .stdin(Stdio::null());
+        c
+    };
+    run_ok(
+        &mut kubectl_cmd(&[
+            "run",
+            "amd64-single-check",
+            &format!("--image={tag}"),
+            "--image-pull-policy=Never",
+            "--restart=Never",
+            "--",
+            "uname",
+            "-m",
+        ]),
+        "kubectl run amd64-single-check",
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let phase = run_ok(
+            &mut kubectl_cmd(&[
+                "get",
+                "pod",
+                "amd64-single-check",
+                "-o",
+                "jsonpath={.status.phase}",
+            ]),
+            "kubectl get pod phase",
+        );
+        match phase.trim() {
+            "Succeeded" => break,
+            "Failed" => {
+                let desc = run_ok(
+                    &mut kubectl_cmd(&["describe", "pod", "amd64-single-check"]),
+                    "kubectl describe pod",
+                );
+                panic!("amd64 pod failed:\n{desc}");
+            }
+            _ => {
+                let waiting = run_ok(
+                    &mut kubectl_cmd(&[
+                        "get",
+                        "pod",
+                        "amd64-single-check",
+                        "-o",
+                        "jsonpath={.status.containerStatuses[0].state.waiting.reason}",
+                    ]),
+                    "kubectl get waiting reason",
+                );
+                assert!(
+                    waiting.trim() != "ErrImageNeverPull" && waiting.trim() != "ImagePullBackOff",
+                    "CRI rejected local single-manifest amd64 image ({waiting}); sync likely took the unchanged native path"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for amd64-single-check pod (phase={phase}, waiting={waiting})"
+                );
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+
+    let logs = run_ok(
+        &mut kubectl_cmd(&["logs", "amd64-single-check"]),
+        "kubectl logs amd64-single-check",
+    );
+    assert_eq!(
+        logs.trim(),
+        "x86_64",
+        "expected pod to execute x86_64 binary under emulation"
+    );
+
+    run_ok(&mut kat_cmd(&["k8s", "stop"]), "kat k8s stop");
+    run_ok(&mut kat_cmd(&["stop"]), "kat stop");
 }

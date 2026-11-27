@@ -7,6 +7,12 @@
 #                                    then run moby's check-config.sh -> guest/out/check-config.txt
 #   guest/kernel/build.sh clean      drop the object tree (keeps the source and ccache volumes)
 #   guest/kernel/build.sh shell CMD  run CMD in the build container, cwd = prepared source tree
+#                                    (guest/out is read-only there; edits to the cached tree are
+#                                    kept for later shells, but the next build re-extracts and
+#                                    re-patches a pristine tree)
+#   guest/kernel/build.sh stamp      print the input stamp (no Docker); a build records it in
+#                                    guest/out/Image.stamp so `cargo xtask test-vm` can reject
+#                                    an Image built from older patches or config
 #
 # Method: allnoconfig + KCONFIG_ALLCONFIG=katamaran.config, then olddefconfig, then every
 # CONFIG_*=<value> line of the fragment must appear verbatim in .config (else `MISSING: ...`) and
@@ -41,16 +47,85 @@ if [[ -n ${KATAMARAN_BUILD_CONTEXT:-} ]]; then
 fi
 SRC_VOL=katamaran-kbuild-src
 CCACHE_VOL=katamaran-kbuild-ccache
-if command -v shasum >/dev/null 2>&1; then
-	TOOL_TAG=$(printf '%s\n' "$BASE_IMAGE" "$PACKAGES" | shasum -a 256 | cut -c1-12)
-else
-	TOOL_TAG=$(printf '%s\n' "$BASE_IMAGE" "$PACKAGES" | sha256sum | cut -c1-12)
-fi
+sha256() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256
+	else
+		sha256sum
+	fi
+}
+TOOL_TAG=$(printf '%s\n' "$BASE_IMAGE" "$PACKAGES" | sha256 | cut -c1-12)
 TOOL_IMAGE=katamaran-kbuild-toolchain:$TOOL_TAG
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# Identity of everything the Image is built from: kernel version, patch set (in name order),
+# config fragment, and this script (pinned toolchain, tarball hash, build steps). Written next to
+# the Image as `input=<hash>` alongside `image=<sha256>` in Image.stamp once the whole build,
+# including check-config, has passed. Fails (no output) if any input is missing or unreadable, so
+# a stamp never silently covers fewer files than the build applies.
+image_stamp() {
+	local dir=${1:-$HERE}
+	(
+		export LC_ALL=C
+		shopt -s nullglob
+		local inputs=("$dir"/patches/*.patch "$dir/katamaran.config" "$dir/build.sh") f data
+		for f in "${inputs[@]}"; do
+			if [[ ! -f $f || ! -r $f ]]; then
+				echo "kernel build input missing or unreadable: $f" >&2
+				exit 1
+			fi
+		done
+		data=$({ echo "$KVER"; cat -- "${inputs[@]}"; } | sha256 | cut -c1-64) || exit 1
+		[[ ${#data} == 64 ]] || { echo "could not hash kernel build inputs" >&2; exit 1; }
+		echo "$data"
+	)
+}
+if [[ ${1:-} == stamp ]]; then
+	image_stamp "$HERE"
+	exit
+fi
+
+MODE=${1:-build}
+SHELL_CMD=""
+case "$MODE" in
+build | clean) ;;
+shell)
+	shift
+	SHELL_CMD=${*:-bash}
+	;;
+*)
+	echo "usage: $0 [build|clean|shell CMD|stamp]" >&2
+	exit 2
+	;;
+esac
+
 OUT=$(cd "$HERE/.." && pwd)/out
 mkdir -p "$OUT"
+
+IN_DIR=$HERE
+IMAGE_STAMP=""
+STAGE_DIR=""
+if [[ $MODE == build ]]; then
+	# Stage a private snapshot of build inputs inside $OUT (which is always on a
+	# Docker-shareable host path and gitignored), hash it, and mount that exact
+	# snapshot at /in:ro so concurrent edits in the working tree cannot cause a
+	# build to stamp different bytes than it compiled.
+	STAGE_DIR=$(mktemp -d "$OUT/.kbuild-in.XXXXXX")
+	trap 'rm -rf "$STAGE_DIR"' EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	mkdir -p "$STAGE_DIR/patches"
+	cp -p "$HERE/build.sh" "$HERE/katamaran.config" "$STAGE_DIR/"
+	(
+		shopt -s nullglob
+		for p in "$HERE"/patches/*.patch; do
+			cp -p "$p" "$STAGE_DIR/patches/"
+		done
+	)
+	IN_DIR=$STAGE_DIR
+	IMAGE_STAMP=$(image_stamp "$IN_DIR")
+fi
 
 if ! "${DOCKER[@]}" info >/dev/null 2>&1; then
 	echo "Docker is not reachable${KATAMARAN_BUILD_CONTEXT:+ (context $KATAMARAN_BUILD_CONTEXT)}; start a Docker engine or set KATAMARAN_BUILD_CONTEXT" >&2
@@ -70,11 +145,27 @@ ensure_toolchain() {
 	"${DOCKER[@]}" rm "$name" >/dev/null
 }
 
-# Runs inside the container. Prepares /work/src/linux (cached), then does $MODE.
+# Runs inside the container. Serializes /work access, prepares /work/src/linux (cached), then does $MODE.
 INNER=$(cat <<'EOF'
 set -euo pipefail
 cd /work
+
+# Serialize build, shell, and clean on a volume-local lock outside src/ and build/
+# so a shell or clean cannot mutate /work/src/linux or /work/build/linux while a
+# build is compiling or publishing /out/Image and /out/Image.stamp.
+exec 9>/work/.katamaran-kbuild.lock
+if ! flock -n 9; then
+	echo ">> waiting for another katamaran kernel build/shell/clean to finish"
+	flock 9
+fi
+
 mkdir -p cache src build
+if [ "$MODE" = clean ]; then
+	rm -rf /work/build/linux
+	echo ">> object tree removed"
+	exit 0
+fi
+
 tarball=cache/linux-$KVER.tar.xz
 if [ ! -f "$tarball" ] || ! echo "$KSHA256  $tarball" | sha256sum -c --status; then
 	echo ">> downloading linux-$KVER"
@@ -83,13 +174,16 @@ if [ ! -f "$tarball" ] || ! echo "$KSHA256  $tarball" | sha256sum -c --status; t
 	mv "$tarball.part" "$tarball"
 fi
 
-# A fresh tree (and object dir) whenever the version or the patch set changes.
+# A fresh tree (and object dir) whenever the version or the patch set changes, and before any
+# build after a shell session may have edited the cached tree (src/shell-used), so an installed
+# Image is always built from the checked-in patches exactly.
 stamp=$( { echo "$KVER"; cat /in/patches/*.patch 2>/dev/null || true; } | sha256sum | cut -c1-64)
 tree=src/linux
 obj=build/linux
-if [ "$(cat src/stamp 2>/dev/null)" != "$stamp" ]; then
+if [ "$(cat src/stamp 2>/dev/null)" != "$stamp" ] ||
+	{ [ "$MODE" = build ] && [ -e src/shell-used ]; }; then
 	echo ">> extracting linux-$KVER"
-	rm -rf "$tree" "$obj" src/stamp
+	rm -rf "$tree" "$obj" src/stamp src/shell-used
 	mkdir -p "$tree"
 	tar -xJf "$tarball" -C "$tree" --strip-components=1
 	for p in /in/patches/*.patch; do
@@ -107,17 +201,16 @@ export KBUILD_BUILD_TIMESTAMP KBUILD_BUILD_USER=katamaran KBUILD_BUILD_HOST=kata
 	KBUILD_BUILD_VERSION=1
 MAKE=(make -C "/work/$tree" O="/work/$obj" ARCH=arm64 CC="ccache gcc" -j"$(nproc)")
 
-case "$MODE" in
-shell)
+if [ "$MODE" = shell ]; then
+	# Edits made here persist for later shells, but the next build starts from a pristine tree.
+	# Run as a child with fd 9 closed so the parent holds the volume lock until the shell exits
+	# and commands inside the shell cannot manipulate or unlock fd 9.
+	touch src/shell-used
 	cd "/work/$tree"
-	exec bash -c "$SHELL_CMD"
-	;;
-clean)
-	rm -rf "/work/$obj"
-	echo ">> object tree removed"
-	exit 0
-	;;
-esac
+	rc=0
+	bash -c "$SHELL_CMD" 9>&- || rc=$?
+	exit "$rc"
+fi
 
 echo ">> configuring"
 "${MAKE[@]}" -s KCONFIG_ALLCONFIG=/in/katamaran.config allnoconfig
@@ -145,6 +238,9 @@ true
 [ "$missing" = 0 ] || { echo "config check failed" >&2; exit 1; }
 echo ">> config check passed"
 
+# Drop the stamp before anything can replace the Image, so an interrupted build never leaves a
+# new Image paired with the previous inputs' stamp.
+rm -f /out/Image.stamp /out/Image.stamp.tmp
 echo ">> building Image ($(nproc) jobs)"
 ccache -z >/dev/null
 start=$(date +%s)
@@ -181,36 +277,31 @@ if [ -n "$bad" ]; then
 	exit 1
 fi
 echo ">> check-config: Generally Necessary, overlay and bridge passed (guest/out/check-config.txt)"
+image_sha=$(sha256sum /out/Image | cut -c1-64)
+[ "${#image_sha}" -eq 64 ] || { echo "could not hash /out/Image" >&2; exit 1; }
+printf 'input=%s\nimage=%s\n' "$IMAGE_STAMP" "$image_sha" > /out/Image.stamp.tmp
+mv /out/Image.stamp.tmp /out/Image.stamp
 EOF
 )
-
-MODE=${1:-build}
-SHELL_CMD=""
-case "$MODE" in
-build | clean) ;;
-shell)
-	shift
-	SHELL_CMD=${*:-bash}
-	;;
-*)
-	echo "usage: $0 [build|clean|shell CMD]" >&2
-	exit 2
-	;;
-esac
 
 ensure_toolchain
 "${DOCKER[@]}" volume create "$SRC_VOL" >/dev/null
 "${DOCKER[@]}" volume create "$CCACHE_VOL" >/dev/null
 
 tty=()
+# A shell can inspect or edit the cached tree but never replace guest/out/Image (or its stamp):
+# only a full build installs an Image.
+out_mode=
+[ "$MODE" = shell ] && out_mode=:ro
 [ "$MODE" = shell ] && [ -t 0 ] && [ -t 1 ] && tty=(-it)
 "${DOCKER[@]}" run --rm "${tty[@]}" --name "katamaran-kbuild-$$" \
 	-v "$SRC_VOL":/work -v "$CCACHE_VOL":/ccache \
-	-v "$HERE":/in:ro -v "$OUT":/out \
+	-v "$IN_DIR":/in:ro -v "$OUT":/out"$out_mode" \
 	--sysctl net.ipv4.ip_forward=1 --sysctl net.ipv6.conf.all.forwarding=1 \
 	--sysctl net.ipv6.conf.default.forwarding=1 \
 	-e MODE="$MODE" -e SHELL_CMD="$SHELL_CMD" \
 	-e KVER="$KVER" -e KSHA256="$KSHA256" -e KURL="$KURL" \
 	-e KBUILD_BUILD_TIMESTAMP="$KBUILD_TIMESTAMP" \
 	-e MOBY_COMMIT="$MOBY_COMMIT" -e CHECK_CONFIG_SHA256="$CHECK_CONFIG_SHA256" \
+	-e IMAGE_STAMP="$IMAGE_STAMP" \
 	"$TOOL_IMAGE" bash -c "$INNER"

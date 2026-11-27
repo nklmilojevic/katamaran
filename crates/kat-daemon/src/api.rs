@@ -39,12 +39,13 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, WireConfig};
 use crate::state::VmState;
 
 pub const SOCKET_NAME: &str = "daemon.sock";
@@ -161,9 +162,10 @@ pub enum Call {
     MachineDefault { name: String },
     K8sStart,
     K8sStop,
-    K8sReset,
+    K8sReset { images: bool, progress: bool },
     K8sKubeconfig,
     K8sSyncImages,
+    K8sMarkVersion { version: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,9 +201,11 @@ impl Call {
             Call::MachineDefault { .. } => "machine.default",
             Call::K8sStart => "k8s.start",
             Call::K8sStop => "k8s.stop",
-            Call::K8sReset => "k8s.reset",
+            Call::K8sReset { images: false, .. } => "k8s.reset",
+            Call::K8sReset { images: true, .. } => "k8s.reset_images",
             Call::K8sKubeconfig => "k8s.kubeconfig",
             Call::K8sSyncImages => "k8s.sync_images",
+            Call::K8sMarkVersion { .. } => "k8s.mark_version",
         }
     }
 
@@ -216,6 +220,11 @@ impl Call {
             | Call::MachineStop { name }
             | Call::MachineDelete { name }
             | Call::MachineDefault { name } => serde_json::json!({ "name": name }),
+            Call::K8sMarkVersion { version } => serde_json::json!({ "version": version }),
+            Call::K8sReset {
+                images: false,
+                progress: true,
+            } => serde_json::json!({ "progress": true }),
             _ => Value::Null,
         }
     }
@@ -261,6 +270,35 @@ impl Call {
                         Value::Number(n) => n.to_string(),
                         Value::Bool(b) => b.to_string(),
                         Value::Null => String::new(),
+                        Value::Array(items) if k == "forward_addresses" => {
+                            if items.is_empty() {
+                                return Err(RpcError::new(
+                                    INVALID_PARAMS,
+                                    format!("{k}: expected a non-empty array of IPv4 addresses"),
+                                ));
+                            }
+                            let mut parts = Vec::with_capacity(items.len());
+                            for item in items {
+                                match item {
+                                    Value::String(s) => {
+                                        let addr: Ipv4Addr = s.trim().parse().map_err(|_| {
+                                            RpcError::new(
+                                                INVALID_PARAMS,
+                                                format!("{k}: {s:?} is not an IPv4 address"),
+                                            )
+                                        })?;
+                                        parts.push(addr.to_string());
+                                    }
+                                    _ => {
+                                        return Err(RpcError::new(
+                                            INVALID_PARAMS,
+                                            format!("{k}: expected an array of IPv4 addresses"),
+                                        ));
+                                    }
+                                }
+                            }
+                            parts.join(",")
+                        }
                         _ => {
                             return Err(RpcError::new(
                                 INVALID_PARAMS,
@@ -304,9 +342,45 @@ impl Call {
             }
             "k8s.start" => Call::K8sStart,
             "k8s.stop" => Call::K8sStop,
-            "k8s.reset" => Call::K8sReset,
+            "k8s.reset" => {
+                #[derive(Deserialize, Default)]
+                #[serde(default, deny_unknown_fields)]
+                struct P {
+                    progress: bool,
+                }
+                let P { progress } = if p.is_null() {
+                    P::default()
+                } else {
+                    serde_json::from_value(p.clone()).map_err(bad)?
+                };
+                Call::K8sReset {
+                    images: false,
+                    progress,
+                }
+            }
+            "k8s.reset_images" => {
+                #[derive(Deserialize, Default)]
+                #[serde(default, deny_unknown_fields)]
+                struct Empty {}
+                if !p.is_null() {
+                    let _: Empty = serde_json::from_value(p.clone()).map_err(bad)?;
+                }
+                Call::K8sReset {
+                    images: true,
+                    progress: true,
+                }
+            }
             "k8s.kubeconfig" => Call::K8sKubeconfig,
             "k8s.sync_images" => Call::K8sSyncImages,
+            "k8s.mark_version" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct P {
+                    version: String,
+                }
+                let P { version } = serde_json::from_value(p.clone()).map_err(bad)?;
+                Call::K8sMarkVersion { version }
+            }
             other => {
                 return Err(RpcError::new(
                     METHOD_NOT_FOUND,
@@ -355,10 +429,35 @@ pub struct LogChunk {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigView {
-    pub config: Config,
+    pub config: WireConfig,
+    /// Saved data-disk ceiling in GiB (`64` when unset). Carried on the
+    /// enclosing response rather than inside `config` so older CLIs (whose
+    /// `Config` uses `deny_unknown_fields`) still decode `config.get` /
+    /// `config.set` replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
+    /// Explicitly configured `disk_gib` target from `config.toml`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_target_gib: Option<u32>,
     pub path: PathBuf,
     /// The running VM was started with different settings.
     pub restart_required: bool,
+    /// Whether this `config.set` call changed `kubernetes` (triggering an
+    /// immediate start or stop on a running VM).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub k8s_toggled: bool,
+}
+
+impl ConfigView {
+    /// Reconstruct the full [`Config`], combining `config` with `disk_target_gib`
+    /// (falling back to `disk_gib` for replies from daemons without `disk_target_gib`).
+    pub fn resolved_config(&self) -> Config {
+        let explicit = self.disk_target_gib.or_else(|| {
+            self.disk_gib
+                .filter(|&d| d != crate::config::DEFAULT_DISK_GIB)
+        });
+        self.config.clone().into_config(explicit)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,8 +482,18 @@ pub struct Status {
     pub uptime_s: Option<f64>,
     pub daemon: DaemonInfo,
     pub versions: Versions,
-    /// The saved settings, used at the next start.
-    pub config: Config,
+    /// The saved settings, used at the next start (legacy wire shape without `disk_gib`).
+    pub config: WireConfig,
+    /// Saved data-disk ceiling in GiB (`64` when unset). Carried on the
+    /// enclosing response rather than inside `config` so older CLIs (whose
+    /// `Config` uses `deny_unknown_fields`) still decode `status` replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
+    /// Explicitly configured `disk_gib` target from `config.toml`, when set.
+    /// Distinguishes an explicit `disk_gib = 64` growth request from an
+    /// omitted default when the attached image is smaller than 64 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_target_gib: Option<u32>,
     /// The running VM's settings and timings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<VmInfo>,
@@ -398,6 +507,21 @@ pub struct Status {
     /// Ports the guest tried to expose that could not be bound on macOS.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_errors: Vec<PortError>,
+}
+
+impl Status {
+    /// Saved data-disk ceiling in GiB, falling back to the default for older daemons.
+    pub fn saved_disk_gib(&self) -> u32 {
+        self.disk_gib.unwrap_or(crate::config::DEFAULT_DISK_GIB)
+    }
+
+    /// Explicitly configured growth target in GiB, if any.
+    pub fn explicit_disk_target_gib(&self) -> Option<u32> {
+        self.disk_target_gib.or_else(|| {
+            self.disk_gib
+                .filter(|&d| d > crate::config::DEFAULT_DISK_GIB)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -414,6 +538,27 @@ pub struct DaemonInfo {
 pub struct VmInfo {
     pub cpus: u8,
     pub memory_mib: u32,
+    /// Attached data-disk size in GiB (rounded up for display; may exceed the
+    /// saved target if `data.img` was already grown larger).
+    #[serde(default = "crate::config::default_disk_gib")]
+    pub disk_gib: u32,
+    /// Exact attached data-disk size in bytes, used for pending-growth checks
+    /// so fractional images (such as 63.5 GiB -> 64 GiB) are not masked by
+    /// GiB rounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+    /// Explicitly configured `disk_gib` target from config when this VM
+    /// started (`None` when the VM booted with no explicit disk target). Kept
+    /// separate from `disk_gib` so a retained larger image does not appear as
+    /// perpetual pending work while a newly set or increased target (even equal
+    /// to the backing image size) still flags a restart for guest Btrfs growth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_disk_gib: Option<u32>,
+    /// True when the guest reported a `data-disk` resize failure during boot,
+    /// meaning the host image may be larger than the guest Btrfs filesystem
+    /// and a VM restart is still needed to retry growing it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk_resize_failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// Start request until the guest's hello.
@@ -422,6 +567,15 @@ pub struct VmInfo {
     /// Start request until Docker answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_ready_ms: Option<f64>,
+}
+
+impl VmInfo {
+    /// Exact attached data-disk size in bytes, falling back to `disk_gib` for
+    /// older daemons that omit `disk_bytes`.
+    pub fn attached_disk_bytes(&self) -> u64 {
+        self.disk_bytes
+            .unwrap_or_else(|| u64::from(self.disk_gib) << 30)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +616,8 @@ pub struct K8sStatus {
     pub dns_port: Option<u16>,
     #[serde(default)]
     pub dns_installed: bool,
+    #[serde(default)]
+    pub dns_isolated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -480,6 +636,7 @@ impl Default for K8sStatus {
             dns_domain: String::new(),
             dns_port: None,
             dns_installed: false,
+            dns_isolated: false,
             error: None,
         }
     }
@@ -499,6 +656,9 @@ pub struct MountInfo {
 pub struct Port {
     pub proto: String,
     pub port: u16,
+    /// The Mac IPv4 addresses this port is actively bound to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -581,9 +741,23 @@ mod tests {
             Call::MachineDefault { name: "dev".into() },
             Call::K8sStart,
             Call::K8sStop,
-            Call::K8sReset,
+            Call::K8sReset {
+                images: false,
+                progress: false,
+            },
+            Call::K8sReset {
+                images: false,
+                progress: true,
+            },
+            Call::K8sReset {
+                images: true,
+                progress: true,
+            },
             Call::K8sKubeconfig,
             Call::K8sSyncImages,
+            Call::K8sMarkVersion {
+                version: "v1.37.2+k3s1".into(),
+            },
         ];
         for (i, call) in calls.iter().enumerate() {
             let line = serde_json::to_string(&Request::new(i as u64, call)).unwrap();
@@ -611,7 +785,12 @@ mod tests {
         );
         let r = req(
             "config.set",
-            json!({"values": {"cpus": 2, "mount": false, "mount_path": "/tmp/x"}}),
+            json!({"values": {
+                "cpus": 2,
+                "mount": false,
+                "mount_path": "/tmp/x",
+                "forward_addresses": ["127.0.0.1", "172.16.1.200"],
+            }}),
         );
         let Call::ConfigSet(v) = Call::parse(&r).unwrap() else {
             panic!()
@@ -619,9 +798,67 @@ mod tests {
         assert_eq!(v["cpus"], "2");
         assert_eq!(v["mount"], "false");
         assert_eq!(v["mount_path"], "/tmp/x");
+        assert_eq!(v["forward_addresses"], "127.0.0.1,172.16.1.200");
         assert_eq!(
             Call::parse(&req("stop", Value::Null)).unwrap(),
             Call::Stop { wait: false }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset", Value::Null)).unwrap(),
+            Call::K8sReset {
+                images: false,
+                progress: false,
+            }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset", json!({}))).unwrap(),
+            Call::K8sReset {
+                images: false,
+                progress: false,
+            }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset", json!({"progress": true}))).unwrap(),
+            Call::K8sReset {
+                images: false,
+                progress: true,
+            }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset_images", Value::Null)).unwrap(),
+            Call::K8sReset {
+                images: true,
+                progress: true,
+            }
+        );
+        assert_eq!(
+            Call::parse(&req("k8s.reset_images", json!({}))).unwrap(),
+            Call::K8sReset {
+                images: true,
+                progress: true,
+            }
+        );
+        assert_eq!(
+            Request::new(
+                1,
+                &Call::K8sReset {
+                    images: false,
+                    progress: false,
+                }
+            )
+            .method,
+            "k8s.reset"
+        );
+        assert_eq!(
+            Request::new(
+                1,
+                &Call::K8sReset {
+                    images: true,
+                    progress: true,
+                }
+            )
+            .method,
+            "k8s.reset_images"
         );
     }
 
@@ -631,6 +868,26 @@ mod tests {
         assert_eq!(code(req("reboot", Value::Null)), METHOD_NOT_FOUND);
         assert_eq!(code(req("stop", json!({"wait": "yes"}))), INVALID_PARAMS);
         assert_eq!(code(req("stop", json!({"force": true}))), INVALID_PARAMS);
+        assert_eq!(
+            code(req("k8s.reset", json!({"images": true}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("k8s.reset", json!({"progress": "yes"}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("k8s.reset", json!({"force": true}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("k8s.reset_images", json!({"progress": true}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("k8s.reset_images", json!({"force": true}))),
+            INVALID_PARAMS
+        );
         assert_eq!(
             code(req("logs", json!({"source": "kernel"}))),
             INVALID_PARAMS
@@ -642,6 +899,49 @@ mod tests {
         );
         assert_eq!(
             code(req("config.set", json!({"values": {"cpus": [1]}}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("config.set", json!({"values": {"cpus": ["2"]}}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req("config.set", json!({"values": {"mount": ["false"]}}))),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": []}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": [""]}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": [","]}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": ["127.0.0.1,172.16.1.200"]}})
+            )),
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            code(req(
+                "config.set",
+                json!({"values": {"forward_addresses": ["127.0.0.1 172.16.1.200"]}})
+            )),
             INVALID_PARAMS
         );
         assert_eq!(code(req("machine.create", Value::Null)), INVALID_PARAMS);
@@ -660,6 +960,14 @@ mod tests {
         assert_eq!(
             Call::parse(&req("machine.info", Value::Null)).unwrap(),
             Call::MachineInfo { name: "".into() }
+        );
+        assert_eq!(code(req("k8s.mark_version", Value::Null)), INVALID_PARAMS);
+        assert_eq!(
+            code(req(
+                "k8s.mark_version",
+                json!({"version": "v1.37.2+k3s1", "extra": true})
+            )),
+            INVALID_PARAMS
         );
         let mut r = req("status", Value::Null);
         r.jsonrpc = "1.0".into();
@@ -699,10 +1007,16 @@ mod tests {
                 protocol: 2,
                 kernel: Some("6.18".into()),
             },
-            config: Config::default(),
+            config: WireConfig::default(),
+            disk_gib: Some(crate::config::DEFAULT_DISK_GIB),
+            disk_target_gib: None,
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
+                disk_gib: 64,
+                disk_bytes: Some(64u64 << 30),
+                requested_disk_gib: Some(64),
+                disk_resize_failed: false,
                 pid: Some(9),
                 boot_ms: Some(120.0),
                 docker_ready_ms: Some(900.0),
@@ -722,6 +1036,7 @@ mod tests {
             ports: vec![Port {
                 proto: "tcp".into(),
                 port: 8080,
+                addresses: vec![Ipv4Addr::LOCALHOST],
             }],
             port_errors: vec![],
         };
@@ -743,5 +1058,160 @@ mod tests {
         assert_eq!(v["port_errors"][0]["port"], 80);
         let back: Status = serde_json::from_value(v).unwrap();
         assert_eq!(back, with_err);
+
+        // Older daemons omit `dns_isolated`; serde must default it to false.
+        let legacy: K8sStatus = serde_json::from_value(json!({
+            "enabled": true,
+            "state": "running",
+            "installed": true,
+            "dns_domain": "k8s.kat.local",
+            "dns_port": 15353,
+            "dns_installed": true
+        }))
+        .unwrap();
+        assert!(!legacy.dns_isolated);
+
+        // Older daemons omit disk_gib and disk_bytes on VmInfo; it defaults to 64 GiB.
+        let legacy: VmInfo =
+            serde_json::from_value(json!({"cpus": 4, "memory_mib": 4096})).unwrap();
+        assert_eq!(legacy.disk_gib, crate::config::DEFAULT_DISK_GIB);
+        assert_eq!(legacy.disk_bytes, None);
+        assert_eq!(
+            legacy.attached_disk_bytes(),
+            u64::from(crate::config::DEFAULT_DISK_GIB) << 30
+        );
+        assert_eq!(legacy.requested_disk_gib, None);
+        assert!(!legacy.disk_resize_failed);
+    }
+
+    #[test]
+    fn pre_disk_cli_decodes_status_and_config_view_replies() {
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct PreDiskConfig {
+            cpus: u8,
+            memory_mib: u32,
+            mount: bool,
+            mount_path: Option<PathBuf>,
+            launch_at_login: bool,
+            pause_on_sleep: bool,
+            auto_forward: bool,
+            amd64: crate::amd64::Emulation,
+            kubernetes: bool,
+        }
+        impl Default for PreDiskConfig {
+            fn default() -> Self {
+                Self {
+                    cpus: 1,
+                    memory_mib: 1024,
+                    mount: true,
+                    mount_path: None,
+                    launch_at_login: true,
+                    pause_on_sleep: false,
+                    auto_forward: true,
+                    amd64: crate::amd64::Emulation::default(),
+                    kubernetes: false,
+                }
+            }
+        }
+        #[derive(Deserialize)]
+        struct PreDiskStatus {
+            state: VmState,
+            versions: Versions,
+            config: PreDiskConfig,
+        }
+        #[derive(Deserialize)]
+        struct PreDiskConfigView {
+            config: PreDiskConfig,
+            restart_required: bool,
+        }
+
+        for explicit_target in [None, Some(crate::config::DEFAULT_DISK_GIB), Some(500)] {
+            let cfg = Config {
+                disk_gib: explicit_target,
+                ..Config::default()
+            };
+            let expected_legacy = PreDiskConfig {
+                cpus: cfg.cpus,
+                memory_mib: cfg.memory_mib,
+                mount: cfg.mount,
+                mount_path: cfg.mount_path.clone(),
+                launch_at_login: cfg.launch_at_login,
+                pause_on_sleep: cfg.pause_on_sleep,
+                auto_forward: cfg.auto_forward,
+                amd64: cfg.amd64,
+                kubernetes: cfg.kubernetes,
+            };
+            let display_gib = cfg.disk_gib();
+            let status = Status {
+                state: VmState::Running,
+                error: None,
+                since_ms: 1,
+                uptime_s: Some(2.5),
+                daemon: DaemonInfo {
+                    pid: 7,
+                    home: "/tmp/h".into(),
+                    started_ms: 0,
+                    launchd_label: None,
+                },
+                versions: Versions {
+                    katamaran: "0.11.0".into(),
+                    protocol: 3,
+                    kernel: Some("6.18".into()),
+                },
+                config: WireConfig::from(&cfg),
+                disk_gib: Some(display_gib),
+                disk_target_gib: cfg.disk_gib,
+                vm: Some(VmInfo {
+                    cpus: cfg.cpus,
+                    memory_mib: cfg.memory_mib,
+                    disk_gib: display_gib,
+                    disk_bytes: Some(u64::from(display_gib) << 30),
+                    requested_disk_gib: cfg.disk_gib,
+                    disk_resize_failed: false,
+                    pid: Some(9),
+                    boot_ms: Some(120.0),
+                    docker_ready_ms: Some(900.0),
+                }),
+                usage: None,
+                docker: DockerInfo {
+                    state: DockerState::Ready,
+                    socket: "/tmp/h/run/docker.sock".into(),
+                },
+                k8s: K8sStatus::default(),
+                mount: MountInfo {
+                    enabled: false,
+                    path: None,
+                    mounted: false,
+                    error: None,
+                },
+                ports: vec![],
+                port_errors: vec![],
+            };
+            let status_json = serde_json::to_value(&status).unwrap();
+            assert!(status_json["config"].get("disk_gib").is_none());
+            assert_eq!(status_json["disk_gib"], display_gib);
+            let old_status: PreDiskStatus = serde_json::from_value(status_json).unwrap();
+            assert_eq!(old_status.state, VmState::Running);
+            assert_eq!(old_status.versions.katamaran, "0.11.0");
+            assert_eq!(old_status.config, expected_legacy);
+
+            let view = ConfigView {
+                config: WireConfig::from(&cfg),
+                disk_gib: Some(display_gib),
+                disk_target_gib: cfg.disk_gib,
+                path: "/tmp/h/config.toml".into(),
+                restart_required: explicit_target == Some(500),
+                k8s_toggled: false,
+            };
+            let view_json = serde_json::to_value(&view).unwrap();
+            assert!(view_json["config"].get("disk_gib").is_none());
+            assert_eq!(view_json["disk_gib"], display_gib);
+            let old_view: PreDiskConfigView = serde_json::from_value(view_json).unwrap();
+            assert_eq!(old_view.config, expected_legacy);
+            assert_eq!(old_view.restart_required, view.restart_required);
+            assert_eq!(view.resolved_config().disk_gib, explicit_target);
+            assert_eq!(view.resolved_config().disk_gib(), display_gib);
+        }
     }
 }

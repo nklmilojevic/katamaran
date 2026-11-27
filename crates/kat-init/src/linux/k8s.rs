@@ -7,22 +7,27 @@
 //! and `nftables` kube-proxy, and mirrors locally built Docker images from the
 //! `moby` namespace into `k8s.io`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::hash::Hasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kat_proto::k3s_config::normalize_k3s_config_yaml;
 use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
 use kat_proto::{K8S_PORT, Msg};
 
@@ -31,6 +36,8 @@ use super::service::{
     CONTAINERD_SOCKET, DOCKER_SOCKET, DockerStack, Notifier, Reaper, describe_status,
 };
 use super::sys;
+use crate::containerd_grpc;
+use crate::oci_rewrite;
 
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const ROOT: &str = "/var/lib/katamaran/k3s";
@@ -38,16 +45,94 @@ const BIN_DIR: &str = "/var/lib/katamaran/k3s/bin";
 const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
+/// Katamaran-owned directory (next to `DATA_DIR`) that reset renames detached
+/// datastores into. Reclamation only ever deletes entries inside it whose
+/// names reset itself generates ([`is_reset_trash_name`]).
+const RESET_TRASH_DIR: &str = ".katamaran-reset-trash";
+/// Prefix of a detached datastore's name inside [`RESET_TRASH_DIR`].
+const DATA_DIR_STALE_PREFIX: &str = "data-";
+
+/// Whether `name` is one reset generates for a detached datastore:
+/// `data-` followed by a UUID or `<pid>-<nanos>-<seq>` (hex digits and `-`).
+fn is_reset_trash_name(name: &str) -> bool {
+    name.strip_prefix(DATA_DIR_STALE_PREFIX)
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest.len() <= 64
+                && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        })
+}
+
+/// The reset trash directory for `parent` (the directory holding `DATA_DIR`),
+/// created owner-only if missing. Refuses anything that is not a real
+/// directory (for example a symlink).
+fn reset_trash_dir(parent: &Path, create: bool) -> Result<Option<std::path::PathBuf>, String> {
+    let trash = parent.join(RESET_TRASH_DIR);
+    match fs::symlink_metadata(&trash) {
+        Ok(m) if m.file_type().is_dir() => Ok(Some(trash)),
+        Ok(_) => Err(format!(
+            "{} is not a directory; refusing to use it for detached cluster data",
+            trash.display()
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+            std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                .create(&trash)
+                .map_err(|e| format!("create {}: {e}", trash.display()))?;
+            Ok(Some(trash))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat {}: {e}", trash.display())),
+    }
+}
+const DATA_VERSION_FILE: &str = "/var/lib/katamaran/k3s/data/.katamaran-version";
+/// Copy of the datastore version kept beside `state.db` in `server/db/`,
+/// written before every launch of k3s against an existing datastore. Unlike
+/// `.katamaran-version`, it travels with any backup or restore of `server/` or
+/// of the `server/db/` directory, so an unmarked datastore that a
+/// tracking-enabled release ever opened still records the newest k3s that may
+/// have opened it. Excluded from `snapshot_datastore`.
+const SERVER_VERSION_STAMP: &str = ".katamaran-k3s-version";
 const KUBELET_DIR: &str = "/var/lib/katamaran/k3s/data/agent/kubelet";
 const LEGACY_KUBELET_DIR: &str = "/var/lib/kubelet";
 const KUBECONFIG: &str = "/var/lib/katamaran/k3s/kubeconfig.yaml";
+const KUBECONFIG_MODE: &str = "0600";
+/// Katamaran-owned copy of the host's `~/.katamaran/k3s-config.yaml`, selected
+/// via `K3S_CONFIG_FILE` only when supplied so any manually managed
+/// `/etc/rancher/k3s/config.yaml` inside the guest is left untouched.
+const K3S_CONFIG_PATH: &str = "/var/lib/katamaran/k3s/config.yaml";
 const LOG_FILE: &str = "/var/log/k3s.log";
 const PROXY_DIR: &str = "/run/katamaran/k8s-proxy";
 const PROXY_SOCKET: &str = "/run/katamaran/k8s-proxy/proxy.sock";
+const API_PORT: &str = "6443";
 pub const API_ADDR: &str = "127.0.0.1:6443";
 
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
+const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
+/// containerd's runtime state for `k8s.io` tasks (each task's rootfs mount
+/// lives under `<this>/<id>/rootfs`).
+const K8S_TASK_STATE_DIR: &str = "/run/containerd/io.containerd.runtime.v2.task/k8s.io";
+/// How long the VM shutdown sequence waits for the k8s stop thread before it
+/// cuts off Kubernetes cleanup (see [`abandon_shutdown_stop`]) and moves on.
+/// Leaves room within the host's ~45 s shutdown deadline for the Docker stack
+/// stop (~19 s), the process sweep, and the data-disk sync.
+pub const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(18);
+/// SIGTERM grace for k3s during VM shutdown: short enough (with the SIGKILL
+/// reap) that workload cleanup still fits in [`SHUTDOWN_K8S_BUDGET`].
+const SHUTDOWN_K3S_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
+const IMAGE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+const CONTAINERD_RPC_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTAINERD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const IMAGE_RM_BATCH_SIZE: usize = 64;
+const IMAGE_LS_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_LS_STDOUT_LIMIT: usize = 8 << 20;
+const IMAGE_RM_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAGE_RM_SYNC_TIMEOUT: Duration = Duration::from_secs(180);
+const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const IMAGE_GC_LEASE_PREFIX: &str = "katamaran-k8s-reset-gc";
+const IMAGE_GC_LEASE_EXPIRES: &str = "5m";
 const MAX_K8S_CONNS: usize = 256;
 
 /// Internal k3s/Kubernetes control-plane ports that must not be auto-forwarded
@@ -58,9 +143,82 @@ const INTERNAL_PORTS: [u16; 6] = [6443, 6444, 10250, 10256, 10257, 10259];
 static SERVICE: OnceLock<Arc<K8s>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// Set by the shutdown sequence once it stops waiting for the k8s stop thread
+/// ([`abandon_shutdown_stop`]). Kubernetes workload cleanup checks it before
+/// every command, so whatever is still running in the guest k8s service stops
+/// issuing `ctr` / `ip` / `nft` / unmount calls while the Docker stack stops,
+/// the process sweep runs, and the data disk is synced. A command already in
+/// flight fails harmlessly once containerd stops, and the sweep kills it.
+static SHUTDOWN_K8S_ABANDONED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Set on the shutdown sequence's own k8s stop thread, the only caller that
+    /// keeps cleaning up after `SHUTTING_DOWN` is set.
+    static IS_SHUTDOWN_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether Kubernetes workload cleanup must stop issuing commands: shutdown
+/// cut it off, or the VM is shutting down and this is not the shutdown stop
+/// itself (a reset or stop still holding `op_lock` yields so the shutdown
+/// stop can take over promptly).
+fn workload_cleanup_cut_off() -> bool {
+    SHUTDOWN_K8S_ABANDONED.load(Ordering::SeqCst)
+        || (SHUTTING_DOWN.load(Ordering::SeqCst) && !IS_SHUTDOWN_STOP.with(|c| c.get()))
+}
+
+/// Make a workload-cleanup command refuse to `exec` once shutdown has cut
+/// Kubernetes cleanup off. The check runs in the forked child, so a command
+/// forked after [`abandon_shutdown_stop`] (for example after the shutdown
+/// process sweep) never runs, closing the gap between the parent's
+/// [`workload_cleanup_cut_off`] check and the spawn.
+fn guard_cleanup_command(cmd: &mut Command) -> &mut Command {
+    // SAFETY: the closure only performs an atomic load, which is
+    // async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if SHUTDOWN_K8S_ABANDONED.load(Ordering::SeqCst) {
+                return Err(io::Error::from_raw_os_error(libc::ECANCELED));
+            }
+            Ok(())
+        })
+    }
+}
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-static IMAGE_SYNC_LOCK: Mutex<()> = Mutex::new(());
+static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// A k3s child that survived SIGKILL after its `Running` handle was dropped,
+/// tracked by its own exit notification (never by a reusable pid lookup).
+/// While it has not exited, nothing may read or modify the datastore.
+struct UnreapedK3s {
+    pid: i32,
+    has_exited: Box<dyn FnMut() -> bool + Send>,
+}
+
+static UNREAPED_K3S: Mutex<Option<UnreapedK3s>> = Mutex::new(None);
+
+fn note_unreaped_k3s(pid: i32, has_exited: impl FnMut() -> bool + Send + 'static) {
+    *UNREAPED_K3S.lock().unwrap_or_else(|e| e.into_inner()) = Some(UnreapedK3s {
+        pid,
+        has_exited: Box::new(has_exited),
+    });
+}
+
+/// Refuse datastore operations while an earlier k3s child has not exited.
+fn ensure_no_unreaped_k3s() -> Result<(), String> {
+    let mut slot = UNREAPED_K3S.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(unreaped) = slot.as_mut() else {
+        return Ok(());
+    };
+    if (unreaped.has_exited)() {
+        *slot = None;
+        return Ok(());
+    }
+    Err(format!(
+        "an earlier k3s (pid {}) did not exit and may still be using the cluster data; \
+         restart the VM (`kat restart`) before starting, installing, marking, or resetting Kubernetes",
+        unreaped.pid
+    ))
+}
 
 struct ConnGuard(Arc<AtomicUsize>);
 
@@ -122,8 +280,27 @@ pub fn forwarded_ports() -> BTreeSet<u16> {
     FORWARDED.lock().unwrap().clone()
 }
 
+/// The `k8s_args` and canonical JSON output of `k3s-config.yaml` (or `None`
+/// when absent) a k3s instance was started with.
+type StartSettings = (Vec<String>, Option<String>);
+
+fn check_running_settings_match(
+    running: &StartSettings,
+    requested_args: &[String],
+    requested_config_json: Option<&str>,
+) -> Result<(), String> {
+    if running.0 == requested_args && running.1.as_deref() == requested_config_json {
+        return Ok(());
+    }
+    Err(
+        "Kubernetes is already running with different k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
+            .into(),
+    )
+}
+
 struct Running {
     pid: i32,
+    settings: StartSettings,
     exit_rx: Receiver<()>,
     exited: Arc<Mutex<Option<i32>>>,
     sync_stop: Arc<AtomicBool>,
@@ -206,12 +383,80 @@ pub fn start_service(
     Ok(svc)
 }
 
-/// Stop k3s cleanly during VM shutdown.
-pub fn stop_for_shutdown() {
+/// Lazily detach (`MNT_DETACH`) every mount under `prefixes`, deepest first.
+/// Unlike a plain `umount`, a lazy detach never blocks on a busy or
+/// unreachable filesystem (for example a stale NFS pod volume), so reset can
+/// never hang here while holding `op_lock`. Fails if any mount remains.
+fn detach_paths_under(prefixes: &[&str]) -> Result<(), String> {
+    let text = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
+    let mut failures = Vec::new();
+    for mp in mounts_under_prefixes(&text, prefixes) {
+        if let Err(e) = umount_detach(&mp) {
+            failures.push(e.to_string());
+        }
+    }
+    let after = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("re-read /proc/self/mountinfo: {e}"))?;
+    let remaining = mounts_under_prefixes(&after, prefixes);
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "mounts still active ({}): {}",
+        remaining.join(", "),
+        failures.join("; ")
+    ))
+}
+
+/// Lazily detach any mounts left under the k3s data and legacy kubelet
+/// directories and `k8s.io` task rootfs mounts (for example when cleanup was
+/// cut off by [`abandon_shutdown_stop`]) so the data disk can unmount cleanly.
+/// Called by the shutdown sequence after the process sweep; `MNT_DETACH`
+/// never blocks on busy mounts and no lock is taken.
+pub fn detach_mounts_for_shutdown() -> String {
+    let text = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(t) => t,
+        Err(e) => return format!("read /proc/self/mountinfo: {e}"),
+    };
+    let mounts = mounts_under_prefixes(&text, &[DATA_DIR, LEGACY_KUBELET_DIR, K8S_TASK_STATE_DIR]);
+    let mut failed = 0usize;
+    for mp in &mounts {
+        if let Err(e) = umount_detach(mp) {
+            log(&format!("shutdown: {e}"));
+            failed += 1;
+        }
+    }
+    format!("{} detached, {failed} failed", mounts.len() - failed)
+}
+
+/// Mark the VM as shutting down so every guest Kubernetes operation (reset,
+/// start, helpers with `abort_on_shutdown`) stops at its next check and no new
+/// one starts. The shutdown sequence calls this first, before anything that
+/// could fail (such as spawning the stop thread).
+pub fn begin_shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
+}
+
+/// Stop k3s for VM shutdown. Every guest Kubernetes operation (including
+/// reset) checks `SHUTTING_DOWN` between steps and runs long work in killable
+/// helpers that abort on shutdown, so `op_lock` is normally released quickly.
+/// The shutdown sequence runs this on its own thread and waits at most
+/// [`SHUTDOWN_K8S_BUDGET`]; see [`abandon_shutdown_stop`].
+pub fn stop_for_shutdown() {
+    begin_shutdown();
+    IS_SHUTDOWN_STOP.with(|c| c.set(true));
     if let Some(svc) = SERVICE.get() {
         let _ = svc.stop_inner(None);
     }
+}
+
+/// Called by the shutdown sequence when [`stop_for_shutdown`] did not finish
+/// within [`SHUTDOWN_K8S_BUDGET`]: Kubernetes workload cleanup stops issuing
+/// commands, k3s and any helpers are left to the process sweep, and leftover
+/// mounts are detached by [`detach_mounts_for_shutdown`].
+pub fn abandon_shutdown_stop() {
+    SHUTDOWN_K8S_ABANDONED.store(true, Ordering::SeqCst);
 }
 
 const CRI_PLUGINS: [&str; 3] = [
@@ -224,13 +469,24 @@ const CONTAINERD_BASE_CONFIG: &str = "/etc/containerd/config.toml";
 const CONTAINERD_CRI_CONFIG: &str = "/run/katamaran/containerd-cri.toml";
 
 fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_inner(target, bytes, None)
+}
+
+fn write_atomic_mode(target: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    write_atomic_inner(target, bytes, Some(mode))
+}
+
+fn write_atomic_inner(target: &Path, bytes: &[u8], forced_mode: Option<u32>) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("missing parent for {}", target.display()))?;
-    let target_mode = match fs::metadata(target) {
-        Ok(meta) => meta.permissions().mode() & 0o7777,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
-        Err(e) => return Err(format!("stat {}: {e}", target.display())),
+    let target_mode = match forced_mode {
+        Some(mode) => mode,
+        None => match fs::metadata(target) {
+            Ok(meta) => meta.permissions().mode() & 0o7777,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
+            Err(e) => return Err(format!("stat {}: {e}", target.display())),
+        },
     };
     let name = target
         .file_name()
@@ -245,6 +501,7 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -263,6 +520,1345 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
             target.display()
         ));
     }
+    sync_dir(parent)
+}
+
+/// fsync `dir` so a rename or link inside it survives a crash. The datastore
+/// version files must be durable before k3s is allowed to touch the datastore.
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("sync {}: {e}", dir.display()))
+}
+
+/// Parse `(major, minor)` from a k3s release tag such as `v1.37.2+k3s1`.
+fn parse_k3s_minor(version: &str) -> Option<(u32, u32)> {
+    // Strict: the guard must never accept a malformed tag such as
+    // `v1.37.2+k3sgarbage`; anything that is not a canonical release tag is
+    // treated as unreadable and fails closed.
+    parse_strict_k3s_tag(version)
+}
+
+/// True once k3s has initialized server state under `data_dir`.
+/// `prepare_dirs_and_sysctls` only creates `agent/etc/cni/net.d`, never `server/`.
+fn datastore_exists(data_dir: &Path) -> Result<bool, String> {
+    let server_dir = data_dir.join("server");
+    match fs::symlink_metadata(&server_dir) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {}: {e}", server_dir.display())),
+    }
+}
+
+fn server_version_stamp(data_dir: &Path) -> PathBuf {
+    data_dir.join("server/db").join(SERVER_VERSION_STAMP)
+}
+
+/// True when the stamp would be written: `server/` and `server/db/` exist.
+fn server_db_dir_exists(data_dir: &Path) -> Result<bool, String> {
+    for dir in [data_dir.join("server"), data_dir.join("server/db")] {
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not a directory; refusing to record its k3s version",
+                    dir.display()
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("stat {}: {e}", dir.display())),
+        }
+    }
+    Ok(true)
+}
+
+/// Record `version` in `server/db/SERVER_VERSION_STAMP` when that directory
+/// exists (a fresh datastore gets its stamp on its next start).
+fn write_server_version_stamp(data_dir: &Path, version: &str) -> Result<(), String> {
+    if !server_db_dir_exists(data_dir)? {
+        return Ok(());
+    }
+    let stamp = server_version_stamp(data_dir);
+    if matches!(read_marker_file(&stamp)?, MarkerFile::Present(v) if v == version) {
+        // Already visible, but an earlier rename may not have been made durable
+        // (its directory sync failed), so sync again rather than trusting it.
+        return sync_dir(&data_dir.join("server/db"));
+    }
+    write_atomic(&stamp, format!("{version}\n").as_bytes())
+}
+
+fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Oldest supported Kubernetes minor. k3s is launched with
+/// `--kube-proxy-arg=proxy-mode=nftables`, and kube-proxy's nftables mode
+/// (`NFTablesProxyMode`) is beta and enabled by default only from v1.31, so
+/// older releases would fail to start kube-proxy. k3s v1.31.0–v1.31.5 bundle
+/// k3s-root v0.14.0 without `nft`; kube-proxy then resolves the rootfs
+/// `nftables` package's `/usr/sbin/nft` through `PATH` (see `guest/rootfs/build.sh`
+/// and `path_resolves_rootfs_nft_for_oldest_supported_k3s`). `scripts/k3s-nft-check.sh`
+/// runs a release in the guest's pinned Alpine image with these flags and checks that
+/// kube-proxy builds its nftables tables with the rootfs `nft`.
+const MIN_K8S_MINOR: u32 = 31;
+const SQLITE3_BIN: &str = "/usr/bin/sqlite3";
+/// Scratch root for WAL/journal inspection copies of `state.db`. `/run` is a
+/// tmpfs, so a copy (which contains cluster secrets) never reaches the
+/// persistent data disk and cannot outlive the VM or survive `kat k8s reset`.
+const STATE_DB_SCRATCH_ROOT: &str = "/run/katamaran";
+/// Upper bound on the bytes copied into `STATE_DB_SCRATCH_ROOT` (database plus
+/// sidecars); larger unmarked datastores fall back to `kat k8s mark-version`.
+const STATE_DB_MAX_SCRATCH_BYTES: u64 = 256 << 20;
+/// katamaran runs a single node; allow a few stale rows but no more.
+const STATE_DB_MAX_NODE_ROWS: usize = 4;
+/// A real Node object is a few KiB. The query's hex output for every row must
+/// fit the 1 MiB stdout capture of `run_reaped_split`, or the trailing `END`
+/// would be cut off and detection would fail silently.
+const STATE_DB_MAX_BLOB_BYTES: usize = 96 << 10;
+// The query returns up to one extra row to detect overflow.
+const _: () =
+    assert!((STATE_DB_MAX_NODE_ROWS + 1) * (2 * STATE_DB_MAX_BLOB_BYTES + 32) + 64 < 1 << 20);
+/// Every k3s release a pre-tracking katamaran release (v0.5.0 through v0.10.0)
+/// could run: those releases always ran their pinned build and never wrote
+/// `.katamaran-version`, while every tracking-enabled release writes the
+/// marker before launching k3s. An unmarked datastore that katamaran itself
+/// created, and whose `server/` carries no `SERVER_VERSION_STAMP` (written before
+/// every tracking-era launch), can therefore only have been opened by one of these builds, so a
+/// `state.db` node version matching one of them is corroborated by both the
+/// datastore and katamaran's release history. Any other detected version is
+/// only a lower bound (a newer server may have opened the datastore before its
+/// kubelet reported status) and requires an explicit `kat k8s mark-version`.
+const PRE_TRACKING_K3S_VERSIONS: &[&str] = &["v1.37.2+k3s1"];
+
+/// Tools and scratch space used to inspect an unmarked `state.db`.
+struct StateDbProbe<'a> {
+    sqlite3_bin: &'a Path,
+    scratch_root: &'a Path,
+    /// Bound on the WAL-recovery copy (`STATE_DB_MAX_SCRATCH_BYTES` in production).
+    max_copy_bytes: u64,
+}
+
+fn state_db_probe() -> StateDbProbe<'static> {
+    StateDbProbe {
+        sqlite3_bin: Path::new(SQLITE3_BIN),
+        scratch_root: Path::new(STATE_DB_SCRATCH_ROOT),
+        max_copy_bytes: STATE_DB_MAX_SCRATCH_BYTES,
+    }
+}
+
+/// Strictly parse a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>`)
+/// with no surrounding whitespace, returning `(major, minor)`.
+fn parse_strict_k3s_tag(v: &str) -> Option<(u32, u32)> {
+    // Digits only, without leading zeros: release tags never pad numbers.
+    let canonical_number = |n: &str| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && (n == "0" || !n.starts_with('0'))
+    };
+    let rest = v.strip_prefix('v')?;
+    let (kube, build) = rest.split_once("+k3s")?;
+    if !canonical_number(build) {
+        return None;
+    }
+    let (core, pre) = match kube.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (kube, None),
+    };
+    if let Some(p) = pre
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'))
+    {
+        return None;
+    }
+    let parts: Vec<u32> = core
+        .split('.')
+        .map(|n| {
+            if !canonical_number(n) {
+                return None;
+            }
+            n.parse().ok()
+        })
+        .collect::<Option<_>>()?;
+    let [major, minor, _patch] = parts[..] else {
+        return None;
+    };
+    Some((major, minor))
+}
+
+/// Validate a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>` with
+/// `major == 1` and `minor >= MIN_K8S_MINOR`), matching the host daemon's config check.
+fn validate_k3s_release_tag(v: &str) -> Result<(), String> {
+    let Some((major, minor)) = parse_strict_k3s_tag(v) else {
+        return Err(format!(
+            "k3s version {v:?} is not a valid release tag such as v1.37.2+k3s1"
+        ));
+    };
+    if major != 1 || minor < MIN_K8S_MINOR {
+        return Err(format!(
+            "k3s version must be v1.{MIN_K8S_MINOR} or newer, got {v}"
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically create a new mode-0600 file at `target` without ever overwriting
+/// an existing file or following a symlink at `target`.
+fn write_atomic_new(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", target.display()))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".into());
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.katamaran.{pid}.{seq}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let write_res = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    let link_res = fs::hard_link(&tmp, target);
+    let _ = fs::remove_file(&tmp);
+    match link_res {
+        Ok(()) => sync_dir(parent).inspect_err(|_| {
+            // Do not leave a marker in place that the caller was told failed.
+            let _ = fs::remove_file(target);
+        }),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(format!(
+            "datastore version marker {} already exists; refusing to overwrite an existing marker",
+            target.display()
+        )),
+        Err(e) => Err(format!("create {}: {e}", target.display())),
+    }
+}
+
+enum MarkerFile {
+    Missing,
+    Empty,
+    NonRegular,
+    Present(String),
+}
+
+fn read_marker_file(path: &Path) -> Result<MarkerFile, String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MarkerFile::Missing),
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+    };
+    if !meta.file_type().is_file() {
+        return Ok(MarkerFile::NonRegular);
+    }
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut content = String::new();
+    f.read_to_string(&mut content)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(MarkerFile::Empty)
+    } else {
+        Ok(MarkerFile::Present(trimmed.to_string()))
+    }
+}
+
+fn corrupt_datastore_version_error(data_version_file: &Path, reason: &str) -> String {
+    format!(
+        "datastore version marker {} {reason}; cannot verify minor-version compatibility. \
+         While Kubernetes is stopped, either restore a matching datastore backup together \
+         with its {} version marker, or back up any state you need and run `kat k8s reset` \
+         to delete cluster data and persistent volumes before starting fresh.",
+        data_version_file.display(),
+        data_version_file.display(),
+    )
+}
+
+fn missing_datastore_version_error(data_dir: &Path, data_version_file: &Path) -> String {
+    format!(
+        "existing cluster data under {} has no version marker ({}) and its k3s version \
+         could not be verified from server/db/state.db; cannot verify minor-version \
+         compatibility. While the VM is running and Kubernetes is stopped, if you have \
+         independently verified the k3s release tag that last opened this datastore \
+         (for example from a backup or an older katamaran release), run \
+         `kat k8s mark-version <version>` to record it (see the Kubernetes guide's \
+         unmarked-cluster migration steps). Otherwise, back up any state you need and \
+         run `kat k8s reset` to delete cluster data and persistent volumes before \
+         starting fresh.",
+        data_dir.display(),
+        data_version_file.display(),
+    )
+}
+
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn encode_sqlite_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'~' | b'+' | b':')
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Copy the regular file `src` to a new `dst`, refusing symlinks, non-regular
+/// files, and anything that would push `*budget` below zero.
+fn copy_regular_file_bounded(src: &Path, dst: &Path, budget: &mut u64) -> io::Result<()> {
+    let src_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(src)?;
+    if !src_file.metadata()?.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            src.display()
+        )));
+    }
+    let mut dst_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)?;
+    // Read at most one byte past the budget so growth after the size check is caught.
+    let copied = io::copy(&mut src_file.take(budget.saturating_add(1)), &mut dst_file)?;
+    if copied > *budget {
+        return Err(io::Error::other(format!(
+            "{} exceeds the inspection copy limit",
+            src.display()
+        )));
+    }
+    *budget -= copied;
+    Ok(())
+}
+
+fn inspect_regular_companion(path: &Path) -> Result<Option<u64>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(Some(meta.len())),
+        Ok(_) => Err(format!("{} is not a regular file", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let hex_val = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = hex_val(pair[0])?;
+        let lo = hex_val(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn read_proto_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        if shift == 63 && b > 1 {
+            return None;
+        }
+        val |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(val);
+        }
+        shift += 7;
+    }
+    None
+}
+
+enum ProtoValue<'a> {
+    Varint,
+    Fixed64,
+    Bytes(&'a [u8]),
+    Fixed32,
+}
+
+fn for_each_proto_field<'a>(
+    buf: &'a [u8],
+    mut f: impl FnMut(u32, ProtoValue<'a>) -> Option<()>,
+) -> Option<()> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let tag = read_proto_varint(buf, &mut pos)?;
+        let field_num = u32::try_from(tag >> 3).ok()?;
+        if field_num == 0 {
+            return None;
+        }
+        let wire_type = (tag & 0x7) as u8;
+        let val = match wire_type {
+            0 => {
+                let _ = read_proto_varint(buf, &mut pos)?;
+                ProtoValue::Varint
+            }
+            1 => {
+                let end = pos.checked_add(8)?;
+                if end > buf.len() {
+                    return None;
+                }
+                pos = end;
+                ProtoValue::Fixed64
+            }
+            2 => {
+                let len = usize::try_from(read_proto_varint(buf, &mut pos)?).ok()?;
+                let end = pos.checked_add(len)?;
+                let slice = buf.get(pos..end)?;
+                pos = end;
+                ProtoValue::Bytes(slice)
+            }
+            5 => {
+                let end = pos.checked_add(4)?;
+                if end > buf.len() {
+                    return None;
+                }
+                pos = end;
+                ProtoValue::Fixed32
+            }
+            _ => return None,
+        };
+        f(field_num, val)?;
+    }
+    Some(())
+}
+
+/// Extract `status.nodeInfo.kubeletVersion` from a serialized Kubernetes
+/// `core/v1.Node` protobuf message (`Node.status = 3`, `NodeStatus.nodeInfo = 7`,
+/// `NodeSystemInfo.kubeletVersion = 7`).
+fn extract_kubelet_version_from_node_proto(buf: &[u8]) -> Option<String> {
+    let mut kubelet_version: Option<String> = None;
+    for_each_proto_field(buf, |field, val| {
+        if field == 3 {
+            let ProtoValue::Bytes(status_buf) = val else {
+                return None;
+            };
+            for_each_proto_field(status_buf, |sfield, sval| {
+                if sfield == 7 {
+                    let ProtoValue::Bytes(info_buf) = sval else {
+                        return None;
+                    };
+                    for_each_proto_field(info_buf, |ifield, ival| {
+                        if ifield == 7 {
+                            let ProtoValue::Bytes(ver_bytes) = ival else {
+                                return None;
+                            };
+                            let s = std::str::from_utf8(ver_bytes).ok()?;
+                            kubelet_version = Some(s.to_string());
+                        }
+                        Some(())
+                    })?;
+                }
+                Some(())
+            })?;
+        }
+        Some(())
+    })?;
+    kubelet_version.filter(|s| !s.is_empty())
+}
+
+/// Extract `status.nodeInfo.kubeletVersion` from a Kubernetes `Node` object
+/// stored in kine's `value` column. Only the encoding kube-apiserver uses for
+/// core types is accepted: the `k8s\0` prefix and an uncompressed
+/// `runtime.Unknown` protobuf envelope with `apiVersion: v1`, `kind: Node`, and
+/// a protobuf body. Anything else (JSON, compression, other kinds) is rejected.
+fn extract_kubelet_version_from_node_blob(blob: &[u8]) -> Option<String> {
+    if let Some(body) = blob.strip_prefix(b"k8s\0") {
+        let mut api_version = "";
+        let mut kind = "";
+        let mut raw: Option<&[u8]> = None;
+        let mut content_encoding = "";
+        let mut content_type = "";
+        for_each_proto_field(body, |field, val| {
+            match field {
+                1 => {
+                    let ProtoValue::Bytes(tm_buf) = val else {
+                        return None;
+                    };
+                    for_each_proto_field(tm_buf, |tfield, tval| {
+                        match tfield {
+                            1 => {
+                                let ProtoValue::Bytes(b) = tval else {
+                                    return None;
+                                };
+                                api_version = std::str::from_utf8(b).ok()?;
+                            }
+                            2 => {
+                                let ProtoValue::Bytes(b) = tval else {
+                                    return None;
+                                };
+                                kind = std::str::from_utf8(b).ok()?;
+                            }
+                            _ => {}
+                        }
+                        Some(())
+                    })?;
+                }
+                2 => {
+                    let ProtoValue::Bytes(b) = val else {
+                        return None;
+                    };
+                    raw = Some(b);
+                }
+                3 => {
+                    let ProtoValue::Bytes(b) = val else {
+                        return None;
+                    };
+                    content_encoding = std::str::from_utf8(b).ok()?;
+                }
+                4 => {
+                    let ProtoValue::Bytes(b) = val else {
+                        return None;
+                    };
+                    content_type = std::str::from_utf8(b).ok()?;
+                }
+                _ => {}
+            }
+            Some(())
+        })?;
+        if !content_encoding.is_empty()
+            || api_version != "v1"
+            || kind != "Node"
+            || !matches!(content_type, "" | "application/vnd.kubernetes.protobuf")
+        {
+            return None;
+        }
+        return extract_kubelet_version_from_node_proto(raw.filter(|r| !r.is_empty())?);
+    }
+    None
+}
+
+/// Inspect `data_dir/server/db/state.db` read-only (never modifying any file in
+/// `data_dir/server/`) to detect the k3s version recorded in live Kubernetes
+/// `Node` objects (`/registry/minions/*`).
+///
+/// Fails closed (returns `None`) if `sqlite3` is unavailable, any path component
+/// is a symlink or non-regular file, `kine` is not a plain table, output is
+/// truncated, or live node versions are missing, unparseable, or disagree on
+/// `(major, minor)`.
+fn detect_datastore_version_from_state_db_with(
+    data_dir: &Path,
+    probe: &StateDbProbe<'_>,
+    mut run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
+) -> Option<String> {
+    let sqlite3_bin = probe.sqlite3_bin;
+    if !sqlite3_bin.is_file() {
+        log(&format!(
+            "cannot inspect unmarked state.db: {} is not available",
+            sqlite3_bin.display()
+        ));
+        return None;
+    }
+    let server_dir = data_dir.join("server");
+    if !fs::symlink_metadata(&server_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return None;
+    }
+    let db_dir = server_dir.join("db");
+    if !fs::symlink_metadata(&db_dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return None;
+    }
+    let db_path = db_dir.join("state.db");
+    if !fs::symlink_metadata(&db_path).is_ok_and(|m| m.file_type().is_file()) {
+        return None;
+    }
+    let wal_path = db_dir.join("state.db-wal");
+    let shm_path = db_dir.join("state.db-shm");
+    let journal_path = db_dir.join("state.db-journal");
+    let wal_len = match inspect_regular_companion(&wal_path) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("skip state.db detection: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = inspect_regular_companion(&shm_path) {
+        log(&format!("skip state.db detection: {e}"));
+        return None;
+    }
+    // kine runs SQLite in WAL mode; a non-empty rollback journal means an
+    // interrupted non-WAL write that only a writable open would recover, so fail
+    // closed instead of emulating it.
+    match inspect_regular_companion(&journal_path) {
+        Ok(None | Some(0)) => {}
+        Ok(Some(_)) => {
+            log("skip state.db detection: state.db-journal is not empty");
+            return None;
+        }
+        Err(e) => {
+            log(&format!("skip state.db detection: {e}"));
+            return None;
+        }
+    }
+
+    // A checkpointed database (no WAL content) is read in place with SQLite's
+    // `immutable=1`, which opens it read-only, takes no locks, and never creates
+    // sidecar files, so any size works. Callers only probe with k3s stopped.
+    // WAL content is only visible through a writable open, so that case reads
+    // a bounded private copy on the /run tmpfs instead; the copy never reaches
+    // the disk and the live files are never opened by sqlite3.
+    let mut _scratch = None;
+    let sqlite_target = if wal_len.unwrap_or(0) == 0 {
+        if !db_path.is_absolute() {
+            return None;
+        }
+        format!("file:{}?immutable=1", encode_sqlite_uri_path(&db_path))
+    } else {
+        let total = wal_len.unwrap_or(0).saturating_add(
+            fs::symlink_metadata(&db_path)
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX),
+        );
+        if total > probe.max_copy_bytes {
+            log(&format!(
+                "skip state.db detection: {total} bytes of database and uncheckpointed WAL \
+                 exceed the {}-byte inspection copy limit",
+                probe.max_copy_bytes
+            ));
+            return None;
+        }
+        if let Err(e) = DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(probe.scratch_root)
+        {
+            log(&format!(
+                "create state.db scratch root {}: {e}",
+                probe.scratch_root.display()
+            ));
+            return None;
+        }
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let scratch_path = probe
+            .scratch_root
+            .join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
+        if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
+            log(&format!(
+                "create state.db scratch dir {}: {e}",
+                scratch_path.display()
+            ));
+            return None;
+        }
+        let scratch = _scratch.insert(ScratchDir(scratch_path));
+        let scratch_db = scratch.0.join("state.db");
+        let mut budget = probe.max_copy_bytes;
+        if let Err(e) = copy_regular_file_bounded(&db_path, &scratch_db, &mut budget) {
+            log(&format!("copy state.db for inspection: {e}"));
+            return None;
+        }
+        if let Err(e) =
+            copy_regular_file_bounded(&wal_path, &scratch.0.join("state.db-wal"), &mut budget)
+        {
+            log(&format!("copy state.db-wal for inspection: {e}"));
+            return None;
+        }
+        format!("file:{}", encode_sqlite_uri_path(&scratch_db))
+    };
+
+    let mut query = |sql: &str| -> Option<String> {
+        let mut cmd = Command::new(sqlite3_bin);
+        cmd.args([
+            "-bail",
+            "-batch",
+            "-noheader",
+            "-list",
+            "-safe",
+            "-cmd",
+            ".timeout 5000",
+            &sqlite_target,
+            sql,
+        ]);
+        match run_cmd(&mut cmd) {
+            Ok((0, out)) => Some(out),
+            Ok((code, _)) => {
+                log(&format!("sqlite3 inspection exited {code}"));
+                None
+            }
+            Err(e) => {
+                log(&format!("sqlite3 inspection failed: {e}"));
+                None
+            }
+        }
+    };
+
+    const SCHEMA_SQL: &str = "\
+PRAGMA trusted_schema = OFF;
+SELECT CASE
+    WHEN type = 'table' AND upper(ltrim(coalesce(sql, ''))) NOT LIKE 'CREATE VIRTUAL %'
+    THEN 'OK'
+    ELSE 'BAD'
+END
+FROM main.sqlite_master
+WHERE name = 'kine';";
+    if query(SCHEMA_SQL)?.trim() != "OK" {
+        return None;
+    }
+
+    let nodes_sql = format!(
+        "\
+PRAGMA trusted_schema = OFF;
+SELECT CASE
+    WHEN k.value IS NULL OR length(k.value) = 0 THEN 'EMPTY'
+    WHEN length(k.value) > {STATE_DB_MAX_BLOB_BYTES} THEN 'OVERSIZED'
+    ELSE length(k.value) || ':' || hex(k.value)
+END
+FROM main.kine k
+INNER JOIN (
+    SELECT name, MAX(id) AS max_id
+    FROM main.kine
+    WHERE name >= '/registry/minions/'
+      AND name < '/registry/minions0'
+    GROUP BY name
+) latest ON k.name = latest.name AND k.id = latest.max_id
+WHERE k.deleted = 0
+ORDER BY k.id DESC
+LIMIT {};
+SELECT 'END';",
+        STATE_DB_MAX_NODE_ROWS + 1
+    );
+    let raw_out = query(&nodes_sql)?;
+    let lines: Vec<&str> = raw_out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let (&last, rows) = lines.split_last()?;
+    if last != "END" || rows.is_empty() || rows.len() > STATE_DB_MAX_NODE_ROWS {
+        return None;
+    }
+
+    let mut chosen: Option<(String, (u32, u32))> = None;
+    for row in rows {
+        let (len_str, hex_str) = row.split_once(':')?;
+        let expected_len: usize = len_str.parse().ok()?;
+        if expected_len == 0
+            || expected_len > STATE_DB_MAX_BLOB_BYTES
+            || hex_str.len() != expected_len.checked_mul(2)?
+        {
+            return None;
+        }
+        let blob = decode_hex(hex_str)?;
+        let version = extract_kubelet_version_from_node_blob(&blob)?;
+        let mm = parse_strict_k3s_tag(&version)?;
+        match &chosen {
+            None => chosen = Some((version, mm)),
+            Some((_, prev_mm)) if *prev_mm == mm => {}
+            Some(_) => return None,
+        }
+    }
+    chosen.map(|(v, _)| v)
+}
+
+/// Record an independently verified k3s release tag in `data_version_file` for
+/// an existing unmarked datastore under `data_dir`. Refuses to run when no
+/// datastore exists, refuses to overwrite any existing marker, and refuses to
+/// mark a lower minor than `server/db/state.db` already records.
+fn mark_datastore_version_at_with(
+    data_dir: &Path,
+    data_version_file: &Path,
+    version: &str,
+    probe: &StateDbProbe<'_>,
+    run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
+) -> Result<(), String> {
+    validate_k3s_release_tag(version)?;
+    if !datastore_exists(data_dir)? {
+        return Err(format!(
+            "no existing cluster datastore found under {}; start Kubernetes normally with `kat k8s start`",
+            data_dir.display()
+        ));
+    }
+    match fs::symlink_metadata(data_version_file) {
+        Ok(meta) => {
+            let detail = if !meta.file_type().is_file() {
+                " (not a regular file)".to_string()
+            } else {
+                match read_marker_file(data_version_file) {
+                    Ok(MarkerFile::Present(existing)) => format!(" ({existing})"),
+                    Ok(MarkerFile::Empty) => " (empty)".to_string(),
+                    Ok(MarkerFile::NonRegular) => " (not a regular file)".to_string(),
+                    Ok(MarkerFile::Missing) | Err(_) => String::new(),
+                }
+            };
+            return Err(format!(
+                "datastore version marker {} already exists{detail}; \
+                 refusing to overwrite an existing marker",
+                data_version_file.display()
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("stat {}: {e}", data_version_file.display()));
+        }
+    }
+    // mark-version is only for datastores whose version is genuinely unknown.
+    // A stamp (even a corrupt one) or a trusted pre-tracking node record already
+    // determines the version, and marking over it could let a skipped minor or
+    // a downgrade through.
+    let stamp = server_version_stamp(data_dir);
+    match read_marker_file(&stamp)? {
+        MarkerFile::Missing => {}
+        MarkerFile::Present(stamped) if parse_k3s_minor(&stamped).is_some() => {
+            return Err(format!(
+                "{} already records this datastore's k3s version ({stamped}); \
+                 refusing to mark it. Start Kubernetes with a compatible k8s_version instead.",
+                stamp.display()
+            ));
+        }
+        MarkerFile::Present(_) | MarkerFile::Empty | MarkerFile::NonRegular => {
+            return Err(corrupt_datastore_version_error(
+                &stamp,
+                "exists but is not a valid version stamp",
+            ));
+        }
+    }
+    if let Some(detected) = detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd) {
+        if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) {
+            return Err(format!(
+                "server/db/state.db shows this datastore was last run by {detected}, which \
+                 katamaran already accepts without a marker; refusing to mark it. Start \
+                 Kubernetes with a compatible k8s_version instead."
+            ));
+        }
+        if let (Some(supplied_mm), Some(detected_mm)) = (
+            parse_strict_k3s_tag(version),
+            parse_strict_k3s_tag(&detected),
+        ) && supplied_mm < detected_mm
+        {
+            return Err(format!(
+                "refusing to mark datastore as {version}: server/db/state.db already records newer k3s {detected}"
+            ));
+        }
+    }
+    write_atomic_new(data_version_file, format!("{version}\n").as_bytes())
+}
+
+/// Return the k3s version associated with an existing datastore under `data_dir`.
+///
+/// Never falls back to `VERSION_FILE` (the installed binary's version). The
+/// recorded version is the newer of `data_version_file` and the
+/// `server/db/SERVER_VERSION_STAMP` stamp, or the stamp alone when the marker is
+/// absent; an empty, non-regular, or invalid record fails closed. The
+/// `server/db/state.db` node record is then always applied as a lower bound.
+/// With neither record, the node record is accepted only when it is one of
+/// `PRE_TRACKING_K3S_VERSIONS`; anything else is rejected with
+/// `kat k8s mark-version` guidance.
+fn effective_datastore_version_with(
+    data_dir: &Path,
+    data_version_file: &Path,
+    probe: &StateDbProbe<'_>,
+    run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
+) -> Result<Option<String>, String> {
+    if !datastore_exists(data_dir)? {
+        return Ok(None);
+    }
+    let recorded = match read_marker_file(data_version_file)? {
+        MarkerFile::Present(v) => Some(newer_of_marker_and_stamp(data_dir, data_version_file, v)?),
+        MarkerFile::Missing => {
+            let stamp = server_version_stamp(data_dir);
+            match read_marker_file(&stamp)? {
+                // Written before every tracking-era launch, so it is at least the
+                // newest k3s that a tracking-enabled release ran against `server/`.
+                MarkerFile::Present(v) if parse_k3s_minor(&v).is_some() => Some(v),
+                MarkerFile::Present(v) => {
+                    return Err(corrupt_datastore_version_error(
+                        &stamp,
+                        &format!("records an invalid k3s version {v:?}"),
+                    ));
+                }
+                MarkerFile::Empty => {
+                    return Err(corrupt_datastore_version_error(&stamp, "is empty"));
+                }
+                MarkerFile::NonRegular => {
+                    return Err(corrupt_datastore_version_error(
+                        &stamp,
+                        "is not a regular file",
+                    ));
+                }
+                // No tracking-enabled release ever launched k3s against this
+                // `server/`, so only a pre-tracking pinned build can have opened it.
+                MarkerFile::Missing => None,
+            }
+        }
+        MarkerFile::Empty => {
+            return Err(corrupt_datastore_version_error(
+                data_version_file,
+                "is empty",
+            ));
+        }
+        MarkerFile::NonRegular => {
+            return Err(corrupt_datastore_version_error(
+                data_version_file,
+                "is not a regular file",
+            ));
+        }
+    };
+    // The node record is always a lower bound: k3s's kubelet reports the server's
+    // own release, so whatever it records has opened this datastore. That catches
+    // data run by a release that did not update the marker or stamp (for example
+    // an older katamaran after a rollback).
+    let detected = detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd);
+    match (recorded, detected) {
+        (Some(recorded), detected) => Ok(Some(newer_minor(recorded, detected))),
+        (None, Some(detected)) if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) => {
+            Ok(Some(detected))
+        }
+        (None, Some(detected)) => Err(format!(
+            "{} The node record in server/db/state.db reports k3s {detected}, \
+             which no pre-tracking katamaran release ran, so it is only a lower \
+             bound (a newer k3s server may have opened this datastore before its \
+             kubelet reported status) and cannot be used to verify compatibility.",
+            missing_datastore_version_error(data_dir, data_version_file)
+        )),
+        (None, None) => Err(missing_datastore_version_error(data_dir, data_version_file)),
+    }
+}
+
+/// `recorded`, unless the state.db node record shows a newer minor.
+fn newer_minor(recorded: String, detected: Option<String>) -> String {
+    match (detected, parse_k3s_minor(&recorded)) {
+        (Some(d), Some(recorded_mm))
+            if parse_k3s_minor(&d).is_some_and(|d_mm| d_mm > recorded_mm) =>
+        {
+            d
+        }
+        _ => recorded,
+    }
+}
+
+/// Publish the outer marker and the `server/db/` stamp before spawning k3s. Any
+/// failure, including a directory sync failure after a rename already made the
+/// new tag visible, runs `restore` (which puts both files back to their prior
+/// states) before returning the error, so a failed attempt never leaves a newer
+/// recorded version behind for a datastore k3s did not open.
+fn publish_version_files(
+    data_dir: &Path,
+    data_version_file: &Path,
+    version: &str,
+    write_marker_file: bool,
+    write_stamp: bool,
+    write_marker: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+    restore: impl FnOnce(),
+) -> Result<(), String> {
+    let res = (|| {
+        if write_marker_file {
+            write_marker(data_version_file, format!("{version}\n").as_bytes())?;
+        } else if let Some(parent) = data_version_file.parent()
+            && matches!(read_marker_file(data_version_file)?, MarkerFile::Present(_))
+        {
+            // The marker already records this version, possibly from an attempt
+            // whose directory sync failed: make it durable before k3s starts.
+            sync_dir(parent)?;
+        }
+        if write_stamp {
+            write_server_version_stamp(data_dir, version)?;
+        } else if server_db_dir_exists(data_dir)? {
+            sync_dir(&data_dir.join("server/db"))?;
+        }
+        Ok(())
+    })();
+    if res.is_err() {
+        restore();
+    }
+    res
+}
+
+/// Stamp a datastore that k3s created during this start once its `server/db/`
+/// exists, clearing `*pending` on success (failures are logged and retried).
+fn stamp_new_datastore(data_dir: &Path, version: &str, pending: &mut bool) {
+    if !*pending {
+        return;
+    }
+    match server_db_dir_exists(data_dir) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            log(&format!("record version stamp for new datastore: {e}"));
+            return;
+        }
+    }
+    match write_server_version_stamp(data_dir, version) {
+        Ok(()) => *pending = false,
+        Err(e) => log(&format!("record version stamp for new datastore: {e}")),
+    }
+}
+
+/// Katamaran always writes `.katamaran-version` and the `server/db/` stamp
+/// together, so they only disagree when one was restored without the other
+/// (for example `server/db/` from a newer backup beside a stale outer marker).
+/// Use whichever records the newer minor so the downgrade guard still holds.
+fn newer_of_marker_and_stamp(
+    data_dir: &Path,
+    data_version_file: &Path,
+    marker: String,
+) -> Result<String, String> {
+    let Some(marker_mm) = parse_k3s_minor(&marker) else {
+        return Err(corrupt_datastore_version_error(
+            data_version_file,
+            &format!("records an invalid k3s version {marker:?}"),
+        ));
+    };
+    let stamp_path = server_version_stamp(data_dir);
+    match read_marker_file(&stamp_path)? {
+        MarkerFile::Missing => Ok(marker),
+        MarkerFile::Present(stamp) => {
+            let Some(stamp_mm) = parse_k3s_minor(&stamp) else {
+                return Err(corrupt_datastore_version_error(
+                    &stamp_path,
+                    &format!("records an invalid k3s version {stamp:?}"),
+                ));
+            };
+            Ok(if marker_mm >= stamp_mm { marker } else { stamp })
+        }
+        MarkerFile::Empty => Err(corrupt_datastore_version_error(&stamp_path, "is empty")),
+        MarkerFile::NonRegular => Err(corrupt_datastore_version_error(
+            &stamp_path,
+            "is not a regular file",
+        )),
+    }
+}
+
+/// Refuse to install or start a lower Kubernetes minor or skip one or more
+/// intermediate minors against an existing datastore without modifying `data_dir`.
+fn check_datastore_compatible_with(
+    data_dir: &Path,
+    data_version_file: &Path,
+    target_version: &str,
+    probe: &StateDbProbe<'_>,
+    run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
+) -> Result<(), String> {
+    let Some(existing) =
+        effective_datastore_version_with(data_dir, data_version_file, probe, run_cmd)?
+    else {
+        return Ok(());
+    };
+    let target_mm = parse_k3s_minor(target_version)
+        .ok_or_else(|| format!("invalid k3s version {target_version:?}"))?;
+    let existing_mm = parse_k3s_minor(&existing).ok_or_else(|| {
+        format!(
+            "cannot determine minor version of existing cluster data ({existing:?}); \
+             while Kubernetes is stopped, either restore a matching datastore backup \
+             together with its {} version marker, or back up any state you need and \
+             run `kat k8s reset` before starting {target_version}",
+            data_version_file.display()
+        )
+    })?;
+    if target_mm < existing_mm {
+        return Err(format!(
+            "refusing to use k3s {target_version} with existing {existing} cluster data: \
+             Kubernetes does not support minor-version downgrades. To start fresh, back up \
+             any state you need, run `kat k8s reset` to delete cluster data and persistent \
+             volumes, then run `kat k8s start`. To roll back to a pre-upgrade datastore \
+             backup instead, stop Kubernetes and restore both the datastore and its \
+             matching {} version marker from that backup before starting {target_version} \
+             (see the Kubernetes guide's rollback procedure).",
+            data_version_file.display()
+        ));
+    }
+    if target_mm.0 != existing_mm.0 || target_mm.1 > existing_mm.1.saturating_add(1) {
+        let next_minor = existing_mm.1.saturating_add(1);
+        return Err(format!(
+            "refusing to upgrade existing {existing} cluster data directly to k3s \
+             {target_version}: Kubernetes does not support skipping minor versions. \
+             To preserve cluster state, back up first and upgrade one minor at a time \
+             (starting with a v{}.{next_minor}.x+k3s1 release). Or, to start fresh on \
+             {target_version}, back up any state you need, run `kat k8s reset` to delete \
+             cluster data and persistent volumes, then run `kat k8s start`.",
+            existing_mm.0
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DatastoreEntryKind {
+    File {
+        len: u64,
+        hash_sip: u64,
+        hash_fnv: u64,
+    },
+    Dir,
+    /// A symlink whose resolved target stays strictly inside `data_dir/server`
+    /// (such as k3s's normal `server/agent-token -> token` link), so its target
+    /// is fingerprinted by the directory walk itself.
+    InternalSymlink(PathBuf),
+    Other(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatastoreEntry {
+    rel_path: PathBuf,
+    dev: u64,
+    ino: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    kind: DatastoreEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DatastoreSnapshot {
+    Absent,
+    Present(Vec<DatastoreEntry>),
+}
+
+fn hash_file(path: &Path) -> io::Result<(u64, u64, u64)> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut sip = DefaultHasher::new();
+    let mut fnv: u64 = 0xcbf29ce484222325;
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        let chunk = &buf[..n];
+        sip.write(chunk);
+        for &b in chunk {
+            fnv ^= u64::from(b);
+            fnv = fnv.wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok((total, sip.finish(), fnv))
+}
+
+fn collect_datastore_entries(
+    path: &Path,
+    canonical_root: &Path,
+    rel_path: PathBuf,
+    out: &mut Vec<DatastoreEntry>,
+) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    let ft = meta.file_type();
+    let kind = if ft.is_symlink() {
+        let target = fs::read_link(path)?;
+        let resolved = fs::canonicalize(path).map_err(|e| {
+            io::Error::other(format!(
+                "cannot resolve symlinked datastore path {} (-> {}): {e}",
+                path.display(),
+                target.display()
+            ))
+        })?;
+        if !resolved.starts_with(canonical_root) {
+            return Err(io::Error::other(format!(
+                "cannot safely fingerprint symlinked datastore path {} resolving outside {}",
+                path.display(),
+                canonical_root.display()
+            )));
+        }
+        DatastoreEntryKind::InternalSymlink(target)
+    } else if ft.is_file() {
+        let (len, hash_sip, hash_fnv) = hash_file(path)?;
+        DatastoreEntryKind::File {
+            len,
+            hash_sip,
+            hash_fnv,
+        }
+    } else if ft.is_dir() {
+        DatastoreEntryKind::Dir
+    } else {
+        DatastoreEntryKind::Other(meta.mode())
+    };
+    out.push(DatastoreEntry {
+        rel_path: rel_path.clone(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+        kind,
+    });
+    if ft.is_dir() {
+        let mut children: Vec<_> = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
+        children.sort_by_key(|e| e.file_name());
+        for entry in children {
+            let child_rel = rel_path.join(entry.file_name());
+            collect_datastore_entries(&entry.path(), canonical_root, child_rel, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fingerprint `data_dir/server` (structure, metadata, and regular-file contents)
+/// so a failed startup that exited before touching the datastore can safely roll
+/// back `.katamaran-version`, while any modification keeps the updated marker.
+///
+/// Permits internal symlinks whose resolved target stays inside `data_dir/server`
+/// (such as k3s's normal `agent-token -> token` link), but fails closed if
+/// `server` itself is a symlink or if any symlink inside it is dangling or
+/// resolves outside `data_dir/server`.
+fn snapshot_datastore(data_dir: &Path) -> io::Result<DatastoreSnapshot> {
+    let server_dir = data_dir.join("server");
+    match fs::symlink_metadata(&server_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::other(format!(
+            "cannot safely fingerprint symlinked datastore path {}",
+            server_dir.display()
+        ))),
+        Ok(_) => {
+            let canonical_root = fs::canonicalize(&server_dir)?;
+            let mut entries = Vec::new();
+            collect_datastore_entries(&server_dir, &canonical_root, PathBuf::new(), &mut entries)?;
+            // Writing SERVER_VERSION_STAMP is katamaran's own bookkeeping, not a
+            // change by k3s: drop the stamp and the times it bumps on `server/db/`.
+            let stamp_rel = Path::new("db").join(SERVER_VERSION_STAMP);
+            entries.retain(|e| e.rel_path != stamp_rel);
+            for e in &mut entries {
+                if e.rel_path == Path::new("db") {
+                    e.mtime = (0, 0);
+                    e.ctime = (0, 0);
+                }
+            }
+            Ok(DatastoreSnapshot::Present(entries))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DatastoreSnapshot::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+fn rollback_data_version_if_untouched(
+    data_dir: &Path,
+    data_version_file: &Path,
+    prev_data_version: Option<&str>,
+    before: Option<&DatastoreSnapshot>,
+) {
+    rollback_versions_if_untouched(data_dir, before, || {
+        restore_data_version(data_version_file, prev_data_version);
+    });
+}
+
+/// Run `restore` (which puts the version marker and stamp back to their prior
+/// states) only when `server/` is unchanged since `before` was taken.
+fn rollback_versions_if_untouched(
+    data_dir: &Path,
+    before: Option<&DatastoreSnapshot>,
+    restore: impl FnOnce(),
+) {
+    let Some(before) = before else {
+        return;
+    };
+    match snapshot_datastore(data_dir) {
+        Ok(after) if &after == before => restore(),
+        Ok(_) => {}
+        Err(e) => {
+            log(&format!(
+                "snapshot {} after startup failure: {e}; keeping updated version marker",
+                data_dir.display()
+            ));
+        }
+    }
+}
+
+/// Remove a version file that did not exist before and fsync its directory, so
+/// a crash cannot bring back a newer recorded version after a rollback.
+fn remove_durably(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log(&format!("remove {}: {e}", path.display()));
+            return;
+        }
+    }
+    if let Some(parent) = path.parent()
+        && let Err(e) = sync_dir(parent)
+    {
+        log(&format!("after removing {}: {e}", path.display()));
+    }
+}
+
+/// Restore the `server/db/` stamp to `prev`, removing it if it did not exist.
+fn restore_server_version_stamp(data_dir: &Path, prev: Option<&str>) {
+    match prev {
+        Some(v) => {
+            if let Err(e) = write_server_version_stamp(data_dir, v) {
+                log(&format!("restore server version stamp: {e}"));
+            }
+        }
+        None => remove_durably(&server_version_stamp(data_dir)),
+    }
+}
+
+fn restore_data_version(path: &Path, prev: Option<&str>) {
+    match prev {
+        Some(v) => {
+            if let Err(e) = write_atomic(path, format!("{v}\n").as_bytes()) {
+                log(&format!("restore {}: {e}", path.display()));
+            }
+        }
+        None => remove_durably(path),
+    }
+}
+
+fn commit_installed_binary(
+    tmp: &Path,
+    bin: &Path,
+    version_file: &Path,
+    version: &str,
+) -> Result<(), String> {
+    commit_installed_binary_with(tmp, bin, version_file, version, write_atomic)
+}
+
+/// Invalidate any previous version marker before swapping the executable into
+/// `bin`, so a failed or interrupted marker write cannot leave the previous
+/// version string describing the newly installed binary.
+fn commit_installed_binary_with(
+    tmp: &Path,
+    bin: &Path,
+    version_file: &Path,
+    version: &str,
+    write_version: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    match fs::remove_file(version_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("remove stale {}: {e}", version_file.display()));
+        }
+    }
+    fs::rename(tmp, bin).map_err(|e| format!("install {}: {e}", bin.display()))?;
+    write_version(version_file, format!("{version}\n").as_bytes())?;
     Ok(())
 }
 
@@ -578,9 +2174,24 @@ impl K8s {
         let reply = match req {
             K8sMsg::Status => Ok(K8sMsg::StatusInfo(self.info())),
             K8sMsg::Install { version } => self.install(&mut conn, &version).map(|()| K8sMsg::Done),
-            K8sMsg::Start => self.start_inner(&mut conn).map(K8sMsg::StatusInfo),
+            K8sMsg::Start {
+                extra_args,
+                config_yaml,
+            } => self
+                .start_inner(&mut conn, &extra_args, config_yaml.as_deref())
+                .map(K8sMsg::StatusInfo),
             K8sMsg::Stop => self.stop_inner(Some(&mut conn)).map(|()| K8sMsg::Done),
-            K8sMsg::Reset => self.reset_inner(&mut conn).map(|()| K8sMsg::Done),
+            K8sMsg::Reset { images } => {
+                let writer = ResetConnWriter::new(&conn, RESET_WRITE_TIMEOUT);
+                let msg = match self.reset_inner(&writer, images) {
+                    Ok(()) => K8sMsg::Done,
+                    Err(e) => K8sMsg::Error(e),
+                };
+                if !writer.failed() {
+                    let _ = k8s::write(&conn, &msg);
+                }
+                return;
+            }
             K8sMsg::Kubeconfig => read_kubeconfig().map(K8sMsg::KubeconfigData),
             K8sMsg::Connect { addr, port } => {
                 self.connect(conn, &addr, port);
@@ -591,6 +2202,10 @@ impl K8s {
                 relay_unix_proxy(conn, Path::new(PROXY_SOCKET));
                 return;
             }
+            K8sMsg::MarkDatastoreVersion { version } => {
+                self.mark_datastore_version(&version).map(|()| K8sMsg::Done)
+            }
+            K8sMsg::Capabilities => Ok(K8sMsg::CapabilitiesInfo(k8s::CAP_START_CONFIG)),
             other => Err(format!("unexpected request {other:?}")),
         };
         let msg = match reply {
@@ -616,6 +2231,46 @@ impl K8s {
         }
     }
 
+    fn run_sqlite_cmd(&self, cmd: &mut Command) -> Result<(i32, String), String> {
+        let (code, stdout, stderr) = run_reaped_split(&self.reaper, cmd, Duration::from_secs(10))
+            .map_err(|e| format!("sqlite3: {e}"))?;
+        if code != 0 && !stderr.trim().is_empty() {
+            log(&format!("sqlite3 stderr: {}", stderr.trim()));
+        }
+        Ok((code, stdout))
+    }
+
+    fn mark_datastore_version(&self, version: &str) -> Result<(), String> {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
+        let _guard = self.op_lock.lock().unwrap();
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err("aborted: VM is shutting down".into());
+        }
+        ensure_no_unreaped_k3s()?;
+        {
+            let st = self.state.lock().unwrap();
+            if st.running.is_some()
+                || matches!(st.phase.as_str(), "starting" | "running" | "stopping")
+            {
+                return Err(
+                    "stop Kubernetes (`kat k8s stop`) before recording the datastore version"
+                        .into(),
+                );
+            }
+        }
+        mark_datastore_version_at_with(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            version,
+            &state_db_probe(),
+            |cmd| self.run_sqlite_cmd(cmd),
+        )?;
+        log(&format!("recorded datastore version {version}"));
+        Ok(())
+    }
+
     fn install(&self, conn: &mut UnixStream, version: &str) -> Result<(), String> {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
@@ -624,9 +2279,18 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
+        ensure_no_unreaped_k3s()?;
+        validate_k3s_release_tag(version)?;
         if self.state.lock().unwrap().running.is_some() {
             return Err("stop Kubernetes before installing a new k3s binary".into());
         }
+        check_datastore_compatible_with(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            version,
+            &state_db_probe(),
+            |cmd| self.run_sqlite_cmd(cmd),
+        )?;
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress(format!("installing k3s {version}")),
@@ -665,8 +2329,12 @@ impl K8s {
             drop(f);
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("chmod {tmp}: {e}"))?;
-            fs::rename(&tmp, BIN).map_err(|e| format!("install {BIN}: {e}"))?;
-            write_atomic(Path::new(VERSION_FILE), format!("{version}\n").as_bytes())?;
+            commit_installed_binary(
+                Path::new(&tmp),
+                Path::new(BIN),
+                Path::new(VERSION_FILE),
+                version,
+            )?;
             Ok(())
         })();
         let _ = conn.set_read_timeout(None);
@@ -678,7 +2346,12 @@ impl K8s {
         res
     }
 
-    fn start_inner(self: &Arc<Self>, conn: &mut UnixStream) -> Result<K8sInfo, String> {
+    fn start_inner(
+        self: &Arc<Self>,
+        conn: &mut UnixStream,
+        extra_args: &[String],
+        config_yaml: Option<&str>,
+    ) -> Result<K8sInfo, String> {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
@@ -686,24 +2359,80 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
+        ensure_no_unreaped_k3s()?;
+        // Validate extra_args and normalize config_yaml before checking
+        // already-running state so invalid inputs always return their
+        // validation error and the running-settings comparison uses canonical
+        // JSON (comment-only YAML edits match).
+        let server_args = build_k3s_server_args(extra_args)?;
+        // k3s reads a canonical JSON rewrite of the host YAML, never the raw
+        // file; see `kat_proto::k3s_config` for the accepted subset and why.
+        let managed_config = match config_yaml {
+            Some(yaml) => Some(normalize_k3s_config_yaml(yaml)?),
+            None => None,
+        };
         {
             let st = self.state.lock().unwrap();
             if st.phase == "running" && st.api_ready {
+                // Never report success while silently ignoring new settings.
+                let cmp = match st.running.as_ref() {
+                    Some(r) => {
+                        check_running_settings_match(&r.settings, extra_args, managed_config.as_deref())
+                    }
+                    None => Err(
+                        "Kubernetes is already running with different k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
+                            .into(),
+                    ),
+                };
                 drop(st);
+                cmp?;
                 return Ok(self.info());
             }
         }
         if !Path::new(BIN).is_file() {
             return Err("k3s binary is not installed".into());
         }
+        let installed_version = read_trimmed_file(Path::new(VERSION_FILE))?.ok_or_else(|| {
+            "k3s installation is incomplete (missing version marker); restart Kubernetes to reinstall"
+                .to_string()
+        })?;
+        // Never copy a malformed tag into the datastore's version files.
+        validate_k3s_release_tag(&installed_version).map_err(|e| {
+            format!(
+                "installed k3s has an invalid version marker ({e}); restart Kubernetes to reinstall"
+            )
+        })?;
+        check_datastore_compatible_with(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            &installed_version,
+            &state_db_probe(),
+            |cmd| self.run_sqlite_cmd(cmd),
+        )?;
+        if managed_config.is_some() {
+            reject_managed_config_dropins(Path::new(K3S_CONFIG_PATH))?;
+        }
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("preparing k3s environment".into()),
         );
         prepare_dirs_and_sysctls(&self.reaper)?;
+        sync_k3s_config(Path::new(K3S_CONFIG_PATH), managed_config.as_deref())?;
         self.activate_containerd_cri(conn)?;
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
+        }
+
+        if !extra_args.is_empty() || config_yaml.is_some() {
+            log(&format!(
+                "starting k3s with {} extra arg(s){}",
+                extra_args.len(),
+                if config_yaml.is_some() {
+                    format!(" and {K3S_CONFIG_PATH}")
+                } else {
+                    String::new()
+                }
+            ));
         }
 
         let _ = k8s::write(&mut *conn, &K8sMsg::Progress("starting k3s server".into()));
@@ -715,32 +2444,71 @@ impl K8s {
             .map_err(|e| format!("open {LOG_FILE}: {e}"))?;
 
         let mut cmd = Command::new(BIN);
-        cmd.args([
-            "server",
-            &format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
-            &format!("--data-dir={DATA_DIR}"),
-            &format!("--write-kubeconfig={KUBECONFIG}"),
-            "--write-kubeconfig-mode=0600",
-            "--node-name=katamaran",
-            "--flannel-backend=host-gw",
-            "--cluster-cidr=10.42.0.0/16",
-            "--service-cidr=10.43.0.0/16",
-            "--cluster-dns=10.43.0.10",
-            "--tls-san=127.0.0.1",
-            "--tls-san=localhost",
-            "--tls-san=katamaran",
-            "--tls-san=k8s.kat.local",
-            "--https-listen-port=6443",
-            "--kubelet-arg=fail-swap-on=false",
-            &format!("--kubelet-arg=root-dir={KUBELET_DIR}"),
-            "--kube-proxy-arg=proxy-mode=nftables",
-        ])
-        .env("PATH", PATH)
-        .stdin(Stdio::null())
-        .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log_file);
+        cmd.args(&server_args)
+            .env("PATH", PATH)
+            .stdin(Stdio::null())
+            .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log_file);
+        configure_k3s_config_env(
+            &mut cmd,
+            config_yaml.is_some().then_some(Path::new(K3S_CONFIG_PATH)),
+        );
 
-        enable_bridge_netfilter()?;
+        let prev_data_version = match read_marker_file(Path::new(DATA_VERSION_FILE))? {
+            MarkerFile::Present(v) => Some(v),
+            MarkerFile::Missing | MarkerFile::Empty | MarkerFile::NonRegular => None,
+        };
+        let wrote_data_version = prev_data_version.as_deref() != Some(installed_version.as_str());
+        let prev_stamp = match read_marker_file(&server_version_stamp(Path::new(DATA_DIR)))? {
+            MarkerFile::Present(v) => Some(v),
+            MarkerFile::Missing | MarkerFile::Empty | MarkerFile::NonRegular => None,
+        };
+        let server_db_existed = server_db_dir_exists(Path::new(DATA_DIR))?;
+        let wrote_stamp =
+            server_db_existed && prev_stamp.as_deref() != Some(installed_version.as_str());
+        // A fresh datastore has no `server/db/` to stamp before launch; stamp it as
+        // soon as k3s creates the directory so even a backup taken after the very
+        // first shutdown carries the version.
+        let mut fresh_stamp_pending = !server_db_existed;
+        let stamp_fresh_datastore = |pending: &mut bool| {
+            stamp_new_datastore(Path::new(DATA_DIR), &installed_version, pending);
+        };
+        // Put each version file back exactly as it was (removing ones that did not exist).
+        let restore_versions = || {
+            if wrote_data_version {
+                restore_data_version(Path::new(DATA_VERSION_FILE), prev_data_version.as_deref());
+            }
+            if wrote_stamp {
+                restore_server_version_stamp(Path::new(DATA_DIR), prev_stamp.as_deref());
+            }
+        };
+        let before_datastore = if wrote_data_version || wrote_stamp {
+            match snapshot_datastore(Path::new(DATA_DIR)) {
+                Ok(snap) => Some(snap),
+                Err(e) => {
+                    log(&format!(
+                        "snapshot {DATA_DIR} before starting k3s: {e}; \
+                         startup failure will keep updated version marker"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        publish_version_files(
+            Path::new(DATA_DIR),
+            Path::new(DATA_VERSION_FILE),
+            &installed_version,
+            wrote_data_version,
+            wrote_stamp,
+            write_atomic,
+            restore_versions,
+        )?;
+        if let Err(e) = enable_bridge_netfilter() {
+            restore_versions();
+            return Err(e);
+        }
         // Mark active before spawning k3s so ports::watch ignores internal
         // control-plane ports (e.g. 6443) from the moment k3s binds them.
         ACTIVE.store(true, Ordering::SeqCst);
@@ -748,6 +2516,7 @@ impl K8s {
             Ok(v) => v,
             Err(e) => {
                 ACTIVE.store(false, Ordering::SeqCst);
+                restore_versions();
                 restore_bridge_netfilter();
                 return Err(format!("spawn k3s: {e}"));
             }
@@ -764,6 +2533,7 @@ impl K8s {
             st.error.clear();
             st.running = Some(Running {
                 pid,
+                settings: (extra_args.to_vec(), managed_config),
                 exit_rx,
                 exited: exited.clone(),
                 sync_stop: sync_stop.clone(),
@@ -833,13 +2603,28 @@ impl K8s {
                                 "k3s did not stop in time after k3s-watch spawn failure, killing it",
                             );
                             unsafe { libc::kill(pid, libc::SIGKILL) };
-                            rx.recv_timeout(Duration::from_secs(3)).is_ok()
+                            let done = rx.recv_timeout(Duration::from_secs(3)).is_ok();
+                            if !done {
+                                // Keep the reaper's own exit channel for this child.
+                                note_unreaped_k3s(pid, move || rx.try_recv().is_ok());
+                            }
+                            done
                         }
                     }
-                    None => false,
+                    None => {
+                        note_unreaped_k3s(pid, || false);
+                        false
+                    }
                 };
                 if reaped {
                     stop_k8s_workloads(&self.reaper);
+                    {
+                        rollback_versions_if_untouched(
+                            Path::new(DATA_DIR),
+                            before_datastore.as_ref(),
+                            restore_versions,
+                        );
+                    }
                     ACTIVE.store(false, Ordering::SeqCst);
                     FORWARDED.lock().unwrap().clear();
                     restore_bridge_netfilter();
@@ -874,10 +2659,15 @@ impl K8s {
                 st.api_ready = false;
                 st.running.take()
             };
-            if let Some(r) = running {
-                terminate_running(r);
-            }
+            let reaped = running.is_none_or(terminate_running);
             stop_k8s_workloads(&self.reaper);
+            if reaped {
+                rollback_versions_if_untouched(
+                    Path::new(DATA_DIR),
+                    before_datastore.as_ref(),
+                    restore_versions,
+                );
+            }
             ACTIVE.store(false, Ordering::SeqCst);
             FORWARDED.lock().unwrap().clear();
             restore_bridge_netfilter();
@@ -896,6 +2686,11 @@ impl K8s {
                 describe_status(status)
             );
             stop_k8s_workloads(&self.reaper);
+            rollback_versions_if_untouched(
+                Path::new(DATA_DIR),
+                before_datastore.as_ref(),
+                restore_versions,
+            );
             let mut st = self.state.lock().unwrap();
             if st.generation == my_gen {
                 st.phase = "failed".into();
@@ -909,12 +2704,43 @@ impl K8s {
             Err(err)
         };
 
+        // Stop a running-but-unready k3s and fail the start. Marks stopping first so
+        // the exit watcher does not race us, then reaps k3s and cleans up workloads
+        // before restoring sysctls.
+        let fail_running_startup = |err: String| -> Result<K8sInfo, String> {
+            let running = {
+                let mut st = self.state.lock().unwrap();
+                st.phase = "stopping".into();
+                st.api_ready = false;
+                st.running.take()
+            };
+            let reaped = running.is_none_or(terminate_running);
+            stop_k8s_workloads(&self.reaper);
+            if reaped {
+                rollback_versions_if_untouched(
+                    Path::new(DATA_DIR),
+                    before_datastore.as_ref(),
+                    restore_versions,
+                );
+            }
+            ACTIVE.store(false, Ordering::SeqCst);
+            FORWARDED.lock().unwrap().clear();
+            restore_bridge_netfilter();
+            let mut st = self.state.lock().unwrap();
+            if st.generation == my_gen {
+                st.phase = "failed".into();
+                st.error = err.clone();
+            }
+            Err(err)
+        };
+
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("waiting for Kubernetes API server".into()),
         );
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
+            stamp_fresh_datastore(&mut fresh_stamp_pending);
             if SHUTTING_DOWN.load(Ordering::SeqCst) {
                 return abort_for_shutdown();
             }
@@ -925,37 +2751,26 @@ impl K8s {
                 break;
             }
             if Instant::now() >= deadline {
-                let err = format!(
+                return fail_running_startup(format!(
                     "Kubernetes API not ready after {}s; see {LOG_FILE}",
                     READY_TIMEOUT.as_secs()
-                );
-                // Mark stopping first so the exit watcher does not race us,
-                // then reap k3s and clean up workloads before restoring sysctls.
-                let running = {
-                    let mut st = self.state.lock().unwrap();
-                    st.phase = "stopping".into();
-                    st.api_ready = false;
-                    st.running.take()
-                };
-                if let Some(r) = running {
-                    terminate_running(r);
-                }
-                stop_k8s_workloads(&self.reaper);
-                ACTIVE.store(false, Ordering::SeqCst);
-                FORWARDED.lock().unwrap().clear();
-                restore_bridge_netfilter();
-                let mut st = self.state.lock().unwrap();
-                if st.generation == my_gen {
-                    st.phase = "failed".into();
-                    st.error = err.clone();
-                }
-                return Err(err);
+                ));
             }
             thread::sleep(Duration::from_millis(250));
         }
 
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return abort_for_shutdown();
+        }
+        // Never report a cluster ready without its datastore version stamp: k3s's
+        // SQLite datastore lives in server/db/, so it must exist once the API is up.
+        stamp_fresh_datastore(&mut fresh_stamp_pending);
+        if fresh_stamp_pending {
+            return fail_running_startup(format!(
+                "could not record the k3s version in {}; stopped Kubernetes \
+                 (see {LOG_FILE} and the kat-init log)",
+                server_version_stamp(Path::new(DATA_DIR)).display()
+            ));
         }
         {
             let mut st = self.state.lock().unwrap();
@@ -1023,6 +2838,133 @@ impl K8s {
 
     /// Caller must hold `self.op_lock`.
     fn stop_locked(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
+        match conn {
+            Some(c) => self.stop_locked_with_progress(&mut |m| {
+                let _ = k8s::write(&mut *c, &K8sMsg::Progress(m.into()));
+            }),
+            None => self.stop_locked_with_progress(&mut |_| {}),
+        }
+    }
+
+    fn reset_inner(&self, writer: &ResetConnWriter<'_>, remove_images: bool) -> Result<(), String> {
+        let not_started = |e: &str| format!("{}{e}", k8s::RESET_NOT_STARTED_PREFIX);
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err(not_started("aborted: VM is shutting down"));
+        }
+        if !remove_images {
+            // Tell compatible daemons this plain reset is only queued so a
+            // connection that closes before RESET_STARTED_PROGRESS preserves
+            // host state (older daemons just display it as progress).
+            writer
+                .write_required(&K8sMsg::Progress(k8s::RESET_QUEUED_PROGRESS.into()))
+                .map_err(|e| not_started(&format!("send reset queued notice: {e}")))?;
+        }
+        // Stream bounded heartbeats while queued behind an in-flight guest
+        // Kubernetes operation so callers with idle timeouts stay alive, and
+        // bound the wait without sending `ResetAccepted` (or mutating state)
+        // until this reset actually acquires `op_lock`.
+        let _guard = try_lock_with_deadline(
+            &self.op_lock,
+            OP_LOCK_WAIT_TIMEOUT,
+            PROGRESS_HEARTBEAT_INTERVAL,
+            "waiting for active guest Kubernetes operation",
+            || SHUTTING_DOWN.load(Ordering::SeqCst) || writer.failed(),
+            &mut |msg| writer.write_progress(msg),
+        )
+        .map_err(|e| not_started(&describe_reset_abort(e, writer.failed())))?;
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return Err(not_started("aborted: VM is shutting down"));
+        }
+        if writer.failed() {
+            return Err(not_started("client stream write failed while queued"));
+        }
+        ensure_no_unreaped_k3s().map_err(|e| not_started(&e))?;
+        let accept = if remove_images {
+            K8sMsg::ResetAccepted
+        } else {
+            K8sMsg::Progress(k8s::RESET_STARTED_PROGRESS.into())
+        };
+        writer
+            .write_required(&accept)
+            .map_err(|e| not_started(&format!("send reset ack: {e}")))?;
+        let paths = ClusterDataPaths {
+            data_dir: Path::new(DATA_DIR),
+            legacy_kubelet_dir: Path::new(LEGACY_KUBELET_DIR),
+            kubeconfig: Path::new(KUBECONFIG),
+            k3s_config: Path::new(K3S_CONFIG_PATH),
+        };
+        let res = execute_reset_sequence(
+            remove_images,
+            &IMAGE_SYNC_LOCK,
+            IMAGE_SYNC_WAIT_TIMEOUT,
+            PROGRESS_HEARTBEAT_INTERVAL,
+            || SHUTTING_DOWN.load(Ordering::SeqCst) || writer.failed(),
+            &mut |msg| writer.write_progress(msg),
+            |progress| {
+                self.stop_locked_with_progress(progress)?;
+                // stop_locked reports success even if k3s survived SIGKILL; never delete
+                // the datastore underneath a live k3s.
+                ensure_no_unreaped_k3s()
+            },
+            |progress| preflight_containerd_for_reset(&self.reaper, progress),
+            |progress| {
+                // Nothing destructive runs once the reply stream to the host
+                // has failed: the data-cleared ack could never arrive.
+                let may_destroy = || {
+                    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                        Err("aborted: VM is shutting down".to_string())
+                    } else if writer.failed() {
+                        Err("client stream write failed; leaving cluster data intact".to_string())
+                    } else {
+                        Ok(())
+                    }
+                };
+                may_destroy()?;
+                // Remove the managed config copy first: if that fails, nothing has
+                // been destroyed yet and the reset error is accurate.
+                sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
+                progress("removing cluster data");
+                detach_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
+                let warning = remove_cluster_data_dirs(
+                    &paths,
+                    &may_destroy,
+                    |dir, beat| remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
+                    |parent, beat| {
+                        reclaim_stale_reaped(&self.reaper, parent, DATA_REMOVE_TIMEOUT, beat)
+                    },
+                    &mut || {
+                        writer
+                            .write_required(&K8sMsg::reset_data_cleared(remove_images))
+                            .map_err(|e| format!("send reset data-cleared ack: {e}"))
+                    },
+                    progress,
+                )?;
+                if let Some(w) = warning {
+                    log(&format!("k8s reset: {w}"));
+                    progress(&w);
+                }
+                Ok(())
+            },
+            |sync_guard, progress| {
+                progress("removing k8s.io images");
+                clear_k8s_images(
+                    &self.reaper,
+                    sync_guard,
+                    &|| SHUTTING_DOWN.load(Ordering::SeqCst) || writer.failed(),
+                    progress,
+                )
+            },
+        );
+        res.map_err(|e| describe_reset_abort(e, writer.failed()))?;
+        log(if remove_images {
+            "k3s cluster data and k8s.io images reset"
+        } else {
+            "k3s cluster data reset"
+        });
+        Ok(())
+    }
+
+    fn stop_locked_with_progress(&self, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
         let (running, needs_cleanup) = {
             let mut st = self.state.lock().unwrap();
             let needs_cleanup = st.running.is_some() || st.phase != "stopped";
@@ -1035,14 +2977,12 @@ impl K8s {
             st.api_ready = false;
             (st.running.take(), needs_cleanup)
         };
-        if let Some(c) = conn {
-            let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
-        }
+        progress("stopping k3s");
         if let Some(r) = running {
-            terminate_running(r);
+            let _ = terminate_running(r);
         }
         if needs_cleanup {
-            stop_k8s_workloads(&self.reaper);
+            stop_k8s_workloads_with_progress(&self.reaper, progress);
         }
         ACTIVE.store(false, Ordering::SeqCst);
         FORWARDED.lock().unwrap().clear();
@@ -1052,36 +2992,6 @@ impl K8s {
         st.api_ready = false;
         st.error.clear();
         log("k3s stopped");
-        Ok(())
-    }
-
-    fn reset_inner(&self, conn: &mut UnixStream) -> Result<(), String> {
-        if SHUTTING_DOWN.load(Ordering::SeqCst) {
-            return Err("aborted: VM is shutting down".into());
-        }
-        let _guard = self.op_lock.lock().unwrap();
-        if SHUTTING_DOWN.load(Ordering::SeqCst) {
-            return Err("aborted: VM is shutting down".into());
-        }
-        self.stop_locked(Some(&mut *conn))?;
-        let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
-        unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
-        if Path::new(DATA_DIR).exists() {
-            // Try btrfs subvolume delete first (instant if it is a subvolume),
-            // falling back to recursive removal.
-            let mut cmd = Command::new("/sbin/btrfs");
-            cmd.args(["subvolume", "delete", DATA_DIR]);
-            let _ = run_reaped(&self.reaper, &mut cmd, Duration::from_secs(30));
-            if Path::new(DATA_DIR).exists() {
-                fs::remove_dir_all(DATA_DIR).map_err(|e| format!("remove {DATA_DIR}: {e}"))?;
-            }
-        }
-        if Path::new(LEGACY_KUBELET_DIR).exists() {
-            fs::remove_dir_all(LEGACY_KUBELET_DIR)
-                .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
-        }
-        let _ = fs::remove_file(KUBECONFIG);
-        log("k3s cluster data reset");
         Ok(())
     }
 
@@ -1108,6 +3018,74 @@ impl K8s {
         let _ = upstream.set_nodelay(true);
         relay_guest_stream(conn, upstream);
     }
+}
+
+/// k3s also loads every `<config>.d/*.{yaml,yml}` next to the file it is
+/// given, and would read those raw. The managed config lives in a
+/// katamaran-owned directory where nothing else should create drop-ins, so
+/// refuse to start (rather than let k3s read unvalidated YAML) if one exists.
+fn reject_managed_config_dropins(config_path: &Path) -> Result<(), String> {
+    let dir = PathBuf::from(format!("{}.d", config_path.display()));
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => Err(format!(
+            "{} exists, but katamaran does not support k3s config drop-ins next to its managed config; remove it and put the settings in ~/.katamaran/k3s-config.yaml",
+            dir.display()
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("stat {}: {e}", dir.display())),
+    }
+}
+
+fn configure_k3s_config_env(cmd: &mut Command, managed_config: Option<&Path>) {
+    if let Some(path) = managed_config {
+        cmd.env("K3S_CONFIG_FILE", path);
+    } else {
+        cmd.env_remove("K3S_CONFIG_FILE");
+    }
+}
+
+fn build_k3s_server_args(extra_args: &[String]) -> Result<Vec<String>, String> {
+    k8s::validate_k3s_extra_args(extra_args)?;
+    let mut args = vec![
+        "server".to_string(),
+        format!("--container-runtime-endpoint=unix://{CONTAINERD_SOCKET}"),
+        format!("--data-dir={DATA_DIR}"),
+        format!("--write-kubeconfig={KUBECONFIG}"),
+        format!("--write-kubeconfig-mode={KUBECONFIG_MODE}"),
+        "--node-name=katamaran".to_string(),
+        "--flannel-backend=host-gw".to_string(),
+        "--cluster-cidr=10.42.0.0/16".to_string(),
+        "--service-cidr=10.43.0.0/16".to_string(),
+        "--cluster-dns=10.43.0.10".to_string(),
+        "--tls-san=127.0.0.1".to_string(),
+        "--tls-san=localhost".to_string(),
+        "--tls-san=katamaran".to_string(),
+        "--tls-san=k8s.kat.local".to_string(),
+        format!("--https-listen-port={API_PORT}"),
+        "--kubelet-arg=fail-swap-on=false".to_string(),
+        format!("--kubelet-arg=root-dir={KUBELET_DIR}"),
+        "--kube-proxy-arg=proxy-mode=nftables".to_string(),
+    ];
+    args.extend(extra_args.iter().cloned());
+    Ok(args)
+}
+
+fn sync_k3s_config(path: &Path, config_yaml: Option<&str>) -> Result<(), String> {
+    match config_yaml {
+        Some(yaml) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+            write_atomic_mode(path, yaml.as_bytes(), 0o600)?;
+        }
+        None => match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        },
+    }
+    Ok(())
 }
 
 trait GuestStream: Read + Write + Send + Sized + 'static {
@@ -1281,19 +3259,34 @@ fn restore_bridge_netfilter() {
     }
 }
 
-fn terminate_running(mut r: Running) {
+fn terminate_running(mut r: Running) -> bool {
     r.sync_stop.store(true, Ordering::SeqCst);
-    if r.exited.lock().unwrap().is_none() {
+    let reaped = if r.exited.lock().unwrap().is_some() {
+        true
+    } else {
         unsafe { libc::kill(r.pid, libc::SIGTERM) };
-        if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_err() {
+        let grace = if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            SHUTDOWN_K3S_STOP_TIMEOUT
+        } else {
+            STOP_TIMEOUT
+        };
+        if r.exit_rx.recv_timeout(grace).is_ok() {
+            true
+        } else {
             log("k3s did not stop in time, killing it");
             unsafe { libc::kill(r.pid, libc::SIGKILL) };
-            let _ = r.exit_rx.recv_timeout(Duration::from_secs(3));
+            r.exit_rx.recv_timeout(Duration::from_secs(3)).is_ok()
         }
+    };
+    if !reaped {
+        // The k3s-watch thread records the reaper's exit status in `exited`.
+        let exited = Arc::clone(&r.exited);
+        note_unreaped_k3s(r.pid, move || exited.lock().unwrap().is_some());
     }
     if let Some(t) = r.proxy_thread.take() {
         let _ = t.join();
     }
+    reaped
 }
 
 /// Unescape octal escape sequences (`\040`, `\011`, `\012`, `\134`) used in
@@ -1361,125 +3354,94 @@ fn umount_detach(target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn unmount_paths_under(prefixes: &[&str]) -> Result<(), String> {
-    let text = fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|e| format!("read /proc/self/mountinfo: {e}"))?;
-    let mut failures = Vec::new();
-    for mp in mounts_under_prefixes(&text, prefixes) {
-        if let Err(e) = sys::umount(&mp)
-            && let Err(de) = umount_detach(&mp)
-        {
-            let msg = format!("unmount {mp} failed ({e}); detach failed: {de}");
-            log(&msg);
-            failures.push(msg);
+/// Stop and remove `k8s.io` tasks and containers one `ctr` call at a time.
+/// `abort` is checked before every call so a caller holding `op_lock` (reset
+/// preflight) stops issuing commands as soon as the VM starts shutting down.
+fn stop_k8s_containers_with_progress(
+    reaper: &Reaper,
+    abort: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(&str),
+) {
+    let mut last_beat = Instant::now();
+    let mut maybe_beat = |msg: &str| {
+        if last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
+            progress(msg);
+            last_beat = Instant::now();
         }
+    };
+    // Every `ctr` call goes through here, so `abort` is checked immediately
+    // before each command is spawned and none starts once it is set.
+    let ctr = |args: &[&str], timeout: Duration| -> Option<String> {
+        if abort() {
+            return None;
+        }
+        let mut cmd = Command::new("/usr/bin/ctr");
+        guard_cleanup_command(&mut cmd)
+            .args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io"])
+            .args(args);
+        match run_reaped_split(reaper, &mut cmd, timeout) {
+            Ok((0, out, _)) => Some(out),
+            _ => Some(String::new()),
+        }
+    };
+    let ids = |out: &str| -> Vec<String> {
+        out.lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+
+    let Some(tasks) = ctr(&["tasks", "ls", "-q"], Duration::from_secs(10)) else {
+        return;
+    };
+    let tasks = ids(&tasks);
+    for id in &tasks {
+        maybe_beat("stopping k8s.io tasks");
+        let _ = ctr(
+            &["tasks", "kill", "-a", "-s", "SIGTERM", id],
+            Duration::from_secs(5),
+        );
     }
-    let after = fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|e| format!("re-read /proc/self/mountinfo: {e}"))?;
-    let remaining = mounts_under_prefixes(&after, prefixes);
-    if !remaining.is_empty() {
-        let detail = if failures.is_empty() {
-            format!("mounts still active: {}", remaining.join(", "))
-        } else {
-            format!(
-                "mounts still active ({}): {}",
-                remaining.join(", "),
-                failures.join("; ")
-            )
-        };
-        return Err(detail);
+    if !tasks.is_empty() {
+        if abort() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(500));
     }
-    Ok(())
+    for id in &tasks {
+        maybe_beat("removing k8s.io tasks");
+        let _ = ctr(
+            &["tasks", "kill", "-a", "-s", "SIGKILL", id],
+            Duration::from_secs(5),
+        );
+        let _ = ctr(&["tasks", "rm", "-f", id], Duration::from_secs(5));
+    }
+    let Some(containers) = ctr(&["containers", "ls", "-q"], Duration::from_secs(10)) else {
+        return;
+    };
+    for id in ids(&containers) {
+        maybe_beat("removing k8s.io containers");
+        let _ = ctr(&["containers", "rm", &id], Duration::from_secs(5));
+    }
 }
 
 /// Stop and remove Kubernetes tasks/containers in the shared containerd
 /// `k8s.io` namespace and tear down CNI interfaces, kube-proxy nftables rules,
 /// and kubelet/data-dir mounts without touching Docker's `moby` namespace.
 fn stop_k8s_workloads(reaper: &Reaper) {
-    let mut ls = Command::new("/usr/bin/ctr");
-    ls.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io", "tasks", "ls", "-q"]);
-    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut ls, Duration::from_secs(10)) {
-        let ids: Vec<&str> = out
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        for id in &ids {
-            let mut kill = Command::new("/usr/bin/ctr");
-            kill.args([
-                "-a",
-                CONTAINERD_SOCKET,
-                "-n",
-                "k8s.io",
-                "tasks",
-                "kill",
-                "-a",
-                "-s",
-                "SIGTERM",
-                id,
-            ]);
-            let _ = run_reaped(reaper, &mut kill, Duration::from_secs(5));
-        }
-        if !ids.is_empty() {
-            thread::sleep(Duration::from_millis(500));
-        }
-        for id in &ids {
-            let mut kill = Command::new("/usr/bin/ctr");
-            kill.args([
-                "-a",
-                CONTAINERD_SOCKET,
-                "-n",
-                "k8s.io",
-                "tasks",
-                "kill",
-                "-a",
-                "-s",
-                "SIGKILL",
-                id,
-            ]);
-            let _ = run_reaped(reaper, &mut kill, Duration::from_secs(5));
-            let mut rm = Command::new("/usr/bin/ctr");
-            rm.args([
-                "-a",
-                CONTAINERD_SOCKET,
-                "-n",
-                "k8s.io",
-                "tasks",
-                "rm",
-                "-f",
-                id,
-            ]);
-            let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
-        }
-    }
-    let mut cls = Command::new("/usr/bin/ctr");
-    cls.args([
-        "-a",
-        CONTAINERD_SOCKET,
-        "-n",
-        "k8s.io",
-        "containers",
-        "ls",
-        "-q",
-    ]);
-    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut cls, Duration::from_secs(10)) {
-        for id in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            let mut rm = Command::new("/usr/bin/ctr");
-            rm.args([
-                "-a",
-                CONTAINERD_SOCKET,
-                "-n",
-                "k8s.io",
-                "containers",
-                "rm",
-                id,
-            ]);
-            let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
-        }
-    }
+    stop_k8s_workloads_with_progress(reaper, &mut |_| {});
+}
+
+fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&str)) {
+    let cut_off = workload_cleanup_cut_off;
+    stop_k8s_containers_with_progress(reaper, &cut_off, progress);
     for iface in ["cni0", "flannel.1"] {
+        if cut_off() {
+            return;
+        }
         let mut del = Command::new("/sbin/ip");
-        del.args(["link", "delete", iface]);
+        guard_cleanup_command(&mut del).args(["link", "delete", iface]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
     }
     let nft_bin = [
@@ -1492,11 +3454,19 @@ fn stop_k8s_workloads(reaper: &Reaper) {
     .find(|p| Path::new(p).is_file())
     .unwrap_or("nft");
     for family in ["ip", "ip6"] {
+        if cut_off() {
+            return;
+        }
         let mut del = Command::new(nft_bin);
-        del.args(["delete", "table", family, "kube-proxy"]);
+        guard_cleanup_command(&mut del).args(["delete", "table", family, "kube-proxy"]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
     }
-    if let Err(e) = unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
+    if cut_off() {
+        return;
+    }
+    // Lazy detach: a plain umount can block forever on an unreachable pod
+    // volume (e.g. NFS) while the caller holds `op_lock`.
+    if let Err(e) = detach_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
         log(&format!("cleanup mounts: {e}"));
     }
 }
@@ -1533,23 +3503,47 @@ fn ensure_symlink(link: &str, target: &str) -> Result<(), String> {
 }
 
 fn wait_containerd() -> Result<(), String> {
+    wait_containerd_with_progress(&mut |_| {})
+}
+
+fn wait_containerd_with_progress(progress: &mut dyn FnMut(&str)) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_beat = Instant::now();
     while Instant::now() < deadline {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
-        if UnixStream::connect(CONTAINERD_SOCKET).is_ok() {
+        let attempt_deadline = (Instant::now() + Duration::from_millis(250)).min(deadline);
+        if super::shutdown::connect_unix_until(CONTAINERD_SOCKET, attempt_deadline).is_some() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        if Instant::now() >= deadline {
+            break;
+        }
+        if last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
+            progress("waiting for containerd");
+            last_beat = Instant::now();
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        thread::sleep(rem.min(Duration::from_millis(50)));
     }
     Err(format!("containerd socket {CONTAINERD_SOCKET} not ready"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedStream {
+    text: String,
+    truncated: bool,
+}
+
 /// Drain `r` completely to EOF so the child never blocks on a full pipe, while
-/// retaining at most `limit` bytes for diagnostics or parsing.
-fn drain_capped(mut r: impl Read, limit: usize) -> String {
+/// retaining at most `limit` bytes and reporting whether any bytes were dropped.
+fn drain_capped_checked(mut r: impl Read, limit: usize) -> CapturedStream {
     let mut captured = Vec::new();
+    let mut truncated = false;
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk) {
@@ -1559,12 +3553,35 @@ fn drain_capped(mut r: impl Read, limit: usize) -> String {
                 if room > 0 {
                     captured.extend_from_slice(&chunk[..n.min(room)]);
                 }
+                if n > room {
+                    truncated = true;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => {
+                truncated = true;
+                break;
+            }
         }
     }
-    String::from_utf8_lossy(&captured).into_owned()
+    CapturedStream {
+        text: String::from_utf8_lossy(&captured).into_owned(),
+        truncated,
+    }
+}
+
+/// Drain `r` completely to EOF so the child never blocks on a full pipe, while
+/// retaining at most `limit` bytes for diagnostics or parsing.
+fn drain_capped(r: impl Read, limit: usize) -> String {
+    drain_capped_checked(r, limit).text
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReapedOutput {
+    code: i32,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
 }
 
 /// Run `cmd` under PID 1's reaper capturing `stdout` and `stderr` separately
@@ -1574,61 +3591,1114 @@ fn run_reaped_split(
     cmd: &mut Command,
     timeout: Duration,
 ) -> io::Result<(i32, String, String)> {
-    let (out_r, out_w) = pipe()?;
-    let (err_r, err_w) = pipe()?;
-    cmd.env("PATH", PATH)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_w))
-        .stderr(Stdio::from(err_w));
-    let (pid, exited) = reaper.spawn(cmd)?;
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let out = run_reaped_split_checked(reaper, cmd, timeout, 1 << 20, false, None)?;
+    Ok((out.code, out.stdout, out.stderr))
+}
 
-    let out_t = match thread::Builder::new()
-        .name("k8s-cmd-out".into())
-        .spawn(move || drain_capped(File::from(out_r), 1 << 20))
-    {
-        Ok(h) => h,
-        Err(e) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = exited.recv_timeout(Duration::from_secs(2));
-            return Err(e);
-        }
-    };
-    let err_t = match thread::Builder::new()
-        .name("k8s-cmd-err".into())
-        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
-    {
-        Ok(h) => h,
-        Err(e) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = exited.recv_timeout(Duration::from_secs(2));
-            let _ = out_t.join();
-            return Err(e);
-        }
-    };
+/// Bounded writer for guest-side reset frames. Sets `SO_SNDTIMEO` and latches
+/// the first write error so a slow or unread direct guest-socket client cannot
+/// block a reset while holding `op_lock` or receive corrupted follow-up frames.
+struct ResetConnWriter<'a> {
+    conn: &'a UnixStream,
+    write_failed: AtomicBool,
+}
 
-    let status = match exited.recv_timeout(timeout) {
-        Ok(s) => s,
-        Err(RecvTimeoutError::Timeout) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = exited.recv_timeout(Duration::from_secs(2));
-            let _ = out_t.join();
-            let _ = err_t.join();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{:?} timed out", cmd.get_program()),
+impl<'a> ResetConnWriter<'a> {
+    fn new(conn: &'a UnixStream, timeout: Duration) -> Self {
+        let _ = conn.set_write_timeout(Some(timeout));
+        Self {
+            conn,
+            write_failed: AtomicBool::new(false),
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.write_failed.load(Ordering::Relaxed)
+    }
+
+    fn write_progress(&self, msg: &str) {
+        if self.failed() {
+            return;
+        }
+        if k8s::write(self.conn, &K8sMsg::Progress(msg.into())).is_err() {
+            self.write_failed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn write_required(&self, msg: &K8sMsg) -> Result<(), String> {
+        if self.failed() {
+            return Err("client stream write failed".into());
+        }
+        k8s::write(self.conn, msg).map_err(|e| {
+            self.write_failed.store(true, Ordering::Relaxed);
+            e.to_string()
+        })
+    }
+}
+
+struct ClusterDataPaths<'a> {
+    data_dir: &'a Path,
+    legacy_kubelet_dir: &'a Path,
+    kubeconfig: &'a Path,
+    k3s_config: &'a Path,
+}
+
+/// Like `Path::exists`, but uses `symlink_metadata` and propagates filesystem
+/// errors (such as `EIO`, `EACCES`, or `ENOTDIR`) instead of mistaking them for
+/// absence.
+fn path_exists_checked(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+fn next_stale_data_dir(parent: &Path) -> Result<std::path::PathBuf, String> {
+    let parent = &reset_trash_dir(parent, true)?.expect("created");
+    for _ in 0..16 {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let suffix = fs::read_to_string("/proc/sys/kernel/random/uuid")
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}-{nanos}-{seq}", std::process::id())
+            });
+        let candidate = parent.join(format!("{DATA_DIR_STALE_PREFIX}{suffix}"));
+        if !path_exists_checked(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(
+        "{DATA_DIR_STALE_PREFIX}{}-{seq}",
+        std::process::id()
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_reset_sequence<T>(
+    remove_images: bool,
+    image_sync_lock: &Mutex<T>,
+    sync_wait_timeout: Duration,
+    heartbeat: Duration,
+    shutting_down: impl Fn() -> bool,
+    progress: &mut dyn FnMut(&str),
+    mut stop: impl FnMut(&mut dyn FnMut(&str)) -> Result<(), String>,
+    mut wait_containerd: impl FnMut(&mut dyn FnMut(&str)) -> Result<(), String>,
+    mut remove_data: impl FnMut(&mut dyn FnMut(&str)) -> Result<(), String>,
+    mut clear_images: impl FnMut(
+        &std::sync::MutexGuard<'_, T>,
+        &mut dyn FnMut(&str),
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    stop(progress)?;
+    // For image resets acquire `IMAGE_SYNC_LOCK` first; then, for EVERY reset,
+    // confirm via containerd that no `k8s.io` task or container is left BEFORE
+    // deleting cluster data, so sync contention, an unreachable containerd, or
+    // a pod that survived the stop leaves the active datastore intact.
+    let sync_guard = if remove_images {
+        Some(try_lock_with_deadline(
+            image_sync_lock,
+            sync_wait_timeout,
+            heartbeat,
+            "waiting for background image sync to stop",
+            &shutting_down,
+            progress,
+        )?)
+    } else {
+        None
+    };
+    wait_containerd(progress)?;
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    remove_data(progress)?;
+    if let Some(ref g) = sync_guard {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        clear_images(g, progress)?;
+    }
+    Ok(())
+}
+
+/// Reset steps share one abort check (`SHUTTING_DOWN || reply stream failed`)
+/// whose message names the shutdown; report a failed reply stream as such.
+fn describe_reset_abort(e: String, stream_failed: bool) -> String {
+    if stream_failed && !SHUTTING_DOWN.load(Ordering::SeqCst) {
+        e.replace(
+            "aborted: VM is shutting down",
+            "aborted: the reply stream to the host failed",
+        )
+    } else {
+        e
+    }
+}
+
+/// Remove active Kubernetes cluster data with exactly one irreversible step.
+///
+/// 1. Atomically rename `data_dir` to a unique `.katamaran-reset-trash/data-*` sibling —
+///    the single step that makes the active datastore unreachable.
+/// 2. Remove the k3s kubeconfig and config, then acknowledge with
+///    `on_active_data_cleared` (the host disables auto-start on this ack).
+/// 3. Best-effort cleanup: remove the legacy pre-migration kubelet directory
+///    with `remove_legacy` and reclaim every `.katamaran-reset-trash/data-*` sibling with
+///    `reclaim_stale`.
+///
+/// `may_destroy` is checked immediately before steps 1 and 3; if it fails
+/// (VM shutting down or the reply stream to the host already failed) nothing
+/// further is destroyed. If the ack in step 2 fails, cleanup is skipped and
+/// an error is returned. Cleanup failure is not a reset failure: the active
+/// data is already gone and leftovers are retried on the next reset,
+/// so it is returned as `Ok(Some(warning))`.
+fn remove_cluster_data_dirs(
+    paths: &ClusterDataPaths<'_>,
+    may_destroy: &dyn Fn() -> Result<(), String>,
+    mut remove_legacy: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
+    mut reclaim_stale: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
+    on_active_data_cleared: &mut dyn FnMut() -> Result<(), String>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<Option<String>, String> {
+    let mut beat = || progress("removing cluster data");
+    if path_exists_checked(paths.data_dir)? {
+        let parent = paths
+            .data_dir
+            .parent()
+            .ok_or_else(|| format!("missing parent directory for {}", paths.data_dir.display()))?;
+        let staged = next_stale_data_dir(parent)?;
+        may_destroy()?;
+        fs::rename(paths.data_dir, &staged).map_err(|e| {
+            format!(
+                "detach {} -> {}: {e}",
+                paths.data_dir.display(),
+                staged.display()
+            )
+        })?;
+    }
+    let _ = fs::remove_file(paths.kubeconfig);
+    let _ = fs::remove_file(paths.k3s_config);
+    on_active_data_cleared()?;
+
+    // Everything below is cleanup of data the host already knows is gone.
+    if let Err(e) = may_destroy() {
+        return Ok(Some(format!(
+            "leftover cluster data not removed ({e}); it is removed on the next reset"
+        )));
+    }
+    let mut warnings = Vec::new();
+    match path_exists_checked(paths.legacy_kubelet_dir) {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(e) = remove_legacy(paths.legacy_kubelet_dir, &mut beat) {
+                warnings.push(format!("could not remove legacy kubelet data ({e})"));
+            }
+        }
+        Err(e) => warnings.push(e),
+    }
+    // Re-checked: the legacy cleanup may have run long enough for a progress
+    // write to fail.
+    if let Err(e) = may_destroy() {
+        warnings.push(format!("detached cluster data not reclaimed ({e})"));
+    } else if let Some(parent) = paths.data_dir.parent()
+        && let Err(e) = reclaim_stale(parent, &mut beat)
+    {
+        warnings.push(format!("could not reclaim detached cluster data ({e})"));
+    }
+    if warnings.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{}; it is retried on the next reset",
+        warnings.join("; ")
+    )))
+}
+
+/// Remove every `DATA_DIR_STALE_PREFIX*` entry directly under `parent` (the
+/// detached datastore of this reset plus leftovers from earlier timed-out
+/// resets) with `remove`. A missing `parent` is an empty inventory.
+fn reclaim_stale_dirs(
+    parent: &Path,
+    remove: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(trash) = reset_trash_dir(parent, false)? else {
+        return Ok(());
+    };
+    let parent = trash.as_path();
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "read {} for detached cluster data: {e}",
+                parent.display()
             ));
         }
-        Err(RecvTimeoutError::Disconnected) => -1,
     };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = err_t.join().unwrap_or_default();
+    let mut stale = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("scan {} for detached cluster data: {e}", parent.display()))?;
+        if entry.file_name().to_str().is_some_and(is_reset_trash_name) {
+            stale.push(entry.path());
+        }
+    }
+    stale.sort();
+    // Try every copy: one that cannot be removed must not keep the others
+    // (including the one this reset just detached) on disk.
+    let errors: Vec<String> = stale.iter().filter_map(|dir| remove(dir).err()).collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// argv[1] that makes `/proc/self/exe` (kat-init, not PID 1) run
+/// [`rmtree_main`] instead of booting the guest.
+pub const RMTREE_HELPER_ARG: &str = "rmtree";
+
+/// argv[2] after [`RMTREE_HELPER_ARG`] selecting stale-sibling reclamation.
+const RMTREE_STALE_FLAG: &str = "--stale-in";
+
+/// Run `/proc/self/exe rmtree <args>` as a killable helper supervised by PID
+/// 1's reaper with a finite `timeout`, shutdown abort, and periodic `beat`
+/// heartbeats; `what` names the target in errors.
+///
+/// Running the walk in a child process (rather than inline) means a filesystem
+/// call that stalls in the kernel can never hold `op_lock` past the deadline or
+/// block orderly VM shutdown: the reaper SIGKILLs the helper and the wait stays
+/// bounded even if the child cannot exit immediately. The helper is kat-init
+/// itself, so reset does not depend on any particular `/bin/rm` in the rootfs.
+/// Exit status 0 means every target was unlinked (or already absent), so the
+/// parent performs no follow-up filesystem checks of its own.
+fn run_rmtree_helper(
+    reaper: &Reaper,
+    args: &[&std::ffi::OsStr],
+    what: &Path,
+    timeout: Duration,
+    beat: &mut dyn FnMut(),
+) -> Result<(), String> {
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg(RMTREE_HELPER_ARG).args(args);
+    let out = run_reaped_split_checked(reaper, &mut cmd, timeout, 64 << 10, true, Some(beat))
+        .map_err(|e| format!("remove {}: {e}", what.display()))?;
+    if out.code != 0 {
+        let detail = ctr_error_detail(&out.stdout, &out.stderr);
+        return Err(if detail.is_empty() {
+            format!(
+                "remove {}: helper exited with status {}",
+                what.display(),
+                out.code
+            )
+        } else {
+            detail.to_string()
+        });
+    }
+    Ok(())
+}
+
+/// Remove `path` recursively in the killable helper (see [`run_rmtree_helper`]).
+fn remove_tree_reaped(
+    reaper: &Reaper,
+    path: &Path,
+    timeout: Duration,
+    beat: &mut dyn FnMut(),
+) -> Result<(), String> {
+    run_rmtree_helper(reaper, &[path.as_os_str()], path, timeout, beat)
+}
+
+/// Discover and remove detached `DATA_DIR_STALE_PREFIX*` siblings under
+/// `parent` entirely inside the killable helper (see [`reclaim_stale_dirs`]).
+fn reclaim_stale_reaped(
+    reaper: &Reaper,
+    parent: &Path,
+    timeout: Duration,
+    beat: &mut dyn FnMut(),
+) -> Result<(), String> {
+    run_rmtree_helper(
+        reaper,
+        &[std::ffi::OsStr::new(RMTREE_STALE_FLAG), parent.as_os_str()],
+        parent,
+        timeout,
+        beat,
+    )
+}
+
+/// Delete `path` if it is a btrfs subvolume root, using the
+/// `BTRFS_IOC_SNAP_DESTROY` ioctl on its already-open parent directory so the
+/// final component is looked up by name without following symlinks. Returns
+/// `Ok(false)` when `path` is not a subvolume root (or not on btrfs).
+fn destroy_btrfs_subvolume(path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
+    const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
+    /// `_IOW(0x94, 15, struct btrfs_ioctl_vol_args)` (4096-byte argument).
+    const BTRFS_IOC_SNAP_DESTROY: libc::c_ulong = 0x5000_940f;
+    #[repr(C)]
+    struct VolArgs {
+        fd: i64,
+        name: [u8; 4088],
+    }
+
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(false);
+    };
+    let name = name.as_bytes();
+    if name.len() >= 4088 {
+        return Ok(false);
+    }
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)?;
+    let c_name = CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: plain-data out-params fully written on success; `c_name` is
+    // NUL-terminated and `dir` is a live descriptor.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        loop {
+            if libc::fstatat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+            {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || st.st_ino as u64 != BTRFS_FIRST_FREE_OBJECTID
+        {
+            return Ok(false);
+        }
+        let mut fs: libc::statfs = std::mem::zeroed();
+        loop {
+            if libc::fstatfs(dir.as_raw_fd(), &mut fs) == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+        }
+        if fs.f_type as i64 != BTRFS_SUPER_MAGIC {
+            return Ok(false);
+        }
+        let mut args = VolArgs {
+            fd: 0,
+            name: [0; 4088],
+        };
+        args.name[..name.len()].copy_from_slice(name);
+        loop {
+            if libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_SNAP_DESTROY as _, &mut args) == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `/init rmtree <path>` removes `<path>` with [`remove_tree_nofollow`];
+/// `/init rmtree --stale-in <parent>` runs [`reclaim_stale_dirs`] on `<parent>`.
+/// Exits 0 on success, or prints the error to stderr and exits 1.
+pub fn rmtree_main() -> ! {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    let no_check = &mut |_: &Path| -> Result<(), String> { Ok(()) };
+    let res = match args.as_slice() {
+        [flag, parent] if flag == RMTREE_STALE_FLAG => {
+            reclaim_stale_dirs(Path::new(parent), &mut |p| {
+                // Detach anything still mounted under a stale datastore (for
+                // example left by an earlier interrupted reset); the walk
+                // itself also refuses to cross mount points.
+                let prefix = p
+                    .to_str()
+                    .ok_or_else(|| format!("non-UTF-8 path {}", p.display()))?;
+                detach_paths_under(&[prefix])?;
+                // A detached datastore that is a btrfs subvolume (the usual
+                // case) is deleted in one step; anything left (or any plain
+                // directory) is removed by the no-follow walk.
+                if let Err(e) = destroy_btrfs_subvolume(p) {
+                    eprintln!(
+                        "btrfs subvolume delete {}: {e}; removing it file by file",
+                        p.display()
+                    );
+                }
+                remove_tree_nofollow(p, no_check)
+            })
+        }
+        [path] => remove_tree_nofollow(Path::new(path), no_check),
+        _ => {
+            eprintln!(
+                "usage: {RMTREE_HELPER_ARG} <path> | {RMTREE_HELPER_ARG} {RMTREE_STALE_FLAG} <parent>"
+            );
+            std::process::exit(2);
+        }
+    };
+    match res {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Maximum directory streams [`remove_tree_nofollow`] keeps open at once,
+/// independent of tree depth (well below the guest's `nofile` limit).
+const RMTREE_MAX_OPEN_DIRS: usize = 32;
+
+/// One directory on the current descent path: the name it has in its parent,
+/// its identity, and its stream while open. Ancestors more than
+/// `max_open` levels above the deepest directory are closed and later
+/// reopened by name from the pinned root parent, with their identity checked.
+struct DirFrame {
+    dir: Option<std::ptr::NonNull<libc::DIR>>,
+    name: CString,
+    path: std::path::PathBuf,
+    /// `(st_dev, st_ino)` recorded when first opened.
+    id: (u64, u64),
+    /// Whether any entry was seen during the current readdir pass.
+    saw_entry: bool,
+}
+
+impl DirFrame {
+    /// Descriptor of the open stream; callers ensure the frame is open.
+    fn fd(&self) -> std::os::fd::RawFd {
+        let dir = self.dir.expect("directory frame is open");
+        // SAFETY: `dir` is a live stream owned by this frame.
+        unsafe { libc::dirfd(dir.as_ptr()) }
+    }
+
+    fn close(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            // SAFETY: `dir` came from `fdopendir` and is closed exactly once.
+            unsafe { libc::closedir(dir.as_ptr()) };
+        }
+    }
+}
+
+impl Drop for DirFrame {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn dir_identity(dir: std::ptr::NonNull<libc::DIR>) -> io::Result<(u64, u64)> {
+    // SAFETY: `dir` is a live stream; `st` is fully written by fstat on success.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::dirfd(dir.as_ptr()), &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+}
+
+/// Which mount `fd` lives on: the kernel mount ID from
+/// `statx(STATX_MNT_ID)` (btrfs subvolumes share their mount's ID), falling
+/// back to `st_dev` on kernels without it (conservatively treating every
+/// device change as a mount boundary).
+fn mount_key(fd: std::os::fd::RawFd) -> io::Result<(bool, u64)> {
+    // SAFETY: the empty path with AT_EMPTY_PATH stats `fd` itself; `stx` is
+    // plain data fully initialized by zeroing and written by statx.
+    unsafe {
+        let mut stx: libc::statx = std::mem::zeroed();
+        if libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stx,
+        ) == 0
+            && stx.stx_mask & libc::STATX_MNT_ID != 0
+        {
+            return Ok((true, stx.stx_mnt_id));
+        }
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((false, st.st_dev as u64))
+    }
+}
+
+/// Reopen `stack[idx]` (and any closed ancestors) by walking names down from
+/// `root_parent` with `O_NOFOLLOW`, verifying each directory's recorded
+/// identity so a renamed or swapped ancestor is never entered. Keeps the
+/// deepest `max_open` reopened frames open.
+fn reopen_frames(
+    stack: &mut [DirFrame],
+    idx: usize,
+    root_parent: std::os::fd::RawFd,
+    max_open: usize,
+) -> Result<(), String> {
+    let first = stack[..=idx]
+        .iter()
+        .rposition(|f| f.dir.is_some())
+        .map_or(0, |i| i + 1);
+    for j in first..=idx {
+        let parent_fd = if j == 0 {
+            root_parent
+        } else {
+            stack[j - 1].fd()
+        };
+        let dir = open_dir_nofollow(parent_fd, &stack[j].name)
+            .map_err(|e| format!("reopen {}: {e}", stack[j].path.display()))?;
+        stack[j].dir = Some(dir);
+        let id = dir_identity(dir).map_err(|e| format!("stat {}: {e}", stack[j].path.display()))?;
+        if id != stack[j].id {
+            return Err(format!(
+                "remove {}: directory was replaced during removal",
+                stack[j].path.display()
+            ));
+        }
+        stack[j].saw_entry = false;
+        if j > 0 && j + max_open <= idx + 1 {
+            stack[j - 1].close();
+        }
+    }
+    for f in stack[..(idx + 1).saturating_sub(max_open)].iter_mut() {
+        f.close();
+    }
+    Ok(())
+}
+
+/// `openat(parent, name, O_DIRECTORY | O_NOFOLLOW)` + `fdopendir`. Fails with
+/// `ELOOP` / `ENOTDIR` if `name` is (now) a symlink or non-directory, so a
+/// directory swapped for a symlink is never entered.
+fn open_dir_nofollow(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> io::Result<std::ptr::NonNull<libc::DIR>> {
+    // SAFETY: `name` is NUL-terminated; the fd is owned by the stream on success.
+    let fd = loop {
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    // SAFETY: `fd` is a valid directory descriptor we own.
+    match std::ptr::NonNull::new(unsafe { libc::fdopendir(fd) }) {
+        Some(dir) => Ok(dir),
+        None => {
+            let e = io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+            unsafe { libc::close(fd) };
+            Err(e)
+        }
+    }
+}
+
+/// `unlinkat(parent, name, flags)`, treating `ENOENT` as success.
+fn unlinkat_checked(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> io::Result<()> {
+    // SAFETY: `name` is NUL-terminated.
+    loop {
+        if unsafe { libc::unlinkat(parent, name.as_ptr(), flags) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if e.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(e);
+    }
+}
+
+/// Recursively remove `root` using only descriptor-relative syscalls so no
+/// symlink is ever followed, even if the tree is modified concurrently.
+///
+/// Every directory is opened relative to its already-open parent with
+/// `O_DIRECTORY | O_NOFOLLOW`, and every entry is removed with `unlinkat`
+/// relative to the descriptor it was enumerated from. Queued pathnames are
+/// never re-resolved, so replacing a directory with a symlink between
+/// enumeration and descent makes the open fail with `ELOOP` and only the
+/// symlink itself is unlinked; files outside the tree are never touched.
+///
+/// Iterative, with at most [`RMTREE_MAX_OPEN_DIRS`] directory streams open
+/// regardless of depth: ancestors further up are closed and reopened by name
+/// from the pinned parent of `root` (no-follow, identity-checked) when the
+/// walk climbs back to them.
+///
+/// `check` is called with each path before it is opened or unlinked; returning
+/// an error aborts the walk.
+fn remove_tree_nofollow(
+    root: &Path,
+    check: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    remove_tree_nofollow_with(root, RMTREE_MAX_OPEN_DIRS, check)
+}
+
+fn remove_tree_nofollow_with(
+    root: &Path,
+    max_open: usize,
+    check: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let max_open = max_open.max(1);
+    let name = root
+        .file_name()
+        .ok_or_else(|| format!("refusing to remove {}", root.display()))?;
+    let parent = match root.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent_dir = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("open {}: {e}", parent.display())),
+    };
+    let parent_fd = parent_dir.as_raw_fd();
+    let root_name =
+        CString::new(name.as_bytes()).map_err(|_| format!("invalid path {}", root.display()))?;
+    let err_at = |path: &Path, e: io::Error| format!("remove {}: {e}", path.display());
+    let not_a_dir = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP));
+    // Every directory removed must be on the same mount as the parent of
+    // `root`: a mount point inside the tree (or `root` itself being one) is
+    // refused instead of descending into a filesystem outside the cluster.
+    let mount = mount_key(parent_fd).map_err(|e| format!("stat {}: {e}", parent.display()))?;
+    let new_frame = |dir, name, path: std::path::PathBuf| -> Result<DirFrame, String> {
+        let mut frame = DirFrame {
+            dir: Some(dir),
+            name,
+            path,
+            id: (0, 0),
+            saw_entry: false,
+        };
+        let m = mount_key(frame.fd()).map_err(|e| format!("stat {}: {e}", frame.path.display()))?;
+        if m != mount {
+            return Err(format!(
+                "remove {}: refusing to cross a mount point",
+                frame.path.display()
+            ));
+        }
+        frame.id = dir_identity(dir).map_err(|e| format!("stat {}: {e}", frame.path.display()))?;
+        Ok(frame)
+    };
+
+    check(root)?;
+    let mut stack: Vec<DirFrame> = Vec::new();
+    match open_dir_nofollow(parent_fd, &root_name) {
+        Ok(dir) => stack.push(new_frame(dir, root_name, root.to_path_buf())?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if not_a_dir(&e) => {
+            return unlinkat_checked(parent_fd, &root_name, 0).map_err(|e| err_at(root, e));
+        }
+        Err(e) => return Err(err_at(root, e)),
+    }
+
+    while let Some(top_idx) = stack.len().checked_sub(1) {
+        if stack[top_idx].dir.is_none() {
+            reopen_frames(&mut stack, top_idx, parent_fd, max_open)?;
+        }
+        let top = &mut stack[top_idx];
+        let dir = top.dir.expect("top frame is open");
+        let ent = loop {
+            // SAFETY: errno is thread-local; reset it before each attempt so a
+            // NULL return distinguishes end-of-stream from an error.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: `dir` is a live stream owned by `top`.
+            let ent = unsafe { libc::readdir(dir.as_ptr()) };
+            if !ent.is_null() {
+                break ent;
+            }
+            let e = io::Error::last_os_error();
+            match e.raw_os_error().unwrap_or(0) {
+                0 => break ent,
+                libc::EINTR => continue,
+                _ => return Err(format!("read {}: {e}", top.path.display())),
+            }
+        };
+        if ent.is_null() {
+            if top.saw_entry {
+                // Rescan: unlinking during iteration can make readdir skip
+                // entries, so only rmdir after a pass that saw nothing.
+                top.saw_entry = false;
+                // SAFETY: `dir` is a live stream owned by `top`.
+                unsafe { libc::rewinddir(dir.as_ptr()) };
+                continue;
+            }
+            let frame = stack.pop().expect("non-empty stack");
+            let (name, path) = (frame.name.clone(), frame.path.clone());
+            drop(frame);
+            let pfd = match stack.len().checked_sub(1) {
+                Some(i) => {
+                    if stack[i].dir.is_none() {
+                        reopen_frames(&mut stack, i, parent_fd, max_open)?;
+                    }
+                    stack[i].fd()
+                }
+                None => parent_fd,
+            };
+            check(&path)?;
+            unlinkat_checked(pfd, &name, libc::AT_REMOVEDIR).map_err(|e| err_at(&path, e))?;
+            continue;
+        }
+        // SAFETY: `ent` stays valid until the next readdir/closedir on this
+        // stream; the name is copied out immediately.
+        let (d_name, d_type) = unsafe {
+            (
+                std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()).to_owned(),
+                (*ent).d_type,
+            )
+        };
+        let bytes = d_name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        top.saw_entry = true;
+        let fd = top.fd();
+        let child = top.path.join(std::ffi::OsStr::from_bytes(bytes));
+        check(&child)?;
+        let mut try_dir = d_type == libc::DT_DIR || d_type == libc::DT_UNKNOWN;
+        loop {
+            if try_dir {
+                match open_dir_nofollow(fd, &d_name) {
+                    Ok(dir) => {
+                        stack.push(new_frame(dir, d_name, child)?);
+                        // Keep at most `max_open` streams open: close the
+                        // ancestor that just fell out of the window.
+                        if let Some(i) = stack.len().checked_sub(max_open + 1) {
+                            stack[i].close();
+                        }
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    // Not a directory (or swapped for a symlink): unlink the
+                    // entry itself below without following it.
+                    Err(e) if not_a_dir(&e) => {}
+                    Err(e) => return Err(err_at(&child, e)),
+                }
+            }
+            match unlinkat_checked(fd, &d_name, 0) {
+                Ok(()) => break,
+                // Replaced by a directory since enumeration: descend into it.
+                Err(e) if e.raw_os_error() == Some(libc::EISDIR) && !try_dir => try_dir = true,
+                Err(e) => return Err(err_at(&child, e)),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn try_lock_with_deadline<'a, T>(
+    mutex: &'a Mutex<T>,
+    timeout: Duration,
+    heartbeat: Duration,
+    wait_msg: &str,
+    shutting_down: impl Fn() -> bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<std::sync::MutexGuard<'a, T>, String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_beat: Option<Instant> = None;
+    loop {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        match mutex.try_lock() {
+            Ok(g) => return Ok(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(format!("timed out {wait_msg}"));
+                }
+                if last_beat.is_none_or(|t| t.elapsed() >= heartbeat) {
+                    progress(wait_msg);
+                    last_beat = Some(Instant::now());
+                }
+                thread::sleep(left.min(heartbeat).min(Duration::from_millis(50)));
+            }
+        }
+    }
+}
+
+fn set_nonblocking_fd(fd: i32) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Attempt at most `max_reads` non-blocking reads from `stream`, retaining at
+/// most `limit` bytes in `buf` while discarding excess output so a noisy child
+/// cannot block on a full pipe. Sets `*truncated = true` if any bytes were
+/// dropped or a read error occurred.
+///
+/// Returns `true` when the per-pass read budget is exhausted before hitting
+/// `WouldBlock` or EOF, signaling the caller to re-check child exit, deadlines,
+/// shutdown, and heartbeats before draining again.
+fn drain_nonblocking_checked<R: Read>(
+    stream: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    limit: usize,
+    truncated: &mut bool,
+    max_reads: usize,
+) -> bool {
+    let Some(r) = stream.as_mut() else {
+        return false;
+    };
+    let mut chunk = [0u8; 8192];
+    for _ in 0..max_reads {
+        match r.read(&mut chunk) {
+            Ok(0) => {
+                *stream = None;
+                return false;
+            }
+            Ok(n) => {
+                let room = limit.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+                if n > room {
+                    *truncated = true;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
+            Err(_) => {
+                *truncated = true;
+                *stream = None;
+                return false;
+            }
+        }
+    }
+    true
+}
+
+struct WaitPipesOpts {
+    timeout: Duration,
+    kill_wait: Duration,
+    post_exit_drain: Duration,
+    heartbeat_interval: Duration,
+    stdout_limit: usize,
+    abort_on_shutdown: bool,
+}
+
+fn wait_reaped_pipes(
+    mut stdout: Option<File>,
+    mut stderr: Option<File>,
+    exited: &Receiver<i32>,
+    opts: &WaitPipesOpts,
+    shutting_down: impl Fn() -> bool,
+    mut kill_child: impl FnMut(),
+    mut on_wait: Option<&mut dyn FnMut()>,
+) -> io::Result<ReapedOutput> {
+    const STDERR_LIMIT: usize = 64 << 10;
+    const MAX_READS_PER_PASS: usize = 16;
+
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let mut out_truncated = false;
+    let mut err_truncated = false;
+    let deadline = Instant::now() + opts.timeout;
+    let mut last_beat = Instant::now();
+
+    let status = loop {
+        let more_out = drain_nonblocking_checked(
+            &mut stdout,
+            &mut out_buf,
+            opts.stdout_limit,
+            &mut out_truncated,
+            MAX_READS_PER_PASS,
+        );
+        let more_err = drain_nonblocking_checked(
+            &mut stderr,
+            &mut err_buf,
+            STDERR_LIMIT,
+            &mut err_truncated,
+            MAX_READS_PER_PASS,
+        );
+        match exited.try_recv() {
+            Ok(s) => break s,
+            Err(TryRecvError::Disconnected) => break -1,
+            Err(TryRecvError::Empty) => {}
+        }
+        if opts.abort_on_shutdown && shutting_down() {
+            kill_child();
+            let _ = exited.recv_timeout(opts.kill_wait);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "aborted: VM is shutting down",
+            ));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            kill_child();
+            let _ = exited.recv_timeout(opts.kill_wait);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
+        }
+        if let Some(cb) = on_wait.as_deref_mut()
+            && last_beat.elapsed() >= opts.heartbeat_interval
+        {
+            cb();
+            last_beat = Instant::now();
+        }
+        if more_out || more_err {
+            continue;
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd: stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let step = left
+            .min(opts.heartbeat_interval)
+            .min(Duration::from_millis(50));
+        if pfds[0].fd >= 0 || pfds[1].fd >= 0 {
+            let step_ms = step.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let _ = unsafe { libc::poll(pfds.as_mut_ptr(), 2, step_ms) };
+        } else {
+            match exited.recv_timeout(step) {
+                Ok(s) => break s,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break -1,
+            }
+        }
+    };
+
+    // Drain any remaining already-buffered bytes written before child exit,
+    // bounded by both the capture cap and `post_exit_drain` so a descendant
+    // holding an inherited pipe open cannot hang the caller.
+    let post_deadline = Instant::now() + opts.post_exit_drain;
+    loop {
+        let drain_out = stdout.is_some() && !out_truncated;
+        let drain_err = stderr.is_some() && !err_truncated;
+        if !drain_out && !drain_err {
+            break;
+        }
+        let more_out = drain_out
+            && drain_nonblocking_checked(
+                &mut stdout,
+                &mut out_buf,
+                opts.stdout_limit,
+                &mut out_truncated,
+                MAX_READS_PER_PASS,
+            );
+        let more_err = drain_err
+            && drain_nonblocking_checked(
+                &mut stderr,
+                &mut err_buf,
+                STDERR_LIMIT,
+                &mut err_truncated,
+                MAX_READS_PER_PASS,
+            );
+        if !more_out && !more_err {
+            break;
+        }
+        if Instant::now() >= post_deadline {
+            if more_out {
+                out_truncated = true;
+            }
+            break;
+        }
+    }
+
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else {
         128 + libc::WTERMSIG(status)
     };
-    Ok((code, stdout, stderr))
+    Ok(ReapedOutput {
+        code,
+        stdout: String::from_utf8_lossy(&out_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+        stdout_truncated: out_truncated,
+    })
+}
+
+fn run_reaped_split_checked(
+    reaper: &Reaper,
+    cmd: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    abort_on_shutdown: bool,
+    on_wait: Option<&mut dyn FnMut()>,
+) -> io::Result<ReapedOutput> {
+    let (out_r, out_w) = pipe()?;
+    let (err_r, err_w) = pipe()?;
+    set_nonblocking_fd(out_r.as_raw_fd())?;
+    set_nonblocking_fd(err_r.as_raw_fd())?;
+    cmd.env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_w))
+        .stderr(Stdio::from(err_w));
+    let (target, exited) = reaper.spawn_pidfd(cmd)?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let opts = WaitPipesOpts {
+        timeout,
+        kill_wait: Duration::from_secs(2),
+        post_exit_drain: Duration::from_millis(500),
+        heartbeat_interval: PROGRESS_HEARTBEAT_INTERVAL,
+        stdout_limit,
+        abort_on_shutdown,
+    };
+    wait_reaped_pipes(
+        Some(File::from(out_r)),
+        Some(File::from(err_r)),
+        &exited,
+        &opts,
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        || reaper.signal_target(&target, libc::SIGKILL),
+        on_wait,
+    )
+    .map_err(|e| {
+        if e.kind() == io::ErrorKind::TimedOut {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{:?} timed out", cmd.get_program()),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 fn api_is_ready(reaper: &Reaper) -> bool {
@@ -1866,45 +4936,98 @@ fn spawn_image_sync(reaper: Reaper, stop: Arc<AtomicBool>) {
     let _ = thread::Builder::new()
         .name("k8s-img-sync".into())
         .spawn(move || {
-            let _ = sync_moby_images(&reaper);
-            while !stop.load(Ordering::Relaxed) {
-                if let Err(e) = watch_docker_image_events(&reaper, &stop) {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    log(&format!("image sync watcher: {e}"));
-                    for _ in 0..20 {
-                        if stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(250));
-                    }
-                }
-            }
+            run_image_sync_loop(&stop, Duration::from_secs(5), || {
+                watch_docker_image_events(Path::new(DOCKER_SOCKET), &reaper, &stop)
+            });
         });
 }
 
-fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<()> {
-    let mut stream = UnixStream::connect(DOCKER_SOCKET)?;
+fn run_image_sync_loop(
+    stop: &AtomicBool,
+    backoff: Duration,
+    mut watch_once: impl FnMut() -> io::Result<()>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        if let Err(e) = watch_once() {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            log(&format!("image sync watcher: {e}"));
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        sleep_interruptible(stop, backoff);
+    }
+}
+
+fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
+    let deadline = Instant::now() + total;
+    while !stop.load(Ordering::Relaxed) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(Duration::from_millis(250)));
+    }
+}
+
+fn watch_docker_image_events(
+    socket_path: &Path,
+    reaper: &Reaper,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    watch_docker_image_events_with(socket_path, stop, || {
+        if let Err(e) = sync_moby_images_inner(reaper, Some(stop)) {
+            log(&format!("background image sync: {e}"));
+        }
+    })
+}
+
+fn watch_docker_image_events_with(
+    socket_path: &Path,
+    stop: &AtomicBool,
+    mut on_sync: impl FnMut(),
+) -> io::Result<()> {
+    let mut stream = crate::unix_connect::connect_unix_until(
+        socket_path,
+        Instant::now() + Duration::from_secs(5),
+    )?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     // HTTP/1.0 avoids chunked framing; Docker streams one JSON object per line.
     write!(
         stream,
         "GET /events?filters=%7B%22type%22%3A%5B%22image%22%5D%7D HTTP/1.0\r\nHost: docker\r\n\r\n"
     )?;
+    stream.flush()?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    // Skip HTTP headers.
+    // Read HTTP response status line and headers before running the initial
+    // sync so we never sync against a failed subscription and never miss a
+    // Docker change made while the sync runs.
+    let mut saw_status = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
+            Ok(_) if !saw_status => {
+                saw_status = true;
+                if line.split_whitespace().nth(1) != Some("200") {
+                    return Err(io::Error::other(format!(
+                        "unexpected Docker /events status: {}",
+                        line.trim()
+                    )));
+                }
+            }
             Ok(_) if line == "\r\n" || line == "\n" => break,
             Ok(_) => continue,
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Acquire) {
                     return Ok(());
                 }
                 continue;
@@ -1912,18 +5035,22 @@ fn watch_docker_image_events(reaper: &Reaper, stop: &AtomicBool) -> io::Result<(
             Err(e) => return Err(e),
         }
     }
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    // Subscribed: run the initial / post-reconnect sync now. Changes made
+    // while this sync runs buffer as events on this stream.
+    on_sync();
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Acquire) {
             return Ok(());
         }
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
             Ok(_) => {
-                if is_docker_image_sync_event(&line)
-                    && let Err(e) = sync_moby_images(reaper)
-                {
-                    log(&format!("background image sync: {e}"));
+                if is_docker_image_sync_event(&line) {
+                    on_sync();
                 }
             }
             Err(e)
@@ -1955,35 +5082,1695 @@ fn is_docker_image_sync_event(line: &str) -> bool {
     matches!(action, "tag" | "pull" | "load" | "import" | "commit")
 }
 
-fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
-    let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let moby = list_ctr_images(reaper, "moby")?;
-    let k8s = list_ctr_images(reaper, "k8s.io")?;
-    let mut failures = Vec::new();
-    for (name, digest) in moby {
-        if name.starts_with("sha256:") || name.contains("<none>") {
-            continue;
-        }
-        if k8s.get(&name).is_some_and(|d| d == &digest) {
-            continue;
-        }
-        if let Err(e) = mirror_one_image(reaper, &name) {
-            log(&format!("mirror image {name}: {e}"));
-            failures.push(format!("{name}: {e}"));
+/// Label recording which `moby` image a re-platformed `k8s.io` copy was made
+/// from, since the copy's own digest differs (see [`crate::oci_rewrite`]).
+const SOURCE_DIGEST_LABEL: &str = "io.katamaran.k8s.source-digest";
+
+/// The guest's platform architecture, the only one containerd's CRI accepts.
+const NATIVE_ARCH: &str = "arm64";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmulationMode {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+const MAX_SYNC_RETRIES: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SyncNoticeKind {
+    SkipDigestAmd64,
+    KeepMirrorEmulationOff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SyncNotice {
+    kind: SyncNoticeKind,
+    name: String,
+    digest: String,
+}
+
+/// Deduplicates non-failure informational sync logs (`SkipDigestAmd64`,
+/// `KeepMirrorEmulationOff`) to once per `(kind, image, digest)` while active.
+struct SyncLogState {
+    logged: BTreeSet<SyncNotice>,
+}
+
+impl SyncLogState {
+    const fn new() -> Self {
+        Self {
+            logged: BTreeSet::new(),
         }
     }
+
+    fn should_log(&mut self, notice: SyncNotice) -> bool {
+        self.logged.insert(notice)
+    }
+
+    fn retain_active(&mut self, active: &BTreeSet<SyncNotice>) {
+        self.logged.retain(|n| active.contains(n));
+    }
+}
+
+fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
+    sync_moby_images_inner(reaper, None)
+}
+
+fn sync_moby_images_inner(reaper: &Reaper, stop: Option<&AtomicBool>) -> Result<(), String> {
+    let mut sync_log = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+        return Ok(());
+    }
+    let mut failures: Vec<String> = Vec::new();
+    let mut only_refs: Option<HashSet<String>> = None;
+    let mut logged_unknown: Vec<String> = Vec::new();
+    let mut active_notices: BTreeSet<SyncNotice> = BTreeSet::new();
+    let mut completed_full_scan = false;
+
+    for attempt in 0..=MAX_SYNC_RETRIES {
+        if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+            return Ok(());
+        }
+        // Re-read the emulation state on every pass so a retry never acts on
+        // a stale reading.
+        let emulation = current_emulation_mode(&mut logged_unknown);
+        let moby = match list_ctr_images(reaper, "moby") {
+            Ok(m) => m,
+            Err(e) => {
+                failures.push(e);
+                break;
+            }
+        };
+        if moby.is_empty() {
+            if attempt == 0 {
+                completed_full_scan = true;
+            }
+            break;
+        }
+        let k8s = match list_ctr_images(reaper, "k8s.io") {
+            Ok(k) => k,
+            Err(e) => {
+                failures.push(e);
+                break;
+            }
+        };
+        if attempt == 0 {
+            completed_full_scan = true;
+        }
+
+        let candidates: Vec<(String, CtrImage)> = match &only_refs {
+            Some(filter) => moby
+                .iter()
+                .filter(|(name, _)| filter.contains(*name))
+                .map(|(n, i)| (n.clone(), i.clone()))
+                .collect(),
+            None => moby.iter().map(|(n, i)| (n.clone(), i.clone())).collect(),
+        };
+
+        let mut retry_refs: HashSet<String> = HashSet::new();
+
+        for (name, img) in candidates {
+            if stop.is_some_and(|s| s.load(Ordering::Acquire)) {
+                return Ok(());
+            }
+            // `moby-dangling@<digest>` is how Docker's containerd image store
+            // keeps untagged images; never mirror or report those.
+            if name.starts_with("sha256:")
+                || name.starts_with("moby-dangling@")
+                || name.contains("<none>")
+            {
+                continue;
+            }
+            let k8s_img = k8s.get(&name);
+            let source_probe = needs_native_probe(&name, &img, k8s_img, emulation, NATIVE_ARCH)
+                .then(|| probe_native_complete(reaper, "moby", &name, &img.digest, NATIVE_ARCH));
+            let native = classify_native_availability(
+                &name,
+                &img,
+                k8s_img,
+                source_probe.as_ref(),
+                emulation,
+                NATIVE_ARCH,
+            );
+            let dest_probe =
+                needs_dest_native_probe(&name, &img, k8s_img, native, emulation, NATIVE_ARCH).then(
+                    || {
+                        let k = k8s_img.expect("destination probe requires k8s_img");
+                        probe_native_complete(reaper, "k8s.io", &name, &k.digest, NATIVE_ARCH)
+                    },
+                );
+            let dest_native =
+                classify_dest_native_availability(k8s_img, dest_probe.as_ref(), NATIVE_ARCH);
+            match plan_sync_action(
+                &name,
+                &img,
+                k8s_img,
+                native,
+                dest_native,
+                emulation,
+                NATIVE_ARCH,
+            ) {
+                SyncAction::Skip => {}
+                SyncAction::SkipDigestAmd64 => {
+                    let notice = SyncNotice {
+                        kind: SyncNoticeKind::SkipDigestAmd64,
+                        name: name.clone(),
+                        digest: img.digest.clone(),
+                    };
+                    active_notices.insert(notice.clone());
+                    if sync_log.should_log(notice) {
+                        log(&format!(
+                            "skipping amd64 rewrite for digest-pinned image {name}; tag it locally to run under emulation"
+                        ));
+                    }
+                }
+                SyncAction::ReportProbeError => {
+                    let detail = source_probe
+                        .as_ref()
+                        .and_then(|r| r.as_ref().err())
+                        .or_else(|| dest_probe.as_ref().and_then(|r| r.as_ref().err()))
+                        .map(String::as_str)
+                        .unwrap_or("native platform check unavailable");
+                    if k8s_img.is_some() {
+                        log(&format!(
+                            "preserving existing Kubernetes image for {name}: {detail}"
+                        ));
+                    } else {
+                        log(&format!(
+                            "skipping {name} due to native platform check error: {detail}"
+                        ));
+                    }
+                    failures.push(format!("{name}: {detail}"));
+                }
+                SyncAction::Relist => {
+                    retry_refs.insert(name);
+                }
+                SyncAction::ReportEmulationDisabled => {
+                    let msg = if k8s_img.is_some() {
+                        format!(
+                            "{name}: amd64 image not mirrored because amd64 emulation is off; existing Kubernetes copy is kept"
+                        )
+                    } else {
+                        format!("{name}: amd64 image not mirrored because amd64 emulation is off")
+                    };
+                    log(&msg);
+                    failures.push(msg);
+                }
+                SyncAction::ReportEmulationUnavailable => {
+                    let msg = if k8s_img.is_some() {
+                        format!(
+                            "{name}: amd64 image not mirrored: amd64 emulation is unavailable (see the guest log); existing Kubernetes copy is kept"
+                        )
+                    } else {
+                        format!(
+                            "{name}: amd64 image not mirrored: amd64 emulation is unavailable (see the guest log)"
+                        )
+                    };
+                    log(&msg);
+                    failures.push(msg);
+                }
+                SyncAction::ReportStaleMirror => {
+                    let msg = format!(
+                        "{name}: Docker now points to {} with no linux/{NATIVE_ARCH} or linux/amd64 variant to mirror; Kubernetes keeps the previous build under this tag",
+                        img.digest
+                    );
+                    log(&msg);
+                    failures.push(msg);
+                }
+                SyncAction::ReportDivergedTag => {
+                    let msg = format!(
+                        "{name}: Kubernetes keeps a different image under this name ({}) than Docker ({}); katamaran never replaces an image it did not publish. Give the Docker image a different local name (`docker tag {name} <new-name> && docker rmi {name}`) and use that name in the pod spec",
+                        k8s_img.map(|k| k.digest.as_str()).unwrap_or("-"),
+                        img.digest
+                    );
+                    log(&msg);
+                    failures.push(msg);
+                }
+                SyncAction::ReportUnownedDestination => {
+                    let msg = unowned_destination_message(&name);
+                    log(&msg);
+                    failures.push(msg);
+                }
+                SyncAction::KeepMirrorEmulationOff => {
+                    // Never deleted automatically: a pod may still use it, and
+                    // its Docker source may be gone. Leaking it is acceptable.
+                    let notice = SyncNotice {
+                        kind: SyncNoticeKind::KeepMirrorEmulationOff,
+                        name: name.clone(),
+                        digest: format!(
+                            "{}:{}",
+                            img.digest,
+                            k8s_img.map(|k| k.digest.as_str()).unwrap_or("")
+                        ),
+                    };
+                    active_notices.insert(notice.clone());
+                    if sync_log.should_log(notice) {
+                        log(&format!(
+                            "keeping amd64 mirror {name} in Kubernetes although amd64 emulation is off"
+                        ));
+                    }
+                }
+                SyncAction::MirrorNative { clear_source_label } => {
+                    match mirror_native_image(reaper, &name) {
+                        Ok(()) => {
+                            if clear_source_label
+                                && let Err(e) = clear_source_digest_label(reaper, &name)
+                            {
+                                log(&format!("clear source-digest label on {name}: {e}"));
+                                failures.push(format!("{name}: {e}"));
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!("mirror image {name}: {e}"));
+                            failures.push(format!("{name}: {e}"));
+                        }
+                    }
+                }
+                SyncAction::MirrorRewrite => {
+                    // Only a Katamaran publication is ever replaced: the tag
+                    // must carry the source-digest label AND its manifest the
+                    // publication annotation (a stale label on a native import
+                    // is not ownership). Anything else is reported, not touched.
+                    if let Some(k) = k8s_img {
+                        let owned = k.label(SOURCE_DIGEST_LABEL).is_some()
+                            && match is_katamaran_published(reaper, &name, &k.digest) {
+                                Ok(owned) => owned,
+                                Err(e) => {
+                                    log(&format!("mirror image {name}: {e}"));
+                                    failures.push(format!("{name}: {e}"));
+                                    continue;
+                                }
+                            };
+                        if !owned {
+                            let msg = unowned_destination_message(&name);
+                            log(&msg);
+                            failures.push(msg);
+                            continue;
+                        }
+                    }
+                    let mut info_client = match containerd_grpc::ContentInfoClient::connect(
+                        Path::new(CONTAINERD_SOCKET),
+                        Duration::from_secs(30),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log(&format!("mirror image {name}: {e}"));
+                            failures.push(format!("{name}: {e}"));
+                            continue;
+                        }
+                    };
+                    let prepare_res = {
+                        let mut store = MobyContentStore::new(
+                            GrpcNamespaceMeta {
+                                client: &mut info_client,
+                                namespace: "moby",
+                            },
+                            |digest: &str, max_bytes: usize| {
+                                get_ctr_content_blob(reaper, "moby", digest, max_bytes)
+                            },
+                            |digest: &str| inspect_ctr_config_platform(reaper, "moby", digest),
+                        );
+                        oci_rewrite::prepare_rewrite_from_store(
+                            &img.digest,
+                            NATIVE_ARCH,
+                            &mut store,
+                        )
+                    };
+                    let plan = match prepare_res {
+                        Ok(oci_rewrite::PrepareRewrite::Ready(plan)) => *plan,
+                        Ok(oci_rewrite::PrepareRewrite::RootMissing) => {
+                            match classify_prepare_root_missing(
+                                &name,
+                                &img.digest,
+                                info_client.image_digest("moby", &name),
+                            ) {
+                                Ok(()) => {
+                                    retry_refs.insert(name);
+                                }
+                                Err(msg) => {
+                                    log(&msg);
+                                    failures.push(msg);
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(oci_rewrite::PrepareRewrite::NotAvailable) => {
+                            // No complete amd64 variant to rewrite. With
+                            // emulation on, never delete an existing mirror
+                            // for this: keep it and report.
+                            let msg = format!(
+                                "{name}: no complete local linux/amd64 variant to mirror under emulation"
+                            );
+                            log(&msg);
+                            failures.push(msg);
+                            continue;
+                        }
+                        Err(e) => {
+                            log(&format!("prepare amd64 rewrite for {name}: {e}"));
+                            failures.push(format!("{name}: {e}"));
+                            continue;
+                        }
+                    };
+                    let selected_platform = plan.selected_platform.clone();
+                    // `publish_rewritten_image` re-verifies the target digest
+                    // and labels against this evidence before deleting.
+                    let expected_k8s = k8s_img.map(|k| containerd_grpc::ExpectedK8sTarget {
+                        digest: k.digest.as_str(),
+                        is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
+                    });
+                    match containerd_grpc::publish_rewritten_image(
+                        Path::new(CONTAINERD_SOCKET),
+                        &name,
+                        SOURCE_DIGEST_LABEL,
+                        expected_k8s,
+                        &plan,
+                        Duration::from_secs(120),
+                    ) {
+                        Ok(_) => log(&format!(
+                            "mirrored amd64 image {name} ({selected_platform}) as linux/{NATIVE_ARCH} (runs under emulation)"
+                        )),
+                        Err(
+                            containerd_grpc::PublishError::SourceChanged { .. }
+                            | containerd_grpc::PublishError::DestinationChanged { .. },
+                        ) => {
+                            retry_refs.insert(name);
+                        }
+                        Err(containerd_grpc::PublishError::ReplacementUncertain(e)) => {
+                            // Nothing was released; report it and re-list (when
+                            // retries remain) so a missing tag is recreated
+                            // from Docker.
+                            log(&format!("mirror image {name}: {e}; re-listing"));
+                            failures.push(format!("{name}: {e}"));
+                            if attempt < MAX_SYNC_RETRIES {
+                                retry_refs.insert(name);
+                            }
+                        }
+                        Err(containerd_grpc::PublishError::Failed(e)) => {
+                            log(&format!("mirror image {name}: {e}"));
+                            failures.push(format!("{name}: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if retry_refs.is_empty() {
+            break;
+        }
+        if attempt == MAX_SYNC_RETRIES {
+            let mut stuck: Vec<String> = retry_refs.into_iter().collect();
+            stuck.sort();
+            for name in stuck {
+                let msg = format!("{name}: image target changed concurrently during sync");
+                log(&msg);
+                failures.push(msg);
+            }
+            break;
+        }
+        // Brief backoff so a burst of Docker retags can settle before the
+        // next pass re-lists.
+        thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+        only_refs = Some(retry_refs);
+    }
+
+    if completed_full_scan {
+        sync_log.retain_active(&active_notices);
+    }
+
     if !failures.is_empty() {
         return Err(format!("failed to mirror images: {}", failures.join("; ")));
     }
     Ok(())
 }
 
-/// Returns `image_ref -> digest` for all images in a containerd namespace.
-fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, String>, String> {
+fn current_emulation_mode(logged_unknown: &mut Vec<String>) -> EmulationMode {
+    match super::amd64::status() {
+        super::amd64::EmulationStatus::Enabled => EmulationMode::Enabled,
+        super::amd64::EmulationStatus::Disabled => EmulationMode::Disabled,
+        super::amd64::EmulationStatus::Unknown(e) => {
+            // Not a sync failure by itself: native images still mirror
+            // normally, while amd64 tags are held back and reported per image.
+            let msg = format!("amd64 emulation state unknown ({e}); not rewriting amd64 images");
+            if !logged_unknown.contains(&msg) {
+                log(&msg);
+                logged_unknown.push(msg);
+            }
+            EmulationMode::Unknown
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAvailability {
+    Present,
+    Absent,
+    ProbeFailed,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAction {
+    Skip,
+    SkipDigestAmd64,
+    MirrorNative {
+        clear_source_label: bool,
+    },
+    MirrorRewrite,
+    /// A Katamaran amd64 mirror whose source would no longer be mirrored
+    /// because emulation is off: kept (never deleted automatically) and logged.
+    KeepMirrorEmulationOff,
+    /// Kubernetes has an unlabelled image under this name whose digest differs
+    /// from Docker's, and sync would otherwise leave it silently.
+    ReportDivergedTag,
+    Relist,
+    ReportProbeError,
+    /// `k8s.io` already has an unlabelled tag under this name that is neither
+    /// a Katamaran mirror nor an exact copy of the `moby` source, and has no
+    /// complete local native content. It is never replaced (a Delete→Create
+    /// swap cannot be made atomic, and an interrupted swap could lose a tag
+    /// Katamaran cannot rebuild); the user is told how to resolve the conflict.
+    ReportUnownedDestination,
+    /// An amd64 tag that cannot be mirrored because `amd64 = "off"`; any
+    /// existing Kubernetes copy is kept.
+    ReportEmulationDisabled,
+    /// An amd64 tag that would be mirrored under emulation, but the emulation
+    /// state is unknown (e.g. the emulator failed to register at boot).
+    ReportEmulationUnavailable,
+    /// Docker's tag now points to an image Katamaran cannot mirror (no
+    /// linux/arm64 or rewritable linux/amd64 variant); the previous build is
+    /// kept under the tag.
+    ReportStaleMirror,
+}
+
+fn unowned_destination_message(name: &str) -> String {
+    format!(
+        "{name}: not mirroring amd64 image under emulation because Kubernetes already has \
+         an image with this name that katamaran cannot safely replace (it was not \
+         published by this version of katamaran, or it is a multi-platform image that \
+         could still gain local linux/{NATIVE_ARCH} content); katamaran never deletes such \
+         an image. Give the Docker image \
+         a different local name (`docker tag {name} <new-name> && docker rmi {name}`) and \
+         use that name in the pod spec"
+    )
+}
+
+/// True when a strict native-content probe is needed to tell whether `moby`
+/// actually has complete `linux/<native_arch>` content locally (rather than
+/// merely advertising a native descriptor in a multi-platform index, or only
+/// having 32-bit `linux/arm/*` blobs).
+fn needs_native_probe(
+    name: &str,
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    emulation: EmulationMode,
+    native_arch: &str,
+) -> bool {
+    let Some(platforms) = moby.platforms.as_deref() else {
+        return false;
+    };
+    if !oci_rewrite::has_native_platform(platforms, native_arch) {
+        return false;
+    }
+    let k8s_is_rewritten = k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some());
+    if k8s_is_rewritten {
+        return true;
+    }
+    if !oci_rewrite::has_amd64_platform(platforms) {
+        return false;
+    }
+    // When `k8s.io` already holds the exact same unlabelled digest, skip the
+    // probe whenever the outcome cannot change the sync action (emulation is
+    // not enabled, or the reference is digest-pinned and never rewritten).
+    // With emulation enabled on a tagged image, keep probing so an unusable
+    // same-digest legacy copy is still reported instead of claimed synced.
+    let same_unlabelled =
+        k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_none() && k.digest == moby.digest);
+    !(same_unlabelled
+        && (emulation != EmulationMode::Enabled || oci_rewrite::is_digest_reference(name)))
+}
+
+/// True when a strict native-content probe on `k8s.io` is needed before
+/// deciding whether to preserve an unlabelled destination tag (an unlabelled
+/// multi-platform index can advertise `linux/arm64` in `ctr images ls` even
+/// when only its `amd64` blobs are cached locally).
+fn needs_dest_native_probe(
+    name: &str,
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    source_native: NativeAvailability,
+    emulation: EmulationMode,
+    native_arch: &str,
+) -> bool {
+    if emulation != EmulationMode::Enabled
+        || source_native != NativeAvailability::Absent
+        || oci_rewrite::is_digest_reference(name)
+    {
+        return false;
+    }
+    let Some(moby_platforms) = moby.platforms.as_deref() else {
+        return false;
+    };
+    if !oci_rewrite::has_amd64_platform(moby_platforms) {
+        return false;
+    }
+    let Some(k) = k8s else {
+        return false;
+    };
+    if k.label(SOURCE_DIGEST_LABEL).is_some() {
+        return false;
+    }
+    k.platforms
+        .as_deref()
+        .is_some_and(|p| oci_rewrite::has_native_platform(p, native_arch))
+}
+
+fn classify_native_availability(
+    name: &str,
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    probe: Option<&Result<NativeAvailability, String>>,
+    emulation: EmulationMode,
+    native_arch: &str,
+) -> NativeAvailability {
+    let Some(platforms) = moby.platforms.as_deref() else {
+        return NativeAvailability::Stale;
+    };
+    if !oci_rewrite::has_native_platform(platforms, native_arch) {
+        return NativeAvailability::Absent;
+    }
+    if !needs_native_probe(name, moby, k8s, emulation, native_arch) {
+        return NativeAvailability::Present;
+    }
+    match probe {
+        Some(Ok(avail)) => *avail,
+        Some(Err(_)) | None => NativeAvailability::ProbeFailed,
+    }
+}
+
+fn classify_dest_native_availability(
+    k8s: Option<&CtrImage>,
+    probe: Option<&Result<NativeAvailability, String>>,
+    native_arch: &str,
+) -> NativeAvailability {
+    let Some(k) = k8s else {
+        return NativeAvailability::Absent;
+    };
+    if k.label(SOURCE_DIGEST_LABEL).is_some() {
+        return NativeAvailability::Absent;
+    }
+    let Some(platforms) = k.platforms.as_deref() else {
+        return NativeAvailability::Stale;
+    };
+    if !oci_rewrite::has_native_platform(platforms, native_arch) {
+        return NativeAvailability::Absent;
+    }
+    match probe {
+        Some(Ok(avail)) => *avail,
+        Some(Err(_)) | None => NativeAvailability::ProbeFailed,
+    }
+}
+
+/// Decide how to synchronize a single `moby` image into `k8s.io`. Never
+/// claims an image synced when Kubernetes keeps a different image or an
+/// unmirrored amd64 tag under the same name.
+fn plan_sync_action(
+    name: &str,
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    native: NativeAvailability,
+    dest_native: NativeAvailability,
+    emulation: EmulationMode,
+    native_arch: &str,
+) -> SyncAction {
+    let k8s_is_rewritten = k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some());
+    match native {
+        NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
+        NativeAvailability::Stale => SyncAction::Relist,
+        NativeAvailability::Present => {
+            if let Some(k) = k8s
+                && k.digest == moby.digest
+                && !k8s_is_rewritten
+            {
+                SyncAction::Skip
+            } else {
+                SyncAction::MirrorNative {
+                    clear_source_label: k8s_is_rewritten,
+                }
+            }
+        }
+        NativeAvailability::Absent => {
+            let Some(platforms) = moby.platforms.as_deref() else {
+                return SyncAction::Relist;
+            };
+            let has_amd64 = oci_rewrite::has_amd64_platform(platforms);
+            let is_digest_ref = oci_rewrite::is_digest_reference(name);
+            let resolved = !platforms.trim().is_empty() && platforms.trim() != "-";
+            let k8s_matches_source =
+                k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str()));
+
+            // Digest-pinned references can never be rewritten because rewriting
+            // changes the manifest digest; existing mirrors are kept.
+            if is_digest_ref {
+                if emulation == EmulationMode::Disabled && k8s_is_rewritten {
+                    return SyncAction::KeepMirrorEmulationOff;
+                }
+                if emulation == EmulationMode::Enabled && has_amd64 {
+                    return SyncAction::SkipDigestAmd64;
+                }
+                if k8s_is_rewritten {
+                    return SyncAction::Skip;
+                }
+                if !resolved {
+                    return if k8s.is_some_and(|k| k.digest == moby.digest) {
+                        SyncAction::Skip
+                    } else {
+                        SyncAction::MirrorNative {
+                            clear_source_label: false,
+                        }
+                    };
+                }
+                return SyncAction::Skip;
+            }
+
+            if has_amd64 {
+                return match emulation {
+                    EmulationMode::Enabled => {
+                        if let Some(k) = k8s {
+                            if k8s_matches_source {
+                                match k.platforms.as_deref() {
+                                    None => SyncAction::Relist,
+                                    Some(p) if oci_rewrite::has_native_platform(p, native_arch) => {
+                                        SyncAction::Skip
+                                    }
+                                    Some(_) => SyncAction::MirrorRewrite,
+                                }
+                            } else if k8s_is_rewritten {
+                                // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
+                                SyncAction::MirrorRewrite
+                            } else {
+                                // Unlabelled `k8s.io` image (a kubelet/`ctr` pull, a
+                                // native mirror, or a copy left by an earlier release):
+                                // never replaced. Stay quiet only when its local native
+                                // arm64 content is verified complete and it matches
+                                // Docker's digest; otherwise report the conflict.
+                                match dest_native {
+                                    NativeAvailability::Present if k.digest == moby.digest => {
+                                        SyncAction::Skip
+                                    }
+                                    NativeAvailability::Present => SyncAction::ReportDivergedTag,
+                                    NativeAvailability::Absent => {
+                                        SyncAction::ReportUnownedDestination
+                                    }
+                                    NativeAvailability::Stale => SyncAction::Relist,
+                                    NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
+                                }
+                            }
+                        } else {
+                            SyncAction::MirrorRewrite
+                        }
+                    }
+                    EmulationMode::Disabled => {
+                        if k8s_matches_source {
+                            SyncAction::KeepMirrorEmulationOff
+                        } else {
+                            SyncAction::ReportEmulationDisabled
+                        }
+                    }
+                    EmulationMode::Unknown => {
+                        if k8s_matches_source {
+                            SyncAction::Skip
+                        } else {
+                            SyncAction::ReportEmulationUnavailable
+                        }
+                    }
+                };
+            }
+
+            if !resolved {
+                return if k8s_is_rewritten {
+                    if emulation == EmulationMode::Disabled {
+                        SyncAction::KeepMirrorEmulationOff
+                    } else {
+                        SyncAction::Skip
+                    }
+                } else if k8s.is_some_and(|k| k.digest == moby.digest) {
+                    SyncAction::Skip
+                } else {
+                    SyncAction::MirrorNative {
+                        clear_source_label: false,
+                    }
+                };
+            }
+
+            // Resolved non-native, non-amd64 image (e.g. linux/s390x): keep any
+            // existing Kubernetes copy, and report when Docker's tag moved to a
+            // different digest that Katamaran cannot mirror.
+            if k8s_is_rewritten {
+                if !k8s_matches_source {
+                    SyncAction::ReportStaleMirror
+                } else if emulation == EmulationMode::Disabled {
+                    SyncAction::KeepMirrorEmulationOff
+                } else {
+                    SyncAction::Skip
+                }
+            } else if k8s.is_some_and(|k| k.digest != moby.digest) {
+                SyncAction::ReportStaleMirror
+            } else {
+                SyncAction::Skip
+            }
+        }
+    }
+}
+
+/// Bounded stdout cap for `ctr images ls` and `Images.List`. Exceeding this
+/// cap returns an explicit error instead of silently truncating the inventory.
+const IMAGE_LIST_LIMIT: usize = 16 << 20;
+
+/// Strictly verify whether `name` in `namespace` (expected to still point to
+/// `expected_digest`) has a locally complete `linux/<native_arch>` manifest
+/// matching containerd v2.4.2's `images.Manifest` + `platforms.DefaultStrict()`
+/// selection (manifest, config, and all layers present locally; never accepting
+/// 32-bit `linux/arm/*` or non-baseline variants such as `linux/arm64/v8.2`).
+fn probe_native_complete(
+    reaper: &Reaper,
+    namespace: &str,
+    name: &str,
+    expected_digest: &str,
+    native_arch: &str,
+) -> Result<NativeAvailability, String> {
+    let mut client = containerd_grpc::ContentInfoClient::connect(
+        Path::new(CONTAINERD_SOCKET),
+        Duration::from_secs(30),
+    )?;
+    match client.image_digest(namespace, name)? {
+        Some(cur) if cur == expected_digest => {}
+        _ => return Ok(NativeAvailability::Stale),
+    }
+    let check = {
+        let mut store = MobyContentStore::new(
+            GrpcNamespaceMeta {
+                client: &mut client,
+                namespace,
+            },
+            |digest: &str, max_bytes: usize| {
+                get_ctr_content_blob(reaper, namespace, digest, max_bytes)
+            },
+            |digest: &str| inspect_ctr_config_platform(reaper, namespace, digest),
+        );
+        oci_rewrite::has_complete_native_manifest(
+            expected_digest,
+            oci_rewrite::NativePlatform::linux(native_arch, None),
+            &mut store,
+        )?
+    };
+    classify_native_check_outcome(namespace, expected_digest, check, || {
+        client.image_digest(namespace, name)
+    })
+}
+
+/// Distinguish a genuine concurrent retag (`Stale` -> re-list) from a dangling
+/// image record whose root manifest blob is missing from `namespace`'s content
+/// store (`Err` -> fail immediately instead of relisting into a misleading
+/// "changed concurrently" error).
+fn classify_native_check_outcome(
+    namespace: &str,
+    expected_digest: &str,
+    check: oci_rewrite::NativeManifestCheck,
+    mut recheck_digest: impl FnMut() -> Result<Option<String>, String>,
+) -> Result<NativeAvailability, String> {
+    match check {
+        oci_rewrite::NativeManifestCheck::Complete => Ok(NativeAvailability::Present),
+        oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
+        oci_rewrite::NativeManifestCheck::RootMissing => match recheck_digest()? {
+            Some(cur) if cur == expected_digest => Err(format!(
+                "root manifest blob {expected_digest} is missing from {namespace} content store"
+            )),
+            _ => Ok(NativeAvailability::Stale),
+        },
+    }
+}
+
+fn classify_prepare_root_missing(
+    name: &str,
+    expected_digest: &str,
+    current_digest: Result<Option<String>, String>,
+) -> Result<(), String> {
+    match current_digest {
+        Ok(Some(cur)) if cur == expected_digest => Err(format!(
+            "{name}: root manifest blob {expected_digest} is missing from moby content store"
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!(
+            "{name}: root manifest blob {expected_digest} is missing from moby content store (re-check failed: {e})"
+        )),
+    }
+}
+
+/// Upper bound for a manifest `publish_rewritten_image` can have written: the
+/// rewriter's whole metadata budget plus room for the publication annotation.
+const PUBLISHED_MANIFEST_MAX_BYTES: usize = oci_rewrite::MAX_TOTAL_METADATA_BYTES + (64 << 10);
+
+/// Whether the `k8s.io` manifest at `digest` was published by Katamaran (it
+/// carries the per-publication annotation). The source-digest label alone is
+/// not proof (a native import whose label clearing failed still carries it).
+/// Content is immutable per digest and every delete is conditional on that
+/// digest, so this check cannot race. A manifest larger than any publication
+/// could be is not ours.
+fn is_katamaran_published(reaper: &Reaper, name: &str, digest: &str) -> Result<bool, String> {
+    match get_ctr_content_blob(reaper, "k8s.io", digest, PUBLISHED_MANIFEST_MAX_BYTES) {
+        Ok(manifest) => Ok(is_published_mirror_manifest(&manifest)),
+        Err(oci_rewrite::BlobReadError::TooLarge(_)) => Ok(false),
+        Err(oci_rewrite::BlobReadError::Other(e)) => {
+            Err(format!("read k8s.io manifest {digest} of {name}: {e}"))
+        }
+    }
+}
+
+/// True when `manifest` carries [`containerd_grpc::PUBLICATION_ANNOTATION`],
+/// which only `publish_rewritten_image` ever writes.
+fn is_published_mirror_manifest(manifest: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(manifest).is_ok_and(|v| {
+        v.get("annotations")
+            .and_then(|a| a.get(containerd_grpc::PUBLICATION_ANNOTATION))
+            .is_some_and(serde_json::Value::is_string)
+    })
+}
+
+fn clear_source_digest_label(reaper: &Reaper, name: &str) -> Result<(), String> {
+    let mut cmd = Command::new("/usr/bin/ctr");
+    cmd.args([
+        "-a",
+        CONTAINERD_SOCKET,
+        "-n",
+        "k8s.io",
+        "images",
+        "label",
+        name,
+        &format!("{SOURCE_DIGEST_LABEL}="),
+    ]);
+    let (code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
+        .map_err(|e| format!("ctr images label {name}: {e}"))?;
+    if code == 0 {
+        return Ok(());
+    }
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!("ctr images label {name} exited {code}: {detail}"))
+}
+
+trait MobyContentMeta {
+    fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String>;
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String>;
+}
+
+struct GrpcNamespaceMeta<'a> {
+    client: &'a mut containerd_grpc::ContentInfoClient,
+    namespace: &'a str,
+}
+
+impl MobyContentMeta for GrpcNamespaceMeta<'_> {
+    fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+        self.client.blob_size(self.namespace, digest)
+    }
+
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
+        self.client.batch_blob_sizes(self.namespace, digests)
+    }
+}
+
+/// Lazy, caching `moby` content-store adapter that resolves authoritative blob
+/// sizes via direct digest-keyed `Content.Info` lookups (single and bounded
+/// batches; never `Content.List`) so unrelated blobs in `moby` never slow or
+/// block a rewrite. Rejects over-budget metadata blobs before running
+/// `ctr content get`, keeping the bounded stdout read as a backstop.
+struct MobyContentStore<M, F, C> {
+    cache: HashMap<String, Option<u64>>,
+    meta: M,
+    fetch: F,
+    inspect_config: C,
+}
+
+impl<M, F, C> MobyContentStore<M, F, C>
+where
+    M: MobyContentMeta,
+    F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
+    C: FnMut(&str) -> Result<Option<oci_rewrite::ConfigPlatform>, String>,
+{
+    fn new(meta: M, fetch: F, inspect_config: C) -> Self {
+        Self {
+            cache: HashMap::new(),
+            meta,
+            fetch,
+            inspect_config,
+        }
+    }
+}
+
+impl<M, F, C> oci_rewrite::BlobStore for MobyContentStore<M, F, C>
+where
+    M: MobyContentMeta,
+    F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
+    C: FnMut(&str) -> Result<Option<oci_rewrite::ConfigPlatform>, String>,
+{
+    fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+        if let Some(&cached) = self.cache.get(digest) {
+            return Ok(cached);
+        }
+        let size = self.meta.blob_size(digest)?;
+        self.cache.insert(digest.to_string(), size);
+        Ok(size)
+    }
+
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
+        let mut out = HashMap::new();
+        let mut uncached = Vec::new();
+        let mut seen = HashSet::new();
+        for &digest in digests {
+            if let Some(&cached) = self.cache.get(digest) {
+                if let Some(size) = cached {
+                    out.insert(digest.to_string(), size);
+                }
+                continue;
+            }
+            if seen.insert(digest) {
+                uncached.push(digest);
+            }
+        }
+        if !uncached.is_empty() {
+            let found = self.meta.batch_blob_sizes(&uncached)?;
+            for digest in uncached {
+                let size = found.get(digest).copied();
+                self.cache.insert(digest.to_string(), size);
+                if let Some(sz) = size {
+                    out.insert(digest.to_string(), sz);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_json_blob(
+        &mut self,
+        digest: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, oci_rewrite::BlobReadError> {
+        let Some(size) = self
+            .blob_size(digest)
+            .map_err(oci_rewrite::BlobReadError::Other)?
+        else {
+            return Err(oci_rewrite::BlobReadError::Other(format!(
+                "blob {digest} missing from moby content store"
+            )));
+        };
+        if size > max_bytes as u64 {
+            return Err(oci_rewrite::BlobReadError::TooLarge(format!(
+                "blob {digest} ({size} bytes) exceeds {max_bytes}-byte remaining budget"
+            )));
+        }
+        (self.fetch)(digest, max_bytes)
+    }
+
+    fn inspect_config_platform(
+        &mut self,
+        digest: &str,
+    ) -> Result<Option<oci_rewrite::ConfigPlatform>, String> {
+        if self.blob_size(digest)?.is_none() {
+            return Ok(None);
+        }
+        (self.inspect_config)(digest)
+    }
+}
+
+/// Stream-inspect `(os, architecture, variant, os.features)` of `digest` in
+/// `ns` directly from `ctr content get`'s stdout pipe using O(1) memory so
+/// platformless native configs larger than `MAX_TOTAL_METADATA_BYTES` never
+/// block native sync or spike guest PID 1 memory.
+fn inspect_ctr_config_platform(
+    reaper: &Reaper,
+    ns: &str,
+    digest: &str,
+) -> Result<Option<oci_rewrite::ConfigPlatform>, String> {
+    let mut cmd = Command::new("/usr/bin/ctr");
+    cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "content", "get", digest]);
+    let (out_r, out_w) = pipe().map_err(|e| format!("ctr content get {digest} pipe: {e}"))?;
+    let (err_r, err_w) = pipe().map_err(|e| format!("ctr content get {digest} pipe: {e}"))?;
+    cmd.env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_w))
+        .stderr(Stdio::from(err_w));
+    let (pid, exited) = reaper
+        .spawn(&mut cmd)
+        .map_err(|e| format!("spawn ctr content get {digest}: {e}"))?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let out_t = match thread::Builder::new()
+        .name("k8s-cfg-scan".into())
+        .spawn(move || oci_rewrite::parse_config_platform_reader(File::from(out_r)))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Err(format!("spawn config stream reader: {e}"));
+        }
+    };
+    let err_t = match thread::Builder::new()
+        .name("k8s-cfg-err".into())
+        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            return Err(format!("spawn config stderr reader: {e}"));
+        }
+    };
+
+    let status = match exited.recv_timeout(Duration::from_secs(15)) {
+        Ok(s) => s,
+        Err(RecvTimeoutError::Timeout) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            let _ = err_t.join();
+            return Err(format!("ctr content get {digest} timed out"));
+        }
+        Err(RecvTimeoutError::Disconnected) => -1,
+    };
+    let parsed = out_t
+        .join()
+        .map_err(|_| "config stream reader panicked".to_string())??;
+    let stderr = err_t.join().unwrap_or_default();
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    };
+    if code != 0 {
+        return Err(format!(
+            "ctr content get {digest} exited {code}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(parsed)
+}
+
+fn get_ctr_content_blob(
+    reaper: &Reaper,
+    ns: &str,
+    digest: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, oci_rewrite::BlobReadError> {
+    let mut cmd = Command::new("/usr/bin/ctr");
+    cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "content", "get", digest]);
+    let (code, stdout, stderr) =
+        match run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), max_bytes) {
+            Ok(v) => v,
+            Err(RunBytesError::ExceededLimit(msg)) => {
+                return Err(oci_rewrite::BlobReadError::TooLarge(format!(
+                    "ctr content get {digest}: {msg}"
+                )));
+            }
+            Err(RunBytesError::Other(msg)) => {
+                return Err(oci_rewrite::BlobReadError::Other(format!(
+                    "ctr content get {digest}: {msg}"
+                )));
+            }
+        };
+    if code != 0 {
+        return Err(oci_rewrite::BlobReadError::Other(format!(
+            "ctr content get {digest} exited {code}: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(stdout)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunBytesError {
+    ExceededLimit(String),
+    Other(String),
+}
+
+impl std::fmt::Display for RunBytesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExceededLimit(msg) | Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Run `cmd` under PID 1's reaper capturing raw `stdout` up to `limit` bytes
+/// (returning [`RunBytesError::ExceededLimit`] rather than silently truncating
+/// if `stdout` exceeds `limit`) and capped `stderr`.
+fn run_reaped_bytes(
+    reaper: &Reaper,
+    cmd: &mut Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<(i32, Vec<u8>, String), RunBytesError> {
+    let (out_r, out_w) = pipe().map_err(|e| RunBytesError::Other(format!("pipe: {e}")))?;
+    let (err_r, err_w) = pipe().map_err(|e| RunBytesError::Other(format!("pipe: {e}")))?;
+    cmd.env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_w))
+        .stderr(Stdio::from(err_w));
+    let (pid, exited) = reaper
+        .spawn(cmd)
+        .map_err(|e| RunBytesError::Other(format!("spawn: {e}")))?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let out_t = match thread::Builder::new()
+        .name("k8s-cmd-bytes".into())
+        .spawn(move || drain_bytes_checked(File::from(out_r), limit))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            return Err(RunBytesError::Other(format!("spawn stdout reader: {e}")));
+        }
+    };
+    let err_t = match thread::Builder::new()
+        .name("k8s-cmd-err".into())
+        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
+    {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            return Err(RunBytesError::Other(format!("spawn stderr reader: {e}")));
+        }
+    };
+
+    let status = match exited.recv_timeout(timeout) {
+        Ok(s) => s,
+        Err(RecvTimeoutError::Timeout) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = exited.recv_timeout(Duration::from_secs(2));
+            let _ = out_t.join();
+            let _ = err_t.join();
+            return Err(RunBytesError::Other(format!(
+                "{:?} timed out",
+                cmd.get_program()
+            )));
+        }
+        Err(RecvTimeoutError::Disconnected) => -1,
+    };
+    let stdout = out_t
+        .join()
+        .map_err(|_| RunBytesError::Other("stdout reader panicked".to_string()))??;
+    let stderr = err_t.join().unwrap_or_default();
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    };
+    Ok((code, stdout, stderr))
+}
+
+fn drain_bytes_checked(mut r: impl Read, limit: usize) -> Result<Vec<u8>, RunBytesError> {
+    let mut captured = Vec::new();
+    let mut overflowed = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if !overflowed {
+                    if captured.len().saturating_add(n) > limit {
+                        overflowed = true;
+                        captured.clear();
+                    } else {
+                        captured.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(RunBytesError::Other(format!("read stdout: {e}"))),
+        }
+    }
+    if overflowed {
+        return Err(RunBytesError::ExceededLimit(format!(
+            "command stdout exceeded {limit}-byte limit"
+        )));
+    }
+    Ok(captured)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtrImage {
+    digest: String,
+    /// Comma-separated `os/arch[/variant]` list from `ctr images ls` when its
+    /// digest matches containerd's `Images.List` target; `None` if the image
+    /// changed concurrently between the two queries.
+    platforms: Option<String>,
+    /// Authoritative structured labels from containerd's `Images.List` gRPC API.
+    labels: HashMap<String, String>,
+}
+
+impl CtrImage {
+    fn label(&self, key: &str) -> Option<&str> {
+        self.labels.get(key).map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtrPlatformRow {
+    digest: String,
+    platforms: String,
+}
+
+/// Remove all images in containerd's `k8s.io` namespace without touching
+/// Docker's `moby` namespace. Verifies no `k8s.io` tasks or containers remain
+/// to pin snapshots, deletes image refs in batches, and unconditionally waits
+/// on a synchronous containerd GC barrier (deleting a short-lived reset-owned
+/// lease with `--sync`) so unreferenced `k8s.io` content blobs and snapshots
+/// are reclaimed before returning — even on a retry that finds no image refs.
+/// `abort` (VM shutdown or a failed reply stream) is checked before every
+/// destructive `ctr` call.
+fn clear_k8s_images<T>(
+    reaper: &Reaper,
+    _sync_guard: &std::sync::MutexGuard<'_, T>,
+    abort: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    if abort() {
+        return Err("aborted: VM is shutting down or the client disconnected".into());
+    }
+    // `preflight_containerd_for_image_reset` already stopped lingering `k8s.io`
+    // containers before cluster data was detached; `clear_k8s_images_with`
+    // still re-verifies no workloads remain before deleting image refs.
+    let lease_id = next_gc_lease_id();
+    clear_k8s_images_with(
+        abort,
+        &lease_id,
+        // Checked immediately before every `ctr` launch (after any progress
+        // write that may just have failed), not only between steps.
+        |args, timeout, on_wait| {
+            if abort() {
+                return Err("aborted: VM is shutting down or the client disconnected".into());
+            }
+            run_ctr_k8s(reaper, args, timeout, on_wait)
+        },
+        progress,
+    )
+}
+
+fn next_gc_lease_id() -> String {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let u = uuid.trim();
+        if !u.is_empty() {
+            return format!("{IMAGE_GC_LEASE_PREFIX}-{u}");
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        "{IMAGE_GC_LEASE_PREFIX}-{}-{nanos}-{seq}",
+        std::process::id()
+    )
+}
+
+fn run_ctr_k8s(
+    reaper: &Reaper,
+    args: &[&str],
+    timeout: Duration,
+    on_wait: Option<&mut dyn FnMut()>,
+) -> Result<ReapedOutput, String> {
+    run_ctr_k8s_at(
+        reaper,
+        "/usr/bin/ctr",
+        CONTAINERD_SOCKET,
+        args,
+        timeout,
+        on_wait,
+    )
+}
+
+fn run_ctr_k8s_at(
+    reaper: &Reaper,
+    ctr_bin: &str,
+    socket: &str,
+    args: &[&str],
+    timeout: Duration,
+    on_wait: Option<&mut dyn FnMut()>,
+) -> Result<ReapedOutput, String> {
+    let mut cmd = Command::new(ctr_bin);
+    cmd.args(["-a", socket, "-n", "k8s.io"]);
+    cmd.args(args);
+    run_reaped_split_checked(
+        reaper,
+        &mut cmd,
+        timeout,
+        IMAGE_LS_STDOUT_LIMIT,
+        true,
+        on_wait,
+    )
+    .map_err(|e| format!("ctr {}: {e}", args.first().copied().unwrap_or_default()))
+}
+
+fn ctr_error_detail<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
+    let err = stderr.trim();
+    if err.is_empty() { stdout.trim() } else { err }
+}
+
+fn parse_ctr_image_refs(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_remaining_ids(ids: &[String]) -> String {
+    const MAX_PREVIEW: usize = 5;
+    if ids.len() <= MAX_PREVIEW {
+        ids.join(", ")
+    } else {
+        format!(
+            "{}, ... (+{} more)",
+            ids[..MAX_PREVIEW].join(", "),
+            ids.len() - MAX_PREVIEW
+        )
+    }
+}
+
+fn plan_image_rm_batches(refs: &[String], batch_size: usize) -> Vec<&[String]> {
+    let batch_size = batch_size.max(1);
+    refs.chunks(batch_size).collect()
+}
+
+/// Wait until containerd answers gRPC RPCs (`ctr version`) within
+/// `total_timeout`. Retries fast non-zero exits (e.g. startup races right
+/// after the socket is bound), while returning immediately on VM shutdown or
+/// probe timeouts/spawn errors (e.g. a listening-but-hung daemon).
+fn wait_containerd_rpc_with<S, R>(
+    shutting_down: S,
+    total_timeout: Duration,
+    probe_timeout: Duration,
+    mut run: R,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String>
+where
+    S: Fn() -> bool,
+    R: FnMut(&[&str], Duration, Option<&mut dyn FnMut()>) -> Result<ReapedOutput, String>,
+{
+    let deadline = Instant::now() + total_timeout;
+    let mut last_beat = Instant::now();
+    let mut last_err: Option<String> = None;
+    let msg = "waiting for containerd";
+    loop {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = remaining.min(probe_timeout);
+        let mut beat = || {
+            progress(msg);
+            last_beat = Instant::now();
+        };
+        let out = run(&["version"], attempt_timeout, Some(&mut beat))?;
+        if out.code == 0 {
+            return Ok(());
+        }
+        last_err = Some(format!(
+            "containerd RPC not ready (ctr version): {}",
+            ctr_error_detail(&out.stdout, &out.stderr)
+        ));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
+            progress(msg);
+            last_beat = Instant::now();
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    Err(last_err.unwrap_or_else(|| "containerd RPC not ready (ctr version): timed out".into()))
+}
+
+fn verify_no_k8s_workloads_with<S, R>(
+    shutting_down: S,
+    mut run: R,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String>
+where
+    S: Fn() -> bool,
+    R: FnMut(&[&str], Duration, Option<&mut dyn FnMut()>) -> Result<ReapedOutput, String>,
+{
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    let msg = "verifying k8s.io tasks and containers are stopped";
+    progress(msg);
+    let mut beat = || progress(msg);
+    let tasks_out = run(&["tasks", "ls", "-q"], IMAGE_LS_TIMEOUT, Some(&mut beat))?;
+    if tasks_out.code != 0 {
+        return Err(format!(
+            "ctr tasks ls (k8s.io) failed: {}",
+            ctr_error_detail(&tasks_out.stdout, &tasks_out.stderr)
+        ));
+    }
+    if tasks_out.stdout_truncated {
+        return Err(
+            "ctr tasks ls (k8s.io) output exceeded capture limit; refusing to reset".into(),
+        );
+    }
+    let remaining_tasks = parse_ctr_image_refs(&tasks_out.stdout);
+    if !remaining_tasks.is_empty() {
+        return Err(format!(
+            "Kubernetes workloads survived the stop: {} task(s) still remain in k8s.io ({}); refusing to reset",
+            remaining_tasks.len(),
+            format_remaining_ids(&remaining_tasks)
+        ));
+    }
+
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    let mut beat = || progress(msg);
+    let containers_out = run(
+        &["containers", "ls", "-q"],
+        IMAGE_LS_TIMEOUT,
+        Some(&mut beat),
+    )?;
+    if containers_out.code != 0 {
+        return Err(format!(
+            "ctr containers ls (k8s.io) failed: {}",
+            ctr_error_detail(&containers_out.stdout, &containers_out.stderr)
+        ));
+    }
+    if containers_out.stdout_truncated {
+        return Err(
+            "ctr containers ls (k8s.io) output exceeded capture limit; refusing to reset".into(),
+        );
+    }
+    let remaining_containers = parse_ctr_image_refs(&containers_out.stdout);
+    if !remaining_containers.is_empty() {
+        return Err(format!(
+            "Kubernetes workloads survived the stop: {} container(s) still remain in k8s.io ({}); refusing to reset",
+            remaining_containers.len(),
+            format_remaining_ids(&remaining_containers)
+        ));
+    }
+    Ok(())
+}
+
+/// Verify containerd is not just listening on its socket but answering gRPC
+/// RPCs, stop any lingering `k8s.io` containers from an unclean shutdown, and
+/// confirm no tasks/containers remain — all before detaching active cluster data.
+/// Refuses (keeping cluster data) unless containerd answers and confirms no
+/// `k8s.io` workload survived the stop: with containerd down, pod shims may
+/// still be running and using the data that reset would delete.
+fn preflight_containerd_for_reset(
+    reaper: &Reaper,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    preflight_containerd_checks(reaper, progress).map_err(|e| {
+        if e.starts_with("aborted:") {
+            e
+        } else {
+            format!(
+                "{e}; cluster data was left intact (restart the VM with `kat restart` and retry the reset)"
+            )
+        }
+    })
+}
+
+fn preflight_containerd_checks(
+    reaper: &Reaper,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    wait_containerd_with_progress(progress)?;
+    wait_containerd_rpc_with(
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        CONTAINERD_RPC_WAIT_TIMEOUT,
+        CONTAINERD_PROBE_TIMEOUT,
+        |args, timeout, on_wait| run_ctr_k8s(reaper, args, timeout, on_wait),
+        progress,
+    )?;
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return Err("aborted: VM is shutting down".into());
+    }
+    progress("stopping lingering k8s.io containers");
+    let shutting_down = || SHUTTING_DOWN.load(Ordering::SeqCst);
+    stop_k8s_containers_with_progress(reaper, &shutting_down, progress);
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    verify_no_k8s_workloads_with(
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        |args, timeout, on_wait| run_ctr_k8s(reaper, args, timeout, on_wait),
+        progress,
+    )
+}
+
+fn clear_k8s_images_with<S, R, P>(
+    shutting_down: S,
+    lease_id: &str,
+    mut run: R,
+    mut progress: P,
+) -> Result<(), String>
+where
+    S: Fn() -> bool,
+    R: FnMut(&[&str], Duration, Option<&mut dyn FnMut()>) -> Result<ReapedOutput, String>,
+    P: FnMut(&str),
+{
+    verify_no_k8s_workloads_with(&shutting_down, &mut run, &mut progress)?;
+
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    progress("listing k8s.io images");
+    let images_out = run(&["images", "ls", "-q"], IMAGE_LS_TIMEOUT, None)?;
+    if images_out.code != 0 {
+        return Err(format!(
+            "ctr images ls (k8s.io) failed: {}",
+            ctr_error_detail(&images_out.stdout, &images_out.stderr)
+        ));
+    }
+    if images_out.stdout_truncated {
+        return Err(
+            "ctr images ls (k8s.io) output exceeded capture limit; refusing to delete from a truncated inventory"
+                .into(),
+        );
+    }
+    let refs = parse_ctr_image_refs(&images_out.stdout);
+    let batches = plan_image_rm_batches(&refs, IMAGE_RM_BATCH_SIZE);
+    let total_batches = batches.len();
+    for (idx, batch) in batches.into_iter().enumerate() {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        let msg = format!(
+            "removing k8s.io images (batch {}/{})",
+            idx + 1,
+            total_batches
+        );
+        progress(&msg);
+        let mut args: Vec<&str> = Vec::with_capacity(batch.len() + 3);
+        args.extend(["images", "rm", "--"]);
+        args.extend(batch.iter().map(String::as_str));
+        let mut beat = || progress(&msg);
+        let out = run(&args, IMAGE_RM_BATCH_TIMEOUT, Some(&mut beat))?;
+        if out.code != 0 {
+            return Err(format!(
+                "ctr images rm (k8s.io) failed: {}",
+                ctr_error_detail(&out.stdout, &out.stderr)
+            ));
+        }
+    }
+
+    // Always run a synchronous GC barrier — even when `refs` is empty (such as
+    // a retry after an earlier purge deleted the last ref and timed out waiting
+    // for GC) — using a short-lived reset-owned lease so existing leases are
+    // never touched.
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    let gc_msg = "waiting for containerd garbage collection";
+    progress(gc_msg);
+    let create_out = run(
+        &[
+            "leases",
+            "create",
+            "--id",
+            lease_id,
+            "--expires",
+            IMAGE_GC_LEASE_EXPIRES,
+        ],
+        IMAGE_LS_TIMEOUT,
+        None,
+    )?;
+    if create_out.code != 0 {
+        return Err(format!(
+            "ctr leases create (k8s.io) failed: {}",
+            ctr_error_detail(&create_out.stdout, &create_out.stderr)
+        ));
+    }
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    let mut gc_beat = || progress(gc_msg);
+    let delete_out = run(
+        &["leases", "delete", "--sync", "--", lease_id],
+        IMAGE_RM_SYNC_TIMEOUT,
+        Some(&mut gc_beat),
+    )?;
+    if delete_out.code != 0 {
+        return Err(format!(
+            "ctr leases delete --sync (k8s.io) failed: {}",
+            ctr_error_detail(&delete_out.stdout, &delete_out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Returns `image_ref -> image` for all images in a containerd namespace.
+///
+/// Image names, target digests, and labels come from containerd's structured
+/// `Images.List` gRPC API (never comma-splitting `ctr images ls` text), while
+/// platform lists come from `ctr images ls` matched by digest. Both calls fail
+/// explicitly if output exceeds [`IMAGE_LIST_LIMIT`] so sync never infers
+/// orphaned mirrors from a silently truncated inventory.
+fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, CtrImage>, String> {
+    let grpc_images = containerd_grpc::list_images(
+        Path::new(CONTAINERD_SOCKET),
+        ns,
+        IMAGE_LIST_LIMIT,
+        Duration::from_secs(15),
+    )?;
+    if grpc_images.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let platforms = list_ctr_platforms(reaper, ns)?;
+    Ok(merge_image_inventory(grpc_images, &platforms))
+}
+
+fn list_ctr_platforms(
+    reaper: &Reaper,
+    ns: &str,
+) -> Result<HashMap<String, CtrPlatformRow>, String> {
     let mut cmd = Command::new("/usr/bin/ctr");
     cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "images", "ls"]);
-    let (code, stdout, stderr) = run_reaped_split(reaper, &mut cmd, Duration::from_secs(15))
-        .map_err(|e| format!("ctr images ls ({ns}): {e}"))?;
+    let (code, stdout_bytes, stderr) =
+        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), IMAGE_LIST_LIMIT)
+            .map_err(|e| format!("ctr images ls ({ns}): {e}"))?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     if code != 0 {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -1992,51 +6779,88 @@ fn list_ctr_images(reaper: &Reaper, ns: &str) -> Result<HashMap<String, String>,
         };
         return Err(format!("ctr images ls ({ns}) failed: {detail}"));
     }
-    let mut map = HashMap::new();
-    for line in stdout.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let Some(name) = fields.next() else {
-            continue;
-        };
-        let _media_type = fields.next();
-        let Some(digest) = fields.next() else {
-            continue;
-        };
-        map.insert(name.to_string(), digest.to_string());
-    }
-    Ok(map)
+    Ok(parse_ctr_platforms(&stdout))
 }
 
-/// Stream an image from `moby` to `k8s.io` via two separate Reaper-managed
-/// `ctr` processes connected by an OS pipe, verifying both exit statuses.
-fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
+/// Join authoritative gRPC image records (`name`, `target.digest`, structured
+/// `labels`) with digest-matched platform rows from `ctr images ls`.
+fn merge_image_inventory(
+    grpc_images: Vec<containerd_grpc::ContainerdImage>,
+    ctr_platforms: &HashMap<String, CtrPlatformRow>,
+) -> HashMap<String, CtrImage> {
+    let mut map = HashMap::with_capacity(grpc_images.len());
+    for img in grpc_images {
+        let platforms = ctr_platforms
+            .get(&img.name)
+            .filter(|row| row.digest == img.target.digest)
+            .map(|row| row.platforms.clone());
+        map.insert(
+            img.name,
+            CtrImage {
+                digest: img.target.digest,
+                platforms,
+                labels: img.labels,
+            },
+        );
+    }
+    map
+}
+
+/// Read and parse `ctr images ls` platform rows up to `limit` bytes, failing
+/// instead of returning a partial inventory when stdout exceeds `limit`.
+#[cfg(test)]
+fn parse_checked_ctr_platforms(
+    r: impl Read,
+    limit: usize,
+) -> Result<HashMap<String, CtrPlatformRow>, String> {
+    let bytes = drain_bytes_checked(r, limit).map_err(|e| e.to_string())?;
+    Ok(parse_ctr_platforms(&String::from_utf8_lossy(&bytes)))
+}
+
+/// Parse `ctr images ls` output (`REF TYPE DIGEST SIZE PLATFORMS LABELS`),
+/// extracting only `(REF -> DIGEST, PLATFORMS)` and ignoring the unescaped
+/// `LABELS` column (authoritative labels come from containerd's `Images.List`).
+fn parse_ctr_platforms(stdout: &str) -> HashMap<String, CtrPlatformRow> {
+    let mut map = HashMap::new();
+    for line in stdout.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let platforms = fields.get(5).copied().unwrap_or("");
+        map.insert(
+            fields[0].to_string(),
+            CtrPlatformRow {
+                digest: fields[2].to_string(),
+                platforms: platforms.to_string(),
+            },
+        );
+    }
+    map
+}
+
+/// Stream a native image from `moby` to `k8s.io` via two Reaper-managed `ctr`
+/// processes connected by an OS pipe, verifying both exit statuses.
+fn mirror_native_image(reaper: &Reaper, name: &str) -> Result<(), String> {
     let timeout = Duration::from_secs(120);
     let (pipe_r, pipe_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
     let (exp_err_r, exp_err_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
     let (imp_err_r, imp_err_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
 
-    let mut exp = Command::new("/usr/bin/ctr");
-    exp.args([
+    // `--local` avoids containerd's transfer-API progress handler writing
+    // status lines onto stdout (the archive stream itself) when exporting to `-`.
+    let exp_args = [
         "-a",
         CONTAINERD_SOCKET,
         "-n",
         "moby",
         "images",
         "export",
+        "--local",
         "-",
         name,
-    ])
-    .env("PATH", PATH)
-    .stdin(Stdio::null())
-    .stdout(Stdio::from(pipe_w))
-    .stderr(Stdio::from(exp_err_w));
-    let (exp_pid, exp_rx) = reaper
-        .spawn(&mut exp)
-        .map_err(|e| format!("spawn ctr export: {e}"))?;
-    exp.stdout(Stdio::null()).stderr(Stdio::null());
-
-    let mut imp = Command::new("/usr/bin/ctr");
-    imp.args([
+    ];
+    let imp_args = [
         "-a",
         CONTAINERD_SOCKET,
         "-n",
@@ -2045,11 +6869,25 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
         "import",
         "--digests",
         "-",
-    ])
-    .env("PATH", PATH)
-    .stdin(Stdio::from(pipe_r))
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(imp_err_w));
+    ];
+
+    let mut exp = Command::new("/usr/bin/ctr");
+    exp.args(exp_args)
+        .env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(pipe_w))
+        .stderr(Stdio::from(exp_err_w));
+    let (exp_pid, exp_rx) = reaper
+        .spawn(&mut exp)
+        .map_err(|e| format!("spawn ctr export: {e}"))?;
+    exp.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut imp = Command::new("/usr/bin/ctr");
+    imp.args(imp_args)
+        .env("PATH", PATH)
+        .stdin(Stdio::from(pipe_r))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(imp_err_w));
     let (imp_pid, imp_rx) = match reaper.spawn(&mut imp) {
         Ok(v) => v,
         Err(e) => {
@@ -2098,34 +6936,73 @@ fn mirror_one_image(reaper: &Reaper, name: &str) -> Result<(), String> {
     };
 
     let deadline = Instant::now() + timeout;
-    let wait_one = |pid: i32, rx: &Receiver<i32>, label: &str| -> Result<i32, String> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left) {
-            Ok(s) => Ok(if libc::WIFEXITED(s) {
-                libc::WEXITSTATUS(s)
-            } else {
-                128 + libc::WTERMSIG(s)
-            }),
-            Err(_) => {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                let _ = rx.recv_timeout(Duration::from_secs(2));
-                Err(format!("{label} timed out"))
+    let wait_one =
+        |pid: i32, rx: &Receiver<i32>, label: &str, min_grace: Duration| -> Result<i32, String> {
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(min_grace);
+            match rx.recv_timeout(left) {
+                Ok(s) => Ok(if libc::WIFEXITED(s) {
+                    libc::WEXITSTATUS(s)
+                } else {
+                    128 + libc::WTERMSIG(s)
+                }),
+                Err(_) => {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    let _ = rx.recv_timeout(Duration::from_secs(2));
+                    Err(format!("{label} timed out"))
+                }
             }
-        }
-    };
+        };
 
-    let exp_res = wait_one(exp_pid, &exp_rx, "ctr export");
-    let imp_res = wait_one(imp_pid, &imp_rx, "ctr import");
+    let exp_res = wait_one(exp_pid, &exp_rx, "ctr export", Duration::ZERO);
+    let imp_grace = if exp_res.is_err() {
+        Duration::from_secs(2)
+    } else {
+        Duration::ZERO
+    };
+    let imp_res = wait_one(imp_pid, &imp_rx, "ctr import", imp_grace);
     let exp_err = exp_err_t.join().unwrap_or_default();
     let imp_err = imp_err_t.join().unwrap_or_default();
 
-    let exp_code = exp_res?;
-    let imp_code = imp_res?;
-    if exp_code != 0 {
-        return Err(format!("ctr export exited {exp_code}: {exp_err}"));
+    combine_mirror_results(exp_res, &exp_err, imp_res, &imp_err)
+}
+
+fn format_child_failure(label: &str, res: Result<i32, String>, stderr: &str) -> Option<String> {
+    match res {
+        Ok(0) => None,
+        Ok(code) => {
+            if stderr.is_empty() {
+                Some(format!("{label} exited {code}"))
+            } else {
+                Some(format!("{label} exited {code}: {stderr}"))
+            }
+        }
+        Err(timeout) => {
+            if stderr.is_empty() {
+                Some(timeout)
+            } else {
+                Some(format!("{timeout}: {stderr}"))
+            }
+        }
     }
-    if imp_code != 0 {
-        return Err(format!("ctr import exited {imp_code}: {imp_err}"));
+}
+
+fn combine_mirror_results(
+    exp_res: Result<i32, String>,
+    exp_err: &str,
+    imp_res: Result<i32, String>,
+    imp_err: &str,
+) -> Result<(), String> {
+    let mut parts = Vec::new();
+    if let Some(exp_msg) = format_child_failure("ctr export", exp_res, exp_err) {
+        parts.push(exp_msg);
+    }
+    if let Some(imp_msg) = format_child_failure("ctr import", imp_res, imp_err) {
+        parts.push(imp_msg);
+    }
+    if !parts.is_empty() {
+        return Err(parts.join("; "));
     }
     Ok(())
 }
@@ -2137,7 +7014,6 @@ fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2145,6 +7021,1451 @@ mod tests {
             std::env::temp_dir().join(format!("kat-init-k8s-{name}-{}-{seq}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn ctr_img(digest: &str, platforms: &str, labels: &[(&str, &str)]) -> CtrImage {
+        CtrImage {
+            digest: digest.into(),
+            platforms: Some(platforms.into()),
+            labels: labels
+                .iter()
+                .map(|&(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn merge_image_inventory_uses_structured_labels_and_guards_digest_drift() {
+        let out = "\
+REF                       TYPE                                                 DIGEST                                                                  SIZE      PLATFORMS                                LABELS
+docker.io/library/app:dev application/vnd.oci.image.index.v1+json              sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 12.3 MiB  linux/amd64                              -
+docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 4.0 KiB   linux/amd64,linux/arm64/v8               note=hello,io.katamaran.k8s.source-digest=sha256:forged
+";
+        let platform_rows = parse_ctr_platforms(out);
+        let grpc_images = vec![
+            containerd_grpc::ContainerdImage {
+                name: "docker.io/library/app:dev".into(),
+                labels: HashMap::new(),
+                target: containerd_grpc::Descriptor {
+                    media_type: "application/vnd.oci.image.index.v1+json".into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    size: 128,
+                    ..Default::default()
+                },
+            },
+            containerd_grpc::ContainerdImage {
+                name: "docker.io/library/web:1".into(),
+                labels: HashMap::from([
+                    ("io.cri-containerd.image".into(), "managed".into()),
+                    (
+                        "note".into(),
+                        format!("hello,{SOURCE_DIGEST_LABEL}=sha256:forged"),
+                    ),
+                ]),
+                target: containerd_grpc::Descriptor {
+                    media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                    size: 256,
+                    ..Default::default()
+                },
+            },
+            containerd_grpc::ContainerdImage {
+                name: "docker.io/library/retagged:1".into(),
+                labels: HashMap::new(),
+                target: containerd_grpc::Descriptor {
+                    media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                    digest: format!("sha256:{}", "c".repeat(64)),
+                    size: 256,
+                    ..Default::default()
+                },
+            },
+        ];
+        let images = merge_image_inventory(grpc_images, &platform_rows);
+        let app = &images["docker.io/library/app:dev"];
+        assert_eq!(app.digest, format!("sha256:{}", "a".repeat(64)));
+        assert_eq!(app.platforms.as_deref(), Some("linux/amd64"));
+        assert_eq!(app.label(SOURCE_DIGEST_LABEL), None);
+
+        // Comma-embedded ownership marker in another label's value must NEVER
+        // match SOURCE_DIGEST_LABEL or be mistaken for a Katamaran mirror.
+        let web = &images["docker.io/library/web:1"];
+        assert_eq!(web.platforms.as_deref(), Some("linux/amd64,linux/arm64/v8"));
+        assert_eq!(web.label(SOURCE_DIGEST_LABEL), None);
+        assert_eq!(web.label("io.cri-containerd.image"), Some("managed"));
+        assert_eq!(
+            plan_sync_action(
+                "docker.io/library/web:1",
+                app,
+                Some(web),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "docker.io/library/web:1",
+                app,
+                Some(web),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportDivergedTag
+        );
+
+        // Missing or mismatched ctr platform row produces `platforms: None` -> Relist.
+        let retagged = &images["docker.io/library/retagged:1"];
+        assert_eq!(retagged.platforms, None);
+        assert_eq!(
+            classify_native_availability(
+                "docker.io/library/retagged:1",
+                retagged,
+                None,
+                None,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            NativeAvailability::Stale
+        );
+    }
+
+    #[test]
+    fn rewrites_complete_single_manifest_amd64_image() {
+        let ls_out = "\
+REF                          TYPE                                            DIGEST                                                                  SIZE     PLATFORMS   LABELS
+docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+json sha256:1111111111111111111111111111111111111111111111111111111111111111 4.0 MiB linux/amd64 -
+";
+        let name = "docker.io/library/app:single";
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let moby = merge_image_inventory(
+            vec![containerd_grpc::ContainerdImage {
+                name: name.into(),
+                labels: HashMap::new(),
+                target: containerd_grpc::Descriptor {
+                    media_type: "application/vnd.docker.distribution.manifest.v2+json".into(),
+                    digest,
+                    size: 128,
+                    ..Default::default()
+                },
+            }],
+            &parse_ctr_platforms(ls_out),
+        );
+        let img = &moby[name];
+        let native =
+            classify_native_availability(name, img, None, None, EmulationMode::Enabled, "arm64");
+        assert_eq!(native, NativeAvailability::Absent);
+        assert_eq!(
+            plan_sync_action(
+                name,
+                img,
+                None,
+                native,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+    }
+
+    #[test]
+    fn probe_failure_preserves_ambiguous_mirrors_without_blocking_others() {
+        let multi = ctr_img("sha256:multi", "linux/amd64,linux/arm64/v8", &[]);
+        let amd64_only = ctr_img("sha256:amd", "linux/amd64", &[]);
+        let arm64_only = ctr_img("sha256:arm", "linux/arm64/v8", &[]);
+        let k8s_rewritten = ctr_img(
+            "sha256:rewritten",
+            "linux/arm64",
+            &[(SOURCE_DIGEST_LABEL, "sha256:multi")],
+        );
+        let failed_probe: Result<NativeAvailability, String> =
+            Err("containerd Content.Info timed out".into());
+
+        // Ambiguous multi-arch image: probe failure leaves existing mirror untouched and reports error.
+        let n_multi = classify_native_availability(
+            "app:multi",
+            &multi,
+            Some(&k8s_rewritten),
+            Some(&failed_probe),
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(n_multi, NativeAvailability::ProbeFailed);
+        assert_eq!(
+            plan_sync_action(
+                "app:multi",
+                &multi,
+                Some(&k8s_rewritten),
+                n_multi,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportProbeError
+        );
+
+        // Non-ambiguous amd64-only and arm64-only images still proceed without the probe.
+        let n_amd = classify_native_availability(
+            "app:amd",
+            &amd64_only,
+            None,
+            Some(&failed_probe),
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:amd",
+                &amd64_only,
+                None,
+                n_amd,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+        let n_arm = classify_native_availability(
+            "app:arm",
+            &arm64_only,
+            None,
+            Some(&failed_probe),
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:arm",
+                &arm64_only,
+                None,
+                n_arm,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
+        );
+    }
+
+    #[test]
+    fn check_digest_mismatch_requests_relist() {
+        let multi = ctr_img("sha256:old", "linux/amd64,linux/arm64/v8", &[]);
+        let stale_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Stale);
+        let native = classify_native_availability(
+            "app:dev",
+            &multi,
+            None,
+            Some(&stale_probe),
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(native, NativeAvailability::Stale);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &multi,
+                None,
+                native,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::Relist
+        );
+    }
+
+    /// Regression test: an unlabelled `k8s.io` tag is never replaced by an
+    /// amd64 rewrite. Its native completeness only decides how it is reported:
+    /// incomplete arm64 (conflict reported to the user), verified arm64
+    /// (silently preserved), probe error (preserved, error reported), and
+    /// stale digest (relist).
+    #[test]
+    fn unlabelled_destination_index_requires_verified_local_arm64_content() {
+        let moby_amd64 = ctr_img("sha256:moby-amd64", "linux/amd64", &[]);
+        let k8s_multi_index = ctr_img("sha256:k8s-multi", "linux/amd64,linux/arm64/v8", &[]);
+
+        assert!(needs_dest_native_probe(
+            "app:dev",
+            &moby_amd64,
+            Some(&k8s_multi_index),
+            NativeAvailability::Absent,
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+
+        // 1. Only amd64 blobs cached under k8s.io's multi-arch index -> Absent ->
+        //    conflict reported, tag never replaced.
+        let incomplete_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Absent);
+        let dest_incomplete = classify_dest_native_availability(
+            Some(&k8s_multi_index),
+            Some(&incomplete_probe),
+            "arm64",
+        );
+        assert_eq!(dest_incomplete, NativeAvailability::Absent);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_incomplete,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportUnownedDestination
+        );
+
+        // 2. Verified complete local arm64 content in k8s.io -> Present: preserved, but reported because it differs from Docker.
+        let complete_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Present);
+        let dest_complete = classify_dest_native_availability(
+            Some(&k8s_multi_index),
+            Some(&complete_probe),
+            "arm64",
+        );
+        assert_eq!(dest_complete, NativeAvailability::Present);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_complete,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportDivergedTag
+        );
+
+        // 3. Probe error on k8s.io -> ProbeFailed -> ReportProbeError (preserve!).
+        let err_probe: Result<NativeAvailability, String> = Err("k8s.io probe failed".into());
+        let dest_err =
+            classify_dest_native_availability(Some(&k8s_multi_index), Some(&err_probe), "arm64");
+        assert_eq!(dest_err, NativeAvailability::ProbeFailed);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_err,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportProbeError
+        );
+
+        // 4. Stale / concurrently retagged k8s.io digest -> Stale -> Relist!
+        let stale_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Stale);
+        let dest_stale =
+            classify_dest_native_availability(Some(&k8s_multi_index), Some(&stale_probe), "arm64");
+        assert_eq!(dest_stale, NativeAvailability::Stale);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &moby_amd64,
+                Some(&k8s_multi_index),
+                NativeAvailability::Absent,
+                dest_stale,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::Relist
+        );
+    }
+
+    #[test]
+    fn plan_sync_action_handles_emulation_off_unknown_and_digest_refs() {
+        let amd64_idx = ctr_img("sha256:src", "linux/amd64", &[]);
+        let k8s_rewritten = ctr_img(
+            "sha256:new",
+            "linux/arm64",
+            &[
+                ("io.cri-containerd.image", "managed"),
+                (SOURCE_DIGEST_LABEL, "sha256:src"),
+            ],
+        );
+        let k8s_stale_rewritten = ctr_img(
+            "sha256:old",
+            "linux/arm64",
+            &[(SOURCE_DIGEST_LABEL, "sha256:older")],
+        );
+        let k8s_unrelated = ctr_img(
+            "sha256:other",
+            "linux/arm64",
+            &[
+                ("io.cri-containerd.image", "managed"),
+                ("note", "x,io.katamaran.k8s.source-digest=sha256:src"),
+            ],
+        );
+
+        // Emulation on: missing / stale -> rewrite; matching rewritten -> skip.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_stale_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+
+        // Emulation on: preserve an existing unlabelled native Kubernetes image
+        // when its local arm64 content is verified complete, re-list if drifted,
+        // and report (never replace) an unlabelled amd64-only tag in k8s.io.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unrelated),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportDivergedTag
+        );
+        let k8s_unlabelled_drifted = CtrImage {
+            digest: "sha256:drifted".into(),
+            platforms: None,
+            labels: HashMap::new(),
+        };
+        assert_eq!(
+            classify_dest_native_availability(Some(&k8s_unlabelled_drifted), None, "arm64"),
+            NativeAvailability::Stale
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unlabelled_drifted),
+                NativeAvailability::Absent,
+                NativeAvailability::Stale,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::Relist
+        );
+        let k8s_unlabelled_amd64 = ctr_img("sha256:legacy-amd64", "linux/amd64", &[]);
+        assert_eq!(
+            classify_dest_native_availability(Some(&k8s_unlabelled_amd64), None, "arm64"),
+            NativeAvailability::Absent
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unlabelled_amd64),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportUnownedDestination
+        );
+        assert!(
+            unowned_destination_message("app:dev").contains("docker tag app:dev"),
+            "conflict message must tell the user how to resolve it"
+        );
+        assert!(is_published_mirror_manifest(
+            br#"{"annotations":{"io.katamaran.k8s.publication":"lease-1"}}"#
+        ));
+        assert!(!is_published_mirror_manifest(br#"{"schemaVersion":2}"#));
+        assert!(!is_published_mirror_manifest(b"not json"));
+        // A legacy unlabelled copy (e.g. an amd64 image mirrored unchanged by
+        // 0.10.0, #41) is never adopted or deleted: it is reported with the
+        // retag workaround instead.
+        let k8s_unchanged_copy = ctr_img(&amd64_idx.digest, "linux/amd64", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unchanged_copy),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportUnownedDestination
+        );
+        let k8s_unchanged_multi = ctr_img(&amd64_idx.digest, "linux/amd64,linux/arm64/v8", &[]);
+        // When emulation is off or unknown and Kubernetes has a different
+        // unlabelled image under the same tag, report the emulation cause
+        // directly (not ReportDivergedTag with a retag workaround that still
+        // cannot mirror).
+        let k8s_native_old = ctr_img("sha256:old-native", "linux/arm64", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_native_old),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_native_old),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationUnavailable
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unchanged_multi),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportUnownedDestination
+        );
+
+        // Emulation disabled for an amd64-only image: keep (never delete)
+        // an up-to-date Katamaran mirror, and report unmirrored amd64 tags
+        // (whether k8s.io has no copy, a stale mirror, or a different image).
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::KeepMirrorEmulationOff
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_stale_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unrelated),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_unchanged_copy),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationDisabled
+        );
+
+        // Emulation status Unknown (e.g. transient binfmt_misc read error): NEVER
+        // retire existing working Katamaran mirrors and NEVER publish new amd64
+        // rewrites (report them instead), while still allowing native arm64
+        // images to sync.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationUnavailable
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Present,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
+        );
+
+        // Native content present over a previously rewritten copy: replace natively
+        // and clear the stale source-digest label.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Present,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: true
+            }
+        );
+
+        // Digest-pinned amd64-only reference: never rewrite; keep an existing
+        // rewritten copy while emulation is on (retire only when explicitly
+        // off); mirror natively when native content is present.
+        let digest_ref = "docker.io/library/app@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::SkipDigestAmd64
+        );
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::SkipDigestAmd64
+        );
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::KeepMirrorEmulationOff
+        );
+        // amd64 = off: a digest ref is not reported as an emulation skip.
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        // Emulation on, but the source's platforms are unresolved (`-`) or
+        // have no amd64 variant: never delete the existing working mirror.
+        // (A resolved non-amd64 source is reported as leaving the previous
+        // build in place; an unresolved list just keeps it.)
+        for (platforms, want) in [
+            ("-", SyncAction::Skip),
+            ("linux/s390x", SyncAction::ReportStaleMirror),
+        ] {
+            let unresolved = ctr_img("sha256:src2", platforms, &[]);
+            assert_eq!(
+                plan_sync_action(
+                    "app:dev",
+                    &unresolved,
+                    Some(&k8s_rewritten),
+                    NativeAvailability::Absent,
+                    NativeAvailability::Absent,
+                    EmulationMode::Enabled,
+                    "arm64"
+                ),
+                want,
+                "platforms {platforms}"
+            );
+        }
+        // Emulation unknown (e.g. registration failed): an amd64 tag with no
+        // up-to-date mirror is reported, never silently skipped; an existing
+        // mirror is kept.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::ReportEmulationUnavailable
+        );
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                None,
+                NativeAvailability::Present,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
+        );
+
+        // Mixed 32-bit ARM + amd64 tag with NO arm64 variant: Katamaran's arm64
+        // guest kernel disables CONFIG_COMPAT, so sync must rewrite amd64.
+        let arm32_and_amd64 = ctr_img("sha256:mixed", "linux/arm/v7,linux/amd64", &[]);
+        let native_mixed = classify_native_availability(
+            "app:mixed",
+            &arm32_and_amd64,
+            None,
+            None,
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(native_mixed, NativeAvailability::Absent);
+        assert_eq!(
+            plan_sync_action(
+                "app:mixed",
+                &arm32_and_amd64,
+                None,
+                native_mixed,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+
+        // Non-baseline `linux/arm64/v8.2` + `linux/amd64` on baseline arm64 guest:
+        // `ctr images export --local` (`DefaultStrict()`) rejects `v8.2`, so sync
+        // must rewrite `linux/amd64`.
+        let v82_and_amd64 = ctr_img("sha256:v82", "linux/arm64/v8.2,linux/amd64", &[]);
+        let native_v82 = classify_native_availability(
+            "app:v82",
+            &v82_and_amd64,
+            None,
+            None,
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(native_v82, NativeAvailability::Absent);
+        assert_eq!(
+            plan_sync_action(
+                "app:v82",
+                &v82_and_amd64,
+                None,
+                native_v82,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+
+        // Baseline alias `linux/arm64/v8.0` + `linux/amd64`: containerd's
+        // `DefaultStrict()` normalizes `v8.0` to baseline `arm64`, so a
+        // complete native probe must select `MirrorNative` instead of rewriting.
+        let v80_and_amd64 = ctr_img("sha256:v80", "linux/arm64/v8.0,linux/amd64", &[]);
+        assert!(needs_native_probe(
+            "app:v80",
+            &v80_and_amd64,
+            None,
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+        let ok_present: Result<NativeAvailability, String> = Ok(NativeAvailability::Present);
+        let native_v80 = classify_native_availability(
+            "app:v80",
+            &v80_and_amd64,
+            None,
+            Some(&ok_present),
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(native_v80, NativeAvailability::Present);
+        assert_eq!(
+            plan_sync_action(
+                "app:v80",
+                &v80_and_amd64,
+                None,
+                native_v80,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
+        );
+
+        // Non-arm64/non-amd64 source over a different unlabelled k8s tag
+        // reports ReportStaleMirror rather than ReportDivergedTag.
+        let s390x = ctr_img("sha256:s390x", "linux/s390x", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &s390x,
+                Some(&k8s_native_old),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::ReportStaleMirror
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &s390x,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+    }
+
+    #[test]
+    fn needs_native_probe_skips_same_unlabelled_digest_when_action_cannot_change() {
+        let multi = ctr_img("sha256:same", "linux/amd64,linux/arm64/v8", &[]);
+        let k8s_same = ctr_img("sha256:same", "linux/amd64,linux/arm64/v8", &[]);
+        let k8s_diff = ctr_img("sha256:other", "linux/amd64,linux/arm64/v8", &[]);
+        let k8s_rewritten = ctr_img(
+            "sha256:rewritten",
+            "linux/arm64",
+            &[(SOURCE_DIGEST_LABEL, "sha256:same")],
+        );
+        let digest_ref = "docker.io/library/app@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let failed_probe: Result<NativeAvailability, String> = Err("transient rpc timeout".into());
+
+        // Emulation Disabled or Unknown with same unlabelled digest: no action
+        // can differ, so skip probing and ignore transient probe failures.
+        for mode in [EmulationMode::Disabled, EmulationMode::Unknown] {
+            assert!(!needs_native_probe(
+                "app:dev",
+                &multi,
+                Some(&k8s_same),
+                mode,
+                "arm64"
+            ));
+            let native = classify_native_availability(
+                "app:dev",
+                &multi,
+                Some(&k8s_same),
+                Some(&failed_probe),
+                mode,
+                "arm64",
+            );
+            assert_eq!(native, NativeAvailability::Present);
+            assert_eq!(
+                plan_sync_action(
+                    "app:dev",
+                    &multi,
+                    Some(&k8s_same),
+                    native,
+                    NativeAvailability::Absent,
+                    mode,
+                    "arm64"
+                ),
+                SyncAction::Skip
+            );
+        }
+
+        // Digest-pinned reference with same unlabelled digest: never rewritten,
+        // so skip probing even when emulation is enabled.
+        assert!(!needs_native_probe(
+            digest_ref,
+            &multi,
+            Some(&k8s_same),
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+
+        // Tagged image with emulation Enabled and same unlabelled digest: MUST
+        // still probe so an unusable amd64-only legacy copy is reported.
+        assert!(needs_native_probe(
+            "app:dev",
+            &multi,
+            Some(&k8s_same),
+            EmulationMode::Enabled,
+            "arm64"
+        ));
+
+        // Missing, diverged, or Katamaran-rewritten destination: probe still
+        // matters even when emulation is off (decides MirrorNative vs report).
+        for dst in [None, Some(&k8s_diff), Some(&k8s_rewritten)] {
+            assert!(needs_native_probe(
+                "app:dev",
+                &multi,
+                dst,
+                EmulationMode::Disabled,
+                "arm64"
+            ));
+        }
+    }
+
+    #[test]
+    fn root_missing_relists_only_when_tag_changed_and_errors_when_dangling() {
+        // Native probe: RootMissing with unchanged digest -> Err (no relist).
+        let err = classify_native_check_outcome(
+            "moby",
+            "sha256:dangling",
+            oci_rewrite::NativeManifestCheck::RootMissing,
+            || Ok(Some("sha256:dangling".into())),
+        )
+        .unwrap_err();
+        assert!(err.contains("root manifest blob sha256:dangling"), "{err}");
+        assert!(err.contains("moby"), "{err}");
+
+        // Native probe: RootMissing after concurrent retag or delete -> Stale (relist).
+        assert_eq!(
+            classify_native_check_outcome(
+                "moby",
+                "sha256:old",
+                oci_rewrite::NativeManifestCheck::RootMissing,
+                || Ok(Some("sha256:new".into())),
+            )
+            .unwrap(),
+            NativeAvailability::Stale
+        );
+        assert_eq!(
+            classify_native_check_outcome(
+                "moby",
+                "sha256:old",
+                oci_rewrite::NativeManifestCheck::RootMissing,
+                || Ok(None),
+            )
+            .unwrap(),
+            NativeAvailability::Stale
+        );
+
+        // Prepare rewrite: RootMissing with unchanged digest -> Err (no relist).
+        let err = classify_prepare_root_missing(
+            "app:dev",
+            "sha256:dangling",
+            Ok(Some("sha256:dangling".into())),
+        )
+        .unwrap_err();
+        assert!(err.contains("root manifest blob sha256:dangling"), "{err}");
+
+        // Prepare rewrite: RootMissing after retag or deletion -> Ok (relist).
+        classify_prepare_root_missing("app:dev", "sha256:old", Ok(Some("sha256:new".into())))
+            .unwrap();
+        classify_prepare_root_missing("app:dev", "sha256:old", Ok(None)).unwrap();
+
+        // Prepare rewrite: re-check RPC failure -> Err.
+        let err =
+            classify_prepare_root_missing("app:dev", "sha256:old", Err("grpc timeout".into()))
+                .unwrap_err();
+        assert!(err.contains("grpc timeout"), "{err}");
+    }
+
+    #[test]
+    fn sync_log_state_deduplicates_per_image_and_digest_and_prunes_removed() {
+        let mut state = SyncLogState::new();
+        let n1 = SyncNotice {
+            kind: SyncNoticeKind::SkipDigestAmd64,
+            name: "app@sha256:1111".into(),
+            digest: "sha256:1111".into(),
+        };
+        let n2 = SyncNotice {
+            kind: SyncNoticeKind::KeepMirrorEmulationOff,
+            name: "app:dev".into(),
+            digest: "sha256:src:sha256:k8s".into(),
+        };
+        let n2_updated = SyncNotice {
+            kind: SyncNoticeKind::KeepMirrorEmulationOff,
+            name: "app:dev".into(),
+            digest: "sha256:src2:sha256:k8s".into(),
+        };
+
+        assert!(state.should_log(n1.clone()));
+        assert!(!state.should_log(n1.clone()));
+        assert!(state.should_log(n2.clone()));
+        assert!(!state.should_log(n2.clone()));
+        // A different digest logs once again.
+        assert!(state.should_log(n2_updated.clone()));
+        assert!(!state.should_log(n2_updated.clone()));
+
+        // Retaining only n2_updated prunes n1 and n2 so re-adding n1 logs again.
+        let active = BTreeSet::from([n2_updated.clone()]);
+        state.retain_active(&active);
+        assert!(!state.should_log(n2_updated));
+        assert!(state.should_log(n1));
+    }
+
+    #[test]
+    fn docker_event_watcher_syncs_once_on_subscribe_checks_status_and_backs_off_on_eof() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_dir("events-watch");
+        let sock = dir.join("docker.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = thread::spawn(move || {
+            // Connection 1: 200 OK -> 1 initial sync + 1 tag event -> clean EOF.
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut req = [0u8; 256];
+            let _ = s1.read(&mut req);
+            s1.write_all(
+                b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                  {\"Action\":\"delete\"}\n\
+                  not-json\n\
+                  {\"Action\":\"tag\"}\n",
+            )
+            .unwrap();
+            drop(s1);
+
+            // Connection 2: non-200 status -> must error without syncing.
+            let (mut s2, _) = listener.accept().unwrap();
+            let _ = s2.read(&mut req);
+            s2.write_all(b"HTTP/1.0 500 Internal Server Error\r\n\r\nboom\n")
+                .unwrap();
+            drop(s2);
+
+            // Connection 3: immediate EOF before headers -> Ok without syncing.
+            let (mut s3, _) = listener.accept().unwrap();
+            let _ = s3.read(&mut req);
+            drop(s3);
+        });
+
+        let stop = AtomicBool::new(false);
+        let mut sync_calls = 0usize;
+        watch_docker_image_events_with(&sock, &stop, || sync_calls += 1).unwrap();
+        // Exactly 2 syncs: 1 right after subscribing + 1 for the "tag" event.
+        assert_eq!(sync_calls, 2);
+
+        let mut err_syncs = 0usize;
+        let err = watch_docker_image_events_with(&sock, &stop, || err_syncs += 1).unwrap_err();
+        assert!(err.to_string().contains("500"), "{err}");
+        assert_eq!(err_syncs, 0);
+
+        let mut eof_syncs = 0usize;
+        watch_docker_image_events_with(&sock, &stop, || eof_syncs += 1).unwrap();
+        assert_eq!(eof_syncs, 0);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        // Clean EOF (`Ok(())`) must wait for the backoff before reconnecting
+        // instead of tight-spinning.
+        let loop_stop = AtomicBool::new(false);
+        let mut attempts = 0usize;
+        let started = Instant::now();
+        run_image_sync_loop(&loop_stop, Duration::from_millis(60), || {
+            attempts += 1;
+            if attempts == 2 {
+                loop_stop.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(attempts, 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "expected backoff after clean EOF, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Regression test: `MobyContentStore` queries authoritative sizes lazily
+    /// (single-digest `Content.Info` + bounded digest-filtered `Content.List`
+    /// batches), never enumerates unrelated `moby` blobs, caches lookups across
+    /// batch and single checks, handles 511+ absent siblings before the only
+    /// complete amd64 manifest, distinguishes `NOT_FOUND` from RPC failures,
+    /// and rejects oversized blobs before invoking the payload fetcher.
+    #[test]
+    fn moby_content_store_uses_lazy_cached_info_and_rejects_oversized_before_fetch() {
+        use sha2::{Digest, Sha256};
+
+        struct MockMeta<'a> {
+            sizes: &'a HashMap<String, u64>,
+            queried: HashMap<String, usize>,
+            batch_sizes: Vec<usize>,
+            fail_single: bool,
+            fail_batch: bool,
+        }
+
+        impl MobyContentMeta for MockMeta<'_> {
+            fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+                if self.fail_single {
+                    return Err("containerd Content.Info failed (grpc-status 13)".into());
+                }
+                assert!(
+                    !digest.starts_with("sha256:unrelated"),
+                    "unrelated moby blob must never be queried: {digest}"
+                );
+                *self.queried.entry(digest.to_string()).or_default() += 1;
+                Ok(self.sizes.get(digest).copied())
+            }
+
+            fn batch_blob_sizes(
+                &mut self,
+                digests: &[&str],
+            ) -> Result<HashMap<String, u64>, String> {
+                if self.fail_batch {
+                    return Err("containerd Content.List failed (grpc-status 13)".into());
+                }
+                self.batch_sizes.push(digests.len());
+                let mut out = HashMap::new();
+                for &d in digests {
+                    assert!(
+                        !d.starts_with("sha256:unrelated"),
+                        "unrelated moby blob must never be queried: {d}"
+                    );
+                    *self.queried.entry(d.to_string()).or_default() += 1;
+                    if let Some(&sz) = self.sizes.get(d) {
+                        out.insert(d.to_string(), sz);
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        let sha = |b: &[u8]| -> String {
+            let hex: String = Sha256::digest(b)
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect();
+            format!("sha256:{hex}")
+        };
+
+        let layer_d = format!("sha256:{}", "2".repeat(64));
+        let huge_a = format!("sha256:{}", "a".repeat(64));
+        let huge_b = format!("sha256:{}", "b".repeat(64));
+
+        let cfg = serde_json::to_vec(&serde_json::json!({"architecture": "amd64", "os": "linux"}))
+            .unwrap();
+        let cfg_d = sha(&cfg);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": cfg_d, "size": cfg.len()},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": layer_d, "size": 512}],
+        }))
+        .unwrap();
+        let manifest_d = sha(&manifest);
+
+        let mut manifests = vec![
+            serde_json::json!({"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_a, "size": 10}),
+            serde_json::json!({"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_b, "size": 10}),
+        ];
+        // Prepend 511 distinct absent amd64 siblings before the only locally complete manifest.
+        for i in 0..511u64 {
+            manifests.push(serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:aaaa{i:060x}"),
+                "size": 128,
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }));
+        }
+        manifests.push(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": manifest_d,
+            "size": manifest.len(),
+            "platform": {"os": "linux", "architecture": "amd64"},
+        }));
+
+        let root = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": manifests,
+        }))
+        .unwrap();
+        let root_d = sha(&root);
+
+        let mut sizes = HashMap::from([
+            (root_d.clone(), root.len() as u64),
+            (
+                huge_a.clone(),
+                (oci_rewrite::MAX_TOTAL_METADATA_BYTES as u64) + 1,
+            ),
+            (
+                huge_b.clone(),
+                (oci_rewrite::MAX_TOTAL_METADATA_BYTES as u64) + 8192,
+            ),
+            (manifest_d.clone(), manifest.len() as u64),
+            (cfg_d.clone(), cfg.len() as u64),
+            (layer_d.clone(), 512),
+        ]);
+        // Simulate thousands of unrelated blobs in `moby`: filtered queries
+        // must never touch them.
+        for i in 0..5_000u64 {
+            sizes.insert(format!("sha256:unrelated{i:055}"), 16 << 10);
+        }
+        let payloads = HashMap::from([
+            (root_d.clone(), root),
+            (manifest_d.clone(), manifest),
+            (cfg_d, cfg),
+        ]);
+
+        let mut fetched = Vec::new();
+        let mut store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: false,
+                fail_batch: false,
+            },
+            |digest: &str, _max: usize| {
+                assert_ne!(digest, huge_a, "oversized sibling A must not be fetched");
+                assert_ne!(digest, huge_b, "oversized sibling B must not be fetched");
+                fetched.push(digest.to_string());
+                payloads
+                    .get(digest)
+                    .cloned()
+                    .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
+            },
+            |digest: &str| {
+                payloads
+                    .get(digest)
+                    .map(|b| oci_rewrite::parse_config_platform_reader(b.as_slice()))
+                    .transpose()
+                    .map(Option::flatten)
+            },
+        );
+
+        let oci_rewrite::PrepareRewrite::Ready(plan) =
+            oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap()
+        else {
+            panic!(
+                "expected Ready plan for complete sibling after 511 absent + oversized siblings"
+            );
+        };
+        assert_eq!(plan.layer_digests, vec![layer_d.clone()]);
+        assert!(
+            store.meta.queried.values().all(|&n| n == 1),
+            "each inspected digest must be queried at most once"
+        );
+        assert!(
+            store
+                .meta
+                .batch_sizes
+                .iter()
+                .all(|&n| n > 0 && n <= containerd_grpc::CONTENT_INFO_BATCH_SIZE),
+            "batch sizes must stay bounded: {:?}",
+            store.meta.batch_sizes
+        );
+        drop(store);
+        assert!(!fetched.contains(&huge_a) && !fetched.contains(&huge_b));
+
+        // Small single-manifest 1-layer case (config + layer = 2 digests) also
+        // resolves via direct cached lookups without scanning unrelated blobs.
+        let mut small_store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: false,
+                fail_batch: false,
+            },
+            |digest: &str, _max: usize| {
+                payloads
+                    .get(digest)
+                    .cloned()
+                    .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
+            },
+            |digest: &str| {
+                payloads
+                    .get(digest)
+                    .map(|b| oci_rewrite::parse_config_platform_reader(b.as_slice()))
+                    .transpose()
+                    .map(Option::flatten)
+            },
+        );
+        let oci_rewrite::PrepareRewrite::Ready(small_plan) =
+            oci_rewrite::prepare_rewrite_from_store(&manifest_d, "arm64", &mut small_store)
+                .unwrap()
+        else {
+            panic!("expected Ready plan for small single-manifest 1-layer image");
+        };
+        assert_eq!(small_plan.layer_digests, vec![layer_d]);
+        assert_eq!(small_store.meta.queried.len(), 3); // manifest, config, layer
+        assert!(small_store.meta.queried.values().all(|&n| n == 1));
+        assert_eq!(small_store.meta.batch_sizes, vec![2]); // [config, layer]
+
+        // RPC errors on Content.Info must propagate instead of looking like RootMissing.
+        let mut err_single_store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: true,
+                fail_batch: false,
+            },
+            |_digest: &str, _max: usize| unreachable!(),
+            |_digest: &str| unreachable!(),
+        );
+        let err = oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_single_store)
+            .unwrap_err();
+        assert!(err.contains("grpc-status 13"), "{err}");
+
+        // RPC errors on batched Content.List must also propagate instead of looking like NotAvailable.
+        let mut err_batch_store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: false,
+                fail_batch: true,
+            },
+            |digest: &str, _max: usize| {
+                payloads
+                    .get(digest)
+                    .cloned()
+                    .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
+            },
+            |_digest: &str| unreachable!(),
+        );
+        let err = oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_batch_store)
+            .unwrap_err();
+        assert!(err.contains("grpc-status 13"), "{err}");
+    }
+
+    #[test]
+    fn combine_mirror_results_preserves_exporter_and_importer_errors_and_timeouts() {
+        let err =
+            combine_mirror_results(Ok(0), "", Ok(1), "ctr: no space left on device").unwrap_err();
+        assert!(
+            err.contains("ctr import exited 1: ctr: no space left on device"),
+            "{err}"
+        );
+
+        let err = combine_mirror_results(
+            Err("ctr export timed out".into()),
+            "",
+            Err("ctr import timed out".into()),
+            "stalled",
+        )
+        .unwrap_err();
+        assert!(err.contains("ctr export timed out"), "{err}");
+        assert!(err.contains("ctr import timed out: stalled"), "{err}");
+    }
+
+    #[test]
+    fn drain_bytes_checked_rejects_oversized_stdout() {
+        let small = b"sha256:abc\n";
+        assert_eq!(drain_bytes_checked(&small[..], 32).unwrap(), small.to_vec());
+        let big = [b'a'; 64];
+        let err = drain_bytes_checked(&big[..], 32).unwrap_err();
+        assert!(
+            matches!(err, RunBytesError::ExceededLimit(ref m) if m.contains("exceeded 32-byte limit")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_moby_listing_errors_instead_of_orphaning_labelled_mirror() {
+        // Construct a `moby` listing whose tail contains a native replacement
+        // for a labelled `k8s.io` tag past the byte limit: checked parsing must
+        // fail explicitly rather than returning a partial map that omits the
+        // tail entry and triggers orphan retirement.
+        let mut listing = String::from("REF TYPE DIGEST SIZE PLATFORMS LABELS\n");
+        for i in 0..20 {
+            listing.push_str(&format!(
+                "docker.io/library/filler-{i:02}:latest application/vnd.oci.image.manifest.v1+json sha256:{:0>64} 4.0 MiB linux/arm64 -\n",
+                i
+            ));
+        }
+        let cutoff = listing.len() - 16;
+        listing.push_str(&format!(
+            "docker.io/library/app:dev application/vnd.oci.image.manifest.v1+json sha256:{} 4.0 MiB linux/arm64 -\n",
+            "f".repeat(64)
+        ));
+
+        let err = parse_checked_ctr_platforms(listing.as_bytes(), cutoff).unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
+
+        // Within the limit, the full listing (including the final native entry)
+        // parses cleanly so `app:dev` is NOT treated as an orphan.
+        let parsed = parse_checked_ctr_platforms(listing.as_bytes(), listing.len() + 64).unwrap();
+        assert!(parsed.contains_key("docker.io/library/app:dev"));
     }
 
     #[test]
@@ -2503,5 +8824,2958 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         relay.join().unwrap();
         upstream.join().unwrap();
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn commit_installed_binary_invalidates_stale_version_on_write_failure() {
+        let dir = temp_dir("install-version-marker");
+        let bin = dir.join("k3s");
+        let tmp = dir.join("k3s.tmp");
+        let version_file = dir.join("version");
+
+        fs::write(&bin, b"k3s-v1.37").unwrap();
+        fs::write(&version_file, "v1.37.2+k3s1\n").unwrap();
+        fs::write(&tmp, b"k3s-v1.32").unwrap();
+
+        let err =
+            commit_installed_binary_with(&tmp, &bin, &version_file, "v1.32.5+k3s1", |_, _| {
+                Err("simulated write failure".into())
+            })
+            .unwrap_err();
+        assert!(err.contains("simulated write failure"), "{err}");
+        assert_eq!(fs::read(&bin).unwrap(), b"k3s-v1.32");
+        assert!(
+            !version_file.exists(),
+            "stale version marker must not survive after swapping binary"
+        );
+
+        // Retry with a working marker write succeeds cleanly even without an existing marker.
+        fs::write(&tmp, b"k3s-v1.32-retry").unwrap();
+        commit_installed_binary(&tmp, &bin, &version_file, "v1.32.5+k3s1").unwrap();
+        assert_eq!(fs::read(&bin).unwrap(), b"k3s-v1.32-retry");
+        assert_eq!(fs::read_to_string(&version_file).unwrap(), "v1.32.5+k3s1\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn datastore_downgrade_is_blocked_without_modifying_datastore() {
+        let dir = temp_dir("datastore-downgrade");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = dir.join("bin/version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        let db_file = data_dir.join("server/db/state.db");
+        fs::write(&db_file, b"v1.37-datastore-bytes").unwrap();
+
+        // Unmarked restored (or legacy) server/ on disk with an older bin/version
+        // must be rejected without creating .katamaran-version or modifying data_dir.
+        fs::write(&bin_version_file, "v1.32.5+k3s1\n").unwrap();
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+        assert!(err.contains(".katamaran-version"), "{err}");
+        assert!(err.contains("kat k8s mark-version"), "{err}");
+        assert!(err.contains("unmarked-cluster migration"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+        assert!(!data_version_file.exists());
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+
+        // Empty or whitespace-only .katamaran-version is reported as corrupt/empty
+        // rather than missing, and does NOT recommend `kat k8s mark-version` (which
+        // refuses to overwrite any existing marker).
+        fs::write(&data_version_file, "   \n").unwrap();
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+        assert!(!err.contains("kat k8s mark-version"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+
+        // Symlinked (including dangling) .katamaran-version is also rejected as
+        // non-regular rather than missing.
+        fs::remove_file(&data_version_file).unwrap();
+        symlink(dir.join("missing-target"), &data_version_file).unwrap();
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!err.contains("kat k8s mark-version"), "{err}");
+        fs::remove_file(&data_version_file).unwrap();
+
+        // Marked v1.37 datastore blocks minor downgrades without modifying data_dir.
+        write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
+        assert!(err.contains("v1.32.5+k3s1"), "{err}");
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+        assert!(err.contains(".katamaran-version"), "{err}");
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+
+        // Same minor (patch change) and next-minor upgrades are permitted.
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.37.1+k3s1").unwrap();
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.38.0+k3s1").unwrap();
+
+        // Multi-minor upgrades (skipping intermediate minors) are blocked without
+        // modifying data_dir, including jumping from a custom older minor to a much
+        // newer pinned release.
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.39.0+k3s1").unwrap_err();
+        assert!(err.contains("skipping minor versions"), "{err}");
+        assert!(err.contains("v1.38.x+k3s1"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+        assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
+
+        // Clearing k8s_version from v1.32 to pinned v1.37 is rejected as a skipped-minor jump.
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("skipping minor versions"), "{err}");
+        assert!(err.contains("v1.33.x+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.33.0+k3s1").unwrap();
+
+        // After reset removes data_dir, starting a lower minor is allowed even while
+        // bin/version still records a newer installed binary.
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+        fs::remove_dir_all(&data_dir).unwrap();
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap();
+
+        // Empty data_dir without server/ (e.g. failed pre-start) does not block switching,
+        // whether or not a stale data marker exists.
+        fs::create_dir_all(data_dir.join("agent/etc/cni/net.d")).unwrap();
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap();
+        fs::write(&data_version_file, "v1.37.2+k3s1\n").unwrap();
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_failure_rolls_back_data_version_only_when_datastore_untouched() {
+        let dir = temp_dir("datastore-rollback");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        let db_file = data_dir.join("server/db/state.db");
+        let token_file = data_dir.join("server/token");
+        fs::write(&db_file, b"v1.32-state-0001").unwrap();
+        fs::write(&token_file, b"cluster-token-v1").unwrap();
+        // Normal k3s creates relative internal symlinks inside server/ (e.g. agent-token -> token).
+        symlink("token", data_dir.join("server/agent-token")).unwrap();
+        symlink("token", data_dir.join("server/node-token")).unwrap();
+        fs::write(&data_version_file, "v1.32.5+k3s1\n").unwrap();
+
+        // 1. Process exits during startup without touching server/ (even with k3s's
+        // normal internal agent-token/node-token symlinks present): version marker
+        // rolls back so the operator can return to v1.32.5+k3s1.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.32.5+k3s1\n"
+        );
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap();
+
+        // Modifying the internal symlink's target file (server/token) IS detected.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(&token_file, b"cluster-token-v2").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+
+        // 2. Process modifies state.db in place (even with identical length) before
+        // exiting: version marker stays bumped and blocks returning to v1.32.5+k3s1.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(&db_file, b"v1.33-state-0001").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+        assert!(check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").is_err());
+
+        // 3. Process creates a WAL file under server/db/ before exiting: marker stays bumped.
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(data_dir.join("server/db/state.db-wal"), b"wal-frame").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            Some(&before),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+
+        // 4. Missing pre-spawn snapshot fails safe and keeps the updated marker.
+        write_atomic(&data_version_file, b"v1.34.0+k3s1\n").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.33.0+k3s1"),
+            None,
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.34.0+k3s1\n"
+        );
+
+        // 5. Symlinked server/db (or server itself, or state.db) fails closed so writes
+        // through the symlink cannot bypass the downgrade guard.
+        let external_db = dir.join("external-db");
+        fs::create_dir_all(&external_db).unwrap();
+        let external_state = external_db.join("state.db");
+        fs::write(&external_state, b"v1.32-external").unwrap();
+        fs::remove_dir_all(data_dir.join("server/db")).unwrap();
+        symlink(&external_db, data_dir.join("server/db")).unwrap();
+        write_atomic(&data_version_file, b"v1.32.5+k3s1\n").unwrap();
+        let symlink_before = snapshot_datastore(&data_dir);
+        assert!(
+            symlink_before.is_err(),
+            "symlinked server/db must fail closed"
+        );
+        write_atomic(&data_version_file, b"v1.33.0+k3s1\n").unwrap();
+        fs::write(&external_state, b"v1.33-external").unwrap();
+        rollback_data_version_if_untouched(
+            &data_dir,
+            &data_version_file,
+            Some("v1.32.5+k3s1"),
+            symlink_before.ok().as_ref(),
+        );
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.33.0+k3s1\n"
+        );
+        assert!(check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").is_err());
+
+        // Symlinked state.db file inside a real server/db directory also fails closed.
+        fs::remove_file(data_dir.join("server/db")).unwrap();
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        symlink(&external_state, data_dir.join("server/db/state.db")).unwrap();
+        assert!(
+            snapshot_datastore(&data_dir).is_err(),
+            "symlinked state.db must fail closed"
+        );
+
+        // Dangling symlink inside server/ also fails closed.
+        fs::remove_file(data_dir.join("server/db/state.db")).unwrap();
+        symlink(
+            dir.join("does-not-exist"),
+            data_dir.join("server/db/state.db"),
+        )
+        .unwrap();
+        assert!(
+            snapshot_datastore(&data_dir).is_err(),
+            "dangling symlink inside server/ must fail closed"
+        );
+
+        // Symlinked server/ itself also fails closed.
+        let external_server = dir.join("external-server");
+        fs::create_dir_all(external_server.join("db")).unwrap();
+        fs::write(external_server.join("db/state.db"), b"v1.32-server").unwrap();
+        fs::remove_dir_all(data_dir.join("server")).unwrap();
+        symlink(&external_server, data_dir.join("server")).unwrap();
+        assert!(
+            snapshot_datastore(&data_dir).is_err(),
+            "symlinked server/ must fail closed"
+        );
+
+        // 6. Fresh data_dir without server/: removes marker if server/ stays absent,
+        // keeps marker if k3s created server/ before exiting.
+        fs::remove_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        let before = snapshot_datastore(&data_dir).unwrap();
+        assert_eq!(before, DatastoreSnapshot::Absent);
+        write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
+        rollback_data_version_if_untouched(&data_dir, &data_version_file, None, Some(&before));
+        assert!(!data_version_file.exists());
+
+        write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
+        fs::create_dir_all(data_dir.join("server")).unwrap();
+        rollback_data_version_if_untouched(&data_dir, &data_version_file, None, Some(&before));
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_datastore_version_migrates_pre_tracking_datastore_for_pinned_upgrade() {
+        let dir = temp_dir("mark-datastore-version");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let bin_version_file = dir.join("bin/version");
+        fs::create_dir_all(bin_version_file.parent().unwrap()).unwrap();
+        fs::write(&bin_version_file, "v1.37.2+k3s1\n").unwrap();
+
+        // 1. Fails when no datastore exists yet.
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("no existing cluster datastore"), "{err}");
+
+        // 2. Pre-tracking datastore (server/ exists, no .katamaran-version, same pinned
+        // v1.37.2+k3s1 in bin/version) is initially rejected without inference.
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(data_dir.join("server/db/state.db"), b"pre-tracking-v1.37").unwrap();
+        assert!(check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").is_err());
+        assert!(!data_version_file.exists());
+
+        // 3. Invalid or unsupported release tags are rejected without writing a marker.
+        for bad in [
+            "",
+            "latest",
+            "v1.30.9+k3s1",
+            "v1.37.2+k3s1\n",
+            " v1.37.2+k3s1",
+            "v2.0.0+k3s1",
+        ] {
+            assert!(
+                mark_datastore_version_at(&data_dir, &data_version_file, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(!data_version_file.exists());
+
+        // 4. Explicit migration writes the verified pinned tag with mode 0600 and
+        // unblocks starting the same pinned release while still blocking downgrades.
+        mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap();
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&data_version_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap();
+        assert!(check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").is_err());
+
+        // 5. Refuses to overwrite an existing marker (populated, empty, or symlinked).
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&data_version_file).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+
+        fs::write(&data_version_file, "  \n").unwrap();
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("already exists (empty)"), "{err}");
+
+        fs::remove_file(&data_version_file).unwrap();
+        let target = dir.join("other-file");
+        symlink(&target, &data_version_file).unwrap();
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("already exists (not a regular file)"), "{err}");
+        assert!(!target.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn run_test_cmd(cmd: &mut Command) -> Result<(i32, String), String> {
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        let code = out.status.code().unwrap_or(-1);
+        Ok((code, String::from_utf8_lossy(&out.stdout).into_owned()))
+    }
+
+    fn test_scratch_root() -> PathBuf {
+        std::env::temp_dir().join(format!("kat-init-state-db-scratch-{}", std::process::id()))
+    }
+
+    fn with_test_probe<T>(f: impl FnOnce(&StateDbProbe<'_>) -> T) -> T {
+        let scratch_root = test_scratch_root();
+        f(&StateDbProbe {
+            sqlite3_bin: Path::new(SQLITE3_BIN),
+            scratch_root: &scratch_root,
+            max_copy_bytes: STATE_DB_MAX_SCRATCH_BYTES,
+        })
+    }
+
+    fn check_datastore_compatible(
+        data_dir: &Path,
+        data_version_file: &Path,
+        target_version: &str,
+    ) -> Result<(), String> {
+        with_test_probe(|probe| {
+            check_datastore_compatible_with(
+                data_dir,
+                data_version_file,
+                target_version,
+                probe,
+                run_test_cmd,
+            )
+        })
+    }
+
+    fn mark_datastore_version_at(
+        data_dir: &Path,
+        data_version_file: &Path,
+        version: &str,
+    ) -> Result<(), String> {
+        with_test_probe(|probe| {
+            mark_datastore_version_at_with(
+                data_dir,
+                data_version_file,
+                version,
+                probe,
+                run_test_cmd,
+            )
+        })
+    }
+
+    fn push_proto_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_proto_bytes(out: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+        push_proto_varint(out, (u64::from(field) << 3) | 2);
+        push_proto_varint(out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+    }
+
+    fn encode_k8s_node_proto(kubelet_version: &str) -> Vec<u8> {
+        let mut node_info = Vec::new();
+        push_proto_bytes(&mut node_info, 1, b"machine-id-123");
+        push_proto_bytes(&mut node_info, 4, b"6.18.64");
+        push_proto_bytes(&mut node_info, 6, b"containerd://2.0.0");
+        push_proto_bytes(&mut node_info, 7, kubelet_version.as_bytes());
+        push_proto_bytes(&mut node_info, 9, b"linux");
+        push_proto_bytes(&mut node_info, 10, b"arm64");
+
+        let mut node_status = Vec::new();
+        push_proto_bytes(&mut node_status, 3, b"Running");
+        push_proto_bytes(&mut node_status, 7, &node_info);
+
+        let mut node = Vec::new();
+        push_proto_bytes(&mut node, 1, b"\x0a\x09katamaran");
+        push_proto_bytes(&mut node, 3, &node_status);
+
+        let mut type_meta = Vec::new();
+        push_proto_bytes(&mut type_meta, 1, b"v1");
+        push_proto_bytes(&mut type_meta, 2, b"Node");
+
+        let mut unknown = Vec::new();
+        push_proto_bytes(&mut unknown, 1, &type_meta);
+        push_proto_bytes(&mut unknown, 2, &node);
+
+        let mut out = Vec::with_capacity(4 + unknown.len());
+        out.extend_from_slice(b"k8s\0");
+        out.extend_from_slice(&unknown);
+        out
+    }
+
+    fn hex_upper(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            s.push_str(&format!("{b:02X}"));
+        }
+        s
+    }
+
+    fn sqlite_exec(db: &Path, sql: &str) {
+        let out = Command::new(SQLITE3_BIN)
+            .args(["-bail", "-batch"])
+            .arg(db)
+            .arg(sql)
+            .output()
+            .expect("run sqlite3");
+        assert!(
+            out.status.success(),
+            "sqlite3 failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn extracts_kubelet_version_only_from_k8s_protobuf_nodes() {
+        let proto = encode_k8s_node_proto("v1.37.2+k3s1");
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&proto).as_deref(),
+            Some("v1.37.2+k3s1")
+        );
+
+        // Explicit protobuf contentType inside runtime.Unknown.
+        let mut with_ct = proto.clone();
+        push_proto_bytes(&mut with_ct, 4, b"application/vnd.kubernetes.protobuf");
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&with_ct).as_deref(),
+            Some("v1.37.2+k3s1")
+        );
+
+        // JSON (plain or inside the envelope) is not an encoding kube-apiserver uses
+        // for core types in kine, so it is rejected rather than parsed.
+        let json = br#"{"apiVersion":"v1","kind":"Node","status":{"nodeInfo":{"kubeletVersion":"v1.32.5+k3s1"}}}"#;
+        assert_eq!(extract_kubelet_version_from_node_blob(json), None);
+        let mut unknown_json = b"k8s\0".to_vec();
+        let mut type_meta = Vec::new();
+        push_proto_bytes(&mut type_meta, 1, b"v1");
+        push_proto_bytes(&mut type_meta, 2, b"Node");
+        push_proto_bytes(&mut unknown_json, 1, &type_meta);
+        push_proto_bytes(&mut unknown_json, 2, json);
+        push_proto_bytes(&mut unknown_json, 4, b"application/json");
+        assert_eq!(extract_kubelet_version_from_node_blob(&unknown_json), None);
+
+        // Non-empty contentEncoding, wrong kind, truncated protobuf, or missing field fail closed.
+        let mut compressed = proto.clone();
+        push_proto_bytes(&mut compressed, 3, b"gzip");
+        assert_eq!(extract_kubelet_version_from_node_blob(&compressed), None);
+
+        let wrong_kind = encode_k8s_node_proto("v1.37.2+k3s1")
+            .windows(4)
+            .position(|w| w == b"Node")
+            .map(|i| {
+                let mut b = encode_k8s_node_proto("v1.37.2+k3s1");
+                b[i..i + 4].copy_from_slice(b"Pods");
+                b
+            })
+            .unwrap();
+        assert_eq!(extract_kubelet_version_from_node_blob(&wrong_kind), None);
+
+        assert_eq!(
+            extract_kubelet_version_from_node_blob(&proto[..proto.len() - 3]),
+            None
+        );
+        assert_eq!(extract_kubelet_version_from_node_blob(b"not-k8s"), None);
+    }
+
+    #[test]
+    fn unmarked_state_db_enables_seamless_upgrade_and_blocks_downgrade_without_mutation() {
+        assert!(
+            Path::new(SQLITE3_BIN).is_file(),
+            "{SQLITE3_BIN} must be installed in the Linux test environment"
+        );
+
+        let dir = temp_dir("state-db-detection");
+        let data_dir = dir.join("data");
+        let data_version_file = data_dir.join(".katamaran-version");
+        let db_dir = data_dir.join("server/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("state.db");
+
+        let v32 = hex_upper(&encode_k8s_node_proto("v1.32.5+k3s1"));
+        let v37 = hex_upper(&encode_k8s_node_proto("v1.37.2+k3s1"));
+        let v38 = hex_upper(&encode_k8s_node_proto("v1.38.0+k3s1"));
+
+        // 1. Pre-tracking v1.37.2+k3s1 datastore (no .katamaran-version), plus an older
+        // deleted node row that must be ignored because its head revision has deleted=1.
+        sqlite_exec(
+            &db_path,
+            &format!(
+                "CREATE TABLE kine (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    created INTEGER,
+                    deleted INTEGER,
+                    create_revision INTEGER,
+                    prev_revision INTEGER,
+                    lease INTEGER,
+                    value BLOB,
+                    old_value BLOB
+                );
+                CREATE INDEX kine_name_id_index ON kine (name, id);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/old-node', 0, X'{v32}');
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/old-node', 1, X'');
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+
+        let before = snapshot_datastore(&data_dir).unwrap();
+        // Seamless start on the unchanged pinned build and 1-minor upgrade both pass.
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap();
+        check_datastore_compatible(&data_dir, &data_version_file, "v1.38.0+k3s1").unwrap();
+        // Downgrade and skipped-minor jump are both blocked without modifying server/.
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.32.5+k3s1").unwrap_err();
+        assert!(err.contains("v1.32.5+k3s1"), "{err}");
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.39.0+k3s1").unwrap_err();
+        assert!(err.contains("skipping minor versions"), "{err}");
+        // A trusted pre-tracking node record cannot be re-marked (e.g. as v1.39 to
+        // skip a minor).
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.39.0+k3s1").unwrap_err();
+        assert!(err.contains("already accepts without a marker"), "{err}");
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+        assert!(!data_version_file.exists());
+
+        // 2. A node version that no pre-tracking release ran (v1.38.0+k3s1) is only a
+        // lower bound: it authorizes neither the pinned build nor its own release, and
+        // blocks `mark-version` with a lower minor.
+        sqlite_exec(
+            &db_path,
+            &format!(
+                "INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v38}');"
+            ),
+        );
+        for target in ["v1.37.2+k3s1", "v1.38.0+k3s1"] {
+            let err =
+                check_datastore_compatible(&data_dir, &data_version_file, target).unwrap_err();
+            assert!(err.contains("reports k3s v1.38.0+k3s1"), "{err}");
+            assert!(err.contains("lower bound"), "{err}");
+            assert!(err.contains("kat k8s mark-version"), "{err}");
+        }
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(
+            err.contains("state.db already records newer k3s v1.38.0+k3s1"),
+            "{err}"
+        );
+
+        // 3. WAL-mode state.db with the pre-tracking v1.37.2+k3s1 node ONLY in an
+        // uncheckpointed state.db-wal (main file still says v1.32.5+k3s1): detection reads
+        // the WAL from a tmpfs-style scratch copy without modifying server/db/ and cleans up.
+        let wal_src = dir.join("wal-src");
+        fs::create_dir_all(&wal_src).unwrap();
+        let wal_src_db = wal_src.join("state.db");
+        sqlite_exec(
+            &wal_src_db,
+            &format!(
+                "PRAGMA journal_mode=WAL;
+                CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                CREATE INDEX kine_name_id_index ON kine (name, id);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v32}');"
+            ),
+        );
+        // Hold an open read transaction while appending v1.37 so it remains uncheckpointed in -wal.
+        let mut reader = Command::new(SQLITE3_BIN)
+            .arg(&wal_src_db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        {
+            let stdin = reader.stdin.as_mut().unwrap();
+            writeln!(stdin, "BEGIN;").unwrap();
+            writeln!(stdin, "SELECT count(*) FROM kine;").unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            let mut stdout = BufReader::new(reader.stdout.take().unwrap());
+            stdout.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "1");
+        }
+        sqlite_exec(
+            &wal_src_db,
+            &format!(
+                "PRAGMA wal_autocheckpoint=0;
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+
+        let wal_root = dir.join("wal-case");
+        let wal_data = wal_root.join("data");
+        let wal_marker = wal_data.join(".katamaran-version");
+        let wal_db_dir = wal_data.join("server/db");
+        fs::create_dir_all(&wal_db_dir).unwrap();
+        fs::copy(&wal_src_db, wal_db_dir.join("state.db")).unwrap();
+        fs::copy(
+            wal_src.join("state.db-wal"),
+            wal_db_dir.join("state.db-wal"),
+        )
+        .unwrap();
+        drop(reader.stdin.take());
+        let _ = reader.wait();
+        assert!(
+            fs::metadata(wal_db_dir.join("state.db-wal")).unwrap().len() > 0,
+            "state.db-wal must be non-empty"
+        );
+
+        // Confirm main state.db alone (immutable=1) still has only v1.32, proving v1.37
+        // lives strictly in state.db-wal.
+        let imm_out = Command::new(SQLITE3_BIN)
+            .args([
+                "-bail",
+                "-batch",
+                "-noheader",
+                "-list",
+                "-safe",
+                &format!(
+                    "file:{}?immutable=1",
+                    encode_sqlite_uri_path(&wal_db_dir.join("state.db"))
+                ),
+                "SELECT hex(value) FROM kine ORDER BY id DESC LIMIT 1;",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&imm_out.stdout).trim(),
+            v32,
+            "v1.37 row must reside solely in uncheckpointed state.db-wal"
+        );
+
+        let wal_before = snapshot_datastore(&wal_data).unwrap();
+        check_datastore_compatible(&wal_data, &wal_marker, "v1.37.2+k3s1").unwrap();
+        check_datastore_compatible(&wal_data, &wal_marker, "v1.38.0+k3s1").unwrap();
+        assert_eq!(snapshot_datastore(&wal_data).unwrap(), wal_before);
+        assert!(!wal_db_dir.join("state.db-shm").exists());
+        // No inspection copy is ever placed beside the datastore, and the scratch
+        // copy under the scratch root is removed after inspection.
+        let leftover_scratch: Vec<_> = fs::read_dir(&wal_root)
+            .unwrap()
+            .chain(fs::read_dir(test_scratch_root()).unwrap())
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".state-db-inspect.")
+            })
+            .collect();
+        assert!(leftover_scratch.is_empty(), "{leftover_scratch:?}");
+
+        // 4. A non-pre-tracking version (v1.36.4+k3s1) is a lower bound only, even for
+        // its own release.
+        let json_data = dir.join("lower-bound-case/data");
+        let json_marker = json_data.join(".katamaran-version");
+        fs::create_dir_all(json_data.join("server/db")).unwrap();
+        let json_blob = hex_upper(&encode_k8s_node_proto("v1.36.4+k3s1"));
+        sqlite_exec(
+            &json_data.join("server/db/state.db"),
+            &format!(
+                "CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{json_blob}');"
+            ),
+        );
+        for target in ["v1.36.4+k3s1", "v1.37.2+k3s1"] {
+            let err = check_datastore_compatible(&json_data, &json_marker, target).unwrap_err();
+            assert!(err.contains("reports k3s v1.36.4+k3s1"), "{err}");
+        }
+        let err = mark_datastore_version_at(&json_data, &json_marker, "v1.35.0+k3s1").unwrap_err();
+        assert!(err.contains("newer k3s v1.36.4+k3s1"), "{err}");
+        assert!(!json_marker.exists());
+
+        // 5. Fail-closed cases (conflicting live node minors, malicious VIEW kine,
+        // symlinked state.db, missing sqlite3) fall back to missing_datastore_version_error.
+        sqlite_exec(
+            &json_data.join("server/db/state.db"),
+            &format!(
+                "INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/node2', 0, X'{v37}');"
+            ),
+        );
+        let err = check_datastore_compatible(&json_data, &json_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+        assert!(err.contains("kat k8s mark-version"), "{err}");
+
+        let view_data = dir.join("view-case/data");
+        let view_marker = view_data.join(".katamaran-version");
+        fs::create_dir_all(view_data.join("server/db")).unwrap();
+        sqlite_exec(
+            &view_data.join("server/db/state.db"),
+            &format!(
+                "CREATE TABLE backing (id INTEGER PRIMARY KEY, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO backing VALUES (1, '/registry/minions/katamaran', 0, X'{v37}');
+                CREATE VIEW kine AS SELECT * FROM backing;"
+            ),
+        );
+        let err = check_datastore_compatible(&view_data, &view_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        let sym_data = dir.join("sym-case/data");
+        let sym_marker = sym_data.join(".katamaran-version");
+        fs::create_dir_all(sym_data.join("server/db")).unwrap();
+        symlink(&db_path, sym_data.join("server/db/state.db")).unwrap();
+        let err = check_datastore_compatible(&sym_data, &sym_marker, "v1.38.0+k3s1").unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        let scratch_root = test_scratch_root();
+        let err = check_datastore_compatible_with(
+            &data_dir,
+            &data_version_file,
+            "v1.38.0+k3s1",
+            &StateDbProbe {
+                sqlite3_bin: Path::new("/nonexistent/sqlite3"),
+                scratch_root: &scratch_root,
+                max_copy_bytes: STATE_DB_MAX_SCRATCH_BYTES,
+            },
+            run_test_cmd,
+        )
+        .unwrap_err();
+        assert!(err.contains("no version marker"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_version_publish_restores_prior_marker_and_stamp() {
+        let dir = temp_dir("publish-restore");
+        let data_dir = dir.join("data");
+        let marker = data_dir.join(".katamaran-version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        write_atomic(&marker, b"v1.37.2+k3s1\n").unwrap();
+        write_server_version_stamp(&data_dir, "v1.37.2+k3s1").unwrap();
+        let restore = || {
+            restore_data_version(&marker, Some("v1.37.2+k3s1"));
+            restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        };
+        // The marker rename succeeds but its directory sync "fails": the new tag was
+        // already visible, so it must be rolled back.
+        let err = publish_version_files(
+            &data_dir,
+            &marker,
+            "v1.38.0+k3s1",
+            true,
+            true,
+            |p, b| {
+                write_atomic(p, b)?;
+                Err("sync failed".into())
+            },
+            restore,
+        )
+        .unwrap_err();
+        assert_eq!(err, "sync failed");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "v1.37.2+k3s1\n");
+        assert_eq!(
+            fs::read_to_string(server_version_stamp(&data_dir)).unwrap(),
+            "v1.37.2+k3s1\n"
+        );
+        // A stamp failure after the marker was published also restores both.
+        fs::remove_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(data_dir.join("server/db"), "not a dir").unwrap();
+        assert!(
+            publish_version_files(
+                &data_dir,
+                &marker,
+                "v1.38.0+k3s1",
+                true,
+                true,
+                write_atomic,
+                || restore_data_version(&marker, Some("v1.37.2+k3s1")),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "v1.37.2+k3s1\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_parsing_rejects_malformed_recorded_versions() {
+        for v in [
+            "v1.37.2+k3sgarbage",
+            "v1.37.2+k3s",
+            "v1.037.2+k3s1",
+            " v1.37.2+k3s1",
+            "1.37.2+k3s1",
+        ] {
+            assert_eq!(parse_k3s_minor(v), None, "{v}");
+        }
+        assert_eq!(parse_k3s_minor("v1.37.2+k3s1"), Some((1, 37)));
+        let dir = temp_dir("strict-marker");
+        let data_dir = dir.join("data");
+        let marker = data_dir.join(".katamaran-version");
+        fs::create_dir_all(data_dir.join("server/db")).unwrap();
+        fs::write(&marker, "v1.37.2+k3sgarbage\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("invalid k3s version"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpointed_state_db_is_read_in_place_regardless_of_copy_limit() {
+        assert!(Path::new(SQLITE3_BIN).is_file());
+        let dir = temp_dir("immutable-probe");
+        let data_dir = dir.join("data");
+        let db_dir = data_dir.join("server/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let v37 = hex_upper(&encode_k8s_node_proto("v1.37.2+k3s1"));
+        sqlite_exec(
+            &db_dir.join("state.db"),
+            &format!(
+                "CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+        let scratch_root = test_scratch_root();
+        // A 1-byte copy limit would reject any copy; the checkpointed database is read
+        // in place, so a datastore larger than the copy limit still migrates.
+        let probe = StateDbProbe {
+            sqlite3_bin: Path::new(SQLITE3_BIN),
+            scratch_root: &scratch_root,
+            max_copy_bytes: 1,
+        };
+        let before = snapshot_datastore(&data_dir).unwrap();
+        assert_eq!(
+            detect_datastore_version_from_state_db_with(&data_dir, &probe, run_test_cmd).as_deref(),
+            Some("v1.37.2+k3s1")
+        );
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+        assert!(!db_dir.join("state.db-shm").exists());
+        assert!(!db_dir.join("state.db-wal").exists());
+        // With uncheckpointed WAL content, the copy limit applies and detection fails closed.
+        fs::write(db_dir.join("state.db-wal"), b"x").unwrap();
+        assert_eq!(
+            detect_datastore_version_from_state_db_with(&data_dir, &probe, run_test_cmd),
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreaped_k3s_blocks_datastore_operations_until_it_exits() {
+        // Tracked by the child's own exit signal, not a pid lookup that a reused
+        // pid could satisfy.
+        let (tx, rx) = mpsc::channel::<i32>();
+        note_unreaped_k3s(4242, move || rx.try_recv().is_ok());
+        let err = ensure_no_unreaped_k3s().unwrap_err();
+        assert!(err.contains("pid 4242"), "{err}");
+        assert!(ensure_no_unreaped_k3s().is_err());
+        tx.send(0).unwrap();
+        ensure_no_unreaped_k3s().unwrap();
+        assert!(UNREAPED_K3S.lock().unwrap().is_none());
+        ensure_no_unreaped_k3s().unwrap();
+    }
+
+    #[test]
+    fn bounded_copy_refuses_files_over_budget() {
+        let dir = temp_dir("bounded-copy");
+        let src = dir.join("src");
+        fs::write(&src, vec![0u8; 100]).unwrap();
+        let mut budget = 99;
+        assert!(copy_regular_file_bounded(&src, &dir.join("small"), &mut budget).is_err());
+        let mut budget = 150;
+        copy_regular_file_bounded(&src, &dir.join("ok"), &mut budget).unwrap();
+        assert_eq!(budget, 50);
+        assert_eq!(fs::read(dir.join("ok")).unwrap().len(), 100);
+        let link = dir.join("link");
+        symlink(&src, &link).unwrap();
+        assert!(copy_regular_file_bounded(&link, &dir.join("via-link"), &mut 1000).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_resolves_rootfs_nft_for_oldest_supported_k3s() {
+        // k3s prepends its own bin dir; when that lacks `nft` (k3s v1.31.0-v1.31.5),
+        // kube-proxy's nftables mode must find the rootfs nftables package's binary.
+        assert!(PATH.split(':').any(|d| d == "/usr/sbin"), "{PATH}");
+        let rootfs = include_str!("../../../../guest/rootfs/build.sh");
+        let packages = rootfs
+            .split("PACKAGES=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("PACKAGES list in guest/rootfs/build.sh");
+        for pkg in ["nftables", "sqlite"] {
+            assert!(
+                packages.split_whitespace().any(|p| p == pkg),
+                "guest rootfs must ship {pkg}: {packages}"
+            );
+        }
+        assert_eq!(validate_k3s_release_tag("v1.31.0+k3s1"), Ok(()));
+        assert!(validate_k3s_release_tag("v1.30.9+k3s1").is_err());
+        assert!(validate_k3s_release_tag("v1.037.2+k3s1").is_err());
+        assert!(validate_k3s_release_tag("v1.37.0+k3s1").is_ok());
+    }
+
+    #[test]
+    fn server_stamp_outranks_stale_node_record_and_is_ignored_by_snapshots() {
+        assert!(Path::new(SQLITE3_BIN).is_file());
+        let dir = temp_dir("server-stamp");
+        let data_dir = dir.join("data");
+        let marker = data_dir.join(".katamaran-version");
+        let db_dir = data_dir.join("server/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let v37 = hex_upper(&encode_k8s_node_proto("v1.37.2+k3s1"));
+        sqlite_exec(
+            &db_dir.join("state.db"),
+            &format!(
+                "CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+            ),
+        );
+
+        // Writing the stamp does not count as a datastore change for rollback.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_server_version_stamp(&data_dir, "v1.38.0+k3s1").unwrap();
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+
+        // A server/ backup without its marker, taken after a v1.38 server opened it but
+        // before its kubelet reported status: the node record still says the pre-tracking
+        // pin, but the stamp that travels with server/ blocks the older build.
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        // mark-version cannot override a stamp in either direction.
+        for v in ["v1.37.2+k3s1", "v1.39.0+k3s1"] {
+            let err = mark_datastore_version_at(&data_dir, &marker, v).unwrap_err();
+            assert!(err.contains("already records"), "{err}");
+            assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        }
+        assert!(!marker.exists());
+
+        // An untouched failed upgrade restores each file to its prior state: with no
+        // outer marker and an existing v1.37 stamp, a failed v1.38 start leaves v1.37
+        // admissible, and a stamp that did not exist before is removed again.
+        restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_server_version_stamp(&data_dir, "v1.38.0+k3s1").unwrap();
+        rollback_versions_if_untouched(&data_dir, Some(&before), || {
+            restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        });
+        check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap();
+        restore_server_version_stamp(&data_dir, None);
+        assert!(!server_version_stamp(&data_dir).exists());
+        // Without a stamp, the pre-tracking node record is accepted again.
+        check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap();
+
+        // A touched datastore keeps the updated stamp.
+        let before = snapshot_datastore(&data_dir).unwrap();
+        write_server_version_stamp(&data_dir, "v1.38.0+k3s1").unwrap();
+        fs::write(db_dir.join("state.db-touched"), "x").unwrap();
+        rollback_versions_if_untouched(&data_dir, Some(&before), || {
+            restore_server_version_stamp(&data_dir, None);
+        });
+        assert!(check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").is_err());
+        fs::remove_file(db_dir.join("state.db-touched")).unwrap();
+
+        // With both files present, the newer minor wins either way round.
+        restore_server_version_stamp(&data_dir, Some("v1.38.0+k3s1"));
+        fs::write(&marker, "v1.37.2+k3s1\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        fs::write(&marker, "v1.38.0+k3s1\n").unwrap();
+        restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        assert!(check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").is_err());
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        fs::remove_file(&marker).unwrap();
+
+        // The node record is a lower bound even with a marker and stamp: data last
+        // run by v1.37.2 (e.g. an older katamaran after a rollback) refuses v1.36.
+        fs::write(&marker, "v1.36.4+k3s1\n").unwrap();
+        restore_server_version_stamp(&data_dir, Some("v1.36.4+k3s1"));
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.36.4+k3s1").unwrap_err();
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap();
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        fs::remove_file(&marker).unwrap();
+
+        // An invalid stamp fails closed the same way in start and mark-version.
+        fs::write(server_version_stamp(&data_dir), "garbage\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("invalid k3s version"), "{err}");
+        let err = mark_datastore_version_at(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("not a valid version stamp"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+
+        // An invalid marker beside a valid stamp fails closed too.
+        restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
+        fs::write(&marker, "v1.39\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("invalid k3s version \"v1.39\""), "{err}");
+        fs::remove_file(&marker).unwrap();
+
+        // An empty stamp fails closed instead of falling back to the node record.
+        fs::write(server_version_stamp(&data_dir), "").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("is empty"), "{err}");
+
+        // A datastore created during this start is stamped as soon as k3s creates
+        // server/db/, so a backup after the first shutdown carries the version even if
+        // the node record is stale.
+        let new_data = dir.join("new/data");
+        let new_marker = new_data.join(".katamaran-version");
+        let mut pending = true;
+        stamp_new_datastore(&new_data, "v1.38.0+k3s1", &mut pending);
+        assert!(pending);
+        fs::create_dir_all(new_data.join("server/db")).unwrap();
+        fs::copy(db_dir.join("state.db"), new_data.join("server/db/state.db")).unwrap();
+        stamp_new_datastore(&new_data, "v1.38.0+k3s1", &mut pending);
+        assert!(!pending);
+        let err = check_datastore_compatible(&new_data, &new_marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+
+        // Without server/db/, nothing is stamped.
+        let fresh = dir.join("fresh");
+        write_server_version_stamp(&fresh, "v1.37.2+k3s1").unwrap();
+        assert!(!fresh.join("server").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Run against a real k3s data directory (for example one copied from
+    /// `rancher/k3s:v1.37.2-k3s1` or a pre-tracking katamaran guest):
+    /// `KAT_REAL_K3S_DATA=<data dir> KAT_REAL_K3S_VERSION=v1.37.2+k3s1 cargo test -- --ignored real_k3s`
+    /// Verified against a `rancher/k3s:v1.37.2-k3s1` datastore whose node record
+    /// lived only in an uncheckpointed `state.db-wal` (`k8s\0` protobuf envelope).
+    #[test]
+    #[ignore = "needs KAT_REAL_K3S_DATA and KAT_REAL_K3S_VERSION"]
+    fn detects_version_from_real_k3s_datastore() {
+        let data_dir = PathBuf::from(std::env::var("KAT_REAL_K3S_DATA").unwrap());
+        let expected = std::env::var("KAT_REAL_K3S_VERSION").unwrap();
+        let before = snapshot_datastore(&data_dir).unwrap();
+        let detected = with_test_probe(|probe| {
+            detect_datastore_version_from_state_db_with(&data_dir, probe, run_test_cmd)
+        });
+        assert_eq!(detected.as_deref(), Some(expected.as_str()));
+        assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
+    }
+
+    #[test]
+    fn build_k3s_server_args_appends_extra_args_and_rejects_invalid() {
+        let base = build_k3s_server_args(&[]).unwrap();
+        assert_eq!(base[0], "server");
+        assert!(base.iter().any(|a| a == "--https-listen-port=6443"));
+        assert!(base.iter().any(|a| a == &format!("--data-dir={DATA_DIR}")));
+
+        let extra = vec!["--disable=traefik".to_string(), "--debug".to_string()];
+        let with_extra = build_k3s_server_args(&extra).unwrap();
+        assert_eq!(with_extra.len(), base.len() + 2);
+        assert_eq!(&with_extra[base.len()..], extra.as_slice());
+
+        // Every flag the guest sets itself is rejected in k8s_args (full
+        // coverage lives in kat-proto's validate_k3s_extra_args tests).
+        for flag in &base[1..] {
+            let name = flag.split_once('=').map_or(flag.as_str(), |(n, _)| n);
+            if matches!(name, "--kubelet-arg" | "--tls-san" | "--kube-proxy-arg") {
+                continue;
+            }
+            let arg = format!("{name}=x");
+            assert!(build_k3s_server_args(&[arg]).is_err(), "{name}");
+        }
+        assert!(build_k3s_server_args(&[format!("--kubelet-arg=root-dir={KUBELET_DIR}")]).is_err());
+        assert!(build_k3s_server_args(&["--token=x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn sync_k3s_config_enforces_0600_and_preserves_unmanaged_default_config() {
+        use std::ffi::OsStr;
+
+        // Managed config lives at a Katamaran-owned path separate from k3s's default.
+        assert_ne!(K3S_CONFIG_PATH, "/etc/rancher/k3s/config.yaml");
+
+        let base = temp_dir("k3s-config");
+        let managed = base.join("var/lib/katamaran/k3s/config.yaml");
+        let default_cfg = base.join("etc/rancher/k3s/config.yaml");
+        fs::create_dir_all(default_cfg.parent().unwrap()).unwrap();
+        fs::write(&default_cfg, "disable:\n  - servicelb\n").unwrap();
+
+        // Removing when managed file is absent is a no-op and never touches default_cfg.
+        sync_k3s_config(&managed, None).unwrap();
+        assert!(!managed.exists());
+        assert_eq!(
+            fs::read_to_string(&default_cfg).unwrap(),
+            "disable:\n  - servicelb\n"
+        );
+
+        // Replacing an existing 0644 destination forces mode 0600 (unlike write_atomic,
+        // which preserves existing permissions for other callers).
+        let preserved = base.join("preserved.txt");
+        fs::write(&preserved, "v1\n").unwrap();
+        fs::set_permissions(&preserved, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&preserved, b"v2\n").unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&preserved)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        fs::write(&managed, "old: true\n").unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o644)).unwrap();
+        sync_k3s_config(&managed, Some("token: secret\n")).unwrap();
+        assert_eq!(fs::read_to_string(&managed).unwrap(), "token: secret\n");
+        assert_eq!(
+            fs::symlink_metadata(&managed).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Passing None (absence or reset) removes only the managed copy.
+        sync_k3s_config(&managed, None).unwrap();
+        assert!(!managed.exists());
+        assert_eq!(
+            fs::read_to_string(&default_cfg).unwrap(),
+            "disable:\n  - servicelb\n"
+        );
+
+        // Non-NotFound removal failures (e.g. a directory/mountpoint at the managed path) are reported.
+        fs::create_dir(&managed).unwrap();
+        assert!(sync_k3s_config(&managed, None).is_err());
+        fs::remove_dir(&managed).unwrap();
+
+        // K3S_CONFIG_FILE is set only when host YAML is supplied.
+        let mut with_cfg = Command::new(BIN);
+        configure_k3s_config_env(&mut with_cfg, Some(&managed));
+        assert!(with_cfg.get_envs().any(|(k, v)| {
+            k == OsStr::new("K3S_CONFIG_FILE") && v == Some(managed.as_os_str())
+        }));
+
+        let mut without_cfg = Command::new(BIN);
+        configure_k3s_config_env(&mut without_cfg, None);
+        assert!(
+            without_cfg
+                .get_envs()
+                .any(|(k, v)| k == OsStr::new("K3S_CONFIG_FILE") && v.is_none())
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn running_settings_compare_normalized_json_and_json_round_trips() {
+        let yaml_a = "# original comment\ndisable:\n  - traefik\nkubelet-arg: [max-pods=200]\n";
+        let yaml_b = "# edited comment\ndisable: [traefik]\nkubelet-arg:\n  - max-pods=200\n";
+        let yaml_c = "disable: [servicelb]\n";
+
+        let json_a = normalize_k3s_config_yaml(yaml_a).unwrap();
+        let json_b = normalize_k3s_config_yaml(yaml_b).unwrap();
+        let json_c = normalize_k3s_config_yaml(yaml_c).unwrap();
+        assert_eq!(json_a, json_b);
+        assert_ne!(json_a, json_c);
+
+        // Verify pure-std JSON emitter produces valid JSON matching serde_json.
+        let parsed: serde_json::Value = serde_json::from_str(&json_a).unwrap();
+        assert_eq!(parsed["disable"], serde_json::json!(["traefik"]));
+        assert_eq!(parsed["kubelet-arg"], serde_json::json!(["max-pods=200"]));
+        let special = normalize_k3s_config_yaml("node-label: ['a\"b\\c=caf\u{e9}']\n").unwrap();
+        let parsed_special: serde_json::Value = serde_json::from_str(&special).unwrap();
+        assert_eq!(
+            parsed_special["node-label"],
+            serde_json::json!(["a\"b\\c=caf\u{e9}"])
+        );
+
+        let running = (vec!["--debug".to_string()], Some(json_a));
+        // Comment/formatting-only YAML edit matches.
+        check_running_settings_match(&running, &["--debug".to_string()], Some(&json_b)).unwrap();
+        // Changed YAML, removed YAML, or changed extra_args are refused.
+        assert!(
+            check_running_settings_match(&running, &["--debug".to_string()], Some(&json_c))
+                .is_err()
+        );
+        assert!(check_running_settings_match(&running, &["--debug".to_string()], None).is_err());
+        assert!(check_running_settings_match(&running, &[], Some(&json_b)).is_err());
+    }
+
+    #[test]
+    fn parse_ctr_image_refs_trims_and_skips_blank_lines() {
+        let out = "\n  docker.io/library/alpine:3.24  \n\nimport-2026-11-26@sha256:abcd\n  \n";
+        assert_eq!(
+            parse_ctr_image_refs(out),
+            vec![
+                "docker.io/library/alpine:3.24".to_string(),
+                "import-2026-11-26@sha256:abcd".to_string(),
+            ]
+        );
+        assert!(parse_ctr_image_refs(" \n\t\n").is_empty());
+    }
+
+    #[test]
+    fn drain_capped_checked_detects_exact_and_overflowing_streams() {
+        let exact = drain_capped_checked(io::Cursor::new(b"abcd"), 4);
+        assert_eq!(exact.text, "abcd");
+        assert!(!exact.truncated);
+
+        let over = drain_capped_checked(io::Cursor::new(b"abcde"), 4);
+        assert_eq!(over.text, "abcd");
+        assert!(over.truncated);
+    }
+
+    #[test]
+    fn try_lock_with_deadline_emits_heartbeats_and_enforces_deadline_and_shutdown() {
+        let m = Mutex::new(());
+        let _held = m.lock().unwrap();
+
+        // 1. Times out with heartbeats when lock stays held.
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = try_lock_with_deadline(
+            &m,
+            Duration::from_millis(120),
+            Duration::from_millis(35),
+            "waiting for background image sync to stop",
+            || false,
+            &mut |msg| beats.push(msg.to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("timed out waiting for background image sync to stop"),
+            "{err}"
+        );
+        assert!(
+            beats.len() >= 2,
+            "expected periodic heartbeats, got: {beats:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // 2. Aborts immediately when shutting down.
+        let err = try_lock_with_deadline(
+            &m,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            "waiting for background image sync to stop",
+            || true,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("VM is shutting down"), "{err}");
+
+        // 3. Succeeds immediately once released.
+        drop(_held);
+        let _g = try_lock_with_deadline(
+            &m,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+            "waiting for background image sync to stop",
+            || false,
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn plan_image_rm_batches_chunks_refs() {
+        let empty: Vec<String> = Vec::new();
+        assert!(plan_image_rm_batches(&empty, 64).is_empty());
+
+        let one = vec!["img:0".to_string()];
+        assert_eq!(plan_image_rm_batches(&one, 64), vec![&one[..]]);
+
+        let three: Vec<String> = (0..3).map(|i| format!("img:{i}")).collect();
+        assert_eq!(plan_image_rm_batches(&three, 64), vec![&three[..]]);
+
+        let many: Vec<String> = (0..137).map(|i| format!("img:{i}")).collect();
+        let plan = plan_image_rm_batches(&many, 64);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].len(), 64);
+        assert_eq!(plan[1].len(), 64);
+        assert_eq!(plan[2].len(), 9);
+    }
+
+    #[test]
+    fn clear_k8s_images_with_handles_empty_batches_errors_and_shutdown() {
+        let ok_out = |stdout: &str| ReapedOutput {
+            code: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+        };
+        let lease_id = "katamaran-k8s-reset-gc-test";
+
+        // Empty namespace (e.g. retry after an earlier GC timeout): still verifies tasks/containers
+        // and runs the synchronous lease GC barrier without deleting any existing leases.
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut timeouts = Vec::new();
+        let mut progress = Vec::new();
+        clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, timeout, on_wait| {
+                calls.push(args.iter().map(|s| (*s).to_string()).collect());
+                timeouts.push(timeout);
+                if let Some(cb) = on_wait {
+                    cb();
+                }
+                Ok(ok_out(""))
+            },
+            |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                vec!["tasks", "ls", "-q"],
+                vec!["containers", "ls", "-q"],
+                vec!["images", "ls", "-q"],
+                vec![
+                    "leases",
+                    "create",
+                    "--id",
+                    lease_id,
+                    "--expires",
+                    IMAGE_GC_LEASE_EXPIRES,
+                ],
+                vec!["leases", "delete", "--sync", "--", lease_id],
+            ]
+        );
+        assert_eq!(
+            timeouts,
+            vec![
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_RM_SYNC_TIMEOUT,
+            ]
+        );
+        assert!(
+            progress
+                .iter()
+                .filter(|m| m.as_str() == "waiting for containerd garbage collection")
+                .count()
+                >= 2,
+            "expected GC progress + heartbeat, got: {progress:?}"
+        );
+
+        // Multiple images: deletes after `--` in batches, then runs synchronous lease GC barrier.
+        calls.clear();
+        timeouts.clear();
+        clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, timeout, _| {
+                calls.push(args.iter().map(|s| (*s).to_string()).collect());
+                timeouts.push(timeout);
+                if args == ["images", "ls", "-q"] {
+                    Ok(ok_out(
+                        "docker.io/library/busybox:latest\n-weird:tag\nrancher/mirrored-pause:3.6\n",
+                    ))
+                } else {
+                    Ok(ok_out(""))
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                vec!["tasks", "ls", "-q"],
+                vec!["containers", "ls", "-q"],
+                vec!["images", "ls", "-q"],
+                vec![
+                    "images",
+                    "rm",
+                    "--",
+                    "docker.io/library/busybox:latest",
+                    "-weird:tag",
+                    "rancher/mirrored-pause:3.6",
+                ],
+                vec![
+                    "leases",
+                    "create",
+                    "--id",
+                    lease_id,
+                    "--expires",
+                    IMAGE_GC_LEASE_EXPIRES,
+                ],
+                vec!["leases", "delete", "--sync", "--", lease_id],
+            ]
+        );
+        assert_eq!(
+            timeouts,
+            vec![
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_RM_BATCH_TIMEOUT,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_RM_SYNC_TIMEOUT,
+            ]
+        );
+
+        // Non-zero exit from `images ls` surfaces stderr detail and never runs `images rm`.
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                if args == ["tasks", "ls", "-q"] || args == ["containers", "ls", "-q"] {
+                    Ok(ok_out(""))
+                } else if args == ["images", "ls", "-q"] {
+                    Ok(ReapedOutput {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: "dial unix failed\n".into(),
+                        stdout_truncated: false,
+                    })
+                } else {
+                    panic!("unexpected command after images ls error: {args:?}");
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("ctr images ls (k8s.io) failed: dial unix failed"));
+
+        // Non-zero exit from the first `images rm` batch stops immediately and never runs
+        // subsequent batches or the synchronous GC barrier.
+        let many_refs: String = (0..(IMAGE_RM_BATCH_SIZE + 2))
+            .map(|i| format!("img:{i}\n"))
+            .collect();
+        let mut rm_calls = Vec::new();
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                rm_calls.push(args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+                if args == ["tasks", "ls", "-q"] || args == ["containers", "ls", "-q"] {
+                    Ok(ok_out(""))
+                } else if args == ["images", "ls", "-q"] {
+                    Ok(ok_out(&many_refs))
+                } else if args.starts_with(&["images", "rm"]) && rm_calls.len() == 4 {
+                    Ok(ReapedOutput {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: "permission denied\n".into(),
+                        stdout_truncated: false,
+                    })
+                } else {
+                    panic!("deletion must stop after first failed batch; saw {args:?}");
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("ctr images rm (k8s.io) failed: permission denied"));
+        assert_eq!(rm_calls.len(), 4);
+
+        // Shutdown flag aborts before running `ctr`.
+        let err = clear_k8s_images_with(
+            || true,
+            lease_id,
+            |_, _, _| panic!("should not run"),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("VM is shutting down"));
+    }
+
+    #[test]
+    fn clear_k8s_images_with_rejects_lingering_workloads_and_truncated_inventory() {
+        let ok_out = |stdout: &str| ReapedOutput {
+            code: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+        };
+        let lease_id = "katamaran-k8s-reset-gc-test";
+
+        // Lingering task stops cleanup before listing or deleting images.
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                if args == ["tasks", "ls", "-q"] {
+                    Ok(ok_out("task-stuck-1\n"))
+                } else {
+                    panic!("should not continue when tasks remain: {args:?}");
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("task(s) still remain"), "{err}");
+        assert!(err.contains("task-stuck-1"), "{err}");
+
+        // Lingering container stops cleanup before listing or deleting images.
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                if args == ["tasks", "ls", "-q"] {
+                    Ok(ok_out(""))
+                } else if args == ["containers", "ls", "-q"] {
+                    Ok(ok_out("ctr-stuck-1\nctr-stuck-2\n"))
+                } else {
+                    panic!("should not continue when containers remain: {args:?}");
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("2 container(s) still remain"), "{err}");
+        assert!(err.contains("ctr-stuck-1"), "{err}");
+
+        // Failed container listing stops cleanup before listing or deleting images.
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                if args == ["tasks", "ls", "-q"] {
+                    Ok(ok_out(""))
+                } else if args == ["containers", "ls", "-q"] {
+                    Ok(ReapedOutput {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: "containerd unavailable\n".into(),
+                        stdout_truncated: false,
+                    })
+                } else {
+                    panic!("should not continue when containers ls fails: {args:?}");
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("ctr containers ls (k8s.io) failed: containerd unavailable"),
+            "{err}"
+        );
+
+        // Truncated image inventory fails cleanly and never invokes `images rm` or GC lease.
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                if args == ["tasks", "ls", "-q"] || args == ["containers", "ls", "-q"] {
+                    Ok(ok_out(""))
+                } else if args == ["images", "ls", "-q"] {
+                    Ok(ReapedOutput {
+                        code: 0,
+                        stdout: "docker.io/library/alpine:3.24\ndocker.io/library/trunc".into(),
+                        stderr: String::new(),
+                        stdout_truncated: true,
+                    })
+                } else {
+                    panic!("truncated inventory must never reach deletion: {args:?}");
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("truncated inventory"), "{err}");
+
+        // Synchronous GC barrier failure surfaces error.
+        let err = clear_k8s_images_with(
+            || false,
+            lease_id,
+            |args, _, _| {
+                if args == ["leases", "delete", "--sync", "--", lease_id] {
+                    Ok(ReapedOutput {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: "gc timed out\n".into(),
+                        stdout_truncated: false,
+                    })
+                } else {
+                    Ok(ok_out(""))
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("ctr leases delete --sync (k8s.io) failed: gc timed out"),
+            "{err}"
+        );
+    }
+
+    struct TempDirGuard(std::path::PathBuf);
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+            let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+            let mut bytes = template.into_os_string().into_vec();
+            bytes.push(0);
+            let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+            assert!(
+                !ptr.is_null(),
+                "mkdtemp failed: {}",
+                io::Error::last_os_error()
+            );
+            bytes.pop();
+            Self(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                bytes,
+            )))
+        }
+    }
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rm_all(path: &Path) -> Result<(), String> {
+        fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn remove_cluster_data_dirs_detaches_once_acks_then_reclaims_best_effort() {
+        let guard = TempDirGuard::create("kat-rcd");
+        let base = &guard.0;
+        let data_dir = base.join("data");
+        let legacy_dir = base.join("legacy-kubelet");
+        let kubeconfig = base.join("kubeconfig.yaml");
+        let k3s_cfg = base.join("config.yaml");
+        let paths = ClusterDataPaths {
+            data_dir: &data_dir,
+            legacy_kubelet_dir: &legacy_dir,
+            kubeconfig: &kubeconfig,
+            k3s_config: &k3s_cfg,
+        };
+        let seed = || {
+            fs::create_dir_all(data_dir.join("server")).unwrap();
+            fs::write(data_dir.join("server/state.db"), b"state").unwrap();
+            fs::write(&kubeconfig, b"kubeconfig").unwrap();
+            fs::write(&k3s_cfg, b"config").unwrap();
+        };
+        let ok = || -> Result<(), String> { Ok(()) };
+        let stale = || -> Vec<std::path::PathBuf> {
+            let Ok(rd) = fs::read_dir(base.join(RESET_TRASH_DIR)) else {
+                return Vec::new();
+            };
+            let mut v: Vec<_> = rd
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        seed();
+
+        // 1. `may_destroy` failing (shutdown / failed reply stream) right before
+        //    the detach leaves the datastore, legacy data and config untouched.
+        fs::create_dir_all(legacy_dir.join("pods")).unwrap();
+        let err = remove_cluster_data_dirs(
+            &paths,
+            &|| Err("client stream write failed; leaving cluster data intact".into()),
+            |_, _| panic!("must not remove legacy data"),
+            |_, _| panic!("must not reclaim"),
+            &mut || panic!("must not ack"),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("leaving cluster data intact"), "{err}");
+        assert!(legacy_dir.join("pods").is_dir());
+        assert!(data_dir.join("server/state.db").is_file());
+        assert!(kubeconfig.is_file() && k3s_cfg.is_file());
+        assert!(stale().is_empty());
+
+        // 2. Legacy kubelet cleanup runs only after the ack, and its failure is
+        //    a warning (the active data is already detached).
+        let acked = AtomicBool::new(false);
+        let warning = remove_cluster_data_dirs(
+            &paths,
+            &ok,
+            |p, _| {
+                assert!(
+                    acked.load(Ordering::SeqCst),
+                    "ack must precede legacy cleanup"
+                );
+                Err(format!("remove {}: EPERM", p.display()))
+            },
+            |_, _| Ok(()),
+            &mut || {
+                acked.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap()
+        .expect("legacy cleanup failure must be a warning");
+        assert!(warning.contains("legacy kubelet"), "{warning}");
+        assert!(!data_dir.exists());
+        // Put the detached copy back aside for the next cases.
+        fs::remove_dir_all(&legacy_dir).unwrap();
+        for p in stale() {
+            fs::remove_dir_all(p).unwrap();
+        }
+        seed();
+
+        // 3. The ack fails after the detach: an error is returned and nothing
+        //    is reclaimed, so the detached copy stays for the next reset.
+        let err = remove_cluster_data_dirs(
+            &paths,
+            &ok,
+            |_, _| panic!("no legacy dir"),
+            |_, _| panic!("must not reclaim without an ack"),
+            &mut || Err("send reset data-cleared ack: broken pipe".into()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("ack"), "{err}");
+        assert!(!data_dir.exists());
+        assert!(!kubeconfig.exists() && !k3s_cfg.exists());
+        let leftover = stale();
+        assert_eq!(leftover.len(), 1);
+        assert!(leftover[0].join("server/state.db").is_file());
+
+        // 4. A fresh datastore is detached and acked BEFORE reclamation; a
+        //    reclamation failure is a warning, not an error.
+        seed();
+        let acked = AtomicBool::new(false);
+        let warning = remove_cluster_data_dirs(
+            &paths,
+            &ok,
+            |_, _| panic!("no legacy dir"),
+            |parent, _| {
+                assert!(acked.load(Ordering::SeqCst), "ack must precede reclamation");
+                assert!(!data_dir.exists(), "live data_dir must already be detached");
+                // Every copy is attempted even though each one fails.
+                let mut attempts = 0;
+                let res = reclaim_stale_dirs(parent, &mut |p| {
+                    assert_ne!(p, data_dir.as_path());
+                    attempts += 1;
+                    Err(format!("remove {}: timed out", p.display()))
+                });
+                assert_eq!(attempts, 2);
+                res
+            },
+            &mut || {
+                acked.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap()
+        .expect("reclamation failure must be reported as a warning");
+        assert!(warning.contains("retried on the next reset"), "{warning}");
+        assert_eq!(stale().len(), 2);
+
+        // 5. A later reset with nothing active reclaims every leftover sibling.
+        let mut reclaimed = Vec::new();
+        let warning = remove_cluster_data_dirs(
+            &paths,
+            &ok,
+            |_, _| panic!("no legacy dir"),
+            |parent, _| {
+                reclaim_stale_dirs(parent, &mut |p| {
+                    reclaimed.push(p.to_path_buf());
+                    rm_all(p)
+                })
+            },
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(warning.is_none());
+        assert_eq!(reclaimed.len(), 2);
+        assert!(stale().is_empty());
+
+        // 6. `may_destroy` failing after the ack skips reclamation with a warning.
+        seed();
+        let calls = std::cell::Cell::new(0);
+        let warning = remove_cluster_data_dirs(
+            &paths,
+            &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() >= 2 {
+                    Err("aborted: VM is shutting down".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| panic!("no legacy dir"),
+            |_, _| panic!("must not reclaim after may_destroy fails"),
+            &mut || Ok(()),
+            &mut |_| {},
+        )
+        .unwrap()
+        .unwrap();
+        assert!(warning.contains("not removed"), "{warning}");
+        assert_eq!(stale().len(), 1);
+
+        // 7. Missing parent (fresh VM): acked, nothing to reclaim.
+        let missing = base.join("never-created");
+        let mut acked = false;
+        let warning = remove_cluster_data_dirs(
+            &ClusterDataPaths {
+                data_dir: &missing.join("data"),
+                legacy_kubelet_dir: &base.join("no-legacy"),
+                kubeconfig: &base.join("no-kc"),
+                k3s_config: &base.join("no-cfg"),
+            },
+            &ok,
+            |_, _| panic!("no legacy dir"),
+            |parent, _| reclaim_stale_dirs(parent, &mut |_| panic!("no siblings")),
+            &mut || {
+                acked = true;
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(acked && warning.is_none());
+
+        // 8. A stat error on data_dir fails before any ack.
+        let file_parent = base.join("not-a-dir");
+        fs::write(&file_parent, b"file").unwrap();
+        let err = remove_cluster_data_dirs(
+            &ClusterDataPaths {
+                data_dir: &file_parent.join("data"),
+                legacy_kubelet_dir: &base.join("no-legacy"),
+                kubeconfig: &base.join("no-kc"),
+                k3s_config: &base.join("no-cfg"),
+            },
+            &ok,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+            &mut || panic!("must not ack after a stat error"),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("stat "), "{err}");
+
+        // 9. A scan error while reclaiming is a warning (data already detached).
+        let warning = reclaim_stale_dirs(&file_parent, &mut |_| Ok(())).unwrap_err();
+        assert!(warning.contains("stat "), "{warning}");
+
+        // 10. Only names reset generates, inside the katamaran-owned trash
+        //     directory, are ever reclaimed; a symlinked trash dir is refused.
+        let p2 = base.join("p2");
+        let trash = p2.join(RESET_TRASH_DIR);
+        fs::create_dir_all(trash.join("data-0a1b-2c3d")).unwrap();
+        fs::create_dir_all(trash.join("data-not_ours!")).unwrap();
+        fs::create_dir_all(trash.join("other")).unwrap();
+        fs::create_dir_all(p2.join(".data.removing-custom")).unwrap();
+        let mut seen = Vec::new();
+        reclaim_stale_dirs(&p2, &mut |p| {
+            seen.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["data-0a1b-2c3d".to_string()]);
+        let p3 = base.join("p3");
+        fs::create_dir_all(&p3).unwrap();
+        std::os::unix::fs::symlink(&trash, p3.join(RESET_TRASH_DIR)).unwrap();
+        let err = reclaim_stale_dirs(&p3, &mut |_| {
+            panic!("must not follow a symlinked trash dir")
+        })
+        .unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn reset_conn_writer_bounds_unread_client_and_latches_failure() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let writer = ResetConnWriter::new(&server, Duration::from_millis(50));
+        let big = "x".repeat(32 << 10);
+        let started = Instant::now();
+        for _ in 0..128 {
+            writer.write_progress(&big);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "ResetConnWriter stalled on unread peer: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            writer.failed(),
+            "expected write_failed latch on unread peer"
+        );
+        assert!(
+            writer.write_required(&K8sMsg::ResetAccepted).is_err(),
+            "latched writer must not write further frames"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn remove_tree_nofollow_clears_trees_and_preserves_symlink_targets() {
+        let guard = TempDirGuard::create("kat-rmt");
+        let base = &guard.0;
+        let no_check = &mut |_: &Path| -> Result<(), String> { Ok(()) };
+
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_file = outside.join("keep");
+        fs::write(&outside_file, b"preserve").unwrap();
+
+        // 1. Nested tree with files, subdirs, a symlink to an outside directory,
+        //    and a wide directory (exercises readdir rescans after unlinks).
+        let tree = base.join("tree");
+        fs::create_dir_all(tree.join("a/b/c")).unwrap();
+        fs::write(tree.join("a/b/c/file.txt"), b"data").unwrap();
+        fs::write(tree.join("top"), b"top").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("a/link-to-outside")).unwrap();
+        fs::create_dir(tree.join("wide")).unwrap();
+        for i in 0..2000 {
+            fs::write(tree.join(format!("wide/f{i}")), b"x").unwrap();
+        }
+        let mut checked = 0usize;
+        remove_tree_nofollow(&tree, &mut |_| {
+            checked += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(fs::symlink_metadata(&tree).is_err());
+        assert!(outside_file.exists(), "must never follow symlinks");
+        assert!(checked > 2000, "check must run per entry, got {checked}");
+
+        // 2. Root symlink to a directory unlinks only the symlink.
+        let root_link = base.join("root-link");
+        std::os::unix::fs::symlink(&outside, &root_link).unwrap();
+        remove_tree_nofollow(&root_link, no_check).unwrap();
+        assert!(fs::symlink_metadata(&root_link).is_err());
+        assert!(outside_file.exists());
+
+        // 3. Missing path succeeds; a single regular file is deleted.
+        remove_tree_nofollow(&base.join("does-not-exist"), no_check).unwrap();
+        remove_tree_nofollow(&base.join("no-parent/child"), no_check).unwrap();
+        assert!(remove_tree_nofollow(Path::new("/"), no_check).is_err());
+        let single = base.join("single-file");
+        fs::write(&single, b"x").unwrap();
+        remove_tree_nofollow(&single, no_check).unwrap();
+        assert!(!single.exists());
+
+        // 4. An aborting check leaves the tree untouched.
+        let untouched = base.join("untouched");
+        fs::create_dir(&untouched).unwrap();
+        fs::write(untouched.join("f"), b"x").unwrap();
+        let err = remove_tree_nofollow(&untouched, &mut |_| {
+            Err("aborted: VM is shutting down".into())
+        })
+        .unwrap_err();
+        assert!(err.contains("shutting down"), "{err}");
+        assert!(untouched.join("f").exists());
+    }
+
+    #[test]
+    fn remove_tree_nofollow_bounds_open_dirs_independently_of_depth() {
+        let guard = TempDirGuard::create("kat-rmt-deep");
+        let base = &guard.0;
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        // A chain far deeper than the open-stream window, with files and a
+        // symlink at several levels and a sibling subtree near the top so the
+        // walk must climb back through closed ancestors more than once.
+        let tree = base.join("tree");
+        let mut dir = tree.clone();
+        for i in 0..200 {
+            dir = dir.join("d");
+            fs::create_dir_all(&dir).unwrap();
+            if i % 37 == 0 {
+                fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+                std::os::unix::fs::symlink(&outside, dir.join(format!("l{i}"))).unwrap();
+            }
+        }
+        fs::create_dir_all(tree.join("d/sibling/a/b")).unwrap();
+        fs::write(tree.join("d/sibling/a/b/f"), b"x").unwrap();
+
+        for max_open in [1, 2, 3] {
+            let t = base.join(format!("tree-{max_open}"));
+            let status = Command::new("cp")
+                .arg("-a")
+                .arg(&tree)
+                .arg(&t)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            remove_tree_nofollow_with(&t, max_open, &mut |_| Ok(())).unwrap();
+            assert!(fs::symlink_metadata(&t).is_err(), "max_open={max_open}");
+        }
+        remove_tree_nofollow(&tree, &mut |_| Ok(())).unwrap();
+        assert!(fs::symlink_metadata(&tree).is_err());
+        assert!(outside.join("keep").exists());
+    }
+
+    #[test]
+    fn remove_tree_nofollow_refuses_reopening_swapped_ancestor() {
+        let guard = TempDirGuard::create("kat-rmt-reopen");
+        let base = &guard.0;
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("x/y")).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        // With one open stream, `tree/x` is closed while `tree/x/y` is walked.
+        // Swapping `tree/x` for a symlink (or another directory) before the
+        // walk climbs back must abort rather than touch anything outside.
+        for replace_with_symlink in [true, false] {
+            let tree = base.join(format!("tree-{replace_with_symlink}"));
+            fs::create_dir_all(tree.join("x/y")).unwrap();
+            fs::write(tree.join("x/y/f"), b"x").unwrap();
+            fs::write(tree.join("x/g"), b"x").unwrap();
+            let moved = base.join(format!("moved-{replace_with_symlink}"));
+            let target = tree.join("x/y/f");
+            let mut swapped = false;
+            let err = remove_tree_nofollow_with(&tree, 1, &mut |p| {
+                if p == target && !swapped {
+                    swapped = true;
+                    fs::rename(tree.join("x"), &moved).unwrap();
+                    if replace_with_symlink {
+                        std::os::unix::fs::symlink(&outside, tree.join("x")).unwrap();
+                    } else {
+                        fs::create_dir_all(tree.join("x/y")).unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(swapped);
+            assert!(
+                err.contains("replaced") || err.contains("reopen"),
+                "replace_with_symlink={replace_with_symlink}: {err}"
+            );
+            assert!(outside.join("keep").exists());
+            assert!(outside.join("x/y").exists());
+            assert!(
+                moved.join("y").is_dir(),
+                "moved ancestor must be left in place"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_tree_nofollow_refuses_to_cross_mount_points() {
+        // Needs root to mount a tmpfs; skip quietly otherwise.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let guard = TempDirGuard::create("kat-rmt-mnt");
+        let base = &guard.0;
+        let tree = base.join("tree");
+        let mnt = tree.join("sub/mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let c_mnt = CString::new(mnt.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated strings; mounting a private tmpfs.
+        let rc = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                c_mnt.as_ptr(),
+                c"tmpfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            // No CAP_SYS_ADMIN (e.g. unprivileged container): nothing to test.
+            return;
+        }
+        fs::write(mnt.join("outside-data"), b"keep").unwrap();
+        let err = remove_tree_nofollow(&tree, &mut |_| Ok(())).unwrap_err();
+        let still_there = mnt.join("outside-data").exists();
+        // SAFETY: unmount the tmpfs mounted above.
+        unsafe { libc::umount2(c_mnt.as_ptr(), libc::MNT_DETACH) };
+        assert!(err.contains("refusing to cross a mount point"), "{err}");
+        assert!(still_there, "files on another mount must never be removed");
+
+        // A root that is itself a mount point is refused too.
+        fs::create_dir_all(&mnt).unwrap();
+        let rc = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                c_mnt.as_ptr(),
+                c"tmpfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0);
+        fs::write(mnt.join("f"), b"keep").unwrap();
+        let err = remove_tree_nofollow(&mnt, &mut |_| Ok(())).unwrap_err();
+        let kept = mnt.join("f").exists();
+        unsafe { libc::umount2(c_mnt.as_ptr(), libc::MNT_DETACH) };
+        assert!(err.contains("refusing to cross a mount point"), "{err}");
+        assert!(kept);
+    }
+
+    #[test]
+    fn destroy_btrfs_subvolume_ignores_plain_dirs_and_symlinks() {
+        let guard = TempDirGuard::create("kat-btrfs-destroy");
+        let base = &guard.0;
+        let dir = base.join("plain");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("f"), b"x").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        // Not a subvolume root (or not btrfs at all): nothing is deleted.
+        assert!(!destroy_btrfs_subvolume(&dir).unwrap());
+        assert!(!destroy_btrfs_subvolume(&link).unwrap());
+        assert!(dir.join("f").exists());
+        assert!(destroy_btrfs_subvolume(&base.join("missing")).is_err());
+    }
+
+    #[test]
+    fn remove_tree_nofollow_never_enters_directory_swapped_for_symlink() {
+        let guard = TempDirGuard::create("kat-rmt-swap");
+        let base = &guard.0;
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        let tree = base.join("tree");
+        fs::create_dir_all(tree.join("a")).unwrap();
+        fs::write(tree.join("a/inner"), b"data").unwrap();
+        let moved = base.join("moved");
+
+        // After `a` is enumerated as a directory but before it is opened,
+        // replace it with a symlink to `outside` (a concurrent writer with
+        // access to the detached tree).
+        let target = tree.join("a");
+        let mut swapped = false;
+        remove_tree_nofollow(&tree, &mut |p| {
+            if p == target && !swapped {
+                swapped = true;
+                fs::rename(&target, &moved).unwrap();
+                std::os::unix::fs::symlink(&outside, &target).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(swapped);
+        assert!(fs::symlink_metadata(&tree).is_err());
+        assert!(
+            outside.join("keep").exists(),
+            "files behind a swapped-in symlink must never be removed"
+        );
+        assert!(moved.join("inner").exists());
+    }
+
+    #[test]
+    fn plain_reset_requires_workload_preflight_before_removing_data() {
+        let sync_lock = Mutex::new(());
+        for preflight_ok in [false, true] {
+            let mut order = Vec::new();
+            let order_cell = std::cell::RefCell::new(&mut order);
+            let res = execute_reset_sequence(
+                false,
+                &sync_lock,
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+                || false,
+                &mut |_| {},
+                |_| {
+                    order_cell.borrow_mut().push("stop");
+                    Ok(())
+                },
+                |_| {
+                    order_cell.borrow_mut().push("preflight");
+                    if preflight_ok {
+                        Ok(())
+                    } else {
+                        Err("k8s.io tasks still present: abc".into())
+                    }
+                },
+                |_| {
+                    order_cell.borrow_mut().push("remove");
+                    Ok(())
+                },
+                |_, _| panic!("plain reset never clears images"),
+            );
+            assert_eq!(res.is_ok(), preflight_ok, "{res:?}");
+            let expected: &[&str] = if preflight_ok {
+                &["stop", "preflight", "remove"]
+            } else {
+                &["stop", "preflight"]
+            };
+            assert_eq!(order, expected);
+        }
+    }
+
+    #[test]
+    fn image_reset_sync_lock_timeout_leaves_cluster_data_untouched() {
+        let sync_lock = Mutex::new(());
+        let _held = sync_lock.lock().unwrap();
+        let mut stop_called = false;
+        let mut wait_containerd_called = false;
+        let mut remove_data_called = false;
+        let mut clear_images_called = false;
+        let mut progress = Vec::new();
+
+        let err = execute_reset_sequence(
+            true,
+            &sync_lock,
+            Duration::from_millis(90),
+            Duration::from_millis(30),
+            || false,
+            &mut |m| progress.push(m.to_string()),
+            |_| {
+                stop_called = true;
+                Ok(())
+            },
+            |_| {
+                wait_containerd_called = true;
+                Ok(())
+            },
+            |_| {
+                remove_data_called = true;
+                Ok(())
+            },
+            |_, _| {
+                clear_images_called = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("timed out waiting for background image sync to stop"),
+            "{err}"
+        );
+        assert!(
+            stop_called,
+            "k3s must be stopped before waiting on sync lock"
+        );
+        assert!(!wait_containerd_called);
+        assert!(
+            !remove_data_called,
+            "sync-lock contention timeout must not delete cluster data"
+        );
+        assert!(!clear_images_called);
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "waiting for background image sync to stop"),
+            "expected sync-lock heartbeat, got: {progress:?}"
+        );
+
+        // Also verify that an unresponsive containerd RPC preflight failure leaves
+        // cluster data untouched once the sync lock is acquired, while a transient
+        // non-zero startup error retries and succeeds.
+        drop(_held);
+        let mut attempts = 0;
+        wait_containerd_rpc_with(
+            || false,
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+            |args, _, _| {
+                assert_eq!(args, ["version"]);
+                attempts += 1;
+                Ok(ReapedOutput {
+                    code: if attempts == 1 { 1 } else { 0 },
+                    stdout: String::new(),
+                    stderr: if attempts == 1 {
+                        "unavailable".into()
+                    } else {
+                        String::new()
+                    },
+                    stdout_truncated: false,
+                })
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+
+        let mut remove_data_called2 = false;
+        let mut clear_images_called2 = false;
+        let err2 = execute_reset_sequence(
+            true,
+            &sync_lock,
+            Duration::from_millis(90),
+            Duration::from_millis(30),
+            || false,
+            &mut |_| {},
+            |_| Ok(()),
+            |progress| {
+                wait_containerd_rpc_with(
+                    || false,
+                    Duration::from_millis(500),
+                    Duration::from_millis(50),
+                    |args, _, _| {
+                        assert_eq!(args, ["version"]);
+                        Err("ctr version: \"/usr/bin/ctr\" timed out".into())
+                    },
+                    progress,
+                )
+            },
+            |_| {
+                remove_data_called2 = true;
+                Ok(())
+            },
+            |_, _| {
+                clear_images_called2 = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err2.contains("timed out"), "{err2}");
+        assert!(
+            !remove_data_called2,
+            "unresponsive containerd preflight must not delete cluster data"
+        );
+        assert!(!clear_images_called2);
+    }
+
+    #[test]
+    fn wait_reaped_pipes_bounds_timeout_shutdown_and_leaked_pipes() {
+        let mk_pipe = || {
+            let (r, w) = pipe().unwrap();
+            set_nonblocking_fd(r.as_raw_fd()).unwrap();
+            (File::from(r), File::from(w))
+        };
+
+        // 1. Timeout when child ignores SIGKILL (never exits) and both pipe write ends
+        //    stay open: must kill, emit heartbeats, and return TimedOut promptly.
+        let (out_r, _out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (_tx, rx) = mpsc::channel::<i32>();
+        let mut killed = false;
+        let mut beats = 0usize;
+        let opts = WaitPipesOpts {
+            timeout: Duration::from_millis(120),
+            kill_wait: Duration::from_millis(40),
+            post_exit_drain: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_millis(35),
+            stdout_limit: 1024,
+            abort_on_shutdown: false,
+        };
+        let started = Instant::now();
+        let mut on_wait = || beats += 1;
+        let err = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx,
+            &opts,
+            || false,
+            || killed = true,
+            Some(&mut on_wait),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(killed, "timeout must signal child");
+        assert!(beats >= 1, "expected heartbeat before timeout, got {beats}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hung on open pipes after timeout: {:?}",
+            started.elapsed()
+        );
+
+        // 2. Shutdown abort during continuous stdout flood: must still notice shutdown,
+        //    kill the child, and return Interrupted promptly.
+        let (out_r, mut out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (_tx2, rx2) = mpsc::channel::<i32>();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_writer = stop_flag.clone();
+        let writer = thread::spawn(move || {
+            let buf = [b'x'; 4096];
+            for i in 0..500 {
+                if i == 10 {
+                    stop_writer.store(true, Ordering::SeqCst);
+                }
+                if out_w.write_all(&buf).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut killed2 = false;
+        let opts2 = WaitPipesOpts {
+            timeout: Duration::from_secs(5),
+            kill_wait: Duration::from_millis(30),
+            post_exit_drain: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(1),
+            stdout_limit: 8192,
+            abort_on_shutdown: true,
+        };
+        let started2 = Instant::now();
+        let err2 = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx2,
+            &opts2,
+            || stop_flag.load(Ordering::SeqCst),
+            || killed2 = true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::Interrupted);
+        assert!(killed2, "shutdown abort must signal child");
+        assert!(started2.elapsed() < Duration::from_secs(2));
+        let _ = writer.join();
+
+        // 3. Direct child exits cleanly while a quiet descendant holds both pipes open:
+        //    collects buffered output immediately without hanging.
+        let (out_r, mut out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (tx3, rx3) = mpsc::channel::<i32>();
+        out_w.write_all(b"img-1\nimg-2\n").unwrap();
+        tx3.send(0).unwrap();
+        let started3 = Instant::now();
+        let out3 = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx3,
+            &opts,
+            || false,
+            || panic!("should not kill exited child"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out3.code, 0);
+        assert_eq!(out3.stdout, "img-1\nimg-2\n");
+        assert!(!out3.stdout_truncated);
+        assert!(started3.elapsed() < Duration::from_secs(1));
+        drop(out_w);
+
+        // 4. Direct child exits cleanly while a noisy descendant floods stdout past the
+        //    capture limit: post-exit drain stops promptly and flags truncation.
+        let (out_r, mut out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (tx4, rx4) = mpsc::channel::<i32>();
+        out_w.write_all(&[b'y'; 4096]).unwrap();
+        let flooder = thread::spawn(move || {
+            let buf = [b'y'; 4096];
+            while out_w.write_all(&buf).is_ok() {}
+        });
+        tx4.send(0).unwrap();
+        let started4 = Instant::now();
+        let out4 = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx4,
+            &opts,
+            || false,
+            || panic!("should not kill exited child"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out4.code, 0);
+        assert!(out4.stdout_truncated);
+        assert_eq!(out4.stdout.len(), opts.stdout_limit);
+        assert!(started4.elapsed() < Duration::from_secs(1));
+        let _ = flooder.join();
+
+        // 5. Exact stdout_limit vs stdout_limit + 1 on normal EOF.
+        for (len, expect_trunc) in [(16usize, false), (17usize, true)] {
+            let (out_r, mut out_w) = mk_pipe();
+            let (err_r, err_w) = mk_pipe();
+            let (tx, rx) = mpsc::channel::<i32>();
+            out_w.write_all(&vec![b'a'; len]).unwrap();
+            drop(out_w);
+            drop(err_w);
+            tx.send(0).unwrap();
+            let o = wait_reaped_pipes(
+                Some(out_r),
+                Some(err_r),
+                &rx,
+                &WaitPipesOpts {
+                    stdout_limit: 16,
+                    ..opts
+                },
+                || false,
+                || {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(o.stdout.len(), len.min(16));
+            assert_eq!(o.stdout_truncated, expect_trunc);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires bundled containerd + ctr binaries via KAT_TEST_CONTAINERD_BIN and KAT_TEST_CTR_BIN"]
+    fn clear_k8s_images_against_live_containerd() {
+        use sha2::{Digest, Sha256};
+
+        let containerd_bin = std::env::var("KAT_TEST_CONTAINERD_BIN")
+            .expect("set KAT_TEST_CONTAINERD_BIN to the bundled containerd binary");
+        let ctr_bin = std::env::var("KAT_TEST_CTR_BIN")
+            .expect("set KAT_TEST_CTR_BIN to the bundled ctr binary");
+
+        let tmp_guard = TempDirGuard::create("kat-init-live-ctr");
+        let base = tmp_guard.0.clone();
+        let root_dir = base.join("root");
+        let state_dir = base.join("state");
+        let socket_path = state_dir.join("containerd.sock");
+        let config_path = base.join("config.toml");
+        let log_path = base.join("containerd.log");
+        let image_tar = base.join("fixture.tar");
+        fs::create_dir(&root_dir).unwrap();
+        fs::create_dir(&state_dir).unwrap();
+
+        let toml_str = |p: &Path| serde_json::to_string(&p.display().to_string()).unwrap();
+        let config_toml = format!(
+            "version = 3\n\
+             root = {}\n\
+             state = {}\n\
+             disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\", \"io.containerd.cri.v1.runtime\"]\n\
+             [grpc]\n\
+               address = {}\n",
+            toml_str(&root_dir),
+            toml_str(&state_dir),
+            toml_str(&socket_path),
+        );
+        fs::write(&config_path, config_toml).unwrap();
+
+        // Build a minimal self-contained OCI image archive so this test needs no
+        // external fixture files or network access.
+        let sha256_hex = |data: &[u8]| -> String {
+            Sha256::digest(data)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let add_entry = |out: &mut dyn Write, path: &str, data: &[u8]| {
+            let name = path.as_bytes();
+            assert!(name.len() <= 100, "tar entry path too long: {path}");
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name);
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            let size = format!("{:011o}\0", data.len());
+            header[124..136].copy_from_slice(size.as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let cksum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+            let cksum_field = format!("{cksum:06o}\0 ");
+            header[148..156].copy_from_slice(cksum_field.as_bytes());
+            out.write_all(&header).unwrap();
+            out.write_all(data).unwrap();
+            let rem = data.len() % 512;
+            if rem != 0 {
+                out.write_all(&vec![0u8; 512 - rem]).unwrap();
+            }
+        };
+        let finish_tar = |out: &mut dyn Write| {
+            out.write_all(&[0u8; 1024]).unwrap();
+        };
+        {
+            let mut layer = Vec::new();
+            let payload = b"katamaran-live-snapshot-fixture\n";
+            add_entry(&mut layer, "fixture.txt", payload);
+            finish_tar(&mut layer);
+
+            let mut archive = File::create(&image_tar).unwrap();
+            let layer_hex = sha256_hex(&layer);
+            let layer_digest = format!("sha256:{layer_hex}");
+            add_entry(&mut archive, &format!("blobs/sha256/{layer_hex}"), &layer);
+
+            let config_json = serde_json::to_vec(&serde_json::json!({
+                "architecture": NATIVE_ARCH,
+                "os": "linux",
+                "rootfs": {
+                    "type": "layers",
+                    "diff_ids": [layer_digest],
+                },
+            }))
+            .unwrap();
+            let config_hex = sha256_hex(&config_json);
+            let config_digest = format!("sha256:{config_hex}");
+            add_entry(
+                &mut archive,
+                &format!("blobs/sha256/{config_hex}"),
+                &config_json,
+            );
+
+            let manifest_json = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": config_digest,
+                    "size": config_json.len(),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_digest,
+                    "size": layer.len(),
+                }],
+            }))
+            .unwrap();
+            let manifest_hex = sha256_hex(&manifest_json);
+            let manifest_digest = format!("sha256:{manifest_hex}");
+            add_entry(
+                &mut archive,
+                &format!("blobs/sha256/{manifest_hex}"),
+                &manifest_json,
+            );
+
+            let index_json = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": manifest_digest,
+                    "size": manifest_json.len(),
+                    "platform": {
+                        "architecture": NATIVE_ARCH,
+                        "os": "linux",
+                    },
+                    "annotations": {
+                        "io.containerd.image.name": "docker.io/library/fixture:base",
+                    },
+                }],
+            }))
+            .unwrap();
+            add_entry(
+                &mut archive,
+                "oci-layout",
+                br#"{"imageLayoutVersion":"1.0.0"}"#,
+            );
+            add_entry(&mut archive, "index.json", &index_json);
+            finish_tar(&mut archive);
+        }
+
+        struct DisposableContainerd {
+            reaper: Reaper,
+            target: crate::linux::service::ChildTarget,
+            exited: Receiver<i32>,
+            already_exited: bool,
+        }
+        impl Drop for DisposableContainerd {
+            fn drop(&mut self) {
+                if !self.already_exited {
+                    self.reaper.signal_target(&self.target, libc::SIGTERM);
+                    if self.exited.recv_timeout(Duration::from_secs(5)).is_err() {
+                        self.reaper.signal_target(&self.target, libc::SIGKILL);
+                        let _ = self.exited.recv_timeout(Duration::from_secs(2));
+                    }
+                }
+            }
+        }
+
+        let reaper = Reaper::start();
+        let log_file = File::create(&log_path).unwrap();
+        let log_err = log_file.try_clone().unwrap();
+        let mut containerd_cmd = Command::new(&containerd_bin);
+        containerd_cmd
+            .args(["--config"])
+            .arg(&config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_err));
+        let (target, exited) = reaper.spawn_pidfd(&mut containerd_cmd).unwrap();
+        let mut daemon = DisposableContainerd {
+            reaper: reaper.clone(),
+            target,
+            exited,
+            already_exited: false,
+        };
+
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if UnixStream::connect(&socket_path).is_ok() {
+                break;
+            }
+            if let Ok(status) = daemon.exited.try_recv() {
+                daemon.already_exited = true;
+                let logs = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "disposable containerd exited early ({}):\n{logs}",
+                    describe_status(status)
+                );
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "disposable containerd socket {} not ready:\n{}",
+                socket_path.display(),
+                fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let socket = socket_path.to_string_lossy().into_owned();
+        let run_ctr = |ns: &str, args: &[&str]| -> ReapedOutput {
+            let mut cmd = Command::new(&ctr_bin);
+            cmd.args(["-a", &socket, "-n", ns]);
+            cmd.args(args);
+            let out = run_reaped_split_checked(
+                &reaper,
+                &mut cmd,
+                IMAGE_LS_TIMEOUT,
+                IMAGE_LS_STDOUT_LIMIT,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                out.code, 0,
+                "ctr {ns} {args:?} failed: stdout={} stderr={}",
+                out.stdout, out.stderr
+            );
+            out
+        };
+        let count_lines = |ns: &str, args: &[&str]| -> usize {
+            parse_ctr_image_refs(&run_ctr(ns, args).stdout).len()
+        };
+        let count_snapshots = |ns: &str| -> usize {
+            let out = run_ctr(ns, &["snapshots", "ls"]).stdout;
+            let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+            let header = lines.next().expect("expected snapshots ls header");
+            assert!(
+                header.starts_with("KEY"),
+                "unexpected snapshots ls header: {header:?}"
+            );
+            lines.count()
+        };
+
+        // Populate both `moby` and `k8s.io` on our private containerd instance
+        // with real unpacked snapshots, adding enough tags in `k8s.io` to
+        // exercise multiple `images rm --` batches.
+        let tar_str = image_tar.to_string_lossy().into_owned();
+        let platform = format!("linux/{NATIVE_ARCH}");
+        run_ctr(
+            "moby",
+            &[
+                "images",
+                "import",
+                "--local",
+                "--platform",
+                &platform,
+                &tar_str,
+            ],
+        );
+        run_ctr(
+            "k8s.io",
+            &[
+                "images",
+                "import",
+                "--local",
+                "--platform",
+                &platform,
+                &tar_str,
+            ],
+        );
+        let base_ref = parse_ctr_image_refs(&run_ctr("k8s.io", &["images", "ls", "-q"]).stdout)
+            .into_iter()
+            .next()
+            .expect("imported fixture ref");
+        for i in 1..=(IMAGE_RM_BATCH_SIZE + 1) {
+            let extra = format!("docker.io/library/fixture:extra-{i}");
+            run_ctr("k8s.io", &["images", "tag", &base_ref, &extra]);
+        }
+
+        let k8s_images_before = count_lines("k8s.io", &["images", "ls", "-q"]);
+        let k8s_content_before = count_lines("k8s.io", &["content", "ls", "-q"]);
+        let k8s_snapshots_before = count_snapshots("k8s.io");
+        let moby_images_before = count_lines("moby", &["images", "ls", "-q"]);
+        let moby_content_before = count_lines("moby", &["content", "ls", "-q"]);
+        let moby_snapshots_before = count_snapshots("moby");
+        assert_eq!(k8s_images_before, IMAGE_RM_BATCH_SIZE + 2);
+        assert!(k8s_content_before > 0, "expected k8s.io content blobs");
+        assert!(
+            k8s_snapshots_before > 0,
+            "expected unpacked k8s.io snapshots"
+        );
+        assert_eq!(moby_images_before, 1);
+        assert!(moby_content_before > 0, "expected moby content to preserve");
+        assert!(
+            moby_snapshots_before > 0,
+            "expected unpacked moby snapshots"
+        );
+
+        // Verify containerd RPC readiness check succeeds against live containerd
+        // and fails cleanly against a listening-but-unresponsive socket.
+        wait_containerd_rpc_with(
+            || false,
+            CONTAINERD_RPC_WAIT_TIMEOUT,
+            CONTAINERD_PROBE_TIMEOUT,
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &socket, args, timeout, on_wait)
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let hung_sock_path = base.join("hung.sock");
+        let _hung_listener = std::os::unix::net::UnixListener::bind(&hung_sock_path).unwrap();
+        let hung_sock = hung_sock_path.to_string_lossy().into_owned();
+        let hung_err = wait_containerd_rpc_with(
+            || false,
+            Duration::from_millis(500),
+            Duration::from_millis(250),
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &hung_sock, args, timeout, on_wait)
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            hung_err.contains("timed out") || hung_err.contains("not ready"),
+            "expected unresponsive socket preflight failure, got: {hung_err}"
+        );
+
+        let mut progress = Vec::new();
+        let lease1 = next_gc_lease_id();
+        clear_k8s_images_with(
+            || false,
+            &lease1,
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &socket, args, timeout, on_wait)
+            },
+            |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "removing k8s.io images (batch 1/2)"),
+            "expected batch 1/2 progress, got {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "removing k8s.io images (batch 2/2)"),
+            "expected batch 2/2 progress, got {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "waiting for containerd garbage collection"),
+            "expected GC barrier progress, got {progress:?}"
+        );
+
+        assert_eq!(count_lines("k8s.io", &["images", "ls", "-q"]), 0);
+        assert_eq!(count_lines("k8s.io", &["content", "ls", "-q"]), 0);
+        assert_eq!(count_snapshots("k8s.io"), 0);
+        assert_eq!(count_lines("k8s.io", &["leases", "ls", "-q"]), 0);
+        assert_eq!(
+            count_lines("moby", &["images", "ls", "-q"]),
+            moby_images_before
+        );
+        assert_eq!(
+            count_lines("moby", &["content", "ls", "-q"]),
+            moby_content_before
+        );
+        assert_eq!(count_snapshots("moby"), moby_snapshots_before);
+
+        // Retry on an already-empty `k8s.io` namespace also runs the lease GC barrier cleanly.
+        let lease2 = next_gc_lease_id();
+        clear_k8s_images_with(
+            || false,
+            &lease2,
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &socket, args, timeout, on_wait)
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(count_lines("k8s.io", &["leases", "ls", "-q"]), 0);
+        assert_eq!(count_snapshots("k8s.io"), 0);
+        assert_eq!(
+            count_lines("moby", &["images", "ls", "-q"]),
+            moby_images_before
+        );
+        assert_eq!(count_snapshots("moby"), moby_snapshots_before);
+
+        drop(daemon);
+        drop(tmp_guard);
+        assert!(
+            !base.exists(),
+            "disposable containerd temp dir was not cleaned up"
+        );
     }
 }

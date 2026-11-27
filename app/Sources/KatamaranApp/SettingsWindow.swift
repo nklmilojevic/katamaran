@@ -27,6 +27,8 @@ final class SettingsWindowController: NSWindowController {
     private let cpuStepper = NSStepper()
     private let memSlider = NSSlider()
     private let memValue = NSTextField(labelWithString: "")
+    private let diskField = NSTextField()
+    private let diskStepper = NSStepper()
     private var mountRow: FormRow!
 
     /// What the controls show, and the daemon's config when last looked at.
@@ -162,6 +164,31 @@ final class SettingsWindowController: NSWindowController {
         let memory = NSStackView(views: [memSlider, memValue])
         memory.spacing = 8
 
+        let diskFormatter = NumberFormatter()
+        diskFormatter.allowsFloats = false
+        diskFormatter.minimum = NSNumber(value: limits.diskGiB.lowerBound)
+        diskFormatter.maximum = NSNumber(value: limits.diskGiB.upperBound)
+        diskField.formatter = diskFormatter
+        diskField.alignment = .right
+        diskField.bezelStyle = .roundedBezel
+        diskField.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        diskField.target = self
+        diskField.action = #selector(diskTyped)
+        diskField.translatesAutoresizingMaskIntoConstraints = false
+        diskField.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        diskStepper.minValue = Double(limits.diskGiB.lowerBound)
+        diskStepper.maxValue = Double(limits.diskGiB.upperBound)
+        diskStepper.increment = 64
+        diskStepper.valueWraps = false
+        diskStepper.target = self
+        diskStepper.action = #selector(diskStepped)
+        let diskUnit = NSTextField(labelWithString: "GiB")
+        diskUnit.textColor = .secondaryLabelColor
+        let disk = NSStackView(views: [diskField, diskStepper, diskUnit])
+        diskField.setAccessibilityLabel("Disk size in GiB")
+        diskStepper.setAccessibilityLabel("Adjust disk size in GiB")
+        disk.spacing = 4
+
         let mac = memoryLabel(gib: Int(ProcessInfo.processInfo.physicalMemory >> 30))
         return FormGroup(
             footer: "The VM gets these the next time it starts.",
@@ -171,6 +198,10 @@ final class SettingsWindowController: NSWindowController {
                         subtitle: "A limit: what the VM doesn’t use goes back to this Mac (\(mac)). "
                             + "Default \(memoryLabel(gib: limits.defaultMemoryGiB)).",
                         control: memory),
+                FormRow("Disk",
+                        subtitle: "Sparse limit: grows at the next start and cannot shrink. "
+                            + "Default \(limits.defaultDiskGiB) GiB.",
+                        control: disk),
             ])
     }
 
@@ -228,7 +259,7 @@ final class SettingsWindowController: NSWindowController {
     /// when they changed elsewhere (the CLI, or a failed save).
     private func sync() {
         let status = model.status
-        let config = status?.config
+        let config = status?.effectiveConfig
         if config != seen && !model.busy {
             seen = config
             if config != shown {
@@ -237,6 +268,7 @@ final class SettingsWindowController: NSWindowController {
             }
         }
         for control in [login, mount, cpuField, cpuStepper, memSlider] as [NSControl] { control.isEnabled = status != nil }
+        for control in [diskField, diskStepper] as [NSControl] { control.isEnabled = status?.supportsDiskResize ?? false }
         let k8s = status?.k8s
         let k8sTransitioning = k8s?.state == "starting" || k8s?.state == "stopping"
         k8sSwitch.isEnabled = status != nil && !model.busy
@@ -287,6 +319,9 @@ final class SettingsWindowController: NSWindowController {
         let gib = limits.memoryGiB(fromMiB: cfg.memory_mib)
         memSlider.integerValue = gib
         memValue.stringValue = memoryLabel(gib: gib)
+        let disk = limits.clampDiskGiB(cfg.disk_gib ?? model.status?.displayedDiskGiB ?? limits.defaultDiskGiB)
+        diskField.integerValue = disk
+        diskStepper.integerValue = disk
     }
 
     /// Size the window to the selected pane, keeping its top edge in place.
@@ -316,7 +351,7 @@ final class SettingsWindowController: NSWindowController {
             self.seen = nil
             if !self.model.busy {
                 // Show what is actually saved.
-                self.shown = self.model.status?.config
+                self.shown = self.model.status?.effectiveConfig
                 self.showValues()
             }
         }
@@ -341,12 +376,20 @@ final class SettingsWindowController: NSWindowController {
     @objc private func k8sResetClicked() {
         let alert = NSAlert()
         alert.messageText = "Reset Kubernetes cluster?"
-        alert.informativeText = "This stops Kubernetes and deletes all cluster state, workloads, and persistent volumes."
+        alert.informativeText = "This stops Kubernetes and deletes all cluster state, workloads, and persistent volumes. Cached images in containerd’s k8s.io namespace are kept by default; Docker images are untouched."
         alert.alertStyle = .warning
+        let removeImages = NSButton(
+            checkboxWithTitle: "Also remove cached Kubernetes images (k8s.io)",
+            target: nil,
+            action: nil
+        )
+        removeImages.state = .off
+        removeImages.sizeToFit()
+        alert.accessoryView = removeImages
         alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            model.k8sReset()
+            model.k8sReset(images: removeImages.state == .on)
         }
     }
 
@@ -368,6 +411,18 @@ final class SettingsWindowController: NSWindowController {
         // Save once the knob is let go, not at every step of a drag.
         if let type = NSApp.currentEvent?.type, type == .leftMouseDown || type == .leftMouseDragged { return }
         apply { $0.memory_mib = gib * 1024 }
+    }
+
+    @objc private func diskStepped() {
+        diskField.integerValue = diskStepper.integerValue
+        apply { $0.disk_gib = diskStepper.integerValue }
+    }
+
+    @objc private func diskTyped() {
+        let gib = limits.clampDiskGiB(diskField.integerValue)
+        diskField.integerValue = gib
+        diskStepper.integerValue = gib
+        apply { $0.disk_gib = gib }
     }
 
     private func noticeAction() {

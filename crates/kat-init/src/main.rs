@@ -5,15 +5,28 @@
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod autofwd;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod containerd_grpc;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod disk;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod nofile;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod oci_rewrite;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod unix_connect;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    if std::process::id() != 1 && std::env::args().nth(1).as_deref() == Some("nfsd") {
-        linux::nfs::main()
+    if std::process::id() != 1 {
+        match std::env::args().nth(1).as_deref() {
+            Some("nfsd") => linux::nfs::main(),
+            Some("vm-exec-probe") => linux::vm_exec::probe_main(),
+            Some(linux::RMTREE_HELPER_ARG) => linux::rmtree_main(),
+            _ => {}
+        }
     }
     linux::run()
 }

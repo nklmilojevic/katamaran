@@ -1,6 +1,7 @@
 mod amd64;
 mod autofwd;
 mod clock;
+mod disk;
 mod fscache;
 mod fsnotify;
 mod k8s;
@@ -15,6 +16,7 @@ mod shutdown;
 mod stats;
 mod sys;
 mod trim;
+pub mod vm_exec;
 
 use std::fs::File;
 use std::io;
@@ -25,6 +27,15 @@ use std::time::Duration;
 use kat_proto::{CONTROL_PORT, DOCKER_PORT, Hello, K8S_API_PORT, Msg, PROTOCOL_VERSION, read_msg};
 
 use service::{DockerStack, Notifier, Reaper};
+
+/// `/init rmtree <path>` helper used by Kubernetes reset to remove detached
+/// cluster data in a killable child process.
+pub fn rmtree_main() -> ! {
+    k8s::rmtree_main()
+}
+
+/// argv[1] selecting [`rmtree_main`].
+pub const RMTREE_HELPER_ARG: &str = k8s::RMTREE_HELPER_ARG;
 
 const HOST_CID: u32 = 2;
 const DIAL_ATTEMPTS: u32 = 2000;
@@ -40,16 +51,21 @@ const DATA_MOUNTS: [(&str, &str); 3] = [
     ("containerd", "/var/lib/containerd"),
 ];
 
+struct SetupOutcome {
+    system: bool,
+    disk_error: Option<String>,
+}
+
 pub fn run() -> ! {
     let init_start_ns = sys::boottime_ns();
-    let (system, setup_error) = match setup() {
-        Ok(system) => (system, None),
+    let (system, setup_error, disk_error) = match setup() {
+        Ok(outcome) => (outcome.system, None, outcome.disk_error),
         Err(e) => {
             log(&format!("setup failed: {e}"));
-            (false, Some(e.to_string()))
+            (false, Some(e.to_string()), None)
         }
     };
-    match serve(init_start_ns, system, setup_error) {
+    match serve(init_start_ns, system, setup_error, disk_error) {
         Ok(()) => log("powering off"),
         Err(e) => log(&format!("control channel failed: {e}; powering off")),
     }
@@ -58,8 +74,8 @@ pub fn run() -> ! {
 
 /// Mount the basics. With a system disk attached, also mount the system
 /// image and data disk and switch into the system image. Returns whether the
-/// system image is running.
-fn setup() -> io::Result<bool> {
+/// system image is running and any nonfatal data-disk resize error.
+fn setup() -> io::Result<SetupOutcome> {
     let nosuid_nodev_noexec = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
     sys::mount("proc", "/proc", "proc", nosuid_nodev_noexec, None)?;
     sys::mount("sysfs", "/sys", "sysfs", nosuid_nodev_noexec, None)?;
@@ -71,10 +87,13 @@ fn setup() -> io::Result<bool> {
         Some("mode=0755"),
     )?;
 
+    let cmdline = std::fs::read_to_string("/proc/cmdline")?;
     let system = sys::exists(SYSTEM_DISK);
-    if system {
-        mount_system()?;
-    }
+    let disk_error = if system {
+        mount_system(&cmdline)?
+    } else {
+        None
+    };
 
     sys::mount(
         "devpts",
@@ -116,12 +135,11 @@ fn setup() -> io::Result<bool> {
         std::fs::write("/etc/hostname", "katamaran\n")?;
         sys::link_up("lo")?;
     }
-    let cmdline = std::fs::read_to_string("/proc/cmdline")?;
     mount_shares(&cmdline)?;
     if let Err(e) = amd64::setup(&cmdline) {
         log(&format!("amd64 programs will not run: {e}"));
     }
-    Ok(system)
+    Ok(SetupOutcome { system, disk_error })
 }
 
 /// Mount the virtio-fs shares the host lists as `kat.share=tag:path[:options]`.
@@ -146,8 +164,9 @@ fn parse_shares(cmdline: &str) -> Vec<(&str, &str, Option<&str>)> {
 }
 
 /// System image as an overlay (read-only EROFS lower, tmpfs upper), data disk
-/// subvolumes inside it, then switch root.
-fn mount_system() -> io::Result<()> {
+/// subvolumes inside it, then switch root. Returns a nonfatal data-disk resize
+/// error (if any) so `serve` can surface it to the host after `Hello`.
+fn mount_system(cmdline: &str) -> io::Result<Option<String>> {
     let ro = libc::MS_RDONLY | libc::MS_NODEV;
     sys::mount(SYSTEM_DISK, "/mnt/system", "erofs", ro, None)?;
     sys::mount(
@@ -167,6 +186,7 @@ fn mount_system() -> io::Result<()> {
         Some("lowerdir=/mnt/system,upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work"),
     )?;
 
+    let mut disk_error = None;
     if sys::exists(DATA_DISK) {
         for (subvol, target) in DATA_MOUNTS {
             let opts = format!("subvol={subvol},discard=async");
@@ -178,6 +198,24 @@ fn mount_system() -> io::Result<()> {
                 Some(&opts),
             )?;
         }
+        if let Some(target_bytes) = crate::disk::target_bytes_from_cmdline(cmdline) {
+            let mount = format!("{NEW_ROOT}{}", DATA_MOUNTS[0].1);
+            match disk::grow_if_needed(DATA_DISK, &mount, Some(target_bytes)) {
+                Ok(Some((before, after))) => {
+                    log(&format!(
+                        "resized data disk filesystem ({} GiB -> {} GiB)",
+                        before >> 30,
+                        after >> 30
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    log(&format!("data disk resize failed: {msg}"));
+                    disk_error = Some(msg);
+                }
+            }
+        }
     } else {
         log("no data disk; Docker data lives in memory");
     }
@@ -185,7 +223,8 @@ fn mount_system() -> io::Result<()> {
     for m in ["/dev", "/proc", "/sys"] {
         sys::move_mount(m, &format!("{NEW_ROOT}{m}"))?;
     }
-    sys::switch_root(NEW_ROOT)
+    sys::switch_root(NEW_ROOT)?;
+    Ok(disk_error)
 }
 
 /// Set PID 1's RLIMIT_NOFILE, soft and hard, to `kat.nofile` (see
@@ -217,7 +256,31 @@ fn raise_nofile(cmdline: &str) {
     }
 }
 
-fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::Result<()> {
+fn report_boot_errors(
+    notifier: &Notifier,
+    setup_error: Option<String>,
+    disk_error: Option<String>,
+) {
+    if let Some(error) = setup_error {
+        notifier.send(&Msg::ServiceFailed {
+            name: "system".into(),
+            error,
+        });
+    }
+    if let Some(error) = disk_error {
+        notifier.send(&Msg::ServiceFailed {
+            name: "data-disk".into(),
+            error,
+        });
+    }
+}
+
+fn serve(
+    init_start_ns: u64,
+    system: bool,
+    setup_error: Option<String>,
+    disk_error: Option<String>,
+) -> io::Result<()> {
     let conn = dial_host(CONTROL_PORT)?;
     let notifier = Notifier(Arc::new(Mutex::new(conn.try_clone()?)));
     notifier.send(&Msg::Hello(Hello {
@@ -227,12 +290,7 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
         mem_total_kib: mem_total_kib().unwrap_or(0),
         kernel_release: sys::kernel_release(),
     }));
-    if let Some(error) = setup_error {
-        notifier.send(&Msg::ServiceFailed {
-            name: "system".into(),
-            error,
-        });
-    }
+    report_boot_errors(&notifier, setup_error, disk_error);
 
     // Before any service starts, so containerd, dockerd, their shims and
     // every container inherit it.
@@ -243,6 +301,9 @@ fn serve(init_start_ns: u64, system: bool, setup_error: Option<String>) -> io::R
 
     let docker = if system {
         let reaper = Reaper::start();
+        if let Err(e) = vm_exec::start(reaper.clone()) {
+            notifier.failed("vm-exec", e.to_string());
+        }
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         let containerd_config = if k8s::enabled_in_cmdline(&cmdline) {
             match k8s::ensure_containerd_cri(&reaper) {
@@ -296,12 +357,15 @@ fn start_network(notifier: &Notifier) {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     match net::setup(&cmdline) {
         Ok(Some(_)) => {
-            let auto = autofwd::enabled(&cmdline)
-                .then(autofwd::AutoForward::start)
-                .and_then(|r| {
-                    r.inspect_err(|e| log(&format!("no auto-forward: {e}")))
-                        .ok()
-                });
+            // Started even with auto-forwarding off: it also carries the
+            // ports Docker publishes on the VM's loopback (`-p 127.0.0.1:...`).
+            let auto = autofwd::AutoForward::start(autofwd::enabled(&cmdline))
+                .inspect_err(|e| {
+                    log(&format!(
+                        "no vsock port forwarding (auto-forward and loopback -p ports): {e}"
+                    ))
+                })
+                .ok();
             ports::watch(notifier.clone(), auto)
         }
         Ok(None) => {}
@@ -378,7 +442,12 @@ fn log(msg: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mem_total, parse_shares};
+    use super::{Notifier, parse_mem_total, parse_shares, report_boot_errors};
+    use kat_proto::{Msg, read_msg};
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn parses_shares_from_cmdline() {
@@ -397,5 +466,24 @@ mod tests {
         let s = "MemTotal:        4028396 kB\nMemFree:  100 kB\n";
         assert_eq!(parse_mem_total(s), Some(4028396));
         assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn reports_nonfatal_disk_resize_error_as_distinct_service_failed() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        let tx_file = File::from(OwnedFd::from(tx));
+        let mut rx_file = File::from(OwnedFd::from(rx));
+        let notifier = Notifier(Arc::new(Mutex::new(tx_file)));
+        report_boot_errors(&notifier, None, Some("read-only filesystem".into()));
+        drop(notifier);
+
+        assert_eq!(
+            read_msg(&mut rx_file).unwrap(),
+            Some(Msg::ServiceFailed {
+                name: "data-disk".into(),
+                error: "read-only filesystem".into(),
+            })
+        );
+        assert_eq!(read_msg(&mut rx_file).unwrap(), None);
     }
 }

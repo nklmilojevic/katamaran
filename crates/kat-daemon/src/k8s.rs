@@ -1,6 +1,6 @@
 //! Host-side Kubernetes (k3s) manager:
-//! - downloads and SHA-256 verifies the pinned `k3s-arm64` binary into
-//!   `<home>/cache/k3s/<version>/k3s-arm64`,
+//! - downloads and SHA-256 verifies the `k3s-arm64` binary (the pinned build,
+//!   or the `k8s_version` config key) into `<home>/cache/k3s/<version>/k3s-arm64`,
 //! - streams requests to the guest's k8s service over `<home>/run/k8s.sock`,
 //! - relays `127.0.0.1:<api_port>` to `<home>/run/k8s-api.sock` (`K8S_API_PORT`),
 //! - merges/removes the `katamaran` context in `~/.kube/config`,
@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
@@ -47,18 +47,27 @@ impl Drop for ConnGuard {
 pub const K3S_VERSION: &str = "v1.37.2+k3s1";
 pub const K3S_ARM64_SHA256: &str =
     "a779ccf1e5e2e33a62f5a29c2f1c0bbf99431e100579d4c10f0aa0742a6aa84b";
-pub const K3S_ARM64_URL: &str =
-    "https://github.com/k3s-io/k3s/releases/download/v1.37.2%2Bk3s1/k3s-arm64";
+const K3S_RELEASES: &str = "https://github.com/k3s-io/k3s/releases/download";
+/// Release asset listing the SHA-256 of every arm64 artifact.
+const K3S_ARM64_SUMS: &str = "sha256sum-arm64.txt";
+const K3S_ARM64: &str = "k3s-arm64";
 
 pub const SOCKET_NAME: &str = "k8s.sock";
 pub const API_SOCKET_NAME: &str = "k8s-api.sock";
 pub const KUBECONFIG_NAME: &str = "kubeconfig.yaml";
 pub const PROXY_SOCKET_NAME: &str = "k8s-proxy.sock";
+pub const K3S_CONFIG_NAME: &str = "k3s-config.yaml";
+pub const MAX_K3S_CONFIG_BYTES: usize = 256 << 10;
 pub const DEFAULT_API_PORT: u16 = 6443;
 
 pub const DNS_DOMAIN: &str = "k8s.kat.local";
 pub const DEFAULT_DNS_PORT: u16 = 15353;
 pub const RESOLVER_PATH: &str = "/etc/resolver/k8s.kat.local";
+/// When set to `1` in the daemon's environment, the `*.k8s.kat.local` DNS responder
+/// binds an ephemeral loopback port instead of the port named by an installed
+/// [`RESOLVER_PATH`]. Integration tests set it so their isolated daemons do not
+/// fail on the port held by the developer's real daemon.
+pub const ISOLATED_DNS_ENV: &str = "KATAMARAN_ISOLATED_DNS";
 
 pub fn socket_path(home: &Path) -> PathBuf {
     home.join("run").join(SOCKET_NAME)
@@ -77,11 +86,113 @@ pub fn kubeconfig_path(home: &Path) -> PathBuf {
     home.join("run").join(KUBECONFIG_NAME)
 }
 
-pub fn cache_binary_path(home: &Path) -> PathBuf {
-    home.join("cache")
-        .join("k3s")
-        .join(K3S_VERSION)
-        .join("k3s-arm64")
+pub fn k3s_config_path(home: &Path) -> PathBuf {
+    home.join(K3S_CONFIG_NAME)
+}
+
+/// Read `<home>/k3s-config.yaml` if present.
+pub fn read_k3s_config(home: &Path) -> anyhow::Result<Option<String>> {
+    let path = k3s_config_path(home);
+    let f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        bail!("{} must be a regular file", path.display());
+    }
+    let mut bytes = Vec::new();
+    f.take((MAX_K3S_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() > MAX_K3S_CONFIG_BYTES {
+        bail!(
+            "{} exceeds maximum size of {MAX_K3S_CONFIG_BYTES} bytes",
+            path.display()
+        );
+    }
+    let yaml = String::from_utf8(bytes)
+        .with_context(|| format!("{} must be valid UTF-8", path.display()))?;
+    Ok(Some(yaml))
+}
+
+/// Effective settings a running k3s instance was started with (used on the
+/// host to refuse silent no-op starts when any setting changed, while treating
+/// comment-only edits to `k3s-config.yaml` as unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct K8sStartSettings {
+    pub version: String,
+    pub extra_args: Vec<String>,
+    /// Canonical JSON output of `normalize_k3s_config_yaml`, or `None` when no
+    /// host `k3s-config.yaml` exists.
+    pub config_json: Option<String>,
+}
+
+/// Validated guest `K8sMsg::Start` request together with its effective settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStart {
+    pub msg: K8sMsg,
+    pub settings: K8sStartSettings,
+}
+
+/// Load and validate `config.toml` (`k8s_version`, `k8s_disable`, `k8s_args`)
+/// and optional `<home>/k3s-config.yaml` before downloading k3s or sending a
+/// `Start` request to the guest.
+pub fn prepare_start(home: &Path) -> anyhow::Result<PreparedStart> {
+    let cfg = crate::config::Config::load(home)?;
+    // config.toml may have been edited by hand: report invalid k8s_disable /
+    // k8s_args here, before anything reaches the guest.
+    cfg.validate_k8s_settings()?;
+    let version = cfg.k3s_version().to_string();
+    let extra_args = cfg.k8s_server_extra_args();
+    let config_yaml = read_k3s_config(home)?;
+    let config_json = match config_yaml.as_deref() {
+        Some(yaml) => Some(
+            kat_proto::k3s_config::normalize_k3s_config_yaml(yaml).map_err(anyhow::Error::msg)?,
+        ),
+        None => None,
+    };
+    Ok(PreparedStart {
+        msg: K8sMsg::Start {
+            extra_args: extra_args.clone(),
+            config_yaml,
+        },
+        settings: K8sStartSettings {
+            version,
+            extra_args,
+            config_json,
+        },
+    })
+}
+
+pub fn cache_binary_path(home: &Path, version: &str) -> PathBuf {
+    home.join("cache").join("k3s").join(version).join(K3S_ARM64)
+}
+
+/// The release asset `name` of k3s `version` (`+` is `%2B` in the tag).
+fn release_url(version: &str, name: &str) -> String {
+    format!("{K3S_RELEASES}/{}/{name}", version.replace('+', "%2B"))
+}
+
+/// The SHA-256 of `k3s-arm64` from a release's `sha256sum-arm64.txt`.
+fn parse_arm64_sha256(sums: &str) -> anyhow::Result<String> {
+    sums.lines()
+        .find_map(|line| {
+            let mut it = line.split_whitespace();
+            let (hash, name) = (it.next()?, it.next()?);
+            (name.trim_start_matches('*') == K3S_ARM64
+                && hash.len() == 64
+                && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+        })
+        .with_context(|| format!("{K3S_ARM64_SUMS} has no {K3S_ARM64} checksum"))
 }
 
 pub fn context_name() -> anyhow::Result<String> {
@@ -127,6 +238,146 @@ pub fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow
     }
 }
 
+/// Read the guest's reply sequence for `K8sMsg::Reset`.
+///
+/// For `remove_images == true`, requires explicit `ResetAccepted` before
+/// marking `accepted = true` (so an older guest closing the connection after
+/// rejecting the trailing flag byte never triggers host teardown) and tracks
+/// `ResetDataCleared` separately from `Done` / `Error`. For plain resets
+/// (`remove_images == false`), `accepted` starts `true` because older guests
+/// mutate state without announcing it; a compatible guest's reserved
+/// [`k8s::RESET_QUEUED_PROGRESS`] marker clears it until
+/// [`k8s::RESET_STARTED_PROGRESS`] arrives, so a connection that closes while
+/// the reset is still queued never triggers host teardown. The reserved
+/// [`k8s::RESET_DATA_CLEARED_PROGRESS`] marker (keeping replies readable by
+/// older daemons) records deletion, falling back to `Done` for older guests.
+///
+/// Invokes `on_data_deleted` once as soon as `data_deleted` becomes `true` so
+/// the host can durably disable Kubernetes auto-start before deferred
+/// reclamation or image cleanup finishes.
+#[cfg(test)]
+pub fn read_reset_answer(
+    s: &mut UnixStream,
+    remove_images: bool,
+    accepted: &mut bool,
+    data_deleted: &mut bool,
+    on_data_deleted: &mut dyn FnMut(),
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let mut terminal = false;
+    read_reset_answer_terminal(
+        s,
+        remove_images,
+        accepted,
+        data_deleted,
+        &mut terminal,
+        on_data_deleted,
+        progress,
+    )
+}
+
+/// Like [`read_reset_answer`], also setting `terminal` when the guest sent a
+/// final `Done` / `Error` reply. A started reset that ends without one (the
+/// connection closed or failed) has an unknown outcome on the guest.
+pub fn read_reset_answer_terminal(
+    s: &mut UnixStream,
+    remove_images: bool,
+    accepted: &mut bool,
+    data_deleted: &mut bool,
+    terminal: &mut bool,
+    on_data_deleted: &mut dyn FnMut(),
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let mut saw_frame = false;
+    let mut mark_deleted = |deleted: &mut bool| {
+        if !*deleted {
+            *deleted = true;
+            on_data_deleted();
+        }
+    };
+    loop {
+        let msg = k8s::read(&mut *s)?;
+        let first_frame = !saw_frame;
+        saw_frame |= msg.is_some();
+        match msg {
+            Some(K8sMsg::ResetAccepted) if remove_images => {
+                *accepted = true;
+                progress("starting Kubernetes cluster reset");
+            }
+            Some(K8sMsg::ResetDataCleared) if remove_images => {
+                if !*accepted {
+                    bail!("unexpected ResetDataCleared before ResetAccepted");
+                }
+                mark_deleted(data_deleted);
+                progress(k8s::RESET_DATA_CLEARED_PROGRESS);
+            }
+            Some(K8sMsg::Progress(p)) => {
+                // Compatible guests may emit queued lock-wait heartbeats before
+                // `ResetAccepted`; forward them to refresh client idle timeouts
+                // without marking the reset accepted until `ResetAccepted` arrives.
+                if !remove_images {
+                    if p == k8s::RESET_QUEUED_PROGRESS && !*data_deleted {
+                        // A compatible guest announced the plain reset is only
+                        // queued: nothing is mutated until RESET_STARTED_PROGRESS,
+                        // so a connection that closes before then must leave host
+                        // kubeconfig/proxy state untouched.
+                        *accepted = false;
+                    } else if p == k8s::RESET_STARTED_PROGRESS {
+                        *accepted = true;
+                    } else if p == k8s::RESET_DATA_CLEARED_PROGRESS {
+                        *accepted = true;
+                        mark_deleted(data_deleted);
+                    }
+                }
+                progress(&p);
+            }
+            Some(K8sMsg::Done) => {
+                *terminal = true;
+                if remove_images {
+                    if !*accepted {
+                        bail!("guest completed image reset without accepting it");
+                    }
+                    if !*data_deleted {
+                        bail!(
+                            "guest completed image reset without confirming cluster data deletion"
+                        );
+                    }
+                } else {
+                    mark_deleted(data_deleted);
+                }
+                return Ok(());
+            }
+            Some(K8sMsg::Error(e)) => {
+                *terminal = true;
+                if let Some(reason) = e.strip_prefix(k8s::RESET_NOT_STARTED_PREFIX) {
+                    if !*data_deleted {
+                        *accepted = false;
+                    }
+                    bail!("{reason}");
+                }
+                bail!("{e}");
+            }
+            Some(other) => bail!("unexpected k8s reset reply {other:?}"),
+            None => {
+                if remove_images && !*accepted {
+                    // Older guests close right after rejecting the flag byte
+                    // without sending anything; a compatible guest that was
+                    // still queued (it sent progress) is not out of date.
+                    if first_frame {
+                        bail!(
+                            "the guest closed the Kubernetes connection before accepting the image reset (the guest may be busy, or outdated: retry, or restart the VM to update the guest)"
+                        );
+                    }
+                    bail!(
+                        "the guest closed the Kubernetes connection before starting the image reset; cluster data was not touched"
+                    );
+                }
+                bail!("the guest closed the Kubernetes connection");
+            }
+        }
+    }
+}
+
 pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
     let mut noop = |_: &str| {};
     match request(home, &K8sMsg::Status, &mut noop)? {
@@ -135,21 +386,87 @@ pub fn guest_status(home: &Path) -> anyhow::Result<K8sInfo> {
     }
 }
 
-/// Download `k3s-arm64` into `<home>/cache/k3s/<version>/k3s-arm64` if not
-/// already cached and verified, then stream it into the guest if the guest
-/// doesn't already have this version installed.
-pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::Result<()> {
-    let info = guest_status(home)?;
-    if info.installed && info.version == K3S_VERSION {
+/// Query the guest Kubernetes service's capability bitmask (see `kat_proto::k8s::CAP_*`).
+/// Older guests fail to decode `Capabilities` and close the connection without
+/// replying. Only that signal (clean close, EOF or reset after the request),
+/// seen on two separate probes with a working `Status` call in between, maps
+/// to `Ok(0)`, so one transient connection drop is not mistaken for an old
+/// guest. Write failures and `Error` replies are real errors.
+pub fn guest_capabilities(home: &Path) -> anyhow::Result<u32> {
+    for attempt in 0..2 {
+        match probe_capabilities(home)? {
+            Some(caps) => return Ok(caps),
+            None if guest_status(home).is_err() => {
+                bail!("the guest closed the Kubernetes connection")
+            }
+            None if attempt == 0 => continue,
+            None => {}
+        }
+    }
+    Ok(0)
+}
+
+/// One `Capabilities` round trip: `Ok(Some(caps))` on a reply, `Ok(None)` when
+/// the guest closed the connection the way older guests do.
+fn probe_capabilities(home: &Path) -> anyhow::Result<Option<u32>> {
+    let mut s = connect(home)?;
+    k8s::write(&mut s, &K8sMsg::Capabilities)?;
+    match k8s::read(&mut s) {
+        Ok(Some(K8sMsg::CapabilitiesInfo(caps))) => Ok(Some(caps)),
+        Ok(Some(K8sMsg::Error(e))) => bail!("{e}"),
+        Ok(Some(other)) => bail!("unexpected capabilities response {other:?}"),
+        Ok(None) => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Check that the running guest supports extended `Start` payloads before
+/// sending non-empty `extra_args` or `config_yaml`. Empty `Start` frames stay
+/// compatible with older guests without probing.
+pub fn ensure_start_supported(home: &Path, msg: &K8sMsg) -> anyhow::Result<()> {
+    if !msg.is_extended_start() {
         return Ok(());
     }
-    let cached = ensure_cached_binary(home, progress)?;
-    progress(&format!("transferring k3s {K3S_VERSION} to VM"));
+    let caps = guest_capabilities(home)?;
+    if caps & k8s::CAP_START_CONFIG == 0 {
+        bail!(
+            "the running guest did not report support for custom k8s_disable, k8s_args, or \
+             k3s-config.yaml, which usually means its initramfs predates them; update or \
+             rebuild the guest initramfs (or clear those settings) and restart the VM"
+        );
+    }
+    Ok(())
+}
+
+/// Download `k3s-arm64` into `<home>/cache/k3s/<version>/k3s-arm64` if not
+/// already cached and verified, then stream it into the guest if the guest
+/// doesn't already have `version` installed.
+pub fn ensure_installed(
+    home: &Path,
+    version: &str,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let info = guest_status(home)?;
+    if info.installed && info.version == version {
+        return Ok(());
+    }
+    let cached = ensure_cached_binary(home, version, progress)?;
+    progress(&format!("transferring k3s {version} to VM"));
     let mut s = connect(home)?;
     k8s::write(
         &mut s,
         &K8sMsg::Install {
-            version: K3S_VERSION.into(),
+            version: version.to_string(),
         },
     )?;
     let mut f = File::open(&cached).with_context(|| format!("open {}", cached.display()))?;
@@ -180,26 +497,80 @@ pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
     }
 }
 
-fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::Result<PathBuf> {
-    let path = cache_binary_path(home);
-    if path.is_file() && verify_sha256(&path, K3S_ARM64_SHA256).is_ok() {
-        return Ok(path);
-    }
+/// The pinned build is checked against [`K3S_ARM64_SHA256`]; any other
+/// release against its own `sha256sum-arm64.txt`, whose `k3s-arm64` line is
+/// kept next to the cached binary so a cache hit needs no network.
+fn ensure_cached_binary(
+    home: &Path,
+    version: &str,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<PathBuf> {
+    ensure_cached_binary_with(
+        home,
+        version,
+        progress,
+        crate::machines::curl_text,
+        crate::machines::curl,
+    )
+}
+
+fn ensure_cached_binary_with<FText, FBin>(
+    home: &Path,
+    version: &str,
+    progress: &mut dyn FnMut(&str),
+    mut fetch_text: FText,
+    mut fetch_bin: FBin,
+) -> anyhow::Result<PathBuf>
+where
+    FText: FnMut(&str) -> anyhow::Result<String>,
+    FBin: FnMut(&str, &Path) -> anyhow::Result<()>,
+{
+    let path = cache_binary_path(home, version);
     let parent = path
         .parent()
         .with_context(|| format!("missing parent for {}", path.display()))?;
+    let sum_path = parent.join(format!("{K3S_ARM64}.sha256"));
+    let pinned = version == K3S_VERSION;
+    let known = if pinned {
+        Some(K3S_ARM64_SHA256.to_string())
+    } else {
+        fs::read_to_string(&sum_path)
+            .ok()
+            .and_then(|s| parse_arm64_sha256(&s).ok())
+    };
+    if let Some(sum) = &known
+        && path.is_file()
+        && verify_sha256(&path, sum).is_ok()
+    {
+        return Ok(path);
+    }
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let expected = if pinned {
+        K3S_ARM64_SHA256.to_string()
+    } else {
+        progress(&format!("fetching k3s {version} checksums"));
+        let url = release_url(version, K3S_ARM64_SUMS);
+        let sums =
+            fetch_text(&url).with_context(|| format!("fetch k3s {version} arm64 checksums"))?;
+        parse_arm64_sha256(&sums).with_context(|| format!("read {url}"))?
+    };
+    // The checksum sidecar is best effort; a cached binary that matches the
+    // freshly fetched checksum is reused instead of downloading it again.
+    if !pinned && path.is_file() && verify_sha256(&path, &expected).is_ok() {
+        write_sum_sidecar(parent, &sum_path, &expected);
+        return Ok(path);
+    }
     let pid = std::process::id();
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!("k3s-arm64.{pid}.{seq}.part"));
+    let tmp = parent.join(format!("{K3S_ARM64}.{pid}.{seq}.part"));
     let _ = fs::remove_file(&tmp);
-    progress(&format!("downloading k3s {K3S_VERSION} (~74 MB)"));
-    if let Err(e) = crate::machines::curl(K3S_ARM64_URL, &tmp) {
+    progress(&format!("downloading k3s {version} (~74 MB)"));
+    if let Err(e) = fetch_bin(&release_url(version, K3S_ARM64), &tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     progress("verifying k3s checksum");
-    if let Err(e) = verify_sha256(&tmp, K3S_ARM64_SHA256) {
+    if let Err(e) = verify_sha256(&tmp, &expected) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -211,7 +582,25 @@ fn ensure_cached_binary(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("save {}", path.display()));
     }
+    if !pinned {
+        write_sum_sidecar(parent, &sum_path, &expected);
+    }
     Ok(path)
+}
+
+/// Best effort: without the sidecar the next start fetches the checksums again
+/// (but still reuses a cached binary that matches them).
+fn write_sum_sidecar(parent: &Path, sum_path: &Path, expected: &str) {
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let sum_tmp = parent.join(format!("{K3S_ARM64}.sha256.{pid}.{seq}.part"));
+    let line = format!("{expected}  {K3S_ARM64}\n");
+    if fs::write(&sum_tmp, line)
+        .and_then(|()| fs::rename(&sum_tmp, sum_path))
+        .is_err()
+    {
+        let _ = fs::remove_file(&sum_tmp);
+    }
 }
 
 fn verify_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
@@ -617,7 +1006,29 @@ fn write_private_atomic(target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
+struct KubeconfigLock(File);
+
+impl Drop for KubeconfigLock {
+    fn drop(&mut self) {
+        // Explicitly unlock before closing the fd so a concurrent fork() in
+        // another thread cannot keep the open-file-description flock alive
+        // until the child completes exec().
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<KubeconfigLock> {
+    lock_kubeconfig_dir_with_deadline(kube_dir, None, Duration::from_secs(5), &mut |_| {})
+}
+
+fn lock_kubeconfig_dir_with_deadline(
+    kube_dir: &Path,
+    deadline: Option<Instant>,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<KubeconfigLock> {
     fs::create_dir_all(kube_dir).with_context(|| format!("create {}", kube_dir.display()))?;
     let lock_path = kube_dir.join(".katamaran-kubeconfig.lock");
     let f = OpenOptions::new()
@@ -628,15 +1039,252 @@ fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
         .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("open {}", lock_path.display()))?;
+    let Some(deadline) = deadline else {
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(KubeconfigLock(f));
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e).with_context(|| format!("flock {}", lock_path.display()));
+            }
+        }
+    };
+    let mut last_beat = Instant::now();
     loop {
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(f);
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(KubeconfigLock(f));
         }
         let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
+        if e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if e.kind() != io::ErrorKind::WouldBlock {
             return Err(e).with_context(|| format!("flock {}", lock_path.display()));
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!(
+                "timed out waiting for kubeconfig lock {}",
+                lock_path.display()
+            );
+        }
+        if last_beat.elapsed() >= heartbeat {
+            progress("waiting for kubeconfig lock");
+            last_beat = Instant::now();
+        }
+        thread::sleep(left.min(heartbeat).min(Duration::from_millis(50)));
     }
+}
+
+fn set_nonblocking(fd: i32) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Attempt at most `max_reads` non-blocking reads from `stream`, capturing up
+/// to `cap` total bytes in `buf` while discarding excess output so a noisy
+/// child cannot block on a full pipe.
+///
+/// Returns `true` when the per-pass read budget is exhausted before hitting
+/// `WouldBlock` or EOF, signaling the caller to re-check deadlines/heartbeats
+/// and alternate with the other pipe before draining again.
+fn drain_nonblocking<R: Read>(
+    stream: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    cap: usize,
+    max_reads: usize,
+) -> bool {
+    let Some(r) = stream.as_mut() else {
+        return false;
+    };
+    let mut chunk = [0u8; 4096];
+    for _ in 0..max_reads {
+        match r.read(&mut chunk) {
+            Ok(0) => {
+                *stream = None;
+                return false;
+            }
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
+            Err(_) => {
+                *stream = None;
+                return false;
+            }
+        }
+    }
+    true
+}
+
+const KUBECTL_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait up to `wait_budget` for `child` to exit. If it still has not exited
+/// (for example, stuck in uninterruptible kernel I/O), hand reaping off to a
+/// detached background thread so the caller never blocks indefinitely while
+/// holding kubeconfig or daemon locks.
+fn reap_bounded(mut child: std::process::Child, wait_budget: Duration) -> bool {
+    let deadline = Instant::now() + wait_budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    let _ = thread::Builder::new()
+                        .name("kubectl-reap".into())
+                        .spawn(move || {
+                            let _ = child.wait();
+                        });
+                    return false;
+                }
+                thread::sleep(left.min(Duration::from_millis(20)));
+            }
+        }
+    }
+}
+
+fn kill_and_reap_bounded(mut child: std::process::Child, wait_budget: Duration) {
+    let _ = child.kill();
+    let _ = reap_bounded(child, wait_budget);
+}
+
+fn run_kubectl_with_deadline(
+    cmd: &mut Command,
+    deadline: Option<Instant>,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> io::Result<std::process::Output> {
+    let Some(deadline) = deadline else {
+        return cmd.output();
+    };
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "kubectl cleanup timed out",
+        ));
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    if let Some(s) = stdout.as_ref()
+        && let Err(e) = set_nonblocking(s.as_raw_fd())
+    {
+        drop(stdout);
+        drop(stderr);
+        kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
+        return Err(e);
+    }
+    if let Some(s) = stderr.as_ref()
+        && let Err(e) = set_nonblocking(s.as_raw_fd())
+    {
+        drop(stdout);
+        drop(stderr);
+        kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
+        return Err(e);
+    }
+    const MAX_CAPTURE: usize = 256 << 10;
+    const MAX_READS_PER_PASS: usize = 16;
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let mut last_beat = Instant::now();
+
+    let status = loop {
+        let more_out =
+            drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        let more_err =
+            drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                drop(stdout);
+                drop(stderr);
+                kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
+                return Err(e);
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            drop(stdout);
+            drop(stderr);
+            kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "kubectl cleanup timed out",
+            ));
+        }
+        if last_beat.elapsed() >= heartbeat {
+            progress("cleaning up kubeconfig");
+            last_beat = Instant::now();
+        }
+        if more_out || more_err {
+            continue;
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd: stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let step_ms = left
+            .min(heartbeat)
+            .min(Duration::from_millis(50))
+            .as_millis()
+            .max(1) as i32;
+        if pfds[0].fd >= 0 || pfds[1].fd >= 0 {
+            let _ = unsafe { libc::poll(pfds.as_mut_ptr(), 2, step_ms) };
+        } else {
+            thread::sleep(Duration::from_millis(step_ms as u64));
+        }
+    };
+    // Collect any remaining already-buffered output produced before the direct
+    // child exited, bounded by both `MAX_CAPTURE` and `deadline` so a
+    // descendant holding an inherited pipe open cannot hold cleanup open.
+    loop {
+        let drain_out = stdout.is_some() && out_buf.len() < MAX_CAPTURE;
+        let drain_err = stderr.is_some() && err_buf.len() < MAX_CAPTURE;
+        if !drain_out && !drain_err {
+            break;
+        }
+        let more_out = drain_out
+            && drain_nonblocking(&mut stdout, &mut out_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        let more_err = drain_err
+            && drain_nonblocking(&mut stderr, &mut err_buf, MAX_CAPTURE, MAX_READS_PER_PASS);
+        if (!more_out && !more_err) || Instant::now() >= deadline {
+            break;
+        }
+        if last_beat.elapsed() >= heartbeat {
+            progress("cleaning up kubeconfig");
+            last_beat = Instant::now();
+        }
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: out_buf,
+        stderr: err_buf,
+    })
 }
 
 /// Resolve every symlink in a chain (including dangling chains) so atomic
@@ -833,8 +1481,48 @@ fn merge_into_user_kubeconfig(
 /// Remove `ctx` from `~/.kube/config` and delete `<home>/run/kubeconfig.yaml`.
 pub fn remove_kubeconfig(home: &Path, ctx: &str) -> anyhow::Result<()> {
     let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    remove_kubeconfig_for_user_home(home, user_home.as_deref(), ctx)
+}
+
+/// Like [`remove_kubeconfig`], using an explicit `user_home` instead of `$HOME`.
+pub fn remove_kubeconfig_for_user_home(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+) -> anyhow::Result<()> {
     let kubectl = resolve_kubectl_bin();
-    remove_kubeconfig_in(home, user_home.as_deref(), ctx, &kubectl)
+    remove_kubeconfig_in(home, user_home, ctx, &kubectl)
+}
+
+/// Like [`remove_kubeconfig_for_user_home`], enforcing a finite `timeout` across
+/// both shared-lock acquisition and `kubectl` subprocess execution while
+/// invoking `progress` every `heartbeat` interval.
+pub fn remove_kubeconfig_bounded(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+    kubectl_override: Option<&Path>,
+    timeout: Duration,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let resolved;
+    let kubectl = match kubectl_override {
+        Some(p) => p,
+        None => {
+            resolved = resolve_kubectl_bin();
+            resolved.as_path()
+        }
+    };
+    remove_kubeconfig_in_with_deadline(
+        home,
+        user_home,
+        ctx,
+        kubectl,
+        Some(Instant::now() + timeout),
+        heartbeat,
+        progress,
+    )
 }
 
 fn remove_kubeconfig_in(
@@ -842,6 +1530,26 @@ fn remove_kubeconfig_in(
     user_home: Option<&Path>,
     ctx: &str,
     kubectl: &Path,
+) -> anyhow::Result<()> {
+    remove_kubeconfig_in_with_deadline(
+        home,
+        user_home,
+        ctx,
+        kubectl,
+        None,
+        Duration::from_secs(5),
+        &mut |_| {},
+    )
+}
+
+fn remove_kubeconfig_in_with_deadline(
+    home: &Path,
+    user_home: Option<&Path>,
+    ctx: &str,
+    kubectl: &Path,
+    deadline: Option<Instant>,
+    heartbeat: Duration,
+    progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<()> {
     if let Err(e) = fs::remove_file(kubeconfig_path(home))
         && e.kind() != io::ErrorKind::NotFound
@@ -855,7 +1563,7 @@ fn remove_kubeconfig_in(
     if !kube_dir.is_dir() {
         return Ok(());
     }
-    let _lock = lock_kubeconfig_dir(&kube_dir)?;
+    let _lock = lock_kubeconfig_dir_with_deadline(&kube_dir, deadline, heartbeat, progress)?;
     let user_cfg = kube_dir.join("config");
     let target_cfg = resolve_symlink_target(&user_cfg)?;
     let existing = match fs::read(&target_cfg) {
@@ -881,12 +1589,12 @@ fn remove_kubeconfig_in(
     }
 
     let result = (|| -> anyhow::Result<()> {
-        let cur = match Command::new(kubectl)
+        let mut cur_cmd = Command::new(kubectl);
+        cur_cmd
             .args(["config", "current-context"])
             .env("KUBECONFIG", &scratch)
-            .stdin(Stdio::null())
-            .output()
-        {
+            .stdin(Stdio::null());
+        let cur = match run_kubectl_with_deadline(&mut cur_cmd, deadline, heartbeat, progress) {
             Ok(o) => Some(o),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 eprintln!(
@@ -901,11 +1609,12 @@ fn remove_kubeconfig_in(
             && o.status.success()
             && String::from_utf8_lossy(&o.stdout).trim() == ctx
         {
-            let out = Command::new(kubectl)
+            let mut unset_cur = Command::new(kubectl);
+            unset_cur
                 .args(["config", "unset", "current-context"])
                 .env("KUBECONFIG", &scratch)
-                .stdin(Stdio::null())
-                .output()
+                .stdin(Stdio::null());
+            let out = run_kubectl_with_deadline(&mut unset_cur, deadline, heartbeat, progress)
                 .context("run kubectl config unset current-context")?;
             if !out.status.success() {
                 bail!(
@@ -919,11 +1628,12 @@ fn remove_kubeconfig_in(
             format!("clusters.{ctx}"),
             format!("users.{ctx}"),
         ] {
-            let out = match Command::new(kubectl)
+            let mut unset_cmd = Command::new(kubectl);
+            unset_cmd
                 .args(["config", "unset", &key])
                 .env("KUBECONFIG", &scratch)
-                .stdin(Stdio::null())
-                .output()
+                .stdin(Stdio::null());
+            let out = match run_kubectl_with_deadline(&mut unset_cmd, deadline, heartbeat, progress)
             {
                 Ok(o) => o,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -956,13 +1666,41 @@ fn remove_kubeconfig_in(
 /// Minimal UDP DNS responder for `k8s.kat.local` and `*.k8s.kat.local` -> `127.0.0.1`.
 pub struct DnsServer {
     pub port: u16,
+    pub isolated: bool,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl DnsServer {
     pub fn start() -> io::Result<DnsServer> {
-        Self::start_with_installed_port(installed_dns_port())
+        let env = std::env::var_os(ISOLATED_DNS_ENV);
+        Self::start_with_mode(env.as_deref(), installed_dns_port)
+    }
+
+    fn start_with_mode(
+        isolated_env: Option<&std::ffi::OsStr>,
+        installed: impl FnOnce() -> Option<u16>,
+    ) -> io::Result<DnsServer> {
+        if isolated_env.is_some_and(|v| v == "1") {
+            eprintln!(
+                "warning: {ISOLATED_DNS_ENV}=1: serving *.{DNS_DOMAIN} on an ephemeral port; {RESOLVER_PATH} is not used"
+            );
+            return Self::start_ephemeral();
+        }
+        Self::start_with_installed_port(installed())
+    }
+
+    /// Bind an ephemeral loopback port, ignoring `/etc/resolver/k8s.kat.local`
+    /// and `DEFAULT_DNS_PORT`, so a throwaway daemon never contends with the
+    /// developer's real daemon for the installed resolver port.
+    fn start_ephemeral() -> io::Result<DnsServer> {
+        let sock = UdpSocket::bind(("127.0.0.1", 0)).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("bind 127.0.0.1:0 for isolated *.{DNS_DOMAIN} DNS: {e}"),
+            )
+        })?;
+        Self::serve(sock, true)
     }
 
     fn start_with_installed_port(installed: Option<u16>) -> io::Result<DnsServer> {
@@ -982,6 +1720,10 @@ impl DnsServer {
                     )
                 })?,
         };
+        Self::serve(sock, false)
+    }
+
+    fn serve(sock: UdpSocket, isolated: bool) -> io::Result<DnsServer> {
         let port = sock.local_addr()?.port();
         sock.set_read_timeout(Some(Duration::from_millis(250)))?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -1013,6 +1755,7 @@ impl DnsServer {
             })?;
         Ok(DnsServer {
             port,
+            isolated,
             stop,
             thread: Some(thread),
         })
@@ -1145,6 +1888,198 @@ mod tests {
     use super::*;
 
     #[test]
+    fn release_urls_escape_the_build_suffix() {
+        assert_eq!(
+            release_url(K3S_VERSION, K3S_ARM64),
+            "https://github.com/k3s-io/k3s/releases/download/v1.37.2%2Bk3s1/k3s-arm64"
+        );
+        assert_eq!(
+            release_url("v1.32.5+k3s1", K3S_ARM64_SUMS),
+            "https://github.com/k3s-io/k3s/releases/download/v1.32.5%2Bk3s1/sha256sum-arm64.txt"
+        );
+    }
+
+    #[test]
+    fn finds_the_arm64_binary_checksum() {
+        let sums = "\
+97c5264b988cac6f26294ded8235e116b52faa0169bdd0c4ea1a5412973d2a8d  k3s-airgap-images-arm64.tar
+EB62D8BA346F7C6A0BB5C874EA92335ECAD7CB3FA167508F94888AAEB43E7F22 *k3s-arm64
+";
+        assert_eq!(
+            parse_arm64_sha256(sums).unwrap(),
+            "eb62d8ba346f7c6a0bb5c874ea92335ecad7cb3fa167508f94888aaeb43e7f22"
+        );
+        assert!(parse_arm64_sha256("abc  k3s-arm64\n").is_err());
+        assert!(parse_arm64_sha256("").is_err());
+        let airgap_only = sums.lines().next().unwrap();
+        assert!(parse_arm64_sha256(airgap_only).is_err());
+    }
+
+    fn temp_k8s_home(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kat-k8s-{name}-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn non_pinned_cache_verifies_and_reuses_without_network() {
+        let home = temp_k8s_home("cache-reuse");
+        let version = "v1.32.5+k3s1";
+        let payload = b"fake k3s-arm64 binary payload";
+        let probe = home.join("probe.bin");
+        fs::write(&probe, payload).unwrap();
+        let expected_hash = crate::machines::sha256_file(&probe).unwrap();
+        fs::remove_file(&probe).unwrap();
+
+        let mut text_fetches = 0usize;
+        let mut bin_fetches = 0usize;
+        let mut noop = |_: &str| {};
+        let got = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |url| {
+                assert_eq!(url, release_url(version, K3S_ARM64_SUMS));
+                text_fetches += 1;
+                Ok(format!("{expected_hash}  {K3S_ARM64}\n"))
+            },
+            |url, out| {
+                assert_eq!(url, release_url(version, K3S_ARM64));
+                bin_fetches += 1;
+                fs::write(out, payload)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, cache_binary_path(&home, version));
+        assert_eq!(text_fetches, 1);
+        assert_eq!(bin_fetches, 1);
+        assert_eq!(fs::read(&got).unwrap(), payload);
+
+        // Second start with matching cached binary + checksum makes zero network calls.
+        let cached = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |url| panic!("unexpected checksum fetch: {url}"),
+            |url, _| panic!("unexpected binary fetch: {url}"),
+        )
+        .unwrap();
+        assert_eq!(cached, got);
+
+        // A lost checksum sidecar refetches only the checksums: the cached binary
+        // matches them, so it is reused (and the sidecar rewritten) without a download.
+        let sidecar = got.with_file_name(format!("{K3S_ARM64}.sha256"));
+        fs::remove_file(&sidecar).unwrap();
+        let mut text_fetches = 0usize;
+        let reused = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| {
+                text_fetches += 1;
+                Ok(format!("{expected_hash}  {K3S_ARM64}\n"))
+            },
+            |url, _| panic!("unexpected binary fetch: {url}"),
+        )
+        .unwrap();
+        assert_eq!(reused, got);
+        assert_eq!(text_fetches, 1);
+        assert!(sidecar.is_file());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mismatched_download_is_rejected_without_publishing_or_replacing_cache() {
+        let home = temp_k8s_home("cache-mismatch");
+        let version = "v1.32.5+k3s1";
+        let good_payload = b"expected k3s-arm64 payload";
+        let bad_payload = b"tampered k3s-arm64 payload";
+        let probe = home.join("probe.bin");
+        fs::write(&probe, good_payload).unwrap();
+        let expected_hash = crate::machines::sha256_file(&probe).unwrap();
+        fs::remove_file(&probe).unwrap();
+
+        let mut noop = |_: &str| {};
+        let err = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| Ok(format!("{expected_hash}  {K3S_ARM64}\n")),
+            |_, out| {
+                fs::write(out, bad_payload)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+
+        let bin_path = cache_binary_path(&home, version);
+        let cache_dir = bin_path.parent().unwrap();
+        assert!(!bin_path.exists());
+        assert!(!cache_dir.join(format!("{K3S_ARM64}.sha256")).exists());
+        let leftovers: Vec<_> = fs::read_dir(cache_dir).unwrap().collect();
+        assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+
+        // Existing corrupted cache entry is not overwritten by another bad download.
+        fs::write(&bin_path, b"corrupted-prior-cache").unwrap();
+        fs::write(
+            cache_dir.join(format!("{K3S_ARM64}.sha256")),
+            format!("{expected_hash}  {K3S_ARM64}\n"),
+        )
+        .unwrap();
+        let err = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| Ok(format!("{expected_hash}  {K3S_ARM64}\n")),
+            |_, out| {
+                fs::write(out, bad_payload)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"corrupted-prior-cache");
+        for entry in fs::read_dir(cache_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".part"), "leftover part file: {name}");
+        }
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn checksum_fetch_error_keeps_underlying_cause() {
+        let home = temp_k8s_home("checksum-fetch-err");
+        let version = "v1.32.5+k3s1";
+        let mut noop = |_: &str| {};
+        let err = ensure_cached_binary_with(
+            &home,
+            version,
+            &mut noop,
+            |_| bail!("curl: (6) Could not resolve host"),
+            |_, _| panic!("should not download binary when checksum fetch fails"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fetch k3s v1.32.5+k3s1 arm64 checksums"),
+            "{msg}"
+        );
+        assert!(msg.contains("Could not resolve host"), "{msg}");
+        assert!(!msg.contains("not found"), "{msg}");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn rewrites_kubeconfig_server_and_context() {
         let raw = "\
 apiVersion: v1
@@ -1236,10 +2171,54 @@ users:
     }
 
     #[test]
+    fn dns_server_ephemeral_ignores_installed_port() {
+        use std::ffi::OsStr;
+
+        let holder = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let held = holder.local_addr().unwrap().port();
+
+        // Exact "1" skips the installed-port lookup and binds an ephemeral port in isolated mode.
+        let mut looked_up = false;
+        let mut srv = DnsServer::start_with_mode(Some(OsStr::new("1")), || {
+            looked_up = true;
+            Some(held)
+        })
+        .unwrap();
+        assert!(!looked_up, "isolated mode must skip installed-port lookup");
+        assert!(srv.isolated);
+        assert_ne!(srv.port, 0);
+        assert_ne!(srv.port, held);
+        srv.stop();
+
+        // Unset env still consults the installed port and fails when it is held.
+        let mut looked_up = false;
+        assert!(
+            DnsServer::start_with_mode(None, || {
+                looked_up = true;
+                Some(held)
+            })
+            .is_err()
+        );
+        assert!(looked_up);
+
+        // Non-"1" values (e.g. "0") still consult the installed port and fail when it is held.
+        let mut looked_up = false;
+        assert!(
+            DnsServer::start_with_mode(Some(OsStr::new("0")), || {
+                looked_up = true;
+                Some(held)
+            })
+            .is_err()
+        );
+        assert!(looked_up);
+    }
+
+    #[test]
     fn dns_server_falls_back_when_default_port_busy() {
         // Hold DEFAULT_DNS_PORT if available, or verify fallback when another server binds first.
         let holder = UdpSocket::bind(("127.0.0.1", DEFAULT_DNS_PORT)).ok();
-        let mut srv = DnsServer::start_with_installed_port(None).unwrap();
+        let mut srv = DnsServer::start_with_mode(None, || None).unwrap();
+        assert!(!srv.isolated);
         assert_ne!(srv.port, 0);
         if holder.is_some() {
             assert_ne!(srv.port, DEFAULT_DNS_PORT);
@@ -1488,5 +2467,692 @@ users:
         assert!(resolve_symlink_target(&loop_a).is_err());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_start_includes_config_flags_and_validates_k3s_config_yaml() {
+        let home = std::env::temp_dir().join(format!(
+            "kat-k8s-start-msg-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+
+        // Empty defaults when neither config.toml nor k3s-config.yaml exist.
+        assert_eq!(
+            prepare_start(&home).unwrap().msg,
+            K8sMsg::Start {
+                extra_args: vec![],
+                config_yaml: None,
+            }
+        );
+
+        // Combines k8s_disable, k8s_args, and k3s-config.yaml.
+        let mut cfg = crate::config::Config::default();
+        let host = crate::config::Host {
+            cpus: 255,
+            memory_mib: 32768,
+        };
+        cfg.set("k8s_disable", "traefik,servicelb", &host).unwrap();
+        cfg.set("k8s_args", "--debug --node-label=env=dev", &host)
+            .unwrap();
+        cfg.save(&home).unwrap();
+        let yaml = "disable:\n  - metrics-server\n";
+        fs::write(k3s_config_path(&home), yaml).unwrap();
+
+        let prepared = prepare_start(&home).unwrap();
+        assert_eq!(
+            prepared.msg,
+            K8sMsg::Start {
+                extra_args: vec![
+                    "--disable=traefik".into(),
+                    "--disable=servicelb".into(),
+                    "--debug".into(),
+                    "--node-label=env=dev".into(),
+                ],
+                config_yaml: Some(yaml.into()),
+            }
+        );
+        assert_eq!(prepared.settings.version, K3S_VERSION);
+        assert_eq!(
+            prepared.settings.config_json.as_deref(),
+            Some("{\n  \"disable\": [\"metrics-server\"]\n}\n")
+        );
+
+        // Comment-only YAML edits keep the same normalized settings.
+        fs::write(
+            k3s_config_path(&home),
+            "# harmless comment\ndisable: [metrics-server]\n",
+        )
+        .unwrap();
+        assert_eq!(prepare_start(&home).unwrap().settings, prepared.settings);
+
+        // Host pre-flight validation rejects reserved settings, unsupported YAML,
+        // excluded datastore endpoints and leaky credentials before contacting the guest.
+        for bad in [
+            "write-kubeconfig-mode: '0600'\n",
+            "disable: &a [traefik]\n",
+            "datastore-endpoint: postgres://ops:placeholder-pw@db:badport/k3s\n",
+            "kubelet-arg: ['manifest-url-header=Authorization:Bearer placeholder-pw']\n",
+            "etcd-s3-proxy: http://ops:placeholder-pw@proxy.invalid:badport\n",
+        ] {
+            fs::write(k3s_config_path(&home), bad).unwrap();
+            let err = prepare_start(&home).unwrap_err();
+            assert!(
+                !err.to_string().contains("placeholder-pw"),
+                "{bad}: {err:#}"
+            );
+        }
+
+        // Rejects invalid UTF-8 and oversized k3s-config.yaml.
+        fs::write(k3s_config_path(&home), [0xff, 0xfe]).unwrap();
+        assert!(prepare_start(&home).is_err());
+
+        fs::write(k3s_config_path(&home), vec![b'a'; MAX_K3S_CONFIG_BYTES + 1]).unwrap();
+        assert!(prepare_start(&home).is_err());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn read_k3s_config_rejects_fifo_and_dir_and_follows_regular_symlinks() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let home = std::env::temp_dir().join(format!(
+            "kat-k8s-config-nonreg-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let cfg_path = k3s_config_path(&home);
+
+        // Symlink to a regular file is allowed.
+        let target = home.join("real-k3s.yaml");
+        fs::write(&target, "disable:\n  - traefik\n").unwrap();
+        symlink(&target, &cfg_path).unwrap();
+        assert_eq!(
+            read_k3s_config(&home).unwrap().as_deref(),
+            Some("disable:\n  - traefik\n")
+        );
+        fs::remove_file(&cfg_path).unwrap();
+
+        // Directory is rejected.
+        fs::create_dir(&cfg_path).unwrap();
+        let err = read_k3s_config(&home).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err:#}");
+        fs::remove_dir(&cfg_path).unwrap();
+
+        // FIFO with no writer is rejected immediately without blocking.
+        let c_path = CString::new(cfg_path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", io::Error::last_os_error());
+        let err = read_k3s_config(&home).unwrap_err();
+        assert!(err.to_string().contains("regular file"), "{err:#}");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_start_supported_detects_older_guests_before_extended_start() {
+        use std::os::unix::net::UnixListener;
+
+        let home = std::env::temp_dir().join(format!(
+            "kat-k8s-caps-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sock = socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+
+        let empty = K8sMsg::Start {
+            extra_args: vec![],
+            config_yaml: None,
+        };
+        let extended = K8sMsg::Start {
+            extra_args: vec!["--disable=traefik".into()],
+            config_yaml: None,
+        };
+
+        // Empty Start does not probe or connect at all.
+        ensure_start_supported(&home, &empty).unwrap();
+
+        // 1. Old guest: closes connection on unknown Capabilities, answers Status.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let old_guest = thread::spawn(move || {
+            // Each probe: Capabilities -> close immediately (simulating
+            // UnknownKind), then Status -> StatusInfo. The host probes twice.
+            for _ in 0..2 {
+                let (mut c1, _) = listener.accept().unwrap();
+                assert_eq!(k8s::read(&mut c1).unwrap(), Some(K8sMsg::Capabilities));
+                drop(c1);
+                let (mut c2, _) = listener.accept().unwrap();
+                assert_eq!(k8s::read(&mut c2).unwrap(), Some(K8sMsg::Status));
+                k8s::write(&mut c2, &K8sMsg::StatusInfo(K8sInfo::default())).unwrap();
+            }
+        });
+        let err = ensure_start_supported(&home, &extended).unwrap_err();
+        assert!(
+            err.to_string().contains("initramfs"),
+            "expected initramfs update guidance, got: {err:#}"
+        );
+        old_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 1b. A current guest whose first probe connection drops is not
+        // mistaken for an old guest: the retry sees CAP_START_CONFIG.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let flaky_guest = thread::spawn(move || {
+            let (mut c1, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c1).unwrap(), Some(K8sMsg::Capabilities));
+            drop(c1);
+            let (mut c2, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c2).unwrap(), Some(K8sMsg::Status));
+            k8s::write(&mut c2, &K8sMsg::StatusInfo(K8sInfo::default())).unwrap();
+            let (mut c3, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c3).unwrap(), Some(K8sMsg::Capabilities));
+            k8s::write(&mut c3, &K8sMsg::CapabilitiesInfo(k8s::CAP_START_CONFIG)).unwrap();
+        });
+        ensure_start_supported(&home, &extended).unwrap();
+        flaky_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 2. New guest advertising CAP_START_CONFIG succeeds.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let new_guest = thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c).unwrap(), Some(K8sMsg::Capabilities));
+            k8s::write(&mut c, &K8sMsg::CapabilitiesInfo(k8s::CAP_START_CONFIG)).unwrap();
+        });
+        ensure_start_supported(&home, &extended).unwrap();
+        new_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 3. Guest returning CapabilitiesInfo(0) is also rejected clearly.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let zero_caps_guest = thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            assert_eq!(k8s::read(&mut c).unwrap(), Some(K8sMsg::Capabilities));
+            k8s::write(&mut c, &K8sMsg::CapabilitiesInfo(0)).unwrap();
+        });
+        let err = ensure_start_supported(&home, &extended).unwrap_err();
+        assert!(
+            err.to_string().contains("initramfs"),
+            "expected initramfs update guidance, got: {err:#}"
+        );
+        zero_caps_guest.join().unwrap();
+        let _ = fs::remove_file(&sock);
+
+        // 4. Unreachable guest reports connection failure, not initramfs mismatch.
+        let err = ensure_start_supported(&home, &extended).unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "expected VM not running error, got: {err:#}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remove_kubeconfig_bounded_enforces_deadline_on_noisy_kubectl_and_inherited_pipes() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct TempDirGuard(PathBuf);
+        impl TempDirGuard {
+            fn create(prefix: &str) -> Self {
+                let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+                let mut bytes = template.into_os_string().into_vec();
+                bytes.push(0);
+                let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+                assert!(
+                    !ptr.is_null(),
+                    "mkdtemp failed: {}",
+                    io::Error::last_os_error()
+                );
+                bytes.pop();
+                Self(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let tmp = TempDirGuard::create("kat-k8s-noisy");
+        let base = &tmp.0;
+        let home = base.join("h");
+        let user = base.join("u");
+        let kube = user.join(".kube");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&user).unwrap();
+        fs::create_dir(&kube).unwrap();
+        let cfg = kube.join("config");
+        fs::write(&cfg, "apiVersion: v1\nkind: Config\n").unwrap();
+
+        // 1. Continuous stdout flood well beyond MAX_CAPTURE: must still hit the
+        //    deadline, emit heartbeats, return a timeout, and release the shared lock.
+        let flood_stdout = base.join("kubectl-flood-out");
+        fs::write(
+            &flood_stdout,
+            "#!/bin/sh\nexec yes \"noisy kubectl stdout line 0123456789abcdef0123456789abcdef\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&flood_stdout, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = remove_kubeconfig_bounded(
+            &home,
+            Some(&user),
+            "katamaran",
+            Some(&flood_stdout),
+            Duration::from_millis(200),
+            Duration::from_millis(40),
+            &mut |m| beats.push(m.to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "noisy stdout bypassed cleanup deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected timeout error, got: {err:#}"
+        );
+        assert!(
+            beats
+                .iter()
+                .filter(|m| m.as_str() == "cleaning up kubeconfig")
+                .count()
+                >= 1,
+            "expected heartbeat during continuous output, got: {beats:?}"
+        );
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(kube.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(
+            rc,
+            0,
+            "kubeconfig lock must be released after noisy kubectl timeout: {}",
+            io::Error::last_os_error()
+        );
+        drop(lock_file);
+
+        // 2. Continuous stderr flood well beyond MAX_CAPTURE: also hits deadline and
+        //    releases the lock.
+        let flood_stderr = base.join("kubectl-flood-err");
+        fs::write(
+            &flood_stderr,
+            "#!/bin/sh\nexec 1>&2\nexec yes \"noisy kubectl stderr line 0123456789abcdef0123456789abcdef\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&flood_stderr, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let err = remove_kubeconfig_bounded(
+            &home,
+            Some(&user),
+            "katamaran",
+            Some(&flood_stderr),
+            Duration::from_millis(200),
+            Duration::from_millis(40),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "noisy stderr bypassed cleanup deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "expected timeout error, got: {err:#}"
+        );
+
+        // 3. Direct kubectl child exits cleanly while leaving a descendant holding
+        //    inherited stdout/stderr open and flooding output: post-exit drain must
+        //    stay bounded and complete promptly without waiting for the descendant.
+        let leaked_pipe = base.join("kubectl-leaked-pipe");
+        fs::write(
+            &leaked_pipe,
+            "#!/bin/sh\nif [ \"$2\" = \"current-context\" ]; then\n  printf 'other\\n'\nfi\n(yes \"descendant pipe flood 0123456789abcdef\" 2>&1) &\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&leaked_pipe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        remove_kubeconfig_bounded(
+            &home,
+            Some(&user),
+            "katamaran",
+            Some(&leaked_pipe),
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "inherited pipe descendant held cleanup open: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn reap_bounded_hands_off_unexited_child_without_blocking() {
+        // 1. Simulate a child that fails to exit within the bounded reap window
+        //    (e.g., stuck in uninterruptible I/O after SIGKILL): reap_bounded must
+        //    return promptly and hand reaping to the background thread.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let started = Instant::now();
+        let reaped_sync = reap_bounded(child, Duration::from_millis(50));
+        assert!(!reaped_sync, "live child should hit reap budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "reap_bounded blocked past budget: {:?}",
+            started.elapsed()
+        );
+        // Closing stdin lets the child exit cleanly so the detached reaper thread reaps it.
+        drop(stdin);
+
+        // 2. Normal killed child is reaped synchronously well within the budget.
+        let mut child2 = Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _stdin2 = child2.stdin.take();
+        let started2 = Instant::now();
+        kill_and_reap_bounded(child2, Duration::from_secs(2));
+        assert!(
+            started2.elapsed() < Duration::from_secs(2),
+            "kill_and_reap_bounded took too long: {:?}",
+            started2.elapsed()
+        );
+    }
+
+    #[test]
+    fn read_reset_answer_plain_reset_closed_while_queued_is_not_attempted() {
+        // A compatible guest that announces the plain reset as queued and then
+        // closes the connection before RESET_STARTED_PROGRESS never mutated state,
+        // so `accepted` must end false (host kubeconfig/proxies are preserved).
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_QUEUED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            drop(guest);
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let err = read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || {},
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(err.to_string().contains("closed"), "{err:#}");
+        assert!(!accepted, "queued plain reset must not count as attempted");
+        assert!(!deleted);
+
+        // Once the guest announces RESET_STARTED_PROGRESS, a later close is
+        // treated as an attempted reset so host state is torn down.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_QUEUED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_STARTED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(&mut guest, &K8sMsg::Progress("stopping k3s".into())).unwrap();
+            drop(guest);
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || {},
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(accepted, "started plain reset must count as attempted");
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn read_reset_answer_handles_plain_progress_marker_and_strict_image_ack() {
+        // 1. Plain reset recognizes the reserved Progress marker immediately and invokes
+        //    on_data_deleted once before Done (even if a duplicate marker arrives).
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(&mut guest, &K8sMsg::Progress("stopping k3s".into())).unwrap();
+            k8s::write(&mut guest, &K8sMsg::reset_data_cleared(false)).unwrap();
+            k8s::write(&mut guest, &K8sMsg::reset_data_cleared(false)).unwrap();
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let mut progress = Vec::new();
+        read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+        t.join().unwrap();
+        assert!(deleted);
+        assert_eq!(deleted_calls, 1);
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == k8s::RESET_DATA_CLEARED_PROGRESS),
+            "got: {progress:?}"
+        );
+
+        // 2. Image reset must NOT treat Progress(RESET_DATA_CLEARED_PROGRESS) as ResetDataCleared.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(&mut guest, &K8sMsg::ResetAccepted).unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_DATA_CLEARED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = false;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let err = read_reset_answer(
+            &mut host,
+            true,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(accepted);
+        assert!(!deleted);
+        assert_eq!(deleted_calls, 0);
+        assert!(
+            err.to_string()
+                .contains("without confirming cluster data deletion"),
+            "{err:#}"
+        );
+
+        // 3. Plain reset against a legacy guest that sends only Done still invokes on_data_deleted.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |_| {},
+        )
+        .unwrap();
+        t.join().unwrap();
+        assert!(deleted);
+        assert_eq!(deleted_calls, 1);
+
+        // 4. Image reset forwards queued pre-acceptance Progress heartbeats without
+        //    marking accepted until ResetAccepted arrives, and preserves accepted=false
+        //    if the queued wait fails before ResetAccepted.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            k8s::write(&mut guest, &K8sMsg::ResetAccepted).unwrap();
+            k8s::write(&mut guest, &K8sMsg::ResetDataCleared).unwrap();
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = false;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let mut progress = Vec::new();
+        read_reset_answer(
+            &mut host,
+            true,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+        t.join().unwrap();
+        assert!(accepted);
+        assert!(deleted);
+        assert_eq!(deleted_calls, 1);
+        assert_eq!(
+            progress.first().map(String::as_str),
+            Some("waiting for active guest Kubernetes operation")
+        );
+
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Error("timed out waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+        });
+        let mut accepted = false;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let err = read_reset_answer(
+            &mut host,
+            true,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(!accepted, "pre-acceptance progress must not mark accepted");
+        assert!(!deleted);
+        assert_eq!(deleted_calls, 0);
+
+        // 5. Plain reset receiving queued Progress followed by RESET_NOT_STARTED_PREFIX
+        //    Error clears `accepted` (which starts true for legacy plain resets) so the
+        //    daemon preserves host proxy/DNS/kubeconfig state.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress("waiting for active guest Kubernetes operation".into()),
+            )
+            .unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Error(format!(
+                    "{}timed out waiting for active guest Kubernetes operation",
+                    k8s::RESET_NOT_STARTED_PREFIX
+                )),
+            )
+            .unwrap();
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let mut progress = Vec::new();
+        let err = read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |m| progress.push(m.to_string()),
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "timed out waiting for active guest Kubernetes operation"
+        );
+        assert!(!accepted, "explicit not-started error must clear accepted");
+        assert!(!deleted);
+        assert_eq!(deleted_calls, 0);
+        assert_eq!(
+            progress,
+            vec!["waiting for active guest Kubernetes operation"]
+        );
     }
 }

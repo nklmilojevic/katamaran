@@ -27,6 +27,10 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     #expect(l.memoryTickMarks == 0)
     #expect(l.clampCPUs(0) == 1)
     #expect(l.clampCPUs(64) == 10)
+    #expect(l.diskGiB == 64...16384)
+    #expect(l.clampDiskGiB(10) == 64)
+    #expect(l.clampDiskGiB(500) == 500)
+    #expect(l.clampDiskGiB(100_000) == 16384)
 }
 
 @Test func smallMacsGetOneTickPerGiB() {
@@ -60,7 +64,8 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     next.launch_at_login = false
     next.mount = false
     next.kubernetes = true
-    #expect(NSDictionary(dictionary: next.values(changedFrom: base)) == ["launch_at_login": false, "mount": false, "kubernetes": true])
+    next.disk_gib = 500
+    #expect(NSDictionary(dictionary: next.values(changedFrom: base)) == ["launch_at_login": false, "mount": false, "kubernetes": true, "disk_gib": 500])
     // An odd size from the CLI stays as it is unless memory itself changes.
     var odd = base
     odd.memory_mib = 1536
@@ -304,4 +309,101 @@ private let base = Config(cpus: 4, memory_mib: 4096, mount: true, mount_path: ni
     let unique = InfoTabView.uniqueHostBindings(bindings)
     #expect(unique.count == 2)
     #expect(unique.map(\.proto) == ["udp", "tcp"])
+}
+
+@Test func portLinksPreferLocalhostWhenBoundAndUseAliasOtherwise() throws {
+    let json = """
+    {"state": "running", "since_ms": 0,
+     "daemon": {"pid": 1, "home": "/tmp/k"},
+     "versions": {"katamaran": "0.8.0", "protocol": 3},
+     "config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "docker": {"state": "ready", "socket": "/tmp/k/run/docker.sock"},
+     "mount": {"enabled": true, "mounted": true},
+     "ports": [
+       {"proto": "tcp", "port": 8080, "addresses": ["172.16.1.200"]},
+       {"proto": "tcp", "port": 8443, "addresses": ["172.16.1.200", "127.0.0.1"]},
+       {"proto": "tcp", "port": 9000}
+     ]}
+    """
+    let decoded = try JSONDecoder().decode(DaemonStatus.self, from: Data(json.utf8))
+    // Alias-only port uses the bound alias.
+    #expect(decoded.portHost(port: 8080) == "172.16.1.200")
+    #expect(decoded.portURL(port: 8080)?.absoluteString == "http://172.16.1.200:8080")
+    // Multi-address port prefers localhost whenever 127.0.0.1 is bound.
+    #expect(decoded.portHost(port: 8443) == "localhost")
+    #expect(decoded.portURL(port: 8443)?.absoluteString == "http://localhost:8443")
+    // Port without addresses (older daemon) or not yet listed falls back to localhost.
+    #expect(decoded.portHost(port: 9000) == "localhost")
+    #expect(decoded.portURL(port: 9000)?.absoluteString == "http://localhost:9000")
+    #expect(decoded.portHost(port: 9999) == "localhost")
+}
+
+@Test func daemonStatusAndConfigViewDecodeEnclosingDiskGib() throws {
+    let legacy = try status()
+    #expect(!legacy.supportsDiskResize)
+    #expect(legacy.disk_gib == nil)
+    #expect(legacy.disk_target_gib == nil)
+    #expect(legacy.effectiveConfig.disk_gib == nil)
+    #expect(legacy.displayedDiskGiB == nil)
+
+    // Untouched default (disk_gib: 64, no disk_target_gib) with a smaller 8 GiB
+    // attached image: control is enabled and displays 64 GiB, unrelated edits
+    // omit disk_gib, and explicitly committing 64 GiB emits ["disk_gib": 64].
+    let smallUnsetJSON = """
+    {"state": "running", "since_ms": 0,
+     "daemon": {"pid": 1, "home": "/tmp/k"},
+     "versions": {"katamaran": "0.11.0", "protocol": 3},
+     "config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "disk_gib": 64,
+     "vm": {"cpus": 4, "memory_mib": 4096, "disk_gib": 8, "requested_disk_gib": 64},
+     "docker": {"state": "ready", "socket": "/tmp/k/run/docker.sock"},
+     "mount": {"enabled": true, "mounted": true},
+     "ports": []}
+    """
+    let smallUnset = try JSONDecoder().decode(DaemonStatus.self, from: Data(smallUnsetJSON.utf8))
+    #expect(smallUnset.supportsDiskResize)
+    #expect(smallUnset.disk_gib == 64)
+    #expect(smallUnset.disk_target_gib == nil)
+    #expect(smallUnset.displayedDiskGiB == 64)
+    #expect(smallUnset.vm?.disk_gib == 8)
+    let before = smallUnset.effectiveConfig
+    #expect(before.disk_gib == nil)
+    var unrelated = before
+    unrelated.cpus = 2
+    #expect(NSDictionary(dictionary: unrelated.values(changedFrom: before)) == ["cpus": 2])
+    var explicit64 = before
+    explicit64.disk_gib = 64
+    #expect(NSDictionary(dictionary: explicit64.values(changedFrom: before)) == ["disk_gib": 64])
+
+    let statusJSON = """
+    {"state": "running", "since_ms": 0,
+     "daemon": {"pid": 1, "home": "/tmp/k"},
+     "versions": {"katamaran": "0.11.0", "protocol": 3},
+     "config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "disk_gib": 500,
+     "disk_target_gib": 500,
+     "vm": {"cpus": 4, "memory_mib": 4096, "disk_gib": 500, "requested_disk_gib": 64},
+     "docker": {"state": "ready", "socket": "/tmp/k/run/docker.sock"},
+     "mount": {"enabled": true, "mounted": true},
+     "ports": []}
+    """
+    let decoded = try JSONDecoder().decode(DaemonStatus.self, from: Data(statusJSON.utf8))
+    #expect(decoded.supportsDiskResize)
+    #expect(decoded.disk_gib == 500)
+    #expect(decoded.disk_target_gib == 500)
+    #expect(decoded.config.disk_gib == nil)
+    #expect(decoded.effectiveConfig.disk_gib == 500)
+    #expect(decoded.displayedDiskGiB == 500)
+    #expect(decoded.vm?.disk_gib == 500)
+
+    let viewJSON = """
+    {"config": {"cpus": 4, "memory_mib": 4096, "mount": true, "launch_at_login": true},
+     "disk_gib": 64,
+     "disk_target_gib": 64,
+     "restart_required": true}
+    """
+    let view = try JSONDecoder().decode(ConfigView.self, from: Data(viewJSON.utf8))
+    #expect(view.disk_gib == 64)
+    #expect(view.disk_target_gib == 64)
+    #expect(view.config.disk_gib == nil)
 }

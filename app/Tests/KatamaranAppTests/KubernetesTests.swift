@@ -471,3 +471,197 @@ private func runningDaemonStatus(proxySocket: String) -> DaemonStatus {
 
     logs.setActive(false)
 }
+
+@Test func daemonClientCallNotifiedRefreshesIdleTimeoutAndEnforcesSilenceTimeout() throws {
+    func bindMockSocket() throws -> (String, Int32) {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kat-rpc-\(UUID().uuidString.prefix(8)).sock").path
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+            for (i, b) in path.utf8.enumerated() { buf[i] = b }
+        }
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(rc == 0)
+        #expect(listen(fd, 4) == 0)
+        return (path, fd)
+    }
+
+    // 1. Progress notifications arriving every 0.15s over 0.45s exceed idleTimeout (0.3s)
+    //    in total wall time, yet succeed because each notification refreshes the idle timeout.
+    let (p1, fd1) = try bindMockSocket()
+    Thread {
+        let c = accept(fd1, nil, nil)
+        var buf = [UInt8](repeating: 0, count: 4096)
+        _ = read(c, &buf, buf.count)
+        let notes = [
+            "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"step 1\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"step 2\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"step 3\"}}\n",
+        ]
+        for n in notes {
+            Thread.sleep(forTimeInterval: 0.15)
+            _ = n.withCString { write(c, $0, strlen($0)) }
+        }
+        // Send a final notification + terminal response in the same write chunk.
+        let tail = "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"step 4\"}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n"
+        _ = tail.withCString { write(c, $0, strlen($0)) }
+        close(c)
+        close(fd1)
+        unlink(p1)
+    }.start()
+
+    var received: [String] = []
+    let result = try DaemonClient(socketPath: p1).callNotified("k8s.reset_images", idleTimeout: 0.35) { method, params in
+        if method == "k8s.progress", let dict = params as? [String: Any], let msg = dict["message"] as? String {
+            received.append(msg)
+        }
+    }
+    #expect(received == ["step 1", "step 2", "step 3", "step 4"])
+    #expect(String(decoding: result, as: UTF8.self).contains("\"ok\":true"))
+
+    // 2. Going completely silent past idleTimeout throws a timeout error.
+    let (p2, fd2) = try bindMockSocket()
+    let release = DispatchSemaphore(value: 0)
+    Thread {
+        let c = accept(fd2, nil, nil)
+        var buf = [UInt8](repeating: 0, count: 4096)
+        _ = read(c, &buf, buf.count)
+        _ = release.wait(timeout: .now() + 3)
+        close(c)
+        close(fd2)
+        unlink(p2)
+    }.start()
+    defer { release.signal() }
+
+    do {
+        _ = try DaemonClient(socketPath: p2).callNotified("k8s.reset_images", idleTimeout: 0.2)
+        Issue.record("expected idle timeout")
+    } catch SocketError.io(let code) {
+        #expect(code == ETIMEDOUT)
+    }
+}
+
+@Test @MainActor func appModelK8sResetSelectsDistinctMethodAndAwaitsProgress() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("kat-app-reset-\(UUID().uuidString.prefix(8)).sock").path
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+        for (i, b) in path.utf8.enumerated() { buf[i] = b }
+    }
+    _ = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    listen(fd, 8)
+
+    final class Recorder: @unchecked Sendable {
+        let lock = NSLock()
+        var methods: [String] = []
+        func record(_ m: String) {
+            lock.lock()
+            methods.append(m)
+            lock.unlock()
+        }
+        var snapshot: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return methods
+        }
+    }
+    let recorder = Recorder()
+
+    // Serve 4 reset calls:
+    //   1. k8s.reset (plain, new daemon) -> progress notifications exceeding idleTimeout + ok
+    //   2. k8s.reset (plain, pre-feature daemon ignoring params) -> ok without notifications
+    //   3. k8s.reset_images (compatible daemon) -> progress + ok
+    //   4. k8s.reset_images (pre-feature daemon) -> METHOD_NOT_FOUND (-32601)
+    let stop = DispatchSemaphore(value: 0)
+    Thread {
+        var plainResetCalls = 0
+        var resetImagesCalls = 0
+        for _ in 0..<4 {
+            let c = accept(fd, nil, nil)
+            if c < 0 { break }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = read(c, &buf, buf.count)
+            let line = n > 0 ? Data(buf[0..<n]) : Data()
+            let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+            let method = obj?["method"] as? String ?? ""
+            let params = obj?["params"] as? [String: Any]
+            recorder.record(method)
+            if method == "k8s.reset" {
+                plainResetCalls += 1
+                #expect(params?["progress"] as? Bool == true)
+                if plainResetCalls == 1 {
+                    for i in 1...3 {
+                        Thread.sleep(forTimeInterval: 0.15)
+                        let note = "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"waiting \(i)\"}}\n"
+                        _ = note.withCString { write(c, $0, strlen($0)) }
+                    }
+                }
+                let resp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n"
+                _ = resp.withCString { write(c, $0, strlen($0)) }
+            } else if method == "k8s.reset_images" {
+                resetImagesCalls += 1
+                if resetImagesCalls == 1 {
+                    for i in 1...2 {
+                        Thread.sleep(forTimeInterval: 0.15)
+                        let note = "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"gc \(i)\"}}\n"
+                        _ = note.withCString { write(c, $0, strlen($0)) }
+                    }
+                    let resp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                } else {
+                    let resp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"unknown method k8s.reset_images\"}}\n"
+                    _ = resp.withCString { write(c, $0, strlen($0)) }
+                }
+            }
+            close(c)
+        }
+        _ = stop.wait(timeout: .now() + 2)
+        close(fd)
+        unlink(path)
+    }.start()
+    defer { stop.signal() }
+
+    let model = AppModel(daemon: DaemonClient(socketPath: path), startPolling: false)
+    // Prevent post-action refresh() from opening extra connections on our mock socket.
+    model.fake(nil)
+
+    // Plain reset with progress notifications arriving over 0.45s succeeds with 0.35s idleTimeout.
+    let okPlainNotified: Bool = await withCheckedContinuation { cont in
+        model.k8sReset(images: false, idleTimeout: 0.35) { ok in cont.resume(returning: ok) }
+    }
+    #expect(okPlainNotified)
+    #expect(model.lastError == nil)
+
+    // Plain reset against a pre-feature daemon that ignores params and sends no notifications.
+    let okPlainLegacy: Bool = await withCheckedContinuation { cont in
+        model.k8sReset(images: false, idleTimeout: 0.35) { ok in cont.resume(returning: ok) }
+    }
+    #expect(okPlainLegacy)
+    #expect(model.lastError == nil)
+
+    let okImages: Bool = await withCheckedContinuation { cont in
+        model.k8sReset(images: true, idleTimeout: 0.35) { ok in cont.resume(returning: ok) }
+    }
+    #expect(okImages)
+    #expect(model.lastError == nil)
+
+    let okOldDaemon: Bool = await withCheckedContinuation { cont in
+        model.k8sReset(images: true, idleTimeout: 0.35) { ok in cont.resume(returning: ok) }
+    }
+    #expect(!okOldDaemon)
+    #expect(model.lastError?.contains("unknown method k8s.reset_images") == true)
+
+    #expect(recorder.snapshot == ["k8s.reset", "k8s.reset", "k8s.reset_images", "k8s.reset_images"])
+}

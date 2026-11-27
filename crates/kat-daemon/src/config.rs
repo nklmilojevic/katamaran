@@ -1,7 +1,11 @@
 //! `<home>/config.toml`: the VM's resources and options. The daemon reads it
 //! at every VM start, so a change applies on the next start.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,6 +24,14 @@ pub struct Config {
     /// A ceiling, not a reservation: memory the guest frees goes back to
     /// macOS, so the default is generous (see [`default_memory_mib`]).
     pub memory_mib: u32,
+    /// Explicitly configured data disk size ceiling in GiB (sparse on APFS;
+    /// grows `data.img` at the next VM start, never shrinks). `None` uses the
+    /// default (`DEFAULT_DISK_GIB` = 64 GiB) without forcing growth of an
+    /// intentionally smaller `data.img`, and is omitted from `config.toml` so
+    /// older versions (which deny unknown keys) still read saved configs after
+    /// a rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
     /// Show the guest's files on the Mac over NFS.
     pub mount: bool,
     /// Where the guest's files appear; empty means `~/Katamaran` (nothing
@@ -31,9 +43,13 @@ pub struct Config {
     /// Freeze the VM's vCPUs while the Mac sleeps, so it does no work in the
     /// Mac's dark wakes.
     pub pause_on_sleep: bool,
-    /// Forward the Mac's 127.0.0.1:<port> to container ports that were not
-    /// published with `-p`.
+    /// Forward `<port>` on the Mac's `forward_addresses` to container ports
+    /// that were not published with `-p`.
     pub auto_forward: bool,
+    /// The Mac addresses forwarded ports listen on: `127.0.0.1`, and any
+    /// alias added to `lo0` (e.g. `sudo ifconfig lo0 alias 172.16.1.200`).
+    #[serde(skip_serializing_if = "is_default_forward_addresses")]
+    pub forward_addresses: Vec<Ipv4Addr>,
     /// How x86-64 (amd64) programs run in the guest.
     pub amd64: Emulation,
     /// Run an optional single-node Kubernetes (k3s) cluster inside the VM.
@@ -44,6 +60,16 @@ pub struct Config {
     /// unknown keys, still read a saved config.
     #[serde(skip_serializing_if = "is_default_nofile")]
     pub nofile: u32,
+    /// The k3s release to run, e.g. `v1.32.5+k3s1`; unset means the build
+    /// this katamaran release pins ([`crate::k8s::K3S_VERSION`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k8s_version: Option<String>,
+    /// Bundled k3s components to disable (for example `["traefik"]`), passed as `--disable=<name>`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_disable: Vec<String>,
+    /// Extra arguments appended to `k3s server`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_args: Vec<String>,
 }
 
 impl Default for Config {
@@ -52,30 +78,143 @@ impl Default for Config {
             // Idle vCPUs cost nothing, so the VM gets every core by default.
             cpus: Host::current().cpus.min(u32::from(u8::MAX)) as u8,
             memory_mib: default_memory_mib(Host::current()),
+            disk_gib: None,
             mount: true,
             mount_path: None,
             launch_at_login: true,
             pause_on_sleep: false,
             auto_forward: true,
+            forward_addresses: default_forward_addresses(),
             amd64: Emulation::default(),
             kubernetes: false,
             nofile: DEFAULT_NOFILE,
+            k8s_version: None,
+            k8s_disable: Vec::new(),
+            k8s_args: Vec::new(),
+        }
+    }
+}
+
+/// Legacy-compatible wire payload of [`Config`] carried inside
+/// [`crate::api::Status`] and [`crate::api::ConfigView`].
+///
+/// Omits `disk_gib` so older CLIs (whose `Config` uses `deny_unknown_fields`)
+/// can still decode `status` and `config.get` replies from a newer daemon.
+/// The saved disk target is exposed instead as an additive top-level
+/// `disk_gib` field on those enclosing RPC responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WireConfig {
+    pub cpus: u8,
+    pub memory_mib: u32,
+    pub mount: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<PathBuf>,
+    pub launch_at_login: bool,
+    pub pause_on_sleep: bool,
+    pub auto_forward: bool,
+    #[serde(skip_serializing_if = "is_default_forward_addresses")]
+    pub forward_addresses: Vec<Ipv4Addr>,
+    pub amd64: Emulation,
+    pub kubernetes: bool,
+    #[serde(skip_serializing_if = "is_default_nofile")]
+    pub nofile: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k8s_version: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_disable: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k8s_args: Vec<String>,
+}
+
+impl Default for WireConfig {
+    fn default() -> Self {
+        WireConfig::from(Config::default())
+    }
+}
+
+impl From<&Config> for WireConfig {
+    fn from(c: &Config) -> Self {
+        WireConfig {
+            cpus: c.cpus,
+            memory_mib: c.memory_mib,
+            mount: c.mount,
+            mount_path: c.mount_path.clone(),
+            launch_at_login: c.launch_at_login,
+            pause_on_sleep: c.pause_on_sleep,
+            auto_forward: c.auto_forward,
+            forward_addresses: c.forward_addresses.clone(),
+            amd64: c.amd64,
+            kubernetes: c.kubernetes,
+            nofile: c.nofile,
+            k8s_version: c.k8s_version.clone(),
+            k8s_disable: c.k8s_disable.clone(),
+            k8s_args: c.k8s_args.clone(),
+        }
+    }
+}
+
+impl From<Config> for WireConfig {
+    fn from(c: Config) -> Self {
+        WireConfig {
+            cpus: c.cpus,
+            memory_mib: c.memory_mib,
+            mount: c.mount,
+            mount_path: c.mount_path,
+            launch_at_login: c.launch_at_login,
+            pause_on_sleep: c.pause_on_sleep,
+            auto_forward: c.auto_forward,
+            forward_addresses: c.forward_addresses,
+            amd64: c.amd64,
+            kubernetes: c.kubernetes,
+            nofile: c.nofile,
+            k8s_version: c.k8s_version,
+            k8s_disable: c.k8s_disable,
+            k8s_args: c.k8s_args,
+        }
+    }
+}
+
+impl WireConfig {
+    /// Recombine this wire config with the enclosing response's `disk_gib`.
+    pub fn into_config(self, disk_gib: Option<u32>) -> Config {
+        Config {
+            cpus: self.cpus,
+            memory_mib: self.memory_mib,
+            disk_gib,
+            mount: self.mount,
+            mount_path: self.mount_path,
+            launch_at_login: self.launch_at_login,
+            pause_on_sleep: self.pause_on_sleep,
+            auto_forward: self.auto_forward,
+            forward_addresses: self.forward_addresses,
+            amd64: self.amd64,
+            kubernetes: self.kubernetes,
+            nofile: self.nofile,
+            k8s_version: self.k8s_version,
+            k8s_disable: self.k8s_disable,
+            k8s_args: self.k8s_args,
         }
     }
 }
 
 /// The keys `config get` and `config set` accept.
-pub const KEYS: [&str; 10] = [
+pub const KEYS: [&str; 15] = [
     "cpus",
     "memory_mib",
+    "disk_gib",
     "mount",
     "mount_path",
     "launch_at_login",
     "pause_on_sleep",
     "auto_forward",
+    "forward_addresses",
     "amd64",
     "kubernetes",
     "nofile",
+    "k8s_version",
+    "k8s_disable",
+    "k8s_args",
 ];
 
 /// What Docker Desktop, OrbStack and Colima give containers.
@@ -89,8 +228,61 @@ fn is_default_nofile(n: &u32) -> bool {
     *n == DEFAULT_NOFILE
 }
 
+/// Upper bound on the total size of extra k3s server arguments so they stay well
+/// within the host-guest protocol frame limit.
+pub const MAX_K8S_ARGS_BYTES: usize = 64 << 10;
+
+pub fn default_forward_addresses() -> Vec<Ipv4Addr> {
+    vec![Ipv4Addr::LOCALHOST]
+}
+
+fn is_default_forward_addresses(v: &[Ipv4Addr]) -> bool {
+    v == [Ipv4Addr::LOCALHOST]
+}
+
+/// Accepts `127.0.0.1,172.16.1.200` (commas or spaces); empty resets to the default.
+fn parse_addresses(v: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
+    if v.trim().is_empty() {
+        return Ok(default_forward_addresses());
+    }
+    v.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<Ipv4Addr>()
+                .with_context(|| format!("forward_addresses: {s:?} is not an IPv4 address"))
+        })
+        .collect()
+}
+
+/// Check that a list of forward addresses is non-empty and contains distinct
+/// IPv4 host addresses (not wildcard, multicast, or broadcast).
+pub fn validate_forward_addresses(addrs: &[Ipv4Addr]) -> anyhow::Result<()> {
+    if addrs.is_empty() {
+        bail!("forward_addresses must list at least one address");
+    }
+    for (i, a) in addrs.iter().enumerate() {
+        if a.is_unspecified() || a.is_multicast() || a.is_broadcast() {
+            bail!("forward_addresses: {a} is not a host address");
+        }
+        if addrs[..i].contains(a) {
+            bail!("forward_addresses: {a} is listed twice");
+        }
+    }
+    Ok(())
+}
+
 /// The smallest guest that still runs dockerd comfortably.
 pub const MIN_MEMORY_MIB: u32 = 1024;
+
+/// Default and minimum data-disk ceiling in GiB (matches the 64 GiB template).
+pub const DEFAULT_DISK_GIB: u32 = 64;
+pub const MIN_DISK_GIB: u32 = DEFAULT_DISK_GIB;
+/// Upper sanity limit for the sparse data-disk ceiling (16 TiB).
+pub const MAX_DISK_GIB: u32 = 16 * 1024;
+
+pub const fn default_disk_gib() -> u32 {
+    DEFAULT_DISK_GIB
+}
 
 /// Half of the Mac's memory, between 2 and 16 GiB, and within what
 /// [`Config::validate`] accepts.
@@ -144,15 +336,26 @@ impl Config {
         let path = Config::path(home);
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = home.join(format!("{FILE_NAME}.tmp.{}.{n}", std::process::id()));
+        // A crash mid-save can leave this name behind for a later process
+        // with the same PID; `create_new` below would then always fail.
+        let _ = fs::remove_file(&tmp);
         let text = format!(
             "# katamaran settings; applied at the next VM start.\n{}",
             toml::to_string(self)?
         );
-        let res = fs::write(&tmp, text)
-            .with_context(|| format!("write {}", tmp.display()))
-            .and_then(|()| {
-                fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
-            });
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        let write_res = f
+            .write_all(text.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()));
+        drop(f);
+        let res = write_res.and_then(|()| {
+            fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
+        });
         if let Err(e) = res {
             let _ = fs::remove_file(&tmp);
             return Err(e);
@@ -160,10 +363,16 @@ impl Config {
         Ok(())
     }
 
+    /// Effective data-disk ceiling in GiB (`DEFAULT_DISK_GIB` when unset).
+    pub fn disk_gib(&self) -> u32 {
+        self.disk_gib.unwrap_or(DEFAULT_DISK_GIB)
+    }
+
     pub fn get(&self, key: &str) -> anyhow::Result<String> {
         Ok(match key {
             "cpus" => self.cpus.to_string(),
-            "memory_mib" => self.memory_mib.to_string(),
+            "memory_mib" | "memory" => self.memory_mib.to_string(),
+            "disk_gib" | "disk" => self.disk_gib().to_string(),
             "mount" => self.mount.to_string(),
             "mount_path" => self
                 .mount_path
@@ -173,9 +382,18 @@ impl Config {
             "launch_at_login" => self.launch_at_login.to_string(),
             "pause_on_sleep" => self.pause_on_sleep.to_string(),
             "auto_forward" => self.auto_forward.to_string(),
+            "forward_addresses" => self
+                .forward_addresses
+                .iter()
+                .map(Ipv4Addr::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
             "amd64" => self.amd64.to_string(),
             "kubernetes" => self.kubernetes.to_string(),
             "nofile" => self.nofile.to_string(),
+            "k8s_version" => self.k8s_version.clone().unwrap_or_default(),
+            "k8s_disable" => self.k8s_disable.join(","),
+            "k8s_args" => format_k8s_args(&self.k8s_args),
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         })
     }
@@ -187,6 +405,7 @@ impl Config {
         match key {
             "cpus" => next.cpus = value.parse().with_context(|| format!("cpus: {value:?}"))?,
             "memory_mib" | "memory" => next.memory_mib = parse_mib(value)?,
+            "disk_gib" | "disk" => next.disk_gib = Some(parse_gib(value)?),
             "mount" => next.mount = parse_bool(value)?,
             "mount_path" => {
                 next.mount_path = if value.is_empty() {
@@ -198,6 +417,7 @@ impl Config {
             "launch_at_login" => next.launch_at_login = parse_bool(value)?,
             "pause_on_sleep" => next.pause_on_sleep = parse_bool(value)?,
             "auto_forward" => next.auto_forward = parse_bool(value)?,
+            "forward_addresses" => next.forward_addresses = parse_addresses(value)?,
             "amd64" => next.amd64 = value.parse()?,
             "kubernetes" => next.kubernetes = parse_bool(value)?,
             "nofile" => {
@@ -205,22 +425,99 @@ impl Config {
                     .parse()
                     .with_context(|| format!("nofile: {value:?}"))?
             }
+            "k8s_version" => {
+                next.k8s_version = match value {
+                    "" | "default" => None,
+                    // Only a bare version number gets the `v`; anything else is
+                    // validated as typed, so errors quote the user's input.
+                    v if v.starts_with(|c: char| c.is_ascii_digit()) => Some(format!("v{v}")),
+                    v => Some(v.to_string()),
+                }
+            }
+            "k8s_disable" => next.k8s_disable = parse_k8s_disable(value)?,
+            "k8s_args" => next.k8s_args = parse_k8s_args(value)?,
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
+        next.validate_k8s_key(key)?;
         *self = next;
         Ok(())
     }
 
-    /// Whether a VM started with `self` has to restart to use `saved`. All
-    /// but `launch_at_login` and `kubernetes` are read at VM start.
+    /// Extra `k3s server` flags derived from `k8s_disable` and `k8s_args`.
+    pub fn k8s_server_extra_args(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.k8s_disable.len() + self.k8s_args.len());
+        for component in &self.k8s_disable {
+            out.push(format!("--disable={component}"));
+        }
+        out.extend(self.k8s_args.iter().cloned());
+        out
+    }
+
+    /// Apply a batch of key-value changes atomically, validating against
+    /// `host` and refusing to shrink an existing `<home>/data/data.img`.
+    pub fn apply_values(
+        &mut self,
+        values: &std::collections::BTreeMap<String, String>,
+        host: &Host,
+        home: &Path,
+    ) -> anyhow::Result<()> {
+        let mut next = self.clone();
+        for (k, v) in values {
+            next.set(k, v, host)?;
+        }
+        if (values.contains_key("disk") || values.contains_key("disk_gib"))
+            && let Some(target_gib) = next.disk_gib
+        {
+            let img_path = home.join("data/data.img");
+            if let Some(cur_bytes) =
+                data_disk_bytes(home).with_context(|| format!("stat {}", img_path.display()))?
+            {
+                let target_bytes = u64::from(target_gib) << 30;
+                if target_bytes < cur_bytes {
+                    let cur_gib = cur_bytes.div_ceil(1 << 30);
+                    bail!(
+                        "cannot shrink data disk from {cur_gib} GiB to {target_gib} GiB (only growing is supported)"
+                    );
+                }
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Whether a VM started with `self` has to restart to use `saved`.
+    /// `launch_at_login` applies to launchd directly, and Kubernetes settings
+    /// (`kubernetes`, `k8s_version`, `k8s_disable`, `k8s_args`) apply when k3s starts.
+    #[cfg(test)]
     pub fn needs_restart_for(&self, saved: &Config) -> bool {
+        self.needs_restart_for_disk_bytes(saved, u64::from(self.disk_gib()) << 30)
+    }
+
+    /// Like [`Self::needs_restart_for`], comparing an explicitly configured
+    /// `saved.disk_gib` against both the VM's exact `attached_disk_bytes` and
+    /// its applied explicit target `self.disk_gib`.
+    ///
+    /// A restart is required when a saved explicit target either exceeds the
+    /// attached backing image size or is newly set / increased relative to the
+    /// target this VM booted with (so filesystem-only growth on a pre-padded
+    /// image still prompts a restart for `kat-init` to expand Btrfs). Lowering
+    /// or removing `disk_gib` never triggers a restart.
+    pub fn needs_restart_for_disk_bytes(&self, saved: &Config, attached_disk_bytes: u64) -> bool {
         let applied = Config {
+            disk_gib: saved.disk_gib,
             launch_at_login: saved.launch_at_login,
             kubernetes: saved.kubernetes,
+            k8s_version: saved.k8s_version.clone(),
+            k8s_disable: saved.k8s_disable.clone(),
+            k8s_args: saved.k8s_args.clone(),
             ..self.clone()
         };
         applied != *saved
+            || saved.disk_gib.is_some_and(|target| {
+                (u64::from(target) << 30) > attached_disk_bytes
+                    || self.disk_gib.is_none_or(|applied| target > applied)
+            })
     }
 
     pub fn validate(&self, host: &Host) -> anyhow::Result<()> {
@@ -231,6 +528,11 @@ impl Config {
         if self.memory_mib < MIN_MEMORY_MIB || self.memory_mib > max {
             bail!("memory_mib must be between {MIN_MEMORY_MIB} and {max}");
         }
+        if let Some(gib) = self.disk_gib
+            && !(MIN_DISK_GIB..=MAX_DISK_GIB).contains(&gib)
+        {
+            bail!("disk_gib must be between {MIN_DISK_GIB} and {MAX_DISK_GIB}");
+        }
         if let Some(p) = &self.mount_path
             && !p.is_absolute()
         {
@@ -239,8 +541,348 @@ impl Config {
         if !(MIN_NOFILE..=MAX_NOFILE).contains(&self.nofile) {
             bail!("nofile must be between {MIN_NOFILE} and {MAX_NOFILE}");
         }
+        if let Some(v) = &self.k8s_version {
+            validate_k8s_version(v)?;
+        }
+        validate_forward_addresses(&self.forward_addresses)?;
+        // `k8s_disable` / `k8s_args` are deliberately not checked here: this
+        // runs on every load, and a bad Kubernetes setting in a hand-edited
+        // config.toml must fail only the Kubernetes start, not the VM.
         Ok(())
     }
+
+    /// Full check of `k8s_disable` and `k8s_args`, the same one the guest
+    /// applies before starting k3s. Run at every Kubernetes start; `set`
+    /// checks only the key being set (see [`Config::validate_k8s_key`]).
+    pub fn validate_k8s_settings(&self) -> anyhow::Result<()> {
+        self.validate_k8s_key("k8s_disable")?;
+        self.validate_k8s_key("k8s_args")
+    }
+
+    /// Check one of `k8s_disable` / `k8s_args`, plus the combined size limit.
+    /// Checking only the key being set lets `kat config set` repair a
+    /// hand-edited config.toml in which both keys are invalid.
+    fn validate_k8s_key(&self, key: &str) -> anyhow::Result<()> {
+        match key {
+            "k8s_disable" => {
+                for component in &self.k8s_disable {
+                    validate_k8s_disable_item(component)?;
+                }
+            }
+            "k8s_args" => kat_proto::k8s::validate_k3s_extra_args(&self.k8s_args)
+                .map_err(anyhow::Error::msg)?,
+            _ => return Ok(()),
+        }
+        let total_k8s_bytes = self
+            .k8s_disable
+            .iter()
+            .map(|c| "--disable=".len() + c.len())
+            .chain(self.k8s_args.iter().map(String::len))
+            .fold(0usize, usize::saturating_add);
+        if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
+            bail!("k8s_disable and k8s_args exceed maximum size of {MAX_K8S_ARGS_BYTES} bytes");
+        }
+        Ok(())
+    }
+
+    /// The k3s release to run: `k8s_version`, or the pinned build.
+    pub fn k3s_version(&self) -> &str {
+        self.k8s_version
+            .as_deref()
+            .unwrap_or(crate::k8s::K3S_VERSION)
+    }
+}
+
+/// The oldest Kubernetes minor the guest's k3s flags work with: kube-proxy's
+/// `NFTablesProxyMode` feature gate is enabled by default from 1.31, and the
+/// guest rootfs ships `nft` (Alpine's `nftables` package) so releases whose
+/// bundled `k3s-root` lacks `nft` (such as v1.31.0–v1.31.5) still work.
+const MIN_K8S_MINOR: u32 = 31;
+
+/// A k3s release tag, `v<major>.<minor>.<patch>[-<pre>]+k3s<n>`, no older
+/// than v1.[`MIN_K8S_MINOR`].
+pub(crate) fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
+    let bad = || {
+        anyhow::anyhow!(
+            "k8s_version {v:?} is not a k3s release tag such as {}{}",
+            crate::k8s::K3S_VERSION,
+            if v.starts_with('v') {
+                ""
+            } else {
+                " (config.toml needs the leading `v`)"
+            }
+        )
+    };
+    // Digits only, without leading zeros: release tags never pad numbers.
+    let canonical_number = |n: &str| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && (n == "0" || !n.starts_with('0'))
+    };
+    let rest = v.strip_prefix('v').ok_or_else(bad)?;
+    let (kube, build) = rest.split_once("+k3s").ok_or_else(bad)?;
+    if !canonical_number(build) {
+        return Err(bad());
+    }
+    let (core, pre) = match kube.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (kube, None),
+    };
+    if let Some(p) = pre
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'))
+    {
+        return Err(bad());
+    }
+    let parts: Vec<u32> = core
+        .split('.')
+        .map(|n| {
+            if !canonical_number(n) {
+                return Err(bad());
+            }
+            n.parse().map_err(|_| bad())
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let [major, minor, _patch] = parts[..] else {
+        return Err(bad());
+    };
+    if major != 1 || minor < MIN_K8S_MINOR {
+        bail!("k8s_version must be v1.{MIN_K8S_MINOR} or newer, got {v}");
+    }
+    Ok(())
+}
+
+fn validate_k8s_disable_item(item: &str) -> anyhow::Result<()> {
+    if item.is_empty() {
+        bail!("k8s_disable must not contain empty component names");
+    }
+    if item.starts_with('-') {
+        bail!(
+            "k8s_disable entry {item:?} must be a component name (for example \"traefik\"), not a flag"
+        );
+    }
+    if !item
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!(
+            "k8s_disable entry {item:?} contains invalid characters; expected letters, digits, '-' or '_'"
+        );
+    }
+    Ok(())
+}
+
+/// Parse a comma-separated list of k3s component names (empty clears the list).
+fn parse_k8s_disable(v: &str) -> anyhow::Result<Vec<String>> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for raw in v.split(',') {
+        let item = raw.trim();
+        validate_k8s_disable_item(item)?;
+        if !out.iter().any(|existing| existing == item) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Split shell-style whitespace-separated arguments (supporting single quotes,
+/// double quotes, and backslash escapes). An empty string clears the list.
+fn parse_k8s_args(v: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = v.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            '\'' => {
+                in_token = true;
+                let mut closed = false;
+                for sc in chars.by_ref() {
+                    if sc == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    cur.push(sc);
+                }
+                if !closed {
+                    bail!("k8s_args: unterminated single quote");
+                }
+            }
+            '"' => {
+                in_token = true;
+                let mut closed = false;
+                while let Some(dc) = chars.next() {
+                    if dc == '"' {
+                        closed = true;
+                        break;
+                    }
+                    if dc == '\\' {
+                        match chars.peek().copied() {
+                            Some(esc @ ('\\' | '"')) => {
+                                chars.next();
+                                cur.push(esc);
+                            }
+                            Some(_) => cur.push('\\'),
+                            None => bail!("k8s_args: unterminated double quote"),
+                        }
+                    } else {
+                        cur.push(dc);
+                    }
+                }
+                if !closed {
+                    bail!("k8s_args: unterminated double quote");
+                }
+            }
+            '\\' => {
+                in_token = true;
+                let Some(esc) = chars.next() else {
+                    bail!("k8s_args: trailing backslash");
+                };
+                cur.push(esc);
+            }
+            other => {
+                in_token = true;
+                cur.push(other);
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+fn format_k8s_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if !arg.is_empty()
+                && !arg
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Short-lived lock file serializing `config.toml` read-modify-write updates
+/// across offline CLI edits and the daemon. Unlike `katamaran.lock`, it is
+/// never held while a VM runs.
+pub const CONFIG_LOCK_NAME: &str = "config.lock";
+
+/// Short-lived lock file serializing host-side `data.img` preparation
+/// (cloning/growing) with offline disk shrink checks. Dropped immediately
+/// after `data.img` is prepared, before the VM boots.
+pub const DISK_LOCK_NAME: &str = "disk.lock";
+
+fn open_lock_file(home: &Path, name: &str) -> anyhow::Result<(PathBuf, File)> {
+    let run_dir = home.join("run");
+    fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", run_dir.display()))?;
+    let path = run_dir.join(name);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    Ok((path, file))
+}
+
+fn lock_blocking(home: &Path, name: &str) -> anyhow::Result<File> {
+    let (path, file) = open_lock_file(home, name)?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
+    }
+}
+
+fn try_lock_nonblocking(home: &Path, name: &str) -> anyhow::Result<Option<File>> {
+    let (path, file) = open_lock_file(home, name)?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
+    }
+}
+
+/// Acquire the cross-process lock protecting `config.toml` updates.
+pub fn lock_config(home: &Path) -> anyhow::Result<File> {
+    lock_blocking(home, CONFIG_LOCK_NAME)
+}
+
+/// Acquire the cross-process lock protecting `data.img` preparation.
+pub fn lock_disk(home: &Path) -> anyhow::Result<File> {
+    lock_blocking(home, DISK_LOCK_NAME)
+}
+
+/// Try to acquire the `data.img` preparation lock without blocking.
+pub fn try_lock_disk(home: &Path) -> anyhow::Result<Option<File>> {
+    try_lock_nonblocking(home, DISK_LOCK_NAME)
+}
+
+/// Current apparent size of `<home>/data/data.img` in bytes, or `Ok(None)`
+/// when the image does not exist yet.
+pub fn data_disk_bytes(home: &Path) -> std::io::Result<Option<u64>> {
+    match fs::metadata(home.join("data/data.img")) {
+        Ok(m) => Ok(Some(m.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Convert a data-disk byte length into whole GiB (rounding up partial GiB).
+pub fn bytes_to_gib(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(1 << 30)).unwrap_or(u32::MAX)
+}
+
+/// Accepts `64`, `500G`, `500GB`, `500GiB`, `1T`, `1TB` and `1TiB`.
+fn parse_gib(v: &str) -> anyhow::Result<u32> {
+    let lower = v.to_ascii_lowercase();
+    let (num, mult) = if let Some(n) = lower
+        .strip_suffix("tib")
+        .or_else(|| lower.strip_suffix("tb"))
+        .or_else(|| lower.strip_suffix('t'))
+    {
+        (n, 1024u32)
+    } else if let Some(n) = lower
+        .strip_suffix("gib")
+        .or_else(|| lower.strip_suffix("gb"))
+        .or_else(|| lower.strip_suffix('g'))
+    {
+        (n, 1u32)
+    } else {
+        (lower.as_str(), 1u32)
+    };
+    let n: u32 = num.trim().parse().with_context(|| format!("disk: {v:?}"))?;
+    n.checked_mul(mult)
+        .with_context(|| format!("disk: {v:?} is too large"))
 }
 
 /// Accepts `4096`, `4096M`, `4096MiB`, `4G` and `4GiB`.
@@ -370,7 +1012,12 @@ mod tests {
         assert!(cfg.set("memory_mib", "40G", &HOST).is_err());
         assert!(cfg.set("mount", "maybe", &HOST).is_err());
         assert!(cfg.set("mount_path", "relative", &HOST).is_err());
-        assert!(cfg.set("disk", "1", &HOST).is_err());
+        assert!(cfg.set("disk", "32G", &HOST).is_err());
+        assert!(cfg.set("disk", "0", &HOST).is_err());
+        assert!(cfg.set("disk", "20T", &HOST).is_err());
+        assert!(cfg.set("disk", "500M", &HOST).is_err());
+        assert!(cfg.set("disk", "lots", &HOST).is_err());
+        assert!(cfg.set("unknown_key", "1", &HOST).is_err());
         // A rejected value leaves the config as it was.
         assert_eq!(cfg, Config::default());
     }
@@ -478,9 +1125,543 @@ mod tests {
     }
 
     #[test]
+    fn k8s_version_defaults_to_the_pinned_build() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.k8s_version, None);
+        assert_eq!(cfg.k3s_version(), crate::k8s::K3S_VERSION);
+        assert_eq!(cfg.get("k8s_version").unwrap(), "");
+        assert!(!toml::to_string(&cfg).unwrap().contains("k8s_version"));
+
+        let started = cfg.clone();
+        cfg.set("k8s_version", "v1.32.5+k3s1", &HOST).unwrap();
+        assert_eq!(cfg.k3s_version(), "v1.32.5+k3s1");
+        // Read at each Kubernetes start, not at VM start.
+        assert!(!started.needs_restart_for(&cfg));
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("k8s_version = \"v1.32.5+k3s1\""), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+
+        cfg.set("k8s_version", "1.33.1+k3s2", &HOST).unwrap();
+        assert_eq!(cfg.get("k8s_version").unwrap(), "v1.33.1+k3s2");
+        cfg.set("k8s_version", "v1.34.0-rc1+k3s1", &HOST).unwrap();
+        cfg.set("k8s_version", "", &HOST).unwrap();
+        assert_eq!(cfg.k8s_version, None);
+        cfg.set("k8s_version", "v1.32.5+k3s1", &HOST).unwrap();
+        cfg.set("k8s_version", "default", &HOST).unwrap();
+        assert_eq!(cfg.k8s_version, None);
+    }
+
+    #[test]
+    fn rejects_bad_k8s_versions() {
+        let mut cfg = Config::default();
+        for v in [
+            "latest",
+            "v1.32",
+            "v1.32.5",
+            "v1.32.5+k3s",
+            "v1.32.5+k3sx",
+            "v1.32.x+k3s1",
+            "v1.32.5-+k3s1",
+            "v1.32.5/../+k3s1",
+            "v2.0.0+k3s1",
+            "v1.30.9+k3s1",
+            "v1.037.2+k3s1",
+            "v1.37.02+k3s1",
+            "v1.37.2+k3s01",
+        ] {
+            assert!(cfg.set("k8s_version", v, &HOST).is_err(), "{v}");
+        }
+        assert_eq!(cfg, Config::default());
+        assert!(Config::parse("k8s_version = \"v1.28.0+k3s1\"\n").is_err());
+        let err = Config::parse("k8s_version = \"1.32.5+k3s1\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("needs the leading `v`"),
+            "{err:#}"
+        );
+        assert!(cfg.set("k8s_version", "v1.37.0+k3s1", &HOST).is_ok());
+        let err = cfg.set("k8s_version", "V1.32.5+k3s1", &HOST).unwrap_err();
+        assert!(format!("{err:#}").contains("\"V1.32.5+k3s1\""), "{err:#}");
+    }
+
+    #[test]
+    fn forward_addresses_default_to_localhost_and_are_a_vm_setting() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
+        assert_eq!(cfg.get("forward_addresses").unwrap(), "127.0.0.1");
+        // The default stays out of the file, so older versions still read it.
+        assert!(!toml::to_string(&cfg).unwrap().contains("forward_addresses"));
+        let started = cfg.clone();
+        cfg.set("forward_addresses", "127.0.0.1, 172.16.1.200", &HOST)
+            .unwrap();
+        assert_eq!(
+            cfg.forward_addresses,
+            [Ipv4Addr::LOCALHOST, Ipv4Addr::new(172, 16, 1, 200)]
+        );
+        assert_eq!(
+            cfg.get("forward_addresses").unwrap(),
+            "127.0.0.1,172.16.1.200"
+        );
+        assert!(started.needs_restart_for(&cfg));
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            text.contains(r#"forward_addresses = ["127.0.0.1", "172.16.1.200"]"#),
+            "{text}"
+        );
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+        cfg.set("forward_addresses", "", &HOST).unwrap();
+        assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
+    }
+
+    #[test]
+    fn rejects_bad_forward_addresses() {
+        let mut cfg = Config::default();
+        for bad in [
+            "localhost",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+        ] {
+            assert!(cfg.set("forward_addresses", bad, &HOST).is_err(), "{bad}");
+        }
+        assert!(
+            cfg.set("forward_addresses", "127.0.0.1,127.0.0.1", &HOST)
+                .is_err()
+        );
+        assert!(Config::parse("forward_addresses = []").is_err());
+        assert_eq!(cfg, Config::default());
+
+        // Non-empty separator-only input is rejected and must not reset aliases.
+        let alias = Ipv4Addr::new(172, 16, 1, 200);
+        cfg.set("forward_addresses", "127.0.0.1,172.16.1.200", &HOST)
+            .unwrap();
+        for sep_only in [",", ",,", " , , "] {
+            assert!(
+                cfg.set("forward_addresses", sep_only, &HOST).is_err(),
+                "{sep_only:?}"
+            );
+            assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST, alias]);
+        }
+        // Only a truly blank input resets to the default.
+        cfg.set("forward_addresses", "   ", &HOST).unwrap();
+        assert_eq!(cfg.forward_addresses, [Ipv4Addr::LOCALHOST]);
+    }
+
+    #[test]
+    fn parses_disk_units() {
+        assert_eq!(parse_gib("64").unwrap(), 64);
+        assert_eq!(parse_gib("500G").unwrap(), 500);
+        assert_eq!(parse_gib("500g").unwrap(), 500);
+        assert_eq!(parse_gib("500GB").unwrap(), 500);
+        assert_eq!(parse_gib("500GiB").unwrap(), 500);
+        assert_eq!(parse_gib("1T").unwrap(), 1024);
+        assert_eq!(parse_gib("2TiB").unwrap(), 2048);
+        assert_eq!(parse_gib("2tb").unwrap(), 2048);
+        assert!(parse_gib("lots").is_err());
+        assert!(parse_gib("500M").is_err());
+        assert!(parse_gib("5000000T").is_err());
+    }
+
+    #[test]
+    fn disk_is_a_vm_setting_and_round_trips() {
+        let mut cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.disk_gib, None);
+        assert_eq!(cfg.disk_gib(), DEFAULT_DISK_GIB);
+        assert_eq!(cfg.get("disk_gib").unwrap(), "64");
+        assert_eq!(cfg.get("disk").unwrap(), "64");
+
+        // Explicitly setting 64G distinguishes an explicit target from an omitted default.
+        let mut explicit_default = Config::default();
+        explicit_default.set("disk", "64G", &HOST).unwrap();
+        assert_eq!(explicit_default.disk_gib, Some(64));
+        assert_eq!(explicit_default.get("disk").unwrap(), "64");
+        let explicit_text = toml::to_string(&explicit_default).unwrap();
+        assert!(explicit_text.contains("disk_gib = 64"), "{explicit_text}");
+        assert_eq!(Config::parse(&explicit_text).unwrap(), explicit_default);
+        assert!(Config::default().needs_restart_for_disk_bytes(&explicit_default, 8u64 << 30));
+        assert!(
+            Config::default()
+                .needs_restart_for_disk_bytes(&explicit_default, (63u64 << 30) + (512u64 << 20),)
+        );
+        // Newly setting an explicit target (even equal to the backing image size)
+        // requires a restart so kat-init can expand any pre-padded Btrfs filesystem;
+        // once applied, the same target does not require another restart.
+        assert!(Config::default().needs_restart_for_disk_bytes(&explicit_default, 64u64 << 30));
+        assert!(!explicit_default.needs_restart_for_disk_bytes(&explicit_default, 64u64 << 30));
+
+        // Pre-padded 100 GiB / 200 GiB images: setting disk=100G from unset or
+        // increasing 100G -> 150G requires a restart, while lowering or removing
+        // disk_gib does not.
+        let target_100 = Config {
+            disk_gib: Some(100),
+            ..Config::default()
+        };
+        let target_150 = Config {
+            disk_gib: Some(150),
+            ..Config::default()
+        };
+        assert!(Config::default().needs_restart_for_disk_bytes(&target_100, 100u64 << 30));
+        assert!(!target_100.needs_restart_for_disk_bytes(&target_100, 100u64 << 30));
+        assert!(target_100.needs_restart_for_disk_bytes(&target_150, 200u64 << 30));
+        assert!(!target_150.needs_restart_for_disk_bytes(&target_100, 200u64 << 30));
+        assert!(!target_150.needs_restart_for_disk_bytes(&Config::default(), 200u64 << 30));
+
+        let started = cfg.clone();
+        cfg.set("disk", "500G", &HOST).unwrap();
+        assert_eq!(cfg.disk_gib, Some(500));
+        assert_eq!(cfg.get("disk").unwrap(), "500");
+        assert_eq!(cfg.get("disk_gib").unwrap(), "500");
+        assert!(started.needs_restart_for(&cfg));
+
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("disk_gib = 500"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), cfg);
+
+        cfg.set("disk_gib", "1T", &HOST).unwrap();
+        assert_eq!(cfg.disk_gib, Some(1024));
+    }
+
+    #[test]
+    fn apply_values_refuses_to_shrink_existing_data_img() {
+        let home = temp_home("disk-shrink");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // Before data.img exists, disk can be set and lowered freely (>= 64 GiB).
+        let mut cfg = Config::default();
+        cfg.apply_values(&map(&[("disk", "500G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, Some(500));
+        cfg.apply_values(&map(&[("disk", "128G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, Some(128));
+
+        // Once data.img is 200 GiB on disk, shrinking below 200 GiB is refused
+        // and leaves the config (including other keys in the same batch) intact.
+        let img = data_dir.join("data.img");
+        let f = fs::File::create(&img).unwrap();
+        f.set_len(200u64 << 30).unwrap();
+        drop(f);
+
+        let before = cfg.clone();
+        let err = cfg
+            .apply_values(&map(&[("cpus", "2"), ("disk", "100G")]), &HOST, &home)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot shrink data disk"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cfg, before);
+
+        // Setting equal or larger size succeeds.
+        cfg.apply_values(&map(&[("disk", "200G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, Some(200));
+        cfg.apply_values(&map(&[("disk", "500G")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(cfg.disk_gib, Some(500));
+
+        // Changing unrelated keys still works even if config.toml has no disk_gib.
+        let mut smaller = Config::default();
+        assert_eq!(smaller.disk_gib, None);
+        smaller
+            .apply_values(&map(&[("cpus", "2")]), &HOST, &home)
+            .unwrap();
+        assert_eq!(smaller.cpus, 2);
+        assert_eq!(smaller.disk_gib, None);
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn default_disk_gib_is_omitted_on_save_so_rollback_reads_config() {
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct PreDiskConfig {
+            cpus: u8,
+            memory_mib: u32,
+            mount: bool,
+            mount_path: Option<PathBuf>,
+            launch_at_login: bool,
+            pause_on_sleep: bool,
+            auto_forward: bool,
+            amd64: Emulation,
+            kubernetes: bool,
+        }
+        impl Default for PreDiskConfig {
+            fn default() -> Self {
+                Self {
+                    cpus: 1,
+                    memory_mib: 1024,
+                    mount: true,
+                    mount_path: None,
+                    launch_at_login: true,
+                    pause_on_sleep: false,
+                    auto_forward: true,
+                    amd64: Emulation::default(),
+                    kubernetes: false,
+                }
+            }
+        }
+
+        let home = temp_home("disk-default-omit");
+        let mut cfg = Config::default();
+        // Saving an unrelated setting leaves disk_gib out of config.toml.
+        cfg.set("mount", "off", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        let text = fs::read_to_string(Config::path(&home)).unwrap();
+        assert!(!text.contains("disk_gib"), "{text}");
+        let legacy: PreDiskConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            legacy,
+            PreDiskConfig {
+                cpus: cfg.cpus,
+                memory_mib: cfg.memory_mib,
+                mount: false,
+                mount_path: cfg.mount_path.clone(),
+                launch_at_login: cfg.launch_at_login,
+                pause_on_sleep: cfg.pause_on_sleep,
+                auto_forward: cfg.auto_forward,
+                amd64: cfg.amd64,
+                kubernetes: cfg.kubernetes,
+            }
+        );
+        assert_eq!(Config::load(&home).unwrap(), cfg);
+
+        // Explicitly setting disk_gib (including 64G or 500G) IS persisted and round-trips.
+        cfg.set("disk", "64G", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        let text = fs::read_to_string(Config::path(&home)).unwrap();
+        assert!(text.contains("disk_gib = 64"), "{text}");
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(64));
+
+        cfg.set("disk", "500G", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        let text = fs::read_to_string(Config::path(&home)).unwrap();
+        assert!(text.contains("disk_gib = 500"), "{text}");
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(500));
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn apply_values_rejects_disk_edit_when_image_metadata_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_home("disk-stat-err");
+        fs::create_dir_all(&home).unwrap();
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // 1. `<home>/data` as a regular file triggers NotADirectory (even as root).
+        let data_path = home.join("data");
+        fs::write(&data_path, b"not a directory").unwrap();
+        let mut cfg = Config::default();
+        let before = cfg.clone();
+        let err = cfg
+            .apply_values(&map(&[("disk", "128G")]), &HOST, &home)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("data.img"),
+            "error should mention data.img path: {err:#}"
+        );
+        assert_eq!(cfg, before);
+        fs::remove_file(&data_path).unwrap();
+
+        // 2. Unsearchable `<home>/data` directory triggers PermissionDenied (when non-root).
+        fs::create_dir_all(&data_path).unwrap();
+        fs::File::create(data_path.join("data.img"))
+            .unwrap()
+            .set_len(200u64 << 30)
+            .unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            fs::set_permissions(&data_path, fs::Permissions::from_mode(0o000)).unwrap();
+            let err = cfg
+                .apply_values(&map(&[("disk", "100G")]), &HOST, &home)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("data.img"),
+                "error should mention data.img path: {err:#}"
+            );
+            assert_eq!(cfg, before);
+            fs::set_permissions(&data_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn host_reports_this_mac() {
         let h = Host::current();
         assert!(h.cpus >= 1);
         assert!(h.memory_mib >= 1024);
+    }
+
+    #[test]
+    fn k8s_disable_and_args_round_trip_and_do_not_require_vm_restart() {
+        let mut cfg = Config::default();
+        assert!(cfg.k8s_disable.is_empty());
+        assert!(cfg.k8s_args.is_empty());
+        assert_eq!(cfg.get("k8s_disable").unwrap(), "");
+        assert_eq!(cfg.get("k8s_args").unwrap(), "");
+
+        // Empty lists are omitted from serialized config.toml.
+        let default_toml = toml::to_string(&cfg).unwrap();
+        assert!(!default_toml.contains("k8s_disable"), "{default_toml}");
+        assert!(!default_toml.contains("k8s_args"), "{default_toml}");
+
+        cfg.set("k8s_disable", "traefik, servicelb, traefik", &HOST)
+            .unwrap();
+        assert_eq!(cfg.k8s_disable, vec!["traefik", "servicelb"]);
+        assert_eq!(cfg.get("k8s_disable").unwrap(), "traefik,servicelb");
+
+        cfg.set(
+            "k8s_args",
+            "--kube-apiserver-arg=feature-gates=Foo=true --node-label='env=my dev' --node-taint=\"a'b\"",
+            &HOST,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.k8s_args,
+            vec![
+                "--kube-apiserver-arg=feature-gates=Foo=true",
+                "--node-label=env=my dev",
+                "--node-taint=a'b",
+            ]
+        );
+        assert_eq!(
+            cfg.k8s_server_extra_args(),
+            vec![
+                "--disable=traefik",
+                "--disable=servicelb",
+                "--kube-apiserver-arg=feature-gates=Foo=true",
+                "--node-label=env=my dev",
+                "--node-taint=a'b",
+            ]
+        );
+
+        // Display format round-trips through set().
+        let formatted = cfg.get("k8s_args").unwrap();
+        let mut reparsed = Config::default();
+        reparsed.set("k8s_args", &formatted, &HOST).unwrap();
+        assert_eq!(reparsed.k8s_args, cfg.k8s_args);
+
+        // TOML round-trips cleanly.
+        let toml_text = toml::to_string(&cfg).unwrap();
+        assert!(toml_text.contains("k8s_disable = ["), "{toml_text}");
+        assert!(toml_text.contains("k8s_args = ["), "{toml_text}");
+        assert_eq!(Config::parse(&toml_text).unwrap(), cfg);
+
+        // Changing k8s_disable or k8s_args does not require restarting the VM.
+        assert!(!Config::default().needs_restart_for(&cfg));
+
+        // Setting empty strings clears both lists.
+        cfg.set("k8s_disable", "", &HOST).unwrap();
+        cfg.set("k8s_args", "", &HOST).unwrap();
+        assert!(cfg.k8s_disable.is_empty());
+        assert!(cfg.k8s_args.is_empty());
+    }
+
+    #[test]
+    fn k8s_disable_and_args_reject_invalid_values() {
+        let mut cfg = Config::default();
+        assert!(cfg.set("k8s_disable", "--traefik", &HOST).is_err());
+        assert!(cfg.set("k8s_disable", "traefik,,servicelb", &HOST).is_err());
+        assert!(cfg.set("k8s_disable", "traefik servicelb", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "--foo='unterminated", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "--foo=\"unterminated", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "--foo\\", &HOST).is_err());
+        assert!(cfg.set("k8s_args", "''", &HOST).is_err());
+        // Hand-edited values load (the VM must still start) but fail the
+        // Kubernetes-start check.
+        for text in ["k8s_args = [\"\"]\n", "k8s_disable = [\"--traefik\"]\n"] {
+            let loaded = Config::parse(text).unwrap();
+            assert!(loaded.validate_k8s_settings().is_err(), "{text}");
+        }
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn save_ignores_stale_temp_file_from_a_crashed_save() {
+        let home = std::env::temp_dir().join(format!("kat-cfg-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        // Every name this process can pick for its next few saves.
+        let n = TMP_COUNTER.load(Ordering::Relaxed);
+        for i in n..n + 4 {
+            fs::write(
+                home.join(format!("{FILE_NAME}.tmp.{}.{i}", std::process::id())),
+                "stale",
+            )
+            .unwrap();
+        }
+        Config::default().save(&home).unwrap();
+        assert!(Config::path(&home).is_file());
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn reserved_k8s_args_are_rejected_by_set_but_do_not_break_loading() {
+        let host = HOST;
+        let mut cfg = Config::default();
+        for bad in [
+            "--token=x",
+            "--data-dir=/tmp/k3s",
+            "--kubelet-arg=root_dir=/x",
+        ] {
+            let err = cfg.set("k8s_args", bad, &host).unwrap_err();
+            assert!(err.to_string().starts_with("k8s_args"), "{bad}: {err:#}");
+            assert!(cfg.k8s_args.is_empty(), "{bad} must not be saved");
+        }
+        cfg.set("k8s_args", "--disable=traefik", &host).unwrap();
+
+        // A hand-edited config.toml with a reserved flag still loads (so the
+        // VM and Docker start) and can be repaired with `config set`.
+        let mut loaded =
+            Config::parse("k8s_args = [\"--token=x\", \"\"]\nk8s_disable = [\"traefik \"]\n")
+                .unwrap();
+        assert!(loaded.validate_k8s_settings().is_err());
+        // Each bad key can be repaired on its own, in either order.
+        loaded.set("cpus", "2", &host).unwrap();
+        loaded.set("k8s_args", "", &host).unwrap();
+        assert!(loaded.validate_k8s_settings().is_err()); // k8s_disable still bad
+        loaded.set("k8s_disable", "traefik", &host).unwrap();
+        loaded.validate_k8s_settings().unwrap();
+    }
+
+    #[test]
+    fn save_replaces_world_readable_config_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_home("mode-0600");
+        fs::create_dir_all(&home).unwrap();
+        let path = Config::path(&home);
+        fs::write(&path, "cpus = 2\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let mut cfg = Config::default();
+        cfg.set("k8s_args", "--debug", &HOST).unwrap();
+        cfg.save(&home).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_dir_all(&home).unwrap();
     }
 }

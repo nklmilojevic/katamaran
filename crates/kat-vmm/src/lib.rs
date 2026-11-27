@@ -258,6 +258,20 @@ impl VmConfig {
                 "network prefix length or MTU out of range"
             );
         }
+        for l in &self.host_listeners {
+            anyhow::ensure!(l.port != 0, "vsock host listener port must be non-zero");
+            anyhow::ensure!(
+                l.path.is_absolute(),
+                "vsock host listener path must be absolute: {}",
+                l.path.display()
+            );
+            if l.port == kat_proto::VM_EXEC_PORT {
+                anyhow::ensure!(
+                    !l.loopback_tcp && !l.kernel_only,
+                    "VM_EXEC_PORT must use a host-listening Unix socket"
+                );
+            }
+        }
         let mut ports: Vec<u32> = self.host_listeners.iter().map(|l| l.port).collect();
         ports.push(kat_proto::CONTROL_PORT);
         ports.push(kat_proto::FSCACHE_PORT);
@@ -337,6 +351,14 @@ pub mod run {
         console.add_console_port("", output);
         let console = console.build().map_err(err)?;
 
+        // `TsiFlags::empty()` disables all TSI hijacking so guest processes
+        // cannot proxy into host Unix/TCP sockets. Every `HostListener` below
+        // (including `VM_EXEC_PORT`, which grants VM root) is registered with
+        // `listen = true`: libkrun's vsock muxer (`muxer.rs:process_op_request`
+        // and `send_stream_pkt`) rejects guest-initiated `VSOCK_OP_REQUEST` /
+        // `is_host_listener_id` packets with `MuxerRx::Reset`, and `muxer_rxq.rs`
+        // stamps `src_cid = VSOCK_HOST_CID` only on connections accepted from
+        // the host-side `UnixAcceptorProxy` socket inside the mode-0700 run dir.
         let mut vsock = VsockDevice::new(GUEST_CID, TsiFlags::empty()).map_err(err)?;
         let control = cfg
             .control_socket
@@ -639,5 +661,41 @@ mod tests {
         assert!(c.validate().is_err());
         c.cpus = 0;
         assert!(c.validate().unwrap_err().to_string().contains("cpus"));
+    }
+
+    #[test]
+    fn validate_enforces_vm_exec_host_listener_invariants() {
+        let dir = std::env::temp_dir().join(format!("kat-vmm-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k"), b"").unwrap();
+        std::fs::write(dir.join("i"), b"").unwrap();
+        let mut c = cfg();
+        c.kernel = dir.join("k");
+        c.initramfs = dir.join("i");
+
+        c.host_listeners.push(HostListener {
+            port: kat_proto::VM_EXEC_PORT,
+            path: dir.join("vm-exec.sock"),
+            kernel_only: false,
+            loopback_tcp: false,
+        });
+        c.validate().unwrap();
+
+        // VM_EXEC_PORT must never be exposed via loopback TCP or kernel-only mode.
+        c.host_listeners[0].loopback_tcp = true;
+        assert!(c.validate().is_err());
+        c.host_listeners[0].loopback_tcp = false;
+        c.host_listeners[0].kernel_only = true;
+        assert!(c.validate().is_err());
+        c.host_listeners[0].kernel_only = false;
+
+        // Relative paths and port 0 are rejected for all host listeners.
+        c.host_listeners[0].path = PathBuf::from("vm-exec.sock");
+        assert!(c.validate().is_err());
+        c.host_listeners[0].path = dir.join("vm-exec.sock");
+        c.host_listeners[0].port = 0;
+        assert!(c.validate().is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

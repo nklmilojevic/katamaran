@@ -19,7 +19,7 @@ final class AppModel {
     func observe(_ f: @escaping () -> Void) { observers.append(f) }
     private func changed() { observers.forEach { $0() } }
 
-    let daemon = DaemonClient(socketPath: DaemonClient.defaultSocket())
+    let daemon: DaemonClient
     var phase: Phase { Phase(status) }
     private var timer: Timer?
     /// Called once, after the first successful status (for the smoke test).
@@ -31,7 +31,9 @@ final class AppModel {
 
     static let shared = AppModel()
 
-    init() {
+    init(daemon: DaemonClient = DaemonClient(socketPath: DaemonClient.defaultSocket()), startPolling: Bool = true) {
+        self.daemon = daemon
+        guard startPolling else { return }
         refresh()
         // .common, so it keeps firing while the menu is tracking.
         let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
@@ -153,9 +155,21 @@ final class AppModel {
         perform("kubernetes") { _ = try d.call("k8s.start", timeout: 300) }
     }
 
-    func k8sReset() {
+    func k8sReset(images: Bool = false, idleTimeout: TimeInterval? = nil, done: ((Bool) -> Void)? = nil) {
         let d = daemon
-        perform("kubernetes") { _ = try d.call("k8s.reset", timeout: 300) }
+        // Image resets always stream progress from the daemon (90s idle timeout).
+        // Plain resets opt into progress notifications (`progress: true`) so lock
+        // waits and deletion heartbeats refresh the timeout, while keeping a 300s
+        // fallback window for pre-feature daemons that ignore `params` and send
+        // no notifications.
+        let timeout = idleTimeout ?? (images ? 90 : 300)
+        perform("kubernetes", done: done) {
+            if images {
+                _ = try d.callNotified("k8s.reset_images", idleTimeout: timeout)
+            } else {
+                _ = try d.callNotified("k8s.reset", ["progress": true], idleTimeout: timeout)
+            }
+        }
     }
 
     func k8sSyncImages() {

@@ -8,6 +8,8 @@ struct ResourceLimits: Equatable {
     let cpus: ClosedRange<Int>
     let memoryGiB: ClosedRange<Int>
     let defaultMemoryGiB: Int
+    let diskGiB: ClosedRange<Int> = 64...16384
+    let defaultDiskGiB: Int = 64
 
     init(hostCPUs: Int, hostMemoryBytes: UInt64) {
         cpus = 1...max(1, hostCPUs)
@@ -21,6 +23,8 @@ struct ResourceLimits: Equatable {
                                      hostMemoryBytes: ProcessInfo.processInfo.physicalMemory)
 
     func clampCPUs(_ n: Int) -> Int { min(max(n, cpus.lowerBound), cpus.upperBound) }
+
+    func clampDiskGiB(_ n: Int) -> Int { min(max(n, diskGiB.lowerBound), diskGiB.upperBound) }
 
     /// The slider position for a saved size, in whole GiB.
     func memoryGiB(fromMiB mib: Int) -> Int {
@@ -44,6 +48,7 @@ extension Config {
         var v: [String: Any] = [:]
         if cpus != old.cpus { v["cpus"] = cpus }
         if memory_mib != old.memory_mib { v["memory_mib"] = memory_mib }
+        if disk_gib != old.disk_gib, let disk_gib { v["disk_gib"] = disk_gib }
         if mount != old.mount { v["mount"] = mount }
         if launch_at_login != old.launch_at_login { v["launch_at_login"] = launch_at_login }
         if kubernetes != old.kubernetes, let kubernetes { v["kubernetes"] = kubernetes }

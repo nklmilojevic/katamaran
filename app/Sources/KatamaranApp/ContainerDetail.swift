@@ -304,7 +304,7 @@ final class DetailHeader: NSView {
 final class InfoTabView: NSView, ContainerTabView {
     private let model: AppModel
     private let content = ScrollingStack()
-    private var shown: (ContainerSummary, ContainerInspect?, [PortError])?
+    private var shown: (ContainerSummary, ContainerInspect?, [Port], [PortError])?
 
     init(model: AppModel) {
         self.model = model
@@ -319,9 +319,10 @@ final class InfoTabView: NSView, ContainerTabView {
 
     func show(_ c: ContainerSummary?, _ inspect: ContainerInspect?) {
         guard let c else { return }
+        let ports = model.status?.ports ?? []
         let portErrors = model.status?.port_errors ?? []
-        if let s = shown, s.0 == c, s.1 == inspect, s.2 == portErrors { return }
-        shown = (c, inspect, portErrors)
+        if let s = shown, s.0 == c, s.1 == inspect, s.2 == ports, s.3 == portErrors { return }
+        shown = (c, inspect, ports, portErrors)
         var groups: [NSView] = []
 
         var general: [NSView] = [
@@ -343,9 +344,10 @@ final class InfoTabView: NSView, ContainerTabView {
         var network: [NSView] = []
         if !bindings.isEmpty {
             let links = Self.uniqueHostBindings(bindings).map { b -> NSView in
+                let host = model.status?.portHost(proto: b.proto, port: b.host) ?? "localhost"
                 let arrow = label("→ \(b.container)/\(b.proto)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
                 if let err = model.status?.portError(proto: b.proto, port: b.host) {
-                    let addr = label("localhost:\(b.host)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
+                    let addr = label("\(host):\(b.host)", font: .systemFont(ofSize: NSFont.systemFontSize), color: .secondaryLabelColor)
                     let warn = symbolView("exclamationmark.triangle.fill", color: .systemOrange, size: 13)
                     let note = label("Not forwarded", font: .systemFont(ofSize: NSFont.smallSystemFontSize), color: .systemOrange)
                     let row = NSStackView(views: [addr, arrow, warn, note])
@@ -353,7 +355,7 @@ final class InfoTabView: NSView, ContainerTabView {
                     row.toolTip = "Port \(b.host)/\(b.proto) could not be forwarded on macOS: \(err)"
                     return row
                 }
-                let link = linkButton("localhost:\(b.host)", target: self, action: #selector(openPort(_:)), tag: Int(b.host))
+                let link = linkButton("\(host):\(b.host)", target: self, action: #selector(openPort(_:)), tag: Int(b.host))
                 link.isEnabled = b.proto == "tcp"
                 let row = NSStackView(views: [link, arrow])
                 row.spacing = 6
@@ -429,7 +431,9 @@ final class InfoTabView: NSView, ContainerTabView {
         return URL(fileURLWithPath: root).appendingPathComponent("docker/volumes/\(name)")
     }
 
-    @objc private func openPort(_ sender: NSButton) { openLocalhost(UInt16(sender.tag)) }
+    @objc private func openPort(_ sender: NSButton) {
+        openForwardedPort(UInt16(sender.tag), status: model.status)
+    }
 
     @objc private func openPath(_ sender: NSButton) {
         guard let path = sender.identifier?.rawValue else { return }

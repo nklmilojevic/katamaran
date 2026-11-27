@@ -10,6 +10,8 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use super::sys;
 
@@ -17,6 +19,12 @@ const BINFMT_MISC: &str = "/proc/sys/fs/binfmt_misc";
 const ROSETTA_TAG: &str = "rosetta";
 const ROSETTA_DIR: &str = "/run/rosetta";
 const QEMU: &str = "/usr/bin/qemu-x86_64";
+
+/// Set once [`setup`] has successfully registered an x86-64 binfmt_misc handler.
+static REGISTERED: OnceLock<Emulator> = OnceLock::new();
+/// Emulator requested on the kernel command line, recorded before setup is
+/// attempted so a failed registration is never mistaken for `amd64 = "off"`.
+static REQUESTED: OnceLock<Emulator> = OnceLock::new();
 
 /// An x86-64 ELF executable: class 64-bit, little endian, `e_type` EXEC or
 /// DYN, `e_machine` 0x3e. The mask ignores the OS ABI and padding bytes.
@@ -61,6 +69,7 @@ pub fn setup(cmdline: &str) -> io::Result<()> {
     let Some(emulator) = Emulator::from_cmdline(cmdline) else {
         return Ok(());
     };
+    let _ = REQUESTED.set(emulator);
     let interpreter = match emulator {
         Emulator::Rosetta => {
             sys::mount(
@@ -80,7 +89,86 @@ pub fn setup(cmdline: &str) -> io::Result<()> {
     fs::write(
         format!("{BINFMT_MISC}/register"),
         registration(emulator.name(), &interpreter),
+    )?;
+    let _ = REGISTERED.set(emulator);
+    Ok(())
+}
+
+/// Live status of x86-64 `binfmt_misc` emulation in the guest kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmulationStatus {
+    /// An emulator was registered at boot and both `binfmt_misc/status` and
+    /// the registered handler entry currently report `enabled`.
+    Enabled,
+    /// No emulator was requested on the kernel command line (`amd64 = "off"`).
+    Disabled,
+    /// An emulator was requested, but it failed to register at boot, its
+    /// handler is now missing or disabled, or `binfmt_misc` state could not be
+    /// read; callers must distinguish this from `amd64 = "off"`.
+    Unknown(String),
+}
+
+/// Query whether an x86-64 emulator was registered at boot and its
+/// `binfmt_misc` handler is currently enabled, distinguishing I/O errors or a
+/// missing/disabled handler (`Unknown`) from `amd64 = "off"` (`Disabled`).
+pub fn status() -> EmulationStatus {
+    status_from(
+        REQUESTED.get().copied(),
+        REGISTERED.get().copied(),
+        Path::new(BINFMT_MISC),
     )
+}
+
+fn status_from(
+    requested: Option<Emulator>,
+    registered: Option<Emulator>,
+    binfmt_dir: &Path,
+) -> EmulationStatus {
+    match (requested, registered) {
+        (_, Some(emu)) => binfmt_handler_status(binfmt_dir, emu.name()),
+        // Requested but registration failed at boot: not a user choice to turn
+        // emulation off, so callers must report unavailability rather than off.
+        (Some(req), None) => EmulationStatus::Unknown(format!(
+            "amd64 emulation ({}) was requested but failed to register at boot",
+            req.name()
+        )),
+        (None, None) => EmulationStatus::Disabled,
+    }
+}
+
+/// Live state of the handler registered at boot. Only `Enabled` or `Unknown`:
+/// a handler that was registered at boot and is now missing or disabled
+/// (e.g. removed by a `binfmt --uninstall` / `qemu-user-static --reset`
+/// container) is not the user turning emulation off in katamaran's config, so
+/// callers must report it as unavailable rather than `Disabled`.
+fn binfmt_handler_status(binfmt_dir: &Path, name: &str) -> EmulationStatus {
+    let read =
+        |path: &Path| fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()));
+    let status_path = binfmt_dir.join("status");
+    let global = match read(&status_path) {
+        Ok(s) => s,
+        Err(e) => return EmulationStatus::Unknown(e),
+    };
+    if global.trim() != "enabled" {
+        return EmulationStatus::Unknown(format!(
+            "{} reports {:?} although {name} was registered at boot",
+            status_path.display(),
+            global.trim()
+        ));
+    }
+    let handler_path = binfmt_dir.join(name);
+    let handler = match read(&handler_path) {
+        Ok(s) => s,
+        Err(e) => return EmulationStatus::Unknown(e),
+    };
+    match handler.lines().next().map(str::trim) {
+        Some("enabled") => EmulationStatus::Enabled,
+        other => EmulationStatus::Unknown(format!(
+            "{} reports {:?} although {name} was registered at boot",
+            handler_path.display(),
+            other
+        )),
+    }
 }
 
 /// `:name:M:offset:magic:mask:interpreter:flags`, with magic and mask
@@ -113,6 +201,12 @@ mod tests {
             Some(Emulator::Qemu)
         );
         assert_eq!(Emulator::from_cmdline("kat.amd64=off"), None);
+        let nowhere = Path::new("/nonexistent-binfmt");
+        assert_eq!(status_from(None, None, nowhere), EmulationStatus::Disabled);
+        assert!(matches!(
+            status_from(Some(Emulator::Rosetta), None, nowhere),
+            EmulationStatus::Unknown(_)
+        ));
     }
 
     #[test]
@@ -126,5 +220,79 @@ mod tests {
         assert_eq!(fields[5].len(), 20 * 4);
         assert_eq!(MAGIC.len(), MASK.len());
         assert!(MAGIC.iter().zip(MASK).all(|(m, k)| m & k == *m));
+    }
+
+    #[test]
+    fn checks_binfmt_handler_and_global_status() {
+        let dir = std::env::temp_dir().join(format!("kat-amd64-binfmt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Missing status and handler files after registration -> Unknown.
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Enabled global status and handler -> Enabled.
+        fs::write(dir.join("status"), "enabled\n").unwrap();
+        fs::write(
+            dir.join("rosetta"),
+            "enabled\ninterpreter /run/rosetta/rosetta\nflags: POCF\n",
+        )
+        .unwrap();
+        assert_eq!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Enabled
+        );
+        assert!(matches!(
+            binfmt_handler_status(&dir, "qemu-x86_64"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Handler disabled after registration -> Unknown (never Disabled).
+        fs::write(
+            dir.join("rosetta"),
+            "disabled\ninterpreter /run/rosetta/rosetta\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Global binfmt_misc disabled -> Unknown even if handler says enabled.
+        fs::write(dir.join("status"), "disabled\n").unwrap();
+        fs::write(
+            dir.join("rosetta"),
+            "enabled\ninterpreter /run/rosetta/rosetta\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Non-NotFound read failure (e.g. EISDIR) on handler -> Unknown (never Disabled).
+        fs::write(dir.join("status"), "enabled\n").unwrap();
+        fs::remove_file(dir.join("rosetta")).unwrap();
+        fs::create_dir(dir.join("rosetta")).unwrap();
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Non-NotFound read failure on global status -> Unknown (never Disabled).
+        fs::remove_file(dir.join("status")).unwrap();
+        fs::create_dir(dir.join("status")).unwrap();
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Nothing registered in this test process -> Disabled.
+        assert_eq!(status(), EmulationStatus::Disabled);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

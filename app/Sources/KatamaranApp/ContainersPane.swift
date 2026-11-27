@@ -10,7 +10,7 @@ final class ContainersPane: SectionPane {
 
     init(store: DockerStore, model: AppModel) {
         self.store = store
-        listVC = ContainerListViewController(store: store)
+        listVC = ContainerListViewController(store: store, model: model)
         detailVC = ContainerDetailViewController(store: store, model: model)
         listVC.onSelect = { [weak self] key in
             self?.detailVC.show(key: key)
@@ -74,6 +74,7 @@ final class ContainerNode: NSObject {
 @MainActor
 final class ContainerListViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
     private let store: DockerStore
+    private let model: AppModel
     private let outline = NSOutlineView()
     private let empty = EmptyStateView()
     private var roots: [ContainerNode] = []
@@ -88,8 +89,9 @@ final class ContainerListViewController: NSViewController, NSOutlineViewDataSour
 
     private static let collapsedKey = "collapsedProjects"
 
-    init(store: DockerStore) {
+    init(store: DockerStore, model: AppModel) {
         self.store = store
+        self.model = model
         collapsed = Set(UserDefaults.standard.stringArray(forKey: Self.collapsedKey) ?? [])
         super.init(nibName: nil, bundle: nil)
         store.observe { [weak self] _ in self?.reload() }
@@ -372,7 +374,10 @@ final class ContainerListViewController: NSViewController, NSOutlineViewDataSour
             let ports = c.publishedPorts
             if !ports.isEmpty { menu.addItem(.separator()) }
             for port in ports {
-                add("Open localhost:\(port)", "safari") { openLocalhost(port) }
+                let host = model.status?.portHost(proto: "tcp", port: port) ?? "localhost"
+                add("Open \(host):\(port)", "safari") { [weak self] in
+                    openForwardedPort(port, status: self?.model.status)
+                }
             }
             menu.addItem(.separator())
             add("Copy ID", "doc.on.doc") {
@@ -401,8 +406,9 @@ final class ClosureMenuItem: NSMenuItem {
 }
 
 @MainActor
-func openLocalhost(_ port: UInt16) {
-    if let url = URL(string: "http://localhost:\(port)") { NSWorkspace.shared.open(url) }
+func openForwardedPort(_ port: UInt16, status: DaemonStatus?) {
+    let url = status?.portURL(proto: "tcp", port: port) ?? URL(string: "http://localhost:\(port)")
+    if let url { NSWorkspace.shared.open(url) }
 }
 
 /// A project or container row: icon, name, a detail line and inline actions.

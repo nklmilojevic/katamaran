@@ -336,7 +336,7 @@ pub(crate) fn curl(url: &str, out: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn curl_text(url: &str) -> anyhow::Result<String> {
+pub(crate) fn curl_text(url: &str) -> anyhow::Result<String> {
     let out = Command::new("/usr/bin/curl")
         .args([
             "-fsSL",

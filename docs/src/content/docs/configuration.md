@@ -19,7 +19,7 @@ amd64 = "auto"
 kubernetes = false
 ```
 
-Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately).
+Edit settings with `kat config set` or the **Settings** window in the app, then run `kat restart` (changes to `launch_at_login` and `kubernetes` apply immediately; changes to `k8s_version`, `k8s_disable`, and `k8s_args` apply on the next Kubernetes start).
 
 Some settings, such as `nofile`, are not in the app's Settings window. Change them with the CLI or by editing `config.toml`:
 
@@ -28,7 +28,7 @@ kat config set nofile=65536
 kat restart
 ```
 
-`nofile` is only written to `config.toml` when it differs from the default. Before downgrading to a katamaran version without `nofile`, remove a custom `nofile` line, since older versions reject unknown keys.
+`nofile` is only written to `config.toml` when it differs from the default, and `disk_gib` is only written when explicitly set. Before downgrading to a katamaran version without `nofile` or `disk_gib`, remove any `nofile` or `disk_gib` line from `config.toml`, since older versions reject unknown keys (removing `disk_gib` leaves `~/.katamaran/data/data.img` intact).
 
 ## Settings keys
 
@@ -36,16 +36,23 @@ kat restart
 |---|---|---|---|
 | `cpus` | integer | All host cores | `1` to the number of host CPU cores |
 | `memory_mib` | integer | Half of host RAM, clamped to `2048` to `16384` | `1024` to `(host RAM - 2048)` MiB. `kat config set` also accepts `memory=8G` or `memory=4096M`. |
+| `disk_gib` | integer | `64` | `64` to `16384` GiB (16 TiB), checked on `config.toml` load. `kat config set` also accepts `disk=500G` or `disk=1T`. Growing only: `kat config set` and the app reject a target smaller than the current `data.img`; a lower in-range value edited directly in `config.toml` is accepted on load and leaves the larger `data.img` unchanged at startup. Omitted from `config.toml` unless explicitly set; remove any `disk_gib` line before downgrading to an older release without touching `data.img`. |
 | `mount` | boolean | `true` | `true`, `false`, `on`, `off`, `yes`, `no`, `1`, `0` |
 | `mount_path` | string (optional) | `~/Katamaran` (unset) | Any absolute path, or empty string to reset to default |
 | `launch_at_login` | boolean | `true` | Boolean |
 | `pause_on_sleep` | boolean | `false` | Boolean. Freezes vCPUs and adjusts virtual timer offsets across macOS sleep. |
-| `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to `127.0.0.1` on macOS. |
+| `auto_forward` | boolean | `true` | Boolean. Forwards unpublished container TCP ports to the configured `forward_addresses` on macOS. |
+| `forward_addresses` | list of IPv4 addresses | `["127.0.0.1"]` | Non-empty list of distinct IPv4 host addresses for forwarded TCP ports. This replaces the default list: include `127.0.0.1` explicitly to keep it, and assign aliases to `lo0` before forwarding starts. `kat config set` accepts addresses separated by commas or whitespace (`forward_addresses=127.0.0.1,172.16.1.200`); an empty value restores the default. Only written to `config.toml` when non-default; before rolling back to an older katamaran release without this key, reset it with `kat config set forward_addresses=""` — or remove the `forward_addresses` line from `config.toml` — because older releases reject unknown keys. See [Listen on lo0 aliases](/networking/#listen-on-lo0-aliases). |
 | `amd64` | string | `"auto"` | `"auto"`, `"rosetta"`, `"qemu"`, or `"off"` |
 | `kubernetes` | boolean | `false` | Boolean. Enables the optional single-node Kubernetes (`k3s`) cluster; applies immediately when the VM is running. |
+| `k8s_version` | string (optional) | Pinned build (unset) | A supported k3s release tag, `v1.31` or newer (for example `"v1.32.5+k3s1"`). To reset to the pinned build, remove the key from `config.toml` or run `kat config set k8s_version=default` (or `kat config set k8s_version=`). Applies at the next Kubernetes start. Before rolling back to an older katamaran release without `k8s_version`: (1) if you ran a custom k3s release, stop Kubernetes and disable auto-start (`kat k8s stop`, setting `kubernetes = false`) so the older daemon does not automatically start its pinned k3s build against the retained datastore; (2) clear the key with `kat config set k8s_version=default`, or, if you already rolled back, remove the `k8s_version` line (and set `kubernetes = false` if you have a custom k3s datastore) in `config.toml`, because older releases reject unknown keys and cannot start the VM until `k8s_version` is removed; (3) compare the retained datastore's k3s version against the destination katamaran release's pinned k3s before enabling Kubernetes again: use a supported sequential minor-upgrade path, restore a matching backup, or run `kat k8s reset` rather than skipping minors or downgrading in place. When upgrading an existing cluster from an older release (or after resetting and recreating a cluster on an older release), katamaran accepts it automatically when `server/db/state.db` shows it was last run by `v1.37.2+k3s1` (the only build older releases pinned); otherwise, follow [Migrating an unmarked cluster from an older katamaran release](/kubernetes/#migrating-an-unmarked-cluster-from-an-older-katamaran-release). See [Choose the k3s version](/kubernetes/#choose-the-k3s-version) for sequential minor upgrades, backup/restore, and reset options. |
+| `k8s_disable` | string array | `[]` | Bundled `k3s` components to disable (for example `["traefik"]`, or `kat config set k8s_disable=traefik,servicelb`). Passed as `--disable=<name>` on `k3s` start. Omitted from `config.toml` when empty; before rolling back to an older katamaran release without this key, clear it with `kat config set k8s_disable=""` (or remove the `k8s_disable` line from `config.toml`), because older releases reject unknown keys and cannot start the VM until it is removed. |
+| `k8s_args` | string array | `[]` | Extra CLI arguments appended to `k3s server` (in `kat config set`, space-separated with shell-style quoting; empty string clears). Applies on `k3s` start. Omitted from `config.toml` when empty; before rolling back to an older katamaran release without this key, clear it with `kat config set k8s_args=""` (or remove the `k8s_args` line from `config.toml`), because older releases reject unknown keys and cannot start the VM until it is removed. |
 | `nofile` | integer | `1048576` | `1024` to `1073741824`. Open-files limit (`RLIMIT_NOFILE`, soft and hard) set at guest boot, like `LimitNOFILE` in Docker Desktop. containerd, dockerd, and containers and pods inherit it unless they set their own (for example `docker run --ulimit nofile=...`). |
 
 `memory_mib` is an upper ceiling, not a fixed allocation. macOS allocates pages on demand as the guest touches them, and katamaran returns freed 64 KiB blocks back to macOS.
+
+`disk_gib` is also a sparse ceiling on APFS, not a pre-allocated file. Raising it extends `~/.katamaran/data/data.img` before the next VM start and expands the guest btrfs filesystem automatically at boot. Existing data is preserved, and unused space continues to be returned to macOS via `discard=async` and periodic `FITRIM`. Shrinking an existing `data.img` is not supported: `kat config set` and the app reject targets below the current image size, while a lower in-range value written manually to `config.toml` leaves the larger image unchanged at startup.
 
 ## State directory layout
 
@@ -54,15 +61,17 @@ All host state lives under `~/.katamaran` (or `$KATAMARAN_HOME`):
 | Path | Contents |
 |---|---|
 | `config.toml` | Saved configuration |
+| `k3s-config.yaml` | Optional user `k3s` configuration file (a [YAML subset](/kubernetes/#use-a-k3s-config-file-katamarank3s-configyaml)) validated and synced, normalized, to `/var/lib/katamaran/k3s/config.yaml` (mode `0600`, passed via `K3S_CONFIG_FILE`) when Kubernetes starts |
 | `data/data.img` | Sparse btrfs disk image for Docker, containerd, and LXC machines |
 | `run/docker.sock` | Docker Engine Unix socket relayed from the guest |
 | `run/daemon.sock` | Control socket used by the CLI and macOS app |
 | `run/k8s.sock` | Kubernetes control socket relayed to the guest |
 | `run/k8s-api.sock` | Kubernetes API server socket relayed from the guest |
 | `run/k8s-proxy.sock` | Plain-HTTP Kubernetes API socket relayed to the guest `kubectl proxy` (used by the macOS app) |
+| `run/vm-exec.sock` | Root shell and exec socket relayed to the Linux VM (`kat vm shell` / `kat vm exec`) |
 | `run/kubeconfig.yaml` | Generated kubeconfig for the single-node Kubernetes cluster |
 | `run/vm.json` | Generated VM launch configuration passed to `katamaran-vm` |
-| `cache/k3s/` | Cached and SHA-256 verified `k3s-arm64` binary downloaded on first Kubernetes start |
+| `cache/k3s/` | Cached and SHA-256 verified `k3s-arm64` binaries downloaded on first Kubernetes start, one directory per version |
 | `logs/` | Logs for `daemon`, `console`, `vm`, and `gvproxy` |
 | `ssh/` | Managed SSH host key, `known_hosts`, and `config` file |
 

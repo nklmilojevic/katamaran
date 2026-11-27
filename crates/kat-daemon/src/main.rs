@@ -23,6 +23,7 @@ mod sparse;
 mod ssh;
 mod state;
 mod vm;
+mod vm_cli;
 
 use std::path::PathBuf;
 
@@ -70,6 +71,15 @@ enum Command {
     /// Manage the optional single-node Kubernetes (k3s) cluster.
     #[command(subcommand, visible_alias = "kubernetes")]
     K8s(k8s_cli::K8sCmd),
+    /// Open a root shell or run commands inside the Linux VM itself.
+    #[command(subcommand)]
+    Vm(vm_cli::VmCmd),
+    /// Internal ordered blocking-output relay helper for `kat vm shell`/`exec`.
+    #[command(hide = true)]
+    VmIoRelay,
+    /// Internal stdin relay helper for `kat vm exec`.
+    #[command(hide = true)]
+    VmStdinRelay,
     /// Open a shell (or run a command) in a Linux machine.
     Shell(machine_cli::ShellArgs),
     /// SSH into a Linux machine through the katamaran SSH config.
@@ -90,8 +100,19 @@ enum Command {
     DebugBoot(boot::BootArgs),
 }
 
-fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+fn main() -> std::process::ExitCode {
+    // Fast-path the internal ordered I/O relay helper before clap parsing so
+    // it adds minimal startup overhead and never touches stdout/stderr (0/1/2).
+    match std::env::args_os()
+        .nth(1)
+        .as_deref()
+        .and_then(|a| a.to_str())
+    {
+        Some("vm-io-relay") => vm_cli::run_io_relay_helper(),
+        Some("vm-stdin-relay") => vm_cli::run_stdin_relay_helper(),
+        _ => {}
+    }
+    let res = match Cli::parse().command {
         Command::Start(args) => cli::start(args),
         Command::Stop => cli::stop(),
         Command::Restart(args) => cli::restart(args),
@@ -104,6 +125,9 @@ fn main() -> anyhow::Result<()> {
         Command::Uninstall(args) => setup::uninstall(args),
         Command::Machine(cmd) => machine_cli::machine(cmd),
         Command::K8s(cmd) => k8s_cli::run(cmd),
+        Command::Vm(cmd) => vm_cli::run(cmd),
+        Command::VmIoRelay => vm_cli::run_io_relay_helper(),
+        Command::VmStdinRelay => vm_cli::run_stdin_relay_helper(),
         Command::Shell(args) => machine_cli::shell(args),
         Command::Ssh(args) => machine_cli::ssh(args),
         Command::SshProxy => ssh::proxy(),
@@ -112,6 +136,17 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => run::run(args),
         Command::PackImage(args) => sparse::pack_cmd(args),
         Command::DebugBoot(args) => boot::debug_boot(args),
+    };
+    match res {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<k8s_cli::ReportedError>().is_some() => {
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            let _ =
+                std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("Error: {e:?}\n"));
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

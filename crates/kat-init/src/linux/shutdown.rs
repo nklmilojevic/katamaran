@@ -6,13 +6,15 @@
 //! 2. stop the NFS server;
 //! 3. stop dockerd, then containerd (SIGTERM, then SIGKILL on timeout);
 //! 4. SIGTERM every remaining process, then SIGKILL;
-//! 5. sync and unmount the data disk, so btrfs is clean;
+//! 5. detach leftover Kubernetes mounts, then sync and unmount the data
+//!    disk, so btrfs is clean;
 //! 6. power off (the caller).
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,20 +25,29 @@ use super::{DATA_MOUNTS, sys};
 /// Seconds Docker gives each container between SIGTERM and SIGKILL.
 const CONTAINER_STOP_SECS: u64 = 8;
 const CONTAINERS_TIMEOUT: Duration = Duration::from_secs(CONTAINER_STOP_SECS + 2);
-/// With dockerd's 10 s and containerd's 5 s, the worst case of the whole
-/// sequence is about 30 s; the host waits longer than that.
+/// Worst case of the whole sequence: up to `k8s::SHUTDOWN_K8S_BUDGET` (18 s,
+/// overlapping the container stop) for Kubernetes, then dockerd's 10 s and
+/// containerd's 5 s, the process sweep, and the sync — under the host's 45 s
+/// shutdown deadline. Keep new steps within that margin.
 const PROCESSES_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
     let t = Instant::now();
     // Machines halt in parallel with the containers; each has
     // `lxc::STOP_SECS` before it is killed.
+    // The k8s stop runs on its own thread and is waited for at most
+    // `SHUTDOWN_K8S_BUDGET`, so nothing in the guest Kubernetes service (a
+    // reset still holding its lock, a slow k3s exit, serial `ctr` cleanup)
+    // can delay the Docker stop, process sweep, or data-disk sync.
+    super::k8s::begin_shutdown();
+    let k8s_budget = Instant::now() + super::k8s::SHUTDOWN_K8S_BUDGET;
+    let (k8s_tx, k8s_rx) = std::sync::mpsc::channel();
     let k8s_stop = thread::Builder::new()
         .name("shutdown-k8s".into())
-        .spawn(|| {
+        .spawn(move || {
             let t = Instant::now();
             super::k8s::stop_for_shutdown();
-            t.elapsed()
+            let _ = k8s_tx.send(t.elapsed());
         });
     let machines = thread::Builder::new()
         .name("shutdown-machines".into())
@@ -53,19 +64,33 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
         nfs.stop();
     }
     match k8s_stop {
-        Ok(h) => {
-            if let Ok(took) = h.join() {
-                super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
+        Ok(_detached) => {
+            match k8s_rx.recv_timeout(k8s_budget.saturating_duration_since(Instant::now())) {
+                Ok(took) => {
+                    super::log(&format!("shutdown: k8s stopped in {} ms", took.as_millis()));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    super::k8s::abandon_shutdown_stop();
+                    super::log(&format!(
+                        "shutdown: k8s stop still running after {} s; cutting off Kubernetes cleanup and continuing",
+                        super::k8s::SHUTDOWN_K8S_BUDGET.as_secs()
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    super::k8s::abandon_shutdown_stop();
+                    super::log(
+                        "shutdown: k8s stop thread failed; leaving k3s to the process sweep",
+                    );
+                }
             }
         }
         Err(e) => {
-            super::log(&format!("shutdown: spawn k8s stop thread: {e}"));
-            let t = Instant::now();
-            super::k8s::stop_for_shutdown();
+            // Without a thread the stop could not be bounded: leave k3s to the
+            // process sweep rather than risk delaying the data-disk sync.
             super::log(&format!(
-                "shutdown: k8s stopped in {} ms",
-                t.elapsed().as_millis()
+                "shutdown: spawn k8s stop thread: {e}; leaving k3s to the process sweep"
             ));
+            super::k8s::abandon_shutdown_stop();
         }
     }
     match machines {
@@ -95,6 +120,7 @@ pub fn run(docker: Option<(&DockerStack, &Nfsd)>, system: bool) {
             let left = stop_processes(PROCESSES_TIMEOUT);
             format!("{left} killed")
         });
+        step("k8s mounts", super::k8s::detach_mounts_for_shutdown);
         step("data disk", || {
             unsafe { libc::sync() };
             unmount_data()
@@ -154,107 +180,8 @@ fn stop_containers(timeout: Duration) -> usize {
 }
 
 /// Connect to a Unix domain stream socket without blocking past `deadline`.
-fn connect_unix_until(path: &str, deadline: Instant) -> Option<UnixStream> {
-    let bytes = path.as_bytes();
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() {
-        return None;
-    }
-    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
-        *dst = src as libc::c_char;
-    }
-    let addr_len =
-        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
-
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-
-    loop {
-        let rem = deadline.checked_duration_since(Instant::now())?;
-        if rem.is_zero() {
-            return None;
-        }
-        let rc = unsafe {
-            libc::connect(
-                fd.as_raw_fd(),
-                (&addr as *const libc::sockaddr_un).cast(),
-                addr_len,
-            )
-        };
-        if rc == 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EAGAIN) => {
-                // On Linux, non-blocking AF_UNIX connect returns EAGAIN when
-                // the listener backlog is full; retry until deadline.
-                thread::sleep(rem.min(Duration::from_millis(10)));
-            }
-            Some(libc::EINPROGRESS) => {
-                loop {
-                    let rem = deadline.checked_duration_since(Instant::now())?;
-                    if rem.is_zero() {
-                        return None;
-                    }
-                    let mut pfd = libc::pollfd {
-                        fd: fd.as_raw_fd(),
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    let timeout_ms = rem.as_millis().min(i32::MAX as u128) as i32;
-                    let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-                    if prc < 0 {
-                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                        {
-                            continue;
-                        }
-                        return None;
-                    }
-                    if prc == 0 {
-                        return None;
-                    }
-                    break;
-                }
-                let mut so_err: libc::c_int = 0;
-                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                let grc = unsafe {
-                    libc::getsockopt(
-                        fd.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        (&mut so_err as *mut libc::c_int).cast(),
-                        &mut len,
-                    )
-                };
-                if grc < 0 || so_err != 0 {
-                    return None;
-                }
-                break;
-            }
-            _ => return None,
-        }
-    }
-
-    // Clear O_NONBLOCK so subsequent write/read calls honor SO_SNDTIMEO/SO_RCVTIMEO.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
-    {
-        return None;
-    }
-    Some(UnixStream::from(fd))
+pub(super) fn connect_unix_until(path: &str, deadline: Instant) -> Option<UnixStream> {
+    crate::unix_connect::connect_unix_until(Path::new(path), deadline).ok()
 }
 
 /// Send an HTTP/1.0 request without a body over the Docker socket, bounded by

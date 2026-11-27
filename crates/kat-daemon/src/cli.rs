@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -54,7 +55,7 @@ pub enum Source {
 pub enum ConfigCmd {
     /// Print one setting, or all of them.
     Get { key: Option<String> },
-    /// Change settings: `set cpus 2`, or `set cpus=2 memory=8G mount=off`.
+    /// Change settings: `set cpus 2`, `set cpus=2 memory=8G disk=200G mount=off`, or `set k8s_args="--debug"` (use `--` for bare hyphen-leading values: `set -- k8s_args --debug`).
     Set {
         #[arg(required = true, num_args = 1..)]
         pairs: Vec<String>,
@@ -155,6 +156,9 @@ fn start_with(args: StartArgs, recycled_stale: bool) -> anyhow::Result<()> {
                     t.elapsed().as_secs_f64(),
                     s.docker.socket.display()
                 );
+                if let Some(err) = &s.error {
+                    eprintln!("katamaran: warning: {err}");
+                }
                 return Ok(());
             }
             (_, DockerState::Failed) => {
@@ -265,7 +269,17 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         line("k8s", k);
     }
     if let Some(vm) = &s.vm {
-        let mut v = format!("{} CPUs · {} MiB", vm.cpus, vm.memory_mib);
+        let mut v = format!(
+            "{} CPUs · {} MiB · {} disk{}",
+            vm.cpus,
+            vm.memory_mib,
+            format_disk_bytes(vm.attached_disk_bytes()),
+            if vm.disk_resize_failed {
+                " (filesystem resize failed)"
+            } else {
+                ""
+            }
+        );
         if let Some(u) = &s.usage {
             v.push_str(&format!(
                 " · guest {:.0}% CPU, {}/{} MiB",
@@ -285,7 +299,12 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
     } else {
         line(
             "resources",
-            format!("{} CPUs · {} MiB", s.config.cpus, s.config.memory_mib),
+            format!(
+                "{} CPUs · {} MiB · {} GiB disk",
+                s.config.cpus,
+                s.config.memory_mib,
+                s.saved_disk_gib()
+            ),
         );
     }
     let files = match (&s.mount.path, s.mount.mounted, &s.mount.error) {
@@ -300,7 +319,18 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
         let ports: Vec<String> = s
             .ports
             .iter()
-            .map(|p| format!("{}/{}", p.port, p.proto))
+            .map(|p| {
+                if p.addresses.is_empty() || p.addresses == [std::net::Ipv4Addr::LOCALHOST] {
+                    format!("{}/{}", p.port, p.proto)
+                } else {
+                    format!(
+                        "{}:{}/{}",
+                        crate::net::addrs_label(&p.addresses),
+                        p.port,
+                        p.proto
+                    )
+                }
+            })
             .collect();
         line("ports", ports.join(", "));
     }
@@ -329,19 +359,41 @@ fn summary_for(s: &Status, cli_version: &str) -> String {
             ),
         );
     }
-    if let Some(vm) = &s.vm
-        && (vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib)
-    {
-        line(
-            "pending",
-            format!(
-                "{} CPUs · {} MiB after a restart",
-                s.config.cpus, s.config.memory_mib
-            ),
-        );
+    if let Some(vm) = &s.vm {
+        let attached_bytes = vm.attached_disk_bytes();
+        let explicit_disk = s.explicit_disk_target_gib();
+        let disk_pending = vm.disk_resize_failed
+            || explicit_disk.is_some_and(|target| {
+                (u64::from(target) << 30) > attached_bytes
+                    || vm.requested_disk_gib.is_none_or(|applied| target > applied)
+            });
+        if vm.cpus != s.config.cpus || vm.memory_mib != s.config.memory_mib || disk_pending {
+            let next_disk_bytes = explicit_disk.map_or(attached_bytes, |target| {
+                (u64::from(target) << 30).max(attached_bytes)
+            });
+            line(
+                "pending",
+                format!(
+                    "{} CPUs · {} MiB · {} disk after a restart",
+                    s.config.cpus,
+                    s.config.memory_mib,
+                    format_disk_bytes(next_disk_bytes)
+                ),
+            );
+        }
     }
     text.push_str(&out);
     text
+}
+
+fn format_disk_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        let tenths = (u128::from(bytes) * 10 / u128::from(GIB)) as u64;
+        format!("{}.{} GiB", tenths / 10, tenths % 10)
+    }
 }
 
 fn duration(secs: f64) -> String {
@@ -383,16 +435,110 @@ pub fn logs(args: LogsArgs) -> anyhow::Result<()> {
     }
 }
 
+const OFFLINE_DISK_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+enum ConfigTarget {
+    Daemon(Client),
+    Offline {
+        _config_lock: std::fs::File,
+        _disk_lock: Option<std::fs::File>,
+    },
+}
+
+/// Either connect to the running daemon or acquire the short-lived per-home
+/// config lock (and, for disk edits, the short-lived disk preparation lock).
+///
+/// Unlike `katamaran.lock` (held for a foreground VM's entire lifetime),
+/// `config.lock` and `disk.lock` are only held during config saves and
+/// host-side `data.img` preparation, so settings remain editable while an
+/// already-started foreground VM runs.
+fn connect_or_lock_offline(
+    home: &Path,
+    sock: &Path,
+    edits_disk: bool,
+    wait: Duration,
+) -> anyhow::Result<ConfigTarget> {
+    if let Ok(c) = Client::connect(sock) {
+        return Ok(ConfigTarget::Daemon(c));
+    }
+    let deadline = Instant::now() + wait;
+    loop {
+        let config_lock = config::lock_config(home)?;
+        if let Ok(c) = Client::connect(sock) {
+            return Ok(ConfigTarget::Daemon(c));
+        }
+        if !edits_disk {
+            return Ok(ConfigTarget::Offline {
+                _config_lock: config_lock,
+                _disk_lock: None,
+            });
+        }
+        if let Some(disk_lock) = config::try_lock_disk(home)? {
+            return Ok(ConfigTarget::Offline {
+                _config_lock: config_lock,
+                _disk_lock: Some(disk_lock),
+            });
+        }
+        // Release config.lock before waiting so unrelated config saves and
+        // daemon RPCs stay unblocked while disk preparation finishes.
+        drop(config_lock);
+        if Instant::now() >= deadline {
+            bail!(
+                "cannot change disk_gib while a VM is preparing its data disk; retry in a moment"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Apply `values` offline while holding `<home>/run/config.lock` (plus
+/// `<home>/run/disk.lock` when editing disk), or via daemon RPC if a daemon
+/// is listening.
+fn apply_config_set_at(
+    home: &Path,
+    sock: &Path,
+    values: std::collections::BTreeMap<String, String>,
+    k8s_opts_set: bool,
+    wait: Duration,
+) -> anyhow::Result<(bool, bool, Option<bool>)> {
+    let edits_disk = values.contains_key("disk") || values.contains_key("disk_gib");
+    match connect_or_lock_offline(home, sock, edits_disk, wait)? {
+        ConfigTarget::Daemon(mut c) => {
+            let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
+            let k8s_state = if k8s_opts_set && !v.k8s_toggled {
+                c.status().ok().map(|s| s.k8s.state)
+            } else {
+                None
+            };
+            let k8s_active = should_show_k8s_restart_hint(k8s_opts_set, &v, k8s_state.as_deref());
+            Ok((v.restart_required, k8s_active, None))
+        }
+        ConfigTarget::Offline {
+            _config_lock,
+            _disk_lock,
+        } => {
+            let mut cfg = config::Config::load(home)?;
+            let host = config::Host::current();
+            cfg.apply_values(&values, &host, home)?;
+            cfg.save(home)?;
+            let launch_at_login = values
+                .contains_key("launch_at_login")
+                .then_some(cfg.launch_at_login);
+            Ok((false, false, launch_at_login))
+        }
+    }
+}
+
 pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
     // Settings work without a daemon too; the file is the source of truth.
-    let daemon = Client::connect(&client::socket_path()?).ok();
+    let home = crate::state_dir()?;
+    let sock = client::socket_path()?;
     match cmd {
         ConfigCmd::Get { key } => {
-            let cfg = match daemon {
-                Some(mut c) => {
-                    serde_json::from_value::<ConfigView>(c.call(&Call::ConfigGet)?)?.config
-                }
-                None => config::Config::load(&crate::state_dir()?)?,
+            let cfg = match Client::connect(&sock).ok() {
+                Some(mut c) => serde_json::from_value::<ConfigView>(c.call(&Call::ConfigGet)?)?
+                    .resolved_config(),
+                None => config::Config::load(&home)?,
             };
             match key {
                 Some(k) => println!("{}", cfg.get(&k)?),
@@ -405,32 +551,37 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
         }
         ConfigCmd::Set { pairs } => {
             let values = parse_pairs(&pairs)?;
-            let restart = match daemon {
-                Some(mut c) => {
-                    let v: ConfigView = serde_json::from_value(c.call(&Call::ConfigSet(values))?)?;
-                    v.restart_required
-                }
-                None => {
-                    let home = crate::state_dir()?;
-                    let mut cfg = config::Config::load(&home)?;
-                    let host = config::Host::current();
-                    for (k, v) in &values {
-                        cfg.set(k, v, &host)?;
-                    }
-                    cfg.save(&home)?;
-                    if values.contains_key("launch_at_login") {
-                        crate::setup::set_run_at_load(cfg.launch_at_login, None)?;
-                    }
-                    false
-                }
-            };
+            // Settings that apply at the next Kubernetes start.
+            let k8s_opts_set = ["k8s_disable", "k8s_args", "k8s_version"]
+                .iter()
+                .any(|k| values.contains_key(*k));
+            let (restart, k8s_restart, launch_at_login) =
+                apply_config_set_at(&home, &sock, values, k8s_opts_set, OFFLINE_DISK_LOCK_WAIT)?;
+            if let Some(enabled) = launch_at_login {
+                crate::setup::set_run_at_load(enabled, None)?;
+            }
             println!("saved");
             if restart {
                 println!("`katamaran restart` applies it to the running VM");
             }
+            if k8s_restart {
+                println!(
+                    "`kat k8s stop && kat k8s start` applies Kubernetes changes to the running cluster"
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn should_show_k8s_restart_hint(
+    k8s_opts_set: bool,
+    view: &ConfigView,
+    k8s_state: Option<&str>,
+) -> bool {
+    // A start in progress may already have read the saved settings, so a
+    // starting cluster gets the hint too (at worst one unneeded restart).
+    k8s_opts_set && !view.k8s_toggled && matches!(k8s_state, Some("running" | "starting"))
 }
 
 /// `["cpus", "2"]` or `["cpus=2", "memory=8G"]`.
@@ -475,7 +626,7 @@ pub fn version() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::api::*;
-    use crate::config::Config;
+    use crate::config::WireConfig;
 
     #[test]
     fn parses_config_pairs() {
@@ -506,13 +657,19 @@ mod tests {
                 protocol: 3,
                 kernel: Some("6.18".into()),
             },
-            config: Config {
+            config: WireConfig {
                 cpus: 2,
-                ..Config::default()
+                ..WireConfig::default()
             },
+            disk_gib: Some(64),
+            disk_target_gib: None,
             vm: Some(VmInfo {
                 cpus: 4,
                 memory_mib: 4096,
+                disk_gib: 64,
+                disk_bytes: None,
+                requested_disk_gib: None,
+                disk_resize_failed: false,
                 pid: Some(2),
                 boot_ms: Some(100.0),
                 docker_ready_ms: Some(1500.0),
@@ -537,6 +694,7 @@ mod tests {
             ports: vec![Port {
                 proto: "tcp".into(),
                 port: 8080,
+                addresses: vec![std::net::Ipv4Addr::LOCALHOST],
             }],
             port_errors: vec![],
         };
@@ -546,20 +704,204 @@ mod tests {
         assert!(text.contains("guest 3% CPU, 500/3900 MiB"), "{text}");
         assert!(text.contains("/Users/me/Katamaran (mounted)"), "{text}");
         assert!(text.contains("8080/tcp"), "{text}");
+        assert!(text.contains("4 CPUs · 4096 MiB · 64 GiB disk"), "{text}");
         assert!(!text.contains("port err"), "{text}");
         assert!(text.contains("pending"), "{text}");
+
+        // Pending also triggers when only disk_gib changed.
+        let mut disk_pending = s.clone();
+        disk_pending.config.cpus = 4;
+        disk_pending.config.memory_mib = 4096;
+        disk_pending.disk_gib = Some(500);
+        disk_pending.disk_target_gib = Some(500);
+        let disk_text = summary(&disk_pending);
+        assert!(
+            disk_text.contains("4 CPUs · 4096 MiB · 500 GiB disk after a restart"),
+            "{disk_text}"
+        );
+
+        // Retaining a larger foreground-grown image reports 500 GiB attached
+        // without creating perpetual pending work when config stays unset.
+        let mut retained = s.clone();
+        retained.config.cpus = 4;
+        retained.config.memory_mib = 4096;
+        retained.disk_gib = Some(64);
+        retained.disk_target_gib = None;
+        retained.vm.as_mut().unwrap().disk_gib = 500;
+        retained.vm.as_mut().unwrap().requested_disk_gib = None;
+        let retained_text = summary(&retained);
+        assert!(
+            retained_text.contains("4 CPUs · 4096 MiB · 500 GiB disk"),
+            "{retained_text}"
+        );
+        assert!(
+            !retained_text.contains("pending"),
+            "retained larger disk must not show pending: {retained_text}"
+        );
+
+        // If another setting changes while retaining a larger disk, pending
+        // reports the effective 500 GiB disk size rather than claiming a shrink.
+        let mut retained_cpu = retained.clone();
+        retained_cpu.config.cpus = 2;
+        let retained_cpu_text = summary(&retained_cpu);
+        assert!(
+            retained_cpu_text.contains("2 CPUs · 4096 MiB · 500 GiB disk after a restart"),
+            "{retained_cpu_text}"
+        );
+
+        // If another setting changes while retaining a smaller custom image
+        // under default disk_gib, pending keeps the smaller 8 GiB size.
+        let mut retained_small = s.clone();
+        retained_small.config.cpus = 2;
+        retained_small.config.memory_mib = 4096;
+        retained_small.disk_gib = Some(64);
+        retained_small.disk_target_gib = None;
+        retained_small.vm.as_mut().unwrap().disk_gib = 8;
+        retained_small.vm.as_mut().unwrap().requested_disk_gib = None;
+        let retained_small_text = summary(&retained_small);
+        assert!(
+            retained_small_text.contains("2 CPUs · 4096 MiB · 8 GiB disk after a restart"),
+            "{retained_small_text}"
+        );
+
+        // Explicitly configuring disk=64G against an attached 8 GiB image
+        // shows pending growth to 64 GiB after a restart.
+        let mut explicit_small = s.clone();
+        explicit_small.config.cpus = 4;
+        explicit_small.config.memory_mib = 4096;
+        explicit_small.disk_gib = Some(64);
+        explicit_small.disk_target_gib = Some(64);
+        explicit_small.vm.as_mut().unwrap().disk_gib = 8;
+        explicit_small.vm.as_mut().unwrap().requested_disk_gib = None;
+        let explicit_small_text = summary(&explicit_small);
+        assert!(
+            explicit_small_text.contains("4 CPUs · 4096 MiB · 64 GiB disk after a restart"),
+            "{explicit_small_text}"
+        );
+
+        // Setting disk=100G on a running 100 GiB pre-padded image that booted
+        // without an explicit target flags pending filesystem-only growth;
+        // once restarted with requested_disk_gib = Some(100), pending clears.
+        let mut padded_100 = s.clone();
+        padded_100.config.cpus = 4;
+        padded_100.config.memory_mib = 4096;
+        padded_100.disk_gib = Some(100);
+        padded_100.disk_target_gib = Some(100);
+        padded_100.vm.as_mut().unwrap().disk_gib = 100;
+        padded_100.vm.as_mut().unwrap().disk_bytes = Some(100u64 << 30);
+        padded_100.vm.as_mut().unwrap().requested_disk_gib = None;
+        let padded_100_text = summary(&padded_100);
+        assert!(
+            padded_100_text.contains("4 CPUs · 4096 MiB · 100 GiB disk after a restart"),
+            "{padded_100_text}"
+        );
+        padded_100.vm.as_mut().unwrap().requested_disk_gib = Some(100);
+        assert!(
+            !summary(&padded_100).contains("pending"),
+            "{}",
+            summary(&padded_100)
+        );
+
+        // Raising an explicit target on a larger padded image (100G -> 150G on
+        // a 200 GiB backing image) flags pending, while lowering (150G -> 100G)
+        // or removing the target does not.
+        let mut padded_200 = s.clone();
+        padded_200.config.cpus = 4;
+        padded_200.config.memory_mib = 4096;
+        padded_200.disk_gib = Some(150);
+        padded_200.disk_target_gib = Some(150);
+        padded_200.vm.as_mut().unwrap().disk_gib = 200;
+        padded_200.vm.as_mut().unwrap().disk_bytes = Some(200u64 << 30);
+        padded_200.vm.as_mut().unwrap().requested_disk_gib = Some(100);
+        assert!(
+            summary(&padded_200).contains("4 CPUs · 4096 MiB · 200 GiB disk after a restart"),
+            "{}",
+            summary(&padded_200)
+        );
+        padded_200.vm.as_mut().unwrap().requested_disk_gib = Some(150);
+        padded_200.disk_gib = Some(100);
+        padded_200.disk_target_gib = Some(100);
+        assert!(
+            !summary(&padded_200).contains("pending"),
+            "{}",
+            summary(&padded_200)
+        );
+        padded_200.disk_gib = Some(64);
+        padded_200.disk_target_gib = None;
+        assert!(
+            !summary(&padded_200).contains("pending"),
+            "{}",
+            summary(&padded_200)
+        );
+
+        // A fractional 63.5 GiB image raised explicitly to 64 GiB still shows
+        // pending growth to 64 GiB (not masked by GiB ceil rounding).
+        let mut fractional = s.clone();
+        fractional.config.cpus = 4;
+        fractional.config.memory_mib = 4096;
+        fractional.disk_gib = Some(64);
+        fractional.disk_target_gib = Some(64);
+        fractional.vm.as_mut().unwrap().disk_gib = 64;
+        fractional.vm.as_mut().unwrap().disk_bytes = Some((63u64 << 30) + (512u64 << 20));
+        let fractional_text = summary(&fractional);
+        assert!(
+            fractional_text.contains("4 CPUs · 4096 MiB · 63.5 GiB disk"),
+            "{fractional_text}"
+        );
+        assert!(
+            fractional_text.contains("4 CPUs · 4096 MiB · 64 GiB disk after a restart"),
+            "{fractional_text}"
+        );
+        assert_eq!(format_disk_bytes((64u64 << 30) - 4096), "63.9 GiB");
+
+        // A guest resize failure keeps a restart pending even when the host
+        // image and applied target already match the saved target.
+        let mut resize_failed = s.clone();
+        resize_failed.config.cpus = 4;
+        resize_failed.config.memory_mib = 4096;
+        resize_failed.disk_gib = Some(500);
+        resize_failed.disk_target_gib = Some(500);
+        resize_failed.vm.as_mut().unwrap().disk_gib = 500;
+        resize_failed.vm.as_mut().unwrap().disk_bytes = Some(500u64 << 30);
+        resize_failed.vm.as_mut().unwrap().requested_disk_gib = Some(500);
+        assert!(
+            !summary(&resize_failed).contains("pending"),
+            "{}",
+            summary(&resize_failed)
+        );
+        resize_failed.vm.as_mut().unwrap().disk_resize_failed = true;
+        let resize_failed_text = summary(&resize_failed);
+        assert!(
+            resize_failed_text
+                .contains("4 CPUs · 4096 MiB · 500 GiB disk (filesystem resize failed)"),
+            "{resize_failed_text}"
+        );
+        assert!(
+            resize_failed_text.contains("4 CPUs · 4096 MiB · 500 GiB disk after a restart"),
+            "{resize_failed_text}"
+        );
+
         assert!(
             !text.contains("k8s"),
             "default disabled k8s should be omitted: {text}"
         );
 
         let mut with_port_err = s.clone();
+        with_port_err.ports.push(Port {
+            proto: "tcp".into(),
+            port: 8443,
+            addresses: vec![std::net::Ipv4Addr::new(172, 16, 1, 200)],
+        });
         with_port_err.port_errors.push(PortError {
             proto: "tcp".into(),
             port: 80,
             error: "address already in use".into(),
         });
         let err_text = summary(&with_port_err);
+        assert!(
+            err_text.contains("8080/tcp, 172.16.1.200:8443/tcp"),
+            "{err_text}"
+        );
         assert!(
             err_text.contains("port err   80/tcp (address already in use)"),
             "{err_text}"
@@ -581,5 +923,179 @@ mod tests {
             err.to_string().contains("kat setup"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn config_set_cli_accepts_hyphenated_k8s_args_and_preserves_help() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: ConfigCmd,
+        }
+
+        // Explicit `--` allows bare hyphen-leading values.
+        let w = Wrapper::try_parse_from(["config", "set", "--", "k8s_args", "--disable=traefik"])
+            .unwrap();
+        let ConfigCmd::Set { pairs } = w.cmd else {
+            panic!("expected ConfigCmd::Set");
+        };
+        let map = parse_pairs(&pairs).unwrap();
+        assert_eq!(
+            map.get("k8s_args").map(String::as_str),
+            Some("--disable=traefik")
+        );
+
+        // Inline `k8s_args=...` works directly without `--`.
+        let w2 = Wrapper::try_parse_from([
+            "config",
+            "set",
+            "k8s_args=--disable=traefik --debug",
+            "k8s_disable=traefik",
+        ])
+        .unwrap();
+        let ConfigCmd::Set { pairs } = w2.cmd else {
+            panic!("expected ConfigCmd::Set");
+        };
+        let map2 = parse_pairs(&pairs).unwrap();
+        assert_eq!(
+            map2.get("k8s_args").map(String::as_str),
+            Some("--disable=traefik --debug")
+        );
+        assert_eq!(map2.get("k8s_disable").map(String::as_str), Some("traefik"));
+
+        // `--help` after a setting still triggers Clap's help output.
+        let err = Wrapper::try_parse_from(["config", "set", "cpus=2", "--help"])
+            .err()
+            .expect("expected DisplayHelp");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn k8s_restart_hint_respects_actual_kubernetes_transition() {
+        let cfg = crate::config::Config {
+            kubernetes: true,
+            ..crate::config::Config::default()
+        };
+        let mut view = ConfigView {
+            config: WireConfig::from(&cfg),
+            disk_gib: None,
+            disk_target_gib: None,
+            path: "/tmp/config.toml".into(),
+            restart_required: false,
+            k8s_toggled: false,
+        };
+
+        // Running cluster receiving unchanged kubernetes=on + new k8s_disable shows the hint.
+        assert!(should_show_k8s_restart_hint(true, &view, Some("running")));
+        assert!(should_show_k8s_restart_hint(true, &view, Some("starting")));
+        assert!(!should_show_k8s_restart_hint(true, &view, Some("stopped")));
+        assert!(!should_show_k8s_restart_hint(false, &view, Some("running")));
+
+        // When kubernetes actually toggled (daemon starts or stops k3s), suppress the hint.
+        view.k8s_toggled = true;
+        assert!(!should_show_k8s_restart_hint(true, &view, Some("running")));
+    }
+
+    #[test]
+    fn offline_config_set_serializes_with_disk_prep_and_allows_edits_during_foreground_vm() {
+        use std::os::unix::net::UnixListener;
+
+        let home = std::env::temp_dir().join(format!("kat-cli-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let run_dir = home.join("run");
+        let data_dir = home.join("data");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let sock = run_dir.join(api::SOCKET_NAME);
+        let vm_lock_path = run_dir.join("katamaran.lock");
+
+        // Pre-existing 64 GiB image with saved target = 500 GiB.
+        std::fs::File::create(data_dir.join("data.img"))
+            .unwrap()
+            .set_len(64u64 << 30)
+            .unwrap();
+        let cfg = config::Config {
+            disk_gib: Some(500),
+            ..config::Config::default()
+        };
+        cfg.save(&home).unwrap();
+
+        // Hold katamaran.lock for the entire test to simulate a foreground
+        // `katamaran run` owning the home (no daemon.sock).
+        let _vm_lock = crate::run::lock(&vm_lock_path).expect("acquire katamaran.lock");
+
+        // 1. While startup disk preparation holds disk.lock (before extending
+        //    data.img), an offline disk shrink edit MUST fail.
+        let disk_prep_lock = config::lock_disk(&home).expect("acquire disk.lock");
+        let mut shrink = std::collections::BTreeMap::new();
+        shrink.insert("disk".into(), "200G".into());
+        let err = apply_config_set_at(
+            &home,
+            &sock,
+            shrink.clone(),
+            false,
+            Duration::from_millis(80),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("preparing its data disk"),
+            "unexpected err: {err:#}"
+        );
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, Some(500));
+
+        // 2. Unrelated offline config edits STILL succeed even while both
+        //    katamaran.lock and disk.lock are held.
+        let mut cpu_edit = std::collections::BTreeMap::new();
+        cpu_edit.insert("cpus".into(), "1".into());
+        apply_config_set_at(&home, &sock, cpu_edit, false, Duration::from_millis(80)).unwrap();
+        assert_eq!(config::Config::load(&home).unwrap().cpus, 1);
+
+        // 3. If a daemon binds daemon.sock while disk.lock is held,
+        //    connect_or_lock_offline switches over to Daemon(client).
+        let sock_for_thread = sock.clone();
+        let binder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let listener = UnixListener::bind(&sock_for_thread).unwrap();
+            let (_conn, _) = listener.accept().unwrap();
+        });
+        let target = connect_or_lock_offline(&home, &sock, true, Duration::from_secs(2)).unwrap();
+        assert!(matches!(target, ConfigTarget::Daemon(_)));
+        drop(target);
+        binder.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+
+        // 4. Once disk preparation finishes (extending data.img to 500 GiB and
+        //    releasing disk.lock) while the foreground VM STILL holds
+        //    katamaran.lock: unrelated edits continue working, shrink is
+        //    rejected against the 500 GiB image, and growing succeeds.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(data_dir.join("data.img"))
+            .unwrap()
+            .set_len(500u64 << 30)
+            .unwrap();
+        drop(disk_prep_lock);
+
+        let mut mount_edit = std::collections::BTreeMap::new();
+        mount_edit.insert("mount".into(), "off".into());
+        apply_config_set_at(&home, &sock, mount_edit, false, Duration::from_millis(80)).unwrap();
+        assert!(!config::Config::load(&home).unwrap().mount);
+
+        let err = apply_config_set_at(&home, &sock, shrink, false, Duration::from_millis(80))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot shrink"),
+            "unexpected err: {err:#}"
+        );
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, Some(500));
+
+        let mut grow = std::collections::BTreeMap::new();
+        grow.insert("disk".into(), "600G".into());
+        apply_config_set_at(&home, &sock, grow, false, Duration::from_millis(80)).unwrap();
+        assert_eq!(config::Config::load(&home).unwrap().disk_gib, Some(600));
+
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

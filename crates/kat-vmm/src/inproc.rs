@@ -121,18 +121,31 @@ mod tests {
     use super::*;
 
     /// Loads the real library if `cargo xtask gvproxy` built it, starts it,
+    /// verifies its `-services` API accepts `protocol: "unix"` exposes/unexposes
+    /// (the path `kat-daemon`'s `AddressesApi` uses for custom `forward_addresses`),
     /// and asks gVisor for the gateway's MAC: the reply comes back through
     /// the receive function and, with no guest attached, is counted as a
     /// drop. One start per process, so one test.
     #[test]
     fn starts_gvproxy_and_exchanges_frames_with_it() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let library = root.join("target/release/libgvproxy.dylib");
         if !library.is_file() {
+            let require = std::env::var_os("KATAMARAN_REQUIRE_GVPROXY")
+                .is_some_and(|v| !v.is_empty() && v != "0");
+            assert!(
+                !require,
+                "KATAMARAN_REQUIRE_GVPROXY is set but {} is missing: run `cargo xtask gvproxy`",
+                library.display()
+            );
             eprintln!("skipped: no {}", library.display());
             return;
         }
         let dir = std::env::temp_dir().join(format!("kat-inproc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let api = dir.join("api.sock");
         let args: Vec<String> = [
@@ -150,6 +163,66 @@ mod tests {
         let (net, starting) = start(&library, &args).unwrap();
         starting.wait().unwrap();
         assert!(api.exists(), "no services API socket");
+
+        let post = |path: &str, body: &str| -> String {
+            let mut s = UnixStream::connect(&api).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: gvproxy\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+            resp
+        };
+
+        // Verify the in-process services API accepts `protocol: "unix"`
+        // expose/unexpose (used by custom forward_addresses).
+        let fwd_sock = dir.join("fwd-8080.sock");
+        let expose_body = serde_json::json!({
+            "local": fwd_sock.to_str().unwrap(),
+            "remote": "tcp://192.168.127.2:8080",
+            "protocol": "unix",
+        })
+        .to_string();
+        let resp = post("/services/forwarder/expose", &expose_body);
+        assert!(resp.starts_with("HTTP/1.1 200 "), "expose failed: {resp:?}");
+        assert!(
+            fwd_sock.exists(),
+            "in-process gvproxy did not bind unix socket"
+        );
+        let conn = UnixStream::connect(&fwd_sock).expect("connect to exposed unix socket");
+        drop(conn);
+
+        let dup = post("/services/forwarder/expose", &expose_body);
+        assert!(
+            dup.starts_with("HTTP/1.1 500 ") && dup.contains("already running"),
+            "unexpected duplicate expose reply: {dup:?}"
+        );
+
+        let unexpose_body = serde_json::json!({
+            "local": fwd_sock.to_str().unwrap(),
+            "protocol": "unix",
+        })
+        .to_string();
+        let resp = post("/services/forwarder/unexpose", &unexpose_body);
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "unexpose failed: {resp:?}"
+        );
+        assert!(
+            !fwd_sock.exists(),
+            "in-process gvproxy left unix socket behind after unexpose"
+        );
+
+        let again_unexpose = post("/services/forwarder/unexpose", &unexpose_body);
+        assert!(
+            again_unexpose.starts_with("HTTP/1.1 500 ")
+                && again_unexpose.contains("proxy not found"),
+            "unexpected second unexpose reply: {again_unexpose:?}"
+        );
 
         let guest_mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
         let mut arp: Vec<u8> = Vec::new();

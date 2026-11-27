@@ -27,6 +27,21 @@ kat logs --source gvproxy -n 200
 
 Add `-f` to follow any stream live. Inside the guest, containerd, dockerd, and k3s also write to `/var/log/containerd.log`, `/var/log/dockerd.log`, and `/var/log/k3s.log`.
 
+## Open a root shell in the VM
+
+Unlike `kat shell` (which opens a Linux LXC machine), `kat vm shell` and `kat vm exec` run as `root` directly in the VM's own namespaces, even when Kubernetes is disabled:
+
+```sh
+kat vm shell
+kat vm exec -- sysctl fs.nr_open
+kat vm exec -- sh -c 'pid=$(pgrep -xo -P 1 containerd) || { echo "containerd is not running" >&2; exit 1; }; grep "open files" "/proc/$pid/limits"'
+kat vm exec -- tail -n 100 /var/log/containerd.log
+```
+
+`kat vm exec` does not allocate a PTY by default, so `stdout`, `stderr`, and exit codes behave cleanly in scripts. Pass `-t` to allocate a PTY for interactive tools such as `top`.
+
+If you upgraded katamaran while the VM was running and the CLI reports that the VM shell service is unavailable, run `kat restart` to start a VM with the new service.
+
 ## Measure boot stages
 
 If the VM starts slowly or fails during boot, run `katamaran debug-boot` to boot a throwaway VM and print per-stage timings:
@@ -89,7 +104,7 @@ umount -f ~/Katamaran
 
 ## Published or auto-forwarded port is unreachable
 
-1. Check that the service inside the container listens on `0.0.0.0` or `::`, not only `127.0.0.1`. Automatic port forwarding and `-p` only expose wildcard listeners.
+1. Check that the service inside the container listens on `0.0.0.0` or `::`, not only `127.0.0.1`. Automatic port forwarding and `-p` only expose wildcard listeners inside the container. (Publishing on the VM's loopback, as in `-p 127.0.0.1:8080:80`, is supported.)
 2. Check whether another macOS process already holds the same port on `127.0.0.1`:
 
 ```sh
@@ -124,10 +139,12 @@ kat logs --source console -n 200
 
 4. If a local image fails with `ErrImagePull`, run `kat k8s sync-images` and set `imagePullPolicy: IfNotPresent` (or `Never`) on the container spec.
 
-5. To wipe a broken cluster state without touching Docker containers or Linux machines, reset Kubernetes and start it again:
+5. To wipe a broken cluster state without touching Docker containers or Linux machines, reset Kubernetes and start it again (`kat k8s reset` keeps cached `k8s.io` images by default; add `--images` to clear them too):
 
 ```sh
 kat k8s reset
+# To also clear cached Kubernetes images, replace the preceding command with:
+# kat k8s reset --images
 kat k8s start
 ```
 

@@ -13,7 +13,7 @@ Enable and start Kubernetes from the command line:
 kat k8s start
 ```
 
-On the first start, katamaran downloads the pinned `k3s-arm64` binary into `~/.katamaran/cache/k3s/`, verifies its SHA-256 checksum, transfers it into the VM, enables CRI on the shared `containerd` daemon, and waits for the API server to become ready. Starting Kubernetes also sets `kubernetes = true` in `~/.katamaran/config.toml` so the cluster starts automatically on future VM boots.
+On the first start, katamaran downloads the selected `k3s-arm64` release (the pinned build by default; see [Choose the k3s version](#choose-the-k3s-version)) into `~/.katamaran/cache/k3s/`, verifies its SHA-256 checksum, transfers it into the VM, enables CRI on the shared `containerd` daemon, and waits for the API server to become ready. Starting Kubernetes also sets `kubernetes = true` in `~/.katamaran/config.toml` so the cluster starts automatically on future VM boots.
 
 You can also toggle Kubernetes immediately while the VM is running with `kat config set` or in the macOS app (**Settings > Kubernetes > Enable Kubernetes**, or the **Turn On** button in the **Pods** and **Services** views):
 
@@ -42,6 +42,73 @@ To wipe all cluster state, workloads, and persistent volumes and start fresh:
 ```sh
 kat k8s reset
 ```
+
+By default, `kat k8s reset` keeps cached images in containerd's `k8s.io` namespace so they remain available for reuse on the next cluster start (subject to each workload's `imagePullPolicy`). To also clear all images in `k8s.io` (for example, to benchmark cold starts or reproduce first-run image pulls) without touching Docker images in the `moby` namespace:
+
+```sh
+kat k8s reset --images
+```
+
+Note that when Kubernetes starts again (`kat k8s start`), local Docker images in `moby` are mirrored back into `k8s.io` by automatic image sync.
+
+## Choose the k3s version
+
+Each katamaran release pins a tested `k3s` build. To keep the local cluster on the same minor as production, set `k8s_version` to any [k3s release tag](https://github.com/k3s-io/k3s/releases) from `v1.31` on:
+
+```sh
+kat config set k8s_version=v1.32.5+k3s1
+kat config set k8s_version=default   # back to the pinned build
+```
+
+katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<version>/` and checks it against the SHA-256 in the same release's `sha256sum-arm64.txt`. That is an integrity check (it catches corrupted or truncated downloads); authenticity rests on HTTPS to GitHub. Only the pinned build is checked against a checksum built into katamaran. The new version is installed at the next Kubernetes start, so a running cluster picks it up after `kat k8s stop && kat k8s start` or `kat restart`.
+
+- **Upgrading while keeping cluster state:** follow the [K3s manual upgrade guide](https://docs.k3s.io/upgrades/manual): back up your cluster state first and upgrade one minor version at a time without skipping intermediate minors. Katamaran refuses to start a release that skips one or more minor versions against an existing datastore. Clearing `k8s_version` (`kat config set k8s_version=default`) selects the pinned release immediately on the next Kubernetes start rather than stepping through intermediate minors; if your cluster is more than one minor behind the pinned build, upgrade one minor at a time or reset the cluster first.
+- **Switching to an older minor (fresh cluster):** Kubernetes does not support minor-version downgrades against an existing datastore, and katamaran refuses to start an older minor against newer cluster data. To switch to an older minor with a fresh cluster:
+  1. Back up any cluster state or data you need.
+  2. Set the desired release tag (for example `kat config set k8s_version=v1.32.5+k3s1`).
+  3. Run `kat k8s reset` **before** the first start of that tag. This stops Kubernetes, deletes all cluster data, workloads, and persistent volumes, and disables auto-start.
+  4. Run `kat k8s start` to initialize the cluster on the selected release and re-enable auto-start.
+- **Backing up and restoring a SQLite datastore for rollback:** to roll back a minor upgrade while keeping pre-upgrade cluster state (see the [K3s rollback guide](https://docs.k3s.io/upgrades/roll-back)), note that a SQLite backup preserves Kubernetes API objects (including PV and PVC records) but **not** persistent-volume file contents. Take datastore, version-marker, and persistent-volume backups from the same stopped point in time:
+  1. **Before upgrading**, quiesce workloads and stop Kubernetes (`kat k8s stop`) so nothing writes to SQLite or persistent volumes. Back up:
+     - `/var/lib/katamaran/k3s/data/server/` (including `server/db/` and hidden files such as `server/db/.katamaran-k3s-version`) for cluster state and Kubernetes objects.
+     - `/var/lib/katamaran/k3s/data/.katamaran-version` for the cluster's `k3s` release tag. On a legacy cluster created before `.katamaran-version` existed, save the exact tag from the guest's `/var/lib/katamaran/k3s/bin/version` (verified to match the katamaran release that created and ran the cluster) alongside the backup so you can restore it as `.katamaran-version`. If both marker files are missing or you are unsure, do not guess: independently verify which `k3s` release created the datastore before relying on the backup for rollback.
+     - `/var/lib/katamaran/k3s/data/storage/` (where k3s's default `local-path` StorageClass stores volume files) and any custom persistent-volume or `hostPath` directories used by your workloads.
+  2. **To restore**, keep Kubernetes stopped (`kat k8s stop`) and restore from the same backup set:
+     - Move the current `/var/lib/katamaran/k3s/data/server/` aside (or delete it), then restore the complete backed-up `server/` directory, including hidden files. Never copy a backup over the live directory: files left by the newer release, such as `state.db-wal`, `state.db-shm`, or a newer `server/db/.katamaran-k3s-version` stamp, would mix with the restored data, and a leftover newer stamp makes katamaran refuse the restored cluster. A backup taken before the stamp existed must not inherit one from the installation being rolled back.
+     - Restore the matching `/var/lib/katamaran/k3s/data/.katamaran-version` file (from the backed-up `.katamaran-version`, or from the verified legacy `/var/lib/katamaran/k3s/bin/version` tag). Katamaran never infers a datastore's version from `/var/lib/katamaran/k3s/bin/version`: if `.katamaran-version` is missing on an existing datastore, it accepts the datastore only if `server/db/state.db` shows the node was last run by `v1.37.2+k3s1` (the build every pre-tracking katamaran release pinned), and still refuses minor downgrades or skipped-minor upgrades. Otherwise, record the independently verified tag from macOS with `kat k8s mark-version <version>` while the VM is running and Kubernetes is stopped (if the VM is stopped, disable Kubernetes auto-start with `kat config set kubernetes=off` and run `kat start` first).
+     - Restore the matching `/var/lib/katamaran/k3s/data/storage/` contents and any custom PV directories so volume files match the restored PV/PVC records.
+  3. Set `k8s_version` to the release tag from that backup (for example `kat config set k8s_version=v1.32.5+k3s1`) and run `kat k8s start`.
+
+  Do not change `/var/lib/katamaran/k3s/data/.katamaran-version` without restoring matching cluster data: mismatched metadata allows an older `k3s` binary to open a newer datastore and can corrupt cluster state.
+
+### Migrating an unmarked cluster from an older katamaran release
+
+Katamaran records the cluster's `k3s` release tag in `/var/lib/katamaran/k3s/data/.katamaran-version` and never falls back to `/var/lib/katamaran/k3s/bin/version`, so an unmarked restored datastore can never inherit an unrelated installed binary's version.
+
+Katamaran decides which `k3s` release last opened an existing datastore from three records, using the newest minor among those available:
+
+- `/var/lib/katamaran/k3s/data/.katamaran-version`, written before every launch.
+- `/var/lib/katamaran/k3s/data/server/db/.katamaran-k3s-version`, a copy written beside `state.db` before every launch (and, for a new cluster, as soon as `k3s` creates `server/db/`; startup fails if it cannot be written). It travels with any backup of `server/` or `server/db/`.
+- The node's `kubeletVersion` in `server/db/state.db`. A checkpointed database is read in place, read-only; a database with uncheckpointed WAL content is read from a private copy (up to 256 MiB) on the guest's `/run` tmpfs, so the live files are never opened for writing. It is a **best-effort** lower bound: when it can be read, data last run by a release that did not update the other two records still refuses a downgrade. When it cannot be read (for example a WAL copy over the limit), the version files alone decide.
+
+A node record alone is not proof of which control plane last opened the datastore: a newer `k3s` server can open the database and stop before its kubelet reports status. So when neither version file exists, katamaran accepts the datastore only if the node record is `v1.37.2+k3s1`, the only build that katamaran releases before version tracking ever ran. Tracking-enabled releases write `.katamaran-version` before launching `k3s` and the stamp before launching it against an existing `server/db/` (for a new cluster, as soon as `k3s` creates it), so a datastore without either file was last opened by a pre-tracking release, unless it was copied without them. This makes a normal upgrade from an older katamaran release automatic. An empty, non-regular, or malformed version file fails closed. Always back up `.katamaran-version` together with `server/`.
+
+If you return to this release after running the same datastore on an older katamaran release (which does not update either version file), check which `k3s` release that older release ran (its pinned build) before choosing `k8s_version`: select that release or one minor newer, or restore a matching backup before selecting an older minor. Do not rely on the node record alone to catch the downgrade.
+
+If the node record shows any other version, or katamaran cannot read it (for example after an incomplete initialization before the node registered, a corrupt or unreadable `state.db`, more than 256 MiB of database and uncheckpointed WAL, or an unmarked backup without a node record), startup fails closed rather than guessing from `/var/lib/katamaran/k3s/bin/version`. To migrate a datastore whose version you **know** independently (do not use this for an unknown backup restore, and never guess the version from whichever `k3s` binary is currently installed):
+
+1. Make sure the VM is running and Kubernetes is stopped:
+   - If the VM is already running (for example after upgrading when Kubernetes auto-start refused the unmarked datastore), run `kat k8s stop` if Kubernetes is still active.
+   - If the VM is stopped, disable Kubernetes auto-start first (`kat config set kubernetes=off`) so booting does not attempt to start Kubernetes, then start the VM (`kat start`).
+2. Independently verify the exact `k3s` release tag that last opened the datastore, for example from the backup's records or your cluster logs from before stopping.
+3. Record that exact verified tag from macOS using `kat k8s mark-version`:
+
+   ```sh
+   kat k8s mark-version v1.36.4+k3s1
+   ```
+
+   `kat k8s mark-version` validates the release tag, requires the VM to be running with Kubernetes stopped and an existing unmarked datastore to be present, writes `/var/lib/katamaran/k3s/data/.katamaran-version` inside the VM, refuses to overwrite any existing marker, refuses when the version is already known (a `server/db/.katamaran-k3s-version` stamp exists, or the node record is `v1.37.2+k3s1`), refuses a lower minor than `state.db` already records, and never infers the version from `/var/lib/katamaran/k3s/bin/version`.
+4. Start Kubernetes (`kat k8s start`) with a compatible `k8s_version` (same minor or one minor newer). This also re-enables Kubernetes auto-start — or run `kat k8s reset` if you prefer to start fresh instead of migrating.
 
 ## Connect with `kubectl`
 
@@ -89,6 +156,27 @@ containers:
     imagePullPolicy: IfNotPresent
 ```
 
+### amd64-only images
+
+Docker runs `linux/amd64` images under Rosetta (or qemu), but Kubernetes's image service (containerd's CRI) only accepts images for the node's own platform, `linux/arm64`, with no configuration option to add fallback platforms. An image that only has a `linux/amd64` manifest locally would otherwise be invisible to kubelet, which then tries to pull it and fails with `no match for platform in manifest`.
+
+When x86-64 emulation is on (`amd64 = "auto"`, `"rosetta"`, or `"qemu"`), the image sync handles this automatically: if a Docker image has `linux/amd64` locally and no native `linux/arm64` variant locally (including amd64-only images, `docker build --platform linux/amd64`, or `docker pull --platform linux/amd64`), katamaran mirrors it into `k8s.io` with the image config's `architecture` set to `arm64`, so kubelet accepts it. The layers are not changed, so the binaries stay x86-64 and run under emulation, the same as with `docker run` (`uname -m` in the pod prints `x86_64`):
+
+```sh
+docker pull --platform linux/amd64 my-amd64-only-app:dev
+kat k8s sync-images
+kubectl run app --image=my-amd64-only-app:dev --image-pull-policy=IfNotPresent
+```
+
+Direct registry pulls by kubelet without mirroring from Docker still require a `linux/arm64` manifest because containerd's CRI cannot be configured to pull `linux/amd64` on an `arm64` node. Only tagged local Docker images (`repo:tag`) are rewritten: digest-pinned references (`repo@sha256:...`) are never rewritten under their original digest because rewriting changes the manifest digest. To run a digest-pinned amd64 image in a pod, tag it locally first (`docker tag my-amd64-app@sha256:... my-amd64-app:dev`), sync, and reference the local tag in your pod spec with `imagePullPolicy: IfNotPresent` (or `Never`). The mirrored copy has a different image ID from the Docker image because its config changed. Images that have a `linux/arm64` variant locally are mirrored unchanged, and kubelet uses the native variant. With `amd64 = "off"`, amd64-only images are not mirrored and the sync reports each one while keeping any existing Kubernetes copy.
+
+katamaran never deletes an image from Kubernetes on its own. It only ever *replaces* an image it published itself (an emulated mirror of the same Docker tag) with a newer one, and every other case leaves the Kubernetes image in place:
+
+- Turning emulation off, or removing an image from Docker, keeps its Kubernetes copy, so running pods keep working.
+- If Kubernetes already has a different image under the same name that katamaran did not publish, the sync leaves it untouched and reports the conflict. Examples: one pulled with `ctr` or by kubelet, a native mirror of an older build, or an amd64 copy mirrored unchanged by an earlier katamaran release. To resolve it, give the Docker image a different local name (`docker tag my-app:dev my-app:dev-amd64 && docker rmi my-app:dev`) and use that name in your pod spec.
+- If a Docker tag is moved to an image katamaran cannot mirror (no `linux/arm64` or `linux/amd64` variant), Kubernetes keeps the previous build under that tag and the sync reports it.
+- If the emulator fails to register at boot, or its `binfmt_misc` handler is later removed or disabled, amd64 images are not mirrored until the next start, and the sync reports each one; native images keep syncing.
+
 ## Services, Ingress DNS, and port forwarding
 
 ### NodePort and LoadBalancer services
@@ -100,6 +188,8 @@ kubectl create deployment web --image=nginx:alpine
 kubectl expose deployment web --type=LoadBalancer --port=8080 --target-port=80
 curl http://127.0.0.1:8080/
 ```
+
+To reach these TCP ports on a `lo0` alias, add the alias to `forward_addresses`. The Mac listener addresses come from that setting, not the Service's `externalIPs` or `loadBalancerIP`. See [Listen on lo0 aliases](/networking/#listen-on-lo0-aliases).
 
 Internal Kubernetes control-plane ports (`6443`, `6444`, `10250`, `10256`, `10257`, `10259`) are excluded from general port forwarding; the API server uses its dedicated relay.
 
@@ -135,8 +225,72 @@ If `--local` is omitted, katamaran binds the same port number on `127.0.0.1`.
 
 ## Storage and host paths
 
-- **Cluster data**: `k3s` stores its state and `local-path` persistent volumes under `/var/lib/katamaran/k3s/data` on the VM's btrfs `data.img` disk (as a btrfs subvolume when supported, making `kat k8s reset` fast).
+- **Cluster data**: `k3s` stores its state and `local-path` persistent volumes under `/var/lib/katamaran/k3s/data` on the VM's btrfs `data.img` disk (as a btrfs subvolume when supported, making `kat k8s reset` fast). Container images live separately in containerd's shared store (`/var/lib/containerd`) under the `k8s.io` namespace, so `kat k8s reset` keeps them unless `--images` is passed.
 - **Host directories**: Because katamaran mounts `/Users` into the VM at the same path, Kubernetes `hostPath` volumes pointing to directories under `/Users` access your macOS files directly.
+
+## Customize `k3s` server flags and config
+
+You can disable bundled `k3s` components (such as Traefik when installing your own ingress controller), pass extra `k3s server` flags, or supply a `k3s` YAML config file:
+
+### Disable bundled components (`k8s_disable`)
+
+```sh
+kat config set k8s_disable=traefik
+# Disable multiple components:
+kat config set k8s_disable=traefik,servicelb
+# Re-enable all bundled components:
+kat config set k8s_disable=""
+```
+
+Each entry is passed to `k3s server` as `--disable=<name>` and stored in `~/.katamaran/config.toml` as `k8s_disable = ["traefik"]`.
+
+### Pass extra `k3s server` flags (`k8s_args`)
+
+Set `k8s_args` in `~/.katamaran/config.toml`:
+
+```toml
+k8s_args = [
+  "--disable=traefik",
+  "--kube-apiserver-arg=service-node-port-range=30000-32767",
+]
+```
+
+Or via `kat config set` (space-separated, supporting single/double quotes; use `k8s_args="..."` or `--` before bare hyphen-leading values):
+
+```sh
+kat config set k8s_args="--kube-apiserver-arg=audit-log-path=- --debug"
+kat config set -- k8s_args --debug
+kat config set k8s_args=""
+```
+
+`k8s_args` (and `~/.katamaran/k3s-config.yaml`) accept only `k3s server` settings that cannot conflict with how Katamaran runs the guest cluster: logging (`--debug`, `-v`, `--vmodule`, `--log`, `--alsologtostderr`), component arguments (`--kube-apiserver-arg`, `--kube-scheduler-arg`, `--kube-controller-manager-arg`, `--kube-cloud-controller-manager-arg`, `--kubelet-arg`, `--kube-proxy-arg`, `--helm-controller-arg`, `--etcd-arg`), `--disable`, `--disable-cloud-controller`, `--disable-helm-controller`, `--disable-network-policy`, `--disable-default-registry-endpoint`, `--node-label`, `--node-taint`, `--tls-san`, `--tls-san-security`, `--service-node-port-range`, `--cluster-domain`, `--default-local-storage-path`, `--secrets-encryption`, `--secrets-encryption-provider`, `--system-default-registry`, `--private-registry`, `--pause-image`, `--egress-selector-mode`, `--servicelb-namespace`, `--protect-kernel-defaults`, `--enable-pprof`, `--supervisor-metrics`, `--image-credential-provider-bin-dir`, `--image-credential-provider-config`, `--helm-job-image`, `--nonroot-devices`, the `*-file` token flags (`--token-file`, `--agent-token-file`), and embedded etcd and snapshot settings (`--cluster-init`, `--etcd-disable-snapshots`, `--etcd-expose-metrics`, `--etcd-snapshot-*`, `--etcd-s3*`). `kat k8s reset` wipes all of `/var/lib/katamaran/k3s/data`, **including default local etcd snapshots** stored under `/var/lib/katamaran/k3s/data/server/db/snapshots`; it preserves only snapshots stored outside that directory (`--etcd-snapshot-dir` set to a path outside `/var/lib/katamaran/k3s/data`, or S3) and `local-path` volumes moved elsewhere with `--default-local-storage-path`. Copy any local backup you need for recovery out of `/var/lib/katamaran/k3s/data` before running `kat k8s reset`. Other flags — those Katamaran sets itself, depends on, or intentionally excludes for a single-node local cluster, such as `--data-dir`, `--write-kubeconfig*`, `--https-listen-port`, `--bind-address`, `--node-name`, `--with-node-id`, `--cluster-cidr`, `--service-cidr`, `--flannel-backend`, `--container-runtime-endpoint`, `--disable-kube-proxy`, `--disable-apiserver`, `--server`, `--config`, `--embedded-registry`, external datastore flags (`--datastore-*`), and experimental VPN flags (`--vpn-auth*`) — are rejected, and `kat config set` refuses them before saving. Component arguments that would override a Katamaran-managed setting or expose inline credentials in `/var/log/k3s.log` are rejected in both `k8s_args` and `k3s-config.yaml`: `--kubelet-arg` `root-dir`, `container-runtime-endpoint`, `image-service-endpoint`, `hostname-override`, `cluster-dns`, `fail-swap-on` (reserved because the VM uses zram swap), `node-ip`, `resolv-conf`, `kubeconfig`, `bootstrap-kubeconfig`, `cert-dir`, `tls-cert-file`, `tls-private-key-file`, `client-ca-file`, `address`, `port`, `config`, `config-dir`, and `manifest-url-header`/`manifest-url` (inline manifest credentials would be logged at info level by k3s); `--kube-proxy-arg` `proxy-mode`, `cluster-cidr`, `hostname-override`, `kubeconfig`, `master`, `healthz-bind-address`, `healthz-port`, `config`, `write-config-to`; `--kube-apiserver-arg` `secure-port`, `bind-address`, `advertise-address`, `advertise-port`, `service-cluster-ip-range`, `cert-dir`, `tls-cert-file`, `tls-private-key-file`, `client-ca-file`, `storage-backend`, `etcd-*`, `kubelet-client-*`, `kubelet-certificate-authority`, `proxy-client-*`, `requestheader-client-ca-file`, `service-account-*`; `--kube-controller-manager-arg` `cluster-cidr`, `service-cluster-ip-range`, `allocate-node-cidrs`, `*kubeconfig`, `master`, `bind-address`, `secure-port`, `tls-*`, `root-ca-file`, `service-account-private-key-file`; `--kube-scheduler-arg` `*kubeconfig`, `master`, `bind-address`, `secure-port`, `tls-*`, `config`, `write-config-to`; `--kube-cloud-controller-manager-arg` `*kubeconfig`, `master`, `cluster-cidr`, `allocate-node-cidrs`, `bind-address`, `secure-port`; `--helm-controller-arg` `kubeconfig`, `master-url`, `node-name`; and `--etcd-arg` `data-dir`, `wal-dir`, `config-file`, cluster/listen/advertise URLs, and TLS settings. Other component arguments are passed through unchecked. Settings that can carry credentials (`token`, `agent-token`, `etcd-s3-access-key`, `etcd-s3-secret-key`, `etcd-s3-session-token`, and `etcd-s3-proxy`) are accepted only in `~/.katamaran/k3s-config.yaml` (synced to the guest with mode `0600`), not in `k8s_args`: besides appearing on the `k3s server` process command line, `k3s --debug` logs the raw CLI argument vector to `/var/log/k3s.log`. Alternatively use the file-reference flags `--token-file` and `--agent-token-file`.
+
+### Use a `k3s` config file (`~/.katamaran/k3s-config.yaml`)
+
+If `~/.katamaran/k3s-config.yaml` (or `$KATAMARAN_HOME/k3s-config.yaml`) exists on your Mac, katamaran validates it when Kubernetes starts (before downloading or launching `k3s`), writes an equivalent normalized copy to `/var/lib/katamaran/k3s/config.yaml` (mode `0600`) inside the guest, and selects it with `K3S_CONFIG_FILE` before starting `k3s server`. While the host file exists, `k3s` reads only that managed copy, so a manually managed `/etc/rancher/k3s/config.yaml` inside the guest is not loaded. If you later remove the host file, katamaran removes only the managed copy, and `k3s` goes back to the guest's own `/etc/rancher/k3s/config.yaml`, which katamaran never modifies:
+
+```yaml
+disable:
+  - traefik
+kube-apiserver-arg:
+  - "service-node-port-range=30000-32767"
+```
+
+For scalar settings, Katamaran's CLI flags take precedence over the synced YAML config. For repeatable flags such as `kubelet-arg`, `k3s` reads the YAML entries first and then appends CLI entries. A repeated key replaces the earlier value and a `key+:` entry appends to it, as in `k3s`; the `+` suffix does not append to CLI flags.
+
+katamaran accepts a well-defined subset of YAML, which covers ordinary `k3s` configs, and rejects anything else with an error naming the line (never the value):
+
+- One `key: value` per line at the start of the line, with `#` comments and an optional leading `---`. Keys are plain `k3s` flag names, optionally ending in `+`.
+- A value is a single-line scalar, a single-line list (`[a, "b"]`), or a list of single-line scalars written as `- item` lines.
+- Scalars are unquoted, `'single-quoted'` (`''` for a literal `'`), or `"double-quoted"` without backslash escapes. Quote values that YAML would otherwise read as a boolean, number or date — such as `yes`, `on`, `0644`, `1e3` or `2024-01-01`. Unquoted `true`, `false`, whole numbers and `null`/`~`/empty values are fine.
+- Not supported: anchors and aliases (`&`, `*`), tags (`!!str`), merge keys (`<<`), directives, multiple documents, block scalars (`|`, `>`), multi-line values, nested or inline (`{}`) mappings, and tab characters.
+- Only the `k3s` settings listed for `k8s_args` above are accepted, plus the credential settings, which belong here.
+
+These limits exist because `k3s` writes some YAML and URL parsing errors, including the offending value, to `/var/log/k3s.log`. Validating a well-defined subset and handing `k3s` a normalized copy keeps such values, for example `etcd-s3-proxy` URLs with embedded credentials, out of the log. For the same reason, `etcd-s3-proxy` must be `none` or a valid URL with a scheme, a host and, if given, a port from 1 to 65535, `etcd-s3-endpoint` must be a `host` or `host:port` without a scheme, path, or credentials, and katamaran refuses to start Kubernetes if a `/var/lib/katamaran/k3s/config.yaml.d` drop-in directory exists in the guest.
+
+Changes to `k8s_disable`, `k8s_args`, or `k3s-config.yaml` apply the next time Kubernetes starts (no VM restart is needed once the VM is running a guest initramfs that supports them; if a VM was booted from an older guest initramfs, update or rebuild the guest image and run `kat restart` first). For a running cluster, use `kat k8s stop && kat k8s start`. If disabling Traefik leaves Gateway API CRDs or admission policies behind, inspect and clean up the leftover resources separately. Use `kat k8s reset` only if you intend to wipe **all cluster state, workloads, persistent volumes, and default local etcd snapshots** under `/var/lib/katamaran/k3s/data` (only snapshots stored outside that directory via `--etcd-snapshot-dir` or in S3, and `local-path` volumes moved elsewhere with `--default-local-storage-path`, are preserved; copy any local backup you need for recovery out before resetting).
+
+Before rolling back to an older katamaran release that predates `k8s_disable` and `k8s_args`, clear both keys with `kat config set k8s_disable="" k8s_args=""` (or remove those lines from `~/.katamaran/config.toml`), because older releases reject unknown keys and cannot start the VM until they are removed.
 
 ## Cluster defaults
 

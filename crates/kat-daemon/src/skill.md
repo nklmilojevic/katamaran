@@ -55,25 +55,27 @@ Manage the optional single-node `k3s` cluster inside the VM (off by default, zer
 ```sh
 kat k8s start                             # Enable and start k3s (downloads on first use)
 kat k8s status [--json]                   # Cluster state, API endpoint, context, DNS
-kat k8s sync-images                       # Mirror local Docker images into k3s
+kat k8s sync-images                       # Mirror local Docker images into k3s (amd64-only images require emulation enabled)
 kat k8s kubeconfig [--path]               # Print kubeconfig YAML or file path
 kat k8s dns status|install|uninstall      # Manage *.k8s.kat.local DNS on macOS
 kat k8s forward <ip>:<port> [--local P]   # Forward a local TCP port to a Pod/Service IP
 kat k8s stop                              # Stop k3s and disable auto-start
-kat k8s reset                             # Stop k3s and wipe cluster state and volumes
+kat k8s reset [--images]                  # Stop k3s and wipe state/volumes (--images also clears k8s.io images)
+kat k8s mark-version <version>            # Record verified k3s tag for an unmarked datastore
 ```
 
 ## Configuration
 
-Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`), except `launch_at_login` and `kubernetes`, which apply immediately.
+Settings live in `~/.katamaran/config.toml` and take effect on the next VM start (`kat restart`), except `launch_at_login` and `kubernetes`, which apply immediately, and `k8s_version` / `k8s_disable` / `k8s_args` (plus optional `~/.katamaran/k3s-config.yaml`), which apply when Kubernetes starts.
 
 ```sh
 kat config get
-kat config set cpus=8 memory=12G pause_on_sleep=on
+kat config set cpus=8 memory=12G disk=500G pause_on_sleep=on
+kat config set k8s_disable=traefik
 kat restart
 ```
 
-Keys: `cpus`, `memory_mib` (`memory=8G`), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `nofile` (open-files limit for containers, default `1048576`).
+Keys: `cpus`, `memory_mib` (`memory=8G`), `disk_gib` (`disk=500G` or `disk=1T`, grow-only), `amd64` (`auto|rosetta|qemu|off`), `auto_forward`, `forward_addresses` (`127.0.0.1,172.16.1.200`; replaces the `127.0.0.1` default for TCP forwards; aliases must be on `lo0`, empty resets), `mount`, `mount_path`, `launch_at_login`, `pause_on_sleep`, `kubernetes`, `k8s_version` (`v1.31+` k3s release tag such as `v1.32.5+k3s1`, `default` or empty via `config set` / omit in `config.toml` for the pinned build; applies at the next Kubernetes start), `k8s_disable`, `k8s_args`, `nofile` (open-files limit for containers, default `1048576`).
 
 ## Files in Finder
 
@@ -91,6 +93,11 @@ kat logs -f               # Follow daemon log
 kat logs --console        # Linux guest console log
 kat logs --source vm      # VMM (katamaran-vm) log
 kat logs --source gvproxy # Networking log
+kat vm shell              # Interactive root shell in the VM's own namespaces
+kat vm exec -- <cmd>      # Run a command as root in the VM (separate stdout/stderr)
+kat vm exec -n -- <cmd>   # Same, without forwarding stdin (use inside `while read` loops)
 ```
+
+`kat vm shell` and `kat vm exec` enter the Linux VM itself (unlike `kat shell`, which enters an LXC machine), so you can inspect `containerd`, `dockerd`, `k3s`, sysctls, rlimits, and `/var/log/*` directly even when Kubernetes is off.
 
 If `docker` cannot reach katamaran, check `kat status`, `docker context ls`, and whether `DOCKER_HOST` is overriding the active context.

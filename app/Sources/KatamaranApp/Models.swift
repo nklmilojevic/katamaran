@@ -10,6 +10,8 @@ struct DaemonStatus: Decodable, Equatable {
     var daemon: DaemonInfo
     var versions: Versions
     var config: Config
+    var disk_gib: Int? = nil
+    var disk_target_gib: Int? = nil
     var vm: VmInfo?
     var usage: Sample?
     var docker: DockerInfo
@@ -38,16 +40,20 @@ struct Config: Codable, Equatable {
     var mount_path: String?
     var launch_at_login: Bool
     var kubernetes: Bool? = nil
+    var disk_gib: Int? = nil
 }
 
 struct ConfigView: Decodable {
     var config: Config
+    var disk_gib: Int? = nil
+    var disk_target_gib: Int? = nil
     var restart_required: Bool
 }
 
 struct VmInfo: Decodable, Equatable {
     var cpus: Int
     var memory_mib: Int
+    var disk_gib: Int? = nil
     var pid: UInt32?
     var boot_ms: Double?
     var docker_ready_ms: Double?
@@ -106,6 +112,7 @@ struct MountInfo: Decodable, Equatable {
 struct Port: Decodable, Equatable, Hashable {
     var proto: String
     var port: UInt16
+    var addresses: [String]? = nil
 }
 
 struct PortError: Decodable, Equatable, Hashable {
@@ -115,6 +122,50 @@ struct PortError: Decodable, Equatable, Hashable {
 }
 
 extension DaemonStatus {
+    /// Preferred Mac host for opening a forwarded port in the browser:
+    /// `"localhost"` when `127.0.0.1` is bound (or when no address list is
+    /// reported), otherwise the port's first bound alias address.
+    func portHost(proto: String = "tcp", port: UInt16) -> String {
+        guard let addrs = ports.first(where: {
+            $0.port == port && $0.proto.caseInsensitiveCompare(proto) == .orderedSame
+        })?.addresses, !addrs.isEmpty else {
+            return "localhost"
+        }
+        if addrs.contains("127.0.0.1") {
+            return "localhost"
+        }
+        return addrs[0]
+    }
+
+    func portURL(proto: String = "tcp", port: UInt16) -> URL? {
+        URL(string: "http://\(portHost(proto: proto, port: port)):\(port)")
+    }
+
+    /// Whether this daemon supports configuring the data disk size.
+    var supportsDiskResize: Bool {
+        disk_gib != nil || disk_target_gib != nil || config.disk_gib != nil
+    }
+
+    /// Saved config with only an explicitly configured disk target merged in.
+    /// Leaving `disk_gib` unset when the daemon reports only the implicit 64 GiB
+    /// default lets the user explicitly commit 64 GiB (e.g., to grow a smaller
+    /// foreground image) while unrelated edits keep omitting `disk_gib`.
+    var effectiveConfig: Config {
+        var c = config
+        if let disk_target_gib {
+            c.disk_gib = disk_target_gib
+        } else if let disk_gib, disk_gib != 64 {
+            c.disk_gib = disk_gib
+        }
+        return c
+    }
+
+    /// Disk size shown in the Settings control, falling back to the daemon's
+    /// default display value when no explicit target is saved.
+    var displayedDiskGiB: Int? {
+        disk_target_gib ?? disk_gib ?? config.disk_gib
+    }
+
     func portError(proto: String = "tcp", port: UInt16) -> String? {
         port_errors?.first {
             $0.port == port && $0.proto.caseInsensitiveCompare(proto) == .orderedSame

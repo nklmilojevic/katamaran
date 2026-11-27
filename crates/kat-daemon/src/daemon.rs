@@ -7,7 +7,7 @@
 //! clients read. SIGTERM (launchd's bootout) and SIGINT stop the VM cleanly
 //! before the daemon exits.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -29,7 +29,7 @@ use crate::api::{
     LogsParams, MountInfo, Port, PortError, Request, Response, RpcError, Sample, StatsResult,
     Status, Versions, VmInfo,
 };
-use crate::config::{Config, Host};
+use crate::config::{Config, Host, WireConfig};
 use crate::power::{self, PowerEvent};
 use crate::run::{self, Control, Event, RunArgs};
 use crate::state::{Transition, Trigger, VmState};
@@ -39,6 +39,9 @@ pub const STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// Five minutes of samples.
 const STATS_HISTORY: usize = 150;
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const PROGRESS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const KUBECONFIG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Rotate `daemon.log` at startup beyond this size.
 const LOG_ROTATE_BYTES: u64 = 4 << 20;
 /// Maximum concurrent client connections served by the daemon socket.
@@ -107,6 +110,9 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     }));
     // Before any thread is spawned.
     let signals = run::block_and_watch_signals()?;
+    // Lift launchd's 256-fd soft limit before opening sockets or spawning
+    // gvproxy / katamaran-vm so forwarding gets its full default budget.
+    crate::autofwd::raise_nofile_limit();
 
     let sock_path = run_dir.join(api::SOCKET_NAME);
     // Holding the lock means any socket left there is stale.
@@ -194,6 +200,20 @@ pub struct Daemon {
     changed: Condvar,
     started: SystemTime,
     launchd_label: Option<String>,
+    /// Shared process-wide relay descriptor budget preserved across VM restarts.
+    relay_budget: crate::autofwd::RelayBudget,
+    #[cfg(test)]
+    test_user_home: Option<PathBuf>,
+    #[cfg(test)]
+    test_kube_context: Option<String>,
+    #[cfg(test)]
+    test_heartbeat_interval: Option<Duration>,
+    #[cfg(test)]
+    test_progress_write_timeout: Option<Duration>,
+    #[cfg(test)]
+    test_kubeconfig_timeout: Option<Duration>,
+    #[cfg(test)]
+    test_kubectl_bin: Option<PathBuf>,
 }
 
 struct K8sRuntime {
@@ -204,6 +224,7 @@ struct K8sRuntime {
     api_proxy: Option<crate::k8s::ApiProxy>,
     dns: Option<crate::k8s::DnsServer>,
     kubeconfig: Option<PathBuf>,
+    started_settings: Option<crate::k8s::K8sStartSettings>,
     error: Option<String>,
     /// Set while `k8s_reset` temporarily boots a stopped VM so Docker
     /// readiness does not auto-start k3s before the reset runs.
@@ -220,6 +241,7 @@ impl Default for K8sRuntime {
             api_proxy: None,
             dns: None,
             kubeconfig: None,
+            started_settings: None,
             error: None,
             suppress_autostart: false,
         }
@@ -241,6 +263,16 @@ struct Inner {
 /// What the daemon knows about the current VM run.
 struct Run {
     applied: Config,
+    /// Exact attached size of `data.img` in bytes (may exceed `applied.disk_gib`
+    /// when `data.img` was already grown larger, or be fractional GiB for a
+    /// custom foreground template).
+    attached_disk_bytes: u64,
+    /// True from [`Daemon::start`] until [`Event::DiskPrepared`] reports that
+    /// `data.img` preparation finished for this run.
+    disk_preparing: bool,
+    /// True when the guest reported a `data-disk` resize failure on this boot,
+    /// keeping `restart_required` set so the user is prompted to retry.
+    disk_resize_failed: bool,
     requested: Instant,
     kernel: Option<String>,
     vm_pid: Option<u32>,
@@ -252,8 +284,10 @@ struct Run {
     mounted: bool,
     mount_error: Option<String>,
     problem: Option<String>,
-    ports: BTreeSet<(PortProto, u16)>,
-    port_errors: BTreeMap<(PortProto, u16), String>,
+    /// Active forwards keyed by `(proto, port, origin)` so removing one origin
+    /// never erases a live forward from the other origin during a handoff.
+    ports: BTreeMap<(PortProto, u16, run::PortOrigin), Vec<std::net::Ipv4Addr>>,
+    port_errors: BTreeMap<(PortProto, u16, run::PortOrigin), String>,
     prev_guest: Option<GuestStats>,
     prev_host: Option<(Instant, u64)>,
     host_cpu_percent: f64,
@@ -261,9 +295,12 @@ struct Run {
 }
 
 impl Run {
-    fn new(applied: Config, mount_path: Option<PathBuf>) -> Run {
+    fn new(applied: Config, mount_path: Option<PathBuf>, attached_disk_bytes: u64) -> Run {
         Run {
             applied,
+            attached_disk_bytes,
+            disk_preparing: false,
+            disk_resize_failed: false,
             requested: Instant::now(),
             kernel: None,
             vm_pid: None,
@@ -275,12 +312,51 @@ impl Run {
             mounted: false,
             mount_error: None,
             problem: None,
-            ports: BTreeSet::new(),
+            ports: BTreeMap::new(),
             port_errors: BTreeMap::new(),
             prev_guest: None,
             prev_host: None,
             host_cpu_percent: 0.0,
             host_footprint_mib: 0,
+        }
+    }
+
+    /// Merge published and automatic forwards into one status entry per
+    /// `(proto, port)`, preferring a live published forward when both exist.
+    fn merged_ports(&self) -> BTreeMap<(PortProto, u16), Vec<std::net::Ipv4Addr>> {
+        let mut merged = BTreeMap::new();
+        // `PortOrigin::Published < PortOrigin::Automatic`, so `Published` is
+        // visited first and wins when both origins are momentarily active.
+        for (&(proto, port, _origin), addrs) in &self.ports {
+            merged.entry((proto, port)).or_insert_with(|| addrs.clone());
+        }
+        merged
+    }
+
+    /// Merge port errors per `(proto, port)`, suppressing errors for ports
+    /// that currently have a live forward from either origin.
+    fn merged_port_errors(
+        &self,
+        live: &BTreeMap<(PortProto, u16), Vec<std::net::Ipv4Addr>>,
+    ) -> BTreeMap<(PortProto, u16), String> {
+        let mut merged = BTreeMap::new();
+        for (&(proto, port, _origin), error) in &self.port_errors {
+            if live.contains_key(&(proto, port)) {
+                continue;
+            }
+            merged.entry((proto, port)).or_insert_with(|| error.clone());
+        }
+        merged
+    }
+
+    fn record_problem(&mut self, msg: String) {
+        match &mut self.problem {
+            Some(prev) if !prev.contains(&msg) => {
+                prev.push_str("; ");
+                prev.push_str(&msg);
+            }
+            Some(_) => {}
+            None => self.problem = Some(msg),
         }
     }
 }
@@ -307,7 +383,94 @@ impl Daemon {
             launchd_label: std::env::var("XPC_SERVICE_NAME")
                 .ok()
                 .filter(|l| l.starts_with(crate::setup::LABEL_PREFIX)),
+            relay_budget: crate::autofwd::RelayBudget::from_process_limits(),
+            #[cfg(test)]
+            test_user_home: None,
+            #[cfg(test)]
+            test_kube_context: None,
+            #[cfg(test)]
+            test_heartbeat_interval: None,
+            #[cfg(test)]
+            test_progress_write_timeout: None,
+            #[cfg(test)]
+            test_kubeconfig_timeout: None,
+            #[cfg(test)]
+            test_kubectl_bin: None,
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(home: PathBuf, user_home: PathBuf, ctx: impl Into<String>) -> Arc<Daemon> {
+        Arc::new(Daemon {
+            home,
+            inner: Mutex::new(Inner {
+                state: VmState::Stopped,
+                since: SystemTime::now(),
+                error: None,
+                control: None,
+                run: None,
+                samples: VecDeque::new(),
+                generation: 0,
+                exiting: false,
+            }),
+            config_lock: Mutex::new(()),
+            k8s: Mutex::new(K8sRuntime::default()),
+            k8s_op: Mutex::new(()),
+            changed: Condvar::new(),
+            started: SystemTime::now(),
+            launchd_label: None,
+            relay_budget: crate::autofwd::RelayBudget::from_process_limits(),
+            test_user_home: Some(user_home),
+            test_kube_context: Some(ctx.into()),
+            test_heartbeat_interval: None,
+            test_progress_write_timeout: None,
+            test_kubeconfig_timeout: None,
+            test_kubectl_bin: None,
+        })
+    }
+
+    fn heartbeat_interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.test_heartbeat_interval {
+            return d;
+        }
+        PROGRESS_HEARTBEAT_INTERVAL
+    }
+
+    fn progress_write_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.test_progress_write_timeout {
+            return d;
+        }
+        PROGRESS_WRITE_TIMEOUT
+    }
+
+    fn kubeconfig_cleanup_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(d) = self.test_kubeconfig_timeout {
+            return d;
+        }
+        KUBECONFIG_CLEANUP_TIMEOUT
+    }
+
+    fn kube_context_name(&self) -> anyhow::Result<String> {
+        #[cfg(test)]
+        if let Some(ctx) = &self.test_kube_context {
+            return Ok(ctx.clone());
+        }
+        crate::k8s::context_name()
+    }
+
+    fn remove_kubeconfig(&self, ctx: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(user_home) = &self.test_user_home {
+            return crate::k8s::remove_kubeconfig_for_user_home(
+                &self.home,
+                Some(user_home.as_path()),
+                ctx,
+            );
+        }
+        crate::k8s::remove_kubeconfig(&self.home, ctx)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -324,6 +487,36 @@ impl Daemon {
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
+        self.start_with(run_args, |d, generation, args, rx, disk_lock| {
+            thread::Builder::new()
+                .name("vm-supervisor".into())
+                .spawn(move || {
+                    let result = run::run_vm_with_disk_lock(
+                        &args,
+                        d.relay_budget.clone(),
+                        rx,
+                        Some(disk_lock),
+                        &mut |e| d.on_event(generation, e),
+                    );
+                    d.on_exit(generation, result);
+                })
+                .map(|_| ())
+        })
+    }
+
+    fn start_with<B, S>(self: &Arc<Self>, build_args: B, spawn: S) -> Result<(), String>
+    where
+        B: FnOnce(&Config) -> anyhow::Result<RunArgs>,
+        S: FnOnce(Arc<Daemon>, u64, RunArgs, mpsc::Receiver<Control>, File) -> io::Result<()>,
+    {
+        // Serialize startup's config snapshot, `disk_preparing` flag, and
+        // cross-process `disk.lock` with both RPC and offline config edits so
+        // no concurrent disk edit can bypass the shrink check before `run.rs`
+        // finishes extending `data.img`.
+        // Lock order: `config_lock` -> `config.lock` -> `inner` -> `disk.lock`.
+        let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg_file_lock =
+            crate::config::lock_config(&self.home).map_err(|e| format!("{e:#}"))?;
         let mut g = self.lock();
         if g.exiting {
             return Err("the daemon is shutting down".into());
@@ -334,35 +527,39 @@ impl Daemon {
             Transition::To(_) => {}
         }
         let cfg = Config::load(&self.home).map_err(|e| format!("{e:#}"))?;
-        let args = run_args(&cfg).map_err(|e| format!("{e:#}"))?;
+        let args = build_args(&cfg).map_err(|e| format!("{e:#}"))?;
+        let disk_lock = crate::config::lock_disk(&self.home).map_err(|e| format!("{e:#}"))?;
         let mount_path = if args.no_mount {
             None
         } else {
             crate::nfs::mount_point(args.mount.as_deref())
+        };
+        let existing_bytes = crate::config::data_disk_bytes(&self.home).ok().flatten();
+        let initial_disk_bytes = match (existing_bytes, args.disk_gib) {
+            (Some(cur), Some(target)) => cur.max(u64::from(target) << 30),
+            (Some(cur), None) => cur,
+            (None, Some(target)) => u64::from(target) << 30,
+            (None, None) => u64::from(cfg.disk_gib()) << 30,
         };
         let prev_state = g.state;
         let prev_error = g.error.clone();
         g.generation += 1;
         let generation = g.generation;
         g.error = None;
-        g.run = Some(Run::new(cfg.clone(), mount_path));
+        let mut run = Run::new(cfg.clone(), mount_path, initial_disk_bytes);
+        run.disk_preparing = true;
+        g.run = Some(run);
         g.samples.clear();
         let (tx, rx) = mpsc::channel();
         g.control = Some(tx);
         self.set_state(&mut g, VmState::Starting);
         dlog!(
-            "starting the VM ({} CPUs, {} MiB)",
+            "starting the VM ({} CPUs, {} MiB, {} GiB disk)",
             cfg.cpus,
-            cfg.memory_mib
+            cfg.memory_mib,
+            crate::config::bytes_to_gib(initial_disk_bytes)
         );
-        let d = self.clone();
-        if let Err(e) = thread::Builder::new()
-            .name("vm-supervisor".into())
-            .spawn(move || {
-                let result = run::run_vm(&args, rx, &mut |e| d.on_event(generation, e));
-                d.on_exit(generation, result);
-            })
-        {
+        if let Err(e) = spawn(self.clone(), generation, args, rx, disk_lock) {
             g.control = None;
             g.run = None;
             g.error = prev_error;
@@ -374,6 +571,10 @@ impl Daemon {
 
     /// Ask the VM to stop; with `wait`, until it is gone.
     pub fn stop(&self, wait: bool) -> Result<(), String> {
+        self.stop_with_progress(wait, &mut |_| {})
+    }
+
+    fn stop_with_progress(&self, wait: bool, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
         let mut g = self.lock();
         match g.state.on(Trigger::Stop) {
             Transition::Invalid(m) => return Err(m),
@@ -388,16 +589,27 @@ impl Daemon {
         }
         if wait {
             let deadline = Instant::now() + STOP_TIMEOUT;
+            let mut last_beat = Instant::now();
             while g.state.is_active() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return Err("the VM did not stop in time".into());
                 }
+                let step = left.min(PROGRESS_HEARTBEAT_INTERVAL);
                 g = self
                     .changed
-                    .wait_timeout(g, left)
+                    .wait_timeout(g, step)
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
+                if g.state.is_active()
+                    && Instant::now() < deadline
+                    && last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL
+                {
+                    drop(g);
+                    progress("stopping temporary VM");
+                    last_beat = Instant::now();
+                    g = self.lock();
+                }
             }
         }
         Ok(())
@@ -441,6 +653,10 @@ impl Daemon {
             let Inner { run, samples, .. } = &mut *g;
             let Some(r) = run.as_mut() else { return };
             match e {
+                Event::DiskPrepared { bytes } => {
+                    r.attached_disk_bytes = bytes;
+                    r.disk_preparing = false;
+                }
                 Event::Booted {
                     kernel_release,
                     vm_pid,
@@ -471,7 +687,10 @@ impl Daemon {
                     if name == "k8s" {
                         k8s_failed = Some(error);
                     } else {
-                        r.problem = Some(format!("{name}: {error}"));
+                        if name == "data-disk" {
+                            r.disk_resize_failed = true;
+                        }
+                        r.record_problem(format!("{name}: {error}"));
                     }
                     if name == "docker" {
                         r.docker = DockerState::Failed;
@@ -486,27 +705,31 @@ impl Daemon {
                     r.mount_path = Some(path);
                 }
                 Event::MountFailed(error) => {
-                    r.problem = Some(format!("files not mounted: {error}"));
+                    r.record_problem(format!("files not mounted: {error}"));
                     r.mount_error = Some(error);
                 }
-                Event::PortAdd(proto, port) => {
-                    r.port_errors.remove(&(proto, port));
-                    r.ports.insert((proto, port));
+                Event::PortAdd(origin, proto, port, addrs) => {
+                    r.port_errors.remove(&(proto, port, origin));
+                    r.ports.insert((proto, port, origin), addrs);
                 }
-                Event::PortRemove(proto, port) => {
-                    r.ports.remove(&(proto, port));
-                    r.port_errors.remove(&(proto, port));
+                Event::PortRemove(origin, proto, port) => {
+                    r.ports.remove(&(proto, port, origin));
+                    r.port_errors.remove(&(proto, port, origin));
                 }
-                Event::PortFailed(proto, port, error) => {
-                    r.ports.remove(&(proto, port));
-                    r.port_errors.insert((proto, port), error);
+                Event::PortFailed(origin, proto, port, error) => {
+                    r.ports.remove(&(proto, port, origin));
+                    r.port_errors.insert((proto, port, origin), error);
                 }
-                Event::PortErrorClear(proto, port) => {
-                    r.port_errors.remove(&(proto, port));
+                Event::PortErrorClear(origin, proto, port) => {
+                    r.port_errors.remove(&(proto, port, origin));
                 }
                 Event::Restarting { why, delay } => {
                     dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
-                    let mut next = Run::new(r.applied.clone(), r.mount_path.clone());
+                    let mut next = Run::new(
+                        r.applied.clone(),
+                        r.mount_path.clone(),
+                        r.attached_disk_bytes,
+                    );
                     next.problem = Some(format!("the VM was restarted: {why}"));
                     *r = next;
                     k8s_reset_runtime = true;
@@ -543,6 +766,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.state = "stopped".into();
             }
             let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
@@ -554,6 +778,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.state = "failed".into();
                 k.error = Some(err);
             }
@@ -605,6 +830,7 @@ impl Daemon {
             k.api_proxy = None;
             k.dns = None;
             k.kubeconfig = None;
+            k.started_settings = None;
             k.state = "stopped".into();
         }
         let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
@@ -671,6 +897,10 @@ impl Daemon {
             vm: r.map(|r| VmInfo {
                 cpus: r.applied.cpus,
                 memory_mib: r.applied.memory_mib,
+                disk_gib: crate::config::bytes_to_gib(r.attached_disk_bytes),
+                disk_bytes: Some(r.attached_disk_bytes),
+                requested_disk_gib: r.applied.disk_gib,
+                disk_resize_failed: r.disk_resize_failed,
                 pid: r.vm_pid,
                 boot_ms: r.boot.map(ms),
                 docker_ready_ms: r.docker_ready.map(ms),
@@ -693,28 +923,32 @@ impl Daemon {
             },
             ports: r
                 .map(|r| {
-                    r.ports
-                        .iter()
-                        .map(|(p, port)| Port {
+                    r.merged_ports()
+                        .into_iter()
+                        .map(|((p, port), addresses)| Port {
                             proto: p.as_str().into(),
-                            port: *port,
+                            port,
+                            addresses,
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
             port_errors: r
                 .map(|r| {
-                    r.port_errors
-                        .iter()
+                    let live = r.merged_ports();
+                    r.merged_port_errors(&live)
+                        .into_iter()
                         .map(|((p, port), error)| PortError {
                             proto: p.as_str().into(),
-                            port: *port,
-                            error: error.clone(),
+                            port,
+                            error,
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
-            config: saved,
+            disk_gib: Some(saved.disk_gib()),
+            disk_target_gib: saved.disk_gib,
+            config: WireConfig::from(saved),
         }
     }
 
@@ -722,36 +956,72 @@ impl Daemon {
         let config = Config::load(&self.home)?;
         let g = self.lock();
         Ok(ConfigView {
-            restart_required: g
-                .run
-                .as_ref()
-                .is_some_and(|r| r.applied.needs_restart_for(&config)),
+            restart_required: g.run.as_ref().is_some_and(|r| {
+                r.disk_resize_failed
+                    || r.applied
+                        .needs_restart_for_disk_bytes(&config, r.attached_disk_bytes)
+            }),
+            k8s_toggled: false,
             path: Config::path(&self.home),
-            config,
+            disk_gib: Some(config.disk_gib()),
+            disk_target_gib: config.disk_gib,
+            config: WireConfig::from(config),
         })
     }
 
     fn set_config(
         self: &Arc<Self>,
         values: &std::collections::BTreeMap<String, String>,
-    ) -> anyhow::Result<ConfigView> {
+    ) -> Result<ConfigView, RpcError> {
+        self.set_config_with(values, |home| match self.kube_context_name() {
+            Ok(ctx) => {
+                if let Err(e) = self.remove_kubeconfig(&ctx) {
+                    dlog!("k8s disable: remove kubeconfig failed: {e:#}");
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(crate::k8s::kubeconfig_path(home));
+                dlog!("k8s disable: context name failed: {e:#}");
+            }
+        })
+    }
+
+    fn set_config_with(
+        self: &Arc<Self>,
+        values: &std::collections::BTreeMap<String, String>,
+        cleanup_disabled_kubeconfig: impl FnOnce(&Path),
+    ) -> Result<ConfigView, RpcError> {
         let (cfg_kubernetes, before_k8s) = {
             let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let mut cfg = Config::load(&self.home)?;
+            let _cfg_file_lock = crate::config::lock_config(&self.home)
+                .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
+            if (values.contains_key("disk") || values.contains_key("disk_gib"))
+                && self.lock().run.as_ref().is_some_and(|r| r.disk_preparing)
+            {
+                return Err(RpcError::new(
+                    api::FAILED,
+                    "cannot change disk_gib while the VM is preparing its data disk; retry in a moment",
+                ));
+            }
+            let mut cfg = Config::load(&self.home)
+                .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
             let host = Host::current();
             let before = cfg.launch_at_login;
             let before_k8s = cfg.kubernetes;
-            for (k, v) in values {
-                cfg.set(k, v, &host)?;
-            }
-            cfg.save(&self.home)?;
-            dlog!("config saved: {values:?}");
+            cfg.apply_values(values, &host, &self.home)
+                .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
+            cfg.save(&self.home)
+                .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
+            let keys: Vec<&str> = values.keys().map(String::as_str).collect();
+            dlog!("config saved: {keys:?}");
             if cfg.launch_at_login != before {
-                crate::setup::set_run_at_load(cfg.launch_at_login, self.launchd_label.as_deref())?;
+                crate::setup::set_run_at_load(cfg.launch_at_login, self.launchd_label.as_deref())
+                    .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
             }
             (cfg.kubernetes, before_k8s)
         };
-        if cfg_kubernetes != before_k8s {
+        let k8s_toggled = cfg_kubernetes != before_k8s;
+        if k8s_toggled {
             if self.lock().state == VmState::Running {
                 let d = self.clone();
                 let enable = cfg_kubernetes;
@@ -770,22 +1040,16 @@ impl Daemon {
                     })
                     .ok();
             } else if !cfg_kubernetes {
-                match crate::k8s::context_name() {
-                    Ok(ctx) => {
-                        if let Err(e) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
-                            dlog!("k8s disable: remove kubeconfig failed: {e:#}");
-                        }
-                    }
-                    Err(e) => {
-                        let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
-                        dlog!("k8s disable: context name failed: {e:#}");
-                    }
-                }
+                cleanup_disabled_kubeconfig(&self.home);
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
                 k.kubeconfig = None;
             }
         }
-        self.config_view()
+        let mut view = self
+            .config_view()
+            .map_err(|e| RpcError::new(api::FAILED, format!("{e:#}")))?;
+        view.k8s_toggled = k8s_toggled;
+        Ok(view)
     }
 
     fn stats(&self) -> StatsResult {
@@ -881,6 +1145,16 @@ impl Daemon {
                 }
                 continue;
             }
+            if let Call::K8sReset {
+                images,
+                progress: true,
+            } = &call
+            {
+                if self.serve_k8s_reset(id, *images, &mut out).is_err() {
+                    return;
+                }
+                continue;
+            }
             if let Call::MachineCreate(c) = &call {
                 let mut progress = |m: &str| {
                     let _ = send(
@@ -918,6 +1192,50 @@ impl Daemon {
         }
     }
 
+    fn serve_k8s_reset(
+        self: &Arc<Self>,
+        id: Value,
+        remove_images: bool,
+        out: &mut UnixStream,
+    ) -> Result<(), ()> {
+        let prev_write_timeout = out.write_timeout().ok().flatten();
+        let write_timeout = self.progress_write_timeout();
+        let mut write_failed = false;
+        let res = {
+            let mut progress = |m: &str| {
+                if write_failed {
+                    return;
+                }
+                let note = api::Notification {
+                    jsonrpc: api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": m }),
+                };
+                if send_bounded(out, &note, write_timeout).is_err() {
+                    write_failed = true;
+                }
+            };
+            self.k8s_reset(remove_images, &mut progress)
+        };
+        if write_failed {
+            // A progress write failed or timed out (possibly leaving a partial
+            // JSON line on the stream). Do not write the terminal response and
+            // close the connection now that k8s_reset has finished.
+            return Err(());
+        }
+        let resp = match res {
+            Ok(()) => Response::ok(id, Value::Null),
+            Err(e) => Response::err(id, e),
+        };
+        if send_bounded(out, &resp, write_timeout).is_err() {
+            return Err(());
+        }
+        if out.set_write_timeout(prev_write_timeout).is_err() {
+            return Err(());
+        }
+        Ok(())
+    }
+
     pub fn handle(self: &Arc<Self>, call: &Call) -> Result<Value, RpcError> {
         let failed = |m: String| RpcError::new(api::FAILED, m);
         let value = |v: Result<Value, serde_json::Error>| {
@@ -947,9 +1265,7 @@ impl Daemon {
                 value(serde_json::to_value(v))
             }
             Call::ConfigSet(values) => {
-                let v = self
-                    .set_config(values)
-                    .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
+                let v = self.set_config(values)?;
                 value(serde_json::to_value(v))
             }
             Call::Stats => value(serde_json::to_value(self.stats())),
@@ -998,8 +1314,8 @@ impl Daemon {
                 self.k8s_stop(true)?;
                 Ok(Value::Null)
             }
-            Call::K8sReset => {
-                self.k8s_reset()?;
+            Call::K8sReset { images, .. } => {
+                self.k8s_reset(*images, &mut |_| {})?;
                 Ok(Value::Null)
             }
             Call::K8sKubeconfig => {
@@ -1012,12 +1328,17 @@ impl Daemon {
                     .map_err(|e| failed(format!("{e:#}")))?;
                 Ok(Value::Null)
             }
+            Call::K8sMarkVersion { version } => {
+                self.k8s_mark_version(version)?;
+                Ok(Value::Null)
+            }
         }
     }
 
     fn k8s_status(&self, enabled: bool) -> K8sStatus {
         let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
         let dns_port = k.dns.as_ref().map(|d| d.port);
+        let dns_isolated = k.dns.as_ref().is_some_and(|d| d.isolated);
         K8sStatus {
             enabled,
             state: k.state.clone(),
@@ -1030,17 +1351,19 @@ impl Daemon {
                 .filter(|_| k.state == "running")
                 .and_then(|p| p.rest_socket())
                 .map(Path::to_path_buf),
-            context: crate::k8s::context_name().unwrap_or_default(),
+            context: self.kube_context_name().unwrap_or_default(),
             kubeconfig: k.kubeconfig.clone(),
             dns_domain: crate::k8s::DNS_DOMAIN.into(),
             dns_port,
-            dns_installed: crate::k8s::dns_resolver_installed(dns_port),
+            dns_installed: !dns_isolated && crate::k8s::dns_resolver_installed(dns_port),
+            dns_isolated,
             error: k.error.clone(),
         }
     }
 
     fn persist_k8s_enabled(&self, enabled: bool) -> anyhow::Result<()> {
         let _cfg_guard = self.config_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _cfg_file_lock = crate::config::lock_config(&self.home)?;
         let mut cfg = Config::load(&self.home)?;
         if cfg.kubernetes != enabled {
             cfg.kubernetes = enabled;
@@ -1050,6 +1373,14 @@ impl Daemon {
     }
 
     fn wait_for_docker_ready(self: &Arc<Self>, allow_start_vm: bool) -> Result<(), RpcError> {
+        self.wait_for_docker_ready_with_progress(allow_start_vm, &mut |_| {})
+    }
+
+    fn wait_for_docker_ready_with_progress(
+        self: &Arc<Self>,
+        allow_start_vm: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), RpcError> {
         let failed = |m: String| RpcError::new(api::FAILED, m);
         {
             let g = self.lock();
@@ -1058,10 +1389,12 @@ impl Daemon {
                     return Err(failed("the VM is not running".into()));
                 }
                 drop(g);
+                progress("starting VM");
                 self.start().map_err(failed)?;
             }
         }
         let deadline = Instant::now() + Duration::from_secs(180);
+        let mut last_beat = Instant::now();
         let mut g = self.lock();
         loop {
             if g.state == VmState::Error
@@ -1088,11 +1421,56 @@ impl Daemon {
             if left.is_zero() {
                 return Err(failed("timed out waiting for the VM to start".into()));
             }
+            let step = left.min(PROGRESS_HEARTBEAT_INTERVAL);
             g = self
                 .changed
-                .wait_timeout(g, left)
+                .wait_timeout(g, step)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+            if Instant::now() < deadline && last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
+                drop(g);
+                progress("waiting for VM and Docker");
+                last_beat = Instant::now();
+                g = self.lock();
+            }
+        }
+    }
+
+    fn lock_k8s_op_with_progress(
+        &self,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<MutexGuard<'_, ()>, RpcError> {
+        const K8S_OP_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+        self.lock_k8s_op_with_timeout(K8S_OP_WAIT_TIMEOUT, self.heartbeat_interval(), progress)
+    }
+
+    fn lock_k8s_op_with_timeout(
+        &self,
+        timeout: Duration,
+        heartbeat: Duration,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<MutexGuard<'_, ()>, RpcError> {
+        let deadline = Instant::now() + timeout;
+        let mut last_beat: Option<Instant> = None;
+        loop {
+            match self.k8s_op.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(RpcError::new(
+                            api::FAILED,
+                            "timed out waiting for active Kubernetes operation",
+                        ));
+                    }
+                    if last_beat.is_none_or(|t| t.elapsed() >= heartbeat) {
+                        progress("waiting for active Kubernetes operation");
+                        last_beat = Some(Instant::now());
+                    }
+                    thread::sleep(left.min(heartbeat).min(Duration::from_millis(100)));
+                }
+            }
         }
     }
 
@@ -1118,21 +1496,30 @@ impl Daemon {
             return Ok(self.k8s_status(false));
         }
 
-        let (vm_gen, k8s_epoch, already_running) = {
+        let (vm_gen, k8s_epoch, already_running_settings) = {
             let g = self.lock();
             if g.state != VmState::Running {
                 return Err(failed("the VM is no longer running".into()));
             }
             let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
             if k.state == "running" && k.api_proxy.is_some() {
-                (g.generation, k.epoch, true)
+                (g.generation, k.epoch, Some(k.started_settings.clone()))
             } else {
                 k.state = "starting".into();
                 k.error = None;
-                (g.generation, k.epoch, false)
+                (g.generation, k.epoch, None)
             }
         };
-        if already_running {
+        if let Some(started) = already_running_settings {
+            // Never report success while silently ignoring changed or invalid settings.
+            let prepared =
+                crate::k8s::prepare_start(&self.home).map_err(|e| failed(format!("{e:#}")))?;
+            if started.as_ref() != Some(&prepared.settings) {
+                return Err(failed(
+                    "Kubernetes is already running with different k8s_version, k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
+                        .into(),
+                ));
+            }
             if persist_enabled {
                 self.persist_k8s_enabled(true)
                     .map_err(|e| failed(format!("{e:#}")))?;
@@ -1147,13 +1534,14 @@ impl Daemon {
             crate::k8s::ApiProxy,
             crate::k8s::DnsServer,
             PathBuf,
+            crate::k8s::K8sStartSettings,
         )> {
-            crate::k8s::ensure_installed(&self.home, progress)?;
-            let info = match crate::k8s::request(
-                &self.home,
-                &kat_proto::k8s::K8sMsg::Start,
-                progress,
-            )? {
+            // Validate config.toml and k3s-config.yaml and check guest support
+            // before downloading and installing k3s (the VM is already up here).
+            let prepared = crate::k8s::prepare_start(&self.home)?;
+            crate::k8s::ensure_start_supported(&self.home, &prepared.msg)?;
+            crate::k8s::ensure_installed(&self.home, &prepared.settings.version, progress)?;
+            let info = match crate::k8s::request(&self.home, &prepared.msg, progress)? {
                 kat_proto::k8s::K8sMsg::StatusInfo(info) => info,
                 other => anyhow::bail!("unexpected k8s start reply {other:?}"),
             };
@@ -1173,7 +1561,7 @@ impl Daemon {
             progress("updating ~/.kube/config");
             let kc_path = crate::k8s::write_and_merge_kubeconfig(&self.home, &raw_kc, proxy.port)?;
             kubeconfig_merged = true;
-            Ok((info, proxy, dns, kc_path))
+            Ok((info, proxy, dns, kc_path, prepared.settings))
         })();
 
         let is_fresh = |g: &Inner, k: &K8sRuntime| {
@@ -1186,8 +1574,8 @@ impl Daemon {
             let can_remove_user =
                 merged && self.k8s.lock().unwrap_or_else(|e| e.into_inner()).state != "running";
             if can_remove_user {
-                if let Ok(ctx) = crate::k8s::context_name() {
-                    if let Err(re) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
+                if let Ok(ctx) = self.kube_context_name() {
+                    if let Err(re) = self.remove_kubeconfig(&ctx) {
                         dlog!("k8s rollback remove kubeconfig failed: {re:#}");
                     }
                 } else {
@@ -1199,7 +1587,7 @@ impl Daemon {
         };
 
         let e = match res {
-            Ok((info, proxy, dns, kc_path)) => {
+            Ok((info, proxy, dns, kc_path, started_settings)) => {
                 let stale = {
                     let g = self.lock();
                     let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
@@ -1236,6 +1624,7 @@ impl Daemon {
                     k.api_proxy = Some(proxy);
                     k.dns = Some(dns);
                     k.kubeconfig = Some(kc_path);
+                    k.started_settings = Some(started_settings);
                     k.error = None;
                     drop(k);
                     drop(g);
@@ -1267,6 +1656,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.error = Some(msg.clone());
             }
         }
@@ -1335,6 +1725,7 @@ impl Daemon {
             k.api_proxy = None;
             k.dns = None;
             k.kubeconfig = None;
+            k.started_settings = None;
             k.state = "stopped".into();
             k.error = None;
         }
@@ -1343,9 +1734,9 @@ impl Daemon {
         if disable_config && let Err(e) = self.persist_k8s_enabled(false) {
             first_err = Some(e);
         }
-        match crate::k8s::context_name() {
+        match self.kube_context_name() {
             Ok(ctx) => {
-                if let Err(e) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
+                if let Err(e) = self.remove_kubeconfig(&ctx) {
                     dlog!("k8s stop: remove kubeconfig failed: {e:#}");
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -1366,10 +1757,16 @@ impl Daemon {
         Ok(())
     }
 
-    fn k8s_reset(self: &Arc<Self>) -> Result<(), RpcError> {
-        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
+    fn k8s_reset(
+        self: &Arc<Self>,
+        remove_images: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<(), RpcError> {
+        let _op = self.lock_k8s_op_with_progress(progress)?;
         let failed = |m: String| RpcError::new(api::FAILED, m);
-        let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
+        let ctx = self
+            .kube_context_name()
+            .map_err(|e| failed(format!("{e:#}")))?;
         let initial_state = self.lock().state;
         let was_stopped = !initial_state.is_active();
         let needs_wait_docker = was_stopped || initial_state == VmState::Starting;
@@ -1380,23 +1777,62 @@ impl Daemon {
                 .suppress_autostart = true;
         }
         let mut guest_reset_attempted = false;
+        let mut guest_data_deleted = false;
+        let mut guest_reply_terminal = false;
+        let mut guest_replied = false;
+        let mut persist_res: Option<anyhow::Result<()>> = None;
         let reset_res = (|| -> Result<(), RpcError> {
             if needs_wait_docker {
-                self.wait_for_docker_ready(was_stopped)?;
+                self.wait_for_docker_ready_with_progress(was_stopped, progress)?;
             }
             let mut stream =
                 crate::k8s::connect(&self.home).map_err(|e| failed(format!("{e:#}")))?;
-            kat_proto::k8s::write(&mut stream, &kat_proto::k8s::K8sMsg::Reset)
-                .map_err(|e| failed(format!("{e:#}")))?;
-            guest_reset_attempted = true;
-            let mut noop = |_: &str| {};
-            crate::k8s::read_answer(&mut stream, &mut noop)
-                .map_err(|e| failed(format!("{e:#}")))?;
+            kat_proto::k8s::write(
+                &mut stream,
+                &kat_proto::k8s::K8sMsg::Reset {
+                    images: remove_images,
+                },
+            )
+            .map_err(|e| failed(format!("{e:#}")))?;
+            if !remove_images {
+                // Legacy handling for plain resets: older guests do not emit
+                // ResetAccepted before mutating cluster state.
+                guest_reset_attempted = true;
+            }
+            let mut last_logged = String::new();
+            let mut on_progress = |m: &str| {
+                guest_replied = true;
+                if last_logged != m {
+                    dlog!("k8s reset: {m}");
+                    last_logged.clear();
+                    last_logged.push_str(m);
+                }
+                progress(m);
+            };
+            // Persist `kubernetes = false` immediately when the guest confirms
+            // active cluster data was detached so even a daemon crash during
+            // deferred reclamation or image purge cannot leave auto-start on.
+            let mut on_data_deleted = || {
+                if persist_res.is_none() {
+                    persist_res = Some(self.persist_k8s_enabled(false));
+                }
+            };
+            crate::k8s::read_reset_answer_terminal(
+                &mut stream,
+                remove_images,
+                &mut guest_reset_attempted,
+                &mut guest_data_deleted,
+                &mut guest_reply_terminal,
+                &mut on_data_deleted,
+                &mut on_progress,
+            )
+            .map_err(|e| failed(format!("{e:#}")))?;
             Ok(())
         })();
 
         let stop_res = if was_stopped {
-            let res = self.stop(true).map_err(failed);
+            progress("stopping temporary VM");
+            let res = self.stop_with_progress(true, progress).map_err(failed);
             self.k8s
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1412,6 +1848,34 @@ impl Daemon {
             Ok(())
         };
 
+        // A started reset whose reply ended without `Done` / `Error` (the guest
+        // connection failed) may already have deleted cluster data without the
+        // host seeing the checkpoint; disable auto-start conservatively so the
+        // next boot never silently starts a fresh, empty cluster. A guest that
+        // never replied at all (for example one that dropped the connection at
+        // its connection limit without reading the request) did not start the
+        // reset, so auto-start is left alone. Compatible guests only count as
+        // started after RESET_STARTED_PROGRESS / ResetAccepted; older guests
+        // count once they sent any progress.
+        let outcome_unknown = reset_res.is_err()
+            && guest_replied
+            && guest_reset_attempted
+            && !guest_data_deleted
+            && !guest_reply_terminal;
+        let persist_res = match persist_res {
+            Some(Ok(())) => Ok(()),
+            _ if guest_data_deleted || outcome_unknown => self.persist_k8s_enabled(false),
+            _ => Ok(()),
+        };
+
+        // A plain reset counts as attempted only once the guest answered with
+        // any frame (progress or a final Done/Error): a guest that dropped the
+        // request unread (e.g. at its connection limit) sends nothing, so host
+        // kubeconfig/proxy/DNS state is left untouched.
+        if !remove_images && !guest_replied && !guest_reply_terminal && !guest_data_deleted {
+            guest_reset_attempted = false;
+        }
+        let mut kubeconfig_err: Option<anyhow::Error> = None;
         if guest_reset_attempted {
             {
                 let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
@@ -1419,22 +1883,216 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.state = "stopped".into();
-                k.error = reset_res.as_ref().err().map(|e| e.message.clone());
+                k.error = None;
             }
-            if let Err(e) = crate::k8s::remove_kubeconfig(&self.home, &ctx) {
+            let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
+            let rm_res = self.remove_kubeconfig_with_progress(&ctx, progress);
+            if let Err(e) = rm_res {
                 dlog!("k8s reset: remove kubeconfig failed: {e:#}");
+                kubeconfig_err = Some(e);
             }
         }
-        reset_res?;
-        stop_res?;
 
-        if let Err(e) = self.persist_k8s_enabled(false) {
-            let msg = format!("{e:#}");
+        if let Err(reset_err) = reset_res {
+            if guest_data_deleted {
+                let mut msg = if remove_images {
+                    format!(
+                        "Kubernetes cluster data was deleted, but finishing image reset failed: {}",
+                        reset_err.message
+                    )
+                } else {
+                    format!(
+                        "Kubernetes cluster data was deleted, but finishing cluster reset failed: {}",
+                        reset_err.message
+                    )
+                };
+                if let Err(e) = persist_res {
+                    msg.push_str(&format!(
+                        " (also failed to disable Kubernetes auto-start: {e:#})"
+                    ));
+                }
+                if let Err(e) = stop_res {
+                    msg.push_str(&format!(
+                        " (also failed to stop temporary VM: {})",
+                        e.message
+                    ));
+                }
+                if let Some(e) = kubeconfig_err {
+                    msg.push_str(&format!(" (also failed to clean up ~/.kube/config: {e:#})"));
+                }
+                self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+                return Err(failed(msg));
+            }
+            if guest_reset_attempted {
+                let mut msg = reset_err.message;
+                if outcome_unknown {
+                    match &persist_res {
+                        Ok(()) => msg.push_str(
+                            " (the guest may have deleted Kubernetes cluster data; Kubernetes auto-start was disabled, run `kat k8s start` to start it again)",
+                        ),
+                        Err(e) => msg.push_str(&format!(
+                            " (the guest may have deleted Kubernetes cluster data; also failed to disable Kubernetes auto-start: {e:#})"
+                        )),
+                    }
+                }
+                if let Some(ke) = kubeconfig_err {
+                    msg.push_str(&format!(
+                        " (also failed to clean up ~/.kube/config: {ke:#})"
+                    ));
+                }
+                self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+                return Err(failed(msg));
+            }
+            return Err(reset_err);
+        }
+
+        if let Err(e) = persist_res {
+            let mut msg = format!("{e:#}");
+            if let Err(se) = stop_res {
+                msg.push_str(&format!(
+                    " (also failed to stop temporary VM: {})",
+                    se.message
+                ));
+            }
+            if let Some(ke) = kubeconfig_err {
+                msg.push_str(&format!(
+                    " (also failed to clean up ~/.kube/config: {ke:#})"
+                ));
+            }
+            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+            return Err(failed(msg));
+        }
+        if let Err(se) = stop_res {
+            let mut msg = se.message;
+            if let Some(ke) = kubeconfig_err {
+                msg.push_str(&format!(
+                    " (also failed to clean up ~/.kube/config: {ke:#})"
+                ));
+            }
+            self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+            return Err(failed(msg));
+        }
+        if let Some(ke) = kubeconfig_err {
+            let msg = if remove_images {
+                format!(
+                    "Kubernetes cluster data and cached k8s.io images were reset, but cleaning up ~/.kube/config failed: {ke:#}"
+                )
+            } else {
+                format!(
+                    "Kubernetes cluster data was reset, but cleaning up ~/.kube/config failed: {ke:#}"
+                )
+            };
             self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
             return Err(failed(msg));
         }
         Ok(())
+    }
+
+    fn k8s_mark_version(&self, version: &str) -> Result<(), RpcError> {
+        crate::config::validate_k8s_version(version)
+            .map_err(|e| RpcError::new(api::INVALID_PARAMS, format!("{e:#}")))?;
+        let _op = self.k8s_op.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = |m: String| RpcError::new(api::FAILED, m);
+        match self.lock().state {
+            VmState::Running => {}
+            VmState::Starting => {
+                return Err(failed(
+                    "the VM is still starting; wait for it to finish starting with Kubernetes \
+                     stopped, then retry `kat k8s mark-version`"
+                        .into(),
+                ));
+            }
+            VmState::Stopping => {
+                return Err(failed(
+                    "the VM is stopping; disable Kubernetes auto-start \
+                     (`kat config set kubernetes=off`) if enabled, start the VM (`kat start`), \
+                     then retry `kat k8s mark-version`"
+                        .into(),
+                ));
+            }
+            state @ (VmState::Stopped | VmState::Error) => {
+                return Err(failed(format!(
+                    "the VM is {}; `kat k8s mark-version` requires a running VM with Kubernetes \
+                     stopped; disable Kubernetes auto-start (`kat config set kubernetes=off`) if \
+                     enabled, start the VM (`kat start`), then retry",
+                    state.as_str()
+                )));
+            }
+        }
+        {
+            let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(k.state.as_str(), "starting" | "running" | "stopping") {
+                return Err(failed(
+                    "stop Kubernetes (`kat k8s stop`) before recording the datastore version"
+                        .into(),
+                ));
+            }
+        }
+        let mut noop = |_: &str| {};
+        match crate::k8s::request(
+            &self.home,
+            &kat_proto::k8s::K8sMsg::MarkDatastoreVersion {
+                version: version.to_string(),
+            },
+            &mut noop,
+        )
+        .map_err(|e| failed(format!("{e:#}")))?
+        {
+            kat_proto::k8s::K8sMsg::Done => {}
+            other => return Err(failed(format!("unexpected mark-version reply {other:?}"))),
+        }
+        {
+            // Clear only the failure this command resolves (an unmarked datastore);
+            // any other startup failure stays visible until the next start.
+            let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
+            if k.state == "failed"
+                && k.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("has no version marker"))
+            {
+                k.state = "stopped".into();
+                k.error = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_kubeconfig_with_progress(
+        &self,
+        ctx: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<()> {
+        progress("cleaning up kubeconfig");
+        let timeout = self.kubeconfig_cleanup_timeout();
+        let heartbeat = self.heartbeat_interval();
+        #[cfg(test)]
+        let kubectl_override = self.test_kubectl_bin.as_deref();
+        #[cfg(not(test))]
+        let kubectl_override: Option<&Path> = None;
+        #[cfg(test)]
+        if let Some(user_home) = &self.test_user_home {
+            return crate::k8s::remove_kubeconfig_bounded(
+                &self.home,
+                Some(user_home.as_path()),
+                ctx,
+                kubectl_override,
+                timeout,
+                heartbeat,
+                progress,
+            );
+        }
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        crate::k8s::remove_kubeconfig_bounded(
+            &self.home,
+            user_home.as_deref(),
+            ctx,
+            kubectl_override,
+            timeout,
+            heartbeat,
+            progress,
+        )
     }
 
     fn k8s_kubeconfig(&self) -> Result<String, RpcError> {
@@ -1456,7 +2114,9 @@ impl Daemon {
             .map_err(|e| failed(format!("{e:#}")))?
         {
             kat_proto::k8s::K8sMsg::KubeconfigData(raw) => {
-                let ctx = crate::k8s::context_name().map_err(|e| failed(format!("{e:#}")))?;
+                let ctx = self
+                    .kube_context_name()
+                    .map_err(|e| failed(format!("{e:#}")))?;
                 Ok(crate::k8s::rewrite_kubeconfig(&raw, &ctx, api_port))
             }
             other => Err(failed(format!("unexpected kubeconfig reply {other:?}"))),
@@ -1557,6 +2217,39 @@ fn send<T: serde::Serialize>(out: &mut UnixStream, msg: &T) -> io::Result<()> {
     out.write_all(&line)
 }
 
+fn send_bounded<T: serde::Serialize>(
+    out: &mut UnixStream,
+    msg: &T,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut line = serde_json::to_vec(msg)?;
+    line.push(b'\n');
+    let deadline = Instant::now() + timeout;
+    let mut written = 0;
+    while written < line.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client write timed out",
+            ));
+        }
+        out.set_write_timeout(Some(left))?;
+        match out.write(&line[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "client closed connection during write",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Wait up to `timeout` for the client to hang up (or send anything, which
 /// a following client must not do).
 fn client_gone(s: &UnixStream, timeout: Duration) -> bool {
@@ -1637,6 +2330,10 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
             p if p.is_file() => p,
             _ => guest.join("data.img.sparse"),
         },
+        // `None` when omitted in config.toml so a normal daemon boot leaves an
+        // intentionally smaller foreground image untouched; `Some(gib)` passes
+        // every explicitly configured target (including `64G`) through.
+        disk_gib: cfg.disk_gib,
         cpus: cfg.cpus,
         memory_mib: cfg.memory_mib,
         cmdline: guest_cmdline(cfg),
@@ -1650,6 +2347,7 @@ fn run_args(cfg: &Config) -> anyhow::Result<RunArgs> {
         mtu: crate::net::DEFAULT_MTU,
         pause_on_sleep: cfg.pause_on_sleep,
         no_auto_forward: !cfg.auto_forward,
+        forward_addresses: cfg.forward_addresses.clone(),
         amd64: cfg.amd64,
     })
 }
@@ -1781,10 +2479,18 @@ mod tests {
     use serde_json::json;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kat-daemon-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        use std::os::unix::ffi::OsStringExt;
+        let template = std::env::temp_dir().join(format!("kat-{name}-XXXXXX"));
+        let mut bytes = template.into_os_string().into_vec();
+        bytes.push(0);
+        let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+        assert!(
+            !ptr.is_null(),
+            "mkdtemp failed: {}",
+            io::Error::last_os_error()
+        );
+        bytes.pop();
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
     }
 
     #[test]
@@ -1917,6 +2623,24 @@ mod tests {
             d.handle(&Call::ConfigSet(bad)).unwrap_err().code,
             api::INVALID_PARAMS
         );
+        // Setting disk accepts unit suffixes and refuses shrinking data.img.
+        let mut disk = std::collections::BTreeMap::new();
+        disk.insert("disk".to_string(), "500G".to_string());
+        let v = d.handle(&Call::ConfigSet(disk)).unwrap();
+        assert_eq!(v["disk_gib"], 500);
+        assert_eq!(v["disk_target_gib"], 500);
+        assert!(v["config"].get("disk_gib").is_none());
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(500));
+        fs::create_dir_all(home.join("data")).unwrap();
+        fs::File::create(home.join("data/data.img"))
+            .unwrap()
+            .set_len(200u64 << 30)
+            .unwrap();
+        let mut shrink = std::collections::BTreeMap::new();
+        shrink.insert("disk".to_string(), "100G".to_string());
+        let err = d.handle(&Call::ConfigSet(shrink)).unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+        assert!(err.message.contains("cannot shrink"), "{}", err.message);
         assert_eq!(
             d.handle(&Call::Version).unwrap()["protocol"],
             json!(PROTOCOL_VERSION)
@@ -1944,7 +2668,11 @@ mod tests {
         {
             let mut g = d.lock();
             g.state = VmState::Running;
-            let mut run = Run::new(Config::default(), None);
+            let mut run = Run::new(
+                Config::default(),
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            );
             run.docker = DockerState::Failed;
             run.problem = Some("dockerd crashed".into());
             g.run = Some(run);
@@ -1982,7 +2710,11 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            g.run = Some(Run::new(Config::default(), None));
+            g.run = Some(Run::new(
+                Config::default(),
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            ));
             let mut k = d.k8s.lock().unwrap();
             k.state = "running".into();
             k.kubeconfig = Some(kc.clone());
@@ -2013,7 +2745,11 @@ mod tests {
         {
             let mut g = d.lock();
             g.state = VmState::Stopping;
-            g.run = Some(Run::new(cfg, None));
+            g.run = Some(Run::new(
+                cfg,
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            ));
         }
         d.on_event(1, Event::ServiceReady("docker".into()));
         assert_eq!(d.lock().state, VmState::Stopping);
@@ -2036,8 +2772,12 @@ mod tests {
 
     #[test]
     fn k8s_stop_tolerates_missing_guest_when_starting_or_stopped() {
-        let home = temp("k8s-stop");
-        let d = Daemon::new(home.clone());
+        let root = temp("k8s-stop");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-stop");
         // Create a dummy (unconnectable) k8s.sock path to simulate Starting VM before guest listens.
         let sock = crate::k8s::socket_path(&home);
         fs::create_dir_all(sock.parent().unwrap()).unwrap();
@@ -2072,13 +2812,17 @@ mod tests {
         assert!(err.message.contains("still busy"), "got: {}", err.message);
         guest.join().unwrap();
 
-        fs::remove_dir_all(&home).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn k8s_reset_only_tears_down_host_state_after_reset_request_is_sent() {
-        let home = temp("k8s-reset");
-        let d = Daemon::new(home.clone());
+        let root = temp("k8s-rst");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-reset");
         let kc = crate::k8s::kubeconfig_path(&home);
         fs::create_dir_all(kc.parent().unwrap()).unwrap();
         fs::write(&kc, "dummy-kc").unwrap();
@@ -2091,7 +2835,7 @@ mod tests {
             k.state = "running".into();
             k.kubeconfig = Some(kc.clone());
         }
-        let err = d.k8s_reset().unwrap_err();
+        let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
         assert!(
             err.message.contains("not running"),
             "unexpected err: {}",
@@ -2111,14 +2855,14 @@ mod tests {
         let guest = thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
-            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset);
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
             kat_proto::k8s::write(
                 &mut conn,
                 &kat_proto::k8s::K8sMsg::Error("remove data failed".into()),
             )
             .unwrap();
         });
-        let err = d.k8s_reset().unwrap_err();
+        let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
         assert!(
             err.message.contains("remove data failed"),
             "unexpected err: {}",
@@ -2138,7 +2882,1339 @@ mod tests {
         assert!(!kc.exists());
         guest.join().unwrap();
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_mark_version_validates_state_and_forwards_tag() {
+        let home = temp("k8s-mark-version");
+        let d = Daemon::new(home.clone());
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+
+        // 1. Invalid version tag is rejected with INVALID_PARAMS before touching the guest.
+        let err = d.k8s_mark_version("latest").unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+        let err = d.k8s_mark_version("v1.30.9+k3s1").unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+
+        // 2. Non-running VM states are rejected without booting or toggling auto-start suppression.
+        for (state, expected_hint) in [
+            (VmState::Stopped, "kat config set kubernetes=off"),
+            (VmState::Error, "kat start"),
+            (VmState::Starting, "still starting"),
+            (VmState::Stopping, "stopping"),
+        ] {
+            d.lock().state = state;
+            let err = d.k8s_mark_version("v1.37.2+k3s1").unwrap_err();
+            assert_eq!(err.code, api::FAILED, "state={state:?}");
+            assert!(
+                err.message.contains(expected_hint),
+                "state={state:?}: {}",
+                err.message
+            );
+            let g = d.lock();
+            assert_eq!(g.state, state, "mark-version must not mutate VM state");
+            assert!(g.run.is_none(), "mark-version must not boot the VM");
+            assert!(!d.k8s.lock().unwrap().suppress_autostart);
+        }
+
+        // 3. Running Kubernetes cluster is rejected before contacting the guest.
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+        }
+        let err = d.k8s_mark_version("v1.37.2+k3s1").unwrap_err();
+        assert_eq!(err.code, api::FAILED);
+        assert!(err.message.contains("kat k8s stop"), "{}", err.message);
+
+        // 4. Stopped/failed cluster on a running VM forwards MarkDatastoreVersion and clears stale error.
+        {
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "failed".into();
+            k.error = Some("existing cluster data has no version marker".into());
+        }
+        let listener = UnixListener::bind(&sock).unwrap();
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(
+                req,
+                kat_proto::k8s::K8sMsg::MarkDatastoreVersion {
+                    version: "v1.37.2+k3s1".into(),
+                }
+            );
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+        d.k8s_mark_version("v1.37.2+k3s1").unwrap();
+        guest.join().unwrap();
+        assert_eq!(d.lock().state, VmState::Running);
+        {
+            let k = d.k8s.lock().unwrap();
+            assert_eq!(k.state, "stopped");
+            assert!(k.error.is_none());
+        }
+
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_forwards_images_flag_to_guest() {
+        let root = temp("k8s-img");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(user_home.join(".kube")).unwrap();
+        let user_kc = user_home.join(".kube/config");
+        fs::write(&user_kc, "apiVersion: v1\nkind: Config\n").unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-reset-images");
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Progress("removing k8s.io images".into()),
+            )
+            .unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+        let mut seen_progress = Vec::new();
+        d.k8s_reset(true, &mut |m| seen_progress.push(m.to_string()))
+            .unwrap();
+        guest.join().unwrap();
+        assert_eq!(d.k8s.lock().unwrap().state, "stopped");
+        assert!(
+            seen_progress.iter().any(|m| m == "removing k8s.io images"),
+            "missing guest progress: {seen_progress:?}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_images_preserves_host_state_when_older_guest_closes_without_ack() {
+        let root = temp("k8s-old");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let cfg = Config {
+            kubernetes: true,
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
+
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-old-guest");
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "live-kubeconfig").unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+
+        // Simulate an older guest that rejects the trailing flag byte and closes
+        // immediately without replying.
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            drop(conn);
+        });
+
+        let err = d.k8s_reset(true, &mut |_| {}).unwrap_err();
+        guest.join().unwrap();
+        assert!(
+            err.message.contains("before accepting the image reset"),
+            "unexpected err: {}",
+            err.message
+        );
+        {
+            let k = d.k8s.lock().unwrap();
+            assert_eq!(k.state, "running");
+            assert_eq!(k.kubeconfig.as_deref(), Some(kc.as_path()));
+            assert_eq!(k.epoch, 0);
+            assert!(k.error.is_none());
+        }
+        assert!(kc.exists(), "host kubeconfig must stay intact");
+        assert!(
+            Config::load(&home).unwrap().kubernetes,
+            "kubernetes config must stay enabled"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_disables_autostart_when_started_reset_outcome_is_unknown() {
+        let root = temp("k8s-unknown");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-unknown");
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // (guest frames, expect auto-start disabled)
+        let cases: [(Vec<kat_proto::k8s::K8sMsg>, bool); 4] = [
+            // Started plain reset, then the connection drops: outcome unknown.
+            (
+                vec![
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_QUEUED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_STARTED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Progress("removing cluster data".into()),
+                ],
+                true,
+            ),
+            // The guest drops the connection without reading or replying (for
+            // example at its connection limit): nothing started.
+            (vec![], false),
+            // Queued only, then the connection drops: nothing started.
+            (
+                vec![kat_proto::k8s::K8sMsg::Progress(
+                    kat_proto::k8s::RESET_QUEUED_PROGRESS.into(),
+                )],
+                false,
+            ),
+            // Started, then a clean guest error: data known to be intact.
+            (
+                vec![
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_QUEUED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Progress(kat_proto::k8s::RESET_STARTED_PROGRESS.into()),
+                    kat_proto::k8s::K8sMsg::Error("unmount busy".into()),
+                ],
+                false,
+            ),
+        ];
+        for (frames, expect_disabled) in cases {
+            let no_reply = frames.is_empty();
+            Config {
+                kubernetes: true,
+                ..Config::default()
+            }
+            .save(&home)
+            .unwrap();
+            {
+                let mut g = d.lock();
+                g.state = VmState::Running;
+                d.k8s.lock().unwrap().state = "running".into();
+            }
+            let l = listener.try_clone().unwrap();
+            let guest = thread::spawn(move || {
+                let (mut conn, _) = l.accept().unwrap();
+                let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+                assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+                for f in &frames {
+                    kat_proto::k8s::write(&mut conn, f).unwrap();
+                }
+            });
+            let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
+            guest.join().unwrap();
+            assert_eq!(
+                !Config::load(&home).unwrap().kubernetes,
+                expect_disabled,
+                "{}",
+                err.message
+            );
+            assert_eq!(
+                err.message
+                    .contains("may have deleted Kubernetes cluster data"),
+                expect_disabled,
+                "{}",
+                err.message
+            );
+            if no_reply {
+                assert_eq!(
+                    d.k8s.lock().unwrap().state,
+                    "running",
+                    "host state must be kept when the guest never answered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn k8s_reset_images_handles_post_ack_and_partial_image_cleanup_failures() {
+        let root = temp("k8s-part");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-partial");
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // 1. Failure after ResetAccepted but before ResetDataCleared: host state is torn down,
+        //    but kubernetes auto-start is NOT disabled because data deletion wasn't confirmed.
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        fs::write(&kc, "kc-1").unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+        let listener_clone = listener.try_clone().unwrap();
+        let guest1 = thread::spawn(move || {
+            let (mut conn, _) = listener_clone.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error("unmount busy".into()),
+            )
+            .unwrap();
+        });
+        let err = d.k8s_reset(true, &mut |_| {}).unwrap_err();
+        guest1.join().unwrap();
+        assert!(err.message.contains("unmount busy"), "got: {}", err.message);
+        assert_eq!(d.k8s.lock().unwrap().state, "stopped");
+        assert!(!kc.exists());
+        assert!(
+            Config::load(&home).unwrap().kubernetes,
+            "data deletion was not confirmed, so kubernetes config should remain enabled"
+        );
+
+        // 2. Partial success: ResetAccepted + ResetDataCleared, then image purge fails.
+        //    Host state is torn down, kubernetes=false IS persisted, and the error reports both.
+        fs::write(&kc, "kc-2").unwrap();
+        {
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+        let guest2 = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error("ctr images rm (k8s.io) failed: busy".into()),
+            )
+            .unwrap();
+        });
+        let err = d.k8s_reset(true, &mut |_| {}).unwrap_err();
+        guest2.join().unwrap();
+        assert!(
+            err.message.contains("cluster data was deleted"),
+            "expected partial-outcome message, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("ctr images rm (k8s.io) failed: busy"),
+            "expected image error detail, got: {}",
+            err.message
+        );
+        assert_eq!(d.k8s.lock().unwrap().state, "stopped");
+        assert!(!kc.exists());
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must be disabled after confirmed cluster data deletion"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_streams_progress_for_k8s_reset_images() {
+        let root = temp("k8s-srv");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-serve");
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = guest_listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Progress("removing cluster data".into()),
+            )
+            .unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Progress(
+                    "waiting for containerd garbage collection".into(),
+                ),
+            )
+            .unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: true,
+                progress: true,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+
+        let mut reader = BufReader::new(client_sock);
+        let mut notifications = Vec::new();
+        let mut final_resp = None;
+        let mut raw = String::new();
+        while reader.read_line(&mut raw).unwrap() > 0 {
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                assert_eq!(v["method"], "k8s.progress");
+                notifications.push(v["params"]["message"].as_str().unwrap().to_string());
+            } else {
+                final_resp = Some(v);
+            }
+            raw.clear();
+        }
+        srv.join().unwrap();
+        guest.join().unwrap();
+
+        assert!(
+            notifications
+                .iter()
+                .any(|m| m == "waiting for containerd garbage collection"),
+            "got notifications: {notifications:?}"
+        );
+        let resp = final_resp.expect("expected terminal response");
+        assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_streams_progress_for_plain_k8s_reset_only_when_requested() {
+        let root = temp("k8s-plain-p");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+
+        let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-plain-p");
+        Arc::get_mut(&mut d).unwrap().test_heartbeat_interval = Some(Duration::from_millis(30));
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut conn, _) = guest_listener.accept().unwrap();
+                let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+                assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+                kat_proto::k8s::write(
+                    &mut conn,
+                    &kat_proto::k8s::K8sMsg::Progress("removing cluster data".into()),
+                )
+                .unwrap();
+                kat_proto::k8s::write(
+                    &mut conn,
+                    &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+                )
+                .unwrap();
+                kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+            }
+        });
+
+        // 1. Plain reset with `progress: true` streams lock-wait and guest progress.
+        let held_op = d.k8s_op.lock().unwrap();
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: false,
+                progress: true,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+
+        let mut reader = BufReader::new(client_sock);
+        let mut notifications = Vec::new();
+        let mut final_resp = None;
+        let mut raw = String::new();
+        let mut held_op = Some(held_op);
+        while reader.read_line(&mut raw).unwrap() > 0 {
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                assert_eq!(v["method"], "k8s.progress");
+                let msg = v["params"]["message"].as_str().unwrap().to_string();
+                if msg == "waiting for active Kubernetes operation" {
+                    held_op.take();
+                }
+                notifications.push(msg);
+            } else {
+                final_resp = Some(v);
+            }
+            raw.clear();
+        }
+        drop(held_op);
+        srv.join().unwrap();
+
+        assert!(
+            notifications
+                .iter()
+                .any(|m| m == "waiting for active Kubernetes operation"),
+            "expected op-lock heartbeat, got: {notifications:?}"
+        );
+        assert!(
+            notifications.iter().any(|m| m == "removing cluster data"),
+            "expected guest progress, got: {notifications:?}"
+        );
+        let resp = final_resp.expect("expected terminal response");
+        assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none());
+
+        // 2. Legacy plain reset without `progress` emits zero notifications.
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            2,
+            &Call::K8sReset {
+                images: false,
+                progress: false,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+
+        let mut reader = BufReader::new(client_sock);
+        let mut legacy_notes = Vec::new();
+        let mut legacy_resp = None;
+        raw.clear();
+        while reader.read_line(&mut raw).unwrap() > 0 {
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                legacy_notes.push(v);
+            } else {
+                legacy_resp = Some(v);
+            }
+            raw.clear();
+        }
+        srv.join().unwrap();
+        guest.join().unwrap();
+
+        assert!(
+            legacy_notes.is_empty(),
+            "legacy k8s.reset must not emit unsolicited notifications: {legacy_notes:?}"
+        );
+        let resp = legacy_resp.expect("expected legacy terminal response");
+        assert_eq!(resp["id"], 2);
+        assert!(resp.get("error").is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_k8s_reset_images_completes_cleanup_when_client_stops_reading() {
+        let root = temp("k8s-stall");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-stall");
+        Arc::get_mut(&mut d).unwrap().test_progress_write_timeout =
+            Some(Duration::from_millis(100));
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "kc-stall").unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+
+        // Guest sends enough progress frames to overflow the Unix socket buffer
+        // while the client keeps the socket open without reading.
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = guest_listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            let big = "p".repeat(4096);
+            for _ in 0..256 {
+                kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Progress(big.clone()))
+                    .unwrap();
+            }
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let (mut client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: true,
+                progress: true,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        client_sock.write_all(&line).unwrap();
+        // Keep `client_sock` open without reading until the server finishes.
+
+        let started = Instant::now();
+        srv.join().unwrap();
+        guest.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "serve stalled on unread client socket: {:?}",
+            started.elapsed()
+        );
+        drop(client_sock);
+
+        assert_eq!(d.k8s.lock().unwrap().state, "stopped");
+        assert!(!kc.exists(), "host kubeconfig file must be cleaned up");
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes=false must be persisted even when client stopped reading"
+        );
+        assert!(
+            d.k8s_op.try_lock().is_ok(),
+            "k8s_op lock must be released after reset"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_k8s_reset_images_heartbeats_and_persists_while_kubeconfig_lock_held() {
+        let root = temp("k8s-flock");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        let kube_dir = user_home.join(".kube");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kube_dir).unwrap();
+        fs::write(kube_dir.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        // Hold the shared kubeconfig lock before starting the reset.
+        let lock_path = kube_dir.join(".katamaran-kubeconfig.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+        let mut held_lock = Some(lock_file);
+
+        let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-flock");
+        Arc::get_mut(&mut d).unwrap().test_heartbeat_interval = Some(Duration::from_millis(50));
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = guest_listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: true,
+                progress: true,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+
+        let mut reader = BufReader::new(client_sock);
+        let mut lock_heartbeats = 0usize;
+        let mut raw = String::new();
+        let reset_resp = loop {
+            raw.clear();
+            assert!(reader.read_line(&mut raw).unwrap() > 0);
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                assert_eq!(v["method"], "k8s.progress");
+                if v["params"]["message"] == "waiting for kubeconfig lock" {
+                    lock_heartbeats += 1;
+                    if lock_heartbeats == 2 {
+                        // Confirmed cluster deletion must ALREADY be persisted
+                        // before waiting on the shared kubeconfig lock.
+                        assert!(
+                            !Config::load(&home).unwrap().kubernetes,
+                            "kubernetes=false must be persisted before kubeconfig cleanup"
+                        );
+                        held_lock.take();
+                    }
+                }
+            } else {
+                break v;
+            }
+        };
+        assert_eq!(reset_resp["id"], 1);
+        assert!(reset_resp.get("error").is_none());
+        assert!(
+            lock_heartbeats >= 2,
+            "expected periodic kubeconfig lock heartbeats, got {lock_heartbeats}"
+        );
+
+        // Verify the healthy connection can still be reused after restoring write timeout.
+        let mut status_req = serde_json::to_vec(&Request::new(2, &Call::Status)).unwrap();
+        status_req.push(b'\n');
+        writer.write_all(&status_req).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+        raw.clear();
+        assert!(reader.read_line(&mut raw).unwrap() > 0);
+        let status_resp: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(status_resp["id"], 2);
+        assert!(status_resp.get("error").is_none());
+
+        srv.join().unwrap();
+        guest.join().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_images_bounds_stuck_kubeconfig_lock_and_kubectl_with_partial_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. Stuck shared kubeconfig lock: emits heartbeats within the finite deadline,
+        //    then returns a partial outcome stating the guest reset succeeded while
+        //    ~/.kube/config cleanup timed out.
+        let root1 = temp("k8s-kcto1");
+        let home1 = root1.join("h");
+        let user1 = root1.join("u");
+        let kube1 = user1.join(".kube");
+        fs::create_dir_all(&home1).unwrap();
+        fs::create_dir_all(&kube1).unwrap();
+        fs::write(kube1.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home1)
+        .unwrap();
+
+        let lock1 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(kube1.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock1.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let mut d1 = Daemon::new_for_test(home1.clone(), user1, "katamaran-test-kcto1");
+        {
+            let dm = Arc::get_mut(&mut d1).unwrap();
+            dm.test_heartbeat_interval = Some(Duration::from_millis(40));
+            dm.test_kubeconfig_timeout = Some(Duration::from_millis(180));
+        }
+        let sock1 = crate::k8s::socket_path(&home1);
+        fs::create_dir_all(sock1.parent().unwrap()).unwrap();
+        let listener1 = UnixListener::bind(&sock1).unwrap();
+        {
+            let mut g = d1.lock();
+            g.state = VmState::Running;
+            d1.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest1 = thread::spawn(move || {
+            let (mut conn, _) = listener1.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = d1
+            .k8s_reset(true, &mut |m| beats.push(m.to_string()))
+            .unwrap_err();
+        guest1.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bounded cleanup exceeded deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            beats
+                .iter()
+                .filter(|m| m.as_str() == "waiting for kubeconfig lock")
+                .count()
+                >= 1,
+            "expected lock heartbeat before timeout, got: {beats:?}"
+        );
+        assert!(
+            err.message
+                .contains("were reset, but cleaning up ~/.kube/config failed"),
+            "expected partial outcome error, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("timed out"), "got: {}", err.message);
+        assert!(!Config::load(&home1).unwrap().kubernetes);
+        drop(lock1);
+        fs::remove_dir_all(&root1).unwrap();
+
+        // 2. Stuck kubectl subprocess: killed cleanly at the finite deadline and reports
+        //    partial outcome without leaving a blocked worker thread.
+        let root2 = temp("k8s-kcto2");
+        let home2 = root2.join("h");
+        let user2 = root2.join("u");
+        let kube2 = user2.join(".kube");
+        fs::create_dir_all(&home2).unwrap();
+        fs::create_dir_all(&kube2).unwrap();
+        fs::write(kube2.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        let fake_kubectl = root2.join("kubectl");
+        fs::write(&fake_kubectl, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&fake_kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut d2 = Daemon::new_for_test(home2.clone(), user2, "katamaran-test-kcto2");
+        {
+            let dm = Arc::get_mut(&mut d2).unwrap();
+            dm.test_heartbeat_interval = Some(Duration::from_millis(40));
+            dm.test_kubeconfig_timeout = Some(Duration::from_millis(200));
+            dm.test_kubectl_bin = Some(fake_kubectl);
+        }
+        let sock2 = crate::k8s::socket_path(&home2);
+        fs::create_dir_all(sock2.parent().unwrap()).unwrap();
+        let listener2 = UnixListener::bind(&sock2).unwrap();
+        {
+            let mut g = d2.lock();
+            g.state = VmState::Running;
+            d2.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest2 = thread::spawn(move || {
+            let (mut conn, _) = listener2.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let mut beats2 = Vec::new();
+        let started2 = Instant::now();
+        let err2 = d2
+            .k8s_reset(true, &mut |m| beats2.push(m.to_string()))
+            .unwrap_err();
+        guest2.join().unwrap();
+        assert!(
+            started2.elapsed() < Duration::from_secs(3),
+            "hung kubectl was not killed at deadline: {:?}",
+            started2.elapsed()
+        );
+        assert!(
+            beats2
+                .iter()
+                .filter(|m| m.as_str() == "cleaning up kubeconfig")
+                .count()
+                >= 2,
+            "expected heartbeats during slow kubectl, got: {beats2:?}"
+        );
+        assert!(
+            err2.message
+                .contains("were reset, but cleaning up ~/.kube/config failed"),
+            "got: {}",
+            err2.message
+        );
+        assert!(err2.message.contains("timed out"), "got: {}", err2.message);
+        // Verify both the shared kubeconfig lock and the daemon's k8s_op lock were released.
+        let lock2 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(kube2.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        let rc = unsafe { libc::flock(lock2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(
+            rc,
+            0,
+            "kubeconfig lock must be released after kubectl timeout: {}",
+            std::io::Error::last_os_error()
+        );
+        drop(lock2);
+        assert!(
+            d2.k8s_op.try_lock().is_ok(),
+            "k8s_op lock must be released after kubectl timeout"
+        );
+        fs::remove_dir_all(&root2).unwrap();
+
+        // 3. Plain reset with stuck shared kubeconfig lock: also reports partial outcome
+        //    (without claiming cached images were cleared) and persists kubernetes = false.
+        let root3 = temp("k8s-kcto3");
+        let home3 = root3.join("h");
+        let user3 = root3.join("u");
+        let kube3 = user3.join(".kube");
+        fs::create_dir_all(&home3).unwrap();
+        fs::create_dir_all(&kube3).unwrap();
+        fs::write(kube3.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home3)
+        .unwrap();
+
+        let lock3 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(kube3.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock3.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let mut d3 = Daemon::new_for_test(home3.clone(), user3, "katamaran-test-kcto3");
+        {
+            let dm = Arc::get_mut(&mut d3).unwrap();
+            dm.test_heartbeat_interval = Some(Duration::from_millis(40));
+            dm.test_kubeconfig_timeout = Some(Duration::from_millis(180));
+        }
+        let sock3 = crate::k8s::socket_path(&home3);
+        fs::create_dir_all(sock3.parent().unwrap()).unwrap();
+        let listener3 = UnixListener::bind(&sock3).unwrap();
+        {
+            let mut g = d3.lock();
+            g.state = VmState::Running;
+            d3.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest3 = thread::spawn(move || {
+            let (mut conn, _) = listener3.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+            )
+            .unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let mut beats3 = Vec::new();
+        let err3 = d3
+            .k8s_reset(false, &mut |m| beats3.push(m.to_string()))
+            .unwrap_err();
+        guest3.join().unwrap();
+        assert!(
+            err3.message.contains(
+                "Kubernetes cluster data was reset, but cleaning up ~/.kube/config failed"
+            ),
+            "expected plain-reset partial outcome, got: {}",
+            err3.message
+        );
+        assert!(
+            !err3.message.contains("cached k8s.io images"),
+            "plain reset must not claim cached images were cleared: {}",
+            err3.message
+        );
+        assert!(err3.message.contains("timed out"), "got: {}", err3.message);
+        assert!(!Config::load(&home3).unwrap().kubernetes);
+        drop(lock3);
+        fs::remove_dir_all(&root3).unwrap();
+    }
+
+    #[test]
+    fn lock_k8s_op_with_timeout_emits_heartbeats_and_times_out() {
+        let root = temp("k8s-opto");
+        let home = root.join("h");
+        let user = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        let d = Daemon::new_for_test(home, user, "katamaran-test-opto");
+        let _held = d.k8s_op.lock().unwrap();
+        let mut beats = Vec::new();
+        let started = Instant::now();
+        let err = d
+            .lock_k8s_op_with_timeout(
+                Duration::from_millis(140),
+                Duration::from_millis(35),
+                &mut |m| beats.push(m.to_string()),
+            )
+            .unwrap_err();
+        assert!(
+            err.message
+                .contains("timed out waiting for active Kubernetes operation"),
+            "got: {}",
+            err.message
+        );
+        assert!(beats.len() >= 2, "expected heartbeats, got: {beats:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(_held);
+        let _ok = d
+            .lock_k8s_op_with_timeout(
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+                &mut |_| {},
+            )
+            .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_plain_reset_disables_autostart_when_deferred_reclamation_fails_after_detach() {
+        let root = temp("k8s-det");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-det");
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let home_check = home.clone();
+        let guest = thread::spawn(move || {
+            // 1. Reclamation error after plain-reset Progress data-cleared marker.
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+            )
+            .unwrap();
+            // Wait until the daemon has reacted to the checkpoint before sending the
+            // follow-up error — verifying `kubernetes = false` is persisted IMMEDIATELY
+            // while the reset is still in flight.
+            release_rx.recv().unwrap();
+            assert!(
+                !Config::load(&home_check).unwrap().kubernetes,
+                "kubernetes=false must be persisted immediately upon data-cleared marker, before reset finishes"
+            );
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error("remove .data.removing-1: timed out".into()),
+            )
+            .unwrap();
+
+            // 2. Lost connection after plain-reset Progress data-cleared marker.
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+            )
+            .unwrap();
+            drop(conn);
+        });
+        let err = d
+            .k8s_reset(false, &mut |m| {
+                if m == kat_proto::k8s::RESET_DATA_CLEARED_PROGRESS {
+                    let _ = release_tx.send(());
+                }
+            })
+            .unwrap_err();
+        assert!(
+            err.message.contains("cluster data was deleted")
+                && err.message.contains("finishing cluster reset failed")
+                && err.message.contains("remove .data.removing-1: timed out"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must be disabled after detached datastore failure"
+        );
+
+        // Re-enable kubernetes and verify a lost guest reply after immediate
+        // ResetDataCleared still disables auto-start.
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        let err2 = d.k8s_reset(false, &mut |_| {}).unwrap_err();
+        guest.join().unwrap();
+        assert!(
+            err2.message.contains("cluster data was deleted")
+                && err2.message.contains("closed the Kubernetes connection"),
+            "got: {}",
+            err2.message
+        );
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must be disabled if guest disconnects after ResetDataCleared"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_retries_persisting_autostart_disable_after_transient_checkpoint_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let root = temp("k8s-retry-p");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        let run_dir = home.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-retry-p");
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+
+        // Make `home` read-only so the immediate `config.toml.tmp.*` write at the
+        // ResetDataCleared checkpoint fails transiently, then restore writability
+        // before the guest sends `Done`.
+        let _restore = RestoreMode(home.clone());
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (checkpoint_tx, checkpoint_rx) = std::sync::mpsc::channel::<()>();
+        let home_guest = home.clone();
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            checkpoint_rx.recv().unwrap();
+            // Confirm the checkpoint save failed while `home` was read-only.
+            assert!(
+                Config::load(&home_guest).unwrap().kubernetes,
+                "checkpoint save should have failed while home was read-only"
+            );
+            // Restore writability before sending Done so the completion retry succeeds.
+            fs::set_permissions(&home_guest, fs::Permissions::from_mode(0o755)).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        d.k8s_reset(true, &mut |m| {
+            if m == kat_proto::k8s::RESET_DATA_CLEARED_PROGRESS {
+                let _ = checkpoint_tx.send(());
+            }
+        })
+        .unwrap();
+        guest.join().unwrap();
+
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "completion retry must persist kubernetes=false once home is writable again"
+        );
+        drop(_restore);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_plain_reset_preserves_host_state_and_kubeconfig_when_guest_queue_times_out() {
+        let root = temp("k8s-qto");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        let kube_dir = user_home.join(".kube");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&kube_dir).unwrap();
+        let user_cfg = kube_dir.join("config");
+        fs::write(
+            &user_cfg,
+            "apiVersion: v1\ncurrent-context: katamaran-qto\n",
+        )
+        .unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-qto");
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "standalone-kc").unwrap();
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.kubeconfig = Some(kc.clone());
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Progress(
+                    "waiting for active guest Kubernetes operation".into(),
+                ),
+            )
+            .unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error(format!(
+                    "{}timed out waiting for active guest Kubernetes operation",
+                    kat_proto::k8s::RESET_NOT_STARTED_PREFIX
+                )),
+            )
+            .unwrap();
+        });
+
+        let mut progress = Vec::new();
+        let err = d
+            .k8s_reset(false, &mut |m| progress.push(m.to_string()))
+            .unwrap_err();
+        guest.join().unwrap();
+
+        assert!(
+            err.message
+                .contains("timed out waiting for active guest Kubernetes operation"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "waiting for active guest Kubernetes operation"),
+            "expected queued progress heartbeat, got: {progress:?}"
+        );
+        assert_eq!(
+            d.k8s.lock().unwrap().state,
+            "running",
+            "runtime state must stay running when guest reset never started"
+        );
+        assert_eq!(
+            d.k8s.lock().unwrap().kubeconfig.as_ref(),
+            Some(&kc),
+            "kubeconfig runtime handle must remain intact"
+        );
+        assert!(kc.exists(), "standalone kubeconfig file must remain intact");
+        assert!(
+            fs::read_to_string(&user_cfg)
+                .unwrap()
+                .contains("katamaran-qto"),
+            "merged ~/.kube/config context must remain intact"
+        );
+        assert!(
+            Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must remain enabled"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2149,11 +4225,20 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            g.run = Some(Run::new(Config::default(), None));
+            g.run = Some(Run::new(
+                Config::default(),
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            ));
         }
         d.on_event(
             1,
-            Event::PortFailed(PortProto::Tcp, 80, "address already in use".into()),
+            Event::PortFailed(
+                run::PortOrigin::Published,
+                PortProto::Tcp,
+                80,
+                "address already in use".into(),
+            ),
         );
         let st = d.status();
         assert!(st.ports.is_empty());
@@ -2166,14 +4251,19 @@ mod tests {
             }]
         );
 
-        // Successful bind replaces the error.
-        d.on_event(1, Event::PortAdd(PortProto::Tcp, 80));
+        // Successful bind replaces the error and records bound addresses.
+        let alias = std::net::Ipv4Addr::new(172, 16, 1, 200);
+        d.on_event(
+            1,
+            Event::PortAdd(run::PortOrigin::Published, PortProto::Tcp, 80, vec![alias]),
+        );
         let st = d.status();
         assert_eq!(
             st.ports,
             vec![Port {
                 proto: "tcp".into(),
                 port: 80,
+                addresses: vec![alias],
             }]
         );
         assert!(st.port_errors.is_empty());
@@ -2181,12 +4271,738 @@ mod tests {
         // Another failure is cleared on PortErrorClear.
         d.on_event(
             1,
-            Event::PortFailed(PortProto::Tcp, 443, "address already in use".into()),
+            Event::PortFailed(
+                run::PortOrigin::Published,
+                PortProto::Tcp,
+                443,
+                "address already in use".into(),
+            ),
         );
         assert_eq!(d.status().port_errors.len(), 1);
-        d.on_event(1, Event::PortErrorClear(PortProto::Tcp, 443));
+        d.on_event(
+            1,
+            Event::PortErrorClear(run::PortOrigin::Published, PortProto::Tcp, 443),
+        );
         assert!(d.status().port_errors.is_empty());
 
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn set_config_reports_k8s_toggled_only_when_enable_state_changes() {
+        let home = temp("k8s-toggled");
+        let d = Daemon::new(home.clone());
+        let kc = crate::k8s::kubeconfig_path(&home);
+        fs::create_dir_all(kc.parent().unwrap()).unwrap();
+        fs::write(&kc, "fixture-kubeconfig\n").unwrap();
+        d.k8s.lock().unwrap().kubeconfig = Some(kc.clone());
+
+        // Enabling kubernetes transitions false -> true without invoking disable cleanup.
+        let mut enable = std::collections::BTreeMap::new();
+        enable.insert("kubernetes".into(), "on".into());
+        let mut cleaned = false;
+        let v = d.set_config_with(&enable, |_| cleaned = true).unwrap();
+        assert!(v.k8s_toggled);
+        assert!(v.config.kubernetes);
+        assert!(!cleaned);
+
+        // Passing kubernetes=on again with new k8s_disable does NOT toggle kubernetes.
+        let mut unchanged = std::collections::BTreeMap::new();
+        unchanged.insert("kubernetes".into(), "on".into());
+        unchanged.insert("k8s_disable".into(), "traefik".into());
+        let v = d.set_config_with(&unchanged, |_| cleaned = true).unwrap();
+        assert!(!v.k8s_toggled);
+        assert_eq!(v.config.k8s_disable, vec!["traefik"]);
+        assert!(!cleaned);
+
+        // Disabling kubernetes transitions true -> false and runs only the injected fixture cleanup.
+        let mut disable = std::collections::BTreeMap::new();
+        disable.insert("kubernetes".into(), "off".into());
+        let v = d
+            .set_config_with(&disable, |h| {
+                cleaned = true;
+                let _ = fs::remove_file(crate::k8s::kubeconfig_path(h));
+            })
+            .unwrap();
+        assert!(v.k8s_toggled);
+        assert!(!v.config.kubernetes);
+        assert!(cleaned);
+        assert!(!kc.exists());
+        assert!(d.k8s.lock().unwrap().kubeconfig.is_none());
+
+        // ConfigGet never reports k8s_toggled and omits it from JSON.
+        let get = d.handle(&Call::ConfigGet).unwrap();
+        assert!(get.get("k8s_toggled").is_none());
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    fn test_run_args(cfg: &Config, template: &Path) -> RunArgs {
+        RunArgs {
+            kernel: PathBuf::from("Image"),
+            initramfs: PathBuf::from("initramfs.cpio"),
+            rootfs: PathBuf::from("rootfs.erofs"),
+            data_template: template.to_path_buf(),
+            disk_gib: cfg.disk_gib,
+            cpus: cfg.cpus,
+            memory_mib: cfg.memory_mib,
+            cmdline: guest_cmdline(cfg),
+            vm_bin: None,
+            no_share: true,
+            permissions: "caller".into(),
+            mount: None,
+            no_mount: true,
+            no_network: true,
+            gvproxy: None,
+            mtu: crate::net::DEFAULT_MTU,
+            pause_on_sleep: cfg.pause_on_sleep,
+            no_auto_forward: true,
+            forward_addresses: cfg.forward_addresses.clone(),
+            amd64: cfg.amd64,
+        }
+    }
+
+    #[test]
+    fn foreground_grown_disk_reports_attached_size_without_perpetual_pending() {
+        let home = temp("attached-disk");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        fs::File::create(&img)
+            .unwrap()
+            .set_len(64u64 << 30)
+            .unwrap();
+        // Simulate a foreground `katamaran run --disk-gib 500` while config.toml stays at default 64 GiB.
+        assert_eq!(
+            run::prepare_data_disk(&img, &img, Some(500)).unwrap(),
+            500u64 << 30
+        );
+
+        let d = Daemon::new(home.clone());
+        let (done_tx, done_rx) = mpsc::channel();
+        let img_for_vm = img.clone();
+        d.start_with(
+            |cfg| Ok(test_run_args(cfg, &img)),
+            move |daemon, generation, args, rx, disk_lock| {
+                thread::spawn(move || {
+                    let bytes =
+                        run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                            .unwrap();
+                    drop(disk_lock);
+                    daemon.on_event(generation, Event::DiskPrepared { bytes });
+                    daemon.on_event(
+                        generation,
+                        Event::Booted {
+                            kernel_release: "6.18".into(),
+                            vm_pid: 42,
+                            took: Duration::from_millis(50),
+                        },
+                    );
+                    daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                    let _ = done_tx.send(());
+                    let _ = rx.recv();
+                    daemon.on_exit(generation, Ok(()));
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let status = d.status();
+        let vm = status.vm.as_ref().expect("running VM info");
+        assert_eq!(vm.disk_gib, 500);
+        assert_eq!(vm.requested_disk_gib, None);
+        assert_eq!(status.saved_disk_gib(), crate::config::DEFAULT_DISK_GIB);
+
+        // Retaining the larger image does not cause perpetual pending work.
+        let view = d.config_view().unwrap();
+        assert!(!view.restart_required);
+        let text = crate::cli::summary(&status);
+        assert!(text.contains("500 GiB disk"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn k8s_start_refuses_silent_noop_when_settings_changed_while_running() {
+        let home = temp("k8s-run");
+        fs::create_dir_all(home.join("run")).unwrap();
+        let d = Daemon::new(home.clone());
+
+        let host = Host {
+            cpus: 255,
+            memory_mib: 32768,
+        };
+        let mut cfg = Config::default();
+        cfg.set("k8s_disable", "traefik", &host).unwrap();
+        cfg.set("k8s_args", "--debug", &host).unwrap();
+        cfg.save(&home).unwrap();
+        let yaml_path = crate::k8s::k3s_config_path(&home);
+        fs::write(&yaml_path, "# initial\ndisable:\n  - metrics-server\n").unwrap();
+
+        let initial = crate::k8s::prepare_start(&home).unwrap();
+        let proxy = crate::k8s::ApiProxy::start(&home).unwrap();
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Running;
+            let mut run = Run::new(cfg.clone(), None, u64::from(cfg.disk_gib()) << 30);
+            run.docker = DockerState::Ready;
+            g.run = Some(run);
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.api_proxy = Some(proxy);
+            k.started_settings = Some(initial.settings);
+        }
+
+        let mut noop = |_: &str| {};
+        // 1. Identical settings succeed as a no-op.
+        let st = d.k8s_start_inner(false, false, false, &mut noop).unwrap();
+        assert_eq!(st.state, "running");
+
+        // 2. Comment/formatting-only YAML edit still matches normalized JSON.
+        fs::write(&yaml_path, "# edited comment\ndisable: [metrics-server]\n").unwrap();
+        let st = d.k8s_start_inner(false, false, false, &mut noop).unwrap();
+        assert_eq!(st.state, "running");
+
+        // 3. Changing k8s_disable is refused instead of silently returning Ok,
+        //    and leaves the running cluster intact.
+        let mut changed_disable = cfg.clone();
+        changed_disable
+            .set("k8s_disable", "traefik,servicelb", &host)
+            .unwrap();
+        changed_disable.save(&home).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+        assert_eq!(d.k8s.lock().unwrap().state, "running");
+        cfg.save(&home).unwrap();
+
+        // 4. Changing k8s_args is refused.
+        let mut changed_args = cfg.clone();
+        changed_args
+            .set("k8s_args", "--debug --kubelet-arg=max-pods=200", &host)
+            .unwrap();
+        changed_args.save(&home).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+        cfg.save(&home).unwrap();
+
+        // 5. Changing k8s_version is refused.
+        let mut changed_ver = cfg.clone();
+        changed_ver
+            .set("k8s_version", "v1.32.5+k3s1", &host)
+            .unwrap();
+        changed_ver.save(&home).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+        cfg.save(&home).unwrap();
+
+        // 6. Changing k3s-config.yaml content is refused.
+        fs::write(&yaml_path, "disable: [servicelb]\n").unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+
+        // 7. Removing k3s-config.yaml is refused.
+        fs::remove_file(&yaml_path).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+
+        // 8. Invalid k3s-config.yaml returns the validation error and keeps state running.
+        fs::write(&yaml_path, "bind-address: 0.0.0.0\n").unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("bind-address"), "got: {}", err.message);
+        assert_eq!(d.k8s.lock().unwrap().state, "running");
+
+        // Clean up ApiProxy before removing temp dir.
+        d.k8s.lock().unwrap().api_proxy = None;
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn startup_disk_preparation_blocks_concurrent_shrink_edits() {
+        let home = temp("disk-race");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        fs::File::create(&img)
+            .unwrap()
+            .set_len(64u64 << 30)
+            .unwrap();
+
+        let cfg = Config {
+            disk_gib: Some(500),
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
+
+        let d = Daemon::new(home.clone());
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let (grown_tx, grown_rx) = mpsc::channel();
+        let img_for_vm = img.clone();
+
+        d.start_with(
+            |cfg| Ok(test_run_args(cfg, &img)),
+            move |daemon, generation, args, rx, disk_lock| {
+                thread::spawn(move || {
+                    // Startup has snapshotted target = 500 GiB and holds disk_lock, paused before growing data.img.
+                    let _ = paused_tx.send(());
+                    proceed_rx.recv().unwrap();
+                    let bytes =
+                        run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                            .unwrap();
+                    drop(disk_lock);
+                    daemon.on_event(generation, Event::DiskPrepared { bytes });
+                    let _ = grown_tx.send(());
+                    let _ = rx.recv();
+                    daemon.on_exit(generation, Ok(()));
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // While startup image preparation is in flight, a smaller concurrent RPC disk edit must fail.
+        let mut shrink = BTreeMap::new();
+        shrink.insert("disk".into(), "200G".into());
+        let err = d.handle(&Call::ConfigSet(shrink.clone())).unwrap_err();
+        assert_eq!(err.code, api::FAILED);
+        assert!(
+            err.message.contains("preparing its data disk"),
+            "{}",
+            err.message
+        );
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(500));
+
+        // Unrelated settings still succeed while disk preparation is in flight.
+        let mut unrelated = BTreeMap::new();
+        unrelated.insert("cpus".into(), "1".into());
+        d.handle(&Call::ConfigSet(unrelated)).unwrap();
+
+        // Resume startup so data.img is extended to 500 GiB.
+        proceed_tx.send(()).unwrap();
+        grown_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(fs::metadata(&img).unwrap().len(), 500u64 << 30);
+
+        // Now shrink is rejected against the grown 500 GiB image, while growing further succeeds.
+        let err = d.handle(&Call::ConfigSet(shrink)).unwrap_err();
+        assert_eq!(err.code, api::INVALID_PARAMS);
+        assert!(err.message.contains("cannot shrink"), "{}", err.message);
+
+        let mut grow = BTreeMap::new();
+        grow.insert("disk".into(), "600G".into());
+        let v = d.handle(&Call::ConfigSet(grow)).unwrap();
+        assert_eq!(v["disk_gib"], 600);
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn published_removal_preserves_live_automatic_forward_on_same_port() {
+        let home = temp("port-handoff");
+        let d = Daemon::new(home.clone());
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Running;
+            g.run = Some(Run::new(
+                Config::default(),
+                None,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
+            ));
+        }
+
+        let alias = std::net::Ipv4Addr::new(172, 16, 1, 200);
+        // 1. Published forward is active on port 8080.
+        d.on_event(
+            1,
+            Event::PortAdd(
+                run::PortOrigin::Published,
+                PortProto::Tcp,
+                8080,
+                vec![std::net::Ipv4Addr::LOCALHOST, alias],
+            ),
+        );
+        // 2. Automatic forward for the same port arrives while the listener
+        // pool is full (queued with a capacity error; published stays live).
+        d.on_event(
+            1,
+            Event::PortFailed(
+                run::PortOrigin::Automatic,
+                PortProto::Tcp,
+                8080,
+                "forward descriptor limit reached".into(),
+            ),
+        );
+        let st = d.status();
+        assert_eq!(
+            st.ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 8080,
+                addresses: vec![std::net::Ipv4Addr::LOCALHOST, alias],
+            }]
+        );
+        assert!(
+            st.port_errors.is_empty(),
+            "live published port must suppress transient automatic error"
+        );
+
+        // 3. Published worker releases the listener, firing the capacity wake
+        // BEFORE its Removed event reaches the session: automatic binds first.
+        d.on_event(
+            1,
+            Event::PortAdd(
+                run::PortOrigin::Automatic,
+                PortProto::Tcp,
+                8080,
+                vec![alias],
+            ),
+        );
+        // While both are momentarily recorded, published takes precedence.
+        assert_eq!(
+            d.status().ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 8080,
+                addresses: vec![std::net::Ipv4Addr::LOCALHOST, alias],
+            }]
+        );
+
+        // 4. Published Removed arrives afterwards: must clear ONLY Published,
+        // keeping the live Automatic alias visible in status.
+        d.on_event(
+            1,
+            Event::PortRemove(run::PortOrigin::Published, PortProto::Tcp, 8080),
+        );
+        let st = d.status();
+        assert_eq!(
+            st.ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 8080,
+                addresses: vec![alias],
+            }]
+        );
+        assert!(st.port_errors.is_empty());
+
+        // 5. Removing Automatic clears the status entry cleanly.
+        d.on_event(
+            1,
+            Event::PortRemove(run::PortOrigin::Automatic, PortProto::Tcp, 8080),
+        );
+        assert!(d.status().ports.is_empty());
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn guest_data_disk_resize_failure_exposes_status_error_without_failing_docker() {
+        let home = temp("disk-resize-err");
+        let cfg = Config {
+            disk_gib: Some(500),
+            ..Config::default()
+        };
+        cfg.save(&home).unwrap();
+        let d = Daemon::new(home.clone());
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Starting;
+            g.run = Some(Run::new(cfg, None, 500u64 << 30));
+        }
+
+        assert!(!d.config_view().unwrap().restart_required);
+
+        d.on_event(
+            1,
+            Event::ServiceFailed("data-disk".into(), "read-only filesystem".into()),
+        );
+        d.on_event(1, Event::ServiceReady("docker".into()));
+
+        let st = d.status();
+        assert_eq!(st.state, VmState::Running);
+        assert_eq!(st.docker.state, DockerState::Ready);
+        assert_eq!(st.error.as_deref(), Some("data-disk: read-only filesystem"));
+        assert!(st.vm.as_ref().unwrap().disk_resize_failed);
+        assert!(d.config_view().unwrap().restart_required);
+        let text = crate::cli::summary(&st);
+        assert!(text.contains("data-disk: read-only filesystem"), "{text}");
+        assert!(text.contains("docker     ready"), "{text}");
+        assert!(
+            text.contains("500 GiB disk (filesystem resize failed)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pending") && text.contains("500 GiB disk after a restart"),
+            "{text}"
+        );
+
+        // Once the VM restarts and boots without a resize error, the pending
+        // restart flag clears.
+        d.on_event(
+            1,
+            Event::Restarting {
+                why: "retry".into(),
+                delay: Duration::from_millis(10),
+            },
+        );
+        d.on_event(1, Event::ServiceReady("docker".into()));
+        let after = d.status();
+        assert!(!after.vm.as_ref().unwrap().disk_resize_failed);
+        assert!(!d.config_view().unwrap().restart_required);
+        let after_text = crate::cli::summary(&after);
+        assert!(
+            !after_text.contains("filesystem resize failed"),
+            "{after_text}"
+        );
+        assert!(!after_text.contains("pending"), "{after_text}");
+
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn daemon_preserves_untouched_small_image_and_honors_explicit_64g_growth() {
+        let home = temp("small-foreground-disk");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        let small_bytes = 8u64 << 30;
+        fs::File::create(&img)
+            .unwrap()
+            .set_len(small_bytes)
+            .unwrap();
+
+        let d = Daemon::new(home.clone());
+        let start_sim = |expected_target: Option<u32>| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let img_for_vm = img.clone();
+            d.start_with(
+                |cfg| Ok(test_run_args(cfg, &img)),
+                move |daemon, generation, args, rx, disk_lock| {
+                    assert_eq!(args.disk_gib, expected_target);
+                    thread::spawn(move || {
+                        let bytes =
+                            run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                                .unwrap();
+                        drop(disk_lock);
+                        daemon.on_event(generation, Event::DiskPrepared { bytes });
+                        daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                        let _ = done_tx.send(());
+                        let _ = rx.recv();
+                        daemon.on_exit(generation, Ok(()));
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+
+        // 1. Untouched default config does not grow the 8 GiB image.
+        start_sim(None);
+        assert_eq!(fs::metadata(&img).unwrap().len(), small_bytes);
+        let status = d.status();
+        let vm = status.vm.as_ref().expect("running VM info");
+        assert_eq!(vm.disk_gib, 8);
+        assert_eq!(status.disk_target_gib, None);
+        assert!(!d.config_view().unwrap().restart_required);
+        let text = crate::cli::summary(&status);
+        assert!(text.contains("8 GiB disk"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+
+        // 2. Explicitly running `config set disk=64G` persists `disk_gib = 64`
+        //    and flags a pending restart against the attached 8 GiB disk.
+        let mut grow_64 = BTreeMap::new();
+        grow_64.insert("disk".into(), "64G".into());
+        let v = d.handle(&Call::ConfigSet(grow_64)).unwrap();
+        assert_eq!(v["disk_gib"], 64);
+        assert_eq!(v["disk_target_gib"], 64);
+        assert_eq!(v["restart_required"], true);
+        assert_eq!(Config::load(&home).unwrap().disk_gib, Some(64));
+
+        let pending_status = d.status();
+        let pending_text = crate::cli::summary(&pending_status);
+        assert!(
+            pending_text.contains("pending")
+                && pending_text.contains("64 GiB disk after a restart"),
+            "{pending_text}"
+        );
+
+        // 3. Restarting grows the 8 GiB image to 64 GiB and clears pending.
+        d.stop(true).unwrap();
+        start_sim(Some(64));
+        assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
+        let after_status = d.status();
+        assert_eq!(after_status.vm.as_ref().unwrap().disk_gib, 64);
+        assert!(!d.config_view().unwrap().restart_required);
+        let after_text = crate::cli::summary(&after_status);
+        assert!(after_text.contains("64 GiB disk"), "{after_text}");
+        assert!(!after_text.contains("pending"), "{after_text}");
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn fractional_63_5_gib_image_flags_restart_when_raised_to_64_gib() {
+        let home = temp("fractional-disk");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        let bytes_63_5 = (63u64 << 30) + (512u64 << 20);
+        fs::File::create(&img).unwrap().set_len(bytes_63_5).unwrap();
+
+        let d = Daemon::new(home.clone());
+        let start_sim = |expected_target: Option<u32>| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let img_for_vm = img.clone();
+            d.start_with(
+                |cfg| Ok(test_run_args(cfg, &img)),
+                move |daemon, generation, args, rx, disk_lock| {
+                    assert_eq!(args.disk_gib, expected_target);
+                    thread::spawn(move || {
+                        let bytes =
+                            run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                                .unwrap();
+                        drop(disk_lock);
+                        daemon.on_event(generation, Event::DiskPrepared { bytes });
+                        daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                        let _ = done_tx.send(());
+                        let _ = rx.recv();
+                        daemon.on_exit(generation, Ok(()));
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+
+        start_sim(None);
+        assert_eq!(d.status().vm.as_ref().unwrap().disk_bytes, Some(bytes_63_5));
+        assert!(!d.config_view().unwrap().restart_required);
+        let initial_text = crate::cli::summary(&d.status());
+        assert!(initial_text.contains("63.5 GiB disk"), "{initial_text}");
+        assert!(!initial_text.contains("pending"), "{initial_text}");
+
+        let mut grow_64 = BTreeMap::new();
+        grow_64.insert("disk".into(), "64G".into());
+        let v = d.handle(&Call::ConfigSet(grow_64)).unwrap();
+        assert_eq!(v["restart_required"], true);
+        let pending_text = crate::cli::summary(&d.status());
+        assert!(
+            pending_text.contains("pending")
+                && pending_text.contains("64 GiB disk after a restart"),
+            "{pending_text}"
+        );
+
+        d.stop(true).unwrap();
+        start_sim(Some(64));
+        assert_eq!(fs::metadata(&img).unwrap().len(), 64u64 << 30);
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&d.status()).contains("pending"));
+
+        d.stop(true).unwrap();
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn padded_image_equal_target_flags_filesystem_only_restart_and_clears_after_restart() {
+        let home = temp("padded-equal-target");
+        let data_dir = home.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let img = data_dir.join("data.img");
+        let bytes_100 = 100u64 << 30;
+        fs::File::create(&img).unwrap().set_len(bytes_100).unwrap();
+
+        let d = Daemon::new(home.clone());
+        let start_sim = |expected_target: Option<u32>| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let img_for_vm = img.clone();
+            d.start_with(
+                |cfg| Ok(test_run_args(cfg, &img)),
+                move |daemon, generation, args, rx, disk_lock| {
+                    assert_eq!(args.disk_gib, expected_target);
+                    thread::spawn(move || {
+                        let bytes =
+                            run::prepare_data_disk(&img_for_vm, &args.data_template, args.disk_gib)
+                                .unwrap();
+                        drop(disk_lock);
+                        daemon.on_event(generation, Event::DiskPrepared { bytes });
+                        daemon.on_event(generation, Event::ServiceReady("docker".into()));
+                        let _ = done_tx.send(());
+                        let _ = rx.recv();
+                        daemon.on_exit(generation, Ok(()));
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        };
+
+        // 1. Boot with a pre-padded 100 GiB backing image and no saved disk target.
+        start_sim(None);
+        let initial = d.status();
+        assert_eq!(initial.vm.as_ref().unwrap().disk_gib, 100);
+        assert_eq!(initial.vm.as_ref().unwrap().requested_disk_gib, None);
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&initial).contains("pending"));
+
+        // 2. Setting disk=100G (equal to the backing image) flags a pending
+        //    restart so kat-init can expand the guest Btrfs filesystem to 100 GiB.
+        let mut set_100 = BTreeMap::new();
+        set_100.insert("disk".into(), "100G".into());
+        let v = d.handle(&Call::ConfigSet(set_100)).unwrap();
+        assert_eq!(v["restart_required"], true);
+        let pending_text = crate::cli::summary(&d.status());
+        assert!(
+            pending_text.contains("pending")
+                && pending_text.contains("100 GiB disk after a restart"),
+            "{pending_text}"
+        );
+
+        // 3. Restarting passes Some(100) to the guest and clears pending.
+        d.stop(true).unwrap();
+        start_sim(Some(100));
+        let after = d.status();
+        assert_eq!(after.vm.as_ref().unwrap().requested_disk_gib, Some(100));
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&after).contains("pending"));
+
+        // 4. Lowering or removing disk_gib directly in config.toml does not flag pending.
+        Config {
+            disk_gib: Some(64),
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&d.status()).contains("pending"));
+
+        Config::default().save(&home).unwrap();
+        assert!(!d.config_view().unwrap().restart_required);
+        assert!(!crate::cli::summary(&d.status()).contains("pending"));
+
+        d.stop(true).unwrap();
         fs::remove_dir_all(&home).unwrap();
     }
 }

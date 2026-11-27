@@ -10,8 +10,10 @@ use std::io::{self, Read, Write};
 
 pub mod backoff;
 pub mod fscache;
+pub mod k3s_config;
 pub mod k8s;
 pub mod machine;
+pub mod vm_exec;
 
 pub const PROTOCOL_VERSION: u32 = 3;
 /// vsock port the guest dials on the host (CID 2) for the control channel.
@@ -23,10 +25,11 @@ pub const DOCKER_PORT: u32 = 1025;
 /// on this port: frames of `u32` little-endian length plus records for
 /// `/dev/kat_fsnotify` (see `kat_vmm::fscache`).
 pub const FSCACHE_PORT: u32 = 1031;
-/// Guest vsock port where the agent relays auto-forwarded container ports.
+/// Guest vsock port where the agent relays auto-forwarded container ports and
+/// ports Docker published on the VM's loopback (`-p 127.0.0.1:...`).
 /// The host writes the port as `u16` little endian first; the agent then
-/// connects to whatever container listens on it and copies both ways. The
-/// host side is a Unix socket libkrun listens on.
+/// connects to the container and copies both ways. The host side is a Unix
+/// socket libkrun listens on.
 pub const AUTO_FORWARD_PORT: u32 = 1032;
 /// Guest vsock port of the NFS server that shows guest files on the Mac. The
 /// host side is a Unix socket libkrun listens on for the macOS kernel only.
@@ -40,6 +43,9 @@ pub const K8S_PORT: u32 = 1051;
 /// Guest vsock port relayed to the k3s Kubernetes API server (`127.0.0.1:6443`).
 /// The host side is a Unix socket libkrun listens on.
 pub const K8S_API_PORT: u32 = 1052;
+/// Guest vsock port of the VM root shell and exec service (see [`vm_exec`]).
+/// The host side is a Unix socket libkrun listens on.
+pub const VM_EXEC_PORT: u32 = 1053;
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub(crate) const HEADER: usize = 6;
@@ -83,13 +89,14 @@ pub enum Msg {
         port: u16,
     },
     /// Guest → host: a container listens on `port` in its own network
-    /// namespace and nothing in the root namespace does; forward the Mac's
-    /// `127.0.0.1:port` to it through [`AUTO_FORWARD_PORT`].
+    /// namespace and nothing in the root namespace does, or Docker published
+    /// `port` on the VM's loopback (`-p 127.0.0.1:port:...`); forward the
+    /// Mac's `127.0.0.1:port` to it through [`AUTO_FORWARD_PORT`].
     AutoForwardAdd {
         proto: PortProto,
         port: u16,
     },
-    /// Guest → host: drop the auto-forward of `port`.
+    /// Guest → host: drop the vsock forward of `port`.
     AutoForwardRemove {
         proto: PortProto,
         port: u16,

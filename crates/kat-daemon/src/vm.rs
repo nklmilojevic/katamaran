@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{self, BufRead};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -66,46 +67,155 @@ pub fn start(cfg: &VmConfig, vm_bin: &Path, timeout: Duration) -> anyhow::Result
 }
 
 /// Enforces a single wall-clock `deadline` across every `read`/`write` syscall
-/// during the guest handshake, so a trickling peer cannot extend the timeout.
-struct DeadlineStream<'a> {
+/// during a handshake using `poll` + nonblocking `recv`/`send`, so an idle or
+/// trickling peer cannot extend the timeout and no persistent socket timeouts
+/// are left on the descriptor (avoiding macOS `EINVAL` on `setsockopt` after
+/// peer close). Sets `O_NONBLOCK` for the guard's lifetime because macOS XNU
+/// ignores `MSG_DONTWAIT` on `AF_UNIX` `SOCK_STREAM` sends.
+pub(crate) struct DeadlineStream<'a> {
     conn: &'a mut UnixStream,
     deadline: Instant,
-    timeout: Duration,
+    timeout_msg: String,
+    restore_blocking: bool,
 }
 
-impl DeadlineStream<'_> {
-    fn remaining(&self) -> io::Result<Duration> {
+impl<'a> DeadlineStream<'a> {
+    pub(crate) fn new(conn: &'a mut UnixStream, deadline: Instant, timeout_msg: String) -> Self {
+        let fd = conn.as_raw_fd();
+        let orig = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let restore_blocking = if orig >= 0 && (orig & libc::O_NONBLOCK) == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFL, orig | libc::O_NONBLOCK) == 0 }
+        } else {
+            false
+        };
+        Self {
+            conn,
+            deadline,
+            timeout_msg,
+            restore_blocking,
+        }
+    }
+
+    fn remaining_ms(&self) -> io::Result<i32> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!(
-                    "guest handshake timed out after {}s",
-                    self.timeout.as_secs()
-                ),
+                self.timeout_msg.clone(),
             ))
         } else {
-            Ok(left)
+            Ok(left.as_millis().clamp(1, i32::MAX as u128) as i32)
+        }
+    }
+
+    fn poll_ready(&self, events: libc::c_short) -> io::Result<()> {
+        loop {
+            let timeout_ms = self.remaining_ms()?;
+            let mut pfd = libc::pollfd {
+                fd: self.conn.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if rc > 0 {
+                return Ok(());
+            }
+            if rc == 0 {
+                if Instant::now() >= self.deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        self.timeout_msg.clone(),
+                    ));
+                }
+                continue;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
         }
     }
 }
 
 impl io::Read for DeadlineStream<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.conn.set_read_timeout(Some(self.remaining()?))?;
-        self.conn.read(buf)
+        if buf.is_empty() {
+            self.remaining_ms()?;
+            return Ok(0);
+        }
+        loop {
+            self.poll_ready(libc::POLLIN)?;
+            let rc = unsafe {
+                libc::recv(
+                    self.conn.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if rc >= 0 {
+                return Ok(rc as usize);
+            }
+            let e = io::Error::last_os_error();
+            if matches!(
+                e.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return Err(e);
+        }
     }
 }
 
 impl io::Write for DeadlineStream<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.conn.set_write_timeout(Some(self.remaining()?))?;
-        self.conn.write(buf)
+        if buf.is_empty() {
+            self.remaining_ms()?;
+            return Ok(0);
+        }
+        loop {
+            self.poll_ready(libc::POLLOUT)?;
+            let rc = unsafe {
+                libc::send(
+                    self.conn.as_raw_fd(),
+                    buf.as_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if rc >= 0 {
+                return Ok(rc as usize);
+            }
+            let e = io::Error::last_os_error();
+            if matches!(
+                e.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return Err(e);
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.remaining()?;
-        self.conn.flush()
+        self.remaining_ms()?;
+        Ok(())
+    }
+}
+
+impl Drop for DeadlineStream<'_> {
+    fn drop(&mut self) {
+        if self.restore_blocking {
+            let fd = self.conn.as_raw_fd();
+            unsafe {
+                let cur = libc::fcntl(fd, libc::F_GETFL);
+                if cur >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                }
+            }
+        }
     }
 }
 
@@ -126,11 +236,11 @@ fn handshake_io(
     timeout: Duration,
 ) -> anyhow::Result<Hello> {
     conn.set_nonblocking(false)?;
-    let mut ds = DeadlineStream {
+    let mut ds = DeadlineStream::new(
         conn,
         deadline,
-        timeout,
-    };
+        format!("guest handshake timed out after {}s", timeout.as_secs()),
+    );
     let hello = match read_msg(&mut ds)? {
         Some(Msg::Hello(h)) => h,
         Some(other) => bail!("expected Hello, got {other:?}"),
@@ -148,8 +258,11 @@ fn handshake_io(
             unix_ns: unix_now_ns(),
         },
     )?;
-    conn.set_read_timeout(None)?;
-    conn.set_write_timeout(None)?;
+    drop(ds);
+    // `DeadlineStream` sets no socket timeouts; clearing them is best-effort
+    // (macOS `setsockopt` fails with `EINVAL` once the peer has closed).
+    let _ = conn.set_read_timeout(None);
+    let _ = conn.set_write_timeout(None);
     Ok(hello)
 }
 

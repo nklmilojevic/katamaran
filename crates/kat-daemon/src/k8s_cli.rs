@@ -1,7 +1,7 @@
 //! `kat k8s`: manage the optional single-node Kubernetes (k3s) cluster.
 
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -24,7 +24,21 @@ pub enum K8sCmd {
     /// Stop Kubernetes and disable auto-start (zero overhead when off).
     Stop,
     /// Stop Kubernetes and wipe all cluster state and persistent volumes.
-    Reset,
+    ///
+    /// Cached images in containerd's `k8s.io` namespace are kept by default so
+    /// they remain available for reuse (subject to each workload's
+    /// `imagePullPolicy`). Pass `--images` to also clear all images in `k8s.io`
+    /// (Docker's `moby` namespace is untouched).
+    Reset {
+        /// Also remove all images in containerd's `k8s.io` namespace.
+        #[arg(long)]
+        images: bool,
+    },
+    /// Record the verified k3s version tag of an existing unmarked cluster datastore.
+    MarkVersion {
+        /// Independently verified k3s release tag (for example `v1.37.2+k3s1`).
+        version: String,
+    },
     /// Print the kubeconfig YAML (or its file path with --path).
     Kubeconfig {
         /// Print the path to `<home>/run/kubeconfig.yaml` instead of its contents.
@@ -61,7 +75,8 @@ pub fn run(cmd: K8sCmd) -> anyhow::Result<()> {
         K8sCmd::Status { json } => status(json),
         K8sCmd::Start => start(),
         K8sCmd::Stop => stop(),
-        K8sCmd::Reset => reset(),
+        K8sCmd::Reset { images } => reset(images),
+        K8sCmd::MarkVersion { version } => mark_version(&version),
         K8sCmd::Kubeconfig { path } => kubeconfig(path),
         K8sCmd::SyncImages => sync_images(),
         K8sCmd::Dns(d) => dns(d),
@@ -101,7 +116,20 @@ pub fn format_status(k: &K8sStatus) -> String {
     if let Some(path) = &k.kubeconfig {
         line("kubeconfig", path.display().to_string());
     }
-    let dns_state = if k.dns_installed {
+    let dns_state = if k.dns_isolated {
+        match k.dns_port {
+            Some(p) => format!(
+                "*.{} (127.0.0.1:{p}, isolated; {} not used)",
+                k.dns_domain,
+                k8s::RESOLVER_PATH
+            ),
+            None => format!(
+                "*.{} (isolated; {} not used)",
+                k.dns_domain,
+                k8s::RESOLVER_PATH
+            ),
+        }
+    } else if k.dns_installed {
         match k.dns_port {
             Some(p) => format!("*.{} (127.0.0.1:{p}, active)", k.dns_domain),
             None => format!("*.{} (installed, waiting for k8s)", k.dns_domain),
@@ -146,11 +174,246 @@ fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reset() -> anyhow::Result<()> {
-    let mut c = Client::connect_default()?;
-    c.call(&Call::K8sReset)?;
-    println!("katamaran: Kubernetes cluster reset");
+/// Sentinel error returned when `k8s reset` has already submitted its failure
+/// diagnostic to its bounded stderr writer, so `main` exits nonzero without
+/// blocking on Rust's synchronous stderr termination handler.
+#[derive(Debug)]
+pub struct ReportedError;
+
+impl std::fmt::Display for ReportedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reset failed")
+    }
+}
+
+impl std::error::Error for ReportedError {}
+
+/// Unbuffered writer targeting `STDERR_FILENO` directly so the detached
+/// progress worker never holds Rust's global `std::io::stderr()` mutex.
+struct RawStderr;
+
+impl std::io::Write for RawStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            let n = unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    buf.as_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Asynchronous bounded progress writer so a closed (`EPIPE`) or undrained
+/// stderr pipe can never panic or block the CLI while reading daemon RPC
+/// notifications or reporting the terminal reset outcome.
+struct ProgressPrinter {
+    tx: Option<std::sync::mpsc::SyncSender<String>>,
+    terminal_tx: std::sync::mpsc::SyncSender<String>,
+    done: std::sync::mpsc::Receiver<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPrinter {
+    fn spawn<W: std::io::Write + Send + 'static>(mut writer: W) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(32);
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = std::thread::Builder::new()
+            .name("k8s-reset-progress".into())
+            .spawn(move || {
+                let mut progress_failed = false;
+                while let Ok(line) = rx.recv() {
+                    if !progress_failed && writer.write_all(line.as_bytes()).is_err() {
+                        progress_failed = true;
+                    }
+                }
+                if let Ok(final_line) = terminal_rx.try_recv() {
+                    let _ = writer.write_all(final_line.as_bytes());
+                }
+                let _ = done_tx.try_send(());
+            })
+            .ok();
+        Self {
+            tx: worker.as_ref().map(|_| tx),
+            terminal_tx,
+            done: done_rx,
+            worker,
+        }
+    }
+
+    fn send(&mut self, msg: &str) {
+        if let Some(tx) = &self.tx
+            && matches!(
+                tx.try_send(format!("katamaran: {msg}\n")),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_))
+            )
+        {
+            self.tx = None;
+        }
+    }
+
+    fn finish(mut self, terminal: Option<String>, flush_timeout: Duration) {
+        if self.worker.is_none() {
+            // The worker thread could not be spawned, so nothing would ever
+            // print the terminal line: write it directly, bounded by `poll`.
+            if let Some(line) = terminal {
+                write_stderr_bounded(line.as_bytes(), flush_timeout);
+            }
+            return;
+        }
+        if let Some(line) = terminal {
+            let _ = self.terminal_tx.try_send(line);
+        }
+        self.tx = None;
+        if self.done.recv_timeout(flush_timeout).is_ok()
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Write `buf` to stderr without ever blocking: stderr is switched to
+/// `O_NONBLOCK` for the duration (the CLI is about to exit), so a full or
+/// undrained pipe just loses the rest of the line instead of hanging. Waits
+/// for writability at most until `timeout`.
+fn write_stderr_bounded(mut buf: &[u8], timeout: Duration) {
+    let fd = libc::STDERR_FILENO;
+    // SAFETY: fcntl on our own stderr descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while !buf.is_empty() {
+        // SAFETY: `buf` is valid for `buf.len()` bytes; the fd is non-blocking.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+            continue;
+        }
+        let e = std::io::Error::last_os_error();
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if n == 0 || e.kind() != std::io::ErrorKind::WouldBlock || left.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ms = left.as_millis().clamp(1, 50) as i32;
+        // SAFETY: `pfd` is valid for the duration of the call.
+        unsafe { libc::poll(&mut pfd, 1, ms) };
+    }
+    // SAFETY: restore the original flags on our own stderr descriptor.
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+}
+
+fn report_error_bounded(printer: ProgressPrinter, err: &anyhow::Error) -> anyhow::Error {
+    printer.finish(
+        Some(format!("Error: {err:?}\n")),
+        Duration::from_millis(250),
+    );
+    ReportedError.into()
+}
+
+fn reset(images: bool) -> anyhow::Result<()> {
+    let mut printer = ProgressPrinter::spawn(RawStderr);
+    let mut c = match Client::connect_default() {
+        Ok(c) => c,
+        Err(e) => return Err(report_error_bounded(printer, &e)),
+    };
+    let res = reset_with_client(&mut c, images, &mut |msg| printer.send(msg));
+    if let Err(e) = res {
+        return Err(report_error_bounded(printer, &e));
+    }
+    printer.finish(None, Duration::from_millis(250));
+    let confirmation = if images {
+        b"katamaran: Kubernetes cluster reset (k8s.io images cleared)\n".as_slice()
+    } else {
+        b"katamaran: Kubernetes cluster reset\n".as_slice()
+    };
+    if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), confirmation)
+        .and_then(|()| std::io::Write::flush(&mut std::io::stdout()))
+    {
+        let err = anyhow::Error::new(e).context("write reset confirmation to stdout");
+        let err_printer = ProgressPrinter::spawn(RawStderr);
+        return Err(report_error_bounded(err_printer, &err));
+    }
     Ok(())
+}
+
+fn mark_version(version: &str) -> anyhow::Result<()> {
+    // Accept the same input as `kat config set k8s_version=...` (leading `v` optional).
+    let version = &if version.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("v{version}")
+    } else {
+        version.to_string()
+    };
+    crate::config::validate_k8s_version(version)?;
+    let mut c = Client::connect_default().context(
+        "`kat k8s mark-version` requires a running VM with Kubernetes stopped; \
+         disable Kubernetes auto-start (`kat config set kubernetes=off`) if enabled, \
+         start the VM (`kat start`), then retry",
+    )?;
+    c.call(&Call::K8sMarkVersion {
+        version: version.to_string(),
+    })?;
+    println!("katamaran: recorded cluster datastore version {version}");
+    Ok(())
+}
+
+fn reset_with_client(
+    client: &mut Client,
+    images: bool,
+    on_progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
+    let mut last = String::new();
+    let mut on_note = |method: &str, params: &Value| {
+        if method == "k8s.progress"
+            && let Some(msg) = params.get("message").and_then(Value::as_str)
+            && last != msg
+        {
+            last.clear();
+            last.push_str(msg);
+            on_progress(msg);
+        }
+    };
+    let res = client.call_notified(
+        &Call::K8sReset {
+            images,
+            progress: true,
+        },
+        &mut on_note,
+    );
+    match res {
+        Ok(_) => Ok(()),
+        Err(e)
+            if images
+                && e.downcast_ref::<crate::api::RpcError>()
+                    .is_some_and(|r| r.code == crate::api::METHOD_NOT_FOUND) =>
+        {
+            bail!(
+                "the running daemon does not support `kat k8s reset --images`; restart the daemon to upgrade"
+            )
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn kubeconfig(path_only: bool) -> anyhow::Result<()> {
@@ -176,26 +439,70 @@ fn sync_images() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn dns_status_line(
+    k8s_status: Option<&K8sStatus>,
+    resolver_installed: impl FnOnce(Option<u16>) -> bool,
+) -> String {
+    if let Some(st) = k8s_status
+        && st.dns_isolated
+    {
+        return match st.dns_port {
+            Some(port) => format!(
+                "*.{} DNS responder is running in isolated mode on 127.0.0.1:{port} ({}=1); {} is not used",
+                k8s::DNS_DOMAIN,
+                k8s::ISOLATED_DNS_ENV,
+                k8s::RESOLVER_PATH
+            ),
+            None => format!(
+                "*.{} DNS responder is running in isolated mode ({}=1); {} is not used",
+                k8s::DNS_DOMAIN,
+                k8s::ISOLATED_DNS_ENV,
+                k8s::RESOLVER_PATH
+            ),
+        };
+    }
+    let active_port = k8s_status.and_then(|s| s.dns_port);
+    if resolver_installed(active_port) {
+        format!(
+            "*.{} resolver installed at {}",
+            k8s::DNS_DOMAIN,
+            k8s::RESOLVER_PATH
+        )
+    } else {
+        format!(
+            "*.{} resolver not installed ({}); run `kat k8s dns install`",
+            k8s::DNS_DOMAIN,
+            k8s::RESOLVER_PATH
+        )
+    }
+}
+
+fn dns_install_port(k8s_status: &K8sStatus) -> anyhow::Result<u16> {
+    if k8s_status.dns_isolated {
+        bail!(
+            "refusing to install {} for an isolated DNS responder ({}=1); \
+             run against a non-isolated daemon instead",
+            k8s::RESOLVER_PATH,
+            k8s::ISOLATED_DNS_ENV
+        );
+    }
+    let Some(port) = k8s_status.dns_port else {
+        bail!("Kubernetes DNS responder is not running; run `kat k8s start` first");
+    };
+    Ok(port)
+}
+
 fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
     match cmd {
         DnsCmd::Status => {
-            let active_port = Client::connect_default()
+            let k8s_status = Client::connect_default()
                 .ok()
                 .and_then(|mut c| c.status().ok())
-                .and_then(|s| s.k8s.dns_port);
-            if k8s::dns_resolver_installed(active_port) {
-                println!(
-                    "*.{} resolver installed at {}",
-                    k8s::DNS_DOMAIN,
-                    k8s::RESOLVER_PATH
-                );
-            } else {
-                println!(
-                    "*.{} resolver not installed ({}); run `kat k8s dns install`",
-                    k8s::DNS_DOMAIN,
-                    k8s::RESOLVER_PATH
-                );
-            }
+                .map(|s| s.k8s);
+            println!(
+                "{}",
+                dns_status_line(k8s_status.as_ref(), k8s::dns_resolver_installed)
+            );
             Ok(())
         }
         DnsCmd::Install => {
@@ -203,9 +510,7 @@ fn dns(cmd: DnsCmd) -> anyhow::Result<()> {
                 "start Kubernetes first (`kat k8s start`) before installing DNS resolution",
             )?;
             let st = c.status()?;
-            let Some(port) = st.k8s.dns_port else {
-                bail!("Kubernetes DNS responder is not running; run `kat k8s start` first");
-            };
+            let port = dns_install_port(&st.k8s)?;
             let content = k8s::dns_resolver_content(port);
             let script = format!(
                 "mkdir -p /etc/resolver && printf '%s' '{}' > {}",
@@ -280,5 +585,439 @@ mod tests {
         assert!(parse_forward_target("not-an-ip:80").is_err());
         assert!(parse_forward_target("10.43.0.1").is_err());
         assert!(parse_forward_target("::1:80").is_err());
+    }
+
+    #[test]
+    fn dns_install_rejects_isolated_responder_before_sudo() {
+        let isolated = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(54321),
+            dns_isolated: true,
+            ..K8sStatus::default()
+        };
+        let err = dns_install_port(&isolated).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("isolated"), "{msg}");
+        assert!(msg.contains(k8s::RESOLVER_PATH), "{msg}");
+
+        let normal = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(15353),
+            dns_isolated: false,
+            ..K8sStatus::default()
+        };
+        assert_eq!(dns_install_port(&normal).unwrap(), 15353);
+
+        let stopped = K8sStatus::default();
+        assert!(dns_install_port(&stopped).is_err());
+    }
+
+    #[test]
+    fn dns_status_reports_isolation_without_recommending_install() {
+        let isolated = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(54321),
+            dns_isolated: true,
+            ..K8sStatus::default()
+        };
+        let line = dns_status_line(Some(&isolated), |_| {
+            panic!("isolated DNS status should not check host resolver installation")
+        });
+        assert!(line.contains("isolated"), "{line}");
+        assert!(line.contains("54321"), "{line}");
+        assert!(!line.contains("kat k8s dns install"), "{line}");
+
+        let formatted = format_status(&isolated);
+        assert!(formatted.contains("isolated"), "{formatted}");
+        assert!(!formatted.contains("kat k8s dns install"), "{formatted}");
+
+        let normal = K8sStatus {
+            dns_domain: k8s::DNS_DOMAIN.into(),
+            dns_port: Some(15353),
+            dns_isolated: false,
+            ..K8sStatus::default()
+        };
+        let not_installed = dns_status_line(Some(&normal), |p| {
+            assert_eq!(p, Some(15353));
+            false
+        });
+        assert!(
+            not_installed.contains("kat k8s dns install"),
+            "{not_installed}"
+        );
+
+        let installed = dns_status_line(Some(&normal), |p| {
+            assert_eq!(p, Some(15353));
+            true
+        });
+        assert!(installed.contains("resolver installed"), "{installed}");
+        assert!(!installed.contains("kat k8s dns install"), "{installed}");
+    }
+
+    #[test]
+    fn parses_reset_images_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: K8sCmd,
+        }
+
+        let default = Wrapper::try_parse_from(["k8s", "reset"]).unwrap();
+        assert!(matches!(default.cmd, K8sCmd::Reset { images: false }));
+
+        let with_images = Wrapper::try_parse_from(["k8s", "reset", "--images"]).unwrap();
+        assert!(matches!(with_images.cmd, K8sCmd::Reset { images: true }));
+    }
+
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn create(prefix: &str) -> Self {
+            use std::os::unix::ffi::OsStringExt;
+            let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+            let mut bytes = template.into_os_string().into_vec();
+            bytes.push(0);
+            let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+            assert!(
+                !ptr.is_null(),
+                "mkdtemp failed: {}",
+                std::io::Error::last_os_error()
+            );
+            bytes.pop();
+            Self(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                bytes,
+            )))
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn reset_images_fails_on_pre_feature_daemon_without_falling_back() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = TempDirGuard::create("kat-cli-rc");
+        let sock = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_srv = seen.clone();
+
+        let srv = thread::spawn(move || {
+            // Simulate a pre-feature daemon that only implements `k8s.reset`.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+                seen_srv.lock().unwrap().push(req.method.clone());
+                let id = req.id.unwrap_or(Value::Null);
+                let resp = if req.method == "k8s.reset" {
+                    crate::api::Response::ok(id, Value::Null)
+                } else {
+                    crate::api::Response::err(
+                        id,
+                        crate::api::RpcError::new(
+                            crate::api::METHOD_NOT_FOUND,
+                            format!("unknown method {}", req.method),
+                        ),
+                    )
+                };
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+                line.clear();
+            }
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let err = reset_with_client(&mut client, true, &mut |_| {}).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support `kat k8s reset --images`"),
+            "unexpected error: {err:#}"
+        );
+        drop(client);
+        srv.join().unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec!["k8s.reset_images".to_string()]);
+    }
+
+    #[test]
+    fn reset_images_consumes_and_deduplicates_progress_notifications() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let dir = TempDirGuard::create("kat-cli-rp");
+        let sock = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let srv = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "k8s.reset_images");
+            assert!(req.params.is_null());
+            let id = req.id.unwrap();
+            for msg in [
+                "removing cluster data",
+                "waiting for containerd garbage collection",
+                "waiting for containerd garbage collection",
+                "stopping temporary VM",
+            ] {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": msg }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let mut progress = Vec::new();
+        reset_with_client(&mut client, true, &mut |m| progress.push(m.to_string())).unwrap();
+        srv.join().unwrap();
+
+        assert_eq!(
+            progress,
+            vec![
+                "removing cluster data",
+                "waiting for containerd garbage collection",
+                "stopping temporary VM",
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_reset_requests_progress_and_works_with_legacy_and_notified_daemons() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let dir = TempDirGuard::create("kat-cli-pl");
+        let sock = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let srv = thread::spawn(move || {
+            // 1. Notified daemon streams progress for plain `k8s.reset`.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "k8s.reset");
+            assert_eq!(req.params, serde_json::json!({ "progress": true }));
+            let id = req.id.unwrap();
+            for msg in [
+                "waiting for active Kubernetes operation",
+                "waiting for active Kubernetes operation",
+                "removing cluster data",
+            ] {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": msg }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+
+            // 2. Pre-feature daemon ignores `params` and returns only the response.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "k8s.reset");
+            let resp = crate::api::Response::ok(req.id.unwrap(), Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let mut progress = Vec::new();
+        reset_with_client(&mut client, false, &mut |m| progress.push(m.to_string())).unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                "waiting for active Kubernetes operation",
+                "removing cluster data",
+            ]
+        );
+
+        let mut legacy_client = Client::connect(&sock).unwrap();
+        let mut legacy_progress = Vec::new();
+        reset_with_client(&mut legacy_client, false, &mut |m| {
+            legacy_progress.push(m.to_string())
+        })
+        .unwrap();
+        assert!(legacy_progress.is_empty());
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn reset_keeps_reading_result_when_progress_writer_fails_or_blocks() {
+        use std::io::{self, BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::thread;
+
+        struct BrokenPipeWriter(Arc<Mutex<usize>>);
+        impl Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                *self.0.lock().unwrap() += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct BlockingWriter(mpsc::Receiver<()>);
+        impl Write for BlockingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = TempDirGuard::create("kat-cli-ep");
+        let sock = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let srv = thread::spawn(move || {
+            // 1. BrokenPipe progress writer still reads notifications through Done.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            let id = req.id.unwrap();
+            for msg in ["stopping k3s", "removing cluster data"] {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": msg }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+
+            // 2. Undrained/blocking stderr writer (50 distinct progress messages > channel
+            //    capacity 32) never stalls reading the terminal reset result.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            let id = req.id.unwrap();
+            for i in 0..50 {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": format!("step {i}") }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+        });
+
+        let attempts = Arc::new(Mutex::new(0usize));
+        let mut client1 = Client::connect(&sock).unwrap();
+        let mut printer1 = ProgressPrinter::spawn(BrokenPipeWriter(attempts.clone()));
+        reset_with_client(&mut client1, false, &mut |msg| printer1.send(msg)).unwrap();
+        printer1.finish(None, Duration::from_millis(250));
+        assert!(*attempts.lock().unwrap() >= 1);
+
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let mut client2 = Client::connect(&sock).unwrap();
+        let mut printer2 = ProgressPrinter::spawn(BlockingWriter(unblock_rx));
+        let started = Instant::now();
+        reset_with_client(&mut client2, false, &mut |msg| printer2.send(msg)).unwrap();
+        printer2.finish(None, Duration::from_millis(50));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "undrained progress writer blocked reset completion: {:?}",
+            started.elapsed()
+        );
+        drop(unblock_tx);
+        srv.join().unwrap();
+
+        // 3. Transient WouldBlock during progress stops progress writes without
+        //    dropping the worker, so restoring writability before `finish` still
+        //    writes the terminal error diagnostic.
+        struct TransientWouldBlockWriter {
+            writable: Arc<std::sync::atomic::AtomicBool>,
+            captured: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for TransientWouldBlockWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.writable.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "pipe full"));
+                }
+                self.captured.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut printer3 = ProgressPrinter::spawn(TransientWouldBlockWriter {
+            writable: writable.clone(),
+            captured: captured.clone(),
+        });
+        printer3.send("stopping k3s");
+        printer3.send("removing cluster data");
+        // Give the worker time to observe WouldBlock on progress before restoring writability.
+        thread::sleep(Duration::from_millis(30));
+        writable.store(true, std::sync::atomic::Ordering::SeqCst);
+        printer3.finish(
+            Some("Error: cluster data deleted, cleanup failed\n".into()),
+            Duration::from_millis(250),
+        );
+        let out = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("Error: cluster data deleted, cleanup failed"),
+            "terminal diagnostic lost after transient progress WouldBlock: {out:?}"
+        );
     }
 }
