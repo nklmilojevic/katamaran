@@ -930,6 +930,19 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             .unwrap_or_else(|e| panic!("{what}: timed out or closed waiting for result: {e}"));
         parse_latencies(&line, what)
     };
+    fn median_of_3(
+        send_cmd: &mut impl FnMut(&str, &str) -> (f64, f64),
+        cmd: &str,
+        what: &str,
+    ) -> (f64, f64) {
+        let mut samples = [
+            send_cmd(cmd, what),
+            send_cmd(cmd, what),
+            send_cmd(cmd, what),
+        ];
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        samples[1]
+    }
 
     let (pod_p50, pod_total) = send_cmd("25", "pod-to-pod keep-alive (quickack=Y)");
     eprintln!("pod-to-pod keep-alive (quickack=Y): p50={pod_p50:.2}ms total={pod_total:.2}ms");
@@ -938,17 +951,23 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "pod-to-pod keep-alive stalled (p50={pod_p50:.2}ms total={pod_total:.2}ms)"
     );
 
-    // Sustained 32 MiB bulk download and 512x4 KiB short-write stream on the
-    // same established pingpong-mode keep-alive socket with quickack=Y, to
-    // compare ACK pacing against quickack=N below.
-    let (bulk_acks_on, bulk_ms_on) = send_cmd("bulk", "sustained 32MiB bulk (quickack=Y)");
+    // Warm up TCP receive-buffer auto-tuning once, then take median-of-3
+    // sustained 32 MiB bulk and 512x4 KiB short-write measurements on the same
+    // established pingpong-mode keep-alive socket to compare tightly against
+    // quickack=N below.
+    send_cmd("bulk", "warmup 32MiB bulk");
+    let (bulk_acks_on, bulk_ms_on) =
+        median_of_3(&mut send_cmd, "bulk", "sustained 32MiB bulk (quickack=Y)");
     eprintln!(
-        "pod-to-pod sustained 32MiB bulk (quickack=Y): out_segs={bulk_acks_on:.0} elapsed={bulk_ms_on:.2}ms"
+        "pod-to-pod sustained 32MiB bulk median (quickack=Y): out_segs={bulk_acks_on:.0} elapsed={bulk_ms_on:.2}ms"
     );
-    let (short_acks_on, short_ms_on) =
-        send_cmd("short", "short-write 512x4KiB stream (quickack=Y)");
+    let (short_acks_on, short_ms_on) = median_of_3(
+        &mut send_cmd,
+        "short",
+        "short-write 512x4KiB stream (quickack=Y)",
+    );
     eprintln!(
-        "pod-to-pod short-write 512x4KiB stream (quickack=Y): out_segs={short_acks_on:.0} elapsed={short_ms_on:.2}ms"
+        "pod-to-pod short-write 512x4KiB stream median (quickack=Y): out_segs={short_acks_on:.0} elapsed={short_ms_on:.2}ms"
     );
     let (paced_acks_on, paced_ms_on) =
         send_cmd("paced", "paced short-write 32x4KiB stream (quickack=Y)");
@@ -989,12 +1008,13 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     // !after(rcv_wup, copied_seq) ensures the override fires at most once per
     // unread batch rather than ACKing every pushed segment below SO_RCVLOWAT.
     send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144");
-    let (pushed_acks_on, pushed_ms_on) = send_cmd(
+    let (pushed_acks_on, pushed_ms_on) = median_of_3(
+        &mut send_cmd,
         "pushed",
         "SO_RCVLOWAT=262144 pushed 48x60000B stream (quickack=Y)",
     );
     eprintln!(
-        "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B (quickack=Y): out_segs={pushed_acks_on:.0} elapsed={pushed_ms_on:.2}ms"
+        "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=Y): out_segs={pushed_acks_on:.0} elapsed={pushed_ms_on:.2}ms"
     );
     send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1");
 
@@ -1051,37 +1071,47 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         );
 
         send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144 (quickack=N)");
-        let (pushed_acks_off, pushed_ms_off) = send_cmd(
+        let (pushed_acks_off, pushed_ms_off) = median_of_3(
+            &mut send_cmd,
             "pushed",
             "SO_RCVLOWAT=262144 pushed 48x60000B stream (quickack=N)",
         );
         eprintln!(
-            "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B (quickack=N): out_segs={pushed_acks_off:.0} elapsed={pushed_ms_off:.2}ms"
+            "pod-to-pod SO_RCVLOWAT=262144 pushed 48x60000B median (quickack=N): out_segs={pushed_acks_off:.0} elapsed={pushed_ms_off:.2}ms"
         );
         // 48 pushed segments: without !after(rcv_wup, copied_seq) each segment
         // below 262144 would be ACKed (~48+ OutSegs). With the guard, stock
         // pacing handles subsequent segments in each batch.
         assert!(
-            pushed_acks_on < 42.0 && pushed_acks_on <= pushed_acks_off * 1.5 + 8.0,
+            pushed_acks_on < 40.0 && pushed_acks_on <= pushed_acks_off * 1.4 + 6.0,
             "SO_RCVLOWAT=262144 pushed stream inflated ACKs (on={pushed_acks_on:.0}, off={pushed_acks_off:.0})"
         );
         send_cmd("rcvlowat 1", "reset SO_RCVLOWAT=1 (quickack=N)");
 
-        let (bulk_acks_off, bulk_ms_off) = send_cmd("bulk", "sustained 32MiB bulk (quickack=N)");
+        let (bulk_acks_off, bulk_ms_off) =
+            median_of_3(&mut send_cmd, "bulk", "sustained 32MiB bulk (quickack=N)");
         eprintln!(
-            "pod-to-pod sustained 32MiB bulk (quickack=N): out_segs={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
+            "pod-to-pod sustained 32MiB bulk median (quickack=N): out_segs={bulk_acks_off:.0} elapsed={bulk_ms_off:.2}ms"
         );
+        // Tight enough to catch a 2x doubling in sustained bulk ACK traffic
+        // (32 MiB exceeds sk_rcvbuf so both peers run in steady state).
         assert!(
-            bulk_acks_on < 350.0 && bulk_acks_on <= bulk_acks_off * 2.0 + 64.0,
+            bulk_acks_on < 260.0 && bulk_acks_on <= bulk_acks_off * 1.4 + 16.0,
             "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}, off={bulk_acks_off:.0})"
         );
-        let (short_acks_off, short_ms_off) =
-            send_cmd("short", "short-write 512x4KiB stream (quickack=N)");
-        eprintln!(
-            "pod-to-pod short-write 512x4KiB stream (quickack=N): out_segs={short_acks_off:.0} elapsed={short_ms_off:.2}ms"
+        let (short_acks_off, short_ms_off) = median_of_3(
+            &mut send_cmd,
+            "short",
+            "short-write 512x4KiB stream (quickack=N)",
         );
+        eprintln!(
+            "pod-to-pod short-write 512x4KiB stream median (quickack=N): out_segs={short_acks_off:.0} elapsed={short_ms_off:.2}ms"
+        );
+        // 2 MiB fits inside the warmed receive buffer so stock Linux itself
+        // varies from ~3 to ~50 OutSegs with vCPU scheduling; ensure quickack=Y
+        // stays far below 1-ACK-per-write (512 writes).
         assert!(
-            short_acks_on < 256.0 && short_acks_on <= short_acks_off * 2.0 + 64.0,
+            short_acks_on < 128.0,
             "quickack=Y inflated short-write stream ACK traffic (on={short_acks_on:.0}, off={short_acks_off:.0})"
         );
         let (paced_acks_off, paced_ms_off) =
