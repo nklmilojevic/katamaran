@@ -759,6 +759,10 @@ pub enum Event {
     CapacityWait(PortProto, u16, String),
     Removed(PortProto, u16),
     RemoveFailed(PortProto, u16, String),
+    /// A remove found no listener for the port (never forwarded, or its add
+    /// was still being retried). Like `Removed` and `RefusedCleared`, it tells
+    /// the session the published side no longer holds the port.
+    RemoveNoop(PortProto, u16),
 }
 
 impl<A: ForwardApi> Forwards<A> {
@@ -1032,7 +1036,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             None if was_waiting => {
                                 on_event(Event::RefusedCleared(proto, port));
                             }
-                            None => {}
+                            None => on_event(Event::RemoveNoop(proto, port)),
                         }
                     }
                     Ok(WorkerMsg::CapacityAvailable) => {
@@ -1158,7 +1162,7 @@ fn report(e: &Event, addrs: &str) {
             "katamaran: cannot forward {addrs}:{port}/{} ({why}); skipped",
             proto.as_str()
         ),
-        Event::RefusedCleared(..) => {}
+        Event::RefusedCleared(..) | Event::RemoveNoop(..) => {}
         Event::Transient(proto, port, why) => eprintln!(
             "katamaran: transient error forwarding {addrs}:{port}/{} ({why})",
             proto.as_str()
@@ -1866,6 +1870,11 @@ mod tests {
             Event::Transient(TCP, 8081, _)
         ));
         tx.send(PortChange::Remove(TCP, 8081)).unwrap();
+        // The remove completes with no listener to close, and cancels the retry.
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveNoop(TCP, 8081)
+        );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         drop(tx);
