@@ -5,6 +5,7 @@
 //! ioctls live in `crate::linux::disk`.
 
 use std::io;
+use std::path::Path;
 
 /// Minimum explicit `kat.disk_gib` value accepted from the host (matches
 /// `kat_daemon::config::MIN_DISK_GIB`).
@@ -12,11 +13,15 @@ pub const MIN_DISK_GIB: u32 = 64;
 /// Maximum explicit `kat.disk_gib` value accepted from the host (matches
 /// `kat_daemon::config::MAX_DISK_GIB`).
 pub const MAX_DISK_GIB: u32 = 16384;
+/// Upper bound on sequential `devid` probes when sysfs
+/// (`/sys/fs/btrfs/<fsid>/devinfo`) is unavailable on a multi-device image.
+pub const MAX_FALLBACK_SCAN_DEVID: u64 = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsInfo {
     pub max_id: u64,
     pub num_devices: u64,
+    pub fsid: [u8; 16],
     pub sectorsize: u64,
 }
 
@@ -113,17 +118,63 @@ pub fn resize_spec(devid: u64, plan: ResizePlan) -> Option<String> {
     })
 }
 
+/// Format a 16-byte Btrfs `fsid` as the lowercase big-endian UUID used by
+/// Linux's `/sys/fs/btrfs/<uuid>/` (`%pU`).
+pub fn format_uuid(bytes: [u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
+/// Enumerate live Btrfs device IDs from `<btrfs_sysfs_root>/<fsid>/devinfo`
+/// (on Linux, `/sys/fs/btrfs/<uuid>/devinfo`). Returns `None` if sysfs is
+/// unavailable or has no numeric entries so callers can fall back cleanly.
+pub fn sysfs_live_devids_in(btrfs_sysfs_root: &Path, fsid: [u8; 16]) -> Option<Vec<u64>> {
+    let dir = btrfs_sysfs_root.join(format_uuid(fsid)).join("devinfo");
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut devids = Vec::new();
+    for entry in entries.flatten() {
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            && id > 0
+        {
+            devids.push(id);
+        }
+    }
+    devids.sort_unstable();
+    devids.dedup();
+    (!devids.is_empty()).then_some(devids)
+}
+
 pub fn find_target_device(
     dev_path: &str,
     fs_info: FsInfo,
+    list_live_devids: &mut impl FnMut([u8; 16]) -> Option<Vec<u64>>,
     read_dev_info: &mut impl FnMut(u64) -> io::Result<Option<DevInfo>>,
 ) -> io::Result<DevInfo> {
     let matches =
         |info: &DevInfo| fs_info.num_devices <= 1 || info.path.as_deref() == Some(dev_path);
     // `BTRFS_IOC_FS_INFO` sets `max_id` to the highest live devid in the
     // filesystem. Checking `max_id` first handles standard devid=1 images AND
-    // single-device custom images whose sole remaining device has any devid
-    // (including > 1024) in a single ioctl without a hard-coded scan limit.
+    // single-device custom images with any devid in a single ioctl.
     let mut seen = 0u64;
     if fs_info.max_id > 0
         && let Some(info) = read_dev_info(fs_info.max_id)?
@@ -134,14 +185,37 @@ pub fn find_target_device(
         seen += 1;
     }
     if fs_info.max_id > 1 && seen < fs_info.num_devices {
-        for devid in 1..fs_info.max_id {
-            if let Some(info) = read_dev_info(devid)? {
-                if matches(&info) {
-                    return Ok(info);
+        // On multi-device images, enumerate exact live device IDs from sysfs
+        // (`/sys/fs/btrfs/<fsid>/devinfo`) so high devids below `max_id` are
+        // found in O(num_devices) without probing unused IDs.
+        if let Some(live_ids) = list_live_devids(fs_info.fsid) {
+            for devid in live_ids {
+                if devid == fs_info.max_id {
+                    continue;
                 }
-                seen += 1;
-                if seen >= fs_info.num_devices {
-                    break;
+                if let Some(info) = read_dev_info(devid)? {
+                    if matches(&info) {
+                        return Ok(info);
+                    }
+                    seen += 1;
+                    if seen >= fs_info.num_devices {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Strictly bounded fallback when sysfs is unavailable so a sparse
+            // high `max_id` can never stall guest boot.
+            let upper = (fs_info.max_id - 1).min(MAX_FALLBACK_SCAN_DEVID);
+            for devid in 1..=upper {
+                if let Some(info) = read_dev_info(devid)? {
+                    if matches(&info) {
+                        return Ok(info);
+                    }
+                    seen += 1;
+                    if seen >= fs_info.num_devices {
+                        break;
+                    }
                 }
             }
         }
@@ -162,6 +236,7 @@ pub fn grow_if_needed_with(
     requested_bytes: Option<u64>,
     mut read_dev_bytes: impl FnMut() -> io::Result<u64>,
     mut read_fs_info: impl FnMut() -> io::Result<FsInfo>,
+    mut list_live_devids: impl FnMut([u8; 16]) -> Option<Vec<u64>>,
     mut read_dev_info: impl FnMut(u64) -> io::Result<Option<DevInfo>>,
     mut resize: impl FnMut(u64, ResizePlan) -> io::Result<()>,
 ) -> io::Result<Option<(u64, u64)>> {
@@ -170,7 +245,7 @@ pub fn grow_if_needed_with(
     };
     let dev_bytes = read_dev_bytes()?;
     let fs_info = read_fs_info()?;
-    let target = find_target_device(dev_path, fs_info, &mut read_dev_info)?;
+    let target = find_target_device(dev_path, fs_info, &mut list_live_devids, &mut read_dev_info)?;
     let plan = plan_resize(
         Some(requested),
         dev_bytes,
@@ -306,6 +381,28 @@ mod tests {
     }
 
     #[test]
+    fn formats_btrfs_fsid_as_linux_sysfs_uuid_and_reads_devinfo_dir() {
+        let fsid = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(format_uuid(fsid), "00010203-0405-0607-0809-0a0b0c0d0e0f");
+
+        let root = std::env::temp_dir().join(format!("kat-btrfs-sysfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let devinfo = root.join(format_uuid(fsid)).join("devinfo");
+        std::fs::create_dir_all(devinfo.join("1000000")).unwrap();
+        std::fs::create_dir_all(devinfo.join("500000")).unwrap();
+        std::fs::create_dir_all(devinfo.join("not-a-devid")).unwrap();
+        std::fs::create_dir_all(devinfo.join("0")).unwrap();
+
+        assert_eq!(
+            sysfs_live_devids_in(&root, fsid),
+            Some(vec![500_000, 1_000_000])
+        );
+        assert_eq!(sysfs_live_devids_in(&root, [0u8; 16]), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn unset_target_leaves_already_padded_custom_image_untouched() {
         // When the host omits `kat.disk_gib=` (no growth requested), the guest
         // must not inspect or resize an already-padded custom image at boot.
@@ -314,6 +411,7 @@ mod tests {
             None,
             || unreachable!("block device size should not be read when no target is set"),
             || unreachable!("BTRFS_IOC_FS_INFO should not run when no target is set"),
+            |_| unreachable!("sysfs devinfo should not be read when no target is set"),
             |_| unreachable!("BTRFS_IOC_DEV_INFO should not run when no target is set"),
             |_, _| unreachable!("BTRFS_IOC_RESIZE should not run when no target is set"),
         )
@@ -337,9 +435,11 @@ mod tests {
                 Ok(FsInfo {
                     max_id: 1,
                     num_devices: 1,
+                    fsid: [0u8; 16],
                     sectorsize: 4096,
                 })
             },
+            |_| unreachable!("single-device fast path should not need sysfs"),
             |devid| {
                 assert_eq!(devid, 1);
                 Ok(Some(DevInfo {
@@ -370,9 +470,11 @@ mod tests {
                 Ok(FsInfo {
                     max_id: 2,
                     num_devices: 1,
+                    fsid: [0u8; 16],
                     sectorsize: 4096,
                 })
             },
+            |_| unreachable!("single-device fast path should not need sysfs"),
             |devid| match devid {
                 1 => Ok(None),
                 2 => Ok(Some(DevInfo {
@@ -405,9 +507,11 @@ mod tests {
                 Ok(FsInfo {
                     max_id: 1,
                     num_devices: 1,
+                    fsid: [0u8; 16],
                     sectorsize: 4096,
                 })
             },
+            |_| unreachable!("single-device fast path should not need sysfs"),
             |_| {
                 Ok(Some(DevInfo {
                     devid: 1,
@@ -437,9 +541,11 @@ mod tests {
                 Ok(FsInfo {
                     max_id: 1,
                     num_devices: 1,
+                    fsid: [0u8; 16],
                     sectorsize: 4096,
                 })
             },
+            |_| unreachable!("single-device fast path should not need sysfs"),
             |_| {
                 Ok(Some(DevInfo {
                     devid: 1,
@@ -467,9 +573,11 @@ mod tests {
                 Ok(FsInfo {
                     max_id: high_devid,
                     num_devices: 1,
+                    fsid: [0u8; 16],
                     sectorsize: 4096,
                 })
             },
+            |_| unreachable!("single-device fast path should not need sysfs"),
             |devid| {
                 lookups.set(lookups.get() + 1);
                 if devid == high_devid {
@@ -500,25 +608,31 @@ mod tests {
     }
 
     #[test]
-    fn finds_target_in_multi_device_filesystem_above_1024_and_stops_when_all_seen() {
-        let mut seen_ids = Vec::new();
+    fn finds_high_devid_in_multi_device_filesystem_via_sysfs_without_scanning_unused_ids() {
+        let fsid = [7u8; 16];
+        let mut probed = Vec::new();
         let found = find_target_device(
             "/dev/vdb",
             FsInfo {
-                max_id: 2000,
+                max_id: 1_000_000,
                 num_devices: 2,
+                fsid,
                 sectorsize: 4096,
             },
+            &mut |id| {
+                assert_eq!(id, fsid);
+                Some(vec![500_000, 1_000_000])
+            },
             &mut |devid| {
-                seen_ids.push(devid);
+                probed.push(devid);
                 match devid {
-                    1500 => Ok(Some(DevInfo {
-                        devid: 1500,
+                    500_000 => Ok(Some(DevInfo {
+                        devid: 500_000,
                         total_bytes: 64 * GIB,
                         path: Some("/dev/vdb".into()),
                     })),
-                    2000 => Ok(Some(DevInfo {
-                        devid: 2000,
+                    1_000_000 => Ok(Some(DevInfo {
+                        devid: 1_000_000,
                         total_bytes: 64 * GIB,
                         path: Some("/dev/vdc".into()),
                     })),
@@ -527,29 +641,98 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(found.devid, 1500);
-        assert_eq!(seen_ids[0], 2000);
+        assert_eq!(found.devid, 500_000);
+        // Exactly two ioctls (max_id then the live sysfs devid), zero unused ID probes.
+        assert_eq!(probed, vec![1_000_000, 500_000]);
 
-        // When /dev/vdb is absent, stops scanning once all `num_devices` live
-        // devices have been inspected (does not scan the whole gap 2..1999).
-        let mut missing_lookups = 0u32;
+        // When sysfs lists all live devices and /dev/vdb is not among them,
+        // returns NotFound without running any brute-force scan.
+        let mut missing_probed = Vec::new();
         let err = find_target_device(
             "/dev/vdb",
             FsInfo {
-                max_id: 2000,
+                max_id: 1_000_000,
                 num_devices: 2,
+                fsid,
                 sectorsize: 4096,
             },
+            &mut |_| Some(vec![500_000, 1_000_000]),
             &mut |devid| {
-                missing_lookups += 1;
+                missing_probed.push(devid);
+                match devid {
+                    500_000 => Ok(Some(DevInfo {
+                        devid: 500_000,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdd".into()),
+                    })),
+                    1_000_000 => Ok(Some(DevInfo {
+                        devid: 1_000_000,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdc".into()),
+                    })),
+                    _ => Ok(None),
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(missing_probed, vec![1_000_000, 500_000]);
+    }
+
+    #[test]
+    fn bounds_fallback_scan_when_sysfs_is_unavailable() {
+        // Without sysfs, scanning a multi-device filesystem with a sparse high
+        // max_id is strictly bounded by MAX_FALLBACK_SCAN_DEVID so guest boot
+        // can never stall.
+        let mut lookups = 0u64;
+        let err = find_target_device(
+            "/dev/vdb",
+            FsInfo {
+                max_id: 1_000_000,
+                num_devices: 2,
+                fsid: [0u8; 16],
+                sectorsize: 4096,
+            },
+            &mut |_| None,
+            &mut |devid| {
+                lookups += 1;
+                if devid == 1_000_000 {
+                    Ok(Some(DevInfo {
+                        devid: 1_000_000,
+                        total_bytes: 64 * GIB,
+                        path: Some("/dev/vdc".into()),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(lookups, 1 + MAX_FALLBACK_SCAN_DEVID);
+
+        // And when all live devices lie within the bounded window, stops as
+        // soon as `num_devices` live devices are seen.
+        let mut early_stop = 0u64;
+        let err = find_target_device(
+            "/dev/vdb",
+            FsInfo {
+                max_id: 1_000_000,
+                num_devices: 2,
+                fsid: [0u8; 16],
+                sectorsize: 4096,
+            },
+            &mut |_| None,
+            &mut |devid| {
+                early_stop += 1;
                 match devid {
                     1 => Ok(Some(DevInfo {
                         devid: 1,
                         total_bytes: 64 * GIB,
                         path: Some("/dev/vdc".into()),
                     })),
-                    2000 => Ok(Some(DevInfo {
-                        devid: 2000,
+                    1_000_000 => Ok(Some(DevInfo {
+                        devid: 1_000_000,
                         total_bytes: 64 * GIB,
                         path: Some("/dev/vdd".into()),
                     })),
@@ -559,6 +742,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        assert_eq!(missing_lookups, 2);
+        assert_eq!(early_stop, 2);
     }
 }

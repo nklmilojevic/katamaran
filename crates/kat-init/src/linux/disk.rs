@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::disk::{
     DevInfo, FsInfo, ResizePlan, grow_if_needed_with, parse_sysfs_sectors, resize_spec,
+    sysfs_live_devids_in,
 };
 
 /// `_IOW(0x94, 3, struct btrfs_ioctl_vol_args)` (4096-byte argument).
@@ -67,6 +68,7 @@ const _: () = assert!(std::mem::size_of::<BtrfsIoctlDevInfoArgs>() == 4096);
 const _: () = assert!(std::mem::offset_of!(BtrfsIoctlDevInfoArgs, total_bytes) == 32);
 const _: () = assert!(std::mem::offset_of!(BtrfsIoctlDevInfoArgs, path) == 3072);
 const _: () = assert!(std::mem::size_of::<BtrfsIoctlFsInfoArgs>() == 1024);
+const _: () = assert!(std::mem::offset_of!(BtrfsIoctlFsInfoArgs, fsid) == 16);
 const _: () = assert!(std::mem::offset_of!(BtrfsIoctlFsInfoArgs, sectorsize) == 36);
 
 /// Grow the btrfs filesystem mounted at `mount_point` up to `requested_bytes`
@@ -87,6 +89,7 @@ pub fn grow_if_needed(
         requested_bytes,
         || block_device_bytes(dev_path),
         || btrfs_fs_info(fd.as_raw_fd()),
+        |fsid| sysfs_live_devids_in(Path::new("/sys/fs/btrfs"), fsid),
         |devid| btrfs_dev_info(fd.as_raw_fd(), devid),
         |devid, plan| btrfs_resize(fd.as_raw_fd(), devid, plan),
     )
@@ -131,6 +134,7 @@ fn btrfs_fs_info(fd: libc::c_int) -> io::Result<FsInfo> {
     Ok(FsInfo {
         max_id: args.max_id,
         num_devices: args.num_devices,
+        fsid: args.fsid,
         sectorsize: u64::from(args.sectorsize),
     })
 }
