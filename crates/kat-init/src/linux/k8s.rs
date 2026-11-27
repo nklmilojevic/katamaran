@@ -370,8 +370,13 @@ const STATE_DB_SCRATCH_ROOT: &str = "/run/katamaran";
 /// Upper bound on the bytes copied into `STATE_DB_SCRATCH_ROOT` (database plus
 /// sidecars); larger unmarked datastores fall back to `kat k8s mark-version`.
 const STATE_DB_MAX_SCRATCH_BYTES: u64 = 256 << 20;
-const STATE_DB_MAX_NODE_ROWS: usize = 64;
-const STATE_DB_MAX_BLOB_BYTES: usize = 4 << 20;
+/// katamaran runs a single node; allow a few stale rows but no more.
+const STATE_DB_MAX_NODE_ROWS: usize = 4;
+/// A real Node object is a few KiB. The query's hex output for every row must
+/// fit the 1 MiB stdout capture of `run_reaped_split`, or the trailing `END`
+/// would be cut off and detection would fail silently.
+const STATE_DB_MAX_BLOB_BYTES: usize = 96 << 10;
+const _: () = assert!(STATE_DB_MAX_NODE_ROWS * (2 * STATE_DB_MAX_BLOB_BYTES + 32) + 64 < 1 << 20);
 /// Every k3s release a pre-tracking katamaran release (v0.5.0 through v0.10.0)
 /// could run: those releases always ran their pinned build and never wrote
 /// `.katamaran-version`, while every tracking-enabled release writes the
@@ -1061,14 +1066,14 @@ fn mark_datastore_version_at_with(
     let stamp = server_version_stamp(data_dir);
     match read_marker_file(&stamp)? {
         MarkerFile::Missing => {}
-        MarkerFile::Present(stamped) => {
+        MarkerFile::Present(stamped) if parse_k3s_minor(&stamped).is_some() => {
             return Err(format!(
                 "{} already records this datastore's k3s version ({stamped}); \
                  refusing to mark it. Start Kubernetes with a compatible k8s_version instead.",
                 stamp.display()
             ));
         }
-        MarkerFile::Empty | MarkerFile::NonRegular => {
+        MarkerFile::Present(_) | MarkerFile::Empty | MarkerFile::NonRegular => {
             return Err(corrupt_datastore_version_error(
                 &stamp,
                 "exists but is not a valid version stamp",
@@ -1098,16 +1103,14 @@ fn mark_datastore_version_at_with(
 
 /// Return the k3s version associated with an existing datastore under `data_dir`.
 ///
-/// Uses `data_version_file` inside `data_dir` when present, and never falls
-/// back to `VERSION_FILE` (the installed binary's version). When
-/// `data_version_file` is absent (`NotFound`), inspects `server/db/state.db`
-/// first uses `server/SERVER_VERSION_STAMP`, and only when that is absent too
-/// inspects `server/db/state.db` read-only for the node's recorded
-/// `kubeletVersion`, accepting it only when it is one of `PRE_TRACKING_K3S_VERSIONS`, so clusters created by older
-/// katamaran releases upgrade seamlessly. Any other detected version is only a
-/// lower bound and is rejected. Only recommends `kat k8s mark-version` when
-/// `data_version_file` is absent (`NotFound`), never when an empty or
-/// non-regular marker already exists.
+/// Never falls back to `VERSION_FILE` (the installed binary's version). The
+/// recorded version is the newer of `data_version_file` and the
+/// `server/db/SERVER_VERSION_STAMP` stamp, or the stamp alone when the marker is
+/// absent; an empty, non-regular, or invalid record fails closed. The
+/// `server/db/state.db` node record is then always applied as a lower bound.
+/// With neither record, the node record is accepted only when it is one of
+/// `PRE_TRACKING_K3S_VERSIONS`; anything else is rejected with
+/// `kat k8s mark-version` guidance.
 fn effective_datastore_version_with(
     data_dir: &Path,
     data_version_file: &Path,
@@ -1124,7 +1127,13 @@ fn effective_datastore_version_with(
             match read_marker_file(&stamp)? {
                 // Written before every tracking-era launch, so it is at least the
                 // newest k3s that a tracking-enabled release ran against `server/`.
-                MarkerFile::Present(v) => Some(v),
+                MarkerFile::Present(v) if parse_k3s_minor(&v).is_some() => Some(v),
+                MarkerFile::Present(v) => {
+                    return Err(corrupt_datastore_version_error(
+                        &stamp,
+                        &format!("records an invalid k3s version {v:?}"),
+                    ));
+                }
                 MarkerFile::Empty => {
                     return Err(corrupt_datastore_version_error(&stamp, "is empty"));
                 }
@@ -4859,6 +4868,14 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap();
         check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
         fs::remove_file(&marker).unwrap();
+
+        // An invalid stamp fails closed the same way in start and mark-version.
+        fs::write(server_version_stamp(&data_dir), "garbage\n").unwrap();
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("invalid k3s version"), "{err}");
+        let err = mark_datastore_version_at(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("not a valid version stamp"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
 
         // An empty stamp fails closed instead of falling back to the node record.
         fs::write(server_version_stamp(&data_dir), "").unwrap();

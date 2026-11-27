@@ -1465,7 +1465,7 @@ impl Daemon {
             }
             state @ (VmState::Stopped | VmState::Error) => {
                 return Err(failed(format!(
-                    "the VM is {} — `kat k8s mark-version` requires a running VM with Kubernetes \
+                    "the VM is {}; `kat k8s mark-version` requires a running VM with Kubernetes \
                      stopped; disable Kubernetes auto-start (`kat config set kubernetes=off`) if \
                      enabled, start the VM (`kat start`), then retry",
                     state.as_str()
