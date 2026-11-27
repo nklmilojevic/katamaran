@@ -73,9 +73,9 @@ const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
 /// How long VM shutdown waits for an in-flight guest Kubernetes operation to
 /// release `op_lock` before falling back to [`stop_k3s_without_op_lock`].
 const SHUTDOWN_OP_LOCK_WAIT: Duration = Duration::from_secs(8);
-/// Total time VM shutdown spends on k3s when `op_lock` is stuck (lock wait
-/// plus waiting for an in-flight k3s exit) before leaving the rest to the
-/// shutdown sweep. Leaves room within the host's ~45 s shutdown deadline for
+/// Total time VM shutdown spends on k3s (lock wait, k3s termination, and
+/// workload cleanup, or waiting for an in-flight k3s exit when `op_lock` is
+/// stuck) before leaving the rest to the shutdown sweep. Leaves room within the host's ~45 s shutdown deadline for
 /// the Docker stack stop (~19 s), the process sweep, and the data-disk sync.
 const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(18);
 const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -107,6 +107,29 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 /// commands then, so it cannot overlap the Docker stack stop, process sweep,
 /// or data-disk sync. (Ordinary shutdown under the lock still cleans up fully.)
 static SHUTDOWN_BYPASSED_OP_LOCK: AtomicBool = AtomicBool::new(false);
+/// When VM shutdown must be done with k3s (see [`SHUTDOWN_K8S_BUDGET`]). Once
+/// set, k3s termination and Kubernetes workload cleanup are clamped to it even
+/// when shutdown holds `op_lock`, so they never delay the Docker stack stop,
+/// process sweep, or data-disk sync.
+static SHUTDOWN_DEADLINE: OnceLock<Instant> = OnceLock::new();
+
+/// Time left before [`SHUTDOWN_DEADLINE`], or `None` outside VM shutdown.
+fn shutdown_time_left() -> Option<Duration> {
+    SHUTDOWN_DEADLINE
+        .get()
+        .map(|d| d.saturating_duration_since(Instant::now()))
+}
+
+/// Clamp a per-command timeout to the remaining shutdown budget.
+fn budgeted(timeout: Duration) -> Duration {
+    shutdown_time_left().map_or(timeout, |left| timeout.min(left))
+}
+
+/// Whether Kubernetes workload cleanup must stop issuing commands: shutdown
+/// proceeded without `op_lock`, or its k3s budget is spent.
+fn workload_cleanup_cut_off() -> bool {
+    SHUTDOWN_BYPASSED_OP_LOCK.load(Ordering::SeqCst) || shutdown_time_left() == Some(Duration::ZERO)
+}
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -383,9 +406,10 @@ pub fn detach_mounts_for_shutdown() -> String {
 }
 
 pub fn stop_for_shutdown() {
+    let deadline = *SHUTDOWN_DEADLINE.get_or_init(|| Instant::now() + SHUTDOWN_K8S_BUDGET);
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     if let Some(svc) = SERVICE.get() {
-        svc.stop_for_shutdown_bounded(SHUTDOWN_OP_LOCK_WAIT, SHUTDOWN_K8S_BUDGET);
+        svc.stop_for_shutdown_bounded(SHUTDOWN_OP_LOCK_WAIT, deadline);
     }
 }
 
@@ -2766,10 +2790,10 @@ impl K8s {
     /// Every guest Kubernetes operation (including reset) checks
     /// `SHUTTING_DOWN` between steps and runs its long work in killable
     /// helpers that abort on shutdown, so the lock is normally released within
-    /// moments and the usual locked stop runs. If a holder is still stuck after
-    /// `lock_wait`, see [`stop_k3s_without_op_lock`].
-    fn stop_for_shutdown_bounded(&self, lock_wait: Duration, budget: Duration) {
-        let deadline = Instant::now() + budget;
+    /// moments and the usual locked stop runs, with k3s termination and
+    /// workload cleanup clamped to `deadline` (via [`SHUTDOWN_DEADLINE`]). If a
+    /// holder is still stuck after `lock_wait`, see [`stop_k3s_without_op_lock`].
+    fn stop_for_shutdown_bounded(&self, lock_wait: Duration, deadline: Instant) {
         match try_lock_with_deadline(
             &self.op_lock,
             lock_wait,
@@ -2882,9 +2906,20 @@ impl K8s {
                 sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
                 progress("removing cluster data");
                 unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
+                // Re-checked right before each irreversible step: a progress
+                // write (including "removing cluster data") may have just
+                // failed, and then the data-cleared ack could never arrive.
+                let stream_ok = || {
+                    if writer.failed() {
+                        Err("client stream write failed; leaving cluster data intact".to_string())
+                    } else {
+                        Ok(())
+                    }
+                };
                 remove_cluster_data_dirs(
                     &paths,
                     |data_dir, beat| {
+                        stream_ok()?;
                         let mut cmd = Command::new("/sbin/btrfs");
                         cmd.args(["subvolume", "delete"]);
                         cmd.arg(data_dir);
@@ -2900,7 +2935,10 @@ impl K8s {
                             _ => Ok(()),
                         }
                     },
-                    |dir, beat| remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
+                    |dir, beat| {
+                        stream_ok()?;
+                        remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat)
+                    },
                     |parent, beat| {
                         reclaim_stale_reaped(&self.reaper, parent, DATA_REMOVE_TIMEOUT, beat)
                     },
@@ -3261,12 +3299,18 @@ fn terminate_running(mut r: Running) -> bool {
         true
     } else {
         unsafe { libc::kill(r.pid, libc::SIGTERM) };
-        if r.exit_rx.recv_timeout(STOP_TIMEOUT).is_ok() {
+        // During VM shutdown keep the SIGTERM grace and SIGKILL reap within
+        // the remaining k3s budget.
+        let kill_wait = budgeted(Duration::from_secs(3));
+        let grace = shutdown_time_left().map_or(STOP_TIMEOUT, |left| {
+            STOP_TIMEOUT.min(left.saturating_sub(kill_wait))
+        });
+        if r.exit_rx.recv_timeout(grace).is_ok() {
             true
         } else {
             log("k3s did not stop in time, killing it");
             unsafe { libc::kill(r.pid, libc::SIGKILL) };
-            r.exit_rx.recv_timeout(Duration::from_secs(3)).is_ok()
+            r.exit_rx.recv_timeout(kill_wait).is_ok()
         }
     };
     if !reaped {
@@ -3398,7 +3442,7 @@ fn stop_k8s_containers_with_progress(
     }
     let mut ls = Command::new("/usr/bin/ctr");
     ls.args(["-a", CONTAINERD_SOCKET, "-n", "k8s.io", "tasks", "ls", "-q"]);
-    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut ls, Duration::from_secs(10)) {
+    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut ls, budgeted(Duration::from_secs(10))) {
         let ids: Vec<&str> = out
             .lines()
             .map(str::trim)
@@ -3422,7 +3466,7 @@ fn stop_k8s_containers_with_progress(
                 "SIGTERM",
                 id,
             ]);
-            let _ = run_reaped(reaper, &mut kill, Duration::from_secs(5));
+            let _ = run_reaped(reaper, &mut kill, budgeted(Duration::from_secs(5)));
         }
         if !ids.is_empty() {
             thread::sleep(Duration::from_millis(500));
@@ -3445,7 +3489,7 @@ fn stop_k8s_containers_with_progress(
                 "SIGKILL",
                 id,
             ]);
-            let _ = run_reaped(reaper, &mut kill, Duration::from_secs(5));
+            let _ = run_reaped(reaper, &mut kill, budgeted(Duration::from_secs(5)));
             let mut rm = Command::new("/usr/bin/ctr");
             rm.args([
                 "-a",
@@ -3457,7 +3501,7 @@ fn stop_k8s_containers_with_progress(
                 "-f",
                 id,
             ]);
-            let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
+            let _ = run_reaped(reaper, &mut rm, budgeted(Duration::from_secs(5)));
         }
     }
     if abort() {
@@ -3473,7 +3517,7 @@ fn stop_k8s_containers_with_progress(
         "ls",
         "-q",
     ]);
-    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut cls, Duration::from_secs(10)) {
+    if let Ok((0, out, _)) = run_reaped_split(reaper, &mut cls, budgeted(Duration::from_secs(10))) {
         for id in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
             if abort() {
                 return;
@@ -3489,7 +3533,7 @@ fn stop_k8s_containers_with_progress(
                 "rm",
                 id,
             ]);
-            let _ = run_reaped(reaper, &mut rm, Duration::from_secs(5));
+            let _ = run_reaped(reaper, &mut rm, budgeted(Duration::from_secs(5)));
         }
     }
 }
@@ -3502,7 +3546,7 @@ fn stop_k8s_workloads(reaper: &Reaper) {
 }
 
 fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&str)) {
-    let bypassed = || SHUTDOWN_BYPASSED_OP_LOCK.load(Ordering::SeqCst);
+    let bypassed = workload_cleanup_cut_off;
     stop_k8s_containers_with_progress(reaper, &bypassed, progress);
     for iface in ["cni0", "flannel.1"] {
         if bypassed() {
@@ -3510,7 +3554,7 @@ fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&s
         }
         let mut del = Command::new("/sbin/ip");
         del.args(["link", "delete", iface]);
-        let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
+        let _ = run_reaped(reaper, &mut del, budgeted(Duration::from_secs(5)));
     }
     let nft_bin = [
         "/usr/sbin/nft",
@@ -3527,7 +3571,7 @@ fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&s
         }
         let mut del = Command::new(nft_bin);
         del.args(["delete", "table", family, "kube-proxy"]);
-        let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
+        let _ = run_reaped(reaper, &mut del, budgeted(Duration::from_secs(5)));
     }
     if bypassed() {
         return;

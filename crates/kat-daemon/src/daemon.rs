@@ -1689,6 +1689,7 @@ impl Daemon {
         let mut guest_reset_attempted = false;
         let mut guest_data_deleted = false;
         let mut guest_reply_terminal = false;
+        let mut guest_replied = false;
         let mut persist_res: Option<anyhow::Result<()>> = None;
         let reset_res = (|| -> Result<(), RpcError> {
             if needs_wait_docker {
@@ -1710,6 +1711,7 @@ impl Daemon {
             }
             let mut last_logged = String::new();
             let mut on_progress = |m: &str| {
+                guest_replied = true;
                 if last_logged != m {
                     dlog!("k8s reset: {m}");
                     last_logged.clear();
@@ -1759,8 +1761,14 @@ impl Daemon {
         // A started reset whose reply ended without `Done` / `Error` (the guest
         // connection failed) may already have deleted cluster data without the
         // host seeing the checkpoint; disable auto-start conservatively so the
-        // next boot never silently starts a fresh, empty cluster.
+        // next boot never silently starts a fresh, empty cluster. A guest that
+        // never replied at all (for example one that dropped the connection at
+        // its connection limit without reading the request) did not start the
+        // reset, so auto-start is left alone. Compatible guests only count as
+        // started after RESET_STARTED_PROGRESS / ResetAccepted; older guests
+        // count once they sent any progress.
         let outcome_unknown = reset_res.is_err()
+            && guest_replied
             && guest_reset_attempted
             && !guest_data_deleted
             && !guest_reply_terminal;
@@ -2938,7 +2946,7 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
 
         // (guest frames, expect auto-start disabled)
-        let cases: [(Vec<kat_proto::k8s::K8sMsg>, bool); 3] = [
+        let cases: [(Vec<kat_proto::k8s::K8sMsg>, bool); 4] = [
             // Started plain reset, then the connection drops: outcome unknown.
             (
                 vec![
@@ -2948,6 +2956,9 @@ mod tests {
                 ],
                 true,
             ),
+            // The guest drops the connection without reading or replying (for
+            // example at its connection limit): nothing started.
+            (vec![], false),
             // Queued only, then the connection drops: nothing started.
             (
                 vec![kat_proto::k8s::K8sMsg::Progress(
