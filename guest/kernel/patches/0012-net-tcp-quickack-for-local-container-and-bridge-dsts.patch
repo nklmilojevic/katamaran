@@ -1,4 +1,4 @@
-Subject: [PATCH] net: enable TCP quickack on container namespace and local bridge dsts
+Subject: [PATCH] net: enable TCP quickack for in-VM container and bridge traffic
 
 Keep-alive request/response traffic inside the guest can stall for a
 delayed-ACK timeout (~40-50 ms at HZ=100) when a server writes response
@@ -14,33 +14,64 @@ Instead, record dst eligibility in a spare bit of icsk_ack
 (kat_quick_ack) inside sk_setup_caps() when a TCP socket's resolved dst
 uses a non-init network namespace (Docker containers, Kubernetes pods,
 LXC machines) or a local bridge/veth device in init_net (cni0, docker0,
-br-*, katbr0), leaving the virtio-net uplink (eth0) and all routing
-tables untouched.
+br-*, katbr0), leaving all routing tables untouched.
+
+To avoid forcing quick ACKs on Internet-bound or host-bound container and
+pod connections whose packets leave/enter the guest through virtio-net
+(eth0), tag skbs received in virtnet_receive_done() with
+skb->kat_from_uplink (preserved across __copy_skb_header and
+skb_scrub_packet when forwarded across veth into a container netns) and
+record it on the socket in tcp_finish_connect() and tcp_event_data_recv().
+In-VM traffic (pod-to-pod, ClusterIP Service DNAT, container-to-container,
+root-to-bridge) never crosses virtio-net, so kat_from_uplink stays 0.
 
 tcp_in_quickack_mode() checks (icsk_ack.kat_quick_ack &&
-READ_ONCE(kat_quickack_enabled)) alongside dst_quick_ack, so toggling
-/sys/module/kat/parameters/quickack at runtime takes effect immediately
-for already-established sockets as well as new ones without affecting
-routes that explicitly set RTAX_QUICKACK=1. Explicit locked route
-metrics (RTAX_LOCK on RTAX_QUICKACK) are respected. Disable at boot with
-kat.quickack=0.
+!icsk_ack.kat_from_uplink && READ_ONCE(kat_quickack_enabled)) alongside
+dst_quick_ack, so toggling /sys/module/kat/parameters/quickack at runtime
+takes effect immediately for already-established sockets as well as new
+ones without affecting routes that explicitly set RTAX_QUICKACK=1.
+Explicit locked route metrics (RTAX_LOCK on RTAX_QUICKACK) are respected.
+Disable at boot with kat.quickack=0.
 
 SPDX-License-Identifier: GPL-2.0
 ---
+diff -ruN a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -2605,6 +2605,7 @@
+ 
+ 	skb_record_rx_queue(skb, vq2rxq(rq->vq));
+ 	skb->protocol = eth_type_trans(skb, dev);
++	skb->kat_from_uplink = 1;
+ 	pr_debug("Receiving skb proto 0x%04x len %i type %i\n",
+ 		 ntohs(skb->protocol), skb->len, skb->pkt_type);
+ 
+diff -ruN a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1032,6 +1032,7 @@
+ #endif
+ 	__u8			unreadable:1;
+ 	__u8			tc_depth:2;
++	__u8			kat_from_uplink:1;
+ #if defined(CONFIG_NET_SCHED) || defined(CONFIG_NET_XGRESS)
+ 	__u16			tc_index;	/* traffic control index */
+ #endif
 diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
 --- a/include/net/inet_connection_sock.h
 +++ b/include/net/inet_connection_sock.h
-@@ -119,7 +119,8 @@
+@@ -119,7 +119,9 @@
  		__u32		  ato:ATO_BITS,	 /* Predicted tick of soft clock	   */
  				  lrcv_flowlabel:20, /* last received ipv6 flowlabel	   */
  				  dst_quick_ack:1, /* cache dst RTAX_QUICKACK		   */
 -				  unused:3;
 +				  kat_quick_ack:1, /* eligible local container/bridge dst  */
-+				  unused:2;
++				  kat_from_uplink:1, /* last rx segment came via virtio_net */
++				  unused:1;
  		__u32		  lrcvtime;	 /* timestamp of last received data packet */
  		__u16		  last_seg_size; /* Size of last incoming segment	   */
  		__u16		  rcv_mss;	 /* MSS used for delayed ACK decisions	   */
-@@ -273,6 +274,8 @@
+@@ -273,6 +275,8 @@
  struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
  				      struct request_sock *req,
  				      struct sock *child);
@@ -49,6 +80,17 @@ diff -ruN a/include/net/inet_connection_sock.h b/include/net/inet_connection_soc
  bool inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
  				   unsigned long timeout);
  struct sock *inet_csk_complete_hashdance(struct sock *sk, struct sock *child,
+diff -ruN a/net/core/gro.c b/net/core/gro.c
+--- a/net/core/gro.c
++++ b/net/core/gro.c
+@@ -691,6 +691,7 @@
+ 		skb_ext_reset(skb);
+ 		nf_reset_ct(skb);
+ 		skb->slow_gro = 0;
++		skb->kat_from_uplink = 0;
+ 	}
+ 
+ 	napi->skb = skb;
 diff -ruN a/net/core/sock.c b/net/core/sock.c
 --- a/net/core/sock.c
 +++ b/net/core/sock.c
@@ -95,12 +137,29 @@ diff -ruN a/net/core/sock.c b/net/core/sock.c
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -338,6 +338,8 @@
+@@ -338,6 +338,9 @@
  	const struct inet_connection_sock *icsk = inet_csk(sk);
  
  	return icsk->icsk_ack.dst_quick_ack ||
 +		(icsk->icsk_ack.kat_quick_ack &&
++		 !icsk->icsk_ack.kat_from_uplink &&
 +		 READ_ONCE(kat_quickack_enabled)) ||
  		(icsk->icsk_ack.quick && !inet_csk_in_pingpong_mode(sk));
  }
  
+@@ -1017,6 +1020,7 @@
+ 		}
+ 	}
+ 	icsk->icsk_ack.lrcvtime = now;
++	icsk->icsk_ack.kat_from_uplink = skb->kat_from_uplink;
+ 	tcp_save_lrcv_flowlabel(sk, skb);
+ 
+ 	tcp_data_ecn_check(sk, skb);
+@@ -6543,6 +6547,7 @@
+ 	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
+ 
+ 	if (skb) {
++		icsk->icsk_ack.kat_from_uplink = skb->kat_from_uplink;
+ 		icsk->icsk_af_ops->sk_rx_dst_set(sk, skb);
+ 		security_inet_conn_established(sk, skb);
+ 		sk_mark_napi_id(sk, skb);

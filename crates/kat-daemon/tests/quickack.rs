@@ -5,10 +5,12 @@
 //! and runs it.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -112,6 +114,67 @@ else:
             continue
         run_burst(int(line))
 sock.close()
+"#;
+
+/// Probes whether Linux's delayed-ACK timer fires (`TcpExt: DelayedACKs` in
+/// `/proc/net/netstat`) on a keep-alive TCP connection to `host:port`.
+/// Warms up with 25 quick exchanges (draining initial quickacks and entering
+/// pingpong mode), then issues 6 exchanges pausing 100 ms after reading each
+/// response so the 40–50 ms delayed-ACK timer fires unless quick ACK is active.
+/// Prints `<delta>` (change in `DelayedACKs`) to stdout.
+const DELACK_PROBE_PY: &str = r#"
+import socket, sys, time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+req = b"GET / HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+
+def delayed_acks():
+    with open("/proc/net/netstat") as f:
+        lines = f.read().splitlines()
+    for i in range(0, len(lines) - 1, 2):
+        keys = lines[i].split()
+        vals = lines[i + 1].split()
+        if keys and keys[0] == "TcpExt:" and "DelayedACKs" in keys:
+            return int(vals[keys.index("DelayedACKs")])
+    raise RuntimeError("DelayedACKs not found in /proc/net/netstat")
+
+def recv_resp(sock, buf):
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("unexpected EOF in headers")
+        buf += chunk
+    hdr, buf = buf.split(b"\r\n\r\n", 1)
+    cl = 0
+    for line in hdr.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            cl = int(line.split(b":", 1)[1].strip())
+    while len(buf) < cl:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("unexpected EOF in body")
+        buf += chunk
+    return buf[cl:]
+
+sock = socket.create_connection((host, port), timeout=10)
+sock.settimeout(10)
+buf = b""
+for _ in range(25):
+    sock.sendall(req)
+    buf = recv_resp(sock, buf)
+
+before = delayed_acks()
+for _ in range(6):
+    # Re-enter pingpong mode after the previous delayed-ACK timer expiry
+    # exited it (TCP_PINGPONG_THRESH = 3), then pause past the 40-50 ms timer.
+    for _ in range(4):
+        sock.sendall(req)
+        buf = recv_resp(sock, buf)
+    time.sleep(0.10)
+after = delayed_acks()
+sock.close()
+print(after - before)
 "#;
 
 fn root() -> PathBuf {
@@ -301,6 +364,75 @@ fn build_test_image(docker_host: &str) {
     .unwrap();
     let out = build.wait_with_output().expect("wait docker build");
     ok(&out, "build test image");
+}
+
+struct HostHttpServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HostHttpServer {
+    /// Minimal keep-alive HTTP/1.1 server on the Mac host (`127.0.0.1`),
+    /// reached by guest containers through `host.docker.internal` over `eth0`.
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind host HTTP server");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking on host listener");
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let handle = thread::spawn(move || {
+            let resp =
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong";
+            while !stop_bg.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let _ = stream.set_nodelay(true);
+                        thread::spawn(move || {
+                            let mut buf = Vec::new();
+                            let mut tmp = [0u8; 1024];
+                            loop {
+                                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    match stream.read(&mut tmp) {
+                                        Ok(0) | Err(_) => return,
+                                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                    }
+                                }
+                                let pos =
+                                    buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                                buf.drain(..pos);
+                                if stream.write_all(resp).is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for HostHttpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 fn parse_latencies(out: &str, what: &str) -> (f64, f64) {
@@ -566,6 +698,75 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     drop(client_in);
     drop(client);
 
+    // 2) Kubernetes ClusterIP Service path (qa-probe -> qa-svc ClusterIP ->
+    //    qa-peer via kube-proxy DNAT): routed via pod's default gateway, stays
+    //    in-VM (never crosses virtio-net), so quick ACK still applies.
+    ok(
+        &kubectl(
+            &kubeconfig,
+            &[
+                "expose",
+                "pod",
+                "qa-peer",
+                "--name=qa-svc",
+                "--port=8080",
+                "--target-port=8080",
+            ],
+        ),
+        "expose qa-peer as ClusterIP service",
+    );
+    let svc_ip = ok(
+        &kubectl(
+            &kubeconfig,
+            &["get", "svc", "qa-svc", "-o", "jsonpath={.spec.clusterIP}"],
+        ),
+        "get qa-svc ClusterIP",
+    )
+    .trim()
+    .to_string();
+    assert!(!svc_ip.is_empty(), "qa-svc has empty clusterIP");
+    wait_until("qa-svc endpoints ready", Duration::from_secs(30), || {
+        kubectl(
+            &kubeconfig,
+            &[
+                "exec",
+                "qa-probe",
+                "--",
+                "python3",
+                "-c",
+                KEEP_ALIVE_CLIENT_PY,
+                &svc_ip,
+                "1",
+            ],
+        )
+        .status
+        .success()
+    });
+    let svc_out = ok(
+        &kubectl(
+            &kubeconfig,
+            &[
+                "exec",
+                "qa-probe",
+                "--",
+                "python3",
+                "-c",
+                KEEP_ALIVE_CLIENT_PY,
+                &svc_ip,
+                "15",
+            ],
+        ),
+        "pod-to-ClusterIP split-write keep-alive",
+    );
+    let (svc_p50, svc_total) = parse_latencies(&svc_out, "pod-to-ClusterIP keep-alive");
+    eprintln!(
+        "pod-to-ClusterIP keep-alive (quickack=Y): p50={svc_p50:.2}ms total={svc_total:.2}ms"
+    );
+    assert!(
+        svc_p50 < 15.0 && svc_total < 300.0,
+        "pod-to-ClusterIP keep-alive stalled (p50={svc_p50:.2}ms total={svc_total:.2}ms)"
+    );
+
     // 3) Root namespace (`--network host`) to bridged Docker container over
     //    `docker0`: verifies root bridge dsts get quickack without mutating
     //    live routing tables or touching the `eth0` uplink.
@@ -656,7 +857,64 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "root-to-bridge keep-alive stalled (p50={br_p50:.2}ms total={br_total:.2}ms)"
     );
 
-    // 4) Confirm the guest root routing table is completely unmutated (no
+    // 4) Container-to-uplink (`eth0` / virtio-net -> host.docker.internal)
+    //    vs container-to-container (`docker0`, in-VM): verifies packets
+    //    arriving over virtio-net (`eth0`) do NOT force quick ACKs (delayed
+    //    ACKs fire normally), while in-VM container traffic sends immediate
+    //    quick ACKs (zero delayed ACKs).
+    let host_srv = HostHttpServer::start();
+    let uplink_delacks: u64 = ok(
+        &docker(
+            &docker_host,
+            &[
+                "run",
+                "--rm",
+                "--add-host=host.docker.internal:host-gateway",
+                TEST_IMAGE,
+                "python3",
+                "-c",
+                DELACK_PROBE_PY,
+                "host.docker.internal",
+                &host_srv.port.to_string(),
+            ],
+        ),
+        "container-to-uplink DelayedACKs probe",
+    )
+    .trim()
+    .parse()
+    .expect("parse uplink DelayedACKs delta");
+    let local_delacks: u64 = ok(
+        &docker(
+            &docker_host,
+            &[
+                "run",
+                "--rm",
+                TEST_IMAGE,
+                "python3",
+                "-c",
+                DELACK_PROBE_PY,
+                &srv_ip,
+                "8080",
+            ],
+        ),
+        "container-to-container DelayedACKs probe",
+    )
+    .trim()
+    .parse()
+    .expect("parse local DelayedACKs delta");
+    eprintln!(
+        "DelayedACKs delta (6 paused responses): uplink={uplink_delacks}, local={local_delacks}"
+    );
+    assert!(
+        uplink_delacks >= 4,
+        "expected normal delayed ACKs on container->eth0 uplink connection (delta={uplink_delacks})"
+    );
+    assert_eq!(
+        local_delacks, 0,
+        "expected immediate quick ACKs (0 delayed ACKs) on in-VM container connection"
+    );
+
+    // 5) Confirm the guest root routing table is completely unmutated (no
     //    `quickack 1` rewritten onto `eth0` or bridge routes).
     let root_routes = ok(
         &docker(
