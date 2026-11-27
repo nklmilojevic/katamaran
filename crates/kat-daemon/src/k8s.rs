@@ -1038,6 +1038,38 @@ fn drain_nonblocking<R: Read>(
     true
 }
 
+const KUBECTL_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait up to `wait_budget` for `child` to exit. If it still has not exited
+/// (for example, stuck in uninterruptible kernel I/O), hand reaping off to a
+/// detached background thread so the caller never blocks indefinitely while
+/// holding kubeconfig or daemon locks.
+fn reap_bounded(mut child: std::process::Child, wait_budget: Duration) -> bool {
+    let deadline = Instant::now() + wait_budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    let _ = thread::Builder::new()
+                        .name("kubectl-reap".into())
+                        .spawn(move || {
+                            let _ = child.wait();
+                        });
+                    return false;
+                }
+                thread::sleep(left.min(Duration::from_millis(20)));
+            }
+        }
+    }
+}
+
+fn kill_and_reap_bounded(mut child: std::process::Child, wait_budget: Duration) {
+    let _ = child.kill();
+    let _ = reap_bounded(child, wait_budget);
+}
+
 fn run_kubectl_with_deadline(
     cmd: &mut Command,
     deadline: Option<Instant>,
@@ -1063,15 +1095,17 @@ fn run_kubectl_with_deadline(
     if let Some(s) = stdout.as_ref()
         && let Err(e) = set_nonblocking(s.as_raw_fd())
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(stdout);
+        drop(stderr);
+        kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
         return Err(e);
     }
     if let Some(s) = stderr.as_ref()
         && let Err(e) = set_nonblocking(s.as_raw_fd())
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(stdout);
+        drop(stderr);
+        kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
         return Err(e);
     }
     const MAX_CAPTURE: usize = 256 << 10;
@@ -1090,8 +1124,9 @@ fn run_kubectl_with_deadline(
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            drop(stdout);
+            drop(stderr);
+            kill_and_reap_bounded(child, KUBECTL_KILL_WAIT);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "kubectl cleanup timed out",
@@ -2708,6 +2743,48 @@ users:
             started.elapsed() < Duration::from_secs(3),
             "inherited pipe descendant held cleanup open: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn reap_bounded_hands_off_unexited_child_without_blocking() {
+        // 1. Simulate a child that fails to exit within the bounded reap window
+        //    (e.g., stuck in uninterruptible I/O after SIGKILL): reap_bounded must
+        //    return promptly and hand reaping to the background thread.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let started = Instant::now();
+        let reaped_sync = reap_bounded(child, Duration::from_millis(50));
+        assert!(!reaped_sync, "live child should hit reap budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "reap_bounded blocked past budget: {:?}",
+            started.elapsed()
+        );
+        // Closing stdin lets the child exit cleanly so the detached reaper thread reaps it.
+        drop(stdin);
+
+        // 2. Normal killed child is reaped synchronously well within the budget.
+        let mut child2 = Command::new("/bin/sh")
+            .args(["-c", "read _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _stdin2 = child2.stdin.take();
+        let started2 = Instant::now();
+        kill_and_reap_bounded(child2, Duration::from_secs(2));
+        assert!(
+            started2.elapsed() < Duration::from_secs(2),
+            "kill_and_reap_bounded took too long: {:?}",
+            started2.elapsed()
         );
     }
 }
