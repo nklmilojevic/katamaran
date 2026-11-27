@@ -3535,25 +3535,34 @@ const SOURCE_DIGEST_LABEL: &str = "io.katamaran.k8s.source-digest";
 /// The guest's platform architecture, the only one containerd's CRI accepts.
 const NATIVE_ARCH: &str = "arm64";
 
-/// Whether an x86-64 emulator (Rosetta or qemu) was successfully registered at
-/// boot and its `binfmt_misc` handler is currently enabled, so amd64-only
-/// images can run in pods once re-labelled for the CRI.
-fn amd64_emulation() -> bool {
-    super::amd64::is_registered()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmulationMode {
+    Enabled,
+    Disabled,
+    Unknown,
 }
 
 const MAX_SYNC_RETRIES: usize = 2;
 
 fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
     let _sync_guard = IMAGE_SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let emulation = amd64_emulation();
     let mut failures = Vec::new();
+    let emulation = match super::amd64::status() {
+        super::amd64::EmulationStatus::Enabled => EmulationMode::Enabled,
+        super::amd64::EmulationStatus::Disabled => EmulationMode::Disabled,
+        super::amd64::EmulationStatus::Unknown(e) => {
+            let msg = format!("check amd64 binfmt_misc status: {e}");
+            log(&msg);
+            failures.push(msg);
+            EmulationMode::Unknown
+        }
+    };
     let mut only_refs: Option<HashSet<String>> = None;
 
     for attempt in 0..=MAX_SYNC_RETRIES {
         let moby = list_ctr_images(reaper, "moby")?;
-        if moby.is_empty() && emulation && only_refs.is_none() {
-            return Ok(());
+        if moby.is_empty() && emulation != EmulationMode::Disabled && only_refs.is_none() {
+            break;
         }
         let k8s = list_ctr_images(reaper, "k8s.io")?;
 
@@ -3753,12 +3762,13 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
             }
         }
 
-        // With emulation disabled, also retire any Katamaran-created emulation
-        // aliases in `k8s.io` whose source tags are no longer in `moby` (on the
-        // initial pass across all of `k8s.io`, and on retry passes for any
-        // retried ref that disappeared from `moby`), leaving all unrelated
-        // Kubernetes images untouched.
-        if !emulation {
+        // Only when emulation is explicitly confirmed disabled (never on a
+        // transient binfmt_misc read error), also retire any Katamaran-created
+        // emulation aliases in `k8s.io` whose source tags are no longer in
+        // `moby` (on the initial pass across all of `k8s.io`, and on retry
+        // passes for any retried ref that disappeared from `moby`), leaving all
+        // unrelated Kubernetes images untouched.
+        if emulation == EmulationMode::Disabled {
             for (name, k8s_img) in &k8s {
                 let in_scope = match &only_refs {
                     None => attempt == 0,
@@ -3839,7 +3849,7 @@ fn needs_native_probe(
     _name: &str,
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
-    _emulation: bool,
+    _emulation: EmulationMode,
     native_arch: &str,
 ) -> bool {
     let Some(platforms) = moby.platforms.as_deref() else {
@@ -3861,10 +3871,10 @@ fn needs_dest_native_probe(
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
     source_native: NativeAvailability,
-    emulation: bool,
+    emulation: EmulationMode,
     native_arch: &str,
 ) -> bool {
-    if !emulation
+    if emulation != EmulationMode::Enabled
         || source_native != NativeAvailability::Absent
         || oci_rewrite::is_digest_reference(name)
     {
@@ -3892,7 +3902,7 @@ fn classify_native_availability(
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
     probe: Option<&Result<NativeAvailability, String>>,
-    emulation: bool,
+    emulation: EmulationMode,
     native_arch: &str,
 ) -> NativeAvailability {
     let Some(platforms) = moby.platforms.as_deref() else {
@@ -3940,7 +3950,7 @@ fn plan_sync_action(
     k8s: Option<&CtrImage>,
     native: NativeAvailability,
     dest_native: NativeAvailability,
-    emulation: bool,
+    emulation: EmulationMode,
     native_arch: &str,
 ) -> SyncAction {
     let k8s_is_rewritten = k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_some());
@@ -3966,13 +3976,13 @@ fn plan_sync_action(
             let has_amd64 = oci_rewrite::has_amd64_platform(platforms);
             let is_digest_ref = oci_rewrite::is_digest_reference(name);
             if is_digest_ref {
-                return if k8s_is_rewritten {
+                return if k8s_is_rewritten && emulation != EmulationMode::Unknown {
                     SyncAction::RetireRewritten
                 } else {
                     SyncAction::SkipDigestAmd64
                 };
             }
-            if emulation && has_amd64 {
+            if emulation == EmulationMode::Enabled && has_amd64 {
                 if let Some(k) = k8s {
                     if k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str()) {
                         match k.platforms.as_deref() {
@@ -3999,9 +4009,9 @@ fn plan_sync_action(
                 } else {
                     SyncAction::MirrorRewrite
                 }
-            } else if k8s_is_rewritten {
+            } else if emulation != EmulationMode::Unknown && k8s_is_rewritten {
                 SyncAction::RetireRewritten
-            } else if platforms.is_empty() || platforms == "-" {
+            } else if !k8s_is_rewritten && (platforms.is_empty() || platforms == "-") {
                 if k8s.is_some_and(|k| k.digest == moby.digest) {
                     SyncAction::Skip
                 } else {
@@ -4023,8 +4033,9 @@ const IMAGE_LIST_LIMIT: usize = 16 << 20;
 
 /// Strictly verify whether `name` in `namespace` (expected to still point to
 /// `expected_digest`) has a locally complete `linux/<native_arch>` manifest
-/// (manifest, config, and all layers present locally; never accepting 32-bit
-/// `linux/arm/*` fallbacks).
+/// matching containerd v2.4.2's `images.Manifest` + `platforms.DefaultStrict()`
+/// selection (manifest, config, and all layers present locally; never accepting
+/// 32-bit `linux/arm/*` or non-baseline variants such as `linux/arm64/v8.2`).
 fn probe_native_complete(
     reaper: &Reaper,
     namespace: &str,
@@ -4047,7 +4058,11 @@ fn probe_native_complete(
         },
         |digest: &str, max_bytes: usize| get_ctr_content_blob(reaper, namespace, digest, max_bytes),
     );
-    match oci_rewrite::has_complete_native_manifest(expected_digest, native_arch, &mut store)? {
+    match oci_rewrite::has_complete_native_manifest(
+        expected_digest,
+        oci_rewrite::NativePlatform::linux(native_arch, None),
+        &mut store,
+    )? {
         oci_rewrite::NativeManifestCheck::Complete => Ok(NativeAvailability::Present),
         oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
         oci_rewrite::NativeManifestCheck::RootMissing => Ok(NativeAvailability::Stale),
@@ -4732,7 +4747,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                 Some(web),
                 NativeAvailability::Absent,
                 NativeAvailability::Present,
-                false,
+                EmulationMode::Disabled,
                 "arm64"
             ),
             SyncAction::Skip
@@ -4747,7 +4762,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                 retagged,
                 None,
                 None,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             NativeAvailability::Stale
@@ -4776,7 +4791,8 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             &parse_ctr_platforms(ls_out),
         );
         let img = &moby[name];
-        let native = classify_native_availability(name, img, None, None, true, "arm64");
+        let native =
+            classify_native_availability(name, img, None, None, EmulationMode::Enabled, "arm64");
         assert_eq!(native, NativeAvailability::Absent);
         assert_eq!(
             plan_sync_action(
@@ -4785,7 +4801,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 native,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite
@@ -4811,7 +4827,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             &multi,
             Some(&k8s_rewritten),
             Some(&failed_probe),
-            true,
+            EmulationMode::Enabled,
             "arm64",
         );
         assert_eq!(n_multi, NativeAvailability::ProbeFailed);
@@ -4822,7 +4838,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_rewritten),
                 n_multi,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::ReportProbeError
@@ -4834,7 +4850,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             &amd64_only,
             None,
             Some(&failed_probe),
-            true,
+            EmulationMode::Enabled,
             "arm64",
         );
         assert_eq!(
@@ -4844,7 +4860,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 n_amd,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite
@@ -4854,7 +4870,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             &arm64_only,
             None,
             Some(&failed_probe),
-            true,
+            EmulationMode::Enabled,
             "arm64",
         );
         assert_eq!(
@@ -4864,7 +4880,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 n_arm,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorNative {
@@ -4882,7 +4898,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             &multi,
             None,
             Some(&stale_probe),
-            true,
+            EmulationMode::Enabled,
             "arm64",
         );
         assert_eq!(native, NativeAvailability::Stale);
@@ -4893,7 +4909,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 native,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::Relist
@@ -4916,7 +4932,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             &moby_amd64,
             Some(&k8s_multi_index),
             NativeAvailability::Absent,
-            true,
+            EmulationMode::Enabled,
             "arm64"
         ));
 
@@ -4935,7 +4951,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_multi_index),
                 NativeAvailability::Absent,
                 dest_incomplete,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite
@@ -4956,7 +4972,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_multi_index),
                 NativeAvailability::Absent,
                 dest_complete,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::Skip
@@ -4974,7 +4990,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_multi_index),
                 NativeAvailability::Absent,
                 dest_err,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::ReportProbeError
@@ -4992,7 +5008,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_multi_index),
                 NativeAvailability::Absent,
                 dest_stale,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::Relist
@@ -5000,7 +5016,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
     }
 
     #[test]
-    fn plan_sync_action_handles_emulation_off_and_digest_refs() {
+    fn plan_sync_action_handles_emulation_off_unknown_and_digest_refs() {
         let amd64_idx = ctr_img("sha256:src", "linux/amd64", &[]);
         let k8s_rewritten = ctr_img(
             "sha256:new",
@@ -5032,7 +5048,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite
@@ -5044,7 +5060,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_rewritten),
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::Skip
@@ -5056,7 +5072,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_stale_rewritten),
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite
@@ -5072,7 +5088,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_unrelated),
                 NativeAvailability::Absent,
                 NativeAvailability::Present,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::Skip
@@ -5093,7 +5109,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_unlabelled_drifted),
                 NativeAvailability::Absent,
                 NativeAvailability::Stale,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::Relist
@@ -5110,7 +5126,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_unlabelled_amd64),
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite
@@ -5126,7 +5142,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_rewritten),
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                false,
+                EmulationMode::Disabled,
                 "arm64"
             ),
             SyncAction::RetireRewritten
@@ -5138,7 +5154,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_unrelated),
                 NativeAvailability::Absent,
                 NativeAvailability::Present,
-                false,
+                EmulationMode::Disabled,
                 "arm64"
             ),
             SyncAction::Skip
@@ -5150,10 +5166,52 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                false,
+                EmulationMode::Disabled,
                 "arm64"
             ),
             SyncAction::Skip
+        );
+
+        // Emulation status Unknown (e.g. transient binfmt_misc read error): NEVER
+        // retire existing working Katamaran mirrors and NEVER publish new amd64
+        // rewrites, while still allowing native arm64 images to sync.
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                None,
+                NativeAvailability::Present,
+                NativeAvailability::Absent,
+                EmulationMode::Unknown,
+                "arm64"
+            ),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
         );
 
         // Native content present over a previously rewritten copy: replace natively
@@ -5165,7 +5223,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_rewritten),
                 NativeAvailability::Present,
                 NativeAvailability::Absent,
-                false,
+                EmulationMode::Disabled,
                 "arm64"
             ),
             SyncAction::MirrorNative {
@@ -5183,7 +5241,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::SkipDigestAmd64
@@ -5195,7 +5253,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 Some(&k8s_rewritten),
                 NativeAvailability::Absent,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::RetireRewritten
@@ -5207,7 +5265,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 NativeAvailability::Present,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorNative {
@@ -5218,8 +5276,14 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         // Mixed 32-bit ARM + amd64 tag with NO arm64 variant: Katamaran's arm64
         // guest kernel disables CONFIG_COMPAT, so sync must rewrite amd64.
         let arm32_and_amd64 = ctr_img("sha256:mixed", "linux/arm/v7,linux/amd64", &[]);
-        let native_mixed =
-            classify_native_availability("app:mixed", &arm32_and_amd64, None, None, true, "arm64");
+        let native_mixed = classify_native_availability(
+            "app:mixed",
+            &arm32_and_amd64,
+            None,
+            None,
+            EmulationMode::Enabled,
+            "arm64",
+        );
         assert_eq!(native_mixed, NativeAvailability::Absent);
         assert_eq!(
             plan_sync_action(
@@ -5228,7 +5292,33 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 None,
                 native_mixed,
                 NativeAvailability::Absent,
-                true,
+                EmulationMode::Enabled,
+                "arm64"
+            ),
+            SyncAction::MirrorRewrite
+        );
+
+        // Non-baseline `linux/arm64/v8.2` + `linux/amd64` on baseline arm64 guest:
+        // `ctr images export --local` (`DefaultStrict()`) rejects `v8.2`, so sync
+        // must rewrite `linux/amd64`.
+        let v82_and_amd64 = ctr_img("sha256:v82", "linux/arm64/v8.2,linux/amd64", &[]);
+        let native_v82 = classify_native_availability(
+            "app:v82",
+            &v82_and_amd64,
+            None,
+            None,
+            EmulationMode::Enabled,
+            "arm64",
+        );
+        assert_eq!(native_v82, NativeAvailability::Absent);
+        assert_eq!(
+            plan_sync_action(
+                "app:v82",
+                &v82_and_amd64,
+                None,
+                native_v82,
+                NativeAvailability::Absent,
+                EmulationMode::Enabled,
                 "arm64"
             ),
             SyncAction::MirrorRewrite

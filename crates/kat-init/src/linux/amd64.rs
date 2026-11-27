@@ -90,18 +90,64 @@ pub fn setup(cmdline: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether an x86-64 emulator was successfully registered at boot and its
-/// `binfmt_misc` handler is currently enabled.
-pub fn is_registered() -> bool {
-    REGISTERED
-        .get()
-        .is_some_and(|emu| binfmt_handler_enabled(Path::new(BINFMT_MISC), emu.name()))
+/// Live status of x86-64 `binfmt_misc` emulation in the guest kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmulationStatus {
+    /// An emulator was registered at boot and both `binfmt_misc/status` and
+    /// the registered handler entry currently report `enabled`.
+    Enabled,
+    /// No emulator was registered at boot, or the kernel explicitly reports
+    /// `binfmt_misc` or the handler as disabled/unregistered (`NotFound`).
+    Disabled,
+    /// An emulator was registered at boot, but reading `binfmt_misc` state
+    /// failed with a non-`NotFound` I/O error; callers must not treat this as
+    /// disabled or retire existing emulation mirrors.
+    Unknown(String),
 }
 
-fn binfmt_handler_enabled(binfmt_dir: &Path, name: &str) -> bool {
-    fs::read_to_string(binfmt_dir.join("status")).is_ok_and(|s| s.trim() == "enabled")
-        && fs::read_to_string(binfmt_dir.join(name))
-            .is_ok_and(|s| s.lines().next().map(str::trim) == Some("enabled"))
+/// Query whether an x86-64 emulator was registered at boot and its
+/// `binfmt_misc` handler is currently enabled, distinguishing I/O errors
+/// (`Unknown`) from an actually disabled or unregistered handler (`Disabled`).
+pub fn status() -> EmulationStatus {
+    let Some(emu) = REGISTERED.get() else {
+        return EmulationStatus::Disabled;
+    };
+    binfmt_handler_status(Path::new(BINFMT_MISC), emu.name())
+}
+
+fn binfmt_handler_status(binfmt_dir: &Path, name: &str) -> EmulationStatus {
+    let status_path = binfmt_dir.join("status");
+    let global = match fs::read_to_string(&status_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return EmulationStatus::Disabled,
+        Err(e) => return EmulationStatus::Unknown(format!("read {}: {e}", status_path.display())),
+    };
+    match global.trim() {
+        "enabled" => {}
+        "disabled" => return EmulationStatus::Disabled,
+        other => {
+            return EmulationStatus::Unknown(format!(
+                "unexpected {} content: {:?}",
+                status_path.display(),
+                other
+            ));
+        }
+    }
+    let handler_path = binfmt_dir.join(name);
+    let handler = match fs::read_to_string(&handler_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return EmulationStatus::Disabled,
+        Err(e) => return EmulationStatus::Unknown(format!("read {}: {e}", handler_path.display())),
+    };
+    match handler.lines().next().map(str::trim) {
+        Some("enabled") => EmulationStatus::Enabled,
+        Some("disabled") => EmulationStatus::Disabled,
+        other => EmulationStatus::Unknown(format!(
+            "unexpected {} content: {:?}",
+            handler_path.display(),
+            other
+        )),
+    }
 }
 
 /// `:name:M:offset:magic:mask:interpreter:flags`, with magic and mask
@@ -155,38 +201,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        // Missing status and handler files -> disabled.
-        assert!(!binfmt_handler_enabled(&dir, "rosetta"));
+        // Missing status and handler files -> Disabled.
+        assert_eq!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Disabled
+        );
 
-        // Enabled global status and handler -> enabled.
+        // Enabled global status and handler -> Enabled.
         fs::write(dir.join("status"), "enabled\n").unwrap();
         fs::write(
             dir.join("rosetta"),
             "enabled\ninterpreter /run/rosetta/rosetta\nflags: POCF\n",
         )
         .unwrap();
-        assert!(binfmt_handler_enabled(&dir, "rosetta"));
-        assert!(!binfmt_handler_enabled(&dir, "qemu-x86_64"));
+        assert_eq!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Enabled
+        );
+        assert_eq!(
+            binfmt_handler_status(&dir, "qemu-x86_64"),
+            EmulationStatus::Disabled
+        );
 
-        // Handler disabled -> disabled.
+        // Handler disabled -> Disabled.
         fs::write(
             dir.join("rosetta"),
             "disabled\ninterpreter /run/rosetta/rosetta\n",
         )
         .unwrap();
-        assert!(!binfmt_handler_enabled(&dir, "rosetta"));
+        assert_eq!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Disabled
+        );
 
-        // Global binfmt_misc disabled -> disabled even if handler says enabled.
+        // Global binfmt_misc disabled -> Disabled even if handler says enabled.
         fs::write(dir.join("status"), "disabled\n").unwrap();
         fs::write(
             dir.join("rosetta"),
             "enabled\ninterpreter /run/rosetta/rosetta\n",
         )
         .unwrap();
-        assert!(!binfmt_handler_enabled(&dir, "rosetta"));
+        assert_eq!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Disabled
+        );
 
-        // Nothing registered in this test process -> is_registered is false.
-        assert!(!is_registered());
+        // Non-NotFound read failure (e.g. EISDIR) on handler -> Unknown (never Disabled).
+        fs::write(dir.join("status"), "enabled\n").unwrap();
+        fs::remove_file(dir.join("rosetta")).unwrap();
+        fs::create_dir(dir.join("rosetta")).unwrap();
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Non-NotFound read failure on global status -> Unknown (never Disabled).
+        fs::remove_file(dir.join("status")).unwrap();
+        fs::create_dir(dir.join("status")).unwrap();
+        assert!(matches!(
+            binfmt_handler_status(&dir, "rosetta"),
+            EmulationStatus::Unknown(_)
+        ));
+
+        // Nothing registered in this test process -> Disabled.
+        assert_eq!(status(), EmulationStatus::Disabled);
 
         let _ = fs::remove_dir_all(&dir);
     }

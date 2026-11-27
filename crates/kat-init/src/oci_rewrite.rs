@@ -104,18 +104,42 @@ pub fn is_digest_reference(name: &str) -> bool {
     )
 }
 
-/// Platforms listed by `ctr images ls` that the guest kernel and CRI can run
-/// natively without rewriting.
+/// Strict native platform specification matching containerd's
+/// `platforms.OnlyStrict(platforms.DefaultSpec())` (used by
+/// `ctr images export --local`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativePlatform<'a> {
+    pub os: &'a str,
+    pub arch: &'a str,
+    pub variant: Option<&'a str>,
+}
+
+impl<'a> NativePlatform<'a> {
+    pub const fn linux(arch: &'a str, variant: Option<&'a str>) -> Self {
+        Self {
+            os: "linux",
+            arch,
+            variant,
+        }
+    }
+
+    fn matches_strict(self, os: &str, arch: &str, variant: Option<&str>) -> bool {
+        os.eq_ignore_ascii_case(self.os)
+            && normalize_arch_variant(arch, variant)
+                == normalize_arch_variant(self.arch, self.variant)
+    }
+}
+
+/// Platforms listed by `ctr images ls` that match the guest's strict native
+/// platform (`platforms.DefaultStrict()`), including normalized variant.
 ///
 /// Katamaran's arm64 guest kernel disables `CONFIG_COMPAT` (no 32-bit ARM
-/// execution) and `ctr images export --local` defaults to `DefaultStrict()`, so
-/// 32-bit `linux/arm/*` variants are deliberately excluded rather than letting
-/// them suppress a usable `linux/amd64` rewrite.
+/// execution) and `ctr images export --local` defaults to `DefaultStrict()`
+/// (`linux/arm64`, where `v8` normalizes to baseline `""`, rejecting both
+/// `linux/arm/*` and non-baseline variants such as `linux/arm64/v8.2`).
 pub fn has_native_platform(platforms: &str, native_arch: &str) -> bool {
-    let (want_arch, _) = normalize_arch_variant(native_arch, None);
-    platform_list(platforms).any(|(os, arch, _)| {
-        os.eq_ignore_ascii_case("linux") && normalize_arch_variant(arch, None).0 == want_arch
-    })
+    let target = NativePlatform::linux(native_arch, None);
+    platform_list(platforms).any(|(os, arch, var)| target.matches_strict(os, arch, var))
 }
 
 /// True when `ctr images ls` lists a `linux/amd64` platform variant.
@@ -150,7 +174,7 @@ fn normalize_arch_variant(arch: &str, variant: Option<&str>) -> (String, Option<
         "i386" | "386" => ("386".into(), variant),
         "arm64" | "aarch64" => {
             let v = match variant.as_deref() {
-                None | Some("8" | "v8" | "v8.0") => None,
+                None | Some("8" | "v8") => None,
                 Some("9" | "9.0" | "v9.0") => Some("v9".into()),
                 Some(other) => Some(other.into()),
             };
@@ -242,20 +266,28 @@ pub enum NativeManifestCheck {
     RootMissing,
 }
 
-/// Verify whether `root_digest` in `store` contains a locally complete
-/// `linux/<native_arch>` manifest (config and every layer present locally).
+/// Verify whether `root_digest` in `store` resolves to a locally complete
+/// native manifest under containerd v2.4.2's `images.Manifest` +
+/// `platforms.OnlyStrict(target)` selection rules.
 ///
-/// Unlike `ctr images check` (which uses containerd's `platforms.Default()`
-/// matcher and treats 32-bit `linux/arm/*` as a fallback on `arm64`), this
-/// check matches `native_arch` strictly so an incomplete `linux/arm64` index
-/// with a complete 32-bit `linux/arm/v7` or `linux/amd64` sibling is never
-/// mistaken for usable native `arm64` content.
+/// Specifically:
+/// - Matches `(os, architecture, variant)` strictly against `target` (never
+///   accepting 32-bit `linux/arm/*` or non-baseline variants such as
+///   `linux/arm64/v8.2` on a baseline `linux/arm64` guest).
+/// - Follows containerd's `images.Manifest` stable descriptor ranking and
+///   `limit = 1` selection (explicit matching platform before platformless,
+///   descending `os.features` length, preserving index order on ties): if the
+///   selected descriptor is missing locally, returns `Incomplete` immediately
+///   rather than scanning past it to a later sibling that containerd won't pick.
+/// - When the selected descriptor explicitly declares a strictly matching
+///   platform, verifies config and layer presence via stat lookups without
+///   fetching the config JSON body (so large native image configs > 16 MiB
+///   never hit the rewrite metadata byte budget).
 pub fn has_complete_native_manifest(
     root_digest: &str,
-    native_arch: &str,
+    target: NativePlatform<'_>,
     store: &mut impl BlobStore,
 ) -> Result<NativeManifestCheck, String> {
-    let (want_arch, _) = normalize_arch_variant(native_arch, None);
     let mut budget = BudgetedStore::new(
         store,
         MAX_TOTAL_METADATA_BYTES,
@@ -271,7 +303,8 @@ pub fn has_complete_native_manifest(
     if walk_native_manifest(
         root_digest,
         None,
-        &want_arch,
+        false,
+        target,
         &mut budget,
         0,
         &mut walk_notes,
@@ -555,22 +588,28 @@ impl PlatformDesc {
         })
     }
 
-    fn allows_linux_arch(&self, want_arch: &str) -> bool {
+    fn allows_amd64(&self) -> bool {
         if let Some(os) = &self.os
             && !os.eq_ignore_ascii_case("linux")
         {
             return false;
         }
         if let Some(arch) = &self.architecture
-            && normalize_arch_variant(arch, None).0 != want_arch
+            && normalize_arch_variant(arch, None).0 != "amd64"
         {
             return false;
         }
         true
     }
 
-    fn allows_amd64(&self) -> bool {
-        self.allows_linux_arch("amd64")
+    /// Strict match matching containerd's `platforms.OnlyStrict(target)`
+    /// (requires explicit `os` and `architecture`, and matching normalized
+    /// `variant`).
+    fn matches_strict(&self, target: NativePlatform<'_>) -> bool {
+        let (Some(os), Some(arch)) = (self.os.as_deref(), self.architecture.as_deref()) else {
+            return false;
+        };
+        target.matches_strict(os, arch, self.variant.as_deref())
     }
 
     /// Explicit normalized `linux/amd64[/variant]` selector when this
@@ -895,7 +934,8 @@ fn resolve_leaf_manifest<S: BlobStore>(
 fn walk_native_manifest<S: BlobStore>(
     digest: &str,
     desc_media_type: Option<&str>,
-    want_arch: &str,
+    explicit_platform_matched: bool,
+    target: NativePlatform<'_>,
     store: &mut BudgetedStore<'_, S>,
     depth: usize,
     notes: &mut WalkNotes,
@@ -928,7 +968,14 @@ fn walk_native_manifest<S: BlobStore>(
         ParsedBlob::Manifest {
             config_digest,
             layers,
-        } => resolve_native_leaf_manifest(config_digest, layers, want_arch, store, notes),
+        } => resolve_native_leaf_manifest(
+            config_digest,
+            layers,
+            explicit_platform_matched,
+            target,
+            store,
+            notes,
+        ),
         ParsedBlob::Index(children) => {
             if depth >= MAX_INDEX_DEPTH {
                 if notes.depth_err.is_none() {
@@ -936,61 +983,39 @@ fn walk_native_manifest<S: BlobStore>(
                 }
                 return Ok(false);
             }
-            let eligible: Vec<ChildDescriptor> = children
+            // Mirror containerd v2.4.2's `images.Manifest` (`LimitManifests` +
+            // `OnlyStrict(target)`): keep only descriptors with omitted platform
+            // or strict platform match, stable-sort explicit platform matches
+            // ahead of omitted platform (preserving index order on ties, since
+            // `onlyStrict.Less` is false between two matching descriptors), then
+            // take ONLY the first entry (`limit = 1`). Never scan past a missing
+            // selected descriptor to a later equally ranked sibling that
+            // containerd will not select.
+            let mut matching: Vec<ChildDescriptor> = children
                 .into_iter()
-                .filter(|c| {
-                    !c.platform
-                        .as_ref()
-                        .is_some_and(|p| !p.allows_linux_arch(want_arch))
+                .filter(|c| match &c.platform {
+                    None => true,
+                    Some(p) => p.matches_strict(target),
                 })
                 .collect();
-            for chunk in eligible.chunks(PREFETCH_BATCH_SIZE) {
-                if store.is_read_exhausted() && notes.budget_err.is_some() {
-                    break;
-                }
-                let chunk_digests: Vec<&str> = chunk.iter().map(|c| c.digest.as_str()).collect();
-                store.prefetch_sizes(&chunk_digests)?;
-
-                for child in chunk {
-                    match store.blob_size(&child.digest)? {
-                        StatOutcome::Size(None) => continue,
-                        StatOutcome::Size(Some(_)) => {}
-                        StatOutcome::BudgetExhausted(msg) => {
-                            if notes.budget_err.is_none() {
-                                notes.budget_err = Some(msg);
-                            }
-                            return Ok(false);
-                        }
-                    }
-                    if store.is_read_exhausted() {
-                        if notes.budget_err.is_none() {
-                            notes.budget_err = Some(if store.remaining_blobs == 0 {
-                                format!(
-                                    "metadata walk exceeded {MAX_METADATA_BLOBS}-blob limit before reading {}",
-                                    child.digest
-                                )
-                            } else {
-                                format!(
-                                    "metadata walk exceeded {}-byte aggregate limit before reading {}",
-                                    store.total_limit, child.digest
-                                )
-                            });
-                        }
-                        return Ok(false);
-                    }
-                    if walk_native_manifest(
-                        &child.digest,
-                        child.media_type.as_deref(),
-                        want_arch,
-                        store,
-                        depth + 1,
-                        notes,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
+            matching.sort_by(|a, b| match (&a.platform, &b.platform) {
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), Some(_)) | (None, None) => std::cmp::Ordering::Equal,
+            });
+            let Some(selected) = matching.into_iter().next() else {
+                return Ok(false);
+            };
+            let child_explicit = explicit_platform_matched || selected.platform.is_some();
+            walk_native_manifest(
+                &selected.digest,
+                selected.media_type.as_deref(),
+                child_explicit,
+                target,
+                store,
+                depth + 1,
+                notes,
+            )
         }
     }
 }
@@ -998,7 +1023,8 @@ fn walk_native_manifest<S: BlobStore>(
 fn resolve_native_leaf_manifest<S: BlobStore>(
     config_digest: Option<String>,
     layers: Vec<Option<String>>,
-    want_arch: &str,
+    explicit_platform_matched: bool,
+    target: NativePlatform<'_>,
     store: &mut BudgetedStore<'_, S>,
     notes: &mut WalkNotes,
 ) -> Result<bool, String> {
@@ -1032,6 +1058,15 @@ fn resolve_native_leaf_manifest<S: BlobStore>(
         }
     }
 
+    // When the selected index descriptor explicitly declared a strictly
+    // matching native platform (e.g. `linux/arm64`), containerd's
+    // `images.Manifest` trusts that descriptor platform without fetching the
+    // config body. Skip reading the config bytes here so large native configs
+    // (> MAX_TOTAL_METADATA_BYTES) never block native sync.
+    if explicit_platform_matched {
+        return Ok(true);
+    }
+
     let config_bytes = match store.read_json_blob(&config_digest)? {
         ReadOutcome::Data(data) => data,
         ReadOutcome::BudgetExhausted(msg) => {
@@ -1041,11 +1076,10 @@ fn resolve_native_leaf_manifest<S: BlobStore>(
             return Ok(false);
         }
     };
-    let Some((cfg_os, cfg_arch, _)) = inspect_config_platform(&config_bytes) else {
+    let Some((cfg_os, cfg_arch, cfg_variant)) = inspect_config_platform(&config_bytes) else {
         return Ok(false);
     };
-    Ok(cfg_os.eq_ignore_ascii_case("linux")
-        && normalize_arch_variant(&cfg_arch, None).0 == want_arch)
+    Ok(target.matches_strict(&cfg_os, &cfg_arch, cfg_variant.as_deref()))
 }
 
 fn sha256(data: &[u8]) -> String {
@@ -1759,6 +1793,8 @@ mod tests {
         assert!(has_native_platform("linux/arm64", "arm64"));
         assert!(has_native_platform("linux/amd64,linux/arm64/v8", "arm64"));
         assert!(has_native_platform("linux/aarch64", "arm64"));
+        assert!(!has_native_platform("linux/arm64/v8.2", "arm64"));
+        assert!(!has_native_platform("linux/arm64/v9", "arm64"));
         assert!(!has_native_platform("linux/arm/v7", "arm64"));
         assert!(!has_native_platform("linux/arm/v6", "arm64"));
         assert!(!has_native_platform("linux/arm", "arm64"));
@@ -2030,7 +2066,8 @@ mod tests {
         );
 
         assert_eq!(
-            has_complete_native_manifest(&root_d, "arm64", &mut store).unwrap(),
+            has_complete_native_manifest(&root_d, NativePlatform::linux("arm64", None), &mut store)
+                .unwrap(),
             NativeManifestCheck::Incomplete
         );
         let PrepareRewrite::Ready(plan) =
@@ -2043,11 +2080,15 @@ mod tests {
         assert_eq!(plan.layer_digests, vec![amd64_layer]);
     }
 
-    /// Regression test: `has_complete_native_manifest` verifies actual local
-    /// `linux/arm64` blobs (manifest + config + every layer), handles 511
-    /// absent siblings, rejects missing layers, and reports `RootMissing`.
+    /// Regression test: `has_complete_native_manifest` follows containerd v2.4.2's
+    /// `images.Manifest` (`LimitManifests(..., 1)` + `OnlyStrict`) stable-first
+    /// selection: a missing first `linux/arm64` descriptor is NEVER masked by a
+    /// complete second equally ranked `linux/arm64` sibling, so fallback to a
+    /// complete `linux/amd64` sibling remains available; explicit `linux/arm64/v8`
+    /// still beats an earlier platformless entry; missing layers report
+    /// `Incomplete`; and absent roots report `RootMissing`.
     #[test]
-    fn native_manifest_check_verifies_local_arm64_content_and_missing_layers() {
+    fn native_manifest_check_follows_containerd_stable_first_selection() {
         let mut store = MemStore::new();
         let arm64_layer = store.insert_layer(b"arm64-layer".to_vec());
         let arm64_cfg = store.insert(
@@ -2084,7 +2125,23 @@ mod tests {
             }))
             .unwrap(),
         );
+        let amd64_layer = store.insert_layer(b"amd64-layer".to_vec());
+        let amd64_cfg = store
+            .insert(serde_json::to_vec(&json!({"os": "linux", "architecture": "amd64"})).unwrap());
+        let complete_amd64 = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": amd64_cfg, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": amd64_layer, "size": 11}],
+            }))
+            .unwrap(),
+        );
+        let target = NativePlatform::linux("arm64", None);
 
+        // 1. Missing layer on selected arm64 manifest -> Incomplete.
         let incomplete_idx = store.insert(
             serde_json::to_vec(&json!({
                 "schemaVersion": 2,
@@ -2099,46 +2156,269 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            has_complete_native_manifest(&incomplete_idx, "arm64", &mut store).unwrap(),
+            has_complete_native_manifest(&incomplete_idx, target, &mut store).unwrap(),
             NativeManifestCheck::Incomplete
         );
 
-        // Complete arm64 manifest listed after 511 absent arm64 siblings still resolves Complete.
-        let mut manifests = Vec::with_capacity(512);
-        for i in 0..511u64 {
-            manifests.push(json!({
-                "mediaType": MT_OCI_MANIFEST,
-                "digest": format!("sha256:1111{i:060x}"),
-                "size": 128,
-                "platform": {"os": "linux", "architecture": "arm64"},
-            }));
-        }
-        manifests.push(json!({
-            "mediaType": MT_OCI_MANIFEST,
-            "digest": complete_arm64,
-            "size": 128,
-            "platform": {"os": "linux", "architecture": "arm64"},
-        }));
-        let complete_idx = store.insert(
+        // 2. Two equally ranked `linux/arm64` entries where the first is missing
+        //    locally and the second + `linux/amd64` are complete: containerd
+        //    selects the first entry (`limit = 1`), so the probe MUST return
+        //    `Incomplete` (allowing sync to fall back to rewriting `amd64`).
+        let missing_first_arm64 = format!("sha256:{}", "d".repeat(64));
+        let shadowed_idx = store.insert(
             serde_json::to_vec(&json!({
                 "schemaVersion": 2,
                 "mediaType": MT_OCI_INDEX,
-                "manifests": manifests,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": missing_first_arm64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64"}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_arm64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_amd64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "amd64"}},
+                ],
             }))
             .unwrap(),
         );
         assert_eq!(
-            has_complete_native_manifest(&complete_idx, "arm64", &mut store).unwrap(),
-            NativeManifestCheck::Complete
+            has_complete_native_manifest(&shadowed_idx, target, &mut store).unwrap(),
+            NativeManifestCheck::Incomplete
+        );
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&shadowed_idx, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready amd64 rewrite when first arm64 entry is missing");
+        };
+        assert_eq!(plan.layer_digests, vec![amd64_layer]);
+
+        // 3. Explicit `linux/arm64/v8` descriptor ranks strictly ahead of an
+        //    earlier platformless entry (matching `LimitManifests`) -> Complete.
+        let missing_platformless = format!("sha256:{}", "e".repeat(64));
+        let explicit_wins_idx = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": missing_platformless, "size": 128},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": complete_arm64, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}},
+                ],
+            }))
+            .unwrap(),
         );
         assert_eq!(
+            has_complete_native_manifest(&explicit_wins_idx, target, &mut store).unwrap(),
+            NativeManifestCheck::Complete
+        );
+
+        // 4. Absent root digest -> RootMissing.
+        assert_eq!(
+            has_complete_native_manifest(&format!("sha256:{}", "0".repeat(64)), target, &mut store)
+                .unwrap(),
+            NativeManifestCheck::RootMissing
+        );
+    }
+
+    /// Regression test: on a baseline `linux/arm64` guest (`platforms.DefaultStrict()`),
+    /// a non-baseline `linux/arm64/v8.2` manifest (either explicitly declared on an
+    /// index descriptor or inside a platformless leaf config) is NOT accepted by
+    /// `ctr images export --local`, so `has_complete_native_manifest` returns
+    /// `Incomplete` and lets sync rewrite the complete `linux/amd64` sibling.
+    #[test]
+    fn native_manifest_check_rejects_arm64_v82_on_baseline_arm64_guest() {
+        let mut store = MemStore::new();
+        let v82_layer = store.insert_layer(b"arm64-v82-layer".to_vec());
+        let v82_cfg = store.insert(
+            serde_json::to_vec(&json!({
+                "os": "linux",
+                "architecture": "arm64",
+                "variant": "v8.2",
+            }))
+            .unwrap(),
+        );
+        let v82_manifest = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": v82_cfg, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": v82_layer, "size": 15}],
+            }))
+            .unwrap(),
+        );
+
+        let amd64_layer = store.insert_layer(b"amd64-layer".to_vec());
+        let amd64_cfg = store
+            .insert(serde_json::to_vec(&json!({"os": "linux", "architecture": "amd64"})).unwrap());
+        let amd64_manifest = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": amd64_cfg, "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                            "digest": amd64_layer, "size": 11}],
+            }))
+            .unwrap(),
+        );
+
+        let baseline = NativePlatform::linux("arm64", None);
+
+        // 1. Index with explicit `linux/arm64/v8.2` + `linux/amd64`.
+        let v82_idx = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": [
+                    {"mediaType": MT_OCI_MANIFEST, "digest": v82_manifest, "size": 128,
+                     "platform": {"os": "linux", "architecture": "arm64", "variant": "v8.2"}},
+                    {"mediaType": MT_OCI_MANIFEST, "digest": amd64_manifest, "size": 128,
+                     "platform": {"os": "linux", "architecture": "amd64"}},
+                ],
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            has_complete_native_manifest(&v82_idx, baseline, &mut store).unwrap(),
+            NativeManifestCheck::Incomplete
+        );
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&v82_idx, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready amd64 rewrite when only arm64/v8.2 and amd64 exist");
+        };
+        assert_eq!(plan.layer_digests, vec![amd64_layer]);
+
+        // 2. Platformless leaf manifest whose config declares `arm64/v8.2`.
+        assert_eq!(
+            has_complete_native_manifest(&v82_manifest, baseline, &mut store).unwrap(),
+            NativeManifestCheck::Incomplete
+        );
+        // Same manifest DOES match an explicit `arm64/v8.2` strict target.
+        assert_eq!(
             has_complete_native_manifest(
-                &format!("sha256:{}", "0".repeat(64)),
-                "arm64",
+                &v82_manifest,
+                NativePlatform::linux("arm64", Some("v8.2")),
                 &mut store
             )
             .unwrap(),
-            NativeManifestCheck::RootMissing
+            NativeManifestCheck::Complete
         );
+    }
+
+    /// Regression test: when an OCI index selects a descriptor with an explicit
+    /// strictly matching `linux/arm64` platform, `has_complete_native_manifest`
+    /// stats the config and layers without reading the config body — so native
+    /// images with > `MAX_TOTAL_METADATA_BYTES` configs succeed without hitting
+    /// the rewrite metadata budget. Platformless descriptors still read the
+    /// config within budget.
+    #[test]
+    fn native_manifest_check_skips_fetching_oversized_config_for_explicit_arm64_descriptor() {
+        struct OversizedConfigStore {
+            blobs: HashMap<String, Vec<u8>>,
+            extra_sizes: HashMap<String, u64>,
+            forbid_read: Vec<String>,
+        }
+
+        impl BlobStore for OversizedConfigStore {
+            fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+                if let Some(&sz) = self.extra_sizes.get(digest) {
+                    return Ok(Some(sz));
+                }
+                Ok(self.blobs.get(digest).map(|b| b.len() as u64))
+            }
+
+            fn batch_blob_sizes(
+                &mut self,
+                digests: &[&str],
+            ) -> Result<HashMap<String, u64>, String> {
+                let mut out = HashMap::new();
+                for &d in digests {
+                    if let Some(sz) = self.blob_size(d)? {
+                        out.insert(d.to_string(), sz);
+                    }
+                }
+                Ok(out)
+            }
+
+            fn read_json_blob(
+                &mut self,
+                digest: &str,
+                max_bytes: usize,
+            ) -> Result<Vec<u8>, BlobReadError> {
+                assert!(
+                    !self.forbid_read.iter().any(|d| d == digest),
+                    "explicitly platformed config/layer {digest} must not be fetched"
+                );
+                let sz = self
+                    .blob_size(digest)
+                    .map_err(BlobReadError::Other)?
+                    .ok_or_else(|| BlobReadError::Other(format!("missing {digest}")))?;
+                if sz > max_bytes as u64 {
+                    return Err(BlobReadError::TooLarge(format!(
+                        "{digest} ({sz} bytes) exceeds {max_bytes}"
+                    )));
+                }
+                Ok(self.blobs[digest].clone())
+            }
+        }
+
+        let oversized_cfg = format!("sha256:{}", "c".repeat(64));
+        let arm64_layer = format!("sha256:{}", "b".repeat(64));
+        let manifest_bytes = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": oversized_cfg, "size": (MAX_TOTAL_METADATA_BYTES as u64) + 4096},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": arm64_layer, "size": 1024}],
+        }))
+        .unwrap();
+        let manifest_d = format!("sha256:{}", sha256(&manifest_bytes));
+        let idx_bytes = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_INDEX,
+            "manifests": [{
+                "mediaType": MT_OCI_MANIFEST,
+                "digest": manifest_d,
+                "size": manifest_bytes.len(),
+                "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"},
+            }],
+        }))
+        .unwrap();
+        let idx_d = format!("sha256:{}", sha256(&idx_bytes));
+
+        let mut store = OversizedConfigStore {
+            blobs: HashMap::from([
+                (manifest_d.clone(), manifest_bytes),
+                (idx_d.clone(), idx_bytes),
+            ]),
+            extra_sizes: HashMap::from([
+                (
+                    oversized_cfg.clone(),
+                    (MAX_TOTAL_METADATA_BYTES as u64) + 4096,
+                ),
+                (arm64_layer.clone(), 1024),
+            ]),
+            forbid_read: vec![oversized_cfg.clone(), arm64_layer],
+        };
+
+        // Explicit `linux/arm64/v8` descriptor: succeeds without reading the >16 MiB config.
+        assert_eq!(
+            has_complete_native_manifest(&idx_d, NativePlatform::linux("arm64", None), &mut store)
+                .unwrap(),
+            NativeManifestCheck::Complete
+        );
+
+        // Platformless single manifest with >16 MiB config: still enforces the metadata read cap.
+        store.forbid_read.retain(|d| d != &oversized_cfg);
+        let err = has_complete_native_manifest(
+            &manifest_d,
+            NativePlatform::linux("arm64", None),
+            &mut store,
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
     }
 }
