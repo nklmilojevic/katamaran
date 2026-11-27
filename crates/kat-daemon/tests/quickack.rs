@@ -637,13 +637,28 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             .expect("start persistent keep-alive client in qa-probe"),
     );
     let mut client_in = client.0.stdin.take().unwrap();
-    let mut client_out = BufReader::new(client.0.stdout.take().unwrap());
+    let client_stdout = client.0.stdout.take().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(client_stdout).lines() {
+            match line {
+                Ok(l) => {
+                    if line_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
     let mut burst = |count: usize, what: &str| -> (f64, f64) {
         writeln!(client_in, "{count}").expect("write burst count");
         client_in.flush().expect("flush burst count");
-        let mut line = String::new();
-        let n = client_out.read_line(&mut line).expect("read burst result");
-        assert!(n > 0, "{what}: persistent client closed early");
+        let line = line_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|e| {
+                panic!("{what}: timed out or closed waiting for burst result: {e}")
+            });
         parse_latencies(&line, what)
     };
 

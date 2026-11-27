@@ -19,11 +19,14 @@ br-*, katbr0), leaving all routing tables untouched.
 To avoid forcing quick ACKs on Internet-bound or host-bound container and
 pod connections whose packets leave/enter the guest through virtio-net
 (eth0), tag skbs received in virtnet_receive_done() with
-skb->kat_from_uplink (preserved across __copy_skb_header and
-skb_scrub_packet when forwarded across veth into a container netns) and
-record it on the socket in tcp_finish_connect() and tcp_event_data_recv().
-In-VM traffic (pod-to-pod, ClusterIP Service DNAT, container-to-container,
-root-to-bridge) never crosses virtio-net, so kat_from_uplink stays 0.
+skb->kat_from_uplink (preserved across __copy_skb_header,
+skb_scrub_packet, IPv4/IPv6 fragmentation metadata copies in
+ip_copy_metadata/ip6_copy_metadata, and fragment reassembly in
+inet_frag_reasm_finish, and cleared in napi_reuse_skb) and record it on
+the socket in tcp_create_openreq_child(), tcp_finish_connect(), and
+tcp_event_data_recv(). In-VM traffic (pod-to-pod, ClusterIP Service DNAT,
+container-to-container, root-to-bridge) never crosses virtio-net, so
+kat_from_uplink stays 0.
 
 tcp_in_quickack_mode() checks (icsk_ack.kat_quick_ack &&
 !icsk_ack.kat_from_uplink && READ_ONCE(kat_quickack_enabled)) alongside
@@ -134,6 +137,28 @@ diff -ruN a/net/core/sock.c b/net/core/sock.c
  	}
  	if (sk->sk_route_caps & NETIF_F_GSO)
  		sk->sk_route_caps |= NETIF_F_GSO_SOFTWARE;
+diff -ruN a/net/ipv4/inet_fragment.c b/net/ipv4/inet_fragment.c
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@ -645,6 +645,7 @@
+ 			int delta;
+ 
+ 			sum_truesize += fp->truesize;
++			head->kat_from_uplink |= fp->kat_from_uplink;
+ 			if (head->ip_summed != fp->ip_summed)
+ 				head->ip_summed = CHECKSUM_NONE;
+ 			else if (head->ip_summed == CHECKSUM_COMPLETE)
+diff -ruN a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -555,6 +555,7 @@
+ 	to->priority = from->priority;
+ 	to->protocol = from->protocol;
+ 	to->skb_iif = from->skb_iif;
++	to->kat_from_uplink = from->kat_from_uplink;
+ 	skb_dst_drop(to);
+ 	skb_dst_copy(to, from);
+ 	to->dev = from->dev;
 diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
@@ -163,3 +188,25 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		icsk->icsk_af_ops->sk_rx_dst_set(sk, skb);
  		security_inet_conn_established(sk, skb);
  		sk_mark_napi_id(sk, skb);
+diff -ruN a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -565,6 +565,7 @@
+ 		return NULL;
+ 
+ 	newicsk = inet_csk(newsk);
++	newicsk->icsk_ack.kat_from_uplink = skb->kat_from_uplink;
+ 	newtp = tcp_sk(newsk);
+ 	oldtp = tcp_sk(sk);
+ 
+diff -ruN a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -696,6 +696,7 @@
+ 	to->pkt_type = from->pkt_type;
+ 	to->priority = from->priority;
+ 	to->protocol = from->protocol;
++	to->kat_from_uplink = from->kat_from_uplink;
+ 	skb_dst_drop(to);
+ 	skb_dst_set(to, dst_clone(skb_dst(from)));
+ 	to->dev = from->dev;
