@@ -1,7 +1,7 @@
 //! `kat k8s`: manage the optional single-node Kubernetes (k3s) cluster.
 
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -174,22 +174,74 @@ fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_progress_line(w: &mut impl std::io::Write, msg: &str) {
-    // Ignore stderr write errors (such as BrokenPipe when output is piped) so
-    // the CLI keeps reading notifications until the terminal reset result arrives.
-    let _ = std::io::Write::write_fmt(w, format_args!("katamaran: {msg}\n"));
+/// Asynchronous bounded progress writer so a closed (`EPIPE`) or undrained
+/// stderr pipe can never panic or block the CLI while reading daemon RPC
+/// notifications and the terminal reset result.
+struct ProgressPrinter {
+    tx: Option<std::sync::mpsc::SyncSender<String>>,
+    done: std::sync::mpsc::Receiver<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPrinter {
+    fn spawn<W: std::io::Write + Send + 'static>(mut writer: W) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(32);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = std::thread::Builder::new()
+            .name("k8s-reset-progress".into())
+            .spawn(move || {
+                while let Ok(line) = rx.recv() {
+                    if writer.write_all(line.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+                let _ = done_tx.try_send(());
+            })
+            .ok();
+        Self {
+            tx: worker.as_ref().map(|_| tx),
+            done: done_rx,
+            worker,
+        }
+    }
+
+    fn send(&mut self, msg: &str) {
+        if let Some(tx) = &self.tx
+            && matches!(
+                tx.try_send(format!("katamaran: {msg}\n")),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_))
+            )
+        {
+            self.tx = None;
+        }
+    }
+
+    fn finish(mut self, flush_timeout: Duration) {
+        self.tx = None;
+        if self.done.recv_timeout(flush_timeout).is_ok()
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn reset(images: bool) -> anyhow::Result<()> {
     let mut c = Client::connect_default()?;
-    let mut stderr = std::io::stderr();
-    reset_with_client(&mut c, images, &mut |msg| {
-        write_progress_line(&mut stderr, msg);
-    })?;
+    let mut printer = ProgressPrinter::spawn(std::io::stderr());
+    let res = reset_with_client(&mut c, images, &mut |msg| printer.send(msg));
+    printer.finish(Duration::from_millis(250));
+    res?;
     if images {
-        println!("katamaran: Kubernetes cluster reset (k8s.io images cleared)");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stdout(),
+            b"katamaran: Kubernetes cluster reset (k8s.io images cleared)\n",
+        );
     } else {
-        println!("katamaran: Kubernetes cluster reset");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stdout(),
+            b"katamaran: Kubernetes cluster reset\n",
+        );
     }
     Ok(())
 }
@@ -716,16 +768,28 @@ mod tests {
     }
 
     #[test]
-    fn reset_keeps_reading_result_when_progress_writer_returns_broken_pipe() {
+    fn reset_keeps_reading_result_when_progress_writer_fails_or_blocks() {
         use std::io::{self, BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex, mpsc};
         use std::thread;
 
-        struct BrokenPipeWriter(usize);
+        struct BrokenPipeWriter(Arc<Mutex<usize>>);
         impl Write for BrokenPipeWriter {
             fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-                self.0 += 1;
+                *self.0.lock().unwrap() += 1;
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct BlockingWriter(mpsc::Receiver<()>);
+        impl Write for BlockingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(buf.len())
             }
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
@@ -736,6 +800,7 @@ mod tests {
         let sock = dir.0.join("daemon.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let srv = thread::spawn(move || {
+            // 1. BrokenPipe progress writer still reads notifications through Done.
             let (mut conn, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(conn.try_clone().unwrap());
             let mut line = String::new();
@@ -756,15 +821,50 @@ mod tests {
             let mut out = serde_json::to_vec(&resp).unwrap();
             out.push(b'\n');
             conn.write_all(&out).unwrap();
+
+            // 2. Undrained/blocking stderr writer (50 distinct progress messages > channel
+            //    capacity 32) never stalls reading the terminal reset result.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            let id = req.id.unwrap();
+            for i in 0..50 {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": format!("step {i}") }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
         });
 
-        let mut client = Client::connect(&sock).unwrap();
-        let mut sink = BrokenPipeWriter(0);
-        reset_with_client(&mut client, false, &mut |msg| {
-            write_progress_line(&mut sink, msg);
-        })
-        .unwrap();
+        let attempts = Arc::new(Mutex::new(0usize));
+        let mut client1 = Client::connect(&sock).unwrap();
+        let mut printer1 = ProgressPrinter::spawn(BrokenPipeWriter(attempts.clone()));
+        reset_with_client(&mut client1, false, &mut |msg| printer1.send(msg)).unwrap();
+        printer1.finish(Duration::from_millis(250));
+        assert!(*attempts.lock().unwrap() >= 1);
+
+        let (unblock_tx, unblock_rx) = mpsc::channel::<()>();
+        let mut client2 = Client::connect(&sock).unwrap();
+        let mut printer2 = ProgressPrinter::spawn(BlockingWriter(unblock_rx));
+        let started = Instant::now();
+        reset_with_client(&mut client2, false, &mut |msg| printer2.send(msg)).unwrap();
+        printer2.finish(Duration::from_millis(50));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "undrained progress writer blocked reset completion: {:?}",
+            started.elapsed()
+        );
+        drop(unblock_tx);
         srv.join().unwrap();
-        assert_eq!(sink.0, 2);
     }
 }

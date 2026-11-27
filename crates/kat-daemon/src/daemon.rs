@@ -1754,13 +1754,11 @@ impl Daemon {
             Ok(())
         };
 
-        let persist_res = persist_res.unwrap_or_else(|| {
-            if guest_data_deleted {
-                self.persist_k8s_enabled(false)
-            } else {
-                Ok(())
-            }
-        });
+        let persist_res = match persist_res {
+            Some(Ok(())) => Ok(()),
+            _ if guest_data_deleted => self.persist_k8s_enabled(false),
+            _ => Ok(()),
+        };
 
         let mut kubeconfig_err: Option<anyhow::Error> = None;
         if guest_reset_attempted {
@@ -3575,10 +3573,12 @@ mod tests {
             .write(true)
             .open(kube2.join(".katamaran-kubeconfig.lock"))
             .unwrap();
+        let rc = unsafe { libc::flock(lock2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(
-            unsafe { libc::flock(lock2.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            rc,
             0,
-            "kubeconfig lock must be released after kubectl timeout"
+            "kubeconfig lock must be released after kubectl timeout: {}",
+            std::io::Error::last_os_error()
         );
         drop(lock2);
         assert!(
@@ -3794,6 +3794,79 @@ mod tests {
             !Config::load(&home).unwrap().kubernetes,
             "kubernetes auto-start must be disabled if guest disconnects after ResetDataCleared"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_reset_retries_persisting_autostart_disable_after_transient_checkpoint_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let root = temp("k8s-retry-p");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        let run_dir = home.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-retry-p");
+        let sock = crate::k8s::socket_path(&home);
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+
+        // Make `home` read-only so the immediate `config.toml.tmp.*` write at the
+        // ResetDataCleared checkpoint fails transiently, then restore writability
+        // before the guest sends `Done`.
+        let _restore = RestoreMode(home.clone());
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (checkpoint_tx, checkpoint_rx) = std::sync::mpsc::channel::<()>();
+        let home_guest = home.clone();
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: true });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetAccepted).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            checkpoint_rx.recv().unwrap();
+            // Confirm the checkpoint save failed while `home` was read-only.
+            assert!(
+                Config::load(&home_guest).unwrap().kubernetes,
+                "checkpoint save should have failed while home was read-only"
+            );
+            // Restore writability before sending Done so the completion retry succeeds.
+            fs::set_permissions(&home_guest, fs::Permissions::from_mode(0o755)).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        d.k8s_reset(true, &mut |m| {
+            if m == kat_proto::k8s::RESET_DATA_CLEARED_PROGRESS {
+                let _ = checkpoint_tx.send(());
+            }
+        })
+        .unwrap();
+        guest.join().unwrap();
+
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "completion retry must persist kubernetes=false once home is writable again"
+        );
+        drop(_restore);
         fs::remove_dir_all(&root).unwrap();
     }
 

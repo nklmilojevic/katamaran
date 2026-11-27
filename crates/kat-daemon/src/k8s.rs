@@ -944,7 +944,20 @@ fn write_private_atomic(target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<File> {
+struct KubeconfigLock(File);
+
+impl Drop for KubeconfigLock {
+    fn drop(&mut self) {
+        // Explicitly unlock before closing the fd so a concurrent fork() in
+        // another thread cannot keep the open-file-description flock alive
+        // until the child completes exec().
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn lock_kubeconfig_dir(kube_dir: &Path) -> anyhow::Result<KubeconfigLock> {
     lock_kubeconfig_dir_with_deadline(kube_dir, None, Duration::from_secs(5), &mut |_| {})
 }
 
@@ -953,7 +966,7 @@ fn lock_kubeconfig_dir_with_deadline(
     deadline: Option<Instant>,
     heartbeat: Duration,
     progress: &mut dyn FnMut(&str),
-) -> anyhow::Result<File> {
+) -> anyhow::Result<KubeconfigLock> {
     fs::create_dir_all(kube_dir).with_context(|| format!("create {}", kube_dir.display()))?;
     let lock_path = kube_dir.join(".katamaran-kubeconfig.lock");
     let f = OpenOptions::new()
@@ -967,7 +980,7 @@ fn lock_kubeconfig_dir_with_deadline(
     let Some(deadline) = deadline else {
         loop {
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(f);
+                return Ok(KubeconfigLock(f));
             }
             let e = io::Error::last_os_error();
             if e.kind() != io::ErrorKind::Interrupted {
@@ -978,7 +991,7 @@ fn lock_kubeconfig_dir_with_deadline(
     let mut last_beat = Instant::now();
     loop {
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(f);
+            return Ok(KubeconfigLock(f));
         }
         let e = io::Error::last_os_error();
         if e.kind() == io::ErrorKind::Interrupted {
@@ -2694,10 +2707,12 @@ users:
             .write(true)
             .open(kube.join(".katamaran-kubeconfig.lock"))
             .unwrap();
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(
-            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            rc,
             0,
-            "kubeconfig lock must be released after noisy kubectl timeout"
+            "kubeconfig lock must be released after noisy kubectl timeout: {}",
+            io::Error::last_os_error()
         );
         drop(lock_file);
 
