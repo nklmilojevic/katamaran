@@ -20,6 +20,12 @@
 //!    process.
 //! 5. Guest streams `Stdout` / `Stderr`, then `Exit { code }` (or `Error`).
 //!
+//! Trust boundary: the guest accepts sessions only from `VMADDR_CID_HOST`
+//! peers, which reach it solely through the host-side listener socket that
+//! libkrun proxies for this port (see `peer_is_host` in `kat-init`). Holding a
+//! connection grants VM root, so access is governed by the host filesystem
+//! permissions on that socket (inside the daemon's mode-0700 run directory).
+//!
 //! Flow control (non-PTY sessions, `ExecSpec::output_window > 0`): each output
 //! stream has its own byte window, replenished by the host with
 //! `OutputWindow { stream, bytes }` once it has handed those bytes to the local

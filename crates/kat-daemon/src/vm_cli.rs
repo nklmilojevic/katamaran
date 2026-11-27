@@ -254,9 +254,10 @@ fn needs_blocking_relay(fd: RawFd) -> bool {
 ///
 /// Reads destination-tagged frames from fd 3 and writes them in strict FIFO
 /// order to inherited stdout (fd 4) or stderr (fd 5), reporting any write
-/// `errno` on fd 6 before exiting. Never touches fds 0/1/2 (`/dev/null`).
+/// `errno` on fd 6 before exiting and signalling downstream write progress with
+/// a byte on the nonblocking fd 7. Never touches fds 0/1/2 (`/dev/null`).
 pub fn run_io_relay_helper() -> ! {
-    let code = run_output_relay_fds(3, 4, 5, 6);
+    let code = run_output_relay_fds(3, 4, 5, 6, 7);
     unsafe { libc::_exit(code) }
 }
 
@@ -279,12 +280,29 @@ fn relay_read_exact(fd: RawFd, buf: &mut [u8]) -> io::Result<bool> {
     Ok(true)
 }
 
-fn relay_write_all(fd: RawFd, data: &[u8]) -> Result<(), libc::c_int> {
+/// Best-effort progress notification: one byte on the nonblocking
+/// `progress_fd` (dropped when the pipe is already full, which still leaves
+/// the reader a pending wakeup).
+fn relay_note_progress(progress_fd: RawFd) {
+    if progress_fd >= 0 {
+        let b = [0u8; 1];
+        let _ = unsafe { libc::write(progress_fd, b.as_ptr().cast(), 1) };
+    }
+}
+
+/// Upper bound per downstream `write` in the relay helper. A blocking pipe
+/// write returns only once its whole buffer is accepted, so slicing bounds how
+/// much a slow reader must consume between progress notes.
+const RELAY_WRITE_SLICE: usize = 4 << 10;
+
+fn relay_write_all(fd: RawFd, data: &[u8], progress_fd: RawFd) -> Result<(), libc::c_int> {
     let mut off = 0usize;
     while off < data.len() {
-        let rc = unsafe { libc::write(fd, data[off..].as_ptr().cast(), data.len() - off) };
+        let len = (data.len() - off).min(RELAY_WRITE_SLICE);
+        let rc = unsafe { libc::write(fd, data[off..].as_ptr().cast(), len) };
         if rc > 0 {
             off += rc as usize;
+            relay_note_progress(progress_fd);
             continue;
         }
         if rc == 0 {
@@ -336,7 +354,13 @@ fn report_relay_errno(status_fd: RawFd, errno: libc::c_int) {
     }
 }
 
-fn run_output_relay_fds(in_fd: RawFd, out_fd: RawFd, err_fd: RawFd, status_fd: RawFd) -> i32 {
+fn run_output_relay_fds(
+    in_fd: RawFd,
+    out_fd: RawFd,
+    err_fd: RawFd,
+    status_fd: RawFd,
+    progress_fd: RawFd,
+) -> i32 {
     // Ignore SIGPIPE so downstream broken pipes return EPIPE explicitly and
     // can be reported over `status_fd`.
     unsafe {
@@ -365,7 +389,7 @@ fn run_output_relay_fds(in_fd: RawFd, out_fd: RawFd, err_fd: RawFd, status_fd: R
             Ok(false) => return 0,
             Err(_) => return 1,
         }
-        if let Err(errno) = relay_write_all(target, &buf) {
+        if let Err(errno) = relay_write_all(target, &buf, progress_fd) {
             report_relay_errno(status_fd, errno);
             return 1;
         }
@@ -492,29 +516,31 @@ impl HelperProc {
 
     /// Spawn the single ordered output relay helper via `posix_spawn` with
     /// `0/1/2 -> /dev/null`, `3 -> cmd_r`, `4 -> out_fd` (or `/dev/null`),
-    /// `5 -> err_fd` (or `/dev/null`), `6 -> status_w`, and
+    /// `5 -> err_fd` (or `/dev/null`), `6 -> status_w`, `7 -> progress_w`, and
     /// `POSIX_SPAWN_CLOEXEC_DEFAULT`.
     fn spawn_output_relay(
         cmd_r: RawFd,
         out_fd: Option<RawFd>,
         err_fd: Option<RawFd>,
         status_w: RawFd,
+        progress_w: RawFd,
     ) -> io::Result<Self> {
         let exe = std::env::current_exe()?;
         let exe_c = CString::new(exe.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in executable path"))?;
 
-        // Relocate every source descriptor to >= 7 so target fds 0..=6 never collide.
-        let in_dup = dup_ge(cmd_r, 7)?;
+        // Relocate every source descriptor to >= 8 so target fds 0..=7 never collide.
+        let in_dup = dup_ge(cmd_r, 8)?;
         let out_dup = match out_fd.filter(|&fd| fd >= 0) {
-            Some(fd) => Some(dup_ge(fd, 7)?),
+            Some(fd) => Some(dup_ge(fd, 8)?),
             None => None,
         };
         let err_dup = match err_fd.filter(|&fd| fd >= 0) {
-            Some(fd) => Some(dup_ge(fd, 7)?),
+            Some(fd) => Some(dup_ge(fd, 8)?),
             None => None,
         };
-        let status_dup = dup_ge(status_w, 7)?;
+        let status_dup = dup_ge(status_w, 8)?;
+        let progress_dup = dup_ge(progress_w, 8)?;
 
         let mut actions_raw: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::posix_spawn_file_actions_init(&mut actions_raw) };
@@ -559,6 +585,9 @@ impl HelperProc {
             },
             unsafe {
                 libc::posix_spawn_file_actions_adddup2(&mut actions.0, status_dup.as_raw_fd(), 6)
+            },
+            unsafe {
+                libc::posix_spawn_file_actions_adddup2(&mut actions.0, progress_dup.as_raw_fd(), 7)
             },
         ] {
             if rc != 0 {
@@ -707,6 +736,8 @@ struct OutputRelay {
     proc: HelperProc,
     cmd_w: Option<OwnedFd>,
     status_r: OwnedFd,
+    /// Nonblocking; readable whenever the helper made downstream progress.
+    progress_r: OwnedFd,
     handles_out: bool,
     handles_err: bool,
 }
@@ -722,18 +753,22 @@ impl OutputRelay {
             }
         }
         let (status_r, status_w) = pipe_cloexec(false)?;
+        let (progress_r, progress_w) = pipe_cloexec(true)?;
         let proc = HelperProc::spawn_output_relay(
             cmd_r.as_raw_fd(),
             out_fd,
             err_fd,
             status_w.as_raw_fd(),
+            progress_w.as_raw_fd(),
         )?;
         drop(cmd_r);
         drop(status_w);
+        drop(progress_w);
         Ok(Self {
             proc,
             cmd_w: Some(cmd_w),
             status_r,
+            progress_r,
             handles_out: out_fd.is_some(),
             handles_err: err_fd.is_some(),
         })
@@ -968,7 +1003,12 @@ const SPLIT_STREAM_QUEUE_CAP: usize = 2 << 20;
 /// surviving channel may go without observable progress before it is aborted
 /// (so an unread peer pipe cannot hang teardown, while a slow but live reader
 /// still receives every buffered byte).
+#[cfg(not(test))]
 const SPLIT_DRAIN_SURVIVOR_IDLE: Duration = Duration::from_secs(2);
+/// Shortened so tests can prove that a slow reader outlasting the idle period
+/// in total, but progressing within it, still receives every byte.
+#[cfg(test)]
+const SPLIT_DRAIN_SURVIVOR_IDLE: Duration = Duration::from_millis(400);
 
 #[derive(Default)]
 struct PendingBytes {
@@ -1069,6 +1109,15 @@ impl SplitChannel {
     fn status_fd(&self) -> Option<RawFd> {
         match self {
             Self::Relay { relay, .. } => Some(relay.status_fd()),
+            Self::Direct { .. } => None,
+        }
+    }
+
+    /// Readable when the relay helper has written downstream since the last
+    /// [`drain_wake`] (direct channels report progress via `pending` instead).
+    fn progress_fd(&self) -> Option<&OwnedFd> {
+        match self {
+            Self::Relay { relay, .. } => Some(&relay.progress_r),
             Self::Direct { .. } => None,
         }
     }
@@ -1260,12 +1309,22 @@ impl OutputRelays {
     /// keeps flushing every byte already received from the guest (e.g. stderr
     /// diagnostics after `head` closed stdout) until it drains, fails, or makes
     /// no observable progress for [`SPLIT_DRAIN_SURVIVOR_IDLE`] (an unread peer
-    /// pipe), at which point it is aborted too.
+    /// pipe), at which point it is aborted too. Progress is either host-queued
+    /// bytes leaving `pending` or, once those are all inside a relay helper,
+    /// the helper's own downstream writes (its `progress_r` pipe), so a slow
+    /// but live reader is never cut off mid-drain.
     fn finish_split(mut chans: [&mut SplitChannel; 2], term_wake_r: RawFd) -> RelayFinish {
         let mut done = [false; 2];
         let mut failure: Option<RelayFinish> = None;
         let mut survivor_deadline: Option<Instant> = None;
         let mut last_pending = [chans[0].pending().bytes, chans[1].pending().bytes];
+        // Discard progress notes from the active session; only writes made
+        // during this drain count.
+        for chan in &chans {
+            if let Some(p) = chan.progress_fd() {
+                drain_wake(p);
+            }
+        }
 
         let fail = |chan: &mut SplitChannel,
                     done: &mut bool,
@@ -1343,28 +1402,37 @@ impl OutputRelays {
                 fd: -1,
                 events: 0,
                 revents: 0,
-            }; 5];
+            }; 7];
             pfds[0] = libc::pollfd {
                 fd: term_wake_r,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // Per channel: [status_fd POLLIN, write_fd POLLOUT] at 1 + 2*i.
+            // Per channel at base 1 + 3*i: [status_fd POLLIN, write_fd POLLOUT,
+            // progress_fd POLLIN].
             for (i, chan) in chans.iter().enumerate() {
                 if done[i] {
                     continue;
                 }
+                let base = 1 + 3 * i;
                 if let Some(fd) = chan.status_fd() {
-                    pfds[1 + 2 * i] = libc::pollfd {
+                    pfds[base] = libc::pollfd {
                         fd,
                         events: libc::POLLIN,
                         revents: 0,
                     };
                 }
                 if let Some(fd) = chan.write_poll_fd() {
-                    pfds[2 + 2 * i] = libc::pollfd {
+                    pfds[base + 1] = libc::pollfd {
                         fd,
                         events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                }
+                if let Some(p) = chan.progress_fd() {
+                    pfds[base + 2] = libc::pollfd {
+                        fd: p.as_raw_fd(),
+                        events: libc::POLLIN,
                         revents: 0,
                     };
                 }
@@ -1391,7 +1459,16 @@ impl OutputRelays {
                 if done[i] {
                     continue;
                 }
-                if pfds[1 + 2 * i].revents != 0 {
+                let base = 1 + 3 * i;
+                if pfds[base + 2].revents != 0
+                    && let Some(p) = chans[i].progress_fd()
+                {
+                    drain_wake(p);
+                    if let Some(dl) = survivor_deadline.as_mut() {
+                        *dl = Instant::now() + SPLIT_DRAIN_SURVIVOR_IDLE;
+                    }
+                }
+                if pfds[base].revents != 0 {
                     match chans[i].collect_finished() {
                         RelayFinish::Drained => done[i] = true,
                         f => fail(
@@ -1404,7 +1481,7 @@ impl OutputRelays {
                     }
                     continue;
                 }
-                let wr = pfds[2 + 2 * i].revents;
+                let wr = pfds[base + 1].revents;
                 if (wr & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
                     && (wr & libc::POLLOUT) == 0
                 {
@@ -2289,6 +2366,21 @@ fn send_signal_oob(
 ///
 /// Using a single `poll` + nonblocking `send` loop eliminates any shared socket
 /// writer mutex and guarantees `Resize` takes priority over further stdin reads.
+/// Pick the next coalesced output-credit frame, alternating between stdout and
+/// stderr (`next` is the stream tried first and advances past the stream
+/// chosen) so continuously replenished stdout credit can never starve a pending
+/// stderr grant.
+fn take_output_credit(pending: &mut [u64; 2], next: &mut usize) -> Option<VmExecMsg> {
+    let stream = [*next, 1 - *next].into_iter().find(|&i| pending[i] > 0)?;
+    let bytes = pending[stream].min(u64::from(u32::MAX));
+    pending[stream] -= bytes;
+    *next = 1 - stream;
+    Some(VmExecMsg::OutputWindow {
+        stream: stream as u8,
+        bytes: bytes as u32,
+    })
+}
+
 /// `stdin_window`: `Some(INPUT_WINDOW)` in windowed sessions, where stdin is
 /// only read (and sent as `Data`) while guest-granted credit remains, so the
 /// guest never has to stop reading the connection; `None` = unmetered (PTY).
@@ -2304,6 +2396,7 @@ fn writer_worker(
     let mut out_off: usize = 0;
     let mut pending_resize: Option<(u16, u16)> = None;
     let mut pending_out_credit = [0u64; 2];
+    let mut next_credit_stream = 0usize;
     let mut stdin_open = stdin_fd >= 0;
     let mut stdin_buf = vec![0u8; CHUNK];
 
@@ -2331,14 +2424,10 @@ fn writer_worker(
             out_off = 0;
             if let Some((rows, cols)) = pending_resize.take() {
                 out_buf = VmExecMsg::Resize { rows, cols }.encode();
-            } else if let Some(stream) = pending_out_credit.iter().position(|&c| c > 0) {
-                let bytes = pending_out_credit[stream].min(u64::from(u32::MAX));
-                pending_out_credit[stream] -= bytes;
-                out_buf = VmExecMsg::OutputWindow {
-                    stream: stream as u8,
-                    bytes: bytes as u32,
-                }
-                .encode();
+            } else if let Some(m) =
+                take_output_credit(&mut pending_out_credit, &mut next_credit_stream)
+            {
+                out_buf = m.encode();
             }
         }
 
@@ -4819,7 +4908,7 @@ mod tests {
     #[ignore = "internal OutputRelay helper entrypoint invoked by unit tests"]
     fn io_relay_helper_entrypoint() {
         if std::env::var_os("KATAMARAN_TEST_IO_RELAY").is_some() {
-            let code = run_output_relay_fds(3, 4, 5, 6);
+            let code = run_output_relay_fds(3, 4, 5, 6, 7);
             unsafe { libc::_exit(code) };
         }
     }
@@ -5328,6 +5417,25 @@ mod tests {
 
     #[test]
     fn split_drain_keeps_flushing_stderr_to_slow_reader_after_stdout_epipe() {
+        // Host-queued stderr far beyond what the pipe + relay can hold.
+        split_drain_after_stdout_epipe(24, 8 << 10, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn split_drain_tracks_relay_helper_progress_for_slow_stderr_reader() {
+        // Everything fits in the relay command pipe + stderr pipe, so the host
+        // queue empties at once; the reader then takes several multiples of
+        // `SPLIT_DRAIN_SURVIVOR_IDLE` in total while progressing well within
+        // it, which only the helper's progress pipe can observe.
+        let pause = Duration::from_millis(60);
+        let chunk = 16usize << 10;
+        let chunks = 6usize;
+        let read = 2usize << 10;
+        assert!(pause * (chunk * chunks / read) as u32 > SPLIT_DRAIN_SURVIVOR_IDLE * 3);
+        split_drain_after_stdout_epipe(chunks, read, pause);
+    }
+
+    fn split_drain_after_stdout_epipe(chunks: usize, read_size: usize, pause: Duration) {
         let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
         let (out_r, out_w) = pipe_cloexec(false).unwrap();
@@ -5363,7 +5471,6 @@ mod tests {
         // and only THEN start a slow stderr reader: every stderr byte already
         // received from the guest must still be delivered.
         let chunk = 16usize << 10;
-        let chunks = 24usize;
         let guest_bg = thread::spawn(move || {
             vm_exec::write(&mut guest, &VmExecMsg::Stdout(vec![b'O'; 96 << 10])).unwrap();
             for i in 0..chunks {
@@ -5381,9 +5488,9 @@ mod tests {
             drop(out_r);
             let mut f = std::fs::File::from(err_r);
             let mut got = Vec::new();
-            let mut buf = vec![0u8; 8 << 10];
+            let mut buf = vec![0u8; read_size];
             loop {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(pause);
                 match io::Read::read(&mut f, &mut buf) {
                     Ok(0) => return got,
                     Ok(n) => got.extend_from_slice(&buf[..n]),
@@ -5560,6 +5667,52 @@ mod tests {
             }
         ));
         assert_eq!(ctrl.len(), 2);
+    }
+
+    #[test]
+    fn output_credit_selection_alternates_so_stderr_is_never_starved() {
+        let mut pending = [0u64; 2];
+        let mut next = 0usize;
+        assert!(take_output_credit(&mut pending, &mut next).is_none());
+        let credit = |stream: u8, bytes: u32| VmExecMsg::OutputWindow { stream, bytes };
+        // stdout credit is replenished before every selection; stderr credit
+        // stays pending and must still get the very next turn.
+        pending = [100, 7];
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(0, 100))
+        );
+        pending[0] += 50;
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(1, 7))
+        );
+        pending[0] += 25;
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(0, 75))
+        );
+        pending[1] += 3;
+        pending[0] += 10;
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(1, 3))
+        );
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(0, 10))
+        );
+        assert!(take_output_credit(&mut pending, &mut next).is_none());
+        // Oversized coalesced credit is split into u32-sized grants.
+        pending = [u64::from(u32::MAX) + 5, 0];
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(0, u32::MAX))
+        );
+        assert_eq!(
+            take_output_credit(&mut pending, &mut next),
+            Some(credit(0, 5))
+        );
     }
 
     #[test]

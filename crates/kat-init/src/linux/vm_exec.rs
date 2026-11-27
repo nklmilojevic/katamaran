@@ -1084,6 +1084,22 @@ fn openpty(t: &Tty) -> io::Result<(OwnedFd, OwnedFd)> {
 /// Verify that an accepted vsock peer address is a complete `AF_VSOCK`
 /// `sockaddr_vm` originating from the host (`VMADDR_CID_HOST`). Rejects guest
 /// loopback (`VMADDR_CID_LOCAL`) and any truncated or non-vsock address.
+///
+/// This check is the listener's only authentication, and it is sound because
+/// no guest workload can appear as a `VMADDR_CID_HOST` peer:
+/// - The guest kernel assigns the source address of every vsock connection.
+///   Connections made inside the guest (to `VMADDR_CID_LOCAL` or the guest's
+///   own CID) use the loopback transport and carry a guest-side source CID, so
+///   containers and other guest processes, which share the guest's vsock
+///   namespace, are rejected here.
+/// - Only the virtio-vsock transport delivers `VMADDR_CID_HOST` peers, and
+///   libkrun's muxer creates those connections only when a host process
+///   connects to the host-side listener socket for this port
+///   (`<home>/run/vm-exec.sock`, inside the daemon's mode-0700 run directory).
+/// - A guest cannot loop back through libkrun to reach that listener: the
+///   muxer rejects guest TSI connects and proxy creation that target any
+///   host-listener port or its Unix socket path (`is_host_listener_id` /
+///   `is_protected_unix_path` in `vendor/libkrun/.../vsock/muxer.rs`).
 fn peer_is_host(addr: &libc::sockaddr_vm, len: libc::socklen_t) -> bool {
     len as usize == std::mem::size_of::<libc::sockaddr_vm>()
         && addr.svm_family == libc::AF_VSOCK as libc::sa_family_t
@@ -1636,6 +1652,22 @@ fn stdin_worker(
     drop(cgroup);
 }
 
+/// First stage of session shutdown once the leader is gone: tell
+/// `stdin_worker` (via one byte on its cancel pipe) to drop the command's stdin
+/// while it keeps reading `OutputWindow` credits and peer disconnects, and
+/// switch `writer` to post-exit mode. Closing the cancel pipe afterwards (once
+/// every output pump has joined) is the second stage that stops `stdin_worker`.
+fn enter_post_exit(stdin_cancel_w: &OwnedFd, writer: &GuestWriter) {
+    let exited_byte = *b"e";
+    loop {
+        let rc = unsafe { libc::write(stdin_cancel_w.as_raw_fd(), exited_byte.as_ptr().cast(), 1) };
+        if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+    }
+    writer.mark_post_exit();
+}
+
 /// Relay output from `from` (nonblocking pipe or PTY master) until EOF/EIO.
 ///
 /// Honors optional per-stream byte windows on `writer` so a blocked stdout sink
@@ -1644,10 +1676,12 @@ fn stdin_worker(
 /// - If all write ends have closed (`POLLHUP`), drains every buffered byte
 ///   across arbitrary host backpressure without discarding output.
 /// - If a surviving background descendant still holds the write end open,
-///   bounds the post-exit window to `post_exit_idle` and bounds each read
-///   batch so `wake_r` is always observed promptly even under continuous
-///   descendant output. At the deadline, rechecks `POLLHUP` so a writer that
-///   closed while a send was backpressured still drains completely.
+///   first drains the backlog already buffered in `from` at the moment the
+///   leader exited (the command's own output, however long the host withholds
+///   credit), then bounds further descendant output to `post_exit_idle`,
+///   observing `wake_r` between reads even under continuous descendant output.
+///   At the deadline, rechecks `POLLHUP` so a writer that closed while a send
+///   was backpressured still drains completely.
 fn pump(
     from: OwnedFd,
     wake_r: OwnedFd,
@@ -1660,6 +1694,13 @@ fn pump(
     let mut child_exited = false;
     let mut idle_deadline: Option<Instant> = None;
     let mut all_writers_closed = false;
+    // Bytes that were already buffered in `from` when the leader exited; never
+    // subject to the descendant idle deadline.
+    let mut exit_backlog = 0usize;
+    let on_leader_exit = |exit_backlog: &mut usize| -> Option<Instant> {
+        *exit_backlog = pipe_unread_bytes(from.as_raw_fd()).unwrap_or(0);
+        Some(Instant::now() + post_exit_idle)
+    };
 
     loop {
         if host_disconnected.load(Ordering::Acquire) {
@@ -1672,7 +1713,7 @@ fn pump(
             }
         }
 
-        let budget_deadline = if !child_exited || all_writers_closed {
+        let budget_deadline = if !child_exited || all_writers_closed || exit_backlog > 0 {
             None
         } else {
             idle_deadline
@@ -1683,7 +1724,7 @@ fn pump(
                 Ok(None) => {
                     if !child_exited {
                         child_exited = true;
-                        idle_deadline = Some(Instant::now() + post_exit_idle);
+                        idle_deadline = on_leader_exit(&mut exit_backlog);
                         continue;
                     }
                     if fd_has_hup(from.as_raw_fd()) {
@@ -1700,7 +1741,7 @@ fn pump(
                 }
             };
 
-        let timeout_ms = if !child_exited || all_writers_closed {
+        let timeout_ms = if !child_exited || all_writers_closed || exit_backlog > 0 {
             -1
         } else {
             match idle_deadline {
@@ -1751,7 +1792,7 @@ fn pump(
         }
         if !child_exited && pfds[1].revents != 0 {
             child_exited = true;
-            idle_deadline = Some(Instant::now() + post_exit_idle);
+            idle_deadline = on_leader_exit(&mut exit_backlog);
         }
         if (pfds[0].revents & libc::POLLHUP) != 0 {
             all_writers_closed = true;
@@ -1780,6 +1821,13 @@ fn pump(
                 return Ok(());
             }
             if n != usize::MAX {
+                if exit_backlog > 0 {
+                    exit_backlog = exit_backlog.saturating_sub(n);
+                    if exit_backlog == 0 {
+                        // Descendant-only output from here on.
+                        idle_deadline = Some(Instant::now() + post_exit_idle);
+                    }
+                }
                 if host_disconnected.load(Ordering::Acquire) {
                     return Ok(());
                 }
@@ -2326,13 +2374,21 @@ fn exec_with_timeouts(
                     cg.kill();
                 }
                 *handle.lock().unwrap() = None;
-                drop(stdin_cancel_w);
+                // Same two-stage shutdown as a normal exit: keep `stdin_worker`
+                // reading `OutputWindow` credits (and host disconnects) until
+                // the already-started pumps have drained, THEN stop it.
+                enter_post_exit(&stdin_cancel_w, &writer);
                 drop(out_wakes);
                 drop(wake_w);
-                writer.mark_post_exit();
-                let _ = stdin_thread.join();
                 for o in outputs {
                     let _ = o.join();
+                }
+                drop(stdin_cancel_w);
+                let _ = stdin_thread.join();
+                if host_disconnected.load(Ordering::Acquire) {
+                    writer.abort();
+                    let _ = writer_thread.join();
+                    return Ok(());
                 }
                 writer.finish_with(Some(
                     VmExecMsg::Error(truncate_error(&format!("spawn output thread: {e}"))).encode(),
@@ -2349,11 +2405,7 @@ fn exec_with_timeouts(
     // (dropping `stdin`/`master` immediately while continuing to read
     // `OutputWindow` credits and peer disconnects until all output pumps drain).
     *handle.lock().unwrap() = None;
-    let exited_byte = *b"e";
-    unsafe {
-        let _ = libc::write(stdin_cancel_w.as_raw_fd(), exited_byte.as_ptr().cast(), 1);
-    }
-    writer.mark_post_exit();
+    enter_post_exit(&stdin_cancel_w, &writer);
 
     // Signal output pumps that the main child has exited, then join every
     // pump so buffered output is preserved across host backpressure while
@@ -3446,6 +3498,85 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(stdout_bytes, 128 * 4096);
         assert_eq!(input_credit, input);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn leader_exit_backlog_survives_withheld_credit_while_descendant_holds_pipe() {
+        let reaper = Reaper::shared_for_tests();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let post_exit_idle = Duration::from_millis(50);
+
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                &reaper,
+                guest,
+                None,
+                &active_sessions,
+                Duration::from_secs(2),
+                Duration::from_millis(150),
+                post_exit_idle,
+                Duration::from_millis(50),
+                CgroupMode::BestEffort(Path::new(CGROUP_PARENT)),
+            );
+        });
+
+        // The leader writes 80 KiB and exits while a quiet background
+        // descendant keeps stdout open (no POLLHUP). With a 32 KiB window, the
+        // remaining ~48 KiB is still in the pipe at leader exit; withholding
+        // credit far past `post_exit_idle` must not discard it.
+        let window = 32u32 << 10;
+        let total = 20 * 4096;
+        vm_exec::write(
+            &mut host,
+            &VmExecMsg::Exec(ExecSpec {
+                cwd: "/".into(),
+                env: vec![],
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "dd if=/dev/zero bs=4096 count=20 2>/dev/null; sleep 5 & exit 0".into(),
+                ],
+                tty: None,
+                output_window: window,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut host).unwrap(),
+            Some(VmExecMsg::Started { .. })
+        ));
+
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut stdout_bytes = 0usize;
+        while stdout_bytes < window as usize {
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => stdout_bytes += d.len(),
+                Some(VmExecMsg::Pong) => {}
+                other => panic!("unexpected frame before window exhausted: {other:?}"),
+            }
+        }
+        thread::sleep(post_exit_idle * 10);
+
+        let code = loop {
+            vm_exec::write(
+                &mut host,
+                &VmExecMsg::OutputWindow {
+                    stream: vm_exec::OUTPUT_STREAM_STDOUT,
+                    bytes: window,
+                },
+            )
+            .unwrap();
+            match vm_exec::read(&mut host).unwrap() {
+                Some(VmExecMsg::Stdout(d)) => stdout_bytes += d.len(),
+                Some(VmExecMsg::Pong) => {}
+                Some(VmExecMsg::Exit { code }) => break code,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        };
+        assert_eq!(code, 0);
+        assert_eq!(stdout_bytes, total, "leader output lost at exit");
         server.join().unwrap();
     }
 
