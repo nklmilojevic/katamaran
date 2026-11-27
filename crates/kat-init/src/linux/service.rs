@@ -102,12 +102,23 @@ impl Reaper {
         r
     }
 
-    /// Process-wide shared [`Reaper`] for unit tests so concurrent tests in
-    /// the same binary never run multiple `waitid(P_ALL)` loops that steal
-    /// each other's child exit statuses.
+    /// Process-wide shared [`Reaper`] for unit tests. Only reaps PIDs
+    /// registered in `watched` so parallel tests spawning unrelated children
+    /// (such as `Command::new("sqlite3").output()`) never lose their child
+    /// exit status to `waitid(P_ALL)`.
     #[cfg(test)]
     pub fn shared_for_tests() -> Reaper {
-        static TEST_REAPER: std::sync::LazyLock<Reaper> = std::sync::LazyLock::new(Reaper::start);
+        static TEST_REAPER: std::sync::LazyLock<Reaper> = std::sync::LazyLock::new(|| {
+            let r = Reaper {
+                watched: Arc::new(Mutex::new(WatchTable::default())),
+            };
+            let watched = r.watched.clone();
+            thread::Builder::new()
+                .name("test-reaper".into())
+                .spawn(move || reap_loop_watched(&watched))
+                .expect("spawn test reaper thread");
+            r
+        });
         TEST_REAPER.clone()
     }
 
@@ -828,6 +839,33 @@ fn reap_loop(watched: &Mutex<WatchTable>) {
         };
         if let Some(tx) = tx {
             let _ = tx.send(status);
+        }
+    }
+}
+
+#[cfg(test)]
+fn reap_loop_watched(watched: &Mutex<WatchTable>) {
+    loop {
+        let mut done = Vec::new();
+        {
+            let mut table = watched.lock().unwrap();
+            let pids: Vec<i32> = table.children.keys().copied().collect();
+            for pid in pids {
+                let mut status = 0;
+                let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if reaped > 0
+                    && let Some(w) = table.children.remove(&reaped)
+                {
+                    done.push((w.tx, status));
+                }
+            }
+        }
+        let had_work = !done.is_empty();
+        for (tx, status) in done {
+            let _ = tx.send(status);
+        }
+        if !had_work {
+            thread::sleep(Duration::from_millis(5));
         }
     }
 }
@@ -1798,6 +1836,16 @@ mod tests {
                 while Instant::now() < deadline {
                     if unsafe { libc::kill(pid, 0) } < 0
                         && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    // Once the killed child is a zombie, the kernel has already
+                    // closed its `go_r`/`err_w` descriptors so the gate write
+                    // will fail with EPIPE before the test reaper collects it.
+                    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        && stat
+                            .rsplit_once(") ")
+                            .is_some_and(|(_, rest)| rest.starts_with('Z'))
                     {
                         break;
                     }
