@@ -3609,13 +3609,19 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                 }
                 SyncAction::RetireRewritten => {
                     if let Some(k) = k8s_img {
-                        match retire_rewritten_image(&name, &k.digest) {
-                            Ok(containerd_grpc::DeleteOutcome::Deleted) => log(&format!(
+                        match retire_rewritten_image(&name, Some(&img.digest), &k.digest) {
+                            Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                                 "retired Katamaran amd64 mirror {name} from k8s.io"
                             )),
-                            Ok(containerd_grpc::DeleteOutcome::NotFoundOrChanged) => log(&format!(
+                            Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => log(&format!(
                                 "skipped retiring {name}: k8s.io target already removed or replaced"
                             )),
+                            Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                                log(&format!(
+                                    "skipped retiring {name}: moby source digest changed concurrently; re-listing"
+                                ));
+                                retry_refs.insert(name);
+                            }
                             Err(e) => {
                                 log(&format!("retire amd64 mirror {name}: {e}"));
                                 failures.push(format!("{name}: {e}"));
@@ -3651,17 +3657,23 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             continue;
                         }
                     };
-                    let mut store = MobyContentStore::new(
-                        |digest: &str| info_client.blob_size("moby", digest),
-                        |digest: &str, max_bytes: usize| {
-                            get_ctr_content_blob(reaper, "moby", digest, max_bytes)
-                        },
-                    );
-                    let plan = match oci_rewrite::prepare_rewrite_from_store(
-                        &img.digest,
-                        NATIVE_ARCH,
-                        &mut store,
-                    ) {
+                    let prepare_res = {
+                        let mut store = MobyContentStore::new(
+                            GrpcMobyMeta {
+                                client: &mut info_client,
+                                max_response_bytes: IMAGE_LIST_LIMIT,
+                            },
+                            |digest: &str, max_bytes: usize| {
+                                get_ctr_content_blob(reaper, "moby", digest, max_bytes)
+                            },
+                        );
+                        oci_rewrite::prepare_rewrite_from_store(
+                            &img.digest,
+                            NATIVE_ARCH,
+                            &mut store,
+                        )
+                    };
+                    let plan = match prepare_res {
                         Ok(oci_rewrite::PrepareRewrite::Ready(plan)) => *plan,
                         Ok(oci_rewrite::PrepareRewrite::RootMissing) => {
                             retry_refs.insert(name);
@@ -3671,11 +3683,21 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             if let Some(k) = k8s_img
                                 && k.label(SOURCE_DIGEST_LABEL).is_some()
                             {
-                                match retire_rewritten_image(&name, &k.digest) {
-                                    Ok(containerd_grpc::DeleteOutcome::Deleted) => log(&format!(
+                                // Guard against concurrent Docker retags: only
+                                // retire the existing k8s.io mirror if `moby`
+                                // still points to `img.digest` AND `k8s.io`
+                                // still points to `k.digest`.
+                                match retire_rewritten_image(&name, Some(&img.digest), &k.digest) {
+                                    Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                                         "retired Katamaran amd64 mirror {name} from k8s.io"
                                     )),
-                                    Ok(containerd_grpc::DeleteOutcome::NotFoundOrChanged) => {}
+                                    Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => {}
+                                    Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                                        log(&format!(
+                                            "skipped retiring {name}: moby source digest changed concurrently; re-listing"
+                                        ));
+                                        retry_refs.insert(name);
+                                    }
                                     Err(e) => {
                                         log(&format!("retire amd64 mirror {name}: {e}"));
                                         failures.push(format!("{name}: {e}"));
@@ -3728,13 +3750,19 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     && !moby.contains_key(name)
                     && k8s_img.label(SOURCE_DIGEST_LABEL).is_some()
                 {
-                    match retire_rewritten_image(name, &k8s_img.digest) {
-                        Ok(containerd_grpc::DeleteOutcome::Deleted) => log(&format!(
+                    match retire_rewritten_image(name, None, &k8s_img.digest) {
+                        Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
                             "retired orphaned Katamaran amd64 mirror {name} from k8s.io"
                         )),
-                        Ok(containerd_grpc::DeleteOutcome::NotFoundOrChanged) => log(&format!(
+                        Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => log(&format!(
                             "skipped retiring orphaned {name}: k8s.io target already removed or replaced"
                         )),
+                        Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
+                            log(&format!(
+                                "skipped retiring orphaned {name}: tag reappeared in moby; re-listing"
+                            ));
+                            retry_refs.insert(name.clone());
+                        }
                         Err(e) => {
                             log(&format!("retire orphaned amd64 mirror {name}: {e}"));
                             failures.push(format!("{name}: {e}"));
@@ -3976,19 +4004,20 @@ fn parse_ctr_check(stdout: &str) -> Option<HashMap<String, CtrCheck>> {
     Some(rows)
 }
 
-/// Atomically retire a Katamaran-rewritten `k8s.io` image only if it still
-/// points to `expected_target_digest`, via containerd's `Images.Delete` RPC
-/// (`DeleteImageRequest.target`). If a concurrent kubelet pull replaced the tag
-/// with a native image, containerd returns `NOT_FOUND` and preserves it.
+/// Guarded retirement of a Katamaran-rewritten `k8s.io` image: verifies that
+/// `moby` still matches `expected_moby_digest` (`Some(digest)` when retiring
+/// for a known source digest, or `None` for orphan cleanup) AND atomically
+/// deletes `k8s.io` only if its target still matches `expected_k8s_digest`.
 fn retire_rewritten_image(
     name: &str,
-    expected_target_digest: &str,
-) -> Result<containerd_grpc::DeleteOutcome, String> {
-    containerd_grpc::delete_image_if_target_matches(
+    expected_moby_digest: Option<&str>,
+    expected_k8s_digest: &str,
+) -> Result<containerd_grpc::RetireOutcome, String> {
+    containerd_grpc::retire_image_if_unchanged(
         Path::new(CONTAINERD_SOCKET),
-        "k8s.io",
         name,
-        expected_target_digest,
+        expected_moby_digest,
+        expected_k8s_digest,
         Duration::from_secs(15),
     )
 }
@@ -4018,42 +4047,92 @@ fn clear_source_digest_label(reaper: &Reaper, name: &str) -> Result<(), String> 
     Err(format!("ctr images label {name} exited {code}: {detail}"))
 }
 
+trait MobyContentMeta {
+    fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String>;
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String>;
+}
+
+struct GrpcMobyMeta<'a> {
+    client: &'a mut containerd_grpc::ContentInfoClient,
+    max_response_bytes: usize,
+}
+
+impl MobyContentMeta for GrpcMobyMeta<'_> {
+    fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+        self.client.blob_size("moby", digest)
+    }
+
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
+        self.client
+            .batch_blob_sizes("moby", digests, self.max_response_bytes)
+    }
+}
+
 /// Lazy, caching `moby` content-store adapter that resolves authoritative blob
-/// sizes per digest via containerd's `Content.Info` RPC so unrelated blobs in
-/// `moby` never affect a rewrite. Rejects over-budget metadata blobs before
-/// running `ctr content get`, keeping the bounded stdout read as a backstop.
-struct MobyContentStore<I, F> {
+/// sizes via containerd's `Content.Info` (single digest) and digest-filtered
+/// `Content.List` (bounded batches) so unrelated blobs in `moby` never affect a
+/// rewrite. Rejects over-budget metadata blobs before running `ctr content get`,
+/// keeping the bounded stdout read as a backstop.
+struct MobyContentStore<M, F> {
     cache: HashMap<String, Option<u64>>,
-    info: I,
+    meta: M,
     fetch: F,
 }
 
-impl<I, F> MobyContentStore<I, F>
+impl<M, F> MobyContentStore<M, F>
 where
-    I: FnMut(&str) -> Result<Option<u64>, String>,
+    M: MobyContentMeta,
     F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
 {
-    fn new(info: I, fetch: F) -> Self {
+    fn new(meta: M, fetch: F) -> Self {
         Self {
             cache: HashMap::new(),
-            info,
+            meta,
             fetch,
         }
     }
 }
 
-impl<I, F> oci_rewrite::BlobStore for MobyContentStore<I, F>
+impl<M, F> oci_rewrite::BlobStore for MobyContentStore<M, F>
 where
-    I: FnMut(&str) -> Result<Option<u64>, String>,
+    M: MobyContentMeta,
     F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
 {
     fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
         if let Some(&cached) = self.cache.get(digest) {
             return Ok(cached);
         }
-        let size = (self.info)(digest)?;
+        let size = self.meta.blob_size(digest)?;
         self.cache.insert(digest.to_string(), size);
         Ok(size)
+    }
+
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
+        let mut out = HashMap::new();
+        let mut uncached = Vec::new();
+        let mut seen = HashSet::new();
+        for &digest in digests {
+            if let Some(&cached) = self.cache.get(digest) {
+                if let Some(size) = cached {
+                    out.insert(digest.to_string(), size);
+                }
+                continue;
+            }
+            if seen.insert(digest) {
+                uncached.push(digest);
+            }
+        }
+        if !uncached.is_empty() {
+            let found = self.meta.batch_blob_sizes(&uncached)?;
+            for digest in uncached {
+                let size = found.get(digest).copied();
+                self.cache.insert(digest.to_string(), size);
+                if let Some(sz) = size {
+                    out.insert(digest.to_string(), sz);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn read_json_blob(
@@ -4960,14 +5039,59 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         );
     }
 
-    /// Regression test: `MobyContentStore` queries `Content.Info` lazily per
-    /// inspected digest (never enumerating unrelated `moby` blobs), caches
-    /// lookups, distinguishes `NOT_FOUND` from RPC failures, and rejects
-    /// oversized blobs before invoking the payload fetcher while still
-    /// selecting a later small amd64 candidate.
+    /// Regression test: `MobyContentStore` queries authoritative sizes lazily
+    /// (single-digest `Content.Info` + bounded digest-filtered `Content.List`
+    /// batches), never enumerates unrelated `moby` blobs, caches lookups across
+    /// batch and single checks, handles 511+ absent siblings before the only
+    /// complete amd64 manifest, distinguishes `NOT_FOUND` from RPC failures,
+    /// and rejects oversized blobs before invoking the payload fetcher.
     #[test]
     fn moby_content_store_uses_lazy_cached_info_and_rejects_oversized_before_fetch() {
         use sha2::{Digest, Sha256};
+
+        struct MockMeta<'a> {
+            sizes: &'a HashMap<String, u64>,
+            queried: HashMap<String, usize>,
+            batch_sizes: Vec<usize>,
+            fail_single: bool,
+            fail_batch: bool,
+        }
+
+        impl MobyContentMeta for MockMeta<'_> {
+            fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
+                if self.fail_single {
+                    return Err("containerd Content.Info failed (grpc-status 13)".into());
+                }
+                assert!(
+                    !digest.starts_with("sha256:unrelated"),
+                    "unrelated moby blob must never be queried: {digest}"
+                );
+                *self.queried.entry(digest.to_string()).or_default() += 1;
+                Ok(self.sizes.get(digest).copied())
+            }
+
+            fn batch_blob_sizes(
+                &mut self,
+                digests: &[&str],
+            ) -> Result<HashMap<String, u64>, String> {
+                if self.fail_batch {
+                    return Err("containerd Content.List failed (grpc-status 13)".into());
+                }
+                self.batch_sizes.push(digests.len());
+                let mut out = HashMap::new();
+                for &d in digests {
+                    assert!(
+                        !d.starts_with("sha256:unrelated"),
+                        "unrelated moby blob must never be queried: {d}"
+                    );
+                    *self.queried.entry(d.to_string()).or_default() += 1;
+                    if let Some(&sz) = self.sizes.get(d) {
+                        out.insert(d.to_string(), sz);
+                    }
+                }
+                Ok(out)
+            }
+        }
 
         let sha = |b: &[u8]| -> String {
             let hex: String = Sha256::digest(b)
@@ -4994,15 +5118,31 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         }))
         .unwrap();
         let manifest_d = sha(&manifest);
+
+        let mut manifests = vec![
+            serde_json::json!({"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_a, "size": 10}),
+            serde_json::json!({"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_b, "size": 10}),
+        ];
+        // Prepend 511 distinct absent amd64 siblings before the only locally complete manifest.
+        for i in 0..511u64 {
+            manifests.push(serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:aaaa{i:060x}"),
+                "size": 128,
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }));
+        }
+        manifests.push(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": manifest_d,
+            "size": manifest.len(),
+            "platform": {"os": "linux", "architecture": "amd64"},
+        }));
+
         let root = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": [
-                {"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_a, "size": 10},
-                {"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_b, "size": 10},
-                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": manifest_d,
-                 "size": manifest.len(), "platform": {"os": "linux", "architecture": "amd64"}},
-            ],
+            "manifests": manifests,
         }))
         .unwrap();
         let root_d = sha(&root);
@@ -5021,24 +5161,22 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             (cfg_d.clone(), cfg.len() as u64),
             (layer_d.clone(), 512),
         ]);
-        // Simulate thousands of unrelated blobs in `moby`: lazy per-digest
-        // lookups must never touch them.
+        // Simulate thousands of unrelated blobs in `moby`: filtered queries
+        // must never touch them.
         for i in 0..5_000u64 {
             sizes.insert(format!("sha256:unrelated{i:055}"), 16 << 10);
         }
         let payloads =
             HashMap::from([(root_d.clone(), root), (manifest_d, manifest), (cfg_d, cfg)]);
 
-        let mut info_calls: HashMap<String, usize> = HashMap::new();
         let mut fetched = Vec::new();
         let mut store = MobyContentStore::new(
-            |digest: &str| {
-                assert!(
-                    !digest.starts_with("sha256:unrelated"),
-                    "unrelated moby blob must never be queried: {digest}"
-                );
-                *info_calls.entry(digest.to_string()).or_default() += 1;
-                Ok(sizes.get(digest).copied())
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: false,
+                fail_batch: false,
             },
             |digest: &str, _max: usize| {
                 assert_ne!(digest, huge_a, "oversized sibling A must not be fetched");
@@ -5054,22 +5192,60 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         let oci_rewrite::PrepareRewrite::Ready(plan) =
             oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap()
         else {
-            panic!("expected Ready plan for small sibling after oversized siblings");
+            panic!(
+                "expected Ready plan for complete sibling after 511 absent + oversized siblings"
+            );
         };
         assert_eq!(plan.layer_digests, vec![layer_d]);
-        assert!(!fetched.contains(&huge_a) && !fetched.contains(&huge_b));
         assert!(
-            info_calls.values().all(|&n| n == 1),
-            "each inspected digest must be queried at most once: {info_calls:?}"
+            store.meta.queried.values().all(|&n| n == 1),
+            "each inspected digest must be queried at most once"
         );
+        assert!(
+            store
+                .meta
+                .batch_sizes
+                .iter()
+                .all(|&n| n > 0 && n <= containerd_grpc::CONTENT_LIST_BATCH_SIZE),
+            "batch sizes must stay bounded: {:?}",
+            store.meta.batch_sizes
+        );
+        drop(store);
+        assert!(!fetched.contains(&huge_a) && !fetched.contains(&huge_b));
 
         // RPC errors on Content.Info must propagate instead of looking like RootMissing.
-        let mut err_store = MobyContentStore::new(
-            |_digest: &str| Err("containerd Content.Info failed (grpc-status 13)".into()),
+        let mut err_single_store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: true,
+                fail_batch: false,
+            },
             |_digest: &str, _max: usize| unreachable!(),
         );
-        let err =
-            oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_store).unwrap_err();
+        let err = oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_single_store)
+            .unwrap_err();
+        assert!(err.contains("grpc-status 13"), "{err}");
+
+        // RPC errors on batched Content.List must also propagate instead of looking like NotAvailable.
+        let mut err_batch_store = MobyContentStore::new(
+            MockMeta {
+                sizes: &sizes,
+                queried: HashMap::new(),
+                batch_sizes: Vec::new(),
+                fail_single: false,
+                fail_batch: true,
+            },
+            |digest: &str, _max: usize| {
+                payloads
+                    .get(digest)
+                    .cloned()
+                    .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
+            },
+        );
+        let err = oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut err_batch_store)
+            .unwrap_err();
         assert!(err.contains("grpc-status 13"), "{err}");
     }
 

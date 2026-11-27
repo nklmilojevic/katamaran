@@ -5,9 +5,13 @@
 //! - `Images.List`: returns structured `map<string, string>` labels and target
 //!   descriptors so label values containing commas can never spoof ownership
 //!   markers.
-//! - `Images.Delete` with `DeleteImageRequest.target`: performs an atomic
-//!   compare-and-delete inside containerd's BoltDB write transaction, leaving
-//!   any concurrent replacement image untouched.
+//! - `Images.Delete` with `DeleteImageRequest.target` (and source-guarded
+//!   `retire_image_if_unchanged`): verifies `moby`'s source digest and performs
+//!   an atomic compare-and-delete inside containerd's BoltDB write transaction,
+//!   leaving any concurrent replacement image untouched.
+//! - `Content.Info` / digest-filtered `Content.List`: resolves authoritative
+//!   blob sizes lazily or in bounded digest-filtered batches without enumerating
+//!   unrelated `moby` blobs.
 //! - Zero-copy rewritten image publication (`Leases.Create`/`Delete`,
 //!   `Content.Info`/`Write`/`Update`, `Images.Get`/`Create`/`Update`): links
 //!   existing `moby` layer blobs into `k8s.io` through containerd's shared
@@ -56,6 +60,8 @@ const DEFAULT_UNARY_RESPONSE_LIMIT: usize = 1 << 20;
 /// Chunk size for streaming metadata blobs over `Content.Write` (fits well
 /// inside HTTP/2's default 65,535-byte window so each chunk round-trips cleanly).
 const CONTENT_WRITE_CHUNK: usize = 32_768;
+/// Maximum number of digest equality filters sent in a single `Content.List` RPC.
+pub const CONTENT_LIST_BATCH_SIZE: usize = 128;
 
 const GRPC_OK: &str = "0";
 const GRPC_NOT_FOUND: &str = "5";
@@ -88,14 +94,29 @@ pub struct ContentInfo {
     pub size: i64,
 }
 
-/// Outcome of a conditional [`delete_image_if_target_matches`] RPC.
+/// Outcome of a conditional `Images.Delete` RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteOutcome {
+enum DeleteOutcome {
     /// Image existed with the expected target digest and was deleted.
     Deleted,
     /// Image was already absent, or its target digest changed (for example,
     /// replaced by a concurrent native kubelet pull) and was left untouched.
     NotFoundOrChanged,
+}
+
+/// Outcome of a source-and-target guarded [`retire_image_if_unchanged`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// `moby` still matched the expected source digest (or remained absent for
+    /// orphan cleanup) and `k8s.io` still matched `expected_k8s_digest`, so the
+    /// `k8s.io` mirror was deleted.
+    Deleted,
+    /// `k8s.io` was already absent or its target digest changed concurrently
+    /// (for example, replaced by a native kubelet pull) and was left untouched.
+    NotFoundOrChanged,
+    /// `moby` changed concurrently (retagged, created, or deleted); `k8s.io`
+    /// was left untouched so the caller can re-list and re-evaluate.
+    SourceChanged,
 }
 
 /// Error returned by [`publish_rewritten_image`].
@@ -130,6 +151,7 @@ struct GrpcResponse {
     grpc_status: String,
     grpc_message: String,
     messages: Vec<Vec<u8>>,
+    total_response_bytes: usize,
 }
 
 /// List all images in `namespace` via `/containerd.services.images.v1.Images/List`,
@@ -160,8 +182,9 @@ pub fn list_images(
     decode_list_images_response(body)
 }
 
-/// Reusable containerd gRPC client for lazy per-digest `Content.Info` metadata
-/// lookups over a single bounded Unix-socket HTTP/2 connection.
+/// Reusable containerd gRPC client for lazy per-digest `Content.Info` and
+/// bounded digest-filtered `Content.List` metadata lookups over a single
+/// deadline-bounded Unix-socket HTTP/2 connection.
 pub struct ContentInfoClient {
     conn: GrpcConn,
 }
@@ -178,12 +201,68 @@ impl ContentInfoClient {
     /// Returns `Ok(None)` when containerd reports gRPC `NOT_FOUND`, and `Err` on
     /// transport or RPC failures.
     pub fn blob_size(&mut self, namespace: &str, digest: &str) -> Result<Option<u64>, String> {
+        if !is_valid_oci_digest(digest) {
+            return Ok(None);
+        }
         let Some(info) = self.conn.content_info(namespace, digest)? else {
             return Ok(None);
         };
         let size = u64::try_from(info.size)
             .map_err(|_| format!("invalid negative size {} for {digest}", info.size))?;
         Ok(Some(size))
+    }
+
+    /// Look up authoritative committed byte sizes for a batch of digests in
+    /// `namespace`, returning ONLY the subset of digests that exist locally.
+    ///
+    /// Invalid digest strings are ignored locally; a single valid digest uses
+    /// O(1) `Content.Info`; larger batches query `/containerd.services.content.v1.Content/List`
+    /// in chunks of at most [`CONTENT_LIST_BATCH_SIZE`] `digest=="..."` filters
+    /// bounded by `max_response_bytes` across all chunks and by this client's
+    /// shared connection deadline.
+    pub fn batch_blob_sizes(
+        &mut self,
+        namespace: &str,
+        digests: &[&str],
+        max_response_bytes: usize,
+    ) -> Result<HashMap<String, u64>, String> {
+        let mut seen = HashSet::new();
+        let mut valid: Vec<&str> = Vec::new();
+        for &digest in digests {
+            if is_valid_oci_digest(digest) && seen.insert(digest) {
+                valid.push(digest);
+            }
+        }
+        if valid.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if valid.len() == 1 {
+            let mut out = HashMap::new();
+            if let Some(size) = self.blob_size(namespace, valid[0])? {
+                out.insert(valid[0].to_string(), size);
+            }
+            return Ok(out);
+        }
+
+        let mut remaining_bytes = max_response_bytes;
+        let mut out = HashMap::new();
+        for chunk in valid.chunks(CONTENT_LIST_BATCH_SIZE) {
+            let filters: Vec<String> = chunk.iter().map(|d| format!("digest==\"{d}\"")).collect();
+            let (infos, bytes_read) =
+                self.conn
+                    .list_content_filtered(namespace, &filters, remaining_bytes)?;
+            remaining_bytes = remaining_bytes.saturating_sub(bytes_read);
+            for info in infos {
+                if !seen.contains(info.digest.as_str()) {
+                    continue;
+                }
+                let size = u64::try_from(info.size).map_err(|_| {
+                    format!("invalid negative size {} for {}", info.size, info.digest)
+                })?;
+                out.insert(info.digest, size);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -193,41 +272,56 @@ impl ContentInfoClient {
 /// Containerd atomically checks that the stored image still points to
 /// `target_digest` before deleting it, preserving any replacement image if the
 /// tag changed after it was inspected.
-pub fn delete_image_if_target_matches(
+#[cfg(test)]
+fn delete_image_if_target_matches(
     socket_path: &Path,
     namespace: &str,
     name: &str,
     target_digest: &str,
     timeout: Duration,
 ) -> Result<DeleteOutcome, String> {
+    let deadline = Instant::now() + timeout;
+    let mut conn = GrpcConn::connect(socket_path, deadline)?;
+    conn.delete_image_if_target_matches(namespace, name, target_digest)
+}
+
+/// Guarded retirement of a Katamaran-created `k8s.io` mirror over a single
+/// bounded HTTP/2 connection:
+///
+/// 1. Queries `Images.Get("moby", name)` and confirms that `moby` still matches
+///    `expected_moby_digest` (`Some(digest)` when retiring for a known source
+///    digest, or `None` when retiring an orphan after `name` disappeared from
+///    `moby`). If `moby` changed concurrently, returns
+///    [`RetireOutcome::SourceChanged`] without touching `k8s.io`.
+/// 2. Calls conditional `Images.Delete("k8s.io", name, target = expected_k8s_digest)`
+///    so any concurrent native replacement in `k8s.io` is also preserved.
+pub fn retire_image_if_unchanged(
+    socket_path: &Path,
+    name: &str,
+    expected_moby_digest: Option<&str>,
+    expected_k8s_digest: &str,
+    timeout: Duration,
+) -> Result<RetireOutcome, String> {
     if name.is_empty() {
-        return Err("refusing to delete image with empty name".into());
+        return Err("refusing to retire image with empty name".into());
     }
-    if target_digest.is_empty() {
+    if expected_k8s_digest.is_empty() {
         return Err(format!(
-            "refusing to delete {name} without an expected target digest"
+            "refusing to retire {name} without an expected k8s.io target digest"
         ));
     }
 
     let deadline = Instant::now() + timeout;
     let mut conn = GrpcConn::connect(socket_path, deadline)?;
-    let proto = encode_delete_image_request(name, target_digest);
-    let resp = conn.unary_rpc(
-        "/containerd.services.images.v1.Images/Delete",
-        namespace,
-        None,
-        &proto,
-        DEFAULT_UNARY_RESPONSE_LIMIT,
-    )?;
-    match resp.grpc_status.as_str() {
-        GRPC_OK => Ok(DeleteOutcome::Deleted),
-        // gRPC status 5 = NOT_FOUND: returned both when the image does not
-        // exist and when DeleteImageRequest.target.digest does not match.
-        GRPC_NOT_FOUND => Ok(DeleteOutcome::NotFoundOrChanged),
-        code => Err(format!(
-            "containerd Images.Delete failed (grpc-status {code}): {}",
-            resp.grpc_message
-        )),
+    let current_moby = conn.get_image("moby", name)?;
+    let actual_moby_digest = current_moby.as_ref().map(|i| i.target.digest.as_str());
+    if actual_moby_digest != expected_moby_digest {
+        return Ok(RetireOutcome::SourceChanged);
+    }
+
+    match conn.delete_image_if_target_matches("k8s.io", name, expected_k8s_digest)? {
+        DeleteOutcome::Deleted => Ok(RetireOutcome::Deleted),
+        DeleteOutcome::NotFoundOrChanged => Ok(RetireOutcome::NotFoundOrChanged),
     }
 }
 
@@ -656,6 +750,7 @@ impl GrpcConn {
             grpc_status,
             grpc_message: std::mem::take(&mut state.grpc_message),
             messages: std::mem::take(&mut state.messages),
+            total_response_bytes: state.total_response_bytes,
         })
     }
 
@@ -804,6 +899,41 @@ impl GrpcConn {
             _ => {}
         }
         Ok(())
+    }
+
+    fn delete_image_if_target_matches(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        target_digest: &str,
+    ) -> Result<DeleteOutcome, String> {
+        if name.is_empty() {
+            return Err("refusing to delete image with empty name".into());
+        }
+        if target_digest.is_empty() {
+            return Err(format!(
+                "refusing to delete {name} without an expected target digest"
+            ));
+        }
+
+        let proto = encode_delete_image_request(name, target_digest);
+        let resp = self.unary_rpc(
+            "/containerd.services.images.v1.Images/Delete",
+            namespace,
+            None,
+            &proto,
+            DEFAULT_UNARY_RESPONSE_LIMIT,
+        )?;
+        match resp.grpc_status.as_str() {
+            GRPC_OK => Ok(DeleteOutcome::Deleted),
+            // gRPC status 5 = NOT_FOUND: returned both when the image does not
+            // exist and when DeleteImageRequest.target.digest does not match.
+            GRPC_NOT_FOUND => Ok(DeleteOutcome::NotFoundOrChanged),
+            code => Err(format!(
+                "containerd Images.Delete failed (grpc-status {code}): {}",
+                resp.grpc_message
+            )),
+        }
     }
 
     fn get_image(
@@ -964,6 +1094,38 @@ impl GrpcConn {
                 resp.grpc_message
             )),
         }
+    }
+
+    fn list_content_filtered(
+        &mut self,
+        namespace: &str,
+        filters: &[String],
+        max_response_bytes: usize,
+    ) -> Result<(Vec<ContentInfo>, usize), String> {
+        // Containerd's filters.ParseAll() with zero filters matches every blob
+        // in the namespace; refuse empty filter lists here as defense in depth.
+        if filters.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let req = encode_list_content_request(filters);
+        let resp = self.unary_rpc(
+            "/containerd.services.content.v1.Content/List",
+            namespace,
+            None,
+            &req,
+            max_response_bytes,
+        )?;
+        if resp.grpc_status != GRPC_OK {
+            return Err(format!(
+                "containerd Content.List ({namespace}) failed (grpc-status {}): {}",
+                resp.grpc_status, resp.grpc_message
+            ));
+        }
+        let mut infos = Vec::new();
+        for msg in &resp.messages {
+            infos.extend(decode_list_content_response(msg)?);
+        }
+        Ok((infos, resp.total_response_bytes))
     }
 
     fn update_content_labels(
@@ -1293,6 +1455,34 @@ fn format_rfc3339_utc(unix_secs: u64) -> String {
 
 const WRITE_ACTION_WRITE: u64 = 1;
 const WRITE_ACTION_COMMIT: u64 = 2;
+
+/// True when `digest` matches the OCI `<algorithm>:<encoded>` grammar
+/// (`[a-z0-9+._-]+:[a-zA-Z0-9=_-]+`) so it can safely appear inside a quoted
+/// containerd filter expression (`digest=="..."`) without escapes or syntax
+/// errors. Invalid digests cannot exist in containerd's content store.
+fn is_valid_oci_digest(digest: &str) -> bool {
+    let Some((algo, encoded)) = digest.split_once(':') else {
+        return false;
+    };
+    !algo.is_empty()
+        && !encoded.is_empty()
+        && algo.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b'.' | b'_' | b'-')
+        })
+        && encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b'_' | b'-'))
+}
+
+/// Encode `containerd.services.content.v1.ListContentRequest`:
+/// - field 1 (repeated string): `filters`
+fn encode_list_content_request(filters: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in filters {
+        encode_proto_bytes(&mut out, 1, f.as_bytes());
+    }
+    out
+}
 
 /// Encode `containerd.services.images.v1.DeleteImageRequest`:
 /// - field 1 (string): `name`
@@ -1668,6 +1858,24 @@ fn decode_content_info_response(mut data: &[u8]) -> Result<Option<ContentInfo>, 
         }
     }
     Ok(info)
+}
+
+fn decode_list_content_response(mut data: &[u8]) -> Result<Vec<ContentInfo>, String> {
+    let mut infos = Vec::new();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                infos.push(decode_content_info(bytes)?);
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(infos)
 }
 
 /// Decode `containerd.services.leases.v1.CreateResponse`:
@@ -2353,6 +2561,23 @@ mod tests {
         String::new()
     }
 
+    fn decode_repeated_strings(mut data: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        while !data.is_empty() {
+            let (tag, rest) = decode_varint(data).unwrap();
+            let field = tag >> 3;
+            let wt = tag & 0x7;
+            if field == 1 && wt == 2 {
+                let (v, next) = decode_len_delimited(rest).unwrap();
+                out.push(String::from_utf8(v.to_vec()).unwrap());
+                data = next;
+            } else {
+                data = skip_proto_field(wt, rest).unwrap();
+            }
+        }
+        out
+    }
+
     fn decode_create_lease_req(mut data: &[u8]) -> (String, HashMap<String, String>) {
         let mut id = String::new();
         let mut labels = HashMap::new();
@@ -2845,6 +3070,12 @@ mod tests {
         mutate_moby_after_manifest: Option<(String, String)>,
         /// Last `Images.Update` field mask received.
         last_update_mask: Vec<String>,
+        /// Optional image name that triggers a gRPC INTERNAL error on `Images.Get`.
+        fail_get_image: Option<String>,
+        /// Call counters for verifying lazy vs batched content metadata queries.
+        content_info_calls: usize,
+        content_list_calls: usize,
+        content_list_batch_sizes: Vec<usize>,
     }
 
     fn spawn_mock_containerd(
@@ -3104,12 +3335,36 @@ mod tests {
                             match path.as_str() {
                                 "/containerd.services.images.v1.Images/Get" => {
                                     let name = decode_first_string(&req_proto);
-                                    if let Some(img) = st.images.get(&(ns.clone(), name)) {
+                                    if st.fail_get_image.as_deref() == Some(name.as_str()) {
+                                        send_grpc_err(&mut conn, sid, "13", "bolt%20get%20error");
+                                    } else if let Some(img) = st.images.get(&(ns.clone(), name)) {
                                         let mut out = Vec::new();
                                         encode_proto_bytes(&mut out, 1, &encode_image(img));
                                         send_grpc_ok(&mut conn, sid, &out);
                                     } else {
                                         send_grpc_err(&mut conn, sid, "5", "not%20found");
+                                    }
+                                }
+                                "/containerd.services.images.v1.Images/Delete" => {
+                                    let (name, target_digest) = decode_delete_request(&req_proto);
+                                    let key = (ns.clone(), name);
+                                    let matched = match target_digest.as_deref() {
+                                        Some(want) => st
+                                            .images
+                                            .get(&key)
+                                            .is_some_and(|cur| cur.target.digest == want),
+                                        None => st.images.contains_key(&key),
+                                    };
+                                    if matched {
+                                        st.images.remove(&key);
+                                        send_grpc_ok(&mut conn, sid, &[]);
+                                    } else {
+                                        send_grpc_err(
+                                            &mut conn,
+                                            sid,
+                                            "5",
+                                            "target%20digest%20mismatch",
+                                        );
                                     }
                                 }
                                 "/containerd.services.images.v1.Images/Create" => {
@@ -3140,6 +3395,7 @@ mod tests {
                                     }
                                 }
                                 "/containerd.services.content.v1.Content/Info" => {
+                                    st.content_info_calls += 1;
                                     let digest = decode_first_string(&req_proto);
                                     if digest == "sha256:trigger-rpc-error" {
                                         send_grpc_err(&mut conn, sid, "13", "bolt%20read%20error");
@@ -3175,15 +3431,80 @@ mod tests {
                                     }
                                 }
                                 "/containerd.services.content.v1.Content/List" => {
-                                    // Stream multiple batched ListContentResponse messages like containerd.
-                                    let mut items: Vec<(String, i64)> = st
+                                    let filters = decode_repeated_strings(&req_proto);
+                                    st.content_list_calls += 1;
+                                    st.content_list_batch_sizes.push(filters.len());
+
+                                    let mut wanted: Option<HashSet<String>> = None;
+                                    let mut parse_err: Option<&str> = None;
+                                    let mut trigger_err = false;
+                                    if !filters.is_empty() {
+                                        let mut set = HashSet::new();
+                                        for f in &filters {
+                                            let Some(val) = f.strip_prefix("digest==") else {
+                                                parse_err = Some("unsupported%20filter");
+                                                break;
+                                            };
+                                            let unquoted = val
+                                                .strip_prefix('"')
+                                                .and_then(|s| s.strip_suffix('"'))
+                                                .unwrap_or(val);
+                                            if unquoted == "sha256:trigger-rpc-error" {
+                                                trigger_err = true;
+                                            }
+                                            set.insert(unquoted.to_string());
+                                        }
+                                        wanted = Some(set);
+                                    }
+
+                                    if let Some(msg) = parse_err {
+                                        drop(st);
+                                        send_grpc_err(&mut conn, sid, "3", msg);
+                                        continue;
+                                    }
+                                    if trigger_err {
+                                        drop(st);
+                                        send_grpc_err(&mut conn, sid, "13", "bolt%20list%20error");
+                                        continue;
+                                    }
+
+                                    // Stream multiple batched ListContentResponse messages like containerd,
+                                    // or trailers-only with zero DATA frames when no blobs match.
+                                    let mut items: Vec<(String, i64, HashMap<String, String>)> = st
                                         .ns_content
                                         .iter()
-                                        .filter(|((n, _), _)| n == &ns)
-                                        .map(|((_, d), (sz, _))| (d.clone(), *sz))
+                                        .filter(|((n, d), _)| {
+                                            n == &ns
+                                                && wanted.as_ref().is_none_or(|set| set.contains(d))
+                                        })
+                                        .map(|((_, d), (sz, lbls))| (d.clone(), *sz, lbls.clone()))
                                         .collect();
                                     items.sort_by(|a, b| a.0.cmp(&b.0));
                                     drop(st);
+                                    if items.is_empty() {
+                                        let mut trl = vec![0x88];
+                                        encode_hpack_huffman_header(
+                                            &mut trl,
+                                            "content-type",
+                                            "application/grpc",
+                                            false,
+                                        );
+                                        encode_hpack_huffman_header(
+                                            &mut trl,
+                                            "grpc-status",
+                                            "0",
+                                            false,
+                                        );
+                                        let _ = write_frame(
+                                            &mut conn,
+                                            FRAME_HEADERS,
+                                            FLAG_END_HEADERS | FLAG_END_STREAM,
+                                            sid,
+                                            &trl,
+                                        );
+                                        let _ = conn.flush();
+                                        continue;
+                                    }
                                     let mut hdr = vec![0x88];
                                     encode_hpack_huffman_header(
                                         &mut hdr,
@@ -3200,10 +3521,13 @@ mod tests {
                                     );
                                     for batch in items.chunks(2) {
                                         let mut resp_msg = Vec::new();
-                                        for (digest, size) in batch {
+                                        for (digest, size, lbls) in batch {
                                             let mut info = Vec::new();
                                             encode_proto_bytes(&mut info, 1, digest.as_bytes());
                                             encode_proto_varint(&mut info, 2, *size as u64);
+                                            for (k, v) in lbls {
+                                                encode_proto_map_entry(&mut info, 5, k, v);
+                                            }
                                             encode_proto_bytes(&mut resp_msg, 1, &info);
                                         }
                                         let framed = frame_grpc_message(&resp_msg).unwrap();
@@ -3671,6 +3995,324 @@ mod tests {
         assert!(err.contains("grpc-status 13"), "{err}");
         assert!(err.contains("bolt read error"), "{err}");
         drop(client);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_info_client_batch_blob_sizes_filters_digests_across_batches() {
+        let (dir, sock) = temp_sock("batch");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let mut ns_content = HashMap::new();
+        // Populate 500 unrelated blobs with padded labels; filtered batch
+        // queries must return ONLY matching requested digests.
+        for i in 0..500u64 {
+            ns_content.insert(
+                ("moby".into(), format!("sha256:0000{i:060x}")),
+                (
+                    ((i + 1) * 512) as i64,
+                    HashMap::from([("pad".into(), "x".repeat(512))]),
+                ),
+            );
+        }
+        let hit_a = format!("sha256:{}", "a".repeat(64));
+        let hit_b = format!("sha256:{}", "b".repeat(64));
+        let hit_c = format!("sha256:{}", "c".repeat(64));
+        ns_content.insert(("moby".into(), hit_a.clone()), (111, HashMap::new()));
+        ns_content.insert(("moby".into(), hit_b.clone()), (222, HashMap::new()));
+        ns_content.insert(
+            ("moby".into(), hit_c.clone()),
+            (333, HashMap::from([("big".into(), "y".repeat(4096))])),
+        );
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            ns_content,
+            ..Default::default()
+        }));
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+
+        let mut client = ContentInfoClient::connect(&sock, Duration::from_secs(5)).unwrap();
+
+        // 297 absent digests + 3 present digests + duplicate + malformed digest string
+        // -> 300 unique valid digests -> 3 bounded Content.List batches (128 + 128 + 44).
+        let absent: Vec<String> = (0..297u64)
+            .map(|i| format!("sha256:eeee{i:060x}"))
+            .collect();
+        let mut query: Vec<&str> = Vec::new();
+        query.push("not-a-valid-digest");
+        query.push("sha256:bad\"quote");
+        query.push(&hit_a);
+        for d in &absent[..150] {
+            query.push(d.as_str());
+        }
+        query.push(&hit_b);
+        query.push(&hit_b); // duplicate should be deduplicated
+        for d in &absent[150..] {
+            query.push(d.as_str());
+        }
+        query.push(&hit_c);
+
+        let got = client.batch_blob_sizes("moby", &query, 1 << 20).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.get(&hit_a).copied(), Some(111));
+        assert_eq!(got.get(&hit_b).copied(), Some(222));
+        assert_eq!(got.get(&hit_c).copied(), Some(333));
+
+        // All-absent batch returns empty map cleanly (zero DATA frames / trailers-only).
+        let absent_only: Vec<&str> = absent[..4].iter().map(String::as_str).collect();
+        assert!(
+            client
+                .batch_blob_sizes("moby", &absent_only, 1 << 20)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Single valid digest uses O(1) Content.Info instead of Content.List.
+        let single = client
+            .batch_blob_sizes("moby", &[hit_a.as_str()], 1 << 20)
+            .unwrap();
+        assert_eq!(single.get(&hit_a).copied(), Some(111));
+
+        // RPC errors propagate explicitly.
+        let err = client
+            .batch_blob_sizes(
+                "moby",
+                &[hit_a.as_str(), "sha256:trigger-rpc-error"],
+                1 << 20,
+            )
+            .unwrap_err();
+        assert!(err.contains("grpc-status 13"), "{err}");
+        assert!(err.contains("bolt list error"), "{err}");
+        drop(client);
+
+        // Response-byte cap is enforced explicitly on matching responses.
+        let mut tight = ContentInfoClient::connect(&sock, Duration::from_secs(5)).unwrap();
+        let err = tight
+            .batch_blob_sizes("moby", &[hit_a.as_str(), hit_c.as_str()], 256)
+            .unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
+        drop(tight);
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.content_info_calls, 1);
+        assert!(
+            st.content_list_batch_sizes
+                .iter()
+                .all(|&n| n > 0 && n <= CONTENT_LIST_BATCH_SIZE),
+            "every Content.List batch must be non-empty and <= {CONTENT_LIST_BATCH_SIZE}: {:?}",
+            st.content_list_batch_sizes
+        );
+        assert_eq!(
+            &st.content_list_batch_sizes[..3],
+            &[CONTENT_LIST_BATCH_SIZE, CONTENT_LIST_BATCH_SIZE, 44]
+        );
+        drop(st);
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: `retire_image_if_unchanged` checks BOTH `moby`'s source
+    /// digest and `k8s.io`'s target digest before deleting, so a concurrent
+    /// Docker retag (or recreated tag during orphan cleanup, or native kubelet
+    /// replacement) never deletes a working mirror or native image.
+    #[test]
+    fn retire_image_if_unchanged_verifies_moby_source_and_k8s_target() {
+        let (dir, sock) = temp_sock("retire");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let mk_img = |name: &str, digest: &str| ContainerdImage {
+            name: name.into(),
+            labels: HashMap::from([(
+                "io.katamaran.k8s.source-digest".into(),
+                "sha256:prev-good".into(),
+            )]),
+            target: Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: digest.into(),
+                size: 128,
+            },
+        };
+
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            images: HashMap::from([
+                // 1. Source retagged concurrently in moby; k8s still holds working mirror.
+                (
+                    ("moby".into(), "docker.io/library/retagged:dev".into()),
+                    mk_img("docker.io/library/retagged:dev", "sha256:new-complete"),
+                ),
+                (
+                    ("k8s.io".into(), "docker.io/library/retagged:dev".into()),
+                    mk_img("docker.io/library/retagged:dev", "sha256:working-mirror"),
+                ),
+                // 2. Source deleted concurrently from moby while retiring for a known source digest.
+                (
+                    ("k8s.io".into(), "docker.io/library/vanished:dev".into()),
+                    mk_img("docker.io/library/vanished:dev", "sha256:working-mirror"),
+                ),
+                // 3. Source still incomplete in moby AND k8s mirror unchanged -> retire!
+                (
+                    ("moby".into(), "docker.io/library/stale:dev".into()),
+                    mk_img("docker.io/library/stale:dev", "sha256:bad-incomplete"),
+                ),
+                (
+                    ("k8s.io".into(), "docker.io/library/stale:dev".into()),
+                    mk_img("docker.io/library/stale:dev", "sha256:old-mirror"),
+                ),
+                // 4. Source still incomplete, but kubelet replaced k8s tag with native pull.
+                (
+                    ("moby".into(), "docker.io/library/kubelet:dev".into()),
+                    mk_img("docker.io/library/kubelet:dev", "sha256:bad-incomplete"),
+                ),
+                (
+                    ("k8s.io".into(), "docker.io/library/kubelet:dev".into()),
+                    mk_img("docker.io/library/kubelet:dev", "sha256:native-pull"),
+                ),
+                // 5. Orphan cleanup: absent from moby and unchanged in k8s -> delete!
+                (
+                    ("k8s.io".into(), "docker.io/library/orphan:dev".into()),
+                    mk_img("docker.io/library/orphan:dev", "sha256:orphan-mirror"),
+                ),
+                // 6. Orphan cleanup raced with tag recreation in moby -> preserve!
+                (
+                    ("moby".into(), "docker.io/library/reborn:dev".into()),
+                    mk_img("docker.io/library/reborn:dev", "sha256:new-native"),
+                ),
+                (
+                    ("k8s.io".into(), "docker.io/library/reborn:dev".into()),
+                    mk_img("docker.io/library/reborn:dev", "sha256:old-mirror"),
+                ),
+                // 7. RPC failure checking moby -> propagate error and preserve k8s mirror.
+                (
+                    ("k8s.io".into(), "docker.io/library/err:dev".into()),
+                    mk_img("docker.io/library/err:dev", "sha256:keep-mirror"),
+                ),
+            ]),
+            fail_get_image: Some("docker.io/library/err:dev".into()),
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 7, 65_535);
+
+        // 1. Concurrent retag in moby -> SourceChanged, working mirror untouched.
+        assert_eq!(
+            retire_image_if_unchanged(
+                &sock,
+                "docker.io/library/retagged:dev",
+                Some("sha256:bad-incomplete"),
+                "sha256:working-mirror",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            RetireOutcome::SourceChanged
+        );
+        // 2. Concurrent delete in moby -> SourceChanged, mirror preserved for relist.
+        assert_eq!(
+            retire_image_if_unchanged(
+                &sock,
+                "docker.io/library/vanished:dev",
+                Some("sha256:bad-incomplete"),
+                "sha256:working-mirror",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            RetireOutcome::SourceChanged
+        );
+        // 3. Unchanged moby + unchanged k8s -> Deleted.
+        assert_eq!(
+            retire_image_if_unchanged(
+                &sock,
+                "docker.io/library/stale:dev",
+                Some("sha256:bad-incomplete"),
+                "sha256:old-mirror",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            RetireOutcome::Deleted
+        );
+        // 4. Unchanged moby + replaced k8s -> NotFoundOrChanged, native pull untouched.
+        assert_eq!(
+            retire_image_if_unchanged(
+                &sock,
+                "docker.io/library/kubelet:dev",
+                Some("sha256:bad-incomplete"),
+                "sha256:old-mirror",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            RetireOutcome::NotFoundOrChanged
+        );
+        // 5. Orphan still absent in moby -> Deleted.
+        assert_eq!(
+            retire_image_if_unchanged(
+                &sock,
+                "docker.io/library/orphan:dev",
+                None,
+                "sha256:orphan-mirror",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            RetireOutcome::Deleted
+        );
+        // 6. Orphan recreated in moby -> SourceChanged, k8s untouched.
+        assert_eq!(
+            retire_image_if_unchanged(
+                &sock,
+                "docker.io/library/reborn:dev",
+                None,
+                "sha256:old-mirror",
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            RetireOutcome::SourceChanged
+        );
+        // 7. RPC error checking moby -> Err, k8s untouched.
+        let err = retire_image_if_unchanged(
+            &sock,
+            "docker.io/library/err:dev",
+            Some("sha256:bad-incomplete"),
+            "sha256:keep-mirror",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(err.contains("grpc-status 13"), "{err}");
+
+        {
+            let st = state.lock().unwrap();
+            assert!(
+                st.images
+                    .contains_key(&("k8s.io".into(), "docker.io/library/retagged:dev".into())),
+                "working mirror must survive concurrent moby retag"
+            );
+            assert!(
+                st.images
+                    .contains_key(&("k8s.io".into(), "docker.io/library/vanished:dev".into()))
+            );
+            assert!(
+                !st.images
+                    .contains_key(&("k8s.io".into(), "docker.io/library/stale:dev".into()))
+            );
+            assert_eq!(
+                st.images[&("k8s.io".into(), "docker.io/library/kubelet:dev".into())]
+                    .target
+                    .digest,
+                "sha256:native-pull"
+            );
+            assert!(
+                !st.images
+                    .contains_key(&("k8s.io".into(), "docker.io/library/orphan:dev".into()))
+            );
+            assert!(
+                st.images
+                    .contains_key(&("k8s.io".into(), "docker.io/library/reborn:dev".into()))
+            );
+            assert!(
+                st.images
+                    .contains_key(&("k8s.io".into(), "docker.io/library/err:dev".into()))
+            );
+        }
 
         server.join().unwrap();
         let _ = fs::remove_dir_all(&dir);

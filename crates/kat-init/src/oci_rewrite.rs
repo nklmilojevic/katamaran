@@ -23,7 +23,7 @@
 //!    the rewritten config and manifest blobs with GC child labels, re-checks
 //!    the `moby` source digest, and publishes the tag in `k8s.io`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -38,9 +38,17 @@ pub const MAX_TOTAL_METADATA_BYTES: usize = 16 << 20;
 /// pathological indexes cannot spin or exhaust PID 1 memory.
 const MAX_METADATA_BLOBS: usize = 64;
 
-/// Cap on the number of unique content-store stat lookups (`Content.Info`)
-/// performed while walking a single image's descriptor graph.
+/// Cap on the number of uncached individual content-store stat lookups
+/// (`Content.Info`) performed while walking a single image's descriptor graph.
+/// Absent index siblings are checked in bounded batches via
+/// [`BlobStore::batch_blob_sizes`] and do not consume this budget.
 const MAX_STAT_LOOKUPS: usize = 512;
+
+/// Number of platform-eligible child digests (or leaf layers) prefetched per
+/// bounded batch presence query so absent siblings neither exhaust
+/// [`MAX_STAT_LOOKUPS`] nor force unnecessary queries once an ideal baseline
+/// candidate is found.
+const PREFETCH_BATCH_SIZE: usize = 128;
 
 /// Maximum OCI index nesting depth traversed per branch. Hitting this cap fails
 /// only the overly deep branch so shallower sibling manifests remain usable.
@@ -69,6 +77,11 @@ pub trait BlobStore {
     /// Returns `Ok(Some(size))` when present locally, `Ok(None)` when absent
     /// (`NOT_FOUND`), or `Err(...)` on store/RPC failure.
     fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String>;
+
+    /// Batch presence and size lookup for `digests`, returning ONLY the subset
+    /// of digests that exist locally along with their authoritative byte sizes.
+    /// Absent digests are omitted from the returned map.
+    fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String>;
 
     /// Read a JSON metadata blob, failing with [`BlobReadError::TooLarge`]
     /// before fetching its payload when the blob's authoritative stored size
@@ -384,6 +397,27 @@ impl<'a, S: BlobStore> BudgetedStore<'a, S> {
         Ok(StatOutcome::Size(size))
     }
 
+    /// Populate `size_cache` for every uncached digest in `digests` using a
+    /// bounded batch presence query so absent siblings do not consume
+    /// `remaining_stats`.
+    fn prefetch_sizes(&mut self, digests: &[&str]) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        let uncached: Vec<&str> = digests
+            .iter()
+            .copied()
+            .filter(|d| !self.size_cache.contains_key(*d) && seen.insert(*d))
+            .collect();
+        if uncached.is_empty() {
+            return Ok(());
+        }
+        let present = self.inner.batch_blob_sizes(&uncached)?;
+        for digest in uncached {
+            let size = present.get(digest).copied();
+            self.size_cache.insert(digest.to_string(), size);
+        }
+        Ok(())
+    }
+
     fn is_read_exhausted(&self) -> bool {
         self.remaining_blobs == 0 || self.remaining_bytes == 0
     }
@@ -639,74 +673,83 @@ fn walk_amd64_manifest<S: BlobStore>(
                 }
                 return Ok(None);
             }
+            let eligible: Vec<ChildDescriptor> = children
+                .into_iter()
+                .filter(|c| !c.platform.as_ref().is_some_and(|p| !p.allows_amd64()))
+                .collect();
             let mut best: Option<Candidate> = None;
-            for child in children {
-                if child.platform.as_ref().is_some_and(|p| !p.allows_amd64()) {
-                    continue;
-                }
-                match store.blob_size(&child.digest)? {
-                    StatOutcome::Size(None) => continue,
-                    StatOutcome::Size(Some(_)) => {}
-                    StatOutcome::BudgetExhausted(msg) => {
-                        if notes.budget_err.is_none() {
-                            notes.budget_err = Some(msg);
-                        }
-                        break;
-                    }
-                }
-                if store.is_read_exhausted() {
-                    if notes.budget_err.is_none() {
-                        notes.budget_err = Some(if store.remaining_blobs == 0 {
-                            format!(
-                                "metadata walk exceeded {MAX_METADATA_BLOBS}-blob limit before reading {}",
-                                child.digest
-                            )
-                        } else {
-                            format!(
-                                "metadata walk exceeded {}-byte aggregate limit before reading {}",
-                                store.total_limit, child.digest
-                            )
-                        });
-                    }
+            'chunks: for chunk in eligible.chunks(PREFETCH_BATCH_SIZE) {
+                if store.is_read_exhausted() && notes.budget_err.is_some() {
                     break;
                 }
-                let outer_selector = if depth == 0 {
-                    child
-                        .platform
-                        .as_ref()
-                        .and_then(PlatformDesc::explicit_amd64_selector)
-                } else {
-                    None
-                };
-                let Some(mut found) = walk_amd64_manifest(
-                    &child.digest,
-                    child.media_type.as_deref(),
-                    child.platform.as_ref(),
-                    store,
-                    depth + 1,
-                    notes,
-                )?
-                else {
-                    continue;
-                };
-                if let Some(outer) = outer_selector {
-                    found.selected_platform = outer;
-                }
-                let better = best.as_ref().is_none_or(|cur| {
-                    (
-                        amd64_platform_rank(&found.leaf_platform),
-                        amd64_platform_rank(&found.selected_platform),
-                    ) < (
-                        amd64_platform_rank(&cur.leaf_platform),
-                        amd64_platform_rank(&cur.selected_platform),
-                    )
-                });
-                if better {
-                    let is_ideal = found.leaf_platform == "linux/amd64"
-                        && found.selected_platform == "linux/amd64";
-                    best = Some(found);
-                    if is_ideal {
-                        break;
+                let chunk_digests: Vec<&str> = chunk.iter().map(|c| c.digest.as_str()).collect();
+                store.prefetch_sizes(&chunk_digests)?;
+
+                for child in chunk {
+                    match store.blob_size(&child.digest)? {
+                        StatOutcome::Size(None) => continue,
+                        StatOutcome::Size(Some(_)) => {}
+                        StatOutcome::BudgetExhausted(msg) => {
+                            if notes.budget_err.is_none() {
+                                notes.budget_err = Some(msg);
+                            }
+                            break 'chunks;
+                        }
+                    }
+                    if store.is_read_exhausted() {
+                        if notes.budget_err.is_none() {
+                            notes.budget_err = Some(if store.remaining_blobs == 0 {
+                                format!(
+                                    "metadata walk exceeded {MAX_METADATA_BLOBS}-blob limit before reading {}",
+                                    child.digest
+                                )
+                            } else {
+                                format!(
+                                    "metadata walk exceeded {}-byte aggregate limit before reading {}",
+                                    store.total_limit, child.digest
+                                )
+                            });
+                        }
+                        break 'chunks;
+                    }
+                    let outer_selector = if depth == 0 {
+                        child
+                            .platform
+                            .as_ref()
+                            .and_then(PlatformDesc::explicit_amd64_selector)
+                    } else {
+                        None
+                    };
+                    let Some(mut found) = walk_amd64_manifest(
+                        &child.digest,
+                        child.media_type.as_deref(),
+                        child.platform.as_ref(),
+                        store,
+                        depth + 1,
+                        notes,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if let Some(outer) = outer_selector {
+                        found.selected_platform = outer;
+                    }
+                    let better = best.as_ref().is_none_or(|cur| {
+                        (
+                            amd64_platform_rank(&found.leaf_platform),
+                            amd64_platform_rank(&found.selected_platform),
+                        ) < (
+                            amd64_platform_rank(&cur.leaf_platform),
+                            amd64_platform_rank(&cur.selected_platform),
+                        )
+                    });
+                    if better {
+                        let is_ideal = found.leaf_platform == "linux/amd64"
+                            && found.selected_platform == "linux/amd64";
+                        best = Some(found);
+                        if is_ideal {
+                            break 'chunks;
+                        }
                     }
                 }
             }
@@ -727,16 +770,8 @@ fn resolve_leaf_manifest<S: BlobStore>(
     let Some(config_digest) = config_digest else {
         return Ok(None);
     };
-    match store.blob_size(&config_digest)? {
-        StatOutcome::Size(None) => return Ok(None),
-        StatOutcome::Size(Some(_)) => {}
-        StatOutcome::BudgetExhausted(msg) => {
-            if notes.budget_err.is_none() {
-                notes.budget_err = Some(msg);
-            }
-            return Ok(None);
-        }
-    }
+    let mut to_check = Vec::with_capacity(1 + layers.len());
+    to_check.push(config_digest.as_str());
     for layer in &layers {
         let Some(layer_digest) = layer.as_deref() else {
             return Ok(None);
@@ -744,14 +779,20 @@ fn resolve_leaf_manifest<S: BlobStore>(
         if !layer_digest.starts_with("sha256:") {
             return Ok(None);
         }
-        match store.blob_size(layer_digest)? {
-            StatOutcome::Size(None) => return Ok(None),
-            StatOutcome::Size(Some(_)) => {}
-            StatOutcome::BudgetExhausted(msg) => {
-                if notes.budget_err.is_none() {
-                    notes.budget_err = Some(msg);
+        to_check.push(layer_digest);
+    }
+    for chunk in to_check.chunks(PREFETCH_BATCH_SIZE) {
+        store.prefetch_sizes(chunk)?;
+        for &digest in chunk {
+            match store.blob_size(digest)? {
+                StatOutcome::Size(None) => return Ok(None),
+                StatOutcome::Size(Some(_)) => {}
+                StatOutcome::BudgetExhausted(msg) => {
+                    if notes.budget_err.is_none() {
+                        notes.budget_err = Some(msg);
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
             }
         }
     }
@@ -805,8 +846,10 @@ mod tests {
         blobs: HashMap<String, Vec<u8>>,
         /// Optional digest whose read triggers a fatal (non-budget) I/O error.
         fail_digest: Option<String>,
-        /// Digests that must never be read (only checked via `has_blob`).
+        /// Digests that must never be read (only checked via `blob_size`/`batch_blob_sizes`).
         forbid_read: Vec<String>,
+        /// Recorded batch sizes passed to `batch_blob_sizes`.
+        batch_sizes: Vec<usize>,
     }
 
     impl MemStore {
@@ -815,6 +858,7 @@ mod tests {
                 blobs: HashMap::new(),
                 fail_digest: None,
                 forbid_read: Vec::new(),
+                batch_sizes: Vec::new(),
             }
         }
 
@@ -834,6 +878,17 @@ mod tests {
     impl BlobStore for MemStore {
         fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
             Ok(self.blobs.get(digest).map(|b| b.len() as u64))
+        }
+
+        fn batch_blob_sizes(&mut self, digests: &[&str]) -> Result<HashMap<String, u64>, String> {
+            self.batch_sizes.push(digests.len());
+            let mut out = HashMap::new();
+            for &d in digests {
+                if let Some(b) = self.blobs.get(d) {
+                    out.insert(d.to_string(), b.len() as u64);
+                }
+            }
+            Ok(out)
         }
 
         fn read_json_blob(
@@ -1523,6 +1578,18 @@ mod tests {
             fn blob_size(&mut self, digest: &str) -> Result<Option<u64>, String> {
                 Ok(self.sizes.get(digest).copied())
             }
+            fn batch_blob_sizes(
+                &mut self,
+                digests: &[&str],
+            ) -> Result<HashMap<String, u64>, String> {
+                let mut out = HashMap::new();
+                for &d in digests {
+                    if let Some(&sz) = self.sizes.get(d) {
+                        out.insert(d.to_string(), sz);
+                    }
+                }
+                Ok(out)
+            }
             fn read_json_blob(
                 &mut self,
                 digest: &str,
@@ -1606,6 +1673,76 @@ mod tests {
             !store.fetched.contains(&oversized_a) && !store.fetched.contains(&oversized_b),
             "oversized siblings must never have their payloads fetched: {:?}",
             store.fetched
+        );
+    }
+
+    /// Regression test: 511 distinct absent `linux/amd64` descriptors listed
+    /// before the only locally complete `linux/amd64` descriptor in an OCI
+    /// index must not exhaust `MAX_STAT_LOOKUPS` or return a budget error.
+    #[test]
+    fn absent_eligible_siblings_do_not_exhaust_lookup_budget() {
+        let mut store = MemStore::new();
+        let layer_d = store.insert_layer(b"complete-amd64-layer".to_vec());
+        let cfg_d = store
+            .insert(serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap());
+        let manifest_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_MANIFEST,
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": cfg_d,
+                    "size": 1,
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_d,
+                    "size": 20,
+                }],
+            }))
+            .unwrap(),
+        );
+
+        let mut manifests = Vec::with_capacity(512);
+        for i in 0..511u64 {
+            manifests.push(json!({
+                "mediaType": MT_OCI_MANIFEST,
+                "digest": format!("sha256:{i:064x}"),
+                "size": 128,
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }));
+        }
+        manifests.push(json!({
+            "mediaType": MT_OCI_MANIFEST,
+            "digest": manifest_d,
+            "size": 256,
+            "platform": {"os": "linux", "architecture": "amd64"},
+        }));
+
+        let root_d = store.insert(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": MT_OCI_INDEX,
+                "manifests": manifests,
+            }))
+            .unwrap(),
+        );
+
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected PrepareRewrite::Ready after 511 absent amd64 siblings");
+        };
+        assert_eq!(plan.selected_platform, "linux/amd64");
+        assert_eq!(plan.layer_digests, vec![layer_d]);
+        assert!(
+            !store.batch_sizes.is_empty()
+                && store
+                    .batch_sizes
+                    .iter()
+                    .all(|&n| n > 0 && n <= PREFETCH_BATCH_SIZE),
+            "batch queries must stay bounded by PREFETCH_BATCH_SIZE ({PREFETCH_BATCH_SIZE}): {:?}",
+            store.batch_sizes
         );
     }
 }
