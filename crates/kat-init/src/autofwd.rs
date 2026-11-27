@@ -72,21 +72,35 @@ fn is_v4_mapped_loopback(a: &IpAddr) -> bool {
     matches!(a, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
 }
 
+pub(crate) fn is_local_or_unspecified(a: &IpAddr) -> bool {
+    a.is_loopback()
+        || a.is_unspecified()
+        || matches!(
+            a,
+            IpAddr::V6(v6)
+                if v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        )
+}
+
 /// Routes for the ports Docker published on a loopback address of the VM
 /// (`-p 127.0.0.1:8080:80`, `-p '[::1]:8080:80'`). docker-proxy listens on
 /// that address in the root namespace, which the gvproxy forward cannot
 /// reach, so the relay dials from inside the VM instead.
 ///
 /// `listeners` are the root namespace's loopback listeners and `held` the
-/// sockets running TCP docker-proxy processes hold, each as a listener on
-/// the proxy's `-host-ip`/`-host-port`, with the proxy's
-/// `-container-ip`/`-container-port`. A listener counts only if a
-/// docker-proxy holds that very socket (same inode) for that very address:
-/// a process merely named docker-proxy (in a container, or
-/// Docker-in-Docker's own) cannot hold a root namespace socket it did not
-/// get, so the VM's own loopback services (containerd, k3s, kubelet) stay
-/// private to the VM. docker-proxy is what Docker runs for a published port
-/// with the userland proxy on (the default, which the guest image keeps).
+/// sockets running root-namespace TCP `/usr/bin/docker-proxy` processes hold,
+/// each as a listener on the proxy's `-host-ip`/`-host-port`, with the proxy's
+/// `-container-ip`/`-container-port`. A listener counts only if a genuine
+/// root-namespace `docker-proxy` holds that very socket (same non-zero inode)
+/// for that very address, and its container target is neither loopback nor
+/// unspecified: a process merely named `docker-proxy` (in a container, a
+/// `--network host` container, or Docker-in-Docker) cannot spoof a root
+/// `docker-proxy` or redirect forwards to VM-internal loopback services
+/// (containerd, k3s, kubelet), which stay private to the VM. `docker-proxy` is
+/// what Docker runs for a published port with the userland proxy on (the
+/// default, which the guest image keeps).
 ///
 /// The route dials the container target, as docker-proxy itself does, not
 /// the loopback address: if the container stops and a VM service binds the
@@ -103,8 +117,14 @@ pub fn published_loopback(
 ) -> BTreeMap<u16, Route> {
     let mut sorted: Vec<(&Listener, SocketAddr)> = listeners
         .iter()
-        .filter(|l| l.addr.is_loopback() && !root.contains(&l.port))
-        .filter_map(|l| Some((l, *held.get(l)?)))
+        .filter(|l| l.inode != 0 && l.port != 0 && l.addr.is_loopback() && !root.contains(&l.port))
+        .filter_map(|l| {
+            let target = *held.get(l)?;
+            if target.port() == 0 || is_local_or_unspecified(&target.ip()) {
+                return None;
+            }
+            Some((l, target))
+        })
         .collect();
     sorted.sort();
     let mut out = BTreeMap::new();
@@ -198,10 +218,14 @@ pub fn docker_proxy_host(cmdline: &[u8]) -> Option<(String, IpAddr, u16)> {
     docker_proxy_addr(cmdline, "-host-ip", "-host-port")
 }
 
-/// The inode of a `/proc/<pid>/fd/<n>` link to a socket (`socket:[1234]`).
+/// The non-zero inode of a `/proc/<pid>/fd/<n>` link to a socket (`socket:[1234]`).
 pub fn socket_inode(link: &[u8]) -> Option<u32> {
     let digits = link.strip_prefix(b"socket:[")?.strip_suffix(b"]")?;
-    std::str::from_utf8(digits).ok()?.parse().ok()
+    std::str::from_utf8(digits)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|n| *n != 0)
 }
 
 fn docker_proxy_addr(cmdline: &[u8], ip: &str, port: &str) -> Option<(String, IpAddr, u16)> {
@@ -209,15 +233,17 @@ fn docker_proxy_addr(cmdline: &[u8], ip: &str, port: &str) -> Option<(String, Ip
         .split(|b| *b == 0)
         .filter_map(|a| std::str::from_utf8(a).ok())
         .collect();
+    let flags = args.get(1..)?;
     let flag = |name: &str| {
-        args.iter()
+        flags
+            .iter()
             .position(|a| *a == name)
-            .and_then(|i| args.get(i + 1).copied())
+            .and_then(|i| flags.get(i + 1).copied())
     };
     Some((
         flag("-proto").unwrap_or("tcp").to_string(),
         flag(ip)?.parse().ok()?,
-        flag(port)?.parse().ok()?,
+        flag(port)?.parse().ok().filter(|p| *p != 0)?,
     ))
 }
 
@@ -602,8 +628,38 @@ mod tests {
     }
 
     #[test]
+    fn published_loopback_rejects_zero_inode_zero_port_and_local_targets() {
+        let valid = held("127.0.0.1", 18098, 1);
+        let zero_inode = held("127.0.0.1", 18099, 0);
+        let zero_port = held("127.0.0.1", 0, 2);
+        let bad_targets = [
+            (held("127.0.0.1", 18100, 3), "127.0.0.1:6444"),
+            (held("127.0.0.1", 18101, 4), "[::1]:10248"),
+            (held("127.0.0.1", 18102, 5), "[::ffff:127.0.0.1]:6444"),
+            (held("127.0.0.1", 18103, 6), "0.0.0.0:80"),
+            (held("127.0.0.1", 18104, 7), "[::]:80"),
+            (held("127.0.0.1", 18105, 8), "[::ffff:0.0.0.0]:80"),
+            (held("127.0.0.1", 18106, 9), "172.17.0.2:0"),
+        ];
+        let mut listeners = vec![valid, zero_inode, zero_port];
+        listeners.extend(bad_targets.iter().map(|(l, _)| *l));
+        let mut proxy_list: Vec<(Listener, &str)> = vec![
+            (valid, "172.17.0.2:80"),
+            (zero_inode, "172.17.0.2:80"),
+            (zero_port, "172.17.0.2:80"),
+        ];
+        proxy_list.extend_from_slice(&bad_targets);
+        let held_map = proxies(&proxy_list);
+        assert_eq!(
+            published_loopback(&BTreeSet::new(), &listeners, &held_map),
+            BTreeMap::from([(18098, root_route("172.17.0.2:80"))])
+        );
+    }
+
+    #[test]
     fn parses_socket_links() {
         assert_eq!(socket_inode(b"socket:[252635]"), Some(252635));
+        assert_eq!(socket_inode(b"socket:[0]"), None);
         assert_eq!(socket_inode(b"socket:[]"), None);
         assert_eq!(socket_inode(b"socket:[99999999999]"), None);
         assert_eq!(socket_inode(b"pipe:[252635]"), None);
@@ -637,6 +693,16 @@ mod tests {
         );
         assert_eq!(
             docker_proxy_host(&cmdline(&["docker-proxy", "-host-port", "1"])),
+            None
+        );
+        assert_eq!(
+            docker_proxy_host(&cmdline(&[
+                "docker-proxy",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "0"
+            ])),
             None
         );
     }

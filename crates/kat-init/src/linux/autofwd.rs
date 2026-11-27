@@ -25,7 +25,7 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -218,8 +218,17 @@ impl AutoForward {
         // that listens has its proxy running.
         self.proxies = (self.read_proxies)();
         self.proxies_read_at = t;
+        // Reconcile `unmatched` against the current loopback set and proxy
+        // table: drop matched/vanished listeners and re-track any still-present
+        // listener that lost its proxy (e.g. a transient /proc miss) without
+        // resetting the first-seen timestamp of already-settled VM services.
         self.unmatched
-            .retain(|l, _| !self.proxies.loopback.contains_key(l));
+            .retain(|l, _| self.loopback.contains(l) && !self.proxies.loopback.contains_key(l));
+        for &l in &self.loopback {
+            if !self.proxies.loopback.contains_key(&l) {
+                self.unmatched.entry(l).or_insert(t);
+            }
+        }
         self.last_root = root.clone();
 
         let mut order: Vec<&Netns> = self.by_path.values().collect();
@@ -462,16 +471,55 @@ fn addresses() -> io::Result<Vec<IpAddr>> {
     Ok(out)
 }
 
-/// The running docker-proxy processes' TCP addresses.
+/// Path of Docker's userland proxy in the guest's read-only system image
+/// (`guest/rootfs/build.sh`).
+const DOCKER_PROXY_EXE: &str = "/usr/bin/docker-proxy";
+
+/// The running root-namespace docker-proxy processes' TCP addresses.
 fn docker_proxies() -> Proxies {
+    docker_proxies_in(Path::new("/proc"), Path::new(DOCKER_PROXY_EXE), 0)
+}
+
+fn is_root_docker_proxy(
+    dir: &Path,
+    self_mnt: &Path,
+    self_net: &Path,
+    expected_exe: &Path,
+    expected_uid: u32,
+) -> bool {
+    fs::metadata(dir).is_ok_and(|m| m.uid() == expected_uid)
+        && fs::read_link(dir.join("ns/mnt")).ok().as_deref() == Some(self_mnt)
+        && fs::read_link(dir.join("ns/net")).ok().as_deref() == Some(self_net)
+        && fs::read_link(dir.join("exe")).ok().as_deref() == Some(expected_exe)
+}
+
+fn docker_proxies_in(proc_root: &Path, expected_exe: &Path, expected_uid: u32) -> Proxies {
     let mut out = Proxies::default();
-    let Ok(procs) = fs::read_dir("/proc") else {
+    let Ok(self_mnt) = fs::read_link(proc_root.join("self/ns/mnt")) else {
+        return out;
+    };
+    let Ok(self_net) = fs::read_link(proc_root.join("self/ns/net")) else {
+        return out;
+    };
+    let Ok(procs) = fs::read_dir(proc_root) else {
         return out;
     };
     for p in procs.flatten() {
+        let name = p.file_name();
+        let bytes = name.as_encoded_bytes();
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
         let dir = p.path();
         let is_proxy = fs::read(dir.join("comm")).is_ok_and(|c| c.trim_ascii() == b"docker-proxy");
         if !is_proxy {
+            continue;
+        }
+        // Only trust the guest's own root-namespace `/usr/bin/docker-proxy`:
+        // containers (including `--network host` and DinD) run in their own
+        // mount namespace and cannot spoof `docker-proxy` to expose VM-internal
+        // loopback services or suppress other containers' auto-forwards.
+        if !is_root_docker_proxy(&dir, &self_mnt, &self_net, expected_exe, expected_uid) {
             continue;
         }
         let Ok(cmdline) = fs::read(dir.join("cmdline")) else {
@@ -480,10 +528,10 @@ fn docker_proxies() -> Proxies {
         let Some((proto, ip, target_port)) = autofwd::docker_proxy_target(&cmdline) else {
             continue;
         };
-        if proto != "tcp" {
+        if proto != "tcp" || autofwd::is_local_or_unspecified(&ip) {
             continue;
         }
-        out.targets.insert((ip, target_port));
+        let mut loopback_entries = Vec::new();
         if let Some((_, addr, port)) = autofwd::docker_proxy_host(&cmdline)
             && addr.is_loopback()
         {
@@ -498,10 +546,17 @@ fn docker_proxies() -> Proxies {
                     .ok()
                     .and_then(|l| autofwd::socket_inode(l.as_os_str().as_encoded_bytes()))
                 {
-                    out.loopback.insert(Listener { addr, port, inode }, target);
+                    loopback_entries.push((Listener { addr, port, inode }, target));
                 }
             }
         }
+        // Re-verify process identity after reading cmdline and fds to close
+        // any PID-reuse or mid-exit race.
+        if !is_root_docker_proxy(&dir, &self_mnt, &self_net, expected_exe, expected_uid) {
+            continue;
+        }
+        out.targets.insert((ip, target_port));
+        out.loopback.extend(loopback_entries);
     }
     out
 }
@@ -768,6 +823,277 @@ mod tests {
             assert!(quiet(&fwd.tick(&BTreeSet::new(), &[published])));
         }
         assert_eq!(scans(), matched);
+    }
+
+    #[test]
+    fn transient_proxy_miss_recovers_without_resetting_settled_services() {
+        let shared = Routes::default();
+        let mut fwd = AutoForward::new(shared.clone(), false, fake_proxies);
+        let vm_svc = lo("127.0.0.1", 6444, 1);
+        let published = lo("127.0.0.1", 18098, 2);
+        let listeners = [vm_svc, published];
+        set_proxies(&[(published, "172.17.0.2:80")]);
+        assert_eq!(fwd.tick(&BTreeSet::new(), &listeners).added, [18098]);
+
+        // Settle the VM service so only `published` can trigger fast rescans.
+        let old_seen = Instant::now() - SETTLING - Duration::from_secs(1);
+        fwd.unmatched.insert(vm_svc, old_seen);
+
+        // An unrelated root change triggers a proxy read that transiently
+        // misses `published` (e.g. a /proc race): `published` is re-tracked
+        // in `unmatched`, while `vm_svc` keeps its settled timestamp.
+        set_proxies(&[]);
+        let c = fwd.tick(&BTreeSet::from([9999]), &listeners);
+        assert_eq!(c.removed, [18098]);
+        assert_eq!(fwd.unmatched.get(&vm_svc), Some(&old_seen));
+        assert!(fwd.unmatched.contains_key(&published));
+
+        // Next tick sees `published` again and restores the forward immediately.
+        set_proxies(&[(published, "172.17.0.2:80")]);
+        let c = fwd.tick(&BTreeSet::from([9999]), &listeners);
+        assert_eq!(c.added, [18098]);
+        assert_eq!(fwd.unmatched.get(&vm_svc), Some(&old_seen));
+        assert!(!fwd.unmatched.contains_key(&published));
+    }
+
+    #[test]
+    fn docker_proxies_requires_root_namespace_and_proxy_binary() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kat-autofwd-proc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("self/ns")).unwrap();
+        symlink("mnt:[100]", dir.join("self/ns/mnt")).unwrap();
+        symlink("net:[200]", dir.join("self/ns/net")).unwrap();
+
+        let make_proc = |name: &str,
+                         comm: &str,
+                         exe: &str,
+                         mnt: &str,
+                         net: &str,
+                         args: &[&str],
+                         fds: &[(&str, &str)]| {
+            let p = dir.join(name);
+            fs::create_dir_all(p.join("ns")).unwrap();
+            fs::create_dir_all(p.join("fd")).unwrap();
+            fs::write(p.join("comm"), format!("{comm}\n")).unwrap();
+            let cmd: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
+            fs::write(p.join("cmdline"), cmd).unwrap();
+            symlink(exe, p.join("exe")).unwrap();
+            symlink(mnt, p.join("ns/mnt")).unwrap();
+            symlink(net, p.join("ns/net")).unwrap();
+            for (fd, target) in fds {
+                symlink(target, p.join("fd").join(fd)).unwrap();
+            }
+        };
+
+        // 101: genuine root-namespace docker-proxy for loopback publish.
+        make_proc(
+            "101",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[100]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "18098",
+                "-container-ip",
+                "172.17.0.2",
+                "-container-port",
+                "80",
+            ],
+            &[("3", "socket:[1001]"), ("4", "/dev/null")],
+        );
+        // 102: genuine wildcard docker-proxy (target recorded, not loopback).
+        make_proc(
+            "102",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[100]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "0.0.0.0",
+                "-host-port",
+                "8080",
+                "-container-ip",
+                "172.17.0.3",
+                "-container-port",
+                "8080",
+            ],
+            &[("3", "socket:[1002]")],
+        );
+        // 103: spoofed comm + argv with a different binary (e.g. --network host).
+        make_proc(
+            "103",
+            "docker-proxy",
+            "/bin/sh",
+            "mnt:[100]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "9999",
+                "-container-ip",
+                "172.17.0.9",
+                "-container-port",
+                "80",
+            ],
+            &[("3", "socket:[1003]")],
+        );
+        // 104: container / DinD docker-proxy in a different mount namespace.
+        make_proc(
+            "104",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[999]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "9998",
+                "-container-ip",
+                "172.17.0.10",
+                "-container-port",
+                "80",
+            ],
+            &[("3", "socket:[1004]")],
+        );
+        // 105: process in a different network namespace.
+        make_proc(
+            "105",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[100]",
+            "net:[999]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "9997",
+                "-container-ip",
+                "172.17.0.11",
+                "-container-port",
+                "80",
+            ],
+            &[("3", "socket:[1005]")],
+        );
+        // 106: loopback container target must be rejected.
+        make_proc(
+            "106",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[100]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "9996",
+                "-container-ip",
+                "127.0.0.1",
+                "-container-port",
+                "6444",
+            ],
+            &[("3", "socket:[1006]")],
+        );
+        // 107: UDP proxy ignored.
+        make_proc(
+            "107",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[100]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "udp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "5353",
+                "-container-ip",
+                "172.17.0.12",
+                "-container-port",
+                "53",
+            ],
+            &[("3", "socket:[1007]")],
+        );
+        // Non-numeric dir ignored.
+        make_proc(
+            "notapid",
+            "docker-proxy",
+            DOCKER_PROXY_EXE,
+            "mnt:[100]",
+            "net:[200]",
+            &[
+                DOCKER_PROXY_EXE,
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "127.0.0.1",
+                "-host-port",
+                "9995",
+                "-container-ip",
+                "172.17.0.13",
+                "-container-port",
+                "80",
+            ],
+            &[("3", "socket:[1008]")],
+        );
+
+        let uid = unsafe { libc::geteuid() };
+        let found = docker_proxies_in(&dir, Path::new(DOCKER_PROXY_EXE), uid);
+        assert_eq!(
+            found.targets,
+            BTreeSet::from([
+                ("172.17.0.2".parse().unwrap(), 80),
+                ("172.17.0.3".parse().unwrap(), 8080),
+            ])
+        );
+        assert_eq!(
+            found.loopback,
+            BTreeMap::from([(
+                lo("127.0.0.1", 18098, 1001),
+                "172.17.0.2:80".parse().unwrap()
+            )])
+        );
+
+        // Wrong expected UID rejects everything.
+        let wrong_uid = docker_proxies_in(&dir, Path::new(DOCKER_PROXY_EXE), uid.wrapping_add(1));
+        assert!(wrong_uid.targets.is_empty());
+        assert!(wrong_uid.loopback.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

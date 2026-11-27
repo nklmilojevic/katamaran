@@ -25,10 +25,11 @@ pub const DOCKER_PORT: u32 = 1025;
 /// on this port: frames of `u32` little-endian length plus records for
 /// `/dev/kat_fsnotify` (see `kat_vmm::fscache`).
 pub const FSCACHE_PORT: u32 = 1031;
-/// Guest vsock port where the agent relays auto-forwarded container ports.
+/// Guest vsock port where the agent relays auto-forwarded container ports and
+/// ports Docker published on the VM's loopback (`-p 127.0.0.1:...`).
 /// The host writes the port as `u16` little endian first; the agent then
-/// connects to whatever container listens on it and copies both ways. The
-/// host side is a Unix socket libkrun listens on.
+/// connects to the container and copies both ways. The host side is a Unix
+/// socket libkrun listens on.
 pub const AUTO_FORWARD_PORT: u32 = 1032;
 /// Guest vsock port of the NFS server that shows guest files on the Mac. The
 /// host side is a Unix socket libkrun listens on for the macOS kernel only.
@@ -95,7 +96,7 @@ pub enum Msg {
         proto: PortProto,
         port: u16,
     },
-    /// Guest → host: drop the auto-forward of `port`.
+    /// Guest → host: drop the vsock forward of `port`.
     AutoForwardRemove {
         proto: PortProto,
         port: u16,
