@@ -50,7 +50,7 @@ pub fn connect_unix_until(path: &Path, deadline: Instant) -> io::Result<UnixStre
         addr.sun_len = addr_len as u8;
     }
 
-    let fd = open_nonblocking_unix_socket()?;
+    let mut fd = open_nonblocking_unix_socket()?;
 
     loop {
         let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
@@ -109,6 +109,10 @@ pub fn connect_unix_until(path: &Path, deadline: Instant) -> io::Result<UnixStre
                         ));
                     };
                     thread::sleep(rem.min(Duration::from_millis(10)));
+                    // A socket whose connect attempt already failed cannot be
+                    // reused portably (BSDs return EALREADY/EINVAL), so retry
+                    // on a fresh socket.
+                    fd = open_nonblocking_unix_socket()?;
                     continue;
                 }
                 if so_err != 0 {

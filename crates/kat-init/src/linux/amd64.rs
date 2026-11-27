@@ -22,6 +22,9 @@ const QEMU: &str = "/usr/bin/qemu-x86_64";
 
 /// Set once [`setup`] has successfully registered an x86-64 binfmt_misc handler.
 static REGISTERED: OnceLock<Emulator> = OnceLock::new();
+/// Emulator requested on the kernel command line, recorded before setup is
+/// attempted so a failed registration is never mistaken for `amd64 = "off"`.
+static REQUESTED: OnceLock<Emulator> = OnceLock::new();
 
 /// An x86-64 ELF executable: class 64-bit, little endian, `e_type` EXEC or
 /// DYN, `e_machine` 0x3e. The mask ignores the OS ABI and padding bytes.
@@ -66,6 +69,7 @@ pub fn setup(cmdline: &str) -> io::Result<()> {
     let Some(emulator) = Emulator::from_cmdline(cmdline) else {
         return Ok(());
     };
+    let _ = REQUESTED.set(emulator);
     let interpreter = match emulator {
         Emulator::Rosetta => {
             sys::mount(
@@ -109,10 +113,28 @@ pub enum EmulationStatus {
 /// `binfmt_misc` handler is currently enabled, distinguishing I/O errors
 /// (`Unknown`) from an actually disabled or unregistered handler (`Disabled`).
 pub fn status() -> EmulationStatus {
-    let Some(emu) = REGISTERED.get() else {
-        return EmulationStatus::Disabled;
-    };
-    binfmt_handler_status(Path::new(BINFMT_MISC), emu.name())
+    status_from(
+        REQUESTED.get().copied(),
+        REGISTERED.get().copied(),
+        Path::new(BINFMT_MISC),
+    )
+}
+
+fn status_from(
+    requested: Option<Emulator>,
+    registered: Option<Emulator>,
+    binfmt_dir: &Path,
+) -> EmulationStatus {
+    match (requested, registered) {
+        (_, Some(emu)) => binfmt_handler_status(binfmt_dir, emu.name()),
+        // Requested but registration failed at boot: not a user choice to turn
+        // emulation off, so callers must not retire mirrors.
+        (Some(req), None) => EmulationStatus::Unknown(format!(
+            "amd64 emulation ({}) was requested but failed to register at boot",
+            req.name()
+        )),
+        (None, None) => EmulationStatus::Disabled,
+    }
 }
 
 fn binfmt_handler_status(binfmt_dir: &Path, name: &str) -> EmulationStatus {
@@ -180,6 +202,12 @@ mod tests {
             Some(Emulator::Qemu)
         );
         assert_eq!(Emulator::from_cmdline("kat.amd64=off"), None);
+        let nowhere = Path::new("/nonexistent-binfmt");
+        assert_eq!(status_from(None, None, nowhere), EmulationStatus::Disabled);
+        assert!(matches!(
+            status_from(Some(Emulator::Rosetta), None, nowhere),
+            EmulationStatus::Unknown(_)
+        ));
     }
 
     #[test]

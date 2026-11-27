@@ -3553,11 +3553,23 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         // Re-read the emulation state on every pass so a retry never acts on
         // a stale "disabled" reading.
         let emulation = current_emulation_mode(&mut failures);
-        let moby = list_ctr_images(reaper, "moby")?;
+        let moby = match list_ctr_images(reaper, "moby") {
+            Ok(m) => m,
+            Err(e) => {
+                failures.push(e);
+                break;
+            }
+        };
         if moby.is_empty() && emulation != EmulationMode::Disabled && only_refs.is_none() {
             break;
         }
-        let k8s = list_ctr_images(reaper, "k8s.io")?;
+        let k8s = match list_ctr_images(reaper, "k8s.io") {
+            Ok(k) => k,
+            Err(e) => {
+                failures.push(e);
+                break;
+            }
+        };
 
         let candidates: Vec<(String, CtrImage)> = match &only_refs {
             Some(filter) => moby
@@ -3740,35 +3752,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             continue;
                         }
                         Ok(oci_rewrite::PrepareRewrite::NotAvailable) => {
-                            if let Some(k) = k8s_img
-                                && k.label(SOURCE_DIGEST_LABEL).is_some()
-                            {
-                                // Guard against concurrent Docker retags: only
-                                // retire the existing k8s.io mirror if `moby`
-                                // still points to `img.digest` AND `k8s.io`
-                                // still points to `k.digest`.
-                                match retire_rewritten_image(
-                                    reaper,
-                                    &name,
-                                    Some(&img.digest),
-                                    &k.digest,
-                                ) {
-                                    Ok(containerd_grpc::RetireOutcome::Deleted) => log(&format!(
-                                        "retired Katamaran amd64 mirror {name} from k8s.io"
-                                    )),
-                                    Ok(containerd_grpc::RetireOutcome::NotFoundOrChanged) => {}
-                                    Ok(containerd_grpc::RetireOutcome::SourceChanged) => {
-                                        log(&format!(
-                                            "skipped retiring {name}: moby source digest changed concurrently; re-listing"
-                                        ));
-                                        retry_refs.insert(name);
-                                    }
-                                    Err(e) => {
-                                        log(&format!("retire amd64 mirror {name}: {e}"));
-                                        failures.push(format!("{name}: {e}"));
-                                    }
-                                }
-                            }
+                            // No complete amd64 variant to rewrite. With
+                            // emulation on, never delete an existing mirror
+                            // for this: keep it and report.
+                            let msg = format!(
+                                "{name}: no complete local linux/amd64 variant to mirror under emulation"
+                            );
+                            log(&msg);
+                            failures.push(msg);
                             continue;
                         }
                         Err(e) => {
@@ -3960,8 +3951,10 @@ fn is_adoptable_source_copy(k8s: &CtrImage, moby: &CtrImage, native_arch: &str) 
 fn unowned_destination_message(name: &str) -> String {
     format!(
         "{name}: not mirroring amd64 image under emulation because Kubernetes already has \
-         an image with this name that katamaran did not create and that has no local \
-         linux/{NATIVE_ARCH} content; katamaran never replaces it. Give the Docker image \
+         an image with this name that katamaran cannot safely replace (it was not \
+         published by this version of katamaran, or it is a multi-platform image that \
+         could still gain local linux/{NATIVE_ARCH} content); katamaran never deletes such \
+         an image. Give the Docker image \
          a different local name (`docker tag {name} <new-name> && docker rmi {name}`) and \
          use that name in the pod spec"
     )
@@ -4101,14 +4094,21 @@ fn plan_sync_action(
             };
             let has_amd64 = oci_rewrite::has_amd64_platform(platforms);
             let is_digest_ref = oci_rewrite::is_digest_reference(name);
+            // Retirement is destructive, so it happens only when emulation is
+            // explicitly off. With emulation on (or unknown), an existing
+            // mirror is kept whenever the source cannot be (re)mirrored.
             if is_digest_ref {
-                return if k8s_is_rewritten && emulation != EmulationMode::Unknown {
-                    SyncAction::RetireRewritten
-                } else {
-                    SyncAction::SkipDigestAmd64
-                };
+                if emulation == EmulationMode::Disabled && k8s_is_rewritten {
+                    return SyncAction::RetireRewritten;
+                }
+                if emulation == EmulationMode::Enabled && has_amd64 {
+                    return SyncAction::SkipDigestAmd64;
+                }
             }
-            if emulation == EmulationMode::Enabled && has_amd64 {
+            if is_digest_ref && k8s_is_rewritten {
+                return SyncAction::Skip;
+            }
+            if emulation == EmulationMode::Enabled && has_amd64 && !is_digest_ref {
                 if let Some(k) = k8s {
                     if k.label(SOURCE_DIGEST_LABEL) == Some(moby.digest.as_str()) {
                         match k.platforms.as_deref() {
@@ -4146,8 +4146,13 @@ fn plan_sync_action(
                 } else {
                     SyncAction::MirrorRewrite
                 }
-            } else if emulation != EmulationMode::Unknown && k8s_is_rewritten {
+            } else if emulation == EmulationMode::Disabled && k8s_is_rewritten {
                 SyncAction::RetireRewritten
+            } else if k8s_is_rewritten {
+                // Emulation on/unknown but the source has no rewritable amd64
+                // variant (or its platforms could not be resolved): keep the
+                // existing mirror rather than deleting a working tag.
+                SyncAction::Skip
             } else if !k8s_is_rewritten && (platforms.is_empty() || platforms == "-") {
                 if k8s.is_some_and(|k| k.digest == moby.digest) {
                     SyncAction::Skip
@@ -5567,8 +5572,9 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             }
         );
 
-        // Digest-pinned amd64-only reference: never rewrite; retire any stale rewritten
-        // copy if one existed; mirror natively when native content is present.
+        // Digest-pinned amd64-only reference: never rewrite; keep an existing
+        // rewritten copy while emulation is on (retire only when explicitly
+        // off); mirror natively when native content is present.
         let digest_ref = "docker.io/library/app@sha256:1111111111111111111111111111111111111111111111111111111111111111";
         assert_eq!(
             plan_sync_action(
@@ -5592,8 +5598,51 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Enabled,
                 "arm64"
             ),
+            SyncAction::SkipDigestAmd64
+        );
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                Some(&k8s_rewritten),
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
             SyncAction::RetireRewritten
         );
+        // amd64 = off: a digest ref is not reported as an emulation skip.
+        assert_eq!(
+            plan_sync_action(
+                digest_ref,
+                &amd64_idx,
+                None,
+                NativeAvailability::Absent,
+                NativeAvailability::Absent,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::Skip
+        );
+        // Emulation on, but the source's platforms are unresolved (`-`) or
+        // have no amd64 variant: never delete the existing working mirror.
+        for platforms in ["-", "linux/s390x"] {
+            let unresolved = ctr_img("sha256:src2", platforms, &[]);
+            assert_eq!(
+                plan_sync_action(
+                    "app:dev",
+                    &unresolved,
+                    Some(&k8s_rewritten),
+                    NativeAvailability::Absent,
+                    NativeAvailability::Absent,
+                    EmulationMode::Enabled,
+                    "arm64"
+                ),
+                SyncAction::Skip,
+                "platforms {platforms}"
+            );
+        }
         assert_eq!(
             plan_sync_action(
                 digest_ref,
