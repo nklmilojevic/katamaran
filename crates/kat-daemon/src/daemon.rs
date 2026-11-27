@@ -1688,6 +1688,7 @@ impl Daemon {
         }
         let mut guest_reset_attempted = false;
         let mut guest_data_deleted = false;
+        let mut persist_res: Option<anyhow::Result<()>> = None;
         let reset_res = (|| -> Result<(), RpcError> {
             if needs_wait_docker {
                 self.wait_for_docker_ready_with_progress(was_stopped, progress)?;
@@ -1715,11 +1716,20 @@ impl Daemon {
                 }
                 progress(m);
             };
+            // Persist `kubernetes = false` immediately when the guest confirms
+            // active cluster data was detached so even a daemon crash during
+            // deferred reclamation or image purge cannot leave auto-start on.
+            let mut on_data_deleted = || {
+                if persist_res.is_none() {
+                    persist_res = Some(self.persist_k8s_enabled(false));
+                }
+            };
             crate::k8s::read_reset_answer(
                 &mut stream,
                 remove_images,
                 &mut guest_reset_attempted,
                 &mut guest_data_deleted,
+                &mut on_data_deleted,
                 &mut on_progress,
             )
             .map_err(|e| failed(format!("{e:#}")))?;
@@ -1744,11 +1754,13 @@ impl Daemon {
             Ok(())
         };
 
-        let persist_res = if guest_data_deleted {
-            self.persist_k8s_enabled(false)
-        } else {
-            Ok(())
-        };
+        let persist_res = persist_res.unwrap_or_else(|| {
+            if guest_data_deleted {
+                self.persist_k8s_enabled(false)
+            } else {
+                Ok(())
+            }
+        });
 
         let mut kubeconfig_err: Option<anyhow::Error> = None;
         if guest_reset_attempted {
@@ -3099,8 +3111,11 @@ mod tests {
                     &kat_proto::k8s::K8sMsg::Progress("removing cluster data".into()),
                 )
                 .unwrap();
-                kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared)
-                    .unwrap();
+                kat_proto::k8s::write(
+                    &mut conn,
+                    &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+                )
+                .unwrap();
                 kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
             }
         });
@@ -3615,7 +3630,11 @@ mod tests {
             let (mut conn, _) = listener3.accept().unwrap();
             let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
             assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
-            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+            )
+            .unwrap();
             kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
         });
 
@@ -3699,26 +3718,50 @@ mod tests {
             g.state = VmState::Running;
             d.k8s.lock().unwrap().state = "running".into();
         }
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let home_check = home.clone();
         let guest = thread::spawn(move || {
-            // 1. Reclamation error after ResetDataCleared.
+            // 1. Reclamation error after plain-reset Progress data-cleared marker.
             let (mut conn, _) = listener.accept().unwrap();
             let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
             assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
-            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+            )
+            .unwrap();
+            // Wait until the daemon has reacted to the checkpoint before sending the
+            // follow-up error — verifying `kubernetes = false` is persisted IMMEDIATELY
+            // while the reset is still in flight.
+            release_rx.recv().unwrap();
+            assert!(
+                !Config::load(&home_check).unwrap().kubernetes,
+                "kubernetes=false must be persisted immediately upon data-cleared marker, before reset finishes"
+            );
             kat_proto::k8s::write(
                 &mut conn,
                 &kat_proto::k8s::K8sMsg::Error("remove .data.removing-1: timed out".into()),
             )
             .unwrap();
 
-            // 2. Lost connection after ResetDataCleared (during deferred reclamation).
+            // 2. Lost connection after plain-reset Progress data-cleared marker.
             let (mut conn, _) = listener.accept().unwrap();
             let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
             assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
-            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::reset_data_cleared(false),
+            )
+            .unwrap();
             drop(conn);
         });
-        let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
+        let err = d
+            .k8s_reset(false, &mut |m| {
+                if m == kat_proto::k8s::RESET_DATA_CLEARED_PROGRESS {
+                    let _ = release_tx.send(());
+                }
+            })
+            .unwrap_err();
         assert!(
             err.message.contains("cluster data was deleted")
                 && err.message.contains("finishing cluster reset failed")

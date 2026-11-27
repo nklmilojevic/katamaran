@@ -2739,7 +2739,9 @@ impl K8s {
                     },
                     |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
                     &mut || {
-                        if let Err(e) = k8s::write(&*conn, &K8sMsg::ResetDataCleared) {
+                        if let Err(e) =
+                            k8s::write(&*conn, &K8sMsg::reset_data_cleared(remove_images))
+                        {
                             ack_err = Some(format!("send reset data-cleared ack: {e}"));
                         }
                     },

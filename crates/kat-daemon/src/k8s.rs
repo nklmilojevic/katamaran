@@ -243,32 +243,47 @@ pub fn read_answer(s: &mut UnixStream, progress: &mut dyn FnMut(&str)) -> anyhow
 /// For `remove_images == true`, requires explicit `ResetAccepted` before
 /// marking `accepted = true` (so an older guest closing the connection after
 /// rejecting the trailing flag byte never triggers host teardown) and tracks
-/// `ResetDataCleared` separately from `Done` / `Error` (so the host can still
-/// disable Kubernetes auto-start if image cleanup fails after cluster data was
-/// erased).
+/// `ResetDataCleared` separately from `Done` / `Error`. For plain resets
+/// (`remove_images == false`), recognizes the reserved
+/// [`k8s::RESET_DATA_CLEARED_PROGRESS`] `Progress` marker (keeping replies
+/// readable by older daemons) and falls back to `Done` for older guests.
+///
+/// Invokes `on_data_deleted` once as soon as `data_deleted` becomes `true` so
+/// the host can durably disable Kubernetes auto-start before deferred
+/// reclamation or image cleanup finishes.
 pub fn read_reset_answer(
     s: &mut UnixStream,
     remove_images: bool,
     accepted: &mut bool,
     data_deleted: &mut bool,
+    on_data_deleted: &mut dyn FnMut(),
     progress: &mut dyn FnMut(&str),
 ) -> anyhow::Result<()> {
+    let mut mark_deleted = |deleted: &mut bool| {
+        if !*deleted {
+            *deleted = true;
+            on_data_deleted();
+        }
+    };
     loop {
         match k8s::read(&mut *s)? {
             Some(K8sMsg::ResetAccepted) if remove_images => {
                 *accepted = true;
                 progress("starting Kubernetes cluster reset");
             }
-            Some(K8sMsg::ResetDataCleared) => {
-                if remove_images && !*accepted {
+            Some(K8sMsg::ResetDataCleared) if remove_images => {
+                if !*accepted {
                     bail!("unexpected ResetDataCleared before ResetAccepted");
                 }
-                *data_deleted = true;
-                progress("cluster data deleted");
+                mark_deleted(data_deleted);
+                progress(k8s::RESET_DATA_CLEARED_PROGRESS);
             }
             Some(K8sMsg::Progress(p)) => {
                 if remove_images && !*accepted {
                     bail!("unexpected Progress before ResetAccepted");
+                }
+                if !remove_images && p == k8s::RESET_DATA_CLEARED_PROGRESS {
+                    mark_deleted(data_deleted);
                 }
                 progress(&p);
             }
@@ -283,7 +298,7 @@ pub fn read_reset_answer(
                         );
                     }
                 } else {
-                    *data_deleted = true;
+                    mark_deleted(data_deleted);
                 }
                 return Ok(());
             }
@@ -2786,5 +2801,94 @@ users:
             "kill_and_reap_bounded took too long: {:?}",
             started2.elapsed()
         );
+    }
+
+    #[test]
+    fn read_reset_answer_handles_plain_progress_marker_and_strict_image_ack() {
+        // 1. Plain reset recognizes the reserved Progress marker immediately and invokes
+        //    on_data_deleted once before Done (even if a duplicate marker arrives).
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(&mut guest, &K8sMsg::Progress("stopping k3s".into())).unwrap();
+            k8s::write(&mut guest, &K8sMsg::reset_data_cleared(false)).unwrap();
+            k8s::write(&mut guest, &K8sMsg::reset_data_cleared(false)).unwrap();
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let mut progress = Vec::new();
+        read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |m| progress.push(m.to_string()),
+        )
+        .unwrap();
+        t.join().unwrap();
+        assert!(deleted);
+        assert_eq!(deleted_calls, 1);
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == k8s::RESET_DATA_CLEARED_PROGRESS),
+            "got: {progress:?}"
+        );
+
+        // 2. Image reset must NOT treat Progress(RESET_DATA_CLEARED_PROGRESS) as ResetDataCleared.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(&mut guest, &K8sMsg::ResetAccepted).unwrap();
+            k8s::write(
+                &mut guest,
+                &K8sMsg::Progress(k8s::RESET_DATA_CLEARED_PROGRESS.into()),
+            )
+            .unwrap();
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = false;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        let err = read_reset_answer(
+            &mut host,
+            true,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        t.join().unwrap();
+        assert!(accepted);
+        assert!(!deleted);
+        assert_eq!(deleted_calls, 0);
+        assert!(
+            err.to_string()
+                .contains("without confirming cluster data deletion"),
+            "{err:#}"
+        );
+
+        // 3. Plain reset against a legacy guest that sends only Done still invokes on_data_deleted.
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let t = thread::spawn(move || {
+            k8s::write(&mut guest, &K8sMsg::Done).unwrap();
+        });
+        let mut accepted = true;
+        let mut deleted = false;
+        let mut deleted_calls = 0usize;
+        read_reset_answer(
+            &mut host,
+            false,
+            &mut accepted,
+            &mut deleted,
+            &mut || deleted_calls += 1,
+            &mut |_| {},
+        )
+        .unwrap();
+        t.join().unwrap();
+        assert!(deleted);
+        assert_eq!(deleted_calls, 1);
     }
 }

@@ -9,7 +9,7 @@
 //! | `Install`              | the `k3s` binary as `Data`..., `DataEnd`                                    | `Progress`…, then `Done` / `Error`                                                                                              |
 //! | `Start`                | optional `extra_args`, `config_yaml`                                        | `Progress`…, then `StatusInfo` / `Error`                                                                                        |
 //! | `Stop`                 | –                                                                           | `Progress`…, then `Done` / `Error`                                                                                              |
-//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` (with `images` = `1`: starts with `ResetAccepted`) |
+//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | plain (`0`): `Progress`… (with reserved [`RESET_DATA_CLEARED_PROGRESS`] on detach), then `Done` / `Error`; image reset (`1`): `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` |
 //! | `Kubeconfig`           | –                                                                           | `KubeconfigData`, or `Error`                                                                                                    |
 //! | `Connect`              | `Data`… (`DataEnd` closes the write side)                                   | `Done` then `Data`…, `DataEnd`; or `Error`                                                                                      |
 //! | `SyncImages`           | –                                                                           | `Done`, or `Error`                                                                                                              |
@@ -27,6 +27,16 @@ pub const CHUNK: usize = 64 << 10;
 /// Capability bit advertised in [`K8sMsg::CapabilitiesInfo`] when the guest
 /// supports non-empty `extra_args` and `config_yaml` payloads on [`K8sMsg::Start`].
 pub const CAP_START_CONFIG: u32 = 1 << 0;
+
+/// Reserved `Progress` text emitted on plain resets (`images == false`) as soon
+/// as active cluster data has been removed or atomically detached, before
+/// deferred disk reclamation completes.
+///
+/// Reusing the existing `Progress` frame kind (`0x810`) keeps plain-reset
+/// replies readable by older daemons (which only recognize kinds `0x801`–`0x810`),
+/// while newer daemons match this exact string on plain resets to record
+/// confirmed deletion and disable Kubernetes auto-start immediately.
+pub const RESET_DATA_CLEARED_PROGRESS: &str = "cluster data deleted";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K8sMsg {
@@ -78,11 +88,13 @@ pub enum K8sMsg {
     /// so the host can distinguish an accepted reset from an older guest closing
     /// the connection after rejecting the flag byte.
     ResetAccepted,
-    /// Emitted by compatible guests as soon as active cluster data has been
-    /// removed or atomically detached, before deferred disk reclamation or
-    /// image cleanup runs, so the host disables Kubernetes auto-start and
-    /// reports a partial outcome even if reclamation, image purge, or the
-    /// guest connection fails afterwards.
+    /// Emitted by compatible guests on `Reset { images: true }` as soon as
+    /// active cluster data has been removed or atomically detached, before
+    /// deferred disk reclamation or image cleanup runs, so the host disables
+    /// Kubernetes auto-start immediately and reports a partial outcome even if
+    /// reclamation, image purge, or the guest connection fails afterwards.
+    /// Plain resets (`images == false`) emit `Progress(RESET_DATA_CLEARED_PROGRESS)`
+    /// at the same checkpoint so older daemons can still decode every reply frame.
     ResetDataCleared,
 }
 
@@ -140,6 +152,20 @@ impl K8sMsg {
                 config_yaml,
             } if !extra_args.is_empty() || config_yaml.is_some()
         )
+    }
+
+    /// Wire frame emitted by the guest at the active-data-cleared checkpoint.
+    ///
+    /// Image resets use the explicit [`K8sMsg::ResetDataCleared`] frame
+    /// (`0x815`), while plain resets emit the reserved
+    /// [`RESET_DATA_CLEARED_PROGRESS`] text inside a legacy [`K8sMsg::Progress`]
+    /// frame (`0x810`) so older daemons decode the entire reply stream cleanly.
+    pub fn reset_data_cleared(remove_images: bool) -> Self {
+        if remove_images {
+            Self::ResetDataCleared
+        } else {
+            Self::Progress(RESET_DATA_CLEARED_PROGRESS.into())
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1216,5 +1242,44 @@ mod tests {
             K8sMsg::decode(kind::RESET, &[1, 0]),
             Err(ProtoError::TrailingBytes(1))
         );
+
+        // Plain-reset reply frames must only use legacy v0.10.0 kinds (<= 0x810)
+        // so an older daemon reading the stream reaches Done without an unknown-kind error.
+        let mut plain_stream = Vec::new();
+        for msg in [
+            K8sMsg::Progress("stopping k3s".into()),
+            K8sMsg::Progress("removing cluster data".into()),
+            K8sMsg::reset_data_cleared(false),
+            K8sMsg::Done,
+        ] {
+            let frame = msg.encode();
+            let k = u16::from_le_bytes([frame[4], frame[5]]);
+            assert!(
+                (kind::STATUS..=kind::PROGRESS).contains(&k),
+                "plain reset emitted non-legacy frame kind {k:#x} for {msg:?}"
+            );
+            plain_stream.extend_from_slice(&frame);
+        }
+        let mut cursor = plain_stream.as_slice();
+        let mut seen_progress = Vec::new();
+        let mut saw_done = false;
+        while let Some(m) = read(&mut cursor).unwrap() {
+            match m {
+                K8sMsg::Progress(p) => seen_progress.push(p),
+                K8sMsg::Done => {
+                    saw_done = true;
+                    break;
+                }
+                other => panic!("unexpected legacy plain-reset frame: {other:?}"),
+            }
+        }
+        assert!(saw_done);
+        assert!(
+            seen_progress
+                .iter()
+                .any(|p| p == RESET_DATA_CLEARED_PROGRESS),
+            "got progress: {seen_progress:?}"
+        );
+        assert_eq!(K8sMsg::reset_data_cleared(true), K8sMsg::ResetDataCleared);
     }
 }
