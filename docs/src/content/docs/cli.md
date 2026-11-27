@@ -252,7 +252,7 @@ kat k8s reset
 
 ### `kat k8s mark-version`
 
-Record an independently verified `k3s` release tag in `/var/lib/katamaran/k3s/data/.katamaran-version` for an existing unmarked cluster datastore whose version cannot be detected automatically from `server/db/state.db`. Requires the VM to be running and Kubernetes to be stopped, validates the release tag, and refuses to overwrite an existing marker (or mark a lower minor than `state.db` already records). If the VM is stopped, disable Kubernetes auto-start (`kat config set kubernetes=off`) if enabled and run `kat start` before marking. See [Migrating an unmarked cluster from an older katamaran release](/kubernetes/#migrating-an-unmarked-cluster-from-an-older-katamaran-release).
+Record an independently verified `k3s` release tag in `/var/lib/katamaran/k3s/data/.katamaran-version` for an existing unmarked cluster datastore that katamaran cannot accept automatically (only a `server/db/state.db` node record showing `v1.37.2+k3s1`, the build every pre-tracking release pinned, is accepted without a marker). Requires the VM to be running and Kubernetes to be stopped, validates the release tag, and refuses to overwrite an existing marker (or mark a lower minor than `state.db` already records). If the VM is stopped, disable Kubernetes auto-start (`kat config set kubernetes=off`) if enabled and run `kat start` before marking. See [Migrating an unmarked cluster from an older katamaran release](/kubernetes/#migrating-an-unmarked-cluster-from-an-older-katamaran-release).
 
 ```sh
 kat k8s mark-version <VERSION>

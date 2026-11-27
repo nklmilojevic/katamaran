@@ -14,7 +14,6 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hash::Hasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
@@ -320,9 +319,38 @@ fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
 /// and `path_resolves_rootfs_nft_for_oldest_supported_k3s`).
 const MIN_K8S_MINOR: u32 = 31;
 const SQLITE3_BIN: &str = "/usr/bin/sqlite3";
+/// Scratch root for WAL/journal inspection copies of `state.db`. `/run` is a
+/// tmpfs, so a copy (which contains cluster secrets) never reaches the
+/// persistent data disk and cannot outlive the VM or survive `kat k8s reset`.
+const STATE_DB_SCRATCH_ROOT: &str = "/run/katamaran";
+/// Upper bound on the bytes copied into `STATE_DB_SCRATCH_ROOT` (database plus
+/// sidecars); larger unmarked datastores fall back to `kat k8s mark-version`.
+const STATE_DB_MAX_SCRATCH_BYTES: u64 = 256 << 20;
 const STATE_DB_MAX_NODE_ROWS: usize = 64;
 const STATE_DB_MAX_BLOB_BYTES: usize = 4 << 20;
-const FICLONE: libc::Ioctl = 0x4004_9409u32 as libc::Ioctl;
+/// Every k3s release a pre-tracking katamaran release (v0.5.0 through v0.10.0)
+/// could run: those releases always ran their pinned build and never wrote
+/// `.katamaran-version`, while every tracking-enabled release writes the
+/// marker before launching k3s. An unmarked datastore that katamaran itself
+/// created can therefore only have been opened by one of these builds, so a
+/// `state.db` node version matching one of them is corroborated by both the
+/// datastore and katamaran's release history. Any other detected version is
+/// only a lower bound (a newer server may have opened the datastore before its
+/// kubelet reported status) and requires an explicit `kat k8s mark-version`.
+const PRE_TRACKING_K3S_VERSIONS: &[&str] = &["v1.37.2+k3s1"];
+
+/// Tools and scratch space used to inspect an unmarked `state.db`.
+struct StateDbProbe<'a> {
+    sqlite3_bin: &'a Path,
+    scratch_root: &'a Path,
+}
+
+fn state_db_probe() -> StateDbProbe<'static> {
+    StateDbProbe {
+        sqlite3_bin: Path::new(SQLITE3_BIN),
+        scratch_root: Path::new(STATE_DB_SCRATCH_ROOT),
+    }
+}
 
 /// Strictly parse a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>`)
 /// with no surrounding whitespace, returning `(major, minor)`.
@@ -459,7 +487,7 @@ fn corrupt_datastore_version_error(data_version_file: &Path, reason: &str) -> St
 fn missing_datastore_version_error(data_dir: &Path, data_version_file: &Path) -> String {
     format!(
         "existing cluster data under {} has no version marker ({}) and its k3s version \
-         could not be determined from server/db/state.db; cannot verify minor-version \
+         could not be verified from server/db/state.db; cannot verify minor-version \
          compatibility. While the VM is running and Kubernetes is stopped, if you have \
          independently verified the k3s release tag that last opened this datastore \
          (for example from a backup or an older katamaran release), run \
@@ -493,8 +521,10 @@ fn encode_sqlite_uri_path(path: &Path) -> String {
     out
 }
 
-fn clone_or_copy_regular_file(src: &Path, dst: &Path) -> io::Result<()> {
-    let mut src_file = OpenOptions::new()
+/// Copy the regular file `src` to a new `dst`, refusing symlinks, non-regular
+/// files, and anything that would push `*budget` below zero.
+fn copy_regular_file_bounded(src: &Path, dst: &Path, budget: &mut u64) -> io::Result<()> {
+    let src_file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(src)?;
@@ -510,11 +540,15 @@ fn clone_or_copy_regular_file(src: &Path, dst: &Path) -> io::Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dst)?;
-    // Use O(1) copy-on-write reflink on btrfs when available; fall back to streaming copy.
-    if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
-        return Ok(());
+    // Read at most one byte past the budget so growth after the size check is caught.
+    let copied = io::copy(&mut src_file.take(budget.saturating_add(1)), &mut dst_file)?;
+    if copied > *budget {
+        return Err(io::Error::other(format!(
+            "{} exceeds the {STATE_DB_MAX_SCRATCH_BYTES}-byte inspection limit",
+            src.display()
+        )));
     }
-    io::copy(&mut src_file, &mut dst_file)?;
+    *budget -= copied;
     Ok(())
 }
 
@@ -769,9 +803,10 @@ fn extract_kubelet_version_from_node_blob(blob: &[u8]) -> Option<String> {
 /// `(major, minor)`.
 fn detect_datastore_version_from_state_db_with(
     data_dir: &Path,
-    sqlite3_bin: &Path,
+    probe: &StateDbProbe<'_>,
     mut run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Option<String> {
+    let sqlite3_bin = probe.sqlite3_bin;
     if !sqlite3_bin.is_file() {
         log(&format!(
             "cannot inspect unmarked state.db: {} is not available",
@@ -822,9 +857,33 @@ fn detect_datastore_version_from_state_db_with(
             format!("file:{}?immutable=1", encode_sqlite_uri_path(&db_path)),
         )
     } else {
-        let parent = data_dir.parent()?;
+        let total = wal_len.unwrap_or(0)
+            + journal_len.unwrap_or(0)
+            + fs::symlink_metadata(&db_path)
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX);
+        if total > STATE_DB_MAX_SCRATCH_BYTES {
+            log(&format!(
+                "skip state.db detection: {total} bytes exceeds the \
+                 {STATE_DB_MAX_SCRATCH_BYTES}-byte inspection limit"
+            ));
+            return None;
+        }
+        if let Err(e) = DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(probe.scratch_root)
+        {
+            log(&format!(
+                "create state.db scratch root {}: {e}",
+                probe.scratch_root.display()
+            ));
+            return None;
+        }
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let scratch_path = parent.join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
+        let scratch_path = probe
+            .scratch_root
+            .join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
         if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
             log(&format!(
                 "create state.db scratch dir {}: {e}",
@@ -834,19 +893,24 @@ fn detect_datastore_version_from_state_db_with(
         }
         let guard = ScratchDir(scratch_path);
         let scratch_db = guard.0.join("state.db");
-        if let Err(e) = clone_or_copy_regular_file(&db_path, &scratch_db) {
+        let mut budget = STATE_DB_MAX_SCRATCH_BYTES;
+        if let Err(e) = copy_regular_file_bounded(&db_path, &scratch_db, &mut budget) {
             log(&format!("copy state.db for inspection: {e}"));
             return None;
         }
         if wal_len.is_some()
-            && let Err(e) = clone_or_copy_regular_file(&wal_path, &guard.0.join("state.db-wal"))
+            && let Err(e) =
+                copy_regular_file_bounded(&wal_path, &guard.0.join("state.db-wal"), &mut budget)
         {
             log(&format!("copy state.db-wal for inspection: {e}"));
             return None;
         }
         if journal_len.is_some()
-            && let Err(e) =
-                clone_or_copy_regular_file(&journal_path, &guard.0.join("state.db-journal"))
+            && let Err(e) = copy_regular_file_bounded(
+                &journal_path,
+                &guard.0.join("state.db-journal"),
+                &mut budget,
+            )
         {
             log(&format!("copy state.db-journal for inspection: {e}"));
             return None;
@@ -957,7 +1021,7 @@ fn mark_datastore_version_at_with(
     data_dir: &Path,
     data_version_file: &Path,
     version: &str,
-    sqlite3_bin: &Path,
+    probe: &StateDbProbe<'_>,
     run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Result<(), String> {
     validate_k3s_release_tag(version)?;
@@ -990,8 +1054,7 @@ fn mark_datastore_version_at_with(
             return Err(format!("stat {}: {e}", data_version_file.display()));
         }
     }
-    if let Some(detected) =
-        detect_datastore_version_from_state_db_with(data_dir, sqlite3_bin, run_cmd)
+    if let Some(detected) = detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd)
         && let (Some(supplied_mm), Some(detected_mm)) = (
             parse_strict_k3s_tag(version),
             parse_strict_k3s_tag(&detected),
@@ -1010,15 +1073,16 @@ fn mark_datastore_version_at_with(
 /// Uses `data_version_file` inside `data_dir` when present, and never falls
 /// back to `VERSION_FILE` (the installed binary's version). When
 /// `data_version_file` is absent (`NotFound`), inspects `server/db/state.db`
-/// read-only for the node's recorded `kubeletVersion` so existing clusters
-/// from older Katamaran releases upgrade seamlessly while still rejecting
-/// unmarked newer backups. Only recommends `kat k8s mark-version` when
-/// `data_version_file` is absent (`NotFound`) and `state.db` cannot determine
-/// the version, never when an empty or non-regular marker already exists.
+/// read-only for the node's recorded `kubeletVersion` and accepts it only when
+/// it is one of `PRE_TRACKING_K3S_VERSIONS`, so clusters created by older
+/// katamaran releases upgrade seamlessly. Any other detected version is only a
+/// lower bound and is rejected. Only recommends `kat k8s mark-version` when
+/// `data_version_file` is absent (`NotFound`), never when an empty or
+/// non-regular marker already exists.
 fn effective_datastore_version_with(
     data_dir: &Path,
     data_version_file: &Path,
-    sqlite3_bin: &Path,
+    probe: &StateDbProbe<'_>,
     run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Result<Option<String>, String> {
     if !datastore_exists(data_dir)? {
@@ -1027,12 +1091,19 @@ fn effective_datastore_version_with(
     match read_marker_file(data_version_file)? {
         MarkerFile::Present(v) => Ok(Some(v)),
         MarkerFile::Missing => {
-            if let Some(detected) =
-                detect_datastore_version_from_state_db_with(data_dir, sqlite3_bin, run_cmd)
-            {
-                return Ok(Some(detected));
+            match detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd) {
+                Some(detected) if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) => {
+                    Ok(Some(detected))
+                }
+                Some(detected) => Err(format!(
+                    "{} The node record in server/db/state.db reports k3s {detected}, \
+                     which no pre-tracking katamaran release ran, so it is only a lower \
+                     bound (a newer k3s server may have opened this datastore before its \
+                     kubelet reported status) and cannot be used to verify compatibility.",
+                    missing_datastore_version_error(data_dir, data_version_file)
+                )),
+                None => Err(missing_datastore_version_error(data_dir, data_version_file)),
             }
-            Err(missing_datastore_version_error(data_dir, data_version_file))
         }
         MarkerFile::Empty => Err(corrupt_datastore_version_error(
             data_version_file,
@@ -1051,11 +1122,11 @@ fn check_datastore_compatible_with(
     data_dir: &Path,
     data_version_file: &Path,
     target_version: &str,
-    sqlite3_bin: &Path,
+    probe: &StateDbProbe<'_>,
     run_cmd: impl FnMut(&mut Command) -> Result<(i32, String), String>,
 ) -> Result<(), String> {
     let Some(existing) =
-        effective_datastore_version_with(data_dir, data_version_file, sqlite3_bin, run_cmd)?
+        effective_datastore_version_with(data_dir, data_version_file, probe, run_cmd)?
     else {
         return Ok(());
     };
@@ -1691,7 +1762,7 @@ impl K8s {
             Path::new(DATA_DIR),
             Path::new(DATA_VERSION_FILE),
             version,
-            Path::new(SQLITE3_BIN),
+            &state_db_probe(),
             |cmd| self.run_sqlite_cmd(cmd),
         )?;
         log(&format!("recorded datastore version {version}"));
@@ -1713,7 +1784,7 @@ impl K8s {
             Path::new(DATA_DIR),
             Path::new(DATA_VERSION_FILE),
             version,
-            Path::new(SQLITE3_BIN),
+            &state_db_probe(),
             |cmd| self.run_sqlite_cmd(cmd),
         )?;
         let _ = k8s::write(
@@ -1797,7 +1868,7 @@ impl K8s {
             Path::new(DATA_DIR),
             Path::new(DATA_VERSION_FILE),
             &installed_version,
-            Path::new(SQLITE3_BIN),
+            &state_db_probe(),
             |cmd| self.run_sqlite_cmd(cmd),
         )?;
         let _ = k8s::write(
@@ -4062,18 +4133,32 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         Ok((code, String::from_utf8_lossy(&out.stdout).into_owned()))
     }
 
+    fn test_scratch_root() -> PathBuf {
+        std::env::temp_dir().join(format!("kat-init-state-db-scratch-{}", std::process::id()))
+    }
+
+    fn with_test_probe<T>(f: impl FnOnce(&StateDbProbe<'_>) -> T) -> T {
+        let scratch_root = test_scratch_root();
+        f(&StateDbProbe {
+            sqlite3_bin: Path::new(SQLITE3_BIN),
+            scratch_root: &scratch_root,
+        })
+    }
+
     fn check_datastore_compatible(
         data_dir: &Path,
         data_version_file: &Path,
         target_version: &str,
     ) -> Result<(), String> {
-        check_datastore_compatible_with(
-            data_dir,
-            data_version_file,
-            target_version,
-            Path::new(SQLITE3_BIN),
-            run_test_cmd,
-        )
+        with_test_probe(|probe| {
+            check_datastore_compatible_with(
+                data_dir,
+                data_version_file,
+                target_version,
+                probe,
+                run_test_cmd,
+            )
+        })
     }
 
     fn mark_datastore_version_at(
@@ -4081,13 +4166,15 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         data_version_file: &Path,
         version: &str,
     ) -> Result<(), String> {
-        mark_datastore_version_at_with(
-            data_dir,
-            data_version_file,
-            version,
-            Path::new(SQLITE3_BIN),
-            run_test_cmd,
-        )
+        with_test_probe(|probe| {
+            mark_datastore_version_at_with(
+                data_dir,
+                data_version_file,
+                version,
+                probe,
+                run_test_cmd,
+            )
+        })
     }
 
     fn push_proto_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -4268,18 +4355,22 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
         assert!(!data_version_file.exists());
 
-        // 2. Unmarked newer (v1.38.0+k3s1) datastore blocks starting pinned v1.37.2+k3s1
-        // and blocks `mark-version` with a lower minor.
+        // 2. A node version that no pre-tracking release ran (v1.38.0+k3s1) is only a
+        // lower bound: it authorizes neither the pinned build nor its own release, and
+        // blocks `mark-version` with a lower minor.
         sqlite_exec(
             &db_path,
             &format!(
                 "INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v38}');"
             ),
         );
-        let err =
-            check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
-        assert!(err.contains("v1.38.0+k3s1"), "{err}");
-        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        for target in ["v1.37.2+k3s1", "v1.38.0+k3s1"] {
+            let err =
+                check_datastore_compatible(&data_dir, &data_version_file, target).unwrap_err();
+            assert!(err.contains("reports k3s v1.38.0+k3s1"), "{err}");
+            assert!(err.contains("lower bound"), "{err}");
+            assert!(err.contains("kat k8s mark-version"), "{err}");
+        }
         let err =
             mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
         assert!(
@@ -4287,8 +4378,9 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "{err}"
         );
 
-        // 3. WAL-mode state.db with uncheckpointed v1.38.0+k3s1 ONLY in state.db-wal:
-        // detection reads the WAL without modifying server/db/ and cleans up its scratch dir.
+        // 3. WAL-mode state.db with the pre-tracking v1.37.2+k3s1 node ONLY in an
+        // uncheckpointed state.db-wal (main file still says v1.32.5+k3s1): detection reads
+        // the WAL from a tmpfs-style scratch copy without modifying server/db/ and cleans up.
         let wal_src = dir.join("wal-src");
         fs::create_dir_all(&wal_src).unwrap();
         let wal_src_db = wal_src.join("state.db");
@@ -4298,10 +4390,10 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 "PRAGMA journal_mode=WAL;
                 CREATE TABLE kine (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, deleted INTEGER, value BLOB);
                 CREATE INDEX kine_name_id_index ON kine (name, id);
-                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v32}');"
             ),
         );
-        // Hold an open read transaction while appending v1.38 so it remains uncheckpointed in -wal.
+        // Hold an open read transaction while appending v1.37 so it remains uncheckpointed in -wal.
         let mut reader = Command::new(SQLITE3_BIN)
             .arg(&wal_src_db)
             .stdin(Stdio::piped())
@@ -4323,7 +4415,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             &wal_src_db,
             &format!(
                 "PRAGMA wal_autocheckpoint=0;
-                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v38}');"
+                INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{v37}');"
             ),
         );
 
@@ -4345,7 +4437,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "state.db-wal must be non-empty"
         );
 
-        // Confirm main state.db alone (immutable=1) still has only v1.37, proving v1.38
+        // Confirm main state.db alone (immutable=1) still has only v1.32, proving v1.37
         // lives strictly in state.db-wal.
         let imm_out = Command::new(SQLITE3_BIN)
             .args([
@@ -4364,18 +4456,20 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&imm_out.stdout).trim(),
-            v37,
-            "v1.38 row must reside solely in uncheckpointed state.db-wal"
+            v32,
+            "v1.37 row must reside solely in uncheckpointed state.db-wal"
         );
 
         let wal_before = snapshot_datastore(&wal_data).unwrap();
-        let err = check_datastore_compatible(&wal_data, &wal_marker, "v1.37.2+k3s1").unwrap_err();
-        assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        check_datastore_compatible(&wal_data, &wal_marker, "v1.37.2+k3s1").unwrap();
         check_datastore_compatible(&wal_data, &wal_marker, "v1.38.0+k3s1").unwrap();
         assert_eq!(snapshot_datastore(&wal_data).unwrap(), wal_before);
         assert!(!wal_db_dir.join("state.db-shm").exists());
+        // No inspection copy is ever placed beside the datastore, and the scratch
+        // copy under the scratch root is removed after inspection.
         let leftover_scratch: Vec<_> = fs::read_dir(&wal_root)
             .unwrap()
+            .chain(fs::read_dir(test_scratch_root()).unwrap())
             .filter_map(|e| e.ok())
             .filter(|e| {
                 e.file_name()
@@ -4385,7 +4479,8 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             .collect();
         assert!(leftover_scratch.is_empty(), "{leftover_scratch:?}");
 
-        // 4. JSON-encoded Node row is also detected accurately.
+        // 4. JSON-encoded Node row is also detected accurately; a non-pre-tracking version
+        // (v1.36.4+k3s1) is a lower bound only, even for its own release.
         let json_data = dir.join("json-case/data");
         let json_marker = json_data.join(".katamaran-version");
         fs::create_dir_all(json_data.join("server/db")).unwrap();
@@ -4399,9 +4494,13 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 INSERT INTO kine (name, deleted, value) VALUES ('/registry/minions/katamaran', 0, X'{json_blob}');"
             ),
         );
-        check_datastore_compatible(&json_data, &json_marker, "v1.36.4+k3s1").unwrap();
-        check_datastore_compatible(&json_data, &json_marker, "v1.37.2+k3s1").unwrap();
-        assert!(check_datastore_compatible(&json_data, &json_marker, "v1.35.0+k3s1").is_err());
+        for target in ["v1.36.4+k3s1", "v1.37.2+k3s1"] {
+            let err = check_datastore_compatible(&json_data, &json_marker, target).unwrap_err();
+            assert!(err.contains("reports k3s v1.36.4+k3s1"), "{err}");
+        }
+        let err = mark_datastore_version_at(&json_data, &json_marker, "v1.35.0+k3s1").unwrap_err();
+        assert!(err.contains("newer k3s v1.36.4+k3s1"), "{err}");
+        assert!(!json_marker.exists());
 
         // 5. Fail-closed cases (conflicting live node minors, malicious VIEW kine,
         // symlinked state.db, missing sqlite3) fall back to missing_datastore_version_error.
@@ -4436,16 +4535,37 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let err = check_datastore_compatible(&sym_data, &sym_marker, "v1.38.0+k3s1").unwrap_err();
         assert!(err.contains("no version marker"), "{err}");
 
+        let scratch_root = test_scratch_root();
         let err = check_datastore_compatible_with(
             &data_dir,
             &data_version_file,
             "v1.38.0+k3s1",
-            Path::new("/nonexistent/sqlite3"),
+            &StateDbProbe {
+                sqlite3_bin: Path::new("/nonexistent/sqlite3"),
+                scratch_root: &scratch_root,
+            },
             run_test_cmd,
         )
         .unwrap_err();
         assert!(err.contains("no version marker"), "{err}");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_copy_refuses_files_over_budget() {
+        let dir = temp_dir("bounded-copy");
+        let src = dir.join("src");
+        fs::write(&src, vec![0u8; 100]).unwrap();
+        let mut budget = 99;
+        assert!(copy_regular_file_bounded(&src, &dir.join("small"), &mut budget).is_err());
+        let mut budget = 150;
+        copy_regular_file_bounded(&src, &dir.join("ok"), &mut budget).unwrap();
+        assert_eq!(budget, 50);
+        assert_eq!(fs::read(dir.join("ok")).unwrap().len(), 100);
+        let link = dir.join("link");
+        symlink(&src, &link).unwrap();
+        assert!(copy_regular_file_bounded(&link, &dir.join("via-link"), &mut 1000).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
