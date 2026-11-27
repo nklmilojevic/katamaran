@@ -301,6 +301,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
     let _lock = lock(&run_dir.join("katamaran.lock"))?;
     // Before any thread is spawned (gvproxy's watcher is one).
     let signals = block_and_watch_signals()?;
+    crate::autofwd::raise_nofile_limit();
     let (tx, rx) = mpsc::channel();
     {
         let tx = tx.clone();
@@ -1014,9 +1015,23 @@ mod tests {
             }
         });
 
-        let free_port = || {
-            let l = TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
+        // Pick distinct high ports without opening throwaway listening sockets
+        // (which a parallel test subprocess could briefly inherit during
+        // macOS's non-atomic `socket()` + `FIOCLEX` window).
+        let mut next_port = 38_000 + ((std::process::id() % 1000) as u16) * 16;
+        let mut free_port = || {
+            loop {
+                let candidate = next_port;
+                next_port += 1;
+                if TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, candidate)),
+                    Duration::from_millis(20),
+                )
+                .is_err()
+                {
+                    return candidate;
+                }
+            }
         };
 
         // Shared budget of 6 listener fds (2 single-address ports total).

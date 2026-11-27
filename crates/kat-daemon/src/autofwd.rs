@@ -144,10 +144,18 @@ impl std::fmt::Debug for RelayBudget {
     }
 }
 
+/// Soft `RLIMIT_NOFILE` floor requested when sizing the process-wide forwarding
+/// budget. macOS `launchd` starts `LaunchAgent` processes with a 256-fd soft
+/// limit and an unlimited hard limit; raising the soft limit to `10240`
+/// (`OPEN_MAX`) gives both default automatic forwarding and custom-alias
+/// published forwarding their full default headroom.
+const TARGET_PROCESS_NOFILE: libc::rlim_t = 10_240;
+
 impl RelayBudget {
-    /// Size a shared budget from this process's soft `RLIMIT_NOFILE`.
+    /// Raise the process's soft `RLIMIT_NOFILE` up to [`TARGET_PROCESS_NOFILE`]
+    /// (bounded by `rlim_max`) and size a shared budget from the resulting limit.
     pub fn from_process_limits() -> Self {
-        let (max_listener_fds, max_relays) = process_fd_budget(current_nofile_limit());
+        let (max_listener_fds, max_relays) = process_fd_budget(raise_nofile_limit());
         Self::with_limits(max_listener_fds, max_relays)
     }
 
@@ -313,6 +321,52 @@ pub fn auto_listener_fd_limit_for_budget(
     uses_published_relays.then(|| budget.max_listener_fds() / 2)
 }
 
+fn target_nofile_for_limits(cur: libc::rlim_t, max: libc::rlim_t) -> Option<libc::rlim_t> {
+    if cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    let cap = if max == libc::RLIM_INFINITY {
+        TARGET_PROCESS_NOFILE
+    } else {
+        TARGET_PROCESS_NOFILE.min(max)
+    };
+    (cur < cap).then_some(cap)
+}
+
+/// Raise this process's soft `RLIMIT_NOFILE` up to [`TARGET_PROCESS_NOFILE`]
+/// (bounded by `rlim_max` and any lower kernel per-process cap) and return the
+/// resulting soft limit (`None` if unlimited or unavailable).
+pub fn raise_nofile_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
+    }
+    if lim.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    if let Some(cap) = target_nofile_for_limits(lim.rlim_cur, lim.rlim_max) {
+        // Try the target first, then step down if the kernel's per-process
+        // file ceiling (`kern.maxfilesperproc`) is lower.
+        let mut want = cap;
+        while want > lim.rlim_cur {
+            let next = libc::rlimit {
+                rlim_cur: want,
+                rlim_max: lim.rlim_max,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
+                lim.rlim_cur = want;
+                break;
+            }
+            want /= 2;
+        }
+    }
+    Some(lim.rlim_cur)
+}
+
+#[cfg(test)]
 fn current_nofile_limit() -> Option<u64> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -1339,6 +1393,89 @@ mod tests {
             auto_listener_fd_limit_for_budget(&bmax, true),
             Some(PROCESS_MAX_LISTENER_FDS / 2)
         );
+
+        // Soft-limit raise calculation: lifts launchd's 256 soft limit to
+        // TARGET_PROCESS_NOFILE, respects lower hard caps, and never lowers.
+        assert_eq!(
+            target_nofile_for_limits(256, libc::RLIM_INFINITY),
+            Some(TARGET_PROCESS_NOFILE)
+        );
+        assert_eq!(target_nofile_for_limits(256, 2048), Some(2048));
+        assert_eq!(target_nofile_for_limits(256, 256), None);
+        assert_eq!(
+            target_nofile_for_limits(TARGET_PROCESS_NOFILE, libc::RLIM_INFINITY),
+            None
+        );
+        assert_eq!(
+            target_nofile_for_limits(TARGET_PROCESS_NOFILE * 4, libc::RLIM_INFINITY),
+            None
+        );
+        assert_eq!(
+            target_nofile_for_limits(libc::RLIM_INFINITY, libc::RLIM_INFINITY),
+            None
+        );
+    }
+
+    #[test]
+    fn raise_nofile_limit_lifts_256_soft_limit_to_full_budget() {
+        const CHILD_ENV: &str = "KATAMARAN_TEST_NOFILE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Isolated single-test child process: simulate macOS launchd's
+            // 256 soft limit and verify `RelayBudget::from_process_limits()`
+            // raises it to the full default forwarding budget.
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+            let hard_allows_target =
+                lim.rlim_max == libc::RLIM_INFINITY || lim.rlim_max >= TARGET_PROCESS_NOFILE;
+            if !hard_allows_target {
+                return;
+            }
+            let low = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: lim.rlim_max,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
+            assert_eq!(current_nofile_limit(), Some(256));
+
+            let budget = RelayBudget::from_process_limits();
+            assert!(
+                current_nofile_limit().is_none_or(|n| n >= TARGET_PROCESS_NOFILE),
+                "expected soft RLIMIT_NOFILE >= {TARGET_PROCESS_NOFILE}, got {:?}",
+                current_nofile_limit()
+            );
+            assert_eq!(budget.max_listener_fds(), PROCESS_MAX_LISTENER_FDS);
+            assert_eq!(budget.max(), PROCESS_MAX_RELAY_CONNS);
+            assert_eq!(
+                auto_conn_limit_for_budget(&budget, false),
+                ConnLimit::Shared(MAX_CONNS)
+            );
+            assert_eq!(
+                published_conn_limit_for_budget(&budget),
+                ConnLimit::PerPort {
+                    per_port: PUBLISHED_MAX_CONNS_PER_PORT,
+                    total: PUBLISHED_MAX_CONNS_TOTAL,
+                }
+            );
+            return;
+        }
+
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "autofwd::tests::raise_nofile_limit_lifts_256_soft_limit_to_full_budget",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "nofile child check failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
@@ -1431,8 +1568,8 @@ mod tests {
         assert_eq!(shared.listener_fds(), 0);
 
         // Privileged low port also succeeds in 3 fds.
-        let low = crate::net::claim_test_low_port();
-        assert!(fwd.add(low).unwrap());
+        let (low, added) = crate::net::try_test_low_port(|p| fwd.add(p));
+        assert!(added);
         assert_eq!(shared.listener_fds(), 3);
         assert_eq!(round_trip(low, "low"), format!("{low}:low"));
         assert!(fwd.remove(low));
@@ -1441,12 +1578,11 @@ mod tests {
         // Direct bind_on_reserved check: when a bind runs out of slots, zero
         // reservations remain leaked.
         let slots = Arc::new(AtomicUsize::new(0));
-        let low2 = crate::net::claim_test_low_port();
-        let (listener, permits) =
-            LoopbackTcpListener::bind_on_reserved(&[Ipv4Addr::LOCALHOST, missing], low2, || {
+        let (_low2, (listener, permits)) = crate::net::try_test_low_port(|p| {
+            LoopbackTcpListener::bind_on_reserved(&[Ipv4Addr::LOCALHOST, missing], p, || {
                 UnitsGuard::try_acquire(&slots, 1, 1)
             })
-            .unwrap();
+        });
         assert_eq!(permits.len(), 1);
         assert_eq!(slots.load(Ordering::Acquire), 1);
         drop(listener);
@@ -2057,11 +2193,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut fwd = AutoForwards::new(&fake_guest(&dir));
-        let port = crate::net::claim_test_low_port();
-        assert!(
-            fwd.add(port)
-                .expect("auto-forward a free privileged port < 1024")
-        );
+        let (port, added) = crate::net::try_test_low_port(|p| fwd.add(p));
+        assert!(added);
         assert_eq!(round_trip(port, "hi"), format!("{port}:hi"));
         assert!(fwd.remove(port));
         fwd.clear();

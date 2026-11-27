@@ -107,6 +107,9 @@ pub fn daemon(args: DaemonArgs) -> anyhow::Result<()> {
     }));
     // Before any thread is spawned.
     let signals = run::block_and_watch_signals()?;
+    // Lift launchd's 256-fd soft limit before opening sockets or spawning
+    // gvproxy / katamaran-vm so forwarding gets its full default budget.
+    crate::autofwd::raise_nofile_limit();
 
     let sock_path = run_dir.join(api::SOCKET_NAME);
     // Holding the lock means any socket left there is stale.

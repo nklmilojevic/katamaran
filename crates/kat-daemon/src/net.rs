@@ -1582,18 +1582,28 @@ fn bind_darwin_lo0(ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
     Ok(TcpListener::from(fd))
 }
 
+/// Hand out distinct privileged ports in `900..=1023` across parallel tests
+/// without opening a throwaway probe socket (which a parallel test subprocess
+/// could inherit during macOS's non-atomic `socket()` + `FIOCLEX` window).
 #[cfg(test)]
-pub(crate) fn claim_test_low_port() -> u16 {
+pub(crate) fn try_test_low_port<T, E: std::fmt::Debug>(
+    mut f: impl FnMut(u16) -> Result<T, E>,
+) -> (u16, T) {
     static NEXT: Mutex<u16> = Mutex::new(1023);
-    let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last_err = None;
     for _ in 0..124 {
-        let port = *next;
-        *next = if port <= 900 { 1023 } else { port - 1 };
-        if LoopbackTcpListener::bind(port).is_ok() {
-            return port;
+        let port = {
+            let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+            let p = *next;
+            *next = if p <= 900 { 1023 } else { p - 1 };
+            p
+        };
+        match f(port) {
+            Ok(v) => return (port, v),
+            Err(e) => last_err = Some(e),
         }
     }
-    panic!("could not find a free privileged port in 900..=1023");
+    panic!("no free privileged port in 900..=1023: {last_err:?}");
 }
 
 #[cfg(test)]
@@ -2331,15 +2341,7 @@ mod tests {
         assert_port_rebindable(port);
 
         // Privileged port (< 1024): exposes unprivileged on macOS via lo0-scoped wildcard.
-        let mut low = None;
-        for _ in 0..16 {
-            let candidate = claim_test_low_port();
-            if api.expose(TCP, candidate).is_ok() {
-                low = Some(candidate);
-                break;
-            }
-        }
-        let low = low.expect("gvproxy should expose a free privileged port < 1024");
+        let (low, ()) = try_test_low_port(|candidate| api.expose(TCP, candidate));
         assert!(
             LoopbackTcpListener::bind(low).is_err(),
             "duplicate bind on exposed low port {low} should fail"
@@ -2421,8 +2423,7 @@ mod tests {
 
     #[test]
     fn loopback_tcp_listener_binds_low_port_and_filters_endpoints() {
-        let port = claim_test_low_port();
-        let listener = LoopbackTcpListener::bind(port).expect("bind a free privileged port < 1024");
+        let (port, listener) = try_test_low_port(LoopbackTcpListener::bind);
         assert_eq!(listener.local_addr().unwrap().port(), port);
         assert!(
             LoopbackTcpListener::bind(port).is_err(),
@@ -2817,10 +2818,6 @@ mod tests {
         probe.local_addr().unwrap().port()
     }
 
-    fn free_low_port() -> u16 {
-        claim_test_low_port()
-    }
-
     /// Confirm `port` can be rebound once closed, polling briefly on
     /// `AddrInUse` in case a parallel test subprocess briefly inherited the fd
     /// during macOS's non-atomic `socket()` + `FIOCLEX` window.
@@ -3060,8 +3057,10 @@ mod tests {
             &[Ipv4Addr::LOCALHOST],
         );
 
-        for port in [free_high_port(), free_low_port()] {
-            api.expose(TCP, port).unwrap();
+        let high = free_high_port();
+        api.expose(TCP, high).unwrap();
+        let (low, ()) = try_test_low_port(|p| api.expose(TCP, p));
+        for port in [high, low] {
             assert_eq!(api.port_addrs(TCP, port), vec![Ipv4Addr::LOCALHOST]);
             assert_eq!(
                 tcp_echo(Ipv4Addr::LOCALHOST, port, &format!("p{port}")),
@@ -3155,8 +3154,7 @@ mod tests {
             budget.clone(),
         );
 
-        for port in [free_high_port(), free_low_port()] {
-            api.expose(TCP, port).unwrap();
+        let check_small = |api: &mut AddressesApi, port: u16| {
             assert_eq!(budget.listener_fds(), 3);
             assert_eq!(api.port_addrs(TCP, port), vec![Ipv4Addr::LOCALHOST]);
             assert_eq!(
@@ -3166,7 +3164,12 @@ mod tests {
             api.unexpose(TCP, port).unwrap();
             assert_eq!(budget.listener_fds(), 0);
             assert_port_rebindable(port);
-        }
+        };
+        let high = free_high_port();
+        api.expose(TCP, high).unwrap();
+        check_small(&mut api, high);
+        let (low, ()) = try_test_low_port(|p| api.expose(TCP, p));
+        check_small(&mut api, low);
         drop(api);
 
         // If a real lo0 alias is configured, verify privileged-port (<1024)
@@ -3175,7 +3178,6 @@ mod tests {
         // CapacityExhausted without leaking a gvproxy Unix socket).
         if let Some(alias) = TestLo0Alias::acquire() {
             let both = [Ipv4Addr::LOCALHOST, alias.addr];
-            let low = free_low_port();
             if unsafe { libc::geteuid() } != 0 {
                 let mut api2 = AddressesApi::with_budget(
                     GvproxyApi {
@@ -3186,7 +3188,7 @@ mod tests {
                     &both,
                     budget.clone(),
                 );
-                api2.expose(TCP, low).unwrap();
+                let (low, ()) = try_test_low_port(|p| api2.expose(TCP, p));
                 assert_eq!(budget.listener_fds(), 3);
                 assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
                 assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
@@ -3196,6 +3198,26 @@ mod tests {
                 assert_port_rebindable(low);
                 drop(api2);
             } else {
+                let budget4 = crate::autofwd::RelayBudget::with_limits(4, 4);
+                let mut api2 = AddressesApi::with_budget(
+                    GvproxyApi {
+                        socket: fake.api_sock.clone(),
+                        guest: GUEST,
+                    },
+                    &dir,
+                    &both,
+                    budget4.clone(),
+                );
+                let (low, ()) = try_test_low_port(|p| api2.expose(TCP, p));
+                assert_eq!(budget4.listener_fds(), 4);
+                assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
+                assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
+                assert_eq!(tcp_echo(alias.addr, low, "al"), "gv:al");
+                api2.unexpose(TCP, low).unwrap();
+                assert_eq!(budget4.listener_fds(), 0);
+                assert_port_rebindable(low);
+                drop(api2);
+
                 let mut api_tight = AddressesApi::with_budget(
                     GvproxyApi {
                         socket: fake.api_sock.clone(),
@@ -3212,26 +3234,6 @@ mod tests {
                 assert!(!crate::autofwd::Upstream::socket(&dir, low).exists());
                 assert_eq!(budget.listener_fds(), 0);
                 drop(api_tight);
-
-                let budget4 = crate::autofwd::RelayBudget::with_limits(4, 4);
-                let mut api2 = AddressesApi::with_budget(
-                    GvproxyApi {
-                        socket: fake.api_sock.clone(),
-                        guest: GUEST,
-                    },
-                    &dir,
-                    &both,
-                    budget4.clone(),
-                );
-                api2.expose(TCP, low).unwrap();
-                assert_eq!(budget4.listener_fds(), 4);
-                assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
-                assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
-                assert_eq!(tcp_echo(alias.addr, low, "al"), "gv:al");
-                api2.unexpose(TCP, low).unwrap();
-                assert_eq!(budget4.listener_fds(), 0);
-                assert_port_rebindable(low);
-                drop(api2);
             }
         }
 
@@ -3630,8 +3632,10 @@ mod tests {
         );
 
         let non_lo = first_non_loopback_v4();
-        for port in [free_high_port(), free_low_port()] {
-            api.expose(TCP, port).unwrap();
+        let high = free_high_port();
+        api.expose(TCP, high).unwrap();
+        let (low, ()) = try_test_low_port(|p| api.expose(TCP, p));
+        for port in [high, low] {
             assert_eq!(api.port_addrs(TCP, port), configured.to_vec());
             assert_eq!(
                 tcp_echo(Ipv4Addr::LOCALHOST, port, &format!("lo-{port}")),
