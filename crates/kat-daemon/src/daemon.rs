@@ -4449,7 +4449,7 @@ mod tests {
             let mut g = d.lock();
             g.generation = 1;
             g.state = VmState::Running;
-            let mut run = Run::new(cfg.clone(), None, cfg.disk_gib);
+            let mut run = Run::new(cfg.clone(), None, u64::from(cfg.disk_gib()) << 30);
             run.docker = DockerState::Ready;
             g.run = Some(run);
             let mut k = d.k8s.lock().unwrap();
@@ -4625,7 +4625,7 @@ mod tests {
             g.run = Some(Run::new(
                 Config::default(),
                 None,
-                crate::config::DEFAULT_DISK_GIB,
+                u64::from(crate::config::DEFAULT_DISK_GIB) << 30,
             ));
         }
 

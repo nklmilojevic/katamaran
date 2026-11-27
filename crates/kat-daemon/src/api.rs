@@ -1202,6 +1202,7 @@ mod tests {
                 disk_target_gib: cfg.disk_gib,
                 path: "/tmp/h/config.toml".into(),
                 restart_required: explicit_target == Some(500),
+                k8s_toggled: false,
             };
             let view_json = serde_json::to_value(&view).unwrap();
             assert!(view_json["config"].get("disk_gib").is_none());

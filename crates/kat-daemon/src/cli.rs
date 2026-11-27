@@ -555,13 +555,8 @@ pub fn config(cmd: ConfigCmd) -> anyhow::Result<()> {
             let k8s_opts_set = ["k8s_disable", "k8s_args", "k8s_version"]
                 .iter()
                 .any(|k| values.contains_key(*k));
-            let (restart, k8s_restart, launch_at_login) = apply_config_set_at(
-                &home,
-                &sock,
-                values,
-                k8s_opts_set,
-                OFFLINE_DISK_LOCK_WAIT,
-            )?;
+            let (restart, k8s_restart, launch_at_login) =
+                apply_config_set_at(&home, &sock, values, k8s_opts_set, OFFLINE_DISK_LOCK_WAIT)?;
             if let Some(enabled) = launch_at_login {
                 crate::setup::set_run_at_load(enabled, None)?;
             }
@@ -979,11 +974,14 @@ mod tests {
 
     #[test]
     fn k8s_restart_hint_respects_actual_kubernetes_transition() {
+        let cfg = crate::config::Config {
+            kubernetes: true,
+            ..crate::config::Config::default()
+        };
         let mut view = ConfigView {
-            config: Config {
-                kubernetes: true,
-                ..Config::default()
-            },
+            config: WireConfig::from(&cfg),
+            disk_gib: None,
+            disk_target_gib: None,
             path: "/tmp/config.toml".into(),
             restart_required: false,
             k8s_toggled: false,

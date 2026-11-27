@@ -3832,7 +3832,9 @@ mod tests {
                 protocol: kat_proto::PROTOCOL_VERSION,
                 kernel: None,
             },
-            config: Config::default(),
+            config: Config::default().into(),
+            disk_gib: None,
+            disk_target_gib: None,
             vm: None,
             usage: None,
             docker: DockerInfo {
