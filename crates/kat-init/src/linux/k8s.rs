@@ -102,6 +102,11 @@ const INTERNAL_PORTS: [u16; 6] = [6443, 6444, 10250, 10256, 10257, 10259];
 static SERVICE: OnceLock<Arc<K8s>> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// Set once VM shutdown gives up waiting for `op_lock` and proceeds without
+/// it. A lock holder still running Kubernetes workload cleanup stops issuing
+/// commands then, so it cannot overlap the Docker stack stop, process sweep,
+/// or data-disk sync. (Ordinary shutdown under the lock still cleans up fully.)
+static SHUTDOWN_BYPASSED_OP_LOCK: AtomicBool = AtomicBool::new(false);
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -310,18 +315,22 @@ pub fn start_service(
 /// Stop k3s cleanly during VM shutdown.
 /// Shutdown fallback when `op_lock` could not be acquired in time.
 ///
-/// Never runs Kubernetes workload cleanup (the lock holder may still be using
-/// it, and the shutdown sweep stops containerd and every remaining process
-/// afterwards). If k3s is still owned by `state.running`, this caller takes
+/// Never runs Kubernetes workload cleanup, and sets `bypassed` so the lock
+/// holder's own cleanup stops issuing commands (the shutdown sweep stops
+/// containerd and every remaining process afterwards). If k3s is still owned by `state.running`, this caller takes
 /// sole ownership and terminates it. If another caller already took it, waits
 /// only until that caller reports k3s has exited (`k3s_terminating` cleared),
 /// not for its workload cleanup, and never past `deadline`. Returns a
 /// description for the shutdown log.
 fn stop_k3s_without_op_lock(
     state: &Mutex<State>,
+    bypassed: &AtomicBool,
     deadline: Instant,
     terminate: impl FnOnce(Running),
 ) -> &'static str {
+    // From here on shutdown proceeds without `op_lock`: make the holder's
+    // workload cleanup stop issuing commands before this returns.
+    bypassed.store(true, Ordering::SeqCst);
     let running = {
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         let r = take_running_for_stop(&mut st);
@@ -2752,7 +2761,12 @@ impl K8s {
                 let _ = self.stop_locked(None);
             }
             Err(e) => {
-                let outcome = stop_k3s_without_op_lock(&self.state, deadline, terminate_running);
+                let outcome = stop_k3s_without_op_lock(
+                    &self.state,
+                    &SHUTDOWN_BYPASSED_OP_LOCK,
+                    deadline,
+                    terminate_running,
+                );
                 log(&format!("shutdown: {e}; {outcome}"));
             }
         }
@@ -3461,8 +3475,12 @@ fn stop_k8s_workloads(reaper: &Reaper) {
 }
 
 fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&str)) {
-    stop_k8s_containers_with_progress(reaper, &|| false, progress);
+    let bypassed = || SHUTDOWN_BYPASSED_OP_LOCK.load(Ordering::SeqCst);
+    stop_k8s_containers_with_progress(reaper, &bypassed, progress);
     for iface in ["cni0", "flannel.1"] {
+        if bypassed() {
+            return;
+        }
         let mut del = Command::new("/sbin/ip");
         del.args(["link", "delete", iface]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
@@ -3477,9 +3495,15 @@ fn stop_k8s_workloads_with_progress(reaper: &Reaper, progress: &mut dyn FnMut(&s
     .find(|p| Path::new(p).is_file())
     .unwrap_or("nft");
     for family in ["ip", "ip6"] {
+        if bypassed() {
+            return;
+        }
         let mut del = Command::new(nft_bin);
         del.args(["delete", "table", family, "kube-proxy"]);
         let _ = run_reaped(reaper, &mut del, Duration::from_secs(5));
+    }
+    if bypassed() {
+        return;
     }
     if let Err(e) = unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR]) {
         log(&format!("cleanup mounts: {e}"));
@@ -10810,6 +10834,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 
     #[test]
     fn shutdown_fallback_waits_only_for_k3s_exit_not_workload_cleanup() {
+        let bypass = AtomicBool::new(false);
         // Another caller owns termination. Once it reports k3s exited, the
         // fallback returns even though that caller's workload cleanup keeps
         // `phase` at "stopping", and it never terminates anything itself.
@@ -10821,10 +10846,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             s2.lock().unwrap().k3s_terminating = false;
         });
         let started = Instant::now();
-        let outcome =
-            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(10), |_| {
-                panic!("must not terminate k3s owned by another stop")
-            });
+        let outcome = stop_k3s_without_op_lock(
+            &state,
+            &bypass,
+            Instant::now() + Duration::from_secs(10),
+            |_| panic!("must not terminate k3s owned by another stop"),
+        );
         finisher.join().unwrap();
         assert_eq!(outcome, "k3s is not running");
         let took = started.elapsed();
@@ -10833,14 +10860,21 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "{took:?}"
         );
         assert_eq!(state.lock().unwrap().phase, "stopping");
+        assert!(
+            bypass.load(Ordering::SeqCst),
+            "fallback must tell the lock holder's workload cleanup to stop"
+        );
 
         // Workload cleanup in flight with k3s already gone: return immediately.
         let state = test_state("stopping", None, false);
         let started = Instant::now();
         assert_eq!(
-            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(10), |_| {
-                panic!("nothing to terminate")
-            }),
+            stop_k3s_without_op_lock(
+                &state,
+                &bypass,
+                Instant::now() + Duration::from_secs(10),
+                |_| { panic!("nothing to terminate") }
+            ),
             "k3s is not running"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -10848,10 +10882,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         // k3s termination still in progress past the budget: give up by the deadline.
         let state = test_state("stopping", None, true);
         let started = Instant::now();
-        let outcome =
-            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_millis(100), |_| {
-                panic!("must not terminate k3s owned by another stop")
-            });
+        let outcome = stop_k3s_without_op_lock(
+            &state,
+            &bypass,
+            Instant::now() + Duration::from_millis(100),
+            |_| panic!("must not terminate k3s owned by another stop"),
+        );
         assert!(
             outcome.contains("leaving it to the shutdown sweep"),
             "{outcome}"
@@ -10870,10 +10906,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         };
         let state = test_state("running", Some(running), false);
         let mut terminated = false;
-        let outcome =
-            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(1), |_| {
-                terminated = true
-            });
+        let outcome = stop_k3s_without_op_lock(
+            &state,
+            &bypass,
+            Instant::now() + Duration::from_secs(1),
+            |_| terminated = true,
+        );
         assert!(terminated);
         assert!(outcome.starts_with("terminated k3s"), "{outcome}");
         let st = state.lock().unwrap();
