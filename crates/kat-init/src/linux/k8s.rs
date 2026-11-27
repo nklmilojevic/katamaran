@@ -14,6 +14,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hash::Hasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
@@ -21,7 +22,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -3473,100 +3474,198 @@ where
     })
 }
 
-fn run_reaped_split_checked(
-    reaper: &Reaper,
-    cmd: &mut Command,
-    timeout: Duration,
-    stdout_limit: usize,
-    abort_on_shutdown: bool,
-    mut on_wait: Option<&mut dyn FnMut()>,
-) -> io::Result<ReapedOutput> {
-    let (out_r, out_w) = pipe()?;
-    let (err_r, err_w) = pipe()?;
-    cmd.env("PATH", PATH)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out_w))
-        .stderr(Stdio::from(err_w));
-    let (target, exited) = reaper.spawn_pidfd(cmd)?;
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+fn set_nonblocking_fd(fd: i32) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
-    let out_t = match thread::Builder::new()
-        .name("k8s-cmd-out".into())
-        .spawn(move || drain_capped_checked(File::from(out_r), stdout_limit))
-    {
-        Ok(h) => h,
-        Err(e) => {
-            reaper.signal_target(&target, libc::SIGKILL);
-            let _ = exited.recv_timeout(Duration::from_secs(2));
-            return Err(e);
-        }
+/// Attempt at most `max_reads` non-blocking reads from `stream`, retaining at
+/// most `limit` bytes in `buf` while discarding excess output so a noisy child
+/// cannot block on a full pipe. Sets `*truncated = true` if any bytes were
+/// dropped or a read error occurred.
+///
+/// Returns `true` when the per-pass read budget is exhausted before hitting
+/// `WouldBlock` or EOF, signaling the caller to re-check child exit, deadlines,
+/// shutdown, and heartbeats before draining again.
+fn drain_nonblocking_checked<R: Read>(
+    stream: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    limit: usize,
+    truncated: &mut bool,
+    max_reads: usize,
+) -> bool {
+    let Some(r) = stream.as_mut() else {
+        return false;
     };
-    let err_t = match thread::Builder::new()
-        .name("k8s-cmd-err".into())
-        .spawn(move || drain_capped(File::from(err_r), 64 << 10))
-    {
-        Ok(h) => h,
-        Err(e) => {
-            reaper.signal_target(&target, libc::SIGKILL);
-            let _ = exited.recv_timeout(Duration::from_secs(2));
-            let _ = out_t.join();
-            return Err(e);
-        }
-    };
-
-    let deadline = Instant::now() + timeout;
-    let mut last_beat = Instant::now();
-    let status = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            reaper.signal_target(&target, libc::SIGKILL);
-            let _ = exited.recv_timeout(Duration::from_secs(2));
-            let _ = out_t.join();
-            let _ = err_t.join();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("{:?} timed out", cmd.get_program()),
-            ));
-        }
-        let step = if abort_on_shutdown {
-            left.min(Duration::from_secs(1))
-        } else if on_wait.is_some() {
-            left.min(PROGRESS_HEARTBEAT_INTERVAL)
-        } else {
-            left
-        };
-        match exited.recv_timeout(step) {
-            Ok(s) => break s,
-            Err(RecvTimeoutError::Timeout) => {
-                if abort_on_shutdown && SHUTTING_DOWN.load(Ordering::SeqCst) {
-                    reaper.signal_target(&target, libc::SIGKILL);
-                    let _ = exited.recv_timeout(Duration::from_secs(2));
-                    let _ = out_t.join();
-                    let _ = err_t.join();
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "aborted: VM is shutting down",
-                    ));
+    let mut chunk = [0u8; 8192];
+    for _ in 0..max_reads {
+        match r.read(&mut chunk) {
+            Ok(0) => {
+                *stream = None;
+                return false;
+            }
+            Ok(n) => {
+                let room = limit.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
                 }
-                if let Some(cb) = on_wait.as_deref_mut()
-                    && Instant::now() < deadline
-                    && last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL
-                {
-                    cb();
-                    last_beat = Instant::now();
+                if n > room {
+                    *truncated = true;
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break -1,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
+            Err(_) => {
+                *truncated = true;
+                *stream = None;
+                return false;
+            }
+        }
+    }
+    true
+}
+
+struct WaitPipesOpts {
+    timeout: Duration,
+    kill_wait: Duration,
+    post_exit_drain: Duration,
+    heartbeat_interval: Duration,
+    stdout_limit: usize,
+    abort_on_shutdown: bool,
+}
+
+fn wait_reaped_pipes(
+    mut stdout: Option<File>,
+    mut stderr: Option<File>,
+    exited: &Receiver<i32>,
+    opts: &WaitPipesOpts,
+    shutting_down: impl Fn() -> bool,
+    mut kill_child: impl FnMut(),
+    mut on_wait: Option<&mut dyn FnMut()>,
+) -> io::Result<ReapedOutput> {
+    const STDERR_LIMIT: usize = 64 << 10;
+    const MAX_READS_PER_PASS: usize = 16;
+
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let mut out_truncated = false;
+    let mut err_truncated = false;
+    let deadline = Instant::now() + opts.timeout;
+    let mut last_beat = Instant::now();
+
+    let status = loop {
+        let more_out = drain_nonblocking_checked(
+            &mut stdout,
+            &mut out_buf,
+            opts.stdout_limit,
+            &mut out_truncated,
+            MAX_READS_PER_PASS,
+        );
+        let more_err = drain_nonblocking_checked(
+            &mut stderr,
+            &mut err_buf,
+            STDERR_LIMIT,
+            &mut err_truncated,
+            MAX_READS_PER_PASS,
+        );
+        match exited.try_recv() {
+            Ok(s) => break s,
+            Err(TryRecvError::Disconnected) => break -1,
+            Err(TryRecvError::Empty) => {}
+        }
+        if opts.abort_on_shutdown && shutting_down() {
+            kill_child();
+            let _ = exited.recv_timeout(opts.kill_wait);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "aborted: VM is shutting down",
+            ));
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            kill_child();
+            let _ = exited.recv_timeout(opts.kill_wait);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
+        }
+        if let Some(cb) = on_wait.as_deref_mut()
+            && last_beat.elapsed() >= opts.heartbeat_interval
+        {
+            cb();
+            last_beat = Instant::now();
+        }
+        if more_out || more_err {
+            continue;
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd: stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let step = left
+            .min(opts.heartbeat_interval)
+            .min(Duration::from_millis(50));
+        if pfds[0].fd >= 0 || pfds[1].fd >= 0 {
+            let step_ms = step.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let _ = unsafe { libc::poll(pfds.as_mut_ptr(), 2, step_ms) };
+        } else {
+            match exited.recv_timeout(step) {
+                Ok(s) => break s,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break -1,
+            }
         }
     };
-    let out = match out_t.join() {
-        Ok(o) => o,
-        Err(_) => CapturedStream {
-            text: String::new(),
-            truncated: true,
-        },
-    };
-    let stderr = err_t.join().unwrap_or_default();
+
+    // Drain any remaining already-buffered bytes written before child exit,
+    // bounded by both the capture cap and `post_exit_drain` so a descendant
+    // holding an inherited pipe open cannot hang the caller.
+    let post_deadline = Instant::now() + opts.post_exit_drain;
+    loop {
+        let drain_out = stdout.is_some() && !out_truncated;
+        let drain_err = stderr.is_some() && !err_truncated;
+        if !drain_out && !drain_err {
+            break;
+        }
+        let more_out = drain_out
+            && drain_nonblocking_checked(
+                &mut stdout,
+                &mut out_buf,
+                opts.stdout_limit,
+                &mut out_truncated,
+                MAX_READS_PER_PASS,
+            );
+        let more_err = drain_err
+            && drain_nonblocking_checked(
+                &mut stderr,
+                &mut err_buf,
+                STDERR_LIMIT,
+                &mut err_truncated,
+                MAX_READS_PER_PASS,
+            );
+        if !more_out && !more_err {
+            break;
+        }
+        if Instant::now() >= post_deadline {
+            if more_out {
+                out_truncated = true;
+            }
+            break;
+        }
+    }
+
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else {
@@ -3574,9 +3673,57 @@ fn run_reaped_split_checked(
     };
     Ok(ReapedOutput {
         code,
-        stdout: out.text,
-        stderr,
-        stdout_truncated: out.truncated,
+        stdout: String::from_utf8_lossy(&out_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+        stdout_truncated: out_truncated,
+    })
+}
+
+fn run_reaped_split_checked(
+    reaper: &Reaper,
+    cmd: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    abort_on_shutdown: bool,
+    on_wait: Option<&mut dyn FnMut()>,
+) -> io::Result<ReapedOutput> {
+    let (out_r, out_w) = pipe()?;
+    let (err_r, err_w) = pipe()?;
+    set_nonblocking_fd(out_r.as_raw_fd())?;
+    set_nonblocking_fd(err_r.as_raw_fd())?;
+    cmd.env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_w))
+        .stderr(Stdio::from(err_w));
+    let (target, exited) = reaper.spawn_pidfd(cmd)?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let opts = WaitPipesOpts {
+        timeout,
+        kill_wait: Duration::from_secs(2),
+        post_exit_drain: Duration::from_millis(500),
+        heartbeat_interval: PROGRESS_HEARTBEAT_INTERVAL,
+        stdout_limit,
+        abort_on_shutdown,
+    };
+    wait_reaped_pipes(
+        Some(File::from(out_r)),
+        Some(File::from(err_r)),
+        &exited,
+        &opts,
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        || reaper.signal_target(&target, libc::SIGKILL),
+        on_wait,
+    )
+    .map_err(|e| {
+        if e.kind() == io::ErrorKind::TimedOut {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{:?} timed out", cmd.get_program()),
+            )
+        } else {
+            e
+        }
     })
 }
 
@@ -9292,6 +9439,172 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     }
 
     #[test]
+    fn wait_reaped_pipes_bounds_timeout_shutdown_and_leaked_pipes() {
+        let mk_pipe = || {
+            let (r, w) = pipe().unwrap();
+            set_nonblocking_fd(r.as_raw_fd()).unwrap();
+            (File::from(r), File::from(w))
+        };
+
+        // 1. Timeout when child ignores SIGKILL (never exits) and both pipe write ends
+        //    stay open: must kill, emit heartbeats, and return TimedOut promptly.
+        let (out_r, _out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (_tx, rx) = mpsc::channel::<i32>();
+        let mut killed = false;
+        let mut beats = 0usize;
+        let opts = WaitPipesOpts {
+            timeout: Duration::from_millis(120),
+            kill_wait: Duration::from_millis(40),
+            post_exit_drain: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_millis(35),
+            stdout_limit: 1024,
+            abort_on_shutdown: false,
+        };
+        let started = Instant::now();
+        let mut on_wait = || beats += 1;
+        let err = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx,
+            &opts,
+            || false,
+            || killed = true,
+            Some(&mut on_wait),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(killed, "timeout must signal child");
+        assert!(beats >= 1, "expected heartbeat before timeout, got {beats}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hung on open pipes after timeout: {:?}",
+            started.elapsed()
+        );
+
+        // 2. Shutdown abort during continuous stdout flood: must still notice shutdown,
+        //    kill the child, and return Interrupted promptly.
+        let (out_r, mut out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (_tx2, rx2) = mpsc::channel::<i32>();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_writer = stop_flag.clone();
+        let writer = thread::spawn(move || {
+            let buf = [b'x'; 4096];
+            for i in 0..500 {
+                if i == 10 {
+                    stop_writer.store(true, Ordering::SeqCst);
+                }
+                if out_w.write_all(&buf).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut killed2 = false;
+        let opts2 = WaitPipesOpts {
+            timeout: Duration::from_secs(5),
+            kill_wait: Duration::from_millis(30),
+            post_exit_drain: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(1),
+            stdout_limit: 8192,
+            abort_on_shutdown: true,
+        };
+        let started2 = Instant::now();
+        let err2 = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx2,
+            &opts2,
+            || stop_flag.load(Ordering::SeqCst),
+            || killed2 = true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::Interrupted);
+        assert!(killed2, "shutdown abort must signal child");
+        assert!(started2.elapsed() < Duration::from_secs(2));
+        let _ = writer.join();
+
+        // 3. Direct child exits cleanly while a quiet descendant holds both pipes open:
+        //    collects buffered output immediately without hanging.
+        let (out_r, mut out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (tx3, rx3) = mpsc::channel::<i32>();
+        out_w.write_all(b"img-1\nimg-2\n").unwrap();
+        tx3.send(0).unwrap();
+        let started3 = Instant::now();
+        let out3 = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx3,
+            &opts,
+            || false,
+            || panic!("should not kill exited child"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out3.code, 0);
+        assert_eq!(out3.stdout, "img-1\nimg-2\n");
+        assert!(!out3.stdout_truncated);
+        assert!(started3.elapsed() < Duration::from_secs(1));
+        drop(out_w);
+
+        // 4. Direct child exits cleanly while a noisy descendant floods stdout past the
+        //    capture limit: post-exit drain stops promptly and flags truncation.
+        let (out_r, mut out_w) = mk_pipe();
+        let (err_r, _err_w) = mk_pipe();
+        let (tx4, rx4) = mpsc::channel::<i32>();
+        out_w.write_all(&[b'y'; 4096]).unwrap();
+        let flooder = thread::spawn(move || {
+            let buf = [b'y'; 4096];
+            while out_w.write_all(&buf).is_ok() {}
+        });
+        tx4.send(0).unwrap();
+        let started4 = Instant::now();
+        let out4 = wait_reaped_pipes(
+            Some(out_r),
+            Some(err_r),
+            &rx4,
+            &opts,
+            || false,
+            || panic!("should not kill exited child"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out4.code, 0);
+        assert!(out4.stdout_truncated);
+        assert_eq!(out4.stdout.len(), opts.stdout_limit);
+        assert!(started4.elapsed() < Duration::from_secs(1));
+        let _ = flooder.join();
+
+        // 5. Exact stdout_limit vs stdout_limit + 1 on normal EOF.
+        for (len, expect_trunc) in [(16usize, false), (17usize, true)] {
+            let (out_r, mut out_w) = mk_pipe();
+            let (err_r, err_w) = mk_pipe();
+            let (tx, rx) = mpsc::channel::<i32>();
+            out_w.write_all(&vec![b'a'; len]).unwrap();
+            drop(out_w);
+            drop(err_w);
+            tx.send(0).unwrap();
+            let o = wait_reaped_pipes(
+                Some(out_r),
+                Some(err_r),
+                &rx,
+                &WaitPipesOpts {
+                    stdout_limit: 16,
+                    ..opts
+                },
+                || false,
+                || {},
+                None,
+            )
+            .unwrap();
+            assert_eq!(o.stdout.len(), len.min(16));
+            assert_eq!(o.stdout_truncated, expect_trunc);
+        }
+    }
+
+    #[test]
     #[ignore = "requires bundled containerd + ctr binaries via KAT_TEST_CONTAINERD_BIN and KAT_TEST_CTR_BIN"]
     fn clear_k8s_images_against_live_containerd() {
         use sha2::{Digest, Sha256};
@@ -9302,26 +9615,40 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             .expect("set KAT_TEST_CTR_BIN to the bundled ctr binary");
 
         struct TempDirGuard(std::path::PathBuf);
+        impl TempDirGuard {
+            fn create(prefix: &str) -> Self {
+                use std::os::unix::ffi::OsStringExt;
+                let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+                let mut bytes = template.into_os_string().into_vec();
+                bytes.push(0);
+                let ptr = unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) };
+                assert!(
+                    !ptr.is_null(),
+                    "mkdtemp failed: {}",
+                    io::Error::last_os_error()
+                );
+                bytes.pop();
+                Self(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                    bytes,
+                )))
+            }
+        }
         impl Drop for TempDirGuard {
             fn drop(&mut self) {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
 
-        let base = std::env::temp_dir().join(format!(
-            "kat-init-live-ctr-{}-{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let tmp_guard = TempDirGuard(base.clone());
+        let tmp_guard = TempDirGuard::create("kat-init-live-ctr");
+        let base = tmp_guard.0.clone();
         let root_dir = base.join("root");
         let state_dir = base.join("state");
         let socket_path = state_dir.join("containerd.sock");
         let config_path = base.join("config.toml");
         let log_path = base.join("containerd.log");
         let image_tar = base.join("fixture.tar");
-        fs::create_dir_all(&root_dir).unwrap();
-        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir(&root_dir).unwrap();
+        fs::create_dir(&state_dir).unwrap();
 
         let toml_str = |p: &Path| serde_json::to_string(&p.display().to_string()).unwrap();
         let config_toml = format!(
