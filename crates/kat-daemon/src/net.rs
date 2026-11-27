@@ -803,7 +803,13 @@ impl<A: ForwardApi> Forwards<A> {
                 Ok(()) => {
                     self.remove_failed.remove(&key);
                     self.cleanup_pending.remove(&key);
-                    None
+                    // Re-report the forward: its failed removal was shown in
+                    // status, and the listener may have been rebound.
+                    Some(Event::Forwarded(
+                        proto,
+                        port,
+                        self.api.port_addrs(proto, port),
+                    ))
                 }
                 Err(ForwardError::Transient(e)) => Some(Event::Transient(proto, port, e)),
                 Err(ForwardError::CapacityExhausted(e)) => {
@@ -898,6 +904,12 @@ impl<A: ForwardApi> Forwards<A> {
 
     fn port_label(&self, proto: PortProto, port: u16) -> String {
         self.api.port_label(proto, port)
+    }
+
+    /// Whether `port` is an active forward (as opposed to a refused port whose
+    /// removal only cleans up gvproxy state).
+    fn is_active(&self, proto: PortProto, port: u16) -> bool {
+        self.active.contains(&(proto, port))
     }
 
     #[cfg(test)]
@@ -1042,6 +1054,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                         capacity_wait.retain(|&k| k != key);
                         let was_waiting = capacity_wait.len() != before;
                         let label = fwd.port_label(proto, port);
+                        let was_active = fwd.is_active(proto, port);
                         match fwd.remove(proto, port) {
                             Some(e @ Event::RemoveFailed(..)) => {
                                 pending.insert(
@@ -1049,7 +1062,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     (PendingOp::Remove, Instant::now() + retry_base, 1),
                                 );
                                 report(&e, &label);
-                                on_event(e);
+                                on_event(removal_failure(e, was_active));
                             }
                             Some(e) => {
                                 report(&e, &label);
@@ -1140,6 +1153,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                         },
                         PendingOp::Remove => {
                             let label = fwd.port_label(proto, port);
+                            let was_active = fwd.is_active(proto, port);
                             match fwd.remove(proto, port) {
                                 Some(e @ Event::RemoveFailed(..)) => {
                                     if attempts < MAX_TRANSIENT_RETRIES {
@@ -1153,7 +1167,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                         );
                                     } else {
                                         report(&e, &label);
-                                        on_event(e);
+                                        on_event(removal_failure(e, was_active));
                                     }
                                 }
                                 Some(e) => {
@@ -1173,6 +1187,17 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
         tx: Some(tx),
         thread: Some(thread),
     })
+}
+
+/// The event to report for a failed remove. Only an active forward may
+/// still be listening on the Mac; for a refused port the guest removed, the
+/// failure only concerns gvproxy cleanup (retried in the background), so its
+/// error is cleared instead.
+fn removal_failure(e: Event, was_active: bool) -> Event {
+    match e {
+        Event::RemoveFailed(proto, port, _) if !was_active => Event::RefusedCleared(proto, port),
+        e => e,
+    }
 }
 
 fn report(e: &Event, addrs: &str) {
@@ -1997,6 +2022,12 @@ mod tests {
             Event::RemoveDone(TCP, 9101, 1)
         );
         tx.send(PortChange::Add(TCP, 9101)).unwrap();
+        // The re-add re-reports the forward, replacing the failed removal in
+        // status, and cancels the pending unexpose retry.
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, 9101, vec![Ipv4Addr::LOCALHOST])
+        );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 1);
         drop(tx);
@@ -3128,10 +3159,12 @@ mod tests {
         fake.fail_next_unexpose_before_remove
             .store(true, Ordering::SeqCst);
         worker.send(PortChange::Remove(TCP, busy2_port, 1)).unwrap();
-        assert!(matches!(
+        // The port never listened on the Mac, so a failed gvproxy cleanup
+        // only clears its refusal in status; the cleanup retries quietly.
+        assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::RemoveFailed(TCP, p, _) if p == busy2_port
-        ));
+            Event::RefusedCleared(TCP, busy2_port)
+        );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveDone(TCP, busy2_port, 1)
