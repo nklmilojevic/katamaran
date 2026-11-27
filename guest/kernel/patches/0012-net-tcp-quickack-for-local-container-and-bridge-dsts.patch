@@ -50,7 +50,10 @@ after the handshake on active and passive opens. Our own send-side state
 batching and timers; where the peer's segments are smaller than this
 estimate (an intermediate hop narrower than both advertised MSS values,
 peer-only MTU probing, SACK blocks, MD5/AO), they may be classified short,
-which only shortens ACK delay below SO_RCVLOWAT. Then
+which only shortens ACK delay below SO_RCVLOWAT. Classification and
+window tracking run only on eligible sockets (classification also only
+for non-uplink segments with kat.quickack enabled); all other sockets pay
+a bit test. Then
 send an immediate ACK if the previous cumulative ACK has not already covered
 unread data (!after(tp->rcv_wup, tp->copied_seq)), and otherwise let
 stock ACK checks run while capping any armed delayed-ACK timer to a
@@ -317,15 +320,21 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
  {
  	struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -236,6 +309,7 @@
+@@ -236,6 +309,13 @@
  	 * sends good full-sized frames.
  	 */
  	len = skb_shinfo(skb)->gso_size ? : skb->len;
-+	icsk->icsk_ack.kat_short_push = kat_is_short_push(sk, skb);
++	/* Only eligible, non-uplink sockets with the policy enabled pay for
++	 * classification; everyone else just clears the bit.
++	 */
++	icsk->icsk_ack.kat_short_push = icsk->icsk_ack.kat_quick_ack &&
++					!skb->kat_from_uplink &&
++					READ_ONCE(kat_quickack_enabled) &&
++					kat_is_short_push(sk, skb);
  	if (len >= icsk->icsk_ack.rcv_mss) {
  		/* Note: divides are still a bit expensive.
  		 * For the moment, only adjust scaling_ratio
-@@ -1017,6 +1091,7 @@
+@@ -1017,6 +1097,7 @@
  		}
  	}
  	icsk->icsk_ack.lrcvtime = now;
@@ -333,14 +342,14 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  	tcp_save_lrcv_flowlabel(sk, skb);
  
  	tcp_data_ecn_check(sk, skb);
-@@ -5926,8 +6001,21 @@
+@@ -5926,7 +6007,20 @@
  static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
 +	int kat_lowat = READ_ONCE(sk->sk_rcvlowat);
 +	bool kat_lowat_pushed;
  	unsigned long rtt, delay;
- 
++
 +	/* Only a short pushed segment (see kat_is_short_push()) can be a
 +	 * sub-MSS write the peer's Nagle is waiting on; full-sized PSH
 +	 * segments keep stock delayed-ACK batching and timers.
@@ -351,11 +360,10 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 +			   (int)(tp->rcv_nxt - tp->copied_seq) < kat_lowat &&
 +			   !tcp_epollin_ready(sk, kat_lowat) &&
 +			   kat_sk_wants_quickack(sk);
-+
+ 
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
- 	     /* ... and right edge of window advances far enough.
-@@ -5940,7 +6028,12 @@
+@@ -5940,7 +6034,12 @@
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
@@ -369,7 +377,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		/* If we are running from __release_sock() in user context,
  		 * Defer the ack until tcp_release_cb().
  		 */
-@@ -5956,6 +6049,22 @@
+@@ -5956,6 +6055,22 @@
  
  	if (!ofo_possible || RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
  		tcp_send_delayed_ack(sk);
@@ -392,7 +400,7 @@ diff -ruN a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
  		return;
  	}
  
-@@ -6543,6 +6652,7 @@
+@@ -6543,6 +6658,7 @@
  	icsk->icsk_ack.lrcvtime = tcp_jiffies32;
  
  	if (skb) {
@@ -432,7 +440,7 @@ diff -ruN a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
  	tcp_dec_quickack_mode(sk);
  	inet_csk_clear_xmit_timer(sk, ICSK_TIME_DACK);
  }
-@@ -1565,13 +1567,19 @@
+@@ -1565,13 +1567,24 @@
  
  	skb_shinfo(skb)->gso_type = sk->sk_gso_type;
  	if (likely(!(tcb->tcp_flags & TCPHDR_SYN))) {
@@ -440,8 +448,13 @@ diff -ruN a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
 +		u16 win = tcp_select_window(sk);
 +
 +		th->window      = htons(win);
-+		tp->kat_max_adv_win = max_t(u32, tp->kat_max_adv_win,
-+					    (u32)win << tp->rx_opt.rcv_wscale);
++		/* Tracked for eligible sockets only. If a route change makes a
++		 * socket eligible later, the lower stale value only makes the
++		 * short-push estimate smaller, i.e. closer to stock behaviour.
++		 */
++		if (inet_csk(sk)->icsk_ack.kat_quick_ack)
++			tp->kat_max_adv_win = max_t(u32, tp->kat_max_adv_win,
++						    (u32)win << tp->rx_opt.rcv_wscale);
  		tcp_ecn_send(sk, skb, th, tcp_header_size);
  	} else {
  		/* RFC1323: The window in SYN & SYN/ACK segments
