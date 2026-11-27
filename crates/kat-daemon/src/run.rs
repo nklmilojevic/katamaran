@@ -505,11 +505,14 @@ fn session(
     }
 
     let auto_limit =
-        crate::autofwd::auto_conn_limit_for_budget(relay_budget.max(), uses_published_relays);
-    let mut auto_forwards = crate::autofwd::AutoForwards::with_limit_and_budget(
+        crate::autofwd::auto_conn_limit_for_budget(relay_budget, uses_published_relays);
+    let auto_listener_fds =
+        crate::autofwd::auto_listener_fd_limit_for_budget(relay_budget, uses_published_relays);
+    let mut auto_forwards = crate::autofwd::AutoForwards::with_limits_and_budget(
         crate::autofwd::Upstream::AutoForward(autofwd_sock.clone()),
         &args.forward_addresses,
         auto_limit,
+        auto_listener_fds,
         relay_budget.clone(),
     );
     let mut mounted = false;

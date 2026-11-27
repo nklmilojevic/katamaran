@@ -34,46 +34,133 @@ pub const PUBLISHED_MAX_CONNS_TOTAL: usize = 512;
 const PROCESS_MAX_RELAY_CONNS: usize = 512;
 /// Each live relay holds two TCP fds (cloned) and two Unix fds (cloned).
 const FDS_PER_RELAY: usize = 4;
+/// Each active forwarded port holds a wakeup pipe (`wake_r`, `wake_w`) in
+/// addition to one TCP listening socket per bound address.
+const WAKEUP_PIPE_FDS: usize = 2;
+/// Minimum descriptors for a single-address forwarded port (1 listener + pipe).
+const MIN_LISTENER_FDS: usize = 1 + WAKEUP_PIPE_FDS;
+/// Upper bound on process-wide listening sockets + wakeup pipes across both
+/// automatic and published forwarders, further clamped by `RLIMIT_NOFILE`.
+const PROCESS_MAX_LISTENER_FDS: usize = 1024;
+/// Upper bound on total daemon descriptors used by forwarding (strictly
+/// partitioned between listeners/wakeup pipes and active relays), further
+/// clamped by `RLIMIT_NOFILE`.
+const PROCESS_MAX_FORWARD_FDS: usize =
+    PROCESS_MAX_LISTENER_FDS + PROCESS_MAX_RELAY_CONNS * FDS_PER_RELAY;
 /// Maximum connections accepted from a single listening socket per poll wake,
 /// so a busy address cannot starve another address bound to the same port.
 const MAX_ACCEPT_BATCH: usize = 16;
 const COPY_BUF_SIZE: usize = 64 << 10;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Daemon-wide relay connection budget derived from `RLIMIT_NOFILE` and shared
-/// across automatic and published forwarders, so combined relay traffic leaves
-/// file descriptors and threads for the daemon's RPC control plane and
-/// listening sockets.
+/// Daemon-wide forwarding descriptor and relay budget derived from
+/// `RLIMIT_NOFILE` and shared across automatic and published forwarders (and
+/// across VM restarts).
+///
+/// Strictly partitions forwarding descriptors into two non-overlapping pools
+/// whose sum stays within the daemon's usable `RLIMIT_NOFILE` headroom:
+/// - `listener_fds` (`<= max_listener_fds`): per-port TCP listening sockets
+///   plus wakeup pipes, preventing many idle ports from exhausting daemon fds.
+/// - `active_relays` (`<= max_relays`, `FDS_PER_RELAY` fds each): active client
+///   relays, preventing traffic bursts from starving either control-plane RPCs
+///   or newly published port bindings.
 #[derive(Clone, Debug)]
 pub struct RelayBudget {
-    active: Arc<AtomicUsize>,
-    max: usize,
+    listener_fds: Arc<AtomicUsize>,
+    max_listener_fds: usize,
+    active_relays: Arc<AtomicUsize>,
+    max_relays: usize,
 }
 
 impl RelayBudget {
-    /// Size a shared relay budget from this process's soft `RLIMIT_NOFILE`.
+    /// Size a shared budget from this process's soft `RLIMIT_NOFILE`.
     pub fn from_process_limits() -> Self {
-        Self::new(process_relay_ceiling(current_nofile_limit()))
+        let (max_listener_fds, max_relays) = process_fd_budget(current_nofile_limit());
+        Self::with_limits(max_listener_fds, max_relays)
     }
 
-    pub fn new(max: usize) -> Self {
+    pub fn with_limits(max_listener_fds: usize, max_relays: usize) -> Self {
         Self {
-            active: Arc::new(AtomicUsize::new(0)),
-            max,
+            listener_fds: Arc::new(AtomicUsize::new(0)),
+            max_listener_fds,
+            active_relays: Arc::new(AtomicUsize::new(0)),
+            max_relays,
         }
     }
 
+    #[cfg(test)]
+    pub fn new(max_relays: usize) -> Self {
+        // Reserve generous listener headroom in relay-count unit tests while
+        // keeping `max_relays` exact.
+        Self::with_limits(64, max_relays)
+    }
+
     pub fn max(&self) -> usize {
-        self.max
+        self.max_relays
+    }
+
+    pub fn max_listener_fds(&self) -> usize {
+        self.max_listener_fds
+    }
+
+    /// Maximum combined descriptors (listeners + wakeup pipes + relays) this
+    /// budget permits across all forwarders.
+    pub fn max_fds(&self) -> usize {
+        self.max_listener_fds
+            .saturating_add(self.max_relays.saturating_mul(FDS_PER_RELAY))
     }
 
     #[cfg(test)]
     pub fn active(&self) -> usize {
-        self.active.load(Ordering::Acquire)
+        self.active_relays.load(Ordering::Acquire)
     }
 
-    fn try_acquire(&self) -> Option<ConnGuard> {
-        ConnGuard::try_acquire(&self.active, self.max)
+    #[cfg(test)]
+    pub fn listener_fds(&self) -> usize {
+        self.listener_fds.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn active_fds(&self) -> usize {
+        self.listener_fds()
+            .saturating_add(self.active().saturating_mul(FDS_PER_RELAY))
+    }
+
+    fn has_listener_headroom(
+        &self,
+        fds: usize,
+        class_counter: &AtomicUsize,
+        class_max: Option<usize>,
+    ) -> bool {
+        let within_class = class_max
+            .is_none_or(|max| class_counter.load(Ordering::Acquire).saturating_add(fds) <= max);
+        within_class
+            && self
+                .listener_fds
+                .load(Ordering::Acquire)
+                .saturating_add(fds)
+                <= self.max_listener_fds
+    }
+
+    fn try_acquire_listener(
+        &self,
+        fds: usize,
+        class_counter: &Arc<AtomicUsize>,
+        class_max: Option<usize>,
+    ) -> Option<ListenerPermit> {
+        let class_listener_fds = match class_max {
+            Some(max) => Some(UnitsGuard::try_acquire(class_counter, fds, max)?),
+            None => None,
+        };
+        let listener_fds = UnitsGuard::try_acquire(&self.listener_fds, fds, self.max_listener_fds)?;
+        Some(ListenerPermit {
+            listener_fds,
+            class_listener_fds,
+        })
+    }
+
+    fn try_acquire_relay(&self) -> Option<UnitsGuard> {
+        UnitsGuard::try_acquire(&self.active_relays, 1, self.max_relays)
     }
 }
 
@@ -90,8 +177,8 @@ pub enum ConnLimit {
 }
 
 /// Default connection policy for published ports given a process relay budget.
-pub fn published_conn_limit_for_budget(budget_max: usize) -> ConnLimit {
-    let total = PUBLISHED_MAX_CONNS_TOTAL.min(budget_max.max(1));
+pub fn published_conn_limit_for_budget(budget: &RelayBudget) -> ConnLimit {
+    let total = PUBLISHED_MAX_CONNS_TOTAL.min(budget.max().max(1));
     let per_port = PUBLISHED_MAX_CONNS_PER_PORT.min((total / 2).max(1));
     ConnLimit::PerPort { per_port, total }
 }
@@ -99,15 +186,25 @@ pub fn published_conn_limit_for_budget(budget_max: usize) -> ConnLimit {
 /// Default connection policy for automatic container forwards given a process
 /// relay budget. When published TCP ports also share daemon relays (i.e. custom
 /// `forward_addresses`), cap automatic forwards to at most half the shared
-/// budget so unpublished containers cannot starve published Docker or
+/// relay ceiling so unpublished containers cannot starve published Docker or
 /// Kubernetes services.
-pub fn auto_conn_limit_for_budget(budget_max: usize, uses_published_relays: bool) -> ConnLimit {
+pub fn auto_conn_limit_for_budget(budget: &RelayBudget, uses_published_relays: bool) -> ConnLimit {
     let cap = if uses_published_relays {
-        MAX_CONNS.min((budget_max / 2).max(1))
+        MAX_CONNS.min((budget.max() / 2).max(1))
     } else {
-        MAX_CONNS.min(budget_max.max(1))
+        MAX_CONNS.min(budget.max().max(1))
     };
     ConnLimit::Shared(cap)
+}
+
+/// Class listener-descriptor ceiling for automatic forwards when published TCP
+/// ports also use daemon listeners (reserves at least half the listener
+/// descriptor budget for published Docker and Kubernetes services).
+pub fn auto_listener_fd_limit_for_budget(
+    budget: &RelayBudget,
+    uses_published_relays: bool,
+) -> Option<usize> {
+    uses_published_relays.then(|| budget.max_listener_fds() / 2)
 }
 
 fn current_nofile_limit() -> Option<u64> {
@@ -125,23 +222,31 @@ fn current_nofile_limit() -> Option<u64> {
     }
 }
 
-fn process_relay_ceiling(nofile: Option<u64>) -> usize {
-    let fd_cap = match nofile {
+fn process_fd_budget(nofile: Option<u64>) -> (usize, usize) {
+    let usable_fds = match nofile {
         Some(n) => {
             let n = usize::try_from(n).unwrap_or(usize::MAX);
             // Leave at least half the soft limit when it is small (e.g.
             // launchd's 256) and at least 512 descriptors when higher so the
-            // daemon RPC socket, listeners, and wakeup pipes stay responsive.
-            let usable = if n < 1024 {
+            // daemon RPC socket, gvproxy, logs, and workers stay responsive.
+            if n < 1024 {
                 n / 2
             } else {
                 n.saturating_sub((n / 2).max(512))
-            };
-            (usable / FDS_PER_RELAY).max(1)
+            }
         }
-        None => PROCESS_MAX_RELAY_CONNS,
+        None => PROCESS_MAX_FORWARD_FDS,
     };
-    PROCESS_MAX_RELAY_CONNS.min(fd_cap)
+    let cap_fds = PROCESS_MAX_FORWARD_FDS.min(usable_fds.max(MIN_LISTENER_FDS + FDS_PER_RELAY));
+    // Allocate 1/3 of forwarding descriptors to listeners + wakeup pipes (up
+    // to 1024 fds) and the remaining 2/3 to live relays (up to 512 relays * 4
+    // fds = 2048 fds), so the two pools never contend or exceed `cap_fds`.
+    let max_listener_fds = PROCESS_MAX_LISTENER_FDS
+        .min((cap_fds / 3).max(MIN_LISTENER_FDS))
+        .min(cap_fds - FDS_PER_RELAY);
+    let max_relays =
+        PROCESS_MAX_RELAY_CONNS.min(((cap_fds - max_listener_fds) / FDS_PER_RELAY).max(1));
+    (max_listener_fds, max_relays)
 }
 
 /// Where a forwarded connection goes.
@@ -178,29 +283,73 @@ struct Forward {
     stop: Arc<AtomicBool>,
     wake_w: OwnedFd,
     thread: JoinHandle<()>,
+    /// Released after `wake_w` closes and `thread.join()` drops `listener` and
+    /// `wake_r`, so descriptor accounting never undercounts open fds.
+    fd_permit: ListenerPermit,
 }
 
-/// RAII guard for an active relayed connection slot.
-struct ConnGuard(Arc<AtomicUsize>);
+/// RAII guard for `count` units against an atomic ceiling.
+struct UnitsGuard {
+    counter: Arc<AtomicUsize>,
+    count: usize,
+}
 
-impl ConnGuard {
-    fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+impl UnitsGuard {
+    fn try_acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
+        if amount == 0 {
+            return Some(UnitsGuard {
+                counter: counter.clone(),
+                count: 0,
+            });
+        }
         let mut cur = counter.load(Ordering::Acquire);
         loop {
-            if cur >= max {
+            let next = cur.checked_add(amount)?;
+            if next > max {
                 return None;
             }
-            match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some(ConnGuard(counter.clone())),
-                Err(next) => cur = next,
+            match counter.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    return Some(UnitsGuard {
+                        counter: counter.clone(),
+                        count: amount,
+                    });
+                }
+                Err(actual) => cur = actual,
             }
+        }
+    }
+
+    fn shrink_to(&mut self, new_count: usize) {
+        if new_count < self.count {
+            let excess = self.count - new_count;
+            self.counter.fetch_sub(excess, Ordering::Release);
+            self.count = new_count;
         }
     }
 }
 
-impl Drop for ConnGuard {
+impl Drop for UnitsGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        if self.count > 0 {
+            self.counter.fetch_sub(self.count, Ordering::Release);
+        }
+    }
+}
+
+/// RAII permit accounting for a forwarded port's TCP listening sockets plus
+/// wakeup pipe descriptors against the shared [`RelayBudget`].
+struct ListenerPermit {
+    listener_fds: UnitsGuard,
+    class_listener_fds: Option<UnitsGuard>,
+}
+
+impl ListenerPermit {
+    fn shrink_to(&mut self, actual_fds: usize) {
+        self.listener_fds.shrink_to(actual_fds);
+        if let Some(g) = &mut self.class_listener_fds {
+            g.shrink_to(actual_fds);
+        }
     }
 }
 
@@ -343,6 +492,8 @@ pub struct AutoForwards {
     active: BTreeMap<u16, Forward>,
     active_conns: Arc<AtomicUsize>,
     conn_limit: ConnLimit,
+    class_listener_fds: Arc<AtomicUsize>,
+    max_class_listener_fds: Option<usize>,
     budget: RelayBudget,
     relays: LiveRelays,
 }
@@ -371,13 +522,17 @@ impl AutoForwards {
         addrs: &[Ipv4Addr],
         budget: RelayBudget,
     ) -> AutoForwards {
-        let limit = match upstream {
+        let (limit, max_class_listener_fds) = match upstream {
             Upstream::AutoForward(_) => {
-                auto_conn_limit_for_budget(budget.max(), addrs != [Ipv4Addr::LOCALHOST])
+                let published_relays = addrs != [Ipv4Addr::LOCALHOST];
+                (
+                    auto_conn_limit_for_budget(&budget, published_relays),
+                    auto_listener_fd_limit_for_budget(&budget, published_relays),
+                )
             }
-            Upstream::PerPort(_) => published_conn_limit_for_budget(budget.max()),
+            Upstream::PerPort(_) => (published_conn_limit_for_budget(&budget), None),
         };
-        Self::with_limit_and_budget(upstream, addrs, limit, budget)
+        Self::with_limits_and_budget(upstream, addrs, limit, max_class_listener_fds, budget)
     }
 
     /// Forwards from `addrs` to `upstream` with an explicit connection policy
@@ -388,20 +543,22 @@ impl AutoForwards {
         addrs: &[Ipv4Addr],
         conn_limit: ConnLimit,
     ) -> AutoForwards {
-        Self::with_limit_and_budget(
+        Self::with_limits_and_budget(
             upstream,
             addrs,
             conn_limit,
+            None,
             RelayBudget::from_process_limits(),
         )
     }
 
-    /// Forwards from `addrs` to `upstream` with an explicit subordinate policy
-    /// and shared process budget.
-    pub fn with_limit_and_budget(
+    /// Forwards from `addrs` to `upstream` with an explicit subordinate policy,
+    /// optional class listener-FD ceiling, and shared process budget.
+    pub fn with_limits_and_budget(
         upstream: Upstream,
         addrs: &[Ipv4Addr],
         conn_limit: ConnLimit,
+        max_class_listener_fds: Option<usize>,
         budget: RelayBudget,
     ) -> AutoForwards {
         AutoForwards {
@@ -410,9 +567,21 @@ impl AutoForwards {
             active: BTreeMap::new(),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_limit,
+            class_listener_fds: Arc::new(AtomicUsize::new(0)),
+            max_class_listener_fds,
             budget,
             relays: LiveRelays::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_limit_and_budget(
+        upstream: Upstream,
+        addrs: &[Ipv4Addr],
+        conn_limit: ConnLimit,
+        budget: RelayBudget,
+    ) -> AutoForwards {
+        Self::with_limits_and_budget(upstream, addrs, conn_limit, None, budget)
     }
 
     pub fn addrs(&self) -> &[Ipv4Addr] {
@@ -445,14 +614,58 @@ impl AutoForwards {
         self.active.keys().copied().collect()
     }
 
+    fn worst_case_port_fds(&self) -> usize {
+        let mut unique = self.addrs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        unique.len().max(1) + WAKEUP_PIPE_FDS
+    }
+
+    fn listener_limit_error(&self) -> io::Error {
+        io::Error::other(format!(
+            "forward descriptor limit reached ({} listener / {} total fds)",
+            self.budget.max_listener_fds(),
+            self.budget.max_fds()
+        ))
+    }
+
+    /// Best-effort check for whether adding a new port fits the listener
+    /// descriptor budget (used to fail fast before asking gvproxy to expose an
+    /// upstream Unix socket; [`Self::add`] still acquires the permit atomically).
+    pub fn check_listener_capacity(&self) -> io::Result<()> {
+        if self.budget.has_listener_headroom(
+            self.worst_case_port_fds(),
+            &self.class_listener_fds,
+            self.max_class_listener_fds,
+        ) {
+            Ok(())
+        } else {
+            Err(self.listener_limit_error())
+        }
+    }
+
     /// Listen on `port` of each forward address. Fails if the Mac already
-    /// uses it; the guest reports the port again only after it stops and
-    /// starts again.
+    /// uses it or the daemon's forwarding descriptor budget is exhausted; the
+    /// guest reports the port again only after it stops and starts again.
     pub fn add(&mut self, port: u16) -> io::Result<bool> {
         if self.active.contains_key(&port) {
             return Ok(false);
         }
+        // Reserve worst-case descriptors (one listening socket per distinct
+        // configured address plus the two wakeup-pipe fds) before opening any
+        // sockets or pipes, then shrink to the actual bound count.
+        let reserved_fds = self.worst_case_port_fds();
+        let mut fd_permit = self
+            .budget
+            .try_acquire_listener(
+                reserved_fds,
+                &self.class_listener_fds,
+                self.max_class_listener_fds,
+            )
+            .ok_or_else(|| self.listener_limit_error())?;
         let listener = LoopbackTcpListener::bind_on(&self.addrs, port)?;
+        let actual_fds = listener.raw_fds().len() + WAKEUP_PIPE_FDS;
+        fd_permit.shrink_to(actual_fds);
         let bound = listener.addrs().to_vec();
         listener.set_nonblocking(true)?;
         let (wake_r, wake_w) = wakeup_pipe()?;
@@ -486,6 +699,7 @@ impl AutoForwards {
                 stop,
                 wake_w,
                 thread,
+                fd_permit,
             },
         );
         Ok(true)
@@ -503,6 +717,9 @@ impl AutoForwards {
         unsafe { libc::write(f.wake_w.as_raw_fd(), b.as_ptr().cast(), 1) };
         drop(f.wake_w);
         let _ = f.thread.join();
+        // Only return descriptor accounting after `wake_w`, `wake_r`, and all
+        // listening sockets owned by `f.thread` have actually closed.
+        drop(f.fd_permit);
         true
     }
 
@@ -525,27 +742,27 @@ impl Drop for AutoForwards {
 /// class slot, and (for per-port policies) the port's own isolation slot.
 /// Dropping on spawn error or relay exit releases every acquired guard.
 struct RelayPermit {
-    _process: ConnGuard,
-    _class: ConnGuard,
-    _port: Option<ConnGuard>,
+    _process_relays: UnitsGuard,
+    _class: UnitsGuard,
+    _port: Option<UnitsGuard>,
 }
 
 impl RelayPermit {
     fn try_acquire(ctx: &AcceptCtx) -> Result<Self, (&'static str, usize)> {
         let port = match (&ctx.port_conns, ctx.max_port_conns) {
             (Some(counter), Some(max)) => {
-                Some(ConnGuard::try_acquire(counter, max).ok_or(("per-port", max))?)
+                Some(UnitsGuard::try_acquire(counter, 1, max).ok_or(("per-port", max))?)
             }
             _ => None,
         };
-        let class = ConnGuard::try_acquire(&ctx.class_conns, ctx.max_class_conns)
+        let class = UnitsGuard::try_acquire(&ctx.class_conns, 1, ctx.max_class_conns)
             .ok_or(("class", ctx.max_class_conns))?;
-        let process = ctx
+        let process_relays = ctx
             .process_budget
-            .try_acquire()
+            .try_acquire_relay()
             .ok_or(("shared", ctx.process_budget.max()))?;
         Ok(RelayPermit {
-            _process: process,
+            _process_relays: process_relays,
             _class: class,
             _port: port,
         })
@@ -936,50 +1153,210 @@ mod tests {
 
     #[test]
     fn published_conn_limit_scales_with_nofile_headroom() {
-        assert_eq!(process_relay_ceiling(Some(256)), 32);
+        // Every nofile tier strictly partitions forwarding descriptors into
+        // non-overlapping listener + relay pools inside usable headroom.
+        assert_eq!(process_fd_budget(Some(256)), (42, 21));
+        let b256 = RelayBudget::with_limits(42, 21);
+        assert!(b256.max_fds() <= 128);
         assert_eq!(
-            published_conn_limit_for_budget(32),
+            published_conn_limit_for_budget(&b256),
             ConnLimit::PerPort {
-                per_port: 16,
-                total: 32
+                per_port: 10,
+                total: 21
             }
         );
-        assert_eq!(process_relay_ceiling(Some(1024)), 128);
+
+        assert_eq!(process_fd_budget(Some(1024)), (170, 85));
+        let b1024 = RelayBudget::with_limits(170, 85);
+        assert!(b1024.max_fds() <= 512);
         assert_eq!(
-            published_conn_limit_for_budget(128),
+            published_conn_limit_for_budget(&b1024),
             ConnLimit::PerPort {
-                per_port: 64,
-                total: 128
+                per_port: 42,
+                total: 85
             }
         );
-        assert_eq!(process_relay_ceiling(Some(2560)), 320);
+
+        assert_eq!(process_fd_budget(Some(2560)), (426, 213));
+        let b2560 = RelayBudget::with_limits(426, 213);
+        assert!(b2560.max_fds() <= 1280);
         assert_eq!(
-            published_conn_limit_for_budget(320),
+            published_conn_limit_for_budget(&b2560),
             ConnLimit::PerPort {
-                per_port: 128,
-                total: 320
+                per_port: 106,
+                total: 213
             }
         );
-        assert_eq!(process_relay_ceiling(Some(10240)), PROCESS_MAX_RELAY_CONNS);
+
         assert_eq!(
-            published_conn_limit_for_budget(PROCESS_MAX_RELAY_CONNS),
+            process_fd_budget(Some(10240)),
+            (PROCESS_MAX_LISTENER_FDS, PROCESS_MAX_RELAY_CONNS)
+        );
+        let bmax = RelayBudget::with_limits(PROCESS_MAX_LISTENER_FDS, PROCESS_MAX_RELAY_CONNS);
+        assert_eq!(
+            published_conn_limit_for_budget(&bmax),
             ConnLimit::PerPort {
                 per_port: PUBLISHED_MAX_CONNS_PER_PORT,
                 total: PUBLISHED_MAX_CONNS_TOTAL
             }
         );
-        assert_eq!(process_relay_ceiling(None), PROCESS_MAX_RELAY_CONNS);
-
-        // Automatic forwards reserve half the shared budget when published TCP
-        // also uses daemon relays, and can use the full budget (up to MAX_CONNS)
-        // when published ports go straight through gvproxy.
-        assert_eq!(auto_conn_limit_for_budget(32, true), ConnLimit::Shared(16));
-        assert_eq!(auto_conn_limit_for_budget(32, false), ConnLimit::Shared(32));
-        assert_eq!(auto_conn_limit_for_budget(128, true), ConnLimit::Shared(64));
         assert_eq!(
-            auto_conn_limit_for_budget(512, true),
+            process_fd_budget(None),
+            (PROCESS_MAX_LISTENER_FDS, PROCESS_MAX_RELAY_CONNS)
+        );
+
+        // Automatic forwards reserve half of both the shared relay ceiling and
+        // the listener descriptor ceiling when published TCP also uses daemon
+        // relays, and can use the full budget when published ports go straight
+        // through gvproxy.
+        assert_eq!(
+            auto_conn_limit_for_budget(&b256, true),
+            ConnLimit::Shared(10)
+        );
+        assert_eq!(
+            auto_conn_limit_for_budget(&b256, false),
+            ConnLimit::Shared(21)
+        );
+        assert_eq!(auto_listener_fd_limit_for_budget(&b256, true), Some(21));
+        assert_eq!(auto_listener_fd_limit_for_budget(&b256, false), None);
+
+        assert_eq!(
+            auto_conn_limit_for_budget(&b1024, true),
+            ConnLimit::Shared(42)
+        );
+        assert_eq!(
+            auto_conn_limit_for_budget(&bmax, true),
             ConnLimit::Shared(MAX_CONNS)
         );
+        assert_eq!(
+            auto_listener_fd_limit_for_budget(&bmax, true),
+            Some(PROCESS_MAX_LISTENER_FDS / 2)
+        );
+    }
+
+    #[test]
+    fn listener_descriptors_are_capped_and_reclaimed_without_active_clients() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-lcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 6 listener fds = 2 single-address ports (1 listener + 2 wakeup pipe
+        // fds each), plus a disjoint pool of 4 relays.
+        let shared = RelayBudget::with_limits(6, 4);
+        let mut fwd = AutoForwards::with_limits_and_budget(
+            Upstream::AutoForward(fake_guest(&dir)),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::Shared(4),
+            None,
+            shared.clone(),
+        );
+
+        let p1 = add_free_port(&mut fwd);
+        assert_eq!(shared.listener_fds(), 3);
+        assert_eq!(shared.active_fds(), 3);
+
+        let p2 = add_free_port(&mut fwd);
+        assert_eq!(shared.listener_fds(), 6);
+        assert_eq!(shared.active_fds(), 6);
+
+        // Even with zero active clients, a 3rd idle port is rejected before
+        // opening any sockets or wakeup pipes.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p3 = probe.local_addr().unwrap().port();
+        drop(probe);
+        let err = fwd.add(p3).unwrap_err();
+        assert!(
+            err.to_string().contains("forward descriptor limit reached"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(shared.listener_fds(), 6);
+        assert!(!fwd.contains(p3));
+
+        // Live relays still work at 100% listener saturation thanks to the
+        // disjoint relay descriptor pool.
+        assert_eq!(round_trip(p1, "still-works"), format!("{p1}:still-works"));
+
+        // Removing a port reclaims its 3 descriptors once its listener + pipe
+        // have closed, allowing a new port to bind.
+        assert!(fwd.remove(p1));
+        assert_eq!(shared.listener_fds(), 3);
+        assert!(fwd.add(p3).unwrap());
+        assert_eq!(shared.listener_fds(), 6);
+        assert_eq!(round_trip(p3, "reclaimed"), format!("{p3}:reclaimed"));
+
+        drop(fwd);
+        assert_eq!(shared.listener_fds(), 0);
+        assert_eq!(shared.active(), 0);
+        assert_eq!(shared.active_fds(), 0);
+        let _ = p2;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn automatic_listeners_reserve_descriptor_budget_for_published_ports() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-lreserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 12 shared listener fds (4 single-address ports total): automatic
+        // forwards are capped at 6 fds (2 ports), reserving 6 fds (2 ports) for
+        // published Docker/Kubernetes services.
+        let shared = RelayBudget::with_limits(12, 4);
+        let guest_sock = fake_guest(&dir);
+        let mut auto = AutoForwards::with_limits_and_budget(
+            Upstream::AutoForward(guest_sock),
+            &[Ipv4Addr::LOCALHOST],
+            auto_conn_limit_for_budget(&shared, true),
+            auto_listener_fd_limit_for_budget(&shared, true),
+            shared.clone(),
+        );
+        let mut published = AutoForwards::with_limits_and_budget(
+            Upstream::PerPort(dir.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            published_conn_limit_for_budget(&shared),
+            None,
+            shared.clone(),
+        );
+
+        let _a1 = add_free_port(&mut auto);
+        let _a2 = add_free_port(&mut auto);
+        assert_eq!(shared.listener_fds(), 6);
+
+        // 3rd automatic port hits its class ceiling (6/6), leaving half free.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a3 = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert!(auto.add(a3).is_err());
+        assert_eq!(shared.listener_fds(), 6);
+
+        // Published services still bind 2 ports using their reserved half.
+        let p1 = add_free_port(&mut published);
+        let _p2 = add_free_port(&mut published);
+        assert_eq!(shared.listener_fds(), 12);
+
+        // Published port relays normally while listener budget is 12/12 full.
+        let pub_listener = UnixListener::bind(Upstream::socket(&dir, p1)).unwrap();
+        let pub_server = thread::spawn(move || {
+            let (mut c, _) = pub_listener.accept().unwrap();
+            c.write_all(b"gv:").unwrap();
+            let mut rest = c.try_clone().unwrap();
+            let _ = copy(&mut rest, &mut c);
+            let _ = c.shutdown(Shutdown::Write);
+        });
+        assert_eq!(round_trip(p1, "ok"), "gv:ok");
+        pub_server.join().unwrap();
+
+        // 3rd published port hits the shared listener ceiling (12/12).
+        let probe2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p3 = probe2.local_addr().unwrap().port();
+        drop(probe2);
+        assert!(published.add(p3).is_err());
+
+        drop(auto);
+        drop(published);
+        assert_eq!(shared.listener_fds(), 0);
+        assert_eq!(shared.active_fds(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -992,16 +1369,18 @@ mod tests {
         // are capped at 2, leaving 2 slots reserved for published services.
         let shared = RelayBudget::new(4);
         let guest_sock = fake_guest(&dir);
-        let mut auto = AutoForwards::with_limit_and_budget(
+        let mut auto = AutoForwards::with_limits_and_budget(
             Upstream::AutoForward(guest_sock),
             &[Ipv4Addr::LOCALHOST],
-            auto_conn_limit_for_budget(shared.max(), true),
+            auto_conn_limit_for_budget(&shared, true),
+            auto_listener_fd_limit_for_budget(&shared, true),
             shared.clone(),
         );
-        let mut published = AutoForwards::with_limit_and_budget(
+        let mut published = AutoForwards::with_limits_and_budget(
             Upstream::PerPort(dir.clone()),
             &[Ipv4Addr::LOCALHOST],
-            published_conn_limit_for_budget(shared.max()),
+            published_conn_limit_for_budget(&shared),
+            None,
             shared.clone(),
         );
         let auto_port = add_free_port(&mut auto);
@@ -1453,14 +1832,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut fwd = AutoForwards::new(&fake_guest(&dir));
-        let mut bound = None;
-        for port in (900u16..=1023).rev() {
-            if matches!(fwd.add(port), Ok(true)) {
-                bound = Some(port);
-                break;
-            }
-        }
-        let port = bound.expect("auto-forward a free privileged port < 1024");
+        let port = crate::net::claim_test_low_port();
+        assert!(
+            fwd.add(port)
+                .expect("auto-forward a free privileged port < 1024")
+        );
         assert_eq!(round_trip(port, "hi"), format!("{port}:hi"));
         assert!(fwd.remove(port));
         fwd.clear();

@@ -593,6 +593,12 @@ impl ForwardApi for AddressesApi {
                 }
             };
         }
+        // Fail fast before creating a gvproxy Unix socket when the daemon's
+        // listener descriptor budget is already full; `listeners.add` below
+        // still acquires the permit atomically and rolls back on race.
+        if let Err(e) = self.listeners.check_listener_capacity() {
+            return Err(ForwardError::Refused(e.to_string()));
+        }
         // Have gvproxy listen on the per-port Unix socket before opening the
         // Mac's TCP listeners, so the very first accepted connection never
         // races socket creation and transient gvproxy errors do not churn
@@ -1407,6 +1413,20 @@ fn bind_darwin_lo0(ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
 }
 
 #[cfg(test)]
+pub(crate) fn claim_test_low_port() -> u16 {
+    static NEXT: Mutex<u16> = Mutex::new(1023);
+    let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..124 {
+        let port = *next;
+        *next = if port <= 900 { 1023 } else { port - 1 };
+        if LoopbackTcpListener::bind(port).is_ok() {
+            return port;
+        }
+    }
+    panic!("could not find a free privileged port in 900..=1023");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1823,8 +1843,284 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Talks to a real gvproxy if one is built: expose a port, see the Mac
-    /// listen on it, unexpose it, see it gone.
+    /// Minimal guest network responder connected to gvproxy's `-listen-vfkit`
+    /// unixgram socket: answers ARP for [`GUEST`] and echoes `"guest:<data>"`
+    /// on TCP connections to [`GUEST`], exercising real payload delivery
+    /// through gvproxy's gVisor stack and forwarders.
+    struct SyntheticGuest {
+        stop: Arc<AtomicBool>,
+        peer_sock: PathBuf,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl SyntheticGuest {
+        fn start(dir: &Path, vfkit_socket: &Path) -> Self {
+            use std::os::unix::net::UnixDatagram;
+
+            let peer_sock = dir.join("g.sock");
+            let _ = fs::remove_file(&peer_sock);
+            let dg = UnixDatagram::bind(&peer_sock).unwrap();
+            let buf_sz: libc::c_int = 1 << 20;
+            unsafe {
+                libc::setsockopt(
+                    dg.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&buf_sz as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+            dg.connect(vfkit_socket).unwrap();
+            dg.send(b"VFKT").unwrap();
+            dg.set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+
+            struct ConnState {
+                seq: u32,
+                rcv_nxt: u32,
+                prefixed: bool,
+                fin_sent: bool,
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let s_stop = stop.clone();
+            let thread = thread::spawn(move || {
+                let guest_ip = GUEST.octets();
+                let mut conns: BTreeMap<(u16, u16), ConnState> = BTreeMap::new();
+                let mut next_isn: u32 = 10_000;
+                let mut frame = vec![0u8; 65536];
+
+                while !s_stop.load(Ordering::SeqCst) {
+                    let n = match dg.recv(&mut frame) {
+                        Ok(n) => n,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    if n < 14 {
+                        continue;
+                    }
+                    let src_mac = &frame[6..12];
+                    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+                    if ethertype == 0x0806 && n >= 42 {
+                        let op = u16::from_be_bytes([frame[20], frame[21]]);
+                        if op == 1 && frame[38..42] == guest_ip {
+                            let mut reply = Vec::with_capacity(42);
+                            reply.extend_from_slice(&frame[22..28]);
+                            reply.extend_from_slice(&GUEST_MAC);
+                            reply.extend_from_slice(&[
+                                0x08, 0x06, 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02,
+                            ]);
+                            reply.extend_from_slice(&GUEST_MAC);
+                            reply.extend_from_slice(&guest_ip);
+                            reply.extend_from_slice(&frame[22..28]);
+                            reply.extend_from_slice(&frame[28..32]);
+                            let _ = dg.send(&reply);
+                        }
+                    } else if ethertype == 0x0800 && n >= 34 {
+                        let ihl = usize::from(frame[14] & 0x0f) * 4;
+                        if frame[23] != 6 || frame[30..34] != guest_ip {
+                            continue;
+                        }
+                        let tot = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+                        if tot < ihl + 20 || n < 14 + tot {
+                            continue;
+                        }
+                        let sip: [u8; 4] = frame[26..30].try_into().unwrap();
+                        let tcp = &frame[14 + ihl..14 + tot];
+                        let sport = u16::from_be_bytes([tcp[0], tcp[1]]);
+                        let dport = u16::from_be_bytes([tcp[2], tcp[3]]);
+                        let rseq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+                        let thl = usize::from(tcp[12] >> 4) * 4;
+                        let flags = tcp[13];
+                        if thl < 20 || thl > tcp.len() {
+                            continue;
+                        }
+                        let payload = &tcp[thl..];
+                        let key = (sport, dport);
+
+                        if flags & 0x04 != 0 {
+                            conns.remove(&key);
+                        } else if flags & 0x02 != 0 {
+                            let isn = next_isn;
+                            next_isn = next_isn.wrapping_add(100_000);
+                            let rcv_nxt = rseq.wrapping_add(1);
+                            conns.insert(
+                                key,
+                                ConnState {
+                                    seq: isn.wrapping_add(1),
+                                    rcv_nxt,
+                                    prefixed: false,
+                                    fin_sent: false,
+                                },
+                            );
+                            let out = Self::tcp_frame(
+                                src_mac,
+                                guest_ip,
+                                sip,
+                                dport,
+                                sport,
+                                isn,
+                                rcv_nxt,
+                                0x12,
+                                &[],
+                            );
+                            let _ = dg.send(&out);
+                        } else if let Some(st) = conns.get_mut(&key) {
+                            if !payload.is_empty() && rseq == st.rcv_nxt {
+                                st.rcv_nxt = st.rcv_nxt.wrapping_add(payload.len() as u32);
+                                let mut echo = Vec::with_capacity(6 + payload.len());
+                                if !st.prefixed {
+                                    echo.extend_from_slice(b"guest:");
+                                    st.prefixed = true;
+                                }
+                                echo.extend_from_slice(payload);
+                                let out = Self::tcp_frame(
+                                    src_mac, guest_ip, sip, dport, sport, st.seq, st.rcv_nxt, 0x18,
+                                    &echo,
+                                );
+                                st.seq = st.seq.wrapping_add(echo.len() as u32);
+                                let _ = dg.send(&out);
+                            }
+                            if flags & 0x01 != 0
+                                && !st.fin_sent
+                                && rseq.wrapping_add(payload.len() as u32) == st.rcv_nxt
+                            {
+                                st.rcv_nxt = st.rcv_nxt.wrapping_add(1);
+                                let out = Self::tcp_frame(
+                                    src_mac,
+                                    guest_ip,
+                                    sip,
+                                    dport,
+                                    sport,
+                                    st.seq,
+                                    st.rcv_nxt,
+                                    0x11,
+                                    &[],
+                                );
+                                st.seq = st.seq.wrapping_add(1);
+                                st.fin_sent = true;
+                                let _ = dg.send(&out);
+                            }
+                        }
+                    }
+                }
+            });
+
+            Self {
+                stop,
+                peer_sock,
+                thread: Some(thread),
+            }
+        }
+
+        fn inet_checksum(data: &[u8]) -> u16 {
+            let mut sum: u32 = 0;
+            let (chunks, rem) = data.as_chunks::<2>();
+            for &c in chunks {
+                sum += u32::from(u16::from_be_bytes(c));
+            }
+            if let Some(&b) = rem.first() {
+                sum += u32::from(u16::from_be_bytes([b, 0]));
+            }
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            !(sum as u16)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn tcp_frame(
+            dst_mac: &[u8],
+            src_ip: [u8; 4],
+            dst_ip: [u8; 4],
+            sport: u16,
+            dport: u16,
+            seq: u32,
+            ack: u32,
+            flags: u8,
+            payload: &[u8],
+        ) -> Vec<u8> {
+            let tcp_len = 20 + payload.len();
+            let mut tcp = Vec::with_capacity(tcp_len);
+            tcp.extend_from_slice(&sport.to_be_bytes());
+            tcp.extend_from_slice(&dport.to_be_bytes());
+            tcp.extend_from_slice(&seq.to_be_bytes());
+            tcp.extend_from_slice(&ack.to_be_bytes());
+            tcp.push(5 << 4);
+            tcp.push(flags);
+            tcp.extend_from_slice(&65535u16.to_be_bytes());
+            tcp.extend_from_slice(&0u16.to_be_bytes());
+            tcp.extend_from_slice(&0u16.to_be_bytes());
+            tcp.extend_from_slice(payload);
+
+            let mut pseudo = Vec::with_capacity(12 + tcp_len);
+            pseudo.extend_from_slice(&src_ip);
+            pseudo.extend_from_slice(&dst_ip);
+            pseudo.push(0);
+            pseudo.push(6);
+            pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
+            pseudo.extend_from_slice(&tcp);
+            let tcp_csum = Self::inet_checksum(&pseudo);
+            tcp[16..18].copy_from_slice(&tcp_csum.to_be_bytes());
+
+            let total_len = (20 + tcp_len) as u16;
+            let mut ip = vec![
+                0x45,
+                0,
+                (total_len >> 8) as u8,
+                total_len as u8,
+                0,
+                1,
+                0,
+                0,
+                64,
+                6,
+                0,
+                0,
+                src_ip[0],
+                src_ip[1],
+                src_ip[2],
+                src_ip[3],
+                dst_ip[0],
+                dst_ip[1],
+                dst_ip[2],
+                dst_ip[3],
+            ];
+            let ip_csum = Self::inet_checksum(&ip);
+            ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+            let mut out = Vec::with_capacity(14 + ip.len() + tcp.len());
+            out.extend_from_slice(dst_mac);
+            out.extend_from_slice(&GUEST_MAC);
+            out.extend_from_slice(&[0x08, 0x00]);
+            out.extend_from_slice(&ip);
+            out.extend_from_slice(&tcp);
+            out
+        }
+    }
+
+    impl Drop for SyntheticGuest {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+            let _ = fs::remove_file(&self.peer_sock);
+        }
+    }
+
+    /// Talks to a real gvproxy if one is built: expose a port, deliver TCP
+    /// payloads end-to-end through gvproxy's stack (both directly and via
+    /// [`AddressesApi`]'s per-port Unix sockets), unexpose it, and see it gone.
     #[test]
     fn gvproxy_forwarder_api_round_trip() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1834,13 +2130,17 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("kat-gvp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let mut gv = Gvproxy::start(&bin, &dir, &dir.join("gvproxy.log"), 1500).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !gv.network().socket.exists() {
+        while !gv.network().socket.exists() || !gv.api_socket.exists() {
             assert!(Instant::now() < deadline, "gvproxy did not start");
             thread::sleep(Duration::from_millis(5));
         }
+        let gv_dir = gv.api_socket.parent().unwrap().to_path_buf();
+        let _guest = SyntheticGuest::start(&gv_dir, &gv.network().socket);
+
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
@@ -1851,38 +2151,42 @@ mod tests {
         };
         api.expose(TCP, port).unwrap();
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        assert_eq!(
+            tcp_echo(Ipv4Addr::LOCALHOST, port, "direct"),
+            "guest:direct"
+        );
         let again = api.expose(TCP, port).unwrap_err();
         assert!(again.to_string().contains("already running"), "{again}");
         api.unexpose(TCP, port).unwrap();
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
 
         // Privileged port (< 1024): exposes unprivileged on macOS via lo0-scoped wildcard.
-        let mut exposed_low = None;
-        for candidate in (900u16..=1023).rev() {
-            if api.expose(TCP, candidate).is_ok() {
-                exposed_low = Some(candidate);
-                break;
-            }
-        }
-        let low = exposed_low.expect("gvproxy should expose a free privileged port < 1024");
+        let low = claim_test_low_port();
+        api.expose(TCP, low)
+            .expect("gvproxy should expose a free privileged port < 1024");
         assert!(
             LoopbackTcpListener::bind(low).is_err(),
             "duplicate bind on exposed low port {low} should fail"
         );
+        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "low"), "guest:low");
         api.unexpose(TCP, low).unwrap();
-        assert!(LoopbackTcpListener::bind(low).is_ok());
+        assert_port_rebindable(low);
 
         // Forward addresses beyond 127.0.0.1: gvproxy serves the guest port
-        // on a Unix socket and the daemon listens on the Mac's addresses,
-        // privileged ports included.
-        let gv_dir = gv.api_socket.parent().unwrap().to_path_buf();
+        // on a Unix socket and the daemon listens on the Mac's addresses and
+        // relays real payloads end-to-end, privileged ports included.
+        let alias = TestLo0Alias::acquire();
+        let mut configured = vec![Ipv4Addr::LOCALHOST];
+        if let Some(a) = &alias {
+            configured.push(a.addr);
+        }
         let mut addrs = AddressesApi::new(
             GvproxyApi {
                 socket: gv.api_socket.clone(),
                 guest: GUEST,
             },
             &gv_dir,
-            &[Ipv4Addr::LOCALHOST],
+            &configured,
         );
         for p in [port, low] {
             let sock = crate::autofwd::Upstream::socket(&gv_dir, p);
@@ -1892,12 +2196,13 @@ mod tests {
                 LoopbackTcpListener::bind(p).is_err(),
                 "not listening on {p}"
             );
+            for &a in &configured {
+                let msg = format!("real-{a}-{p}");
+                assert_eq!(tcp_echo(a, p, &msg), format!("guest:{msg}"));
+            }
             addrs.unexpose(TCP, p).unwrap();
             assert!(!sock.exists());
-            assert!(
-                LoopbackTcpListener::bind(p).is_ok(),
-                "still listening on {p}"
-            );
+            assert_port_rebindable(p);
         }
         // A port the Mac already uses is refused, and nothing is left behind.
         let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1907,7 +2212,7 @@ mod tests {
             Err(ForwardError::Refused(_))
         ));
         assert!(!crate::autofwd::Upstream::socket(&gv_dir, busy_port).exists());
-        assert_eq!(addrs.port_label(TCP, port), "127.0.0.1");
+        assert_eq!(addrs.port_label(TCP, port), addrs_label(&configured));
 
         // Dropping AddressesApi stops active listeners and removes their sockets.
         addrs.expose(TCP, port).unwrap();
@@ -1915,8 +2220,9 @@ mod tests {
         assert!(sock.exists());
         drop(addrs);
         assert!(!sock.exists());
-        assert!(LoopbackTcpListener::bind(port).is_ok());
+        assert_port_rebindable(port);
 
+        drop(_guest);
         gv.stop();
         assert!(!gv.api_socket.exists(), "gvproxy left its socket behind");
         fs::remove_dir_all(&dir).unwrap();
@@ -1924,14 +2230,8 @@ mod tests {
 
     #[test]
     fn loopback_tcp_listener_binds_low_port_and_filters_endpoints() {
-        let mut bound = None;
-        for port in (900u16..=1023).rev() {
-            if let Ok(listener) = LoopbackTcpListener::bind(port) {
-                bound = Some((port, listener));
-                break;
-            }
-        }
-        let (port, listener) = bound.expect("bind a free privileged port < 1024");
+        let port = claim_test_low_port();
+        let listener = LoopbackTcpListener::bind(port).expect("bind a free privileged port < 1024");
         assert_eq!(listener.local_addr().unwrap().port(), port);
         assert!(
             LoopbackTcpListener::bind(port).is_err(),
@@ -2327,12 +2627,26 @@ mod tests {
     }
 
     fn free_low_port() -> u16 {
-        for candidate in (900u16..=1023).rev() {
-            if LoopbackTcpListener::bind(candidate).is_ok() {
-                return candidate;
+        claim_test_low_port()
+    }
+
+    /// Confirm `port` can be rebound once closed, polling briefly on
+    /// `AddrInUse` in case a parallel test subprocess briefly inherited the fd
+    /// during macOS's non-atomic `socket()` + `FIOCLEX` window.
+    fn assert_port_rebindable(port: u16) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match LoopbackTcpListener::bind(port) {
+                Ok(rebound) => {
+                    drop(rebound);
+                    return;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("still listening on {port}: {e:?}"),
             }
         }
-        panic!("could not find a free privileged port in 900..=1023");
     }
 
     #[test]
@@ -2517,10 +2831,7 @@ mod tests {
             Some(Event::RemoveFailed(TCP, p, _)) if p == p1
         ));
         assert_eq!(fwd.remove(TCP, p1), Some(Event::Removed(TCP, p1)));
-        assert!(
-            TcpListener::bind(("127.0.0.1", p1)).is_ok(),
-            "Mac listener must be closed after idempotent unexpose"
-        );
+        assert_port_rebindable(p1);
 
         // 2. Guest immediately re-adds after an ambiguous unexpose whose effect
         // already closed gvproxy's socket: upstream is recreated so the running
@@ -2566,10 +2877,63 @@ mod tests {
                 format!("gv:p{port}")
             );
             api.unexpose(TCP, port).unwrap();
-            assert!(LoopbackTcpListener::bind(port).is_ok());
+            assert_port_rebindable(port);
         }
 
         drop(api);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addresses_api_enforces_listener_descriptor_cap_without_leaking_gvproxy_socket() {
+        let dir = std::env::temp_dir().join(format!("kat-addr-lcap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+        // 6 listener fds fits 2 single-address ports (3 fds each).
+        let budget = crate::autofwd::RelayBudget::with_limits(6, 4);
+        let mut api = AddressesApi::with_budget(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &[Ipv4Addr::LOCALHOST],
+            budget.clone(),
+        );
+
+        let p1 = free_high_port();
+        let p2 = free_high_port();
+        let p3 = free_high_port();
+        api.expose(TCP, p1).unwrap();
+        api.expose(TCP, p2).unwrap();
+        assert_eq!(budget.listener_fds(), 6);
+
+        let err = api.expose(TCP, p3).unwrap_err();
+        assert!(
+            matches!(err, ForwardError::Refused(ref msg) if msg.contains("forward descriptor limit reached")),
+            "expected descriptor limit refusal, got {err:?}"
+        );
+        assert!(
+            !crate::autofwd::Upstream::socket(&dir, p3).exists(),
+            "refused port must not leave a gvproxy Unix socket behind"
+        );
+        assert!(!api.has_pending_cleanup(TCP, p3));
+
+        // Unexposing p1 returns its descriptors so p3 can bind and relay.
+        api.unexpose(TCP, p1).unwrap();
+        assert_eq!(budget.listener_fds(), 3);
+        api.expose(TCP, p3).unwrap();
+        assert_eq!(budget.listener_fds(), 6);
+        assert_eq!(
+            tcp_echo(Ipv4Addr::LOCALHOST, p3, "after-free"),
+            "gv:after-free"
+        );
+
+        drop(api);
+        assert_eq!(budget.listener_fds(), 0);
+        assert_eq!(budget.active_fds(), 0);
         drop(fake);
         let _ = fs::remove_dir_all(&dir);
     }
