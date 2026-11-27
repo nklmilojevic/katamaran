@@ -86,6 +86,15 @@ pub struct RunArgs {
     pub amd64: crate::amd64::Emulation,
 }
 
+/// Which forwarding path owns a port status event, so concurrent handoffs
+/// between published and automatic forwards on the same `(proto, port)` never
+/// erase each other's live status entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PortOrigin {
+    Published,
+    Automatic,
+}
+
 /// What [`run_vm`] reports while the VM runs, for the daemon's status.
 #[derive(Debug)]
 pub enum Event {
@@ -98,10 +107,10 @@ pub enum Event {
     ServiceFailed(String, String),
     Mounted(PathBuf),
     MountFailed(String),
-    PortAdd(PortProto, u16, Vec<std::net::Ipv4Addr>),
-    PortRemove(PortProto, u16),
-    PortFailed(PortProto, u16, String),
-    PortErrorClear(PortProto, u16),
+    PortAdd(PortOrigin, PortProto, u16, Vec<std::net::Ipv4Addr>),
+    PortRemove(PortOrigin, PortProto, u16),
+    PortFailed(PortOrigin, PortProto, u16, String),
+    PortErrorClear(PortOrigin, PortProto, u16),
     Stats(GuestStats),
     /// The VM died and starts again after `delay`; [`Event::Booted`] and
     /// the rest follow as for the first boot.
@@ -167,7 +176,7 @@ impl AutoForwardTracker {
                     net::addrs_label(&addrs),
                     proto.as_str()
                 );
-                on_event(Event::PortAdd(proto, port, addrs));
+                on_event(Event::PortAdd(PortOrigin::Automatic, proto, port, addrs));
             }
             Ok(false) => {
                 self.pending_capacity.retain(|&(_, p)| p != port);
@@ -180,7 +189,7 @@ impl AutoForwardTracker {
                         self.forwards.label(),
                         proto.as_str()
                     );
-                    on_event(Event::PortFailed(proto, port, why));
+                    on_event(Event::PortFailed(PortOrigin::Automatic, proto, port, why));
                 }
             }
             Err(crate::autofwd::AddError::Io(e)) => {
@@ -190,7 +199,12 @@ impl AutoForwardTracker {
                     self.forwards.label(),
                     proto.as_str()
                 );
-                on_event(Event::PortFailed(proto, port, e.to_string()));
+                on_event(Event::PortFailed(
+                    PortOrigin::Automatic,
+                    proto,
+                    port,
+                    e.to_string(),
+                ));
             }
         }
     }
@@ -203,10 +217,10 @@ impl AutoForwardTracker {
                 "katamaran: stopped auto-forwarding {label}:{port}/{}",
                 proto.as_str()
             );
-            on_event(Event::PortRemove(proto, port));
+            on_event(Event::PortRemove(PortOrigin::Automatic, proto, port));
             self.retry_pending(on_event);
         } else {
-            on_event(Event::PortErrorClear(proto, port));
+            on_event(Event::PortErrorClear(PortOrigin::Automatic, proto, port));
         }
     }
 
@@ -228,7 +242,7 @@ impl AutoForwardTracker {
                         net::addrs_label(&addrs),
                         proto.as_str()
                     );
-                    on_event(Event::PortAdd(proto, port, addrs));
+                    on_event(Event::PortAdd(PortOrigin::Automatic, proto, port, addrs));
                 }
                 Ok(false) => {}
                 Err(crate::autofwd::AddError::CapacityExhausted(_)) => {
@@ -240,7 +254,12 @@ impl AutoForwardTracker {
                         self.forwards.label(),
                         proto.as_str()
                     );
-                    on_event(Event::PortFailed(proto, port, e.to_string()));
+                    on_event(Event::PortFailed(
+                        PortOrigin::Automatic,
+                        proto,
+                        port,
+                        e.to_string(),
+                    ));
                 }
             }
         }
@@ -716,17 +735,17 @@ fn session(
                 }
             }
             Ok(Input::Forward(_, net::Event::Forwarded(proto, port, addrs))) => {
-                on_event(Event::PortAdd(proto, port, addrs));
+                on_event(Event::PortAdd(PortOrigin::Published, proto, port, addrs));
             }
             Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
-                on_event(Event::PortRemove(proto, port));
+                on_event(Event::PortRemove(PortOrigin::Published, proto, port));
             }
             Ok(Input::Forward(_, net::Event::Refused(proto, port, why)))
             | Ok(Input::Forward(_, net::Event::CapacityWait(proto, port, why))) => {
-                on_event(Event::PortFailed(proto, port, why));
+                on_event(Event::PortFailed(PortOrigin::Published, proto, port, why));
             }
             Ok(Input::Forward(_, net::Event::RefusedCleared(proto, port))) => {
-                on_event(Event::PortErrorClear(proto, port));
+                on_event(Event::PortErrorClear(PortOrigin::Published, proto, port));
             }
             Ok(Input::Forward(_, net::Event::Transient(..) | net::Event::RemoveFailed(..))) => {}
             Ok(Input::ListenerCapacityAvailable(_)) => {
@@ -1024,7 +1043,7 @@ mod tests {
         tracker.add(PortProto::Tcp, busy_port, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == busy_port
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == busy_port
         ));
         assert!(tracker.pending_capacity.is_empty());
 
@@ -1032,12 +1051,12 @@ mod tests {
         tracker.add(PortProto::Tcp, p1, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortAdd(PortProto::Tcp, p, ref a)) if p == p1 && a == &[Ipv4Addr::LOCALHOST]
+            Some(Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, ref a)) if p == p1 && a == &[Ipv4Addr::LOCALHOST]
         ));
         tracker.add(PortProto::Tcp, p2, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortAdd(PortProto::Tcp, p, ref a)) if p == p2 && a == &[Ipv4Addr::LOCALHOST]
+            Some(Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, ref a)) if p == p2 && a == &[Ipv4Addr::LOCALHOST]
         ));
         assert_eq!(budget.listener_fds(), 6);
 
@@ -1045,19 +1064,19 @@ mod tests {
         tracker.add(PortProto::Tcp, p3, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == p3
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == p3
         ));
         tracker.add(PortProto::Tcp, p4, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == p4
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == p4
         ));
 
         // Guest cancels p4 before any slot frees up.
         tracker.remove(PortProto::Tcp, p4, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortErrorClear(PortProto::Tcp, p)) if p == p4
+            Some(Event::PortErrorClear(PortOrigin::Automatic, PortProto::Tcp, p)) if p == p4
         ));
 
         // Drop busy socket to verify ordinary bind failures are NOT retried
@@ -1068,10 +1087,13 @@ mod tests {
         // a second AutoForwardAdd from the guest.
         tracker.remove(PortProto::Tcp, p1, &mut |e| events.push(e));
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], Event::PortRemove(PortProto::Tcp, p) if p == p1));
+        assert!(matches!(
+            events[0],
+            Event::PortRemove(PortOrigin::Automatic, PortProto::Tcp, p) if p == p1
+        ));
         assert!(matches!(
             events[1],
-            Event::PortAdd(PortProto::Tcp, p, ref a) if p == p3 && a == &[Ipv4Addr::LOCALHOST]
+            Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, ref a) if p == p3 && a == &[Ipv4Addr::LOCALHOST]
         ));
         events.clear();
         assert!(!tracker.forwards.contains(p4));
@@ -1110,14 +1132,14 @@ mod tests {
         tracker.add(PortProto::Tcp, p5, &mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == p5
+            Some(Event::PortFailed(PortOrigin::Automatic, PortProto::Tcp, p, _)) if p == p5
         ));
         assert!(published.remove(pub_port));
         wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         tracker.retry_pending(&mut |e| events.push(e));
         assert!(matches!(
             events.pop(),
-            Some(Event::PortAdd(PortProto::Tcp, p, ref a)) if p == p5 && a == &[Ipv4Addr::LOCALHOST]
+            Some(Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, ref a)) if p == p5 && a == &[Ipv4Addr::LOCALHOST]
         ));
 
         drop(published);

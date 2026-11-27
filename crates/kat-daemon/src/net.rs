@@ -3148,29 +3148,70 @@ mod tests {
         }
         drop(api);
 
-        // If a real lo0 alias is configured, a privileged port (<1024) served
-        // by macOS's single lo0-scoped wildcard socket also fits in 3 fds.
+        // If a real lo0 alias is configured, verify privileged-port (<1024)
+        // accounting for both unprivileged (single lo0-scoped wildcard socket ->
+        // 3 fds) and root (two specific sockets -> 4 fds; 3 fds refuses with
+        // CapacityExhausted without leaking a gvproxy Unix socket).
         if let Some(alias) = TestLo0Alias::acquire() {
             let both = [Ipv4Addr::LOCALHOST, alias.addr];
-            let mut api2 = AddressesApi::with_budget(
-                GvproxyApi {
-                    socket: fake.api_sock.clone(),
-                    guest: GUEST,
-                },
-                &dir,
-                &both,
-                budget.clone(),
-            );
             let low = free_low_port();
-            api2.expose(TCP, low).unwrap();
-            assert_eq!(budget.listener_fds(), 3);
-            assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
-            assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
-            assert_eq!(tcp_echo(alias.addr, low, "al"), "gv:al");
-            api2.unexpose(TCP, low).unwrap();
-            assert_eq!(budget.listener_fds(), 0);
-            assert_port_rebindable(low);
-            drop(api2);
+            if unsafe { libc::geteuid() } != 0 {
+                let mut api2 = AddressesApi::with_budget(
+                    GvproxyApi {
+                        socket: fake.api_sock.clone(),
+                        guest: GUEST,
+                    },
+                    &dir,
+                    &both,
+                    budget.clone(),
+                );
+                api2.expose(TCP, low).unwrap();
+                assert_eq!(budget.listener_fds(), 3);
+                assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
+                assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
+                assert_eq!(tcp_echo(alias.addr, low, "al"), "gv:al");
+                api2.unexpose(TCP, low).unwrap();
+                assert_eq!(budget.listener_fds(), 0);
+                assert_port_rebindable(low);
+                drop(api2);
+            } else {
+                let mut api_tight = AddressesApi::with_budget(
+                    GvproxyApi {
+                        socket: fake.api_sock.clone(),
+                        guest: GUEST,
+                    },
+                    &dir,
+                    &both,
+                    budget.clone(),
+                );
+                assert!(matches!(
+                    api_tight.expose(TCP, low),
+                    Err(ForwardError::CapacityExhausted(_))
+                ));
+                assert!(!crate::autofwd::Upstream::socket(&dir, low).exists());
+                assert_eq!(budget.listener_fds(), 0);
+                drop(api_tight);
+
+                let budget4 = crate::autofwd::RelayBudget::with_limits(4, 4);
+                let mut api2 = AddressesApi::with_budget(
+                    GvproxyApi {
+                        socket: fake.api_sock.clone(),
+                        guest: GUEST,
+                    },
+                    &dir,
+                    &both,
+                    budget4.clone(),
+                );
+                api2.expose(TCP, low).unwrap();
+                assert_eq!(budget4.listener_fds(), 4);
+                assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
+                assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
+                assert_eq!(tcp_echo(alias.addr, low, "al"), "gv:al");
+                api2.unexpose(TCP, low).unwrap();
+                assert_eq!(budget4.listener_fds(), 0);
+                assert_port_rebindable(low);
+                drop(api2);
+            }
         }
 
         drop(fake);

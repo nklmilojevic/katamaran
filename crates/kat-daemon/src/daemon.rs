@@ -256,8 +256,10 @@ struct Run {
     mounted: bool,
     mount_error: Option<String>,
     problem: Option<String>,
-    ports: BTreeMap<(PortProto, u16), Vec<std::net::Ipv4Addr>>,
-    port_errors: BTreeMap<(PortProto, u16), String>,
+    /// Active forwards keyed by `(proto, port, origin)` so removing one origin
+    /// never erases a live forward from the other origin during a handoff.
+    ports: BTreeMap<(PortProto, u16, run::PortOrigin), Vec<std::net::Ipv4Addr>>,
+    port_errors: BTreeMap<(PortProto, u16, run::PortOrigin), String>,
     prev_guest: Option<GuestStats>,
     prev_host: Option<(Instant, u64)>,
     host_cpu_percent: f64,
@@ -286,6 +288,34 @@ impl Run {
             host_cpu_percent: 0.0,
             host_footprint_mib: 0,
         }
+    }
+
+    /// Merge published and automatic forwards into one status entry per
+    /// `(proto, port)`, preferring a live published forward when both exist.
+    fn merged_ports(&self) -> BTreeMap<(PortProto, u16), Vec<std::net::Ipv4Addr>> {
+        let mut merged = BTreeMap::new();
+        // `PortOrigin::Published < PortOrigin::Automatic`, so `Published` is
+        // visited first and wins when both origins are momentarily active.
+        for (&(proto, port, _origin), addrs) in &self.ports {
+            merged.entry((proto, port)).or_insert_with(|| addrs.clone());
+        }
+        merged
+    }
+
+    /// Merge port errors per `(proto, port)`, suppressing errors for ports
+    /// that currently have a live forward from either origin.
+    fn merged_port_errors(
+        &self,
+        live: &BTreeMap<(PortProto, u16), Vec<std::net::Ipv4Addr>>,
+    ) -> BTreeMap<(PortProto, u16), String> {
+        let mut merged = BTreeMap::new();
+        for (&(proto, port, _origin), error) in &self.port_errors {
+            if live.contains_key(&(proto, port)) {
+                continue;
+            }
+            merged.entry((proto, port)).or_insert_with(|| error.clone());
+        }
+        merged
     }
 }
 
@@ -496,20 +526,20 @@ impl Daemon {
                     r.problem = Some(format!("files not mounted: {error}"));
                     r.mount_error = Some(error);
                 }
-                Event::PortAdd(proto, port, addrs) => {
-                    r.port_errors.remove(&(proto, port));
-                    r.ports.insert((proto, port), addrs);
+                Event::PortAdd(origin, proto, port, addrs) => {
+                    r.port_errors.remove(&(proto, port, origin));
+                    r.ports.insert((proto, port, origin), addrs);
                 }
-                Event::PortRemove(proto, port) => {
-                    r.ports.remove(&(proto, port));
-                    r.port_errors.remove(&(proto, port));
+                Event::PortRemove(origin, proto, port) => {
+                    r.ports.remove(&(proto, port, origin));
+                    r.port_errors.remove(&(proto, port, origin));
                 }
-                Event::PortFailed(proto, port, error) => {
-                    r.ports.remove(&(proto, port));
-                    r.port_errors.insert((proto, port), error);
+                Event::PortFailed(origin, proto, port, error) => {
+                    r.ports.remove(&(proto, port, origin));
+                    r.port_errors.insert((proto, port, origin), error);
                 }
-                Event::PortErrorClear(proto, port) => {
-                    r.port_errors.remove(&(proto, port));
+                Event::PortErrorClear(origin, proto, port) => {
+                    r.port_errors.remove(&(proto, port, origin));
                 }
                 Event::Restarting { why, delay } => {
                     dlog!("the VM died ({why}); restarting in {:.0} ms", ms(delay));
@@ -703,24 +733,25 @@ impl Daemon {
             },
             ports: r
                 .map(|r| {
-                    r.ports
-                        .iter()
+                    r.merged_ports()
+                        .into_iter()
                         .map(|((p, port), addresses)| Port {
                             proto: p.as_str().into(),
-                            port: *port,
-                            addresses: addresses.clone(),
+                            port,
+                            addresses,
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
             port_errors: r
                 .map(|r| {
-                    r.port_errors
-                        .iter()
+                    let live = r.merged_ports();
+                    r.merged_port_errors(&live)
+                        .into_iter()
                         .map(|((p, port), error)| PortError {
                             proto: p.as_str().into(),
-                            port: *port,
-                            error: error.clone(),
+                            port,
+                            error,
                         })
                         .collect()
                 })
@@ -2342,7 +2373,12 @@ mod tests {
         }
         d.on_event(
             1,
-            Event::PortFailed(PortProto::Tcp, 80, "address already in use".into()),
+            Event::PortFailed(
+                run::PortOrigin::Published,
+                PortProto::Tcp,
+                80,
+                "address already in use".into(),
+            ),
         );
         let st = d.status();
         assert!(st.ports.is_empty());
@@ -2357,7 +2393,10 @@ mod tests {
 
         // Successful bind replaces the error and records bound addresses.
         let alias = std::net::Ipv4Addr::new(172, 16, 1, 200);
-        d.on_event(1, Event::PortAdd(PortProto::Tcp, 80, vec![alias]));
+        d.on_event(
+            1,
+            Event::PortAdd(run::PortOrigin::Published, PortProto::Tcp, 80, vec![alias]),
+        );
         let st = d.status();
         assert_eq!(
             st.ports,
@@ -2372,10 +2411,18 @@ mod tests {
         // Another failure is cleared on PortErrorClear.
         d.on_event(
             1,
-            Event::PortFailed(PortProto::Tcp, 443, "address already in use".into()),
+            Event::PortFailed(
+                run::PortOrigin::Published,
+                PortProto::Tcp,
+                443,
+                "address already in use".into(),
+            ),
         );
         assert_eq!(d.status().port_errors.len(), 1);
-        d.on_event(1, Event::PortErrorClear(PortProto::Tcp, 443));
+        d.on_event(
+            1,
+            Event::PortErrorClear(run::PortOrigin::Published, PortProto::Tcp, 443),
+        );
         assert!(d.status().port_errors.is_empty());
 
         fs::remove_dir_all(&home).unwrap();
@@ -2534,6 +2581,101 @@ mod tests {
 
         // Clean up ApiProxy before removing temp dir.
         d.k8s.lock().unwrap().api_proxy = None;
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn published_removal_preserves_live_automatic_forward_on_same_port() {
+        let home = temp("port-handoff");
+        let d = Daemon::new(home.clone());
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Running;
+            g.run = Some(Run::new(Config::default(), None));
+        }
+
+        let alias = std::net::Ipv4Addr::new(172, 16, 1, 200);
+        // 1. Published forward is active on port 8080.
+        d.on_event(
+            1,
+            Event::PortAdd(
+                run::PortOrigin::Published,
+                PortProto::Tcp,
+                8080,
+                vec![std::net::Ipv4Addr::LOCALHOST, alias],
+            ),
+        );
+        // 2. Automatic forward for the same port arrives while the listener
+        // pool is full (queued with a capacity error; published stays live).
+        d.on_event(
+            1,
+            Event::PortFailed(
+                run::PortOrigin::Automatic,
+                PortProto::Tcp,
+                8080,
+                "forward descriptor limit reached".into(),
+            ),
+        );
+        let st = d.status();
+        assert_eq!(
+            st.ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 8080,
+                addresses: vec![std::net::Ipv4Addr::LOCALHOST, alias],
+            }]
+        );
+        assert!(
+            st.port_errors.is_empty(),
+            "live published port must suppress transient automatic error"
+        );
+
+        // 3. Published worker releases the listener, firing the capacity wake
+        // BEFORE its Removed event reaches the session: automatic binds first.
+        d.on_event(
+            1,
+            Event::PortAdd(
+                run::PortOrigin::Automatic,
+                PortProto::Tcp,
+                8080,
+                vec![alias],
+            ),
+        );
+        // While both are momentarily recorded, published takes precedence.
+        assert_eq!(
+            d.status().ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 8080,
+                addresses: vec![std::net::Ipv4Addr::LOCALHOST, alias],
+            }]
+        );
+
+        // 4. Published Removed arrives afterwards: must clear ONLY Published,
+        // keeping the live Automatic alias visible in status.
+        d.on_event(
+            1,
+            Event::PortRemove(run::PortOrigin::Published, PortProto::Tcp, 8080),
+        );
+        let st = d.status();
+        assert_eq!(
+            st.ports,
+            vec![Port {
+                proto: "tcp".into(),
+                port: 8080,
+                addresses: vec![alias],
+            }]
+        );
+        assert!(st.port_errors.is_empty());
+
+        // 5. Removing Automatic clears the status entry cleanly.
+        d.on_event(
+            1,
+            Event::PortRemove(run::PortOrigin::Automatic, PortProto::Tcp, 8080),
+        );
+        assert!(d.status().ports.is_empty());
+
         fs::remove_dir_all(&home).unwrap();
     }
 }

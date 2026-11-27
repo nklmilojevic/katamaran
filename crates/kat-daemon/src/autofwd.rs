@@ -718,7 +718,10 @@ impl AutoForwards {
     /// Best-effort preflight check requiring only the minimum descriptors any
     /// valid port bind needs (one socket + wakeup pipe), so a smaller bind
     /// (e.g. skipped unassigned alias or privileged wildcard) is never blocked.
+    /// Acquires the shared listener-bind lock so it never observes transient
+    /// reservations from a concurrent bind attempt that later fails.
     pub fn check_listener_capacity(&self) -> Result<(), AddError> {
+        let _bind_lock = self.budget.lock_listener_bind();
         if self.budget.has_listener_headroom(
             MIN_LISTENER_FDS,
             &self.class_listener_fds,
@@ -1451,6 +1454,66 @@ mod tests {
         assert_eq!(slots.load(Ordering::Acquire), 0);
 
         drop(fwd);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn capacity_preflight_serializes_with_failed_concurrent_bind_reservation() {
+        let dir =
+            std::env::temp_dir().join(format!("kat-autofwd-preflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Only 3 shared listener fds available. Simulate an automatic bind
+        // holding the bind lock and reserving 2 pipe fds before failing and
+        // releasing them without calling `notify_listener_released`: a
+        // concurrent published `check_listener_capacity` must block until the
+        // failed attempt unwinds and then see all 3 descriptors available.
+        let shared = RelayBudget::with_limits(3, 4);
+        let published = AutoForwards::with_limits_and_budget(
+            Upstream::PerPort(dir.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            published_conn_limit_for_budget(&shared),
+            None,
+            shared.clone(),
+        );
+
+        let bind_guard = shared.lock_listener_bind();
+        let temp_pipe = shared
+            .try_acquire_listener(WAKEUP_PIPE_FDS, &Arc::new(AtomicUsize::new(0)), None)
+            .unwrap();
+        assert_eq!(shared.listener_fds(), WAKEUP_PIPE_FDS);
+
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let s2 = started.clone();
+        let d2 = done.clone();
+        let checker = thread::spawn(move || {
+            s2.store(true, Ordering::SeqCst);
+            let res = published.check_listener_capacity();
+            d2.store(true, Ordering::SeqCst);
+            res
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "preflight must wait for the in-flight bind lock"
+        );
+
+        // Failed bind unwinds: drops its transient pipe permits and releases
+        // the bind lock without calling notify_listener_released.
+        drop(temp_pipe);
+        drop(bind_guard);
+
+        checker
+            .join()
+            .unwrap()
+            .expect("preflight must observe released descriptors after failed bind");
+        assert_eq!(shared.listener_fds(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
