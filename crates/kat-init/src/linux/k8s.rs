@@ -3662,40 +3662,26 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     log(&msg);
                     failures.push(msg);
                 }
+                SyncAction::ReportDivergedTag => {
+                    let msg = format!(
+                        "{name}: Kubernetes keeps a different image under this name ({}) than Docker ({}); katamaran never replaces an image it did not publish. Give the Docker image a different local name (`docker tag {name} <new-name> && docker rmi {name}`) and use that name in the pod spec",
+                        k8s_img.map(|k| k.digest.as_str()).unwrap_or("-"),
+                        img.digest
+                    );
+                    log(&msg);
+                    failures.push(msg);
+                }
                 SyncAction::ReportUnownedDestination => {
                     let msg = unowned_destination_message(&name);
                     log(&msg);
                     failures.push(msg);
                 }
-                SyncAction::RetireRewritten => {
-                    if emulation == EmulationMode::Disabled && !emulation_still_disabled() {
-                        log(&format!(
-                            "skipped retiring {name}: amd64 emulation state changed; re-listing"
-                        ));
-                        retry_refs.insert(name);
-                        continue;
-                    }
-                    if let Some(k) = k8s_img {
-                        match retire_rewritten_image(reaper, &name, Some(&img.digest), &k.digest) {
-                            Ok(RetireResult::Deleted) => log(&format!(
-                                "retired Katamaran amd64 mirror {name} from k8s.io"
-                            )),
-                            Ok(RetireResult::NotFoundOrChanged) => log(&format!(
-                                "skipped retiring {name}: k8s.io target already removed or replaced"
-                            )),
-                            Ok(RetireResult::NotOwned) => {}
-                            Ok(RetireResult::SourceChanged) => {
-                                log(&format!(
-                                    "skipped retiring {name}: moby source digest changed concurrently; re-listing"
-                                ));
-                                retry_refs.insert(name);
-                            }
-                            Err(e) => {
-                                log(&format!("retire amd64 mirror {name}: {e}"));
-                                failures.push(format!("{name}: {e}"));
-                            }
-                        }
-                    }
+                SyncAction::KeepMirrorEmulationOff => {
+                    // Never deleted automatically: a pod may still use it, and
+                    // its Docker source may be gone. Leaking it is acceptable.
+                    log(&format!(
+                        "keeping amd64 mirror {name} in Kubernetes although amd64 emulation is off"
+                    ));
                 }
                 SyncAction::MirrorNative { clear_source_label } => {
                     match mirror_native_image(reaper, &name) {
@@ -3714,38 +3700,27 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     }
                 }
                 SyncAction::MirrorRewrite => {
-                    // Establish ownership evidence for an existing tag before
-                    // any work: a labelled tag must be a Katamaran publication
-                    // (a stale label on a native import is not ownership), and
-                    // an unlabelled one must be an adoptable legacy copy.
-                    let ownership = match k8s_img {
-                        None => None,
-                        Some(k) if k.label(SOURCE_DIGEST_LABEL).is_some() => {
-                            match is_katamaran_published(reaper, &name, &k.digest) {
-                                Ok(true) => Some(containerd_grpc::K8sOwnership::PublishedMirror),
-                                Ok(false) => {
-                                    let msg = unowned_destination_message(&name);
-                                    log(&msg);
-                                    failures.push(msg);
-                                    continue;
-                                }
+                    // Only a Katamaran publication is ever replaced: the tag
+                    // must carry the source-digest label AND its manifest the
+                    // publication annotation (a stale label on a native import
+                    // is not ownership). Anything else is reported, not touched.
+                    if let Some(k) = k8s_img {
+                        let owned = k.label(SOURCE_DIGEST_LABEL).is_some()
+                            && match is_katamaran_published(reaper, &name, &k.digest) {
+                                Ok(owned) => owned,
                                 Err(e) => {
                                     log(&format!("mirror image {name}: {e}"));
                                     failures.push(format!("{name}: {e}"));
                                     continue;
                                 }
-                            }
-                        }
-                        Some(k) if is_adoptable_source_copy(k, &img, NATIVE_ARCH) => {
-                            Some(containerd_grpc::K8sOwnership::SourceCopy)
-                        }
-                        Some(_) => {
+                            };
+                        if !owned {
                             let msg = unowned_destination_message(&name);
                             log(&msg);
                             failures.push(msg);
                             continue;
                         }
-                    };
+                    }
                     let mut info_client = match containerd_grpc::ContentInfoClient::connect(
                         Path::new(CONTAINERD_SOCKET),
                         Duration::from_secs(30),
@@ -3800,12 +3775,9 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     let selected_platform = plan.selected_platform.clone();
                     // `publish_rewritten_image` re-verifies the target digest
                     // and labels against this evidence before deleting.
-                    let expected_k8s = k8s_img.zip(ownership).map(|(k, ownership)| {
-                        containerd_grpc::ExpectedK8sTarget {
-                            digest: k.digest.as_str(),
-                            is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
-                            ownership,
-                        }
+                    let expected_k8s = k8s_img.map(|k| containerd_grpc::ExpectedK8sTarget {
+                        digest: k.digest.as_str(),
+                        is_cri_managed: k.label("io.cri-containerd.image") == Some("managed"),
                     });
                     match containerd_grpc::publish_rewritten_image(
                         Path::new(CONTAINERD_SOCKET),
@@ -3824,54 +3796,15 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                         ) => {
                             retry_refs.insert(name);
                         }
+                        Err(containerd_grpc::PublishError::ReplacementUncertain(e)) => {
+                            // Nothing was released; report it and re-list so a
+                            // missing tag is recreated from Docker.
+                            log(&format!("mirror image {name}: {e}; re-listing"));
+                            failures.push(format!("{name}: {e}"));
+                            retry_refs.insert(name);
+                        }
                         Err(containerd_grpc::PublishError::Failed(e)) => {
                             log(&format!("mirror image {name}: {e}"));
-                            failures.push(format!("{name}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Only when emulation is explicitly confirmed disabled (never on a
-        // transient binfmt_misc read error), also retire any Katamaran-created
-        // emulation aliases in `k8s.io` whose source tags are no longer in
-        // `moby` (on the initial pass across all of `k8s.io`, and on retry
-        // passes for any retried ref that disappeared from `moby`), leaving all
-        // unrelated Kubernetes images untouched.
-        if emulation == EmulationMode::Disabled {
-            for (name, k8s_img) in &k8s {
-                let in_scope = match &only_refs {
-                    None => attempt == 0,
-                    Some(filter) => filter.contains(name),
-                };
-                if in_scope
-                    && !moby.contains_key(name)
-                    && k8s_img.label(SOURCE_DIGEST_LABEL).is_some()
-                {
-                    if !emulation_still_disabled() {
-                        log(&format!(
-                            "skipped retiring orphaned {name}: amd64 emulation state changed; re-listing"
-                        ));
-                        retry_refs.insert(name.clone());
-                        continue;
-                    }
-                    match retire_rewritten_image(reaper, name, None, &k8s_img.digest) {
-                        Ok(RetireResult::Deleted) => log(&format!(
-                            "retired orphaned Katamaran amd64 mirror {name} from k8s.io"
-                        )),
-                        Ok(RetireResult::NotFoundOrChanged) => log(&format!(
-                            "skipped retiring orphaned {name}: k8s.io target already removed or replaced"
-                        )),
-                        Ok(RetireResult::NotOwned) => {}
-                        Ok(RetireResult::SourceChanged) => {
-                            log(&format!(
-                                "skipped retiring orphaned {name}: tag reappeared in moby; re-listing"
-                            ));
-                            retry_refs.insert(name.clone());
-                        }
-                        Err(e) => {
-                            log(&format!("retire orphaned amd64 mirror {name}: {e}"));
                             failures.push(format!("{name}: {e}"));
                         }
                     }
@@ -3923,15 +3856,6 @@ fn current_emulation_mode(logged_unknown: &mut Vec<String>) -> EmulationMode {
     }
 }
 
-/// Re-check, right before retiring a mirror because emulation is disabled,
-/// that it is still explicitly disabled (never on an unknown reading).
-fn emulation_still_disabled() -> bool {
-    matches!(
-        super::amd64::status(),
-        super::amd64::EmulationStatus::Disabled
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeAvailability {
     Present,
@@ -3948,7 +3872,12 @@ enum SyncAction {
         clear_source_label: bool,
     },
     MirrorRewrite,
-    RetireRewritten,
+    /// A Katamaran amd64 mirror whose source would no longer be mirrored
+    /// because emulation is off: kept (never deleted automatically) and logged.
+    KeepMirrorEmulationOff,
+    /// Kubernetes has an unlabelled image under this name whose digest differs
+    /// from Docker's, and sync would otherwise leave it silently.
+    ReportDivergedTag,
     Relist,
     ReportProbeError,
     /// `k8s.io` already has an unlabelled tag under this name that is neither
@@ -3964,32 +3893,6 @@ enum SyncAction {
     /// linux/arm64 or rewritable linux/amd64 variant); the previous mirror is
     /// kept under the tag.
     ReportStaleMirror,
-}
-
-/// True when an unlabelled `k8s.io` tag can be adopted (replaced by the
-/// emulated mirror): its target is exactly the `moby` source digest, so the
-/// next sync can always rebuild it from Docker if the Delete→Create swap is
-/// interrupted, and its listed platforms advertise no native platform, so a
-/// concurrent kubelet pull can never give that digest usable native content
-/// (CRI rejects a manifest without a native match before creating any image
-/// record) and the conditional delete cannot remove a native tag.
-///
-/// Both platform lists must be resolved (`ctr images ls` prints `-` or
-/// nothing when it cannot walk the descriptor graph, e.g. a platformless
-/// child manifest is missing locally); an unresolved list is never taken as
-/// proof that no native variant exists. `moby` holds the fuller graph for the
-/// same digest, so a partially present native child shows up there.
-fn is_adoptable_source_copy(k8s: &CtrImage, moby: &CtrImage, native_arch: &str) -> bool {
-    let resolved_non_native = |platforms: Option<&str>| {
-        platforms.is_some_and(|p| {
-            let p = p.trim();
-            !p.is_empty() && p != "-" && !oci_rewrite::has_native_platform(p, native_arch)
-        })
-    };
-    k8s.label(SOURCE_DIGEST_LABEL).is_none()
-        && k8s.digest == moby.digest
-        && resolved_non_native(k8s.platforms.as_deref())
-        && resolved_non_native(moby.platforms.as_deref())
 }
 
 fn unowned_destination_message(name: &str) -> String {
@@ -4106,8 +4009,31 @@ fn classify_dest_native_availability(
     }
 }
 
-/// Decide how to synchronize a single `moby` image into `k8s.io`.
+/// Decide how to synchronize a single `moby` image into `k8s.io`. Never
+/// claims an image synced when Kubernetes keeps a different unlabelled image
+/// under the same name.
 fn plan_sync_action(
+    name: &str,
+    moby: &CtrImage,
+    k8s: Option<&CtrImage>,
+    native: NativeAvailability,
+    dest_native: NativeAvailability,
+    emulation: EmulationMode,
+    native_arch: &str,
+) -> SyncAction {
+    let action =
+        plan_sync_action_inner(name, moby, k8s, native, dest_native, emulation, native_arch);
+    let diverged_unlabelled =
+        k8s.is_some_and(|k| k.label(SOURCE_DIGEST_LABEL).is_none() && k.digest != moby.digest);
+    if action == SyncAction::Skip && diverged_unlabelled && !oci_rewrite::is_digest_reference(name)
+    {
+        SyncAction::ReportDivergedTag
+    } else {
+        action
+    }
+}
+
+fn plan_sync_action_inner(
     name: &str,
     moby: &CtrImage,
     k8s: Option<&CtrImage>,
@@ -4143,7 +4069,7 @@ fn plan_sync_action(
             // mirror is kept whenever the source cannot be (re)mirrored.
             if is_digest_ref {
                 if emulation == EmulationMode::Disabled && k8s_is_rewritten {
-                    return SyncAction::RetireRewritten;
+                    return SyncAction::KeepMirrorEmulationOff;
                 }
                 if emulation == EmulationMode::Enabled && has_amd64 {
                     return SyncAction::SkipDigestAmd64;
@@ -4166,22 +4092,14 @@ fn plan_sync_action(
                         // Stale Katamaran emulation mirror: update via CAS on `k.digest`.
                         SyncAction::MirrorRewrite
                     } else {
-                        // Unlabelled `k8s.io` image. Stay quiet when its local
-                        // native arm64 content is verified complete (not merely
-                        // advertised in `ctr images ls`). Otherwise adopt it only
-                        // if it is an exact amd64-only copy of the `moby` source
-                        // (mirrored unchanged by an earlier release; see
-                        // `is_adoptable_source_copy`). Anything else (e.g. a `ctr`
-                        // or kubelet pull, or a multi-platform index kubelet could
-                        // complete natively under the same digest) is never
-                        // replaced; tell the user how to resolve the conflict.
+                        // Unlabelled `k8s.io` image (a kubelet/`ctr` pull, a
+                        // native mirror, or a copy left by an earlier release):
+                        // never replaced. Stay quiet only when its local native
+                        // arm64 content is verified complete (not merely
+                        // advertised in `ctr images ls`) and it is the same
+                        // image; otherwise tell the user how to resolve it.
                         match dest_native {
                             NativeAvailability::Present => SyncAction::Skip,
-                            NativeAvailability::Absent
-                                if is_adoptable_source_copy(k, moby, native_arch) =>
-                            {
-                                SyncAction::MirrorRewrite
-                            }
                             NativeAvailability::Absent => SyncAction::ReportUnownedDestination,
                             NativeAvailability::Stale => SyncAction::Relist,
                             NativeAvailability::ProbeFailed => SyncAction::ReportProbeError,
@@ -4191,7 +4109,7 @@ fn plan_sync_action(
                     SyncAction::MirrorRewrite
                 }
             } else if emulation == EmulationMode::Disabled && k8s_is_rewritten {
-                SyncAction::RetireRewritten
+                SyncAction::KeepMirrorEmulationOff
             } else if emulation == EmulationMode::Unknown
                 && has_amd64
                 && !is_digest_ref
@@ -4274,56 +4192,6 @@ fn probe_native_complete(
         oci_rewrite::NativeManifestCheck::Incomplete => Ok(NativeAvailability::Absent),
         oci_rewrite::NativeManifestCheck::RootMissing => Ok(NativeAvailability::Stale),
     }
-}
-
-/// Guarded retirement of a Katamaran-rewritten `k8s.io` image: verifies that
-/// `moby` still matches `expected_moby_digest` (`Some(digest)` when retiring
-/// for a known source digest, or `None` for orphan cleanup) AND atomically
-/// deletes `k8s.io` only if its target still matches `expected_k8s_digest`.
-///
-/// The source-digest label alone is not proof of ownership (a native import
-/// whose label clearing failed still carries it), so the `k8s.io` target
-/// manifest must also carry Katamaran's per-publication annotation. Content
-/// is immutable per digest and the delete is conditional on that digest, so
-/// this check cannot race. A labelled tag without it is left untouched and
-/// reported as `NotFoundOrChanged`.
-fn retire_rewritten_image(
-    reaper: &Reaper,
-    name: &str,
-    expected_moby_digest: Option<&str>,
-    expected_k8s_digest: &str,
-) -> Result<RetireResult, String> {
-    if !is_katamaran_published(reaper, name, expected_k8s_digest)? {
-        log(&format!(
-            "not retiring {name}: k8s.io target {expected_k8s_digest} is not a katamaran-published mirror"
-        ));
-        return Ok(RetireResult::NotOwned);
-    }
-    let outcome = containerd_grpc::retire_image_if_unchanged(
-        Path::new(CONTAINERD_SOCKET),
-        name,
-        expected_moby_digest,
-        expected_k8s_digest,
-        Duration::from_secs(15),
-    )?;
-    Ok(match outcome {
-        containerd_grpc::RetireOutcome::Deleted => RetireResult::Deleted,
-        containerd_grpc::RetireOutcome::NotFoundOrChanged => RetireResult::NotFoundOrChanged,
-        containerd_grpc::RetireOutcome::SourceChanged => RetireResult::SourceChanged,
-    })
-}
-
-/// Result of [`retire_rewritten_image`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetireResult {
-    Deleted,
-    /// `k8s.io` was already absent or no longer points to the expected digest.
-    NotFoundOrChanged,
-    /// `moby` changed concurrently; re-list.
-    SourceChanged,
-    /// The tag is still present but is not a Katamaran publication, so it was
-    /// left untouched (already logged).
-    NotOwned,
 }
 
 /// Upper bound for a manifest `publish_rewritten_image` can have written: the
@@ -5498,8 +5366,9 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
         ));
         assert!(!is_published_mirror_manifest(br#"{"schemaVersion":2}"#));
         assert!(!is_published_mirror_manifest(b"not json"));
-        // Upgrade from 0.10.0 (#41): the amd64 image was mirrored unchanged, so
-        // the unlabelled k8s.io tag is an exact copy of the moby source -> adopt.
+        // A legacy unlabelled copy (e.g. an amd64 image mirrored unchanged by
+        // 0.10.0, #41) is never adopted or deleted: it is reported with the
+        // retag workaround instead.
         let k8s_unchanged_copy = ctr_img(&amd64_idx.digest, "linux/amd64", &[]);
         assert_eq!(
             plan_sync_action(
@@ -5511,37 +5380,24 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Enabled,
                 "arm64"
             ),
-            SyncAction::MirrorRewrite
+            SyncAction::ReportUnownedDestination
         );
-        // A legacy copy of a multi-platform index that advertises arm64 (only
-        // amd64 blobs local) is NOT adopted: kubelet could complete arm64 under
-        // the same registry digest, which a digest-only delete would then hit.
         let k8s_unchanged_multi = ctr_img(&amd64_idx.digest, "linux/amd64,linux/arm64/v8", &[]);
-        assert!(!is_adoptable_source_copy(
-            &k8s_unchanged_multi,
-            &amd64_idx,
-            "arm64"
-        ));
-        // An unresolved platform inventory (`-`, e.g. a platformless arm64
-        // child missing from k8s.io) on either side is never proof of absence.
-        let k8s_unresolved = ctr_img(&amd64_idx.digest, "-", &[]);
-        assert!(!is_adoptable_source_copy(
-            &k8s_unresolved,
-            &amd64_idx,
-            "arm64"
-        ));
-        let moby_partial_native = ctr_img(&amd64_idx.digest, "linux/amd64,linux/arm64", &[]);
-        assert!(!is_adoptable_source_copy(
-            &k8s_unchanged_copy,
-            &moby_partial_native,
-            "arm64"
-        ));
-        let moby_unresolved = ctr_img(&amd64_idx.digest, "-", &[]);
-        assert!(!is_adoptable_source_copy(
-            &k8s_unchanged_copy,
-            &moby_unresolved,
-            "arm64"
-        ));
+        // A diverged unlabelled tag that sync would otherwise skip (here:
+        // emulation off) is reported, never claimed as synced.
+        let k8s_native_old = ctr_img("sha256:old-native", "linux/arm64", &[]);
+        assert_eq!(
+            plan_sync_action(
+                "app:dev",
+                &amd64_idx,
+                Some(&k8s_native_old),
+                NativeAvailability::Absent,
+                NativeAvailability::Present,
+                EmulationMode::Disabled,
+                "arm64"
+            ),
+            SyncAction::ReportDivergedTag
+        );
         assert_eq!(
             plan_sync_action(
                 "app:dev",
@@ -5568,7 +5424,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::RetireRewritten
+            SyncAction::KeepMirrorEmulationOff
         );
         assert_eq!(
             plan_sync_action(
@@ -5693,7 +5549,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::RetireRewritten
+            SyncAction::KeepMirrorEmulationOff
         );
         // amd64 = off: a digest ref is not reported as an emulation skip.
         assert_eq!(

@@ -5,10 +5,9 @@
 //! - `Images.List`: returns structured `map<string, string>` labels and target
 //!   descriptors so label values containing commas can never spoof ownership
 //!   markers.
-//! - `Images.Delete` with `DeleteImageRequest.target` (and source-guarded
-//!   `retire_image_if_unchanged`): verifies `moby`'s source digest and performs
-//!   an atomic compare-and-delete inside containerd's BoltDB write transaction,
-//!   leaving any concurrent replacement image untouched.
+//! - `Images.Delete` with `DeleteImageRequest.target`: an atomic
+//!   compare-and-delete inside containerd's BoltDB write transaction, leaving
+//!   any concurrent replacement image untouched.
 //! - `Content.Info`: resolves authoritative blob sizes via direct O(1)
 //!   digest-keyed lookups (never `Content.List`, which scans the entire
 //!   namespace in containerd v2.4.2) so unrelated `moby` blobs never slow or
@@ -119,21 +118,6 @@ enum DeleteOutcome {
     NotFoundOrChanged,
 }
 
-/// Outcome of a source-and-target guarded [`retire_image_if_unchanged`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetireOutcome {
-    /// `moby` still matched the expected source digest (or remained absent for
-    /// orphan cleanup) and `k8s.io` still matched `expected_k8s_digest`, so the
-    /// `k8s.io` mirror was deleted.
-    Deleted,
-    /// `k8s.io` was already absent or its target digest changed concurrently
-    /// (for example, replaced by a native kubelet pull) and was left untouched.
-    NotFoundOrChanged,
-    /// `moby` changed concurrently (retagged, created, or deleted); `k8s.io`
-    /// was left untouched so the caller can re-list and re-evaluate.
-    SourceChanged,
-}
-
 /// Error returned by [`publish_rewritten_image`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishError {
@@ -144,6 +128,10 @@ pub enum PublishError {
     /// or replaced by a native kubelet pull); the existing `k8s.io` tag was
     /// left untouched.
     DestinationChanged { expected: String, actual: String },
+    /// Replacing an existing mirror: `Images.Delete` returned an uncertain
+    /// error. The previous content stays pinned under the lease; the caller
+    /// should report this and re-list.
+    ReplacementUncertain(String),
     /// Any other containerd gRPC, content, or I/O error.
     Failed(String),
 }
@@ -159,7 +147,7 @@ impl fmt::Display for PublishError {
                 f,
                 "k8s.io destination digest changed before publish (expected {expected}, got {actual})"
             ),
-            Self::Failed(msg) => f.write_str(msg),
+            Self::ReplacementUncertain(msg) | Self::Failed(msg) => f.write_str(msg),
         }
     }
 }
@@ -301,75 +289,18 @@ fn delete_image_if_target_matches(
     conn.delete_image_if_target_matches(namespace, name, target_digest)
 }
 
-/// Guarded retirement of a Katamaran-created `k8s.io` mirror over a single
-/// bounded HTTP/2 connection:
+/// Expected destination state in `k8s.io` when replacing an existing
+/// Katamaran mirror.
 ///
-/// 1. Queries `Images.Get("moby", name)` and confirms that `moby` still matches
-///    `expected_moby_digest` (`Some(digest)` when retiring for a known source
-///    digest, or `None` when retiring an orphan after `name` disappeared from
-///    `moby`). If `moby` changed concurrently, returns
-///    [`RetireOutcome::SourceChanged`] without touching `k8s.io`.
-/// 2. Calls conditional `Images.Delete("k8s.io", name, target = expected_k8s_digest)`
-///    so any concurrent native replacement in `k8s.io` is also preserved.
-pub fn retire_image_if_unchanged(
-    socket_path: &Path,
-    name: &str,
-    expected_moby_digest: Option<&str>,
-    expected_k8s_digest: &str,
-    timeout: Duration,
-) -> Result<RetireOutcome, String> {
-    if name.is_empty() {
-        return Err("refusing to retire image with empty name".into());
-    }
-    if expected_k8s_digest.is_empty() {
-        return Err(format!(
-            "refusing to retire {name} without an expected k8s.io target digest"
-        ));
-    }
-
-    let deadline = Instant::now() + timeout;
-    let mut conn = GrpcConn::connect(socket_path, deadline)?;
-    let current_moby = conn.get_image("moby", name)?;
-    let actual_moby_digest = current_moby.as_ref().map(|i| i.target.digest.as_str());
-    if actual_moby_digest != expected_moby_digest {
-        return Ok(RetireOutcome::SourceChanged);
-    }
-
-    match conn.delete_image_if_target_matches("k8s.io", name, expected_k8s_digest)? {
-        DeleteOutcome::Deleted => Ok(RetireOutcome::Deleted),
-        DeleteOutcome::NotFoundOrChanged => Ok(RetireOutcome::NotFoundOrChanged),
-    }
-}
-
-/// Expected destination state in `k8s.io` when replacing an existing tag.
-///
-/// Only tags that sync can always rebuild from `moby`, and whose digest no
-/// other writer will ever recreate, are replaced (see [`K8sOwnership`]). A
-/// Delete→Create swap cannot be made atomic; if it is interrupted (for
-/// example by a guest restart between the two RPCs), the sync at the next
-/// Kubernetes start or Docker image event recreates the tag from `moby`, and
-/// a delayed delete of the old digest can never match a later tag. Any other
-/// existing tag is never replaced.
+/// The caller must have established, for this exact digest, that the tag is a
+/// Katamaran publication: it carries the source-digest label and its manifest
+/// carries [`PUBLICATION_ANNOTATION`] (content is immutable per digest, and the
+/// delete is conditional on that digest, so the check cannot race). No other
+/// existing `k8s.io` tag is ever deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpectedK8sTarget<'a> {
     pub digest: &'a str,
     pub is_cri_managed: bool,
-    pub ownership: K8sOwnership,
-}
-
-/// Evidence, established by the caller for the exact target digest (content
-/// is immutable per digest, and every delete is conditional on that digest),
-/// that an existing `k8s.io` tag may be replaced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum K8sOwnership {
-    /// The tag carries the source-digest label and its manifest carries
-    /// [`PUBLICATION_ANNOTATION`], i.e. it was written by
-    /// [`publish_rewritten_image`]; its digest is unique to that publication.
-    PublishedMirror,
-    /// Legacy upgrade: an unlabelled tag whose digest equals the `moby` source
-    /// digest and whose resolved platform lists (in both namespaces) have no
-    /// native entry, so kubelet can never pull native content under it.
-    SourceCopy,
 }
 
 /// Manifest annotation carrying a unique per-publication identifier (the
@@ -378,51 +309,36 @@ pub enum K8sOwnership {
 /// targeting an earlier digest) can ever match.
 pub const PUBLICATION_ANNOTATION: &str = "io.katamaran.k8s.publication";
 
-enum RestoreState {
-    /// `Images.Delete` definitely committed, and the subsequent `Images.Create`
-    /// failed. No delete is in flight, so recovery restores `old_image` (a
-    /// Katamaran mirror) if the tag is absent.
-    DefiniteDelete(ContainerdImage),
-    /// `Images.Delete(name, target = old_digest)` returned an uncertain error
-    /// and may still execute in BoltDB at any future time. Recovery re-checks
-    /// `moby` and, if the source is unchanged, neutralizes the in-flight
-    /// conditional delete by swapping `old_digest` to `new_image` (whose digest
-    /// is unique to this publication) via conditional
-    /// `Images.Delete(target = old_digest)` + create-only `Images.Create`.
-    UncertainDelete(Box<UncertainDeleteState>),
-}
-
-struct UncertainDeleteState {
-    old_image: ContainerdImage,
-    new_image: ContainerdImage,
-    new_config_digest: String,
-}
-
 /// Publish a metadata-only [`RewritePlan`] into `k8s.io` without reading,
 /// transmitting, or writing a second copy of any layer blobs.
 ///
 /// Existing layer blobs from `moby` are linked into `k8s.io` via containerd's
 /// shared-content `Content.Write` commit (`offset == size`, empty `data`), only
 /// the rewritten config and manifest blobs are written (with containerd GC
-/// child labels on the manifest), the `moby` source image digest is verified
-/// before writing and immediately prior to publication, and a temporary lease
-/// protects in-flight metadata from GC until guarded publication completes.
+/// child labels on the manifest), and a temporary lease protects in-flight
+/// metadata from GC. The `moby` source digest is verified before writing and
+/// immediately before publishing, and re-read after publishing (a retag then
+/// returns [`PublishError::SourceChanged`] so the caller re-lists; the new tag
+/// is kept).
 ///
-/// Every publication stamps the manifest with [`PUBLICATION_ANNOTATION`] set
-/// to its server-generated lease ID, so a published manifest digest is never
-/// reused by a later publication and a delayed conditional delete of an
-/// earlier digest can never remove a newer mirror.
+/// Every publication stamps the manifest with [`PUBLICATION_ANNOTATION`], so
+/// published digests never recur.
 ///
-/// `expected_k8s` prevents overwriting concurrent Kubernetes image pulls or
-/// tags Katamaran does not own:
-/// - `None`: publishes strictly via `Images.Create`; if the tag already exists,
-///   returns [`PublishError::DestinationChanged`] without touching `k8s.io`.
-/// - `Some(target)`: replaces an existing tag only with ownership evidence
-///   ([`K8sOwnership`]). Verifies that `k8s.io` still points to
-///   `target.digest`, that its labels still match that evidence, and that it
-///   has not been claimed by CRI, then swaps it via conditional
-///   `Images.Delete(target)` + create-only `Images.Create`. Otherwise returns
-///   [`PublishError::DestinationChanged`] without deleting anything.
+/// `expected_k8s`:
+/// - `None`: create-only `Images.Create`; an existing tag is never touched
+///   ([`PublishError::DestinationChanged`]).
+/// - `Some(target)`: replaces an existing Katamaran mirror (see
+///   [`ExpectedK8sTarget`]) via conditional `Images.Delete(target)` +
+///   create-only `Images.Create`.
+///
+/// Nothing is deleted, and the lease is not released, unless that is
+/// provably safe. If the delete's outcome is uncertain, the lease stays
+/// pinned (until its `gc.expire` TTL) and [`PublishError::ReplacementUncertain`]
+/// is returned so the caller reports it and re-lists: a missing tag is then
+/// recreated from `moby`, and a delayed delete can never match the new
+/// publication's unique digest. If the delete definitely committed but the
+/// create failed, the previous mirror is restored; if that also fails, the
+/// lease stays pinned.
 pub fn publish_rewritten_image(
     socket_path: &Path,
     name: &str,
@@ -466,13 +382,6 @@ fn publish_rewritten_image_with_delete_timeout(
             "refusing to publish {name} with empty expected k8s.io target digest"
         )));
     }
-    if expected_k8s
-        .is_some_and(|e| e.ownership == K8sOwnership::SourceCopy && e.digest != plan.source_digest)
-    {
-        return Err(PublishError::Failed(format!(
-            "refusing to adopt {name}: k8s.io target is not a copy of the moby source"
-        )));
-    }
 
     let deadline = Instant::now() + timeout;
     let mut conn = GrpcConn::connect(socket_path, deadline).map_err(PublishError::Failed)?;
@@ -514,9 +423,10 @@ fn publish_rewritten_image_with_delete_timeout(
         .create_lease("k8s.io", &[(LEASE_EXPIRE_LABEL, &expire)])
         .map_err(PublishError::Failed)?;
 
-    let mut restore_state: Option<RestoreState> = None;
+    let mut keep_lease = false;
     let publish_res = publish_under_lease(
         &mut conn,
+        socket_path,
         name,
         source_digest_label,
         expected_k8s,
@@ -524,30 +434,11 @@ fn publish_rewritten_image_with_delete_timeout(
         &unique_layers,
         &lease_id,
         delete_rpc_timeout,
-        &mut restore_state,
+        &mut keep_lease,
     );
-
-    // If replacing an existing mirror failed after `Images.Delete` was
-    // attempted (or its outcome was uncertain), shut down and drop the possibly
-    // broken/expired publish connection and recover BEFORE deleting the lease
-    // (which pins both the old and new target content) over a fresh connection.
-    if let Some(state) = restore_state {
-        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
-        drop(conn);
-        return recover_and_cleanup_lease(
-            socket_path,
-            "k8s.io",
-            &lease_id,
-            &plan.source_digest,
-            &state,
-            publish_res,
-        );
+    if !keep_lease {
+        cleanup_lease_best_effort(&mut conn, socket_path, "k8s.io", &lease_id);
     }
-
-    // Best-effort lease cleanup: try on the active connection first, falling
-    // back to a fresh bounded dial if the connection broke mid-publish.
-    cleanup_lease_best_effort(&mut conn, socket_path, "k8s.io", &lease_id);
-
     publish_res
 }
 
@@ -565,161 +456,19 @@ fn cleanup_lease_best_effort(
     }
 }
 
-fn recover_and_cleanup_lease(
-    socket_path: &Path,
-    namespace: &str,
-    lease_id: &str,
-    expected_moby_digest: &str,
-    restore_state: &RestoreState,
-    mut publish_res: Result<Rewritten, PublishError>,
-) -> Result<Rewritten, PublishError> {
-    let mut recovery_conn =
-        match GrpcConn::connect(socket_path, Instant::now() + RECOVERY_OP_TIMEOUT) {
-            Ok(c) => c,
-            Err(e) => {
-                // Keep `lease_id` pinned until its `gc.expire` TTL on failure.
-                if let Err(PublishError::Failed(ref mut msg)) = publish_res {
-                    msg.push_str(&format!("; failed to restore previous tag: {e}"));
-                }
-                return publish_res;
-            }
-        };
-
-    match restore_state {
-        RestoreState::DefiniteDelete(old_image) => {
-            match restore_if_absent(&mut recovery_conn, namespace, lease_id, old_image) {
-                Ok(()) => {
-                    cleanup_lease_best_effort(&mut recovery_conn, socket_path, namespace, lease_id)
-                }
-                Err(restore_err) => {
-                    // Do not delete `lease_id` when recovery fails so containerd
-                    // GC cannot collect `old_image.target.digest` prematurely.
-                    if let Err(PublishError::Failed(ref mut msg)) = publish_res {
-                        msg.push_str(&format!("; failed to restore previous tag: {restore_err}"));
-                    }
-                }
-            }
-            publish_res
-        }
-        RestoreState::UncertainDelete(uncertain) => {
-            // An uncertain `Images.Delete(name, target = old_digest)` may still
-            // execute in BoltDB at any later time (a lease write or timer cannot
-            // prove it finished under Go mutex barging and non-cancellable bbolt
-            // transactions). Neutralize it by swapping `k8s.io` away from
-            // `old_digest` to `new_image` (a digest unique to this publication),
-            // unless `moby` changed, in which case the stale plan is never
-            // published and the caller re-lists.
-            match recover_uncertain_delete(
-                &mut recovery_conn,
-                namespace,
-                lease_id,
-                expected_moby_digest,
-                &uncertain.old_image,
-                &uncertain.new_image,
-                &uncertain.new_config_digest,
-            ) {
-                Ok(final_res) => {
-                    cleanup_lease_best_effort(&mut recovery_conn, socket_path, namespace, lease_id);
-                    final_res
-                }
-                Err(restore_err) => {
-                    // Recovery did not neutralize or confirm the tag — keep
-                    // `lease_id` pinned until `gc.expire` and report failure.
-                    if let Err(PublishError::Failed(ref mut msg)) = publish_res {
-                        msg.push_str(&format!("; failed to restore previous tag: {restore_err}"));
-                    }
-                    publish_res
-                }
-            }
-        }
-    }
-}
-
+/// Recreate `old_image` (whose content is pinned under `lease_id`) if its tag
+/// is absent, over a fresh bounded connection.
 fn restore_if_absent(
-    conn: &mut GrpcConn,
-    namespace: &str,
+    socket_path: &Path,
     lease_id: &str,
     old_image: &ContainerdImage,
 ) -> Result<(), String> {
-    match conn.get_image(namespace, &old_image.name)? {
+    let mut conn = GrpcConn::connect(socket_path, Instant::now() + RECOVERY_OP_TIMEOUT)?;
+    match conn.get_image("k8s.io", &old_image.name)? {
         Some(_) => Ok(()),
-        None => match conn.create_image(namespace, Some(lease_id), old_image)? {
+        None => match conn.create_image("k8s.io", Some(lease_id), old_image)? {
             CreateOutcome::Created | CreateOutcome::AlreadyExists => Ok(()),
         },
-    }
-}
-
-/// Recovery after an uncertain `Images.Delete(name, target = old_digest)`.
-///
-/// Only tags rebuildable from `moby` are ever deleted (see
-/// [`ExpectedK8sTarget`]), so a tag left absent here (or by a guest restart
-/// mid-replacement) is recreated by the next sync while `moby` still has the
-/// source.
-fn recover_uncertain_delete(
-    conn: &mut GrpcConn,
-    namespace: &str,
-    lease_id: &str,
-    expected_moby_digest: &str,
-    old_image: &ContainerdImage,
-    new_image: &ContainerdImage,
-    new_config_digest: &str,
-) -> Result<Result<Rewritten, PublishError>, String> {
-    if old_image.target.digest == new_image.target.digest {
-        return Err("refusing to neutralize an uncertain delete with the same digest".into());
-    }
-
-    let source = verify_moby_source_digest(conn, &old_image.name, expected_moby_digest);
-    if let Err(PublishError::Failed(e)) = source {
-        return Err(e);
-    }
-
-    // Fence the in-flight delete: after this conditional delete commits,
-    // `k8s.io[name]` is either absent or points to a digest other than
-    // `old_digest`, and no later publication reuses `old_digest` (every
-    // publication's manifest digest is unique), so the original delete can
-    // never remove a tag a later sync creates or accepts.
-    let _ =
-        conn.delete_image_if_target_matches(namespace, &old_image.name, &old_image.target.digest)?;
-
-    // If Docker retagged the source while the delete was uncertain, never
-    // publish the stale plan: return `SourceChanged` with the tag fenced so
-    // the re-list publishes the mirror of the new source. If Docker removed
-    // the source, still publish this plan (the last Docker state before the
-    // removal): removing a Docker image never removes its Kubernetes copy,
-    // so the tag must not be left absent.
-    let source_removed = matches!(
-        &source,
-        Err(PublishError::SourceChanged { actual, .. }) if actual == "<deleted>"
-    );
-    if let Err(changed) = &source
-        && !source_removed
-    {
-        return Ok(Err(changed.clone()));
-    }
-
-    match conn.create_image(namespace, Some(lease_id), new_image)? {
-        CreateOutcome::Created => {
-            // `k8s.io[name]` now points to `new_image.target.digest`, unique
-            // to this publication, so the original in-flight
-            // `Delete(target = old_digest)` can never match or remove this tag.
-            if let Err(removed) = source {
-                return Ok(Err(removed));
-            }
-            Ok(Ok(Rewritten {
-                manifest: new_image.target.digest.clone(),
-                config: new_config_digest.to_string(),
-            }))
-        }
-        CreateOutcome::AlreadyExists => {
-            // A competing writer created a tag with digest != `old_digest`
-            // (our conditional `Delete(old_digest)` just ran), so leave it
-            // untouched; the original `Delete(target = old_digest)` cannot
-            // match it either.
-            Ok(Err(PublishError::DestinationChanged {
-                expected: old_image.target.digest.clone(),
-                actual: "<changed>".into(),
-            }))
-        }
     }
 }
 
@@ -750,6 +499,7 @@ fn stamp_publication_id(manifest: &[u8], publication_id: &str) -> Result<Vec<u8>
 #[allow(clippy::too_many_arguments)]
 fn publish_under_lease(
     conn: &mut GrpcConn,
+    socket_path: &Path,
     name: &str,
     source_digest_label: &str,
     expected_k8s: Option<ExpectedK8sTarget<'_>>,
@@ -757,7 +507,7 @@ fn publish_under_lease(
     unique_layers: &[(&str, i64)],
     lease_id: &str,
     delete_rpc_timeout: Duration,
-    restore_state: &mut Option<RestoreState>,
+    keep_lease: &mut bool,
 ) -> Result<Rewritten, PublishError> {
     let config_digest = format!("sha256:{}", plan.new_config_hex);
 
@@ -893,31 +643,20 @@ fn publish_under_lease(
                 Some(cur) => cur,
             };
 
-            // Only ever replace a tag the next sync can rebuild from `moby`:
-            // a Katamaran mirror, or (when adopting) an unlabelled exact copy
-            // of the current source. Any other tag without
-            // `source_digest_label` (such as a native kubelet/`ctr` pull)
-            // could be lost if the Delete→Create swap is interrupted, so it is
-            // never deleted. Also back off if CRI claimed the tag concurrently.
+            // The caller proved this digest is a Katamaran publication; also
+            // require the label still present and no concurrent CRI claim.
             let cur_is_labelled = old_image.labels.contains_key(source_digest_label);
-            let ownership_holds = match expected.ownership {
-                K8sOwnership::PublishedMirror => cur_is_labelled,
-                K8sOwnership::SourceCopy => {
-                    !cur_is_labelled && old_image.target.digest == plan.source_digest
-                }
-            };
             let cur_is_cri_managed =
                 old_image.labels.get(CRI_MANAGED_LABEL).map(String::as_str) == Some("managed");
-            if !ownership_holds || (!expected.is_cri_managed && cur_is_cri_managed) {
+            if !cur_is_labelled || (!expected.is_cri_managed && cur_is_cri_managed) {
                 return Err(PublishError::DestinationChanged {
                     expected: expected.digest.to_string(),
                     actual: "<labels-changed>".into(),
                 });
             }
 
-            // Pin the existing mirror's target content under `lease_id` before
-            // deleting so containerd GC cannot collect it if replacement
-            // creation fails and `old_image` must be restored.
+            // Pin the previous mirror's content under the lease before deleting
+            // so it can be restored (and is not collected) if anything fails.
             conn.add_lease_resource("k8s.io", lease_id, &old_image.target.digest, "content")
                 .map_err(|e| {
                     PublishError::Failed(format!(
@@ -929,67 +668,68 @@ fn publish_under_lease(
             let del_timeout = remaining_or_timeout(conn.deadline, "Images.Delete")
                 .map_err(PublishError::Failed)?
                 .min(delete_rpc_timeout);
-
-            // Record `UncertainDelete` BEFORE sending `Images.Delete` so
-            // recovery neutralizes the conditional delete by swapping away
-            // from `old_image.target.digest` if `Images.Delete` returns an
-            // uncertain transport/timeout error.
-            *restore_state = Some(RestoreState::UncertainDelete(Box::new(
-                UncertainDeleteState {
-                    old_image: old_image.clone(),
-                    new_image: image.clone(),
-                    new_config_digest: config_digest.clone(),
-                },
-            )));
-
-            // Atomic BoltDB compare-and-delete on `expected.digest` with a
-            // tight per-RPC `grpc-timeout`, followed by `Images.Create` under
-            // `lease_id`.
-            match conn
-                .delete_image_if_target_matches_with_timeout(
-                    "k8s.io",
-                    name,
-                    expected.digest,
-                    del_timeout,
-                )
-                .map_err(PublishError::Failed)?
-            {
-                DeleteOutcome::Deleted => {
-                    *restore_state = Some(RestoreState::DefiniteDelete(old_image.clone()));
-                }
-                DeleteOutcome::NotFoundOrChanged => {
-                    *restore_state = None;
+            match conn.delete_image_if_target_matches_with_timeout(
+                "k8s.io",
+                name,
+                expected.digest,
+                del_timeout,
+            ) {
+                Ok(DeleteOutcome::Deleted) => {}
+                Ok(DeleteOutcome::NotFoundOrChanged) => {
                     return Err(PublishError::DestinationChanged {
                         expected: expected.digest.to_string(),
                         actual: "<changed>".into(),
                     });
                 }
+                Err(e) => {
+                    // The delete may or may not have committed (or may still
+                    // commit). Keep everything pinned and let the caller re-list.
+                    *keep_lease = true;
+                    return Err(PublishError::ReplacementUncertain(format!(
+                        "replace {name}: Images.Delete outcome unknown ({e}); previous content stays pinned under lease {lease_id}"
+                    )));
+                }
             }
 
-            match conn
-                .create_image("k8s.io", Some(lease_id), &image)
-                .map_err(PublishError::Failed)?
-            {
-                CreateOutcome::Created => {
-                    *restore_state = None;
-                }
-                CreateOutcome::AlreadyExists => {
-                    *restore_state = None;
+            match conn.create_image("k8s.io", Some(lease_id), &image) {
+                Ok(CreateOutcome::Created) => {}
+                Ok(CreateOutcome::AlreadyExists) => {
+                    // A competing writer took the tag after our delete.
                     return Err(PublishError::DestinationChanged {
                         expected: expected.digest.to_string(),
                         actual: "<exists>".into(),
+                    });
+                }
+                Err(e) => {
+                    return Err(match restore_if_absent(socket_path, lease_id, &old_image) {
+                        Ok(()) => PublishError::Failed(format!(
+                            "create {name}: {e}; previous mirror restored"
+                        )),
+                        Err(re) => {
+                            *keep_lease = true;
+                            PublishError::Failed(format!(
+                                "create {name}: {e}; failed to restore previous tag: {re}; previous content stays pinned under lease {lease_id}"
+                            ))
+                        }
                     });
                 }
             }
         }
     }
 
-    // A Docker retag after step 7 emits an image event whose (serialized)
-    // sync sees the source-digest label mismatch and replaces this mirror.
-    Ok(Rewritten {
-        manifest: manifest_digest,
-        config: config_digest,
-    })
+    // 9. Non-destructive source re-check: if Docker retagged the source after
+    //    step 7 (e.g. during the startup sync, before the event subscription
+    //    is open), report it so the caller re-lists and replaces this mirror.
+    //    A removal or an unreadable source keeps the new mirror as is.
+    match verify_moby_source_digest(conn, name, &plan.source_digest) {
+        Err(PublishError::SourceChanged { expected, actual }) if actual != "<deleted>" => {
+            Err(PublishError::SourceChanged { expected, actual })
+        }
+        _ => Ok(Rewritten {
+            manifest: manifest_digest,
+            config: config_digest,
+        }),
+    }
 }
 
 fn verify_moby_source_digest(
@@ -1425,6 +1165,7 @@ impl GrpcConn {
         Ok(())
     }
 
+    #[cfg(test)]
     fn delete_image_if_target_matches(
         &mut self,
         namespace: &str,
@@ -2895,7 +2636,6 @@ mod tests {
         ExpectedK8sTarget {
             digest,
             is_cri_managed: false,
-            ownership: K8sOwnership::PublishedMirror,
         }
     }
 
@@ -4948,211 +4688,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Regression test: `retire_image_if_unchanged` checks BOTH `moby`'s source
-    /// digest and `k8s.io`'s target digest before deleting, so a concurrent
-    /// Docker retag (or recreated tag during orphan cleanup, or native kubelet
-    /// replacement) never deletes a working mirror or native image.
-    #[test]
-    fn retire_image_if_unchanged_verifies_moby_source_and_k8s_target() {
-        let (dir, sock) = temp_sock("retire");
-        let listener = UnixListener::bind(&sock).unwrap();
-
-        let mk_img = |name: &str, digest: &str| ContainerdImage {
-            name: name.into(),
-            labels: HashMap::from([(
-                "io.katamaran.k8s.source-digest".into(),
-                "sha256:prev-good".into(),
-            )]),
-            target: Descriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
-                digest: digest.into(),
-                size: 128,
-                ..Default::default()
-            },
-        };
-
-        let state = Arc::new(Mutex::new(MockContainerdState {
-            images: HashMap::from([
-                // 1. Source retagged concurrently in moby; k8s still holds working mirror.
-                (
-                    ("moby".into(), "docker.io/library/retagged:dev".into()),
-                    mk_img("docker.io/library/retagged:dev", "sha256:new-complete"),
-                ),
-                (
-                    ("k8s.io".into(), "docker.io/library/retagged:dev".into()),
-                    mk_img("docker.io/library/retagged:dev", "sha256:working-mirror"),
-                ),
-                // 2. Source deleted concurrently from moby while retiring for a known source digest.
-                (
-                    ("k8s.io".into(), "docker.io/library/vanished:dev".into()),
-                    mk_img("docker.io/library/vanished:dev", "sha256:working-mirror"),
-                ),
-                // 3. Source still incomplete in moby AND k8s mirror unchanged -> retire!
-                (
-                    ("moby".into(), "docker.io/library/stale:dev".into()),
-                    mk_img("docker.io/library/stale:dev", "sha256:bad-incomplete"),
-                ),
-                (
-                    ("k8s.io".into(), "docker.io/library/stale:dev".into()),
-                    mk_img("docker.io/library/stale:dev", "sha256:old-mirror"),
-                ),
-                // 4. Source still incomplete, but kubelet replaced k8s tag with native pull.
-                (
-                    ("moby".into(), "docker.io/library/kubelet:dev".into()),
-                    mk_img("docker.io/library/kubelet:dev", "sha256:bad-incomplete"),
-                ),
-                (
-                    ("k8s.io".into(), "docker.io/library/kubelet:dev".into()),
-                    mk_img("docker.io/library/kubelet:dev", "sha256:native-pull"),
-                ),
-                // 5. Orphan cleanup: absent from moby and unchanged in k8s -> delete!
-                (
-                    ("k8s.io".into(), "docker.io/library/orphan:dev".into()),
-                    mk_img("docker.io/library/orphan:dev", "sha256:orphan-mirror"),
-                ),
-                // 6. Orphan cleanup raced with tag recreation in moby -> preserve!
-                (
-                    ("moby".into(), "docker.io/library/reborn:dev".into()),
-                    mk_img("docker.io/library/reborn:dev", "sha256:new-native"),
-                ),
-                (
-                    ("k8s.io".into(), "docker.io/library/reborn:dev".into()),
-                    mk_img("docker.io/library/reborn:dev", "sha256:old-mirror"),
-                ),
-                // 7. RPC failure checking moby -> propagate error and preserve k8s mirror.
-                (
-                    ("k8s.io".into(), "docker.io/library/err:dev".into()),
-                    mk_img("docker.io/library/err:dev", "sha256:keep-mirror"),
-                ),
-            ]),
-            fail_get_image: Some("docker.io/library/err:dev".into()),
-            ..Default::default()
-        }));
-
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 7, 65_535);
-
-        // 1. Concurrent retag in moby -> SourceChanged, working mirror untouched.
-        assert_eq!(
-            retire_image_if_unchanged(
-                &sock,
-                "docker.io/library/retagged:dev",
-                Some("sha256:bad-incomplete"),
-                "sha256:working-mirror",
-                Duration::from_secs(5),
-            )
-            .unwrap(),
-            RetireOutcome::SourceChanged
-        );
-        // 2. Concurrent delete in moby -> SourceChanged, mirror preserved for relist.
-        assert_eq!(
-            retire_image_if_unchanged(
-                &sock,
-                "docker.io/library/vanished:dev",
-                Some("sha256:bad-incomplete"),
-                "sha256:working-mirror",
-                Duration::from_secs(5),
-            )
-            .unwrap(),
-            RetireOutcome::SourceChanged
-        );
-        // 3. Unchanged moby + unchanged k8s -> Deleted.
-        assert_eq!(
-            retire_image_if_unchanged(
-                &sock,
-                "docker.io/library/stale:dev",
-                Some("sha256:bad-incomplete"),
-                "sha256:old-mirror",
-                Duration::from_secs(5),
-            )
-            .unwrap(),
-            RetireOutcome::Deleted
-        );
-        // 4. Unchanged moby + replaced k8s -> NotFoundOrChanged, native pull untouched.
-        assert_eq!(
-            retire_image_if_unchanged(
-                &sock,
-                "docker.io/library/kubelet:dev",
-                Some("sha256:bad-incomplete"),
-                "sha256:old-mirror",
-                Duration::from_secs(5),
-            )
-            .unwrap(),
-            RetireOutcome::NotFoundOrChanged
-        );
-        // 5. Orphan still absent in moby -> Deleted.
-        assert_eq!(
-            retire_image_if_unchanged(
-                &sock,
-                "docker.io/library/orphan:dev",
-                None,
-                "sha256:orphan-mirror",
-                Duration::from_secs(5),
-            )
-            .unwrap(),
-            RetireOutcome::Deleted
-        );
-        // 6. Orphan recreated in moby -> SourceChanged, k8s untouched.
-        assert_eq!(
-            retire_image_if_unchanged(
-                &sock,
-                "docker.io/library/reborn:dev",
-                None,
-                "sha256:old-mirror",
-                Duration::from_secs(5),
-            )
-            .unwrap(),
-            RetireOutcome::SourceChanged
-        );
-        // 7. RPC error checking moby -> Err, k8s untouched.
-        let err = retire_image_if_unchanged(
-            &sock,
-            "docker.io/library/err:dev",
-            Some("sha256:bad-incomplete"),
-            "sha256:keep-mirror",
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert!(err.contains("grpc-status 13"), "{err}");
-
-        {
-            let st = state.lock().unwrap();
-            assert!(
-                st.images
-                    .contains_key(&("k8s.io".into(), "docker.io/library/retagged:dev".into())),
-                "working mirror must survive concurrent moby retag"
-            );
-            assert!(
-                st.images
-                    .contains_key(&("k8s.io".into(), "docker.io/library/vanished:dev".into()))
-            );
-            assert!(
-                !st.images
-                    .contains_key(&("k8s.io".into(), "docker.io/library/stale:dev".into()))
-            );
-            assert_eq!(
-                st.images[&("k8s.io".into(), "docker.io/library/kubelet:dev".into())]
-                    .target
-                    .digest,
-                "sha256:native-pull"
-            );
-            assert!(
-                !st.images
-                    .contains_key(&("k8s.io".into(), "docker.io/library/orphan:dev".into()))
-            );
-            assert!(
-                st.images
-                    .contains_key(&("k8s.io".into(), "docker.io/library/reborn:dev".into()))
-            );
-            assert!(
-                st.images
-                    .contains_key(&("k8s.io".into(), "docker.io/library/err:dev".into()))
-            );
-        }
-
-        server.join().unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     /// Regression test: when replacing an existing `k8s.io` mirror and
     /// `Images.Delete` commits but the following `Images.Create` fails,
     /// `publish_rewritten_image` pins the old target under the lease before
@@ -5228,7 +4763,6 @@ mod tests {
             Some(ExpectedK8sTarget {
                 digest: &old_digest,
                 is_cri_managed: true,
-                ownership: K8sOwnership::PublishedMirror,
             }),
             &plan,
             Duration::from_secs(5),
@@ -5358,117 +4892,6 @@ mod tests {
                 .get(&("k8s.io".into(), "docker.io/library/app:dev".into())),
             Some(&competing),
             "recovery must never overwrite a competing writer's tag"
-        );
-        drop(st);
-
-        server.join().unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Regression test: if `Images.Delete(name, target = old_digest)` returns
-    /// an uncertain error (dropped connection / timeout) while the server-side
-    /// BoltDB delete is STILL queued and executes AFTER `publish_rewritten_image`
-    /// returns and deletes its lease, recovery neutralizes the delayed delete
-    /// unconditionally by swapping `k8s.io[name]` to `new_image`
-    /// (`new_digest != old_digest`) — so when the stale delete later wakes up,
-    /// its target-digest check fails and the tag survives intact.
-    #[test]
-    fn publish_rewritten_image_recovery_neutralizes_delayed_uncertain_delete_even_after_return() {
-        let (dir, sock) = temp_sock("delayed");
-        let listener = UnixListener::bind(&sock).unwrap();
-
-        let layer_digest = format!("sha256:{}", "3".repeat(64));
-        let old_digest = format!("sha256:{}", "4".repeat(64));
-        let plan = sample_plan(
-            &layer_digest,
-            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
-        );
-        let old_image = ContainerdImage {
-            name: "docker.io/library/app:dev".into(),
-            labels: HashMap::from([(
-                "io.katamaran.k8s.source-digest".into(),
-                "sha256:prev-source".into(),
-            )]),
-            target: Descriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
-                digest: old_digest.clone(),
-                size: 640,
-                ..Default::default()
-            },
-        };
-
-        let (delayed_tx, delayed_rx) = std::sync::mpsc::channel();
-        let state = Arc::new(Mutex::new(MockContainerdState {
-            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
-            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
-            images: HashMap::from([
-                (
-                    ("moby".into(), "docker.io/library/app:dev".into()),
-                    ContainerdImage {
-                        name: "docker.io/library/app:dev".into(),
-                        labels: HashMap::new(),
-                        target: Descriptor {
-                            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
-                            digest: "sha256:source-amd64".into(),
-                            size: 128,
-                            ..Default::default()
-                        },
-                    },
-                ),
-                (
-                    ("k8s.io".into(), "docker.io/library/app:dev".into()),
-                    old_image,
-                ),
-            ]),
-            remaining_disk_bytes: 1 << 20,
-            // Run the original delayed conditional delete 150ms later — WELL
-            // AFTER `publish_rewritten_image` has already returned & deleted
-            // the lease!
-            delayed_k8s_delete: Some((Duration::from_millis(150), delayed_tx)),
-            ..Default::default()
-        }));
-
-        // Connection 1: publish (drops on Images.Delete while delayed delete is in flight)
-        // Connection 2: recovery swaps `old_digest` -> `new_manifest_digest` and deletes lease
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
-
-        let rewritten = publish_rewritten_image_with_delete_timeout(
-            &sock,
-            "docker.io/library/app:dev",
-            "io.katamaran.k8s.source-digest",
-            Some(expected_mirror(&old_digest)),
-            &plan,
-            Duration::from_secs(5),
-            Duration::from_millis(350),
-        )
-        .unwrap();
-        assert_ne!(rewritten.manifest, old_digest);
-
-        // Wait until the stale delayed `Images.Delete(target = old_digest)`
-        // actually wakes up and executes AFTER `publish_rewritten_image` returned.
-        let stale_delete_matched = delayed_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("delayed delete thread must run");
-        assert!(
-            !stale_delete_matched,
-            "delayed delete targeting old_digest must NOT match the swapped replacement tag"
-        );
-
-        let st = state.lock().unwrap();
-        assert!(
-            st.leases.is_empty(),
-            "temporary lease should be deleted once recovery neutralizes the tag"
-        );
-        let cur = st
-            .images
-            .get(&("k8s.io".into(), "docker.io/library/app:dev".into()))
-            .expect("k8s.io tag must remain present after delayed delete wakes up");
-        assert_eq!(cur.target.digest, rewritten.manifest);
-        assert_eq!(
-            cur.labels
-                .get("io.katamaran.k8s.source-digest")
-                .map(String::as_str),
-            Some("sha256:source-amd64")
         );
         drop(st);
 
@@ -5663,79 +5086,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Regression test: if Docker removes the source while the replacement
-    /// `Images.Delete` is uncertain (its reply is lost after it committed),
-    /// recovery still leaves a mirror under the tag (removing a Docker image
-    /// never removes its Kubernetes copy): it publishes the planned mirror of
-    /// the last Docker state and reports `SourceChanged`.
-    #[test]
-    fn publish_rewritten_image_recovery_keeps_a_tag_when_source_removed() {
-        let (dir, sock) = temp_sock("recover-src");
-        let listener = UnixListener::bind(&sock).unwrap();
-
-        let layer_digest = format!("sha256:{}", "c".repeat(64));
-        let old_digest = format!("sha256:{}", "d".repeat(64));
-        let plan = sample_plan(
-            &layer_digest,
-            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
-        );
-        let name = "docker.io/library/app:dev";
-
-        let state = Arc::new(Mutex::new(MockContainerdState {
-            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
-            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
-            images: HashMap::from([
-                moby_source(name, "sha256:source-amd64"),
-                (
-                    ("k8s.io".into(), name.into()),
-                    katamaran_mirror(name, &old_digest, "sha256:prev-source"),
-                ),
-            ]),
-            remaining_disk_bytes: 1 << 20,
-            drop_after_k8s_delete: Some(None),
-            mutate_moby_on_k8s_delete: Some((name.into(), None)),
-            ..Default::default()
-        }));
-
-        // Connection 1: publish (delete commits, reply lost, moby source removed)
-        // Connection 2: recovery (moby check fails -> no create)
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
-        let err = publish_rewritten_image(
-            &sock,
-            name,
-            "io.katamaran.k8s.source-digest",
-            Some(expected_mirror(&old_digest)),
-            &plan,
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, PublishError::SourceChanged { ref actual, .. } if actual == "<deleted>"),
-            "expected SourceChanged after the source was removed, got {err:?}"
-        );
-
-        let st = state.lock().unwrap();
-        let cur = st
-            .images
-            .get(&("k8s.io".into(), name.into()))
-            .expect("a Docker removal must never leave the Kubernetes tag absent");
-        assert_ne!(
-            cur.target.digest, old_digest,
-            "in-flight delete must be fenced"
-        );
-        assert_eq!(
-            cur.labels
-                .get("io.katamaran.k8s.source-digest")
-                .map(String::as_str),
-            Some("sha256:source-amd64")
-        );
-        assert!(st.leases.is_empty());
-        drop(st);
-
-        server.join().unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     /// Regression test: a delayed conditional delete of an earlier mirror
     /// digest that executes only after a SECOND replacement (Docker retagged a
     /// new outer index wrapping the same amd64 leaf, so the rewrite plan is
@@ -5815,181 +5165,6 @@ mod tests {
                 .map(String::as_str),
             Some("sha256:newer-outer-index")
         );
-        drop(st);
-
-        server.join().unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Regression test: Docker moves the tag A -> B -> A while the replacement
-    /// delete of A's mirror is still in flight. Recovery sees B, never
-    /// publishes the stale plan, but FENCES the in-flight delete with its own
-    /// conditional delete, so the retry recreates A's mirror under a fresh
-    /// digest and the delayed delete (released afterwards) cannot remove it.
-    #[test]
-    fn publish_rewritten_image_recovery_fences_delayed_delete_when_source_flaps() {
-        let (dir, sock) = temp_sock("flap");
-        let listener = UnixListener::bind(&sock).unwrap();
-
-        let layer_digest = format!("sha256:{}", "1".repeat(64));
-        let old_digest = format!("sha256:{}", "2".repeat(64));
-        let plan = sample_plan(
-            &layer_digest,
-            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
-        );
-        let name = "docker.io/library/app:dev";
-
-        let (delayed_tx, delayed_rx) = std::sync::mpsc::channel();
-        let state = Arc::new(Mutex::new(MockContainerdState {
-            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
-            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
-            images: HashMap::from([
-                moby_source(name, "sha256:source-amd64"),
-                (
-                    ("k8s.io".into(), name.into()),
-                    katamaran_mirror(name, &old_digest, "sha256:source-amd64"),
-                ),
-            ]),
-            remaining_disk_bytes: 1 << 20,
-            delayed_k8s_delete: Some((Duration::from_millis(600), delayed_tx)),
-            mutate_moby_on_k8s_delete: Some((name.into(), Some("sha256:source-b".into()))),
-            ..Default::default()
-        }));
-
-        // Connections 1+2: replacement (delete held in flight) + recovery.
-        // Connection 3: retry after Docker moved the tag back to A.
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 3, 65_535);
-        let err = publish_rewritten_image(
-            &sock,
-            name,
-            "io.katamaran.k8s.source-digest",
-            Some(expected_mirror(&old_digest)),
-            &plan,
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, PublishError::SourceChanged { ref actual, .. } if actual == "sha256:source-b"),
-            "expected SourceChanged to B, got {err:?}"
-        );
-        {
-            let mut st = state.lock().unwrap();
-            assert_eq!(st.k8s_create_calls, 0, "stale plan must never be published");
-            assert!(
-                !st.images.contains_key(&("k8s.io".into(), name.into())),
-                "recovery must fence the in-flight delete by deleting old_digest itself"
-            );
-            assert!(st.leases.is_empty());
-            // Docker moves the tag back to A.
-            st.images
-                .get_mut(&("moby".into(), name.into()))
-                .unwrap()
-                .target
-                .digest = "sha256:source-amd64".into();
-        }
-
-        // The re-list sees no k8s.io tag and publishes A afresh.
-        let retried = publish_rewritten_image(
-            &sock,
-            name,
-            "io.katamaran.k8s.source-digest",
-            None,
-            &plan,
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        assert_ne!(retried.manifest, old_digest);
-
-        assert!(
-            !delayed_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
-            "the held delete of old_digest must not match the retried mirror"
-        );
-        assert_eq!(
-            state.lock().unwrap().images[&("k8s.io".into(), name.into())]
-                .target
-                .digest,
-            retried.manifest
-        );
-
-        server.join().unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Upgrade from 0.10.0 (#41): an amd64 image mirrored unchanged left an
-    /// unlabelled `k8s.io` tag whose target equals the `moby` source digest.
-    /// It is adopted (replaced by the emulated mirror) because the next sync
-    /// can always rebuild it; adoption is refused if the target is not an
-    /// exact copy of the source.
-    #[test]
-    fn publish_rewritten_image_adopts_unlabelled_exact_source_copy() {
-        let (dir, sock) = temp_sock("adopt");
-        let listener = UnixListener::bind(&sock).unwrap();
-
-        let layer_digest = format!("sha256:{}", "4".repeat(64));
-        let plan = sample_plan(
-            &layer_digest,
-            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
-        );
-        let name = "docker.io/library/app:dev";
-        let (moby_key, moby_img) = moby_source(name, "sha256:source-amd64");
-        let unchanged_copy = ContainerdImage {
-            labels: HashMap::new(),
-            ..moby_img.clone()
-        };
-
-        let state = Arc::new(Mutex::new(MockContainerdState {
-            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
-            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
-            images: HashMap::from([
-                (moby_key, moby_img),
-                (("k8s.io".into(), name.into()), unchanged_copy),
-            ]),
-            remaining_disk_bytes: 1 << 20,
-            ..Default::default()
-        }));
-
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
-
-        // Adoption claimed for a target that is not the source digest: refused
-        // before connecting.
-        let err = publish_rewritten_image(
-            &sock,
-            name,
-            "io.katamaran.k8s.source-digest",
-            Some(ExpectedK8sTarget {
-                digest: "sha256:something-else",
-                is_cri_managed: false,
-                ownership: K8sOwnership::SourceCopy,
-            }),
-            &plan,
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert!(matches!(err, PublishError::Failed(ref m) if m.contains("refusing to adopt")));
-
-        let rewritten = publish_rewritten_image(
-            &sock,
-            name,
-            "io.katamaran.k8s.source-digest",
-            Some(ExpectedK8sTarget {
-                digest: "sha256:source-amd64",
-                is_cri_managed: false,
-                ownership: K8sOwnership::SourceCopy,
-            }),
-            &plan,
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        let st = state.lock().unwrap();
-        let cur = &st.images[&("k8s.io".into(), name.into())];
-        assert_eq!(cur.target.digest, rewritten.manifest);
-        assert_eq!(
-            cur.labels
-                .get("io.katamaran.k8s.source-digest")
-                .map(String::as_str),
-            Some("sha256:source-amd64")
-        );
-        assert!(st.leases.is_empty());
         drop(st);
 
         server.join().unwrap();
