@@ -34,8 +34,8 @@ pub struct Config {
     /// Freeze the VM's vCPUs while the Mac sleeps, so it does no work in the
     /// Mac's dark wakes.
     pub pause_on_sleep: bool,
-    /// Forward the Mac's 127.0.0.1:<port> to container ports that were not
-    /// published with `-p`.
+    /// Forward `<port>` on the Mac's `forward_addresses` to container ports
+    /// that were not published with `-p`.
     pub auto_forward: bool,
     /// The Mac addresses forwarded ports listen on: `127.0.0.1`, and any
     /// alias added to `lo0` (e.g. `sudo ifconfig lo0 alias 172.16.1.200`).
