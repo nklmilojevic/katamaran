@@ -93,13 +93,13 @@ Run fast host unit tests:
 cargo test --lib -p kat-proto -p kat-vmm -p kat-daemon -p xtask
 ```
 
-The port forwarding tests send payloads through a real `gvproxy` and a `lo0` alias on regular and privileged ports. Without an alias, or without `target/release/gvproxy`, they only test `127.0.0.1` or skip. CI runs them in strict mode, where a missing alias, a missing `gvproxy`, or no non-loopback IPv4 address (used to check that LAN peers are rejected) fails the run:
+The port forwarding tests send payloads through both the standalone `gvproxy` binary and the default in-process `libgvproxy.dylib` with a `lo0` alias on regular and privileged ports. Without an alias, or without `target/release/gvproxy` and `target/release/libgvproxy.dylib`, they only test `127.0.0.1` or skip. CI runs them in strict mode, where a missing alias, a missing `gvproxy`/`libgvproxy.dylib`, or no non-loopback IPv4 address (used to check that LAN peers are rejected) fails the run:
 
 ```sh
 cargo xtask gvproxy
 sudo ifconfig lo0 alias 172.16.254.200
 KATAMARAN_TEST_LO0_ALIAS=172.16.254.200 KATAMARAN_REQUIRE_LO0_ALIAS=1 \
-  KATAMARAN_REQUIRE_GVPROXY=1 cargo test --lib -p kat-daemon
+  KATAMARAN_REQUIRE_GVPROXY=1 cargo test --locked -p kat-daemon -p kat-vmm
 sudo ifconfig lo0 -alias 172.16.254.200
 ```
 

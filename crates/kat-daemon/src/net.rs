@@ -418,8 +418,14 @@ impl GvproxyApi {
                 local.display()
             )));
         }
+        let Some(local_str) = local.to_str() else {
+            return Err(ForwardError::Refused(format!(
+                "socket path {} is not UTF-8",
+                local.display()
+            )));
+        };
         let body = serde_json::json!({
-            "local": local,
+            "local": local_str,
             "remote": format!("tcp://{}:{port}", self.guest),
             "protocol": "unix",
         });
@@ -431,7 +437,13 @@ impl GvproxyApi {
     }
 
     fn unexpose_unix(&self, local: &Path) -> Result<(), ForwardError> {
-        let body = serde_json::json!({ "local": local, "protocol": "unix" });
+        let Some(local_str) = local.to_str() else {
+            return Err(ForwardError::Refused(format!(
+                "socket path {} is not UTF-8",
+                local.display()
+            )));
+        };
+        let body = serde_json::json!({ "local": local_str, "protocol": "unix" });
         post(
             &self.socket,
             "/services/forwarder/unexpose",
@@ -648,9 +660,10 @@ impl ForwardApi for AddressesApi {
             // Closing the Mac listeners is the removal: the guest no longer
             // serves the port, so it is released on the Mac whatever gvproxy
             // says. If gvproxy cannot drop its private Unix socket,
-            // `unexpose_upstream` marks it Uncertain; a re-add reconciles it
-            // via `ensure_upstream_exposed`, and `Drop` cleans it up at
-            // session end.
+            // `unexpose_upstream` marks it Uncertain so `Forwards::remove`
+            // keeps it in `cleanup_pending` for quiet background retries; a
+            // re-add cancels the retry and reconciles via
+            // `ensure_upstream_exposed`, and `Drop` cleans up at session end.
             if self.unexpose_upstream(port, &sock).is_ok() {
                 let _ = fs::remove_file(&sock);
             }
@@ -1072,7 +1085,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     key,
                                     (PendingOp::Remove, Instant::now() + retry_base, 1),
                                 );
-                                report_removal_failure(&e, &label, was_active);
+                                report_removal_failure(&e, &label, was_active, true);
                                 on_event(removal_failure(e, was_active));
                             }
                             Some(e) => {
@@ -1183,14 +1196,16 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                             ),
                                         );
                                     } else {
-                                        report_removal_failure(&e, &label, was_active);
+                                        report_removal_failure(&e, &label, was_active, false);
                                         on_event(removal_failure(e, was_active));
                                     }
                                 }
                                 Some(e) => {
                                     report(&e, &label);
                                     on_event(e);
-                                    if fwd.needs_cleanup(proto, port) {
+                                    if fwd.needs_cleanup(proto, port)
+                                        && attempts < MAX_TRANSIENT_RETRIES
+                                    {
                                         pending.insert(
                                             key,
                                             (
@@ -1217,9 +1232,9 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
 }
 
 /// The event to report for a failed remove. Only an active forward may
-/// still be listening on the Mac; for a refused port the guest removed, the
-/// failure only concerns gvproxy cleanup (retried in the background), so its
-/// error is cleared instead.
+/// still be listening on the Mac; for a non-active port (refused, cancelled,
+/// or whose Mac listeners already closed), the failure only concerns gvproxy
+/// cleanup (retried in the background), so its error is cleared instead.
 fn removal_failure(e: Event, was_active: bool) -> Event {
     match e {
         Event::RemoveFailed(proto, port, _) if !was_active => Event::RefusedCleared(proto, port),
@@ -1227,13 +1242,16 @@ fn removal_failure(e: Event, was_active: bool) -> Event {
     }
 }
 
-/// Log a failed remove: for a refused port it only concerns gvproxy cleanup.
-fn report_removal_failure(e: &Event, addrs: &str, was_active: bool) {
+/// Log a failed remove: for a non-active port it only concerns gvproxy cleanup.
+fn report_removal_failure(e: &Event, addrs: &str, was_active: bool, retrying: bool) {
     match e {
-        Event::RemoveFailed(proto, port, why) if !was_active => eprintln!(
-            "katamaran: cleaning up gvproxy state for refused forward {addrs}:{port}/{} failed ({why}); retrying",
-            proto.as_str()
-        ),
+        Event::RemoveFailed(proto, port, why) if !was_active => {
+            let action = if retrying { "retrying" } else { "giving up" };
+            eprintln!(
+                "katamaran: cleaning up gvproxy state for {addrs}:{port}/{} failed ({why}); {action}",
+                proto.as_str()
+            );
+        }
         e => report(e, addrs),
     }
 }
@@ -2218,6 +2236,141 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    struct ConnState {
+        seq: u32,
+        rcv_nxt: u32,
+        prefixed: bool,
+        fin_sent: bool,
+    }
+
+    /// Minimal Ethernet/ARP/TCP state machine for [`GUEST`]: answers ARP and
+    /// echoes `"guest:<data>"` on TCP connections to [`GUEST`], shared by both
+    /// vfkit (`gvproxy` binary) and in-process (`libgvproxy.dylib`) round-trip
+    /// tests.
+    struct SyntheticGuestState {
+        conns: BTreeMap<(u16, u16), ConnState>,
+        next_isn: u32,
+    }
+
+    impl SyntheticGuestState {
+        fn new() -> Self {
+            Self {
+                conns: BTreeMap::new(),
+                next_isn: 10_000,
+            }
+        }
+
+        fn handle_frame(&mut self, frame: &[u8], mut send: impl FnMut(&[u8])) {
+            let n = frame.len();
+            if n < 14 {
+                return;
+            }
+            let guest_ip = GUEST.octets();
+            let src_mac = &frame[6..12];
+            let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+            if ethertype == 0x0806 && n >= 42 {
+                let op = u16::from_be_bytes([frame[20], frame[21]]);
+                if op == 1 && frame[38..42] == guest_ip {
+                    let mut reply = Vec::with_capacity(42);
+                    reply.extend_from_slice(&frame[22..28]);
+                    reply.extend_from_slice(&GUEST_MAC);
+                    reply
+                        .extend_from_slice(&[0x08, 0x06, 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02]);
+                    reply.extend_from_slice(&GUEST_MAC);
+                    reply.extend_from_slice(&guest_ip);
+                    reply.extend_from_slice(&frame[22..28]);
+                    reply.extend_from_slice(&frame[28..32]);
+                    send(&reply);
+                }
+            } else if ethertype == 0x0800 && n >= 34 {
+                let ihl = usize::from(frame[14] & 0x0f) * 4;
+                if frame[23] != 6 || frame[30..34] != guest_ip {
+                    return;
+                }
+                let tot = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+                if tot < ihl + 20 || n < 14 + tot {
+                    return;
+                }
+                let sip: [u8; 4] = frame[26..30].try_into().unwrap();
+                let tcp = &frame[14 + ihl..14 + tot];
+                let sport = u16::from_be_bytes([tcp[0], tcp[1]]);
+                let dport = u16::from_be_bytes([tcp[2], tcp[3]]);
+                let rseq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+                let thl = usize::from(tcp[12] >> 4) * 4;
+                let flags = tcp[13];
+                if thl < 20 || thl > tcp.len() {
+                    return;
+                }
+                let payload = &tcp[thl..];
+                let key = (sport, dport);
+
+                if flags & 0x04 != 0 {
+                    self.conns.remove(&key);
+                } else if flags & 0x02 != 0 {
+                    let isn = self.next_isn;
+                    self.next_isn = self.next_isn.wrapping_add(100_000);
+                    let rcv_nxt = rseq.wrapping_add(1);
+                    self.conns.insert(
+                        key,
+                        ConnState {
+                            seq: isn.wrapping_add(1),
+                            rcv_nxt,
+                            prefixed: false,
+                            fin_sent: false,
+                        },
+                    );
+                    let out = SyntheticGuest::tcp_frame(
+                        src_mac,
+                        guest_ip,
+                        sip,
+                        dport,
+                        sport,
+                        isn,
+                        rcv_nxt,
+                        0x12,
+                        &[],
+                    );
+                    send(&out);
+                } else if let Some(st) = self.conns.get_mut(&key) {
+                    if !payload.is_empty() && rseq == st.rcv_nxt {
+                        st.rcv_nxt = st.rcv_nxt.wrapping_add(payload.len() as u32);
+                        let mut echo = Vec::with_capacity(6 + payload.len());
+                        if !st.prefixed {
+                            echo.extend_from_slice(b"guest:");
+                            st.prefixed = true;
+                        }
+                        echo.extend_from_slice(payload);
+                        let out = SyntheticGuest::tcp_frame(
+                            src_mac, guest_ip, sip, dport, sport, st.seq, st.rcv_nxt, 0x18, &echo,
+                        );
+                        st.seq = st.seq.wrapping_add(echo.len() as u32);
+                        send(&out);
+                    }
+                    if flags & 0x01 != 0
+                        && !st.fin_sent
+                        && rseq.wrapping_add(payload.len() as u32) == st.rcv_nxt
+                    {
+                        st.rcv_nxt = st.rcv_nxt.wrapping_add(1);
+                        let out = SyntheticGuest::tcp_frame(
+                            src_mac,
+                            guest_ip,
+                            sip,
+                            dport,
+                            sport,
+                            st.seq,
+                            st.rcv_nxt,
+                            0x11,
+                            &[],
+                        );
+                        st.seq = st.seq.wrapping_add(1);
+                        st.fin_sent = true;
+                        send(&out);
+                    }
+                }
+            }
+        }
+    }
+
     /// Minimal guest network responder connected to gvproxy's `-listen-vfkit`
     /// unixgram socket: answers ARP for [`GUEST`] and echoes `"guest:<data>"`
     /// on TCP connections to [`GUEST`], exercising real payload delivery
@@ -2250,19 +2403,10 @@ mod tests {
             dg.set_read_timeout(Some(Duration::from_millis(20)))
                 .unwrap();
 
-            struct ConnState {
-                seq: u32,
-                rcv_nxt: u32,
-                prefixed: bool,
-                fin_sent: bool,
-            }
-
             let stop = Arc::new(AtomicBool::new(false));
             let s_stop = stop.clone();
             let thread = thread::spawn(move || {
-                let guest_ip = GUEST.octets();
-                let mut conns: BTreeMap<(u16, u16), ConnState> = BTreeMap::new();
-                let mut next_isn: u32 = 10_000;
+                let mut state = SyntheticGuestState::new();
                 let mut frame = vec![0u8; 65536];
 
                 while !s_stop.load(Ordering::SeqCst) {
@@ -2280,113 +2424,9 @@ mod tests {
                         }
                         Err(_) => break,
                     };
-                    if n < 14 {
-                        continue;
-                    }
-                    let src_mac = &frame[6..12];
-                    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-                    if ethertype == 0x0806 && n >= 42 {
-                        let op = u16::from_be_bytes([frame[20], frame[21]]);
-                        if op == 1 && frame[38..42] == guest_ip {
-                            let mut reply = Vec::with_capacity(42);
-                            reply.extend_from_slice(&frame[22..28]);
-                            reply.extend_from_slice(&GUEST_MAC);
-                            reply.extend_from_slice(&[
-                                0x08, 0x06, 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02,
-                            ]);
-                            reply.extend_from_slice(&GUEST_MAC);
-                            reply.extend_from_slice(&guest_ip);
-                            reply.extend_from_slice(&frame[22..28]);
-                            reply.extend_from_slice(&frame[28..32]);
-                            let _ = dg.send(&reply);
-                        }
-                    } else if ethertype == 0x0800 && n >= 34 {
-                        let ihl = usize::from(frame[14] & 0x0f) * 4;
-                        if frame[23] != 6 || frame[30..34] != guest_ip {
-                            continue;
-                        }
-                        let tot = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
-                        if tot < ihl + 20 || n < 14 + tot {
-                            continue;
-                        }
-                        let sip: [u8; 4] = frame[26..30].try_into().unwrap();
-                        let tcp = &frame[14 + ihl..14 + tot];
-                        let sport = u16::from_be_bytes([tcp[0], tcp[1]]);
-                        let dport = u16::from_be_bytes([tcp[2], tcp[3]]);
-                        let rseq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
-                        let thl = usize::from(tcp[12] >> 4) * 4;
-                        let flags = tcp[13];
-                        if thl < 20 || thl > tcp.len() {
-                            continue;
-                        }
-                        let payload = &tcp[thl..];
-                        let key = (sport, dport);
-
-                        if flags & 0x04 != 0 {
-                            conns.remove(&key);
-                        } else if flags & 0x02 != 0 {
-                            let isn = next_isn;
-                            next_isn = next_isn.wrapping_add(100_000);
-                            let rcv_nxt = rseq.wrapping_add(1);
-                            conns.insert(
-                                key,
-                                ConnState {
-                                    seq: isn.wrapping_add(1),
-                                    rcv_nxt,
-                                    prefixed: false,
-                                    fin_sent: false,
-                                },
-                            );
-                            let out = Self::tcp_frame(
-                                src_mac,
-                                guest_ip,
-                                sip,
-                                dport,
-                                sport,
-                                isn,
-                                rcv_nxt,
-                                0x12,
-                                &[],
-                            );
-                            let _ = dg.send(&out);
-                        } else if let Some(st) = conns.get_mut(&key) {
-                            if !payload.is_empty() && rseq == st.rcv_nxt {
-                                st.rcv_nxt = st.rcv_nxt.wrapping_add(payload.len() as u32);
-                                let mut echo = Vec::with_capacity(6 + payload.len());
-                                if !st.prefixed {
-                                    echo.extend_from_slice(b"guest:");
-                                    st.prefixed = true;
-                                }
-                                echo.extend_from_slice(payload);
-                                let out = Self::tcp_frame(
-                                    src_mac, guest_ip, sip, dport, sport, st.seq, st.rcv_nxt, 0x18,
-                                    &echo,
-                                );
-                                st.seq = st.seq.wrapping_add(echo.len() as u32);
-                                let _ = dg.send(&out);
-                            }
-                            if flags & 0x01 != 0
-                                && !st.fin_sent
-                                && rseq.wrapping_add(payload.len() as u32) == st.rcv_nxt
-                            {
-                                st.rcv_nxt = st.rcv_nxt.wrapping_add(1);
-                                let out = Self::tcp_frame(
-                                    src_mac,
-                                    guest_ip,
-                                    sip,
-                                    dport,
-                                    sport,
-                                    st.seq,
-                                    st.rcv_nxt,
-                                    0x11,
-                                    &[],
-                                );
-                                st.seq = st.seq.wrapping_add(1);
-                                st.fin_sent = true;
-                                let _ = dg.send(&out);
-                            }
-                        }
-                    }
+                    state.handle_frame(&frame[..n], |out| {
+                        let _ = dg.send(out);
+                    });
                 }
             });
 
@@ -2626,6 +2666,199 @@ mod tests {
         drop(_guest);
         gv.stop();
         assert!(!gv.api_socket.exists(), "gvproxy left its socket behind");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Loads the default in-process `libgvproxy.dylib` with the exact arguments
+    /// produced by [`Gvproxy::in_process`], wires [`SyntheticGuestState`] to
+    /// its C frame callbacks (`kat_gvproxy_start` / `kat_gvproxy_tx`), and
+    /// verifies [`AddressesApi`] (`protocol: "unix"`) delivers real TCP
+    /// payloads end-to-end on regular and privileged ports (and `lo0` aliases)
+    /// and cleans up cleanly on unexpose and drop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_process_gvproxy_addresses_api_round_trip() {
+        use std::ffi::{CString, c_char, c_int, c_void};
+        use std::os::unix::ffi::OsStrExt;
+
+        const VIRTIO_NET_HDR_LEN: usize = 12;
+
+        type RxFn = unsafe extern "C" fn(*mut c_void, *const libc::iovec, c_int) -> c_int;
+        type StartFn =
+            unsafe extern "C" fn(c_int, *const *const c_char, RxFn, *mut c_void) -> c_int;
+        type TxFn = unsafe extern "C" fn(*const libc::iovec, c_int) -> c_int;
+
+        struct InprocGuestCtx {
+            stop: AtomicBool,
+            frames: Sender<Vec<u8>>,
+        }
+
+        unsafe extern "C" fn inproc_guest_rx(
+            ctx: *mut c_void,
+            iov: *const libc::iovec,
+            iovcnt: c_int,
+        ) -> c_int {
+            if ctx.is_null() || iov.is_null() || iovcnt <= 0 {
+                return 0;
+            }
+            // SAFETY: `ctx` is leaked for the lifetime of the test process,
+            // matching the loaded Go runtime's lifetime.
+            let ctx = unsafe { &*(ctx as *const InprocGuestCtx) };
+            if ctx.stop.load(Ordering::Acquire) {
+                return 0;
+            }
+            let slices = unsafe { std::slice::from_raw_parts(iov, iovcnt as usize) };
+            let total: usize = slices.iter().map(|v| v.iov_len).sum();
+            if total <= VIRTIO_NET_HDR_LEN {
+                return 0;
+            }
+            let mut buf = Vec::with_capacity(total);
+            for v in slices {
+                if !v.iov_base.is_null() && v.iov_len > 0 {
+                    let part =
+                        unsafe { std::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len) };
+                    buf.extend_from_slice(part);
+                }
+            }
+            let _ = ctx.frames.send(buf.split_off(VIRTIO_NET_HDR_LEN));
+            0
+        }
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let library = root.join("target/release/libgvproxy.dylib");
+        if !library.is_file() {
+            assert!(
+                !env_flag("KATAMARAN_REQUIRE_GVPROXY"),
+                "KATAMARAN_REQUIRE_GVPROXY is set but {} is missing: run `cargo xtask gvproxy`",
+                library.display()
+            );
+            eprintln!("skipped: no {}", library.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("kat-gvp-inproc-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut gv = Gvproxy::in_process(&library, &dir, &dir.join("gvproxy.log"), 1500).unwrap();
+        let inproc = gv.network().in_process.expect("in-process network");
+
+        let lib_path = CString::new(inproc.library.as_os_str().as_bytes()).unwrap();
+        let handle = unsafe { libc::dlopen(lib_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(
+            !handle.is_null(),
+            "dlopen {} failed",
+            inproc.library.display()
+        );
+        let start_sym = unsafe { libc::dlsym(handle, c"kat_gvproxy_start".as_ptr()) };
+        let tx_sym = unsafe { libc::dlsym(handle, c"kat_gvproxy_tx".as_ptr()) };
+        assert!(
+            !start_sym.is_null() && !tx_sym.is_null(),
+            "missing inproc gvproxy symbols"
+        );
+        // SAFETY: exported by cmd/gvproxy/inproc.go with these exact C signatures.
+        let start_fn: StartFn = unsafe { std::mem::transmute(start_sym) };
+        let tx_fn: TxFn = unsafe { std::mem::transmute(tx_sym) };
+
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
+        let ctx: &'static InprocGuestCtx = Box::leak(Box::new(InprocGuestCtx {
+            stop: AtomicBool::new(false),
+            frames: frame_tx,
+        }));
+        let guest_thread = thread::spawn(move || {
+            let mut state = SyntheticGuestState::new();
+            while !ctx.stop.load(Ordering::Acquire) {
+                let frame = match frame_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(f) => f,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                state.handle_frame(&frame, |out| {
+                    let iov = libc::iovec {
+                        iov_base: out.as_ptr() as *mut c_void,
+                        iov_len: out.len(),
+                    };
+                    let _ = unsafe { tx_fn(&iov, 1) };
+                });
+            }
+        });
+
+        let c_args: Vec<CString> = inproc
+            .args
+            .iter()
+            .map(|a| CString::new(a.as_str()).unwrap())
+            .collect();
+        let argv: Vec<*const c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+        let rc = unsafe {
+            start_fn(
+                argv.len() as c_int,
+                argv.as_ptr(),
+                inproc_guest_rx,
+                (ctx as *const InprocGuestCtx) as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0, "kat_gvproxy_start failed with errno {rc}");
+        assert!(
+            gv.api_socket.exists(),
+            "in-process gvproxy did not create {}",
+            gv.api_socket.display()
+        );
+
+        let gv_dir = gv.api_socket.parent().unwrap().to_path_buf();
+        let alias = TestLo0Alias::acquire();
+        let mut configured = vec![Ipv4Addr::LOCALHOST];
+        if let Some(a) = &alias {
+            configured.push(a.addr);
+        }
+        let mut addrs = AddressesApi::new(
+            GvproxyApi {
+                socket: gv.api_socket.clone(),
+                guest: GUEST,
+            },
+            &gv_dir,
+            &configured,
+        );
+
+        let high = free_high_port();
+        addrs.expose(TCP, high).unwrap();
+        let (low, ()) = try_test_low_port(|candidate| addrs.expose(TCP, candidate));
+        for p in [high, low] {
+            let sock = crate::autofwd::Upstream::socket(&gv_dir, p);
+            assert!(
+                sock.exists(),
+                "in-process libgvproxy did not serve {}",
+                sock.display()
+            );
+            assert!(
+                LoopbackTcpListener::bind(p).is_err(),
+                "not listening on {p}"
+            );
+            for &a in &configured {
+                let msg = format!("inproc-{a}-{p}");
+                assert_eq!(tcp_echo(a, p, &msg), format!("guest:{msg}"));
+            }
+            addrs.unexpose(TCP, p).unwrap();
+            assert!(
+                !sock.exists(),
+                "in-process libgvproxy left {} behind after unexpose",
+                sock.display()
+            );
+            assert_port_rebindable(p);
+            // Repeated unexpose after removal finds "proxy not found" and succeeds.
+            addrs.unexpose(TCP, p).unwrap();
+        }
+
+        // Dropping AddressesApi stops active listeners and cleans up sockets.
+        addrs.expose(TCP, high).unwrap();
+        let sock = crate::autofwd::Upstream::socket(&gv_dir, high);
+        assert!(sock.exists());
+        drop(addrs);
+        assert!(!sock.exists());
+        assert_port_rebindable(high);
+
+        ctx.stop.store(true, Ordering::SeqCst);
+        guest_thread.join().unwrap();
+        gv.stop();
+        assert!(!gv.api_socket.exists() && !gv.token.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3275,6 +3508,201 @@ mod tests {
         }
 
         drop(fwd);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addresses_api_active_remove_retries_gvproxy_cleanup_and_cancels_on_readd() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = std::env::temp_dir().join(format!("kat-addr-cleanup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+
+        // 1. Active port whose gvproxy unexpose fails before removing the
+        // proxy: Mac listeners close and Event::Removed arrives immediately,
+        // while the worker quietly retries gvproxy cleanup in the background
+        // until the Unix socket disappears without any re-add.
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let worker = spawn_forwarder_with(
+            AddressesApi::new(
+                GvproxyApi {
+                    socket: fake.api_sock.clone(),
+                    guest: GUEST,
+                },
+                &dir,
+                &[Ipv4Addr::LOCALHOST],
+            ),
+            Duration::from_millis(10),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+
+        let p1 = free_high_port();
+        let sock1 = crate::autofwd::Upstream::socket(&dir, p1);
+        worker.send(PortChange::Add(TCP, p1)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p1, vec![Ipv4Addr::LOCALHOST])
+        );
+        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p1, "live"), "gv:live");
+        assert!(sock1.exists());
+
+        fake.fail_next_unexpose_before_remove
+            .store(true, Ordering::SeqCst);
+        worker.send(PortChange::Remove(TCP, p1, 1)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, p1)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, p1, 1)
+        );
+        assert_port_rebindable(p1);
+        // Background retry finishes the upstream unexpose quietly (never
+        // emitting RemoveFailed) and removes the Unix socket.
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RefusedCleared(TCP, p1)
+        );
+        assert!(
+            !sock1.exists(),
+            "background retry must remove gvproxy Unix socket without a re-add"
+        );
+        assert!(ev_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(worker);
+
+        // 2. Re-adding the port before the background cleanup retry runs
+        // cancels the cleanup retry and reconciles the existing Unix socket.
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let worker = spawn_forwarder_with(
+            AddressesApi::new(
+                GvproxyApi {
+                    socket: fake.api_sock.clone(),
+                    guest: GUEST,
+                },
+                &dir,
+                &[Ipv4Addr::LOCALHOST],
+            ),
+            Duration::from_millis(50),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+
+        let p2 = free_high_port();
+        let sock2 = crate::autofwd::Upstream::socket(&dir, p2);
+        worker.send(PortChange::Add(TCP, p2)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p2, vec![Ipv4Addr::LOCALHOST])
+        );
+        fake.fail_next_unexpose_before_remove
+            .store(true, Ordering::SeqCst);
+        worker.send(PortChange::Remove(TCP, p2, 1)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, p2)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, p2, 1)
+        );
+        assert!(sock2.exists());
+
+        worker.send(PortChange::Add(TCP, p2)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p2, vec![Ipv4Addr::LOCALHOST])
+        );
+        // Past the retry window: no cleanup retry fired to tear down p2.
+        assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(sock2.exists());
+        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p2, "kept"), "gv:kept");
+
+        worker.send(PortChange::Remove(TCP, p2, 2)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, p2)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, p2, 2)
+        );
+        assert!(!sock2.exists());
+        drop(worker);
+
+        // 3. Persistent upstream cleanup failure stops after
+        // MAX_TRANSIENT_RETRIES without emitting RemoveFailed.
+        struct AlwaysFailCleanup {
+            unexpose_calls: Arc<AtomicUsize>,
+            cleaned: bool,
+        }
+        impl ForwardApi for AlwaysFailCleanup {
+            fn expose(&mut self, _: PortProto, _: u16) -> Result<(), ForwardError> {
+                self.cleaned = false;
+                Ok(())
+            }
+            fn unexpose(&mut self, _: PortProto, _: u16) -> Result<(), ForwardError> {
+                let n = self.unexpose_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Simulate Mac listeners closed while upstream stays stuck.
+                    Ok(())
+                } else {
+                    Err(ForwardError::Transient("gvproxy gone".into()))
+                }
+            }
+            fn has_pending_cleanup(&self, _: PortProto, _: u16) -> bool {
+                !self.cleaned
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let worker = spawn_forwarder_with(
+            AlwaysFailCleanup {
+                unexpose_calls: calls.clone(),
+                cleaned: true,
+            },
+            Duration::from_millis(1),
+            move |e| {
+                let _ = ev_tx.send(e);
+            },
+        )
+        .unwrap();
+        worker.send(PortChange::Add(TCP, 9300)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, 9300, vec![Ipv4Addr::LOCALHOST])
+        );
+        worker.send(PortChange::Remove(TCP, 9300, 1)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, 9300)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, 9300, 1)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::RefusedCleared(TCP, 9300)
+        );
+        let total = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            total,
+            1 + MAX_TRANSIENT_RETRIES as usize,
+            "expected initial unexpose + MAX_TRANSIENT_RETRIES cleanup attempts"
+        );
+        assert!(ev_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), total);
+
+        drop(worker);
         drop(fake);
         let _ = fs::remove_dir_all(&dir);
     }
