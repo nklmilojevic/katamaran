@@ -1,0 +1,451 @@
+Subject: virtio-fs: track guest cache activity, directories, and one-shot wake hooks
+
+Extend `GuestCache` and `GuestCacheView` with:
+- an `activity` counter incremented on lookups, negative lookups (when
+  `negative_timeout` is non-zero), directory reads, and inode retargets,
+  leaving `init`/`destroy` quiet so idle shares stay dormant;
+- a `dir_seq` counter incremented whenever a directory inode is added,
+  evicted, or re-anchored, plus `GuestCacheView::dirs()` to snapshot
+  currently cached directories;
+- one-shot `arm_activity`/`arm_dir_change` wake hooks with `SeqCst`
+  barriers so host cache watchers can sleep with no active FSEvents
+  stream while a share is idle and drop FSEvents exclusions immediately
+  when the guest looks up an excluded directory.
+
+diff --git a/src/devices/src/virtio/fs/macos/guest_cache.rs b/src/devices/src/virtio/fs/macos/guest_cache.rs
+index 2163d2b..e54d784 100644
+--- a/src/devices/src/virtio/fs/macos/guest_cache.rs
++++ b/src/devices/src/virtio/fs/macos/guest_cache.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::ffi::CString;
+ use std::fmt;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, RwLock, Weak};
+ 
+ use super::super::multikey::MultikeyBTreeMap;
+@@ -11,10 +12,36 @@ use super::passthrough::{InodeAltKey, InodeData};
+ 
+ pub(super) type InodeTable = RwLock<MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>>;
+ 
++type WakeCallback = Arc<dyn Fn() + Send + Sync>;
++
++struct State {
++    table: Mutex<Weak<InodeTable>>,
++    /// Incremented whenever the guest looks up, lists, or caches entries in the share.
++    activity: AtomicU64,
++    /// Incremented whenever the set of cached directories or a directory's anchor changes.
++    dir_seq: AtomicU64,
++    activity_armed: AtomicBool,
++    dir_armed: AtomicBool,
++    on_wake: Mutex<Option<WakeCallback>>,
++}
++
++impl Default for State {
++    fn default() -> Self {
++        State {
++            table: Mutex::new(Weak::new()),
++            activity: AtomicU64::new(0),
++            dir_seq: AtomicU64::new(0),
++            activity_armed: AtomicBool::new(false),
++            dir_armed: AtomicBool::new(false),
++            on_wake: Mutex::new(None),
++        }
++    }
++}
++
+ /// A handle on a share's inode table; empty until the device is active and after the file
+ /// system is gone.
+ #[derive(Clone, Default)]
+-pub struct GuestCache(Arc<Mutex<Weak<InodeTable>>>);
++pub struct GuestCache(Arc<State>);
+ 
+ impl fmt::Debug for GuestCache {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+@@ -44,22 +71,98 @@ impl CachedNode {
+ 
+ impl GuestCache {
+     pub(super) fn attach(&self, table: &Arc<InodeTable>) {
+-        *self.0.lock().unwrap() = Arc::downgrade(table);
++        *self.0.table.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(table);
++    }
++
++    /// Register a non-blocking callback invoked when an armed activity or directory-change
++    /// notification triggers.
++    pub fn set_notifier(&self, cb: impl Fn() + Send + Sync + 'static) {
++        *self.0.on_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(cb));
++    }
++
++    /// Arm a one-shot wake on the next cache activity. Callers must re-check `activity()`
++    /// afterwards so an update racing with arming is never missed.
++    pub fn arm_activity(&self) {
++        self.0.activity_armed.store(true, Ordering::SeqCst);
++    }
++
++    pub fn disarm_activity(&self) {
++        self.0.activity_armed.store(false, Ordering::Release);
++    }
++
++    /// Arm a one-shot wake on the next cached-directory change. Callers must re-check `dir_seq()`
++    /// afterwards so an update racing with arming is never missed.
++    pub fn arm_dir_change(&self) {
++        self.0.dir_armed.store(true, Ordering::SeqCst);
++    }
++
++    pub fn disarm_dir_change(&self) {
++        self.0.dir_armed.store(false, Ordering::Release);
++    }
++
++    pub fn activity(&self) -> u64 {
++        self.0.activity.load(Ordering::SeqCst)
++    }
++
++    pub fn dir_seq(&self) -> u64 {
++        self.0.dir_seq.load(Ordering::SeqCst)
++    }
++
++    #[inline]
++    pub(super) fn note_activity(&self) {
++        self.0.activity.fetch_add(1, Ordering::SeqCst);
++        if self.0.activity_armed.load(Ordering::SeqCst)
++            && self.0.activity_armed.swap(false, Ordering::AcqRel)
++        {
++            self.wake();
++        }
++    }
++
++    #[inline]
++    pub(super) fn note_dir_change(&self) {
++        self.0.dir_seq.fetch_add(1, Ordering::SeqCst);
++        if self.0.dir_armed.load(Ordering::SeqCst) && self.0.dir_armed.swap(false, Ordering::AcqRel)
++        {
++            self.wake();
++        }
++    }
++
++    fn wake(&self) {
++        let cb = self
++            .0
++            .on_wake
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .clone();
++        if let Some(cb) = cb {
++            cb();
++        }
+     }
+ 
+     /// The table, while the file system lives. Take one per batch of lookups.
+     pub fn view(&self) -> Option<GuestCacheView> {
+-        self.0.lock().unwrap().upgrade().map(GuestCacheView)
++        self.0
++            .table
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .upgrade()
++            .map(|table| GuestCacheView {
++                table,
++                state: Arc::clone(&self.0),
++            })
+     }
+ }
+ 
+-pub struct GuestCacheView(Arc<InodeTable>);
++pub struct GuestCacheView {
++    table: Arc<InodeTable>,
++    state: Arc<State>,
++}
+ 
+ impl GuestCacheView {
+     /// The inode with host identity (`dev`, `ino`), if the guest holds it.
+     pub fn get(&self, dev: i32, ino: u64) -> Option<CachedNode> {
+         let key = InodeAltKey { ino, dev };
+-        self.0
++        self.table
+             .read()
+             .unwrap()
+             .get_alt(&key)
+@@ -68,7 +171,7 @@ impl GuestCacheView {
+ 
+     /// Every inode the guest holds.
+     pub fn all(&self) -> Vec<CachedNode> {
+-        self.0
++        self.table
+             .read()
+             .unwrap()
+             .values()
+@@ -76,13 +179,32 @@ impl GuestCacheView {
+             .collect()
+     }
+ 
++    /// Every directory inode the guest holds.
++    pub fn dirs(&self) -> Vec<CachedNode> {
++        self.table
++            .read()
++            .unwrap()
++            .values()
++            .filter(|d| u32::from(d.kind) == libc::S_IFDIR as u32)
++            .map(|d| CachedNode::of(d))
++            .collect()
++    }
++
+     pub fn len(&self) -> usize {
+-        self.0.read().unwrap().len()
++        self.table.read().unwrap().len()
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+         self.len() == 0
+     }
++
++    pub fn activity(&self) -> u64 {
++        self.state.activity.load(Ordering::SeqCst)
++    }
++
++    pub fn dir_seq(&self) -> u64 {
++        self.state.dir_seq.load(Ordering::SeqCst)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -185,4 +307,59 @@ mod tests {
+         };
+         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+     }
++
++    #[test]
++    fn tracks_activity_dirs_and_one_shot_notifications() {
++        use std::sync::atomic::AtomicUsize;
++
++        let dir = TempDir::new();
++        std::fs::create_dir(dir.0.join("d")).unwrap();
++        std::fs::write(dir.0.join("d/f"), "x").unwrap();
++
++        let cache = GuestCache::default();
++        let wakes = Arc::new(AtomicUsize::new(0));
++        let wakes_cb = Arc::clone(&wakes);
++        cache.set_notifier(move || {
++            wakes_cb.fetch_add(1, Ordering::SeqCst);
++        });
++
++        let fs = share(&dir, &cache);
++        let view = cache.view().unwrap();
++        // init registers ROOT_ID and bumps dir_seq, but leaves activity at 0 so idle shares stay dormant.
++        assert_eq!(view.activity(), 0);
++        assert!(view.dir_seq() >= 1);
++        assert_eq!(view.dirs().len(), 1);
++        assert_eq!(view.dirs()[0].nodeid, ROOT_ID);
++
++        // Armed activity fires once on negative lookup, then stays disarmed until re-armed.
++        cache.arm_activity();
++        let _ = fs.lookup(CTX, ROOT_ID, &CString::new("missing").unwrap());
++        assert_eq!(wakes.load(Ordering::SeqCst), 1);
++        assert_eq!(view.activity(), 1);
++
++        let d = fs
++            .lookup(CTX, ROOT_ID, &CString::new("d").unwrap())
++            .unwrap();
++        assert_eq!(wakes.load(Ordering::SeqCst), 1, "still disarmed");
++        assert_eq!(view.dirs().len(), 2);
++
++        // Armed dir_change ignores regular-file lookup, fires on directory forget.
++        let dir_seq_before = view.dir_seq();
++        cache.arm_dir_change();
++        let f = fs
++            .lookup(CTX, d.inode, &CString::new("f").unwrap())
++            .unwrap();
++        assert_eq!(view.dir_seq(), dir_seq_before);
++        assert_eq!(wakes.load(Ordering::SeqCst), 1);
++        assert_eq!(view.dirs().len(), 2, "only directories returned");
++
++        fs.forget(CTX, f.inode, 1);
++        assert_eq!(view.dir_seq(), dir_seq_before);
++        assert_eq!(wakes.load(Ordering::SeqCst), 1);
++
++        fs.forget(CTX, d.inode, 1);
++        assert!(view.dir_seq() > dir_seq_before);
++        assert_eq!(wakes.load(Ordering::SeqCst), 2);
++        assert_eq!(view.dirs().len(), 1);
++    }
+ }
+diff --git a/src/devices/src/virtio/fs/macos/passthrough.rs b/src/devices/src/virtio/fs/macos/passthrough.rs
+index 855f5eb..02e51df 100644
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -99,7 +99,7 @@ impl InodeData {
+         }
+     }
+ 
+-    fn set_anchor(&self, parent: Inode, name: &CStr) {
++    fn set_anchor(&self, parent: Inode, name: &CStr) -> bool {
+         let mut anchor = self.anchor.lock().unwrap();
+         if anchor
+             .as_ref()
+@@ -107,7 +107,9 @@ impl InodeData {
+         {
+             *anchor = Some((parent, name.to_owned()));
+             self.anchor_parent.store(parent, Ordering::Release);
++            return true;
+         }
++        false
+     }
+ 
+     fn active_dir_file(&self) -> Option<Arc<RwLock<File>>> {
+@@ -1401,6 +1403,8 @@ impl PassthroughFs {
+             }
+         }
+ 
++        drop(ds);
++        self.cfg.guest_cache.note_activity();
+         Ok(())
+     }
+ 
+@@ -1428,6 +1432,7 @@ impl PassthroughFs {
+             data.refcount.fetch_add(1, Ordering::Acquire);
+             data.clone()
+         };
++        let mut dir_changed = false;
+         let found = self.inodes.read().unwrap().get_alt(&altkey).map(take);
+         let data = found.unwrap_or_else(|| {
+             let mut inodes = self.inodes.write().unwrap();
+@@ -1436,12 +1441,23 @@ impl PassthroughFs {
+             }
+             let data = Arc::new(InodeData::new(self.inode_alloc.next(), &st, 1));
+             inodes.insert(data.inode, altkey, data.clone());
++            if u32::from(data.kind) == libc::S_IFDIR as u32 {
++                dir_changed = true;
++            }
+             data
+         });
+         if data.kind != libc::S_IFDIR && st.st_nlink > 1 {
+             data.hardlinked.store(true, Ordering::Release);
+         }
+-        data.set_anchor(parent_data.inode, name);
++        if data.set_anchor(parent_data.inode, name)
++            && u32::from(data.kind) == libc::S_IFDIR as u32
++        {
++            dir_changed = true;
++        }
++        if dir_changed {
++            self.cfg.guest_cache.note_dir_change();
++        }
++        self.cfg.guest_cache.note_activity();
+ 
+         Entry {
+             inode: data.inode,
+@@ -2137,17 +2153,20 @@ impl FileSystem for PassthroughFs {
+         // we want the client to be able to set all the bits in the mode.
+         unsafe { libc::umask(0o000) };
+ 
+-        let mut inodes = self.inodes.write().unwrap();
++        {
++            let mut inodes = self.inodes.write().unwrap();
+ 
+-        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
+-        inodes.insert(
+-            fuse::ROOT_ID,
+-            InodeAltKey {
+-                ino: st.st_ino,
+-                dev: st.st_dev,
+-            },
+-            Arc::new(InodeData::new(fuse::ROOT_ID, &st, 2)),
+-        );
++            // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
++            inodes.insert(
++                fuse::ROOT_ID,
++                InodeAltKey {
++                    ino: st.st_ino,
++                    dev: st.st_dev,
++                },
++                Arc::new(InodeData::new(fuse::ROOT_ID, &st, 2)),
++            );
++        }
++        self.cfg.guest_cache.note_dir_change();
+ 
+         let mut opts = FsOptions::empty();
+         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+@@ -2174,6 +2193,7 @@ impl FileSystem for PassthroughFs {
+     fn destroy(&self) {
+         self.handles.clear();
+         self.inodes.write().unwrap().clear();
++        self.cfg.guest_cache.note_dir_change();
+     }
+ 
+     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
+@@ -2202,7 +2222,15 @@ impl FileSystem for PassthroughFs {
+             .cloned()
+             .ok_or_else(ebadf)?;
+ 
+-        let st = self.stat_child(&ctx, &parent_data, name)?;
++        let st = match self.stat_child(&ctx, &parent_data, name) {
++            Ok(st) => st,
++            Err(e) => {
++                if e.raw_os_error() == Some(libc::ENOENT) && !self.cfg.negative_timeout.is_zero() {
++                    self.cfg.guest_cache.note_activity();
++                }
++                return Err(e);
++            }
++        };
+ 
+         debug!(
+             "lookup: parent={parent} name={} ino={}",
+@@ -2223,7 +2251,11 @@ impl FileSystem for PassthroughFs {
+             forget_one(&mut inodes, inode, count)
+         };
+         if let Some(data) = evicted {
++            let is_dir = u32::from(data.kind) == libc::S_IFDIR as u32;
+             finish_forget(data);
++            if is_dir {
++                self.cfg.guest_cache.note_dir_change();
++            }
+         }
+     }
+ 
+@@ -2237,9 +2269,16 @@ impl FileSystem for PassthroughFs {
+                 }
+             }
+         }
++        let mut dir_evicted = false;
+         for data in evicted {
++            if u32::from(data.kind) == libc::S_IFDIR as u32 {
++                dir_evicted = true;
++            }
+             finish_forget(data);
+         }
++        if dir_evicted {
++            self.cfg.guest_cache.note_dir_change();
++        }
+     }
+ 
+     fn opendir(
+@@ -2364,14 +2403,22 @@ impl FileSystem for PassthroughFs {
+                 Ok(0) => {
+                     let evicted = forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                     if let Some(data) = evicted {
++                        let is_dir = u32::from(data.kind) == libc::S_IFDIR as u32;
+                         finish_forget(data);
++                        if is_dir {
++                            self.cfg.guest_cache.note_dir_change();
++                        }
+                     }
+                     Ok(0)
+                 }
+                 Err(e) => {
+                     let evicted = forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                     if let Some(data) = evicted {
++                        let is_dir = u32::from(data.kind) == libc::S_IFDIR as u32;
+                         finish_forget(data);
++                        if is_dir {
++                            self.cfg.guest_cache.note_dir_change();
++                        }
+                     }
+                     Err(e)
+                 }
+@@ -3619,6 +3666,7 @@ impl PassthroughFs {
+                 *hd.file.write().unwrap() = file.try_clone()?;
+             }
+         }
++        self.cfg.guest_cache.note_activity();
+         Ok(())
+     }
+ }

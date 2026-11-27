@@ -227,7 +227,9 @@ impl Stream {
             if !exclusions.is_empty() {
                 let ex = cf_array(&exclusions[..exclusions.len().min(MAX_EXCLUSIONS)]);
                 if !ex.is_null() {
-                    FSEventStreamSetExclusionPaths(stream, ex);
+                    if FSEventStreamSetExclusionPaths(stream, ex) == 0 {
+                        log::warn!("fsevents: FSEventStreamSetExclusionPaths failed");
+                    }
                     CFRelease(ex);
                 }
             }

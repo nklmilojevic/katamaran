@@ -99,7 +99,7 @@ impl InodeData {
         }
     }
 
-    fn set_anchor(&self, parent: Inode, name: &CStr) {
+    fn set_anchor(&self, parent: Inode, name: &CStr) -> bool {
         let mut anchor = self.anchor.lock().unwrap();
         if anchor
             .as_ref()
@@ -107,7 +107,9 @@ impl InodeData {
         {
             *anchor = Some((parent, name.to_owned()));
             self.anchor_parent.store(parent, Ordering::Release);
+            return true;
         }
+        false
     }
 
     fn active_dir_file(&self) -> Option<Arc<RwLock<File>>> {
@@ -1401,6 +1403,8 @@ impl PassthroughFs {
             }
         }
 
+        drop(ds);
+        self.cfg.guest_cache.note_activity();
         Ok(())
     }
 
@@ -1428,6 +1432,7 @@ impl PassthroughFs {
             data.refcount.fetch_add(1, Ordering::Acquire);
             data.clone()
         };
+        let mut dir_changed = false;
         let found = self.inodes.read().unwrap().get_alt(&altkey).map(take);
         let data = found.unwrap_or_else(|| {
             let mut inodes = self.inodes.write().unwrap();
@@ -1436,12 +1441,23 @@ impl PassthroughFs {
             }
             let data = Arc::new(InodeData::new(self.inode_alloc.next(), &st, 1));
             inodes.insert(data.inode, altkey, data.clone());
+            if u32::from(data.kind) == libc::S_IFDIR as u32 {
+                dir_changed = true;
+            }
             data
         });
         if data.kind != libc::S_IFDIR && st.st_nlink > 1 {
             data.hardlinked.store(true, Ordering::Release);
         }
-        data.set_anchor(parent_data.inode, name);
+        if data.set_anchor(parent_data.inode, name)
+            && u32::from(data.kind) == libc::S_IFDIR as u32
+        {
+            dir_changed = true;
+        }
+        if dir_changed {
+            self.cfg.guest_cache.note_dir_change();
+        }
+        self.cfg.guest_cache.note_activity();
 
         Entry {
             inode: data.inode,
@@ -2137,17 +2153,20 @@ impl FileSystem for PassthroughFs {
         // we want the client to be able to set all the bits in the mode.
         unsafe { libc::umask(0o000) };
 
-        let mut inodes = self.inodes.write().unwrap();
+        {
+            let mut inodes = self.inodes.write().unwrap();
 
-        // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
-        inodes.insert(
-            fuse::ROOT_ID,
-            InodeAltKey {
-                ino: st.st_ino,
-                dev: st.st_dev,
-            },
-            Arc::new(InodeData::new(fuse::ROOT_ID, &st, 2)),
-        );
+            // Not sure why the root inode gets a refcount of 2 but that's what libfuse does.
+            inodes.insert(
+                fuse::ROOT_ID,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                },
+                Arc::new(InodeData::new(fuse::ROOT_ID, &st, 2)),
+            );
+        }
+        self.cfg.guest_cache.note_dir_change();
 
         let mut opts = FsOptions::empty();
         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
@@ -2174,6 +2193,7 @@ impl FileSystem for PassthroughFs {
     fn destroy(&self) {
         self.handles.clear();
         self.inodes.write().unwrap().clear();
+        self.cfg.guest_cache.note_dir_change();
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
@@ -2202,7 +2222,15 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = self.stat_child(&ctx, &parent_data, name)?;
+        let st = match self.stat_child(&ctx, &parent_data, name) {
+            Ok(st) => st,
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::ENOENT) && !self.cfg.negative_timeout.is_zero() {
+                    self.cfg.guest_cache.note_activity();
+                }
+                return Err(e);
+            }
+        };
 
         debug!(
             "lookup: parent={parent} name={} ino={}",
@@ -2223,7 +2251,11 @@ impl FileSystem for PassthroughFs {
             forget_one(&mut inodes, inode, count)
         };
         if let Some(data) = evicted {
+            let is_dir = u32::from(data.kind) == libc::S_IFDIR as u32;
             finish_forget(data);
+            if is_dir {
+                self.cfg.guest_cache.note_dir_change();
+            }
         }
     }
 
@@ -2237,8 +2269,15 @@ impl FileSystem for PassthroughFs {
                 }
             }
         }
+        let mut dir_evicted = false;
         for data in evicted {
+            if u32::from(data.kind) == libc::S_IFDIR as u32 {
+                dir_evicted = true;
+            }
             finish_forget(data);
+        }
+        if dir_evicted {
+            self.cfg.guest_cache.note_dir_change();
         }
     }
 
@@ -2364,14 +2403,22 @@ impl FileSystem for PassthroughFs {
                 Ok(0) => {
                     let evicted = forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
                     if let Some(data) = evicted {
+                        let is_dir = u32::from(data.kind) == libc::S_IFDIR as u32;
                         finish_forget(data);
+                        if is_dir {
+                            self.cfg.guest_cache.note_dir_change();
+                        }
                     }
                     Ok(0)
                 }
                 Err(e) => {
                     let evicted = forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
                     if let Some(data) = evicted {
+                        let is_dir = u32::from(data.kind) == libc::S_IFDIR as u32;
                         finish_forget(data);
+                        if is_dir {
+                            self.cfg.guest_cache.note_dir_change();
+                        }
                     }
                     Err(e)
                 }
@@ -3619,6 +3666,7 @@ impl PassthroughFs {
                 *hd.file.write().unwrap() = file.try_clone()?;
             }
         }
+        self.cfg.guest_cache.note_activity();
         Ok(())
     }
 }
