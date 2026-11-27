@@ -186,14 +186,88 @@ fn katamaran() -> PathBuf {
     root().join("target/release/katamaran")
 }
 
-fn cli(home: &Path, user_home: &Path, args: &[&str]) -> Output {
-    Command::new(katamaran())
-        .args(args)
-        .env("KATAMARAN_HOME", home)
-        .env("HOME", user_home)
+fn run_child_with_timeout(mut child: Child, timeout: Duration) -> Result<Output, String> {
+    let stdout_rx = child.stdout.take().map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    });
+    let stderr_rx = child.stderr.take().map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_rx
+                    .and_then(|rx| rx.recv_timeout(Duration::from_secs(5)).ok())
+                    .unwrap_or_default();
+                let stderr = stderr_rx
+                    .and_then(|rx| rx.recv_timeout(Duration::from_secs(5)).ok())
+                    .unwrap_or_default();
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_rx
+                        .and_then(|rx| rx.recv_timeout(Duration::from_secs(1)).ok())
+                        .unwrap_or_default();
+                    let stderr = stderr_rx
+                        .and_then(|rx| rx.recv_timeout(Duration::from_secs(1)).ok())
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "timed out after {:.1}s\nstdout:\n{}\nstderr:\n{}",
+                        timeout.as_secs_f64(),
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr),
+                    ));
+                }
+                thread::sleep(left.min(Duration::from_millis(25)));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait failed: {e}"));
+            }
+        }
+    }
+}
+
+fn run_output_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    let child = cmd
         .stdin(Stdio::null())
-        .output()
-        .expect("run katamaran")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    run_child_with_timeout(child, timeout)
+}
+
+fn cli(home: &Path, user_home: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new(katamaran());
+    cmd.args(args)
+        .env("KATAMARAN_HOME", home)
+        .env("HOME", user_home);
+    run_output_timeout(&mut cmd, Duration::from_secs(240))
+        .unwrap_or_else(|e| panic!("run katamaran {args:?} failed: {e}"))
 }
 
 fn ok(out: &Output, what: &str) -> String {
@@ -207,11 +281,22 @@ fn ok(out: &Output, what: &str) -> String {
     stdout
 }
 
-fn wait_until(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
+fn ok_result(res: Result<Output, String>, what: &str) -> String {
+    let out = res.unwrap_or_else(|e| panic!("{what} failed: {e}"));
+    ok(&out, what)
+}
+
+fn wait_until(what: &str, timeout: Duration, mut f: impl FnMut(Duration) -> bool) {
     let deadline = Instant::now() + timeout;
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        thread::sleep(Duration::from_millis(200));
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for {what}");
+        if f(remaining) {
+            return;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for {what}");
+        thread::sleep(left.min(Duration::from_millis(200)));
     }
 }
 
@@ -238,7 +323,7 @@ impl Daemon {
             home: home.to_path_buf(),
         };
         let sock = home.join("run/daemon.sock");
-        wait_until("the daemon socket", Duration::from_secs(10), || {
+        wait_until("the daemon socket", Duration::from_secs(10), |_| {
             UnixStream::connect(&sock).is_ok()
         });
         d
@@ -278,7 +363,11 @@ struct ContainerGuard {
 
 impl Drop for ContainerGuard {
     fn drop(&mut self) {
-        let _ = docker(&self.docker_host, &["rm", "-f", &self.id]);
+        let _ = docker_timeout(
+            &self.docker_host,
+            &["rm", "-f", &self.id],
+            Duration::from_secs(15),
+        );
     }
 }
 
@@ -289,8 +378,8 @@ struct QuickackRestoreGuard {
 
 impl QuickackRestoreGuard {
     fn restore(mut self) {
-        ok(
-            &docker(
+        ok_result(
+            docker_timeout(
                 &self.docker_host,
                 &[
                     "run",
@@ -301,6 +390,7 @@ impl QuickackRestoreGuard {
                     "-c",
                     &format!("echo 1 > {QUICKACK_PARAM}"),
                 ],
+                Duration::from_secs(30),
             ),
             "re-enable kat.quickack",
         );
@@ -311,7 +401,7 @@ impl QuickackRestoreGuard {
 impl Drop for QuickackRestoreGuard {
     fn drop(&mut self) {
         if !self.restored {
-            let _ = docker(
+            let _ = docker_timeout(
                 &self.docker_host,
                 &[
                     "run",
@@ -322,29 +412,34 @@ impl Drop for QuickackRestoreGuard {
                     "-c",
                     &format!("echo 1 > {QUICKACK_PARAM}"),
                 ],
+                Duration::from_secs(15),
             );
         }
     }
 }
 
+fn kubectl_timeout(kubeconfig: &Path, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("--kubeconfig").arg(kubeconfig).args(args);
+    run_output_timeout(&mut cmd, timeout)
+}
+
 fn kubectl(kubeconfig: &Path, args: &[&str]) -> Output {
-    Command::new("kubectl")
-        .arg("--kubeconfig")
-        .arg(kubeconfig)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run kubectl")
+    kubectl_timeout(kubeconfig, args, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("run kubectl {args:?} failed: {e}"))
+}
+
+fn docker_timeout(docker_host: &str, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let mut cmd = Command::new("docker");
+    cmd.env("DOCKER_HOST", docker_host)
+        .env_remove("DOCKER_CONTEXT")
+        .args(args);
+    run_output_timeout(&mut cmd, timeout)
 }
 
 fn docker(docker_host: &str, args: &[&str]) -> Output {
-    Command::new("docker")
-        .env("DOCKER_HOST", docker_host)
-        .env_remove("DOCKER_CONTEXT")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run docker")
+    docker_timeout(docker_host, args, Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("run docker {args:?} failed: {e}"))
 }
 
 fn build_test_image(docker_host: &str) {
@@ -362,8 +457,10 @@ fn build_test_image(docker_host: &str) {
         "FROM {BASE_IMAGE}\nRUN apk add --no-cache python3 iproute2\n"
     )
     .unwrap();
-    let out = build.wait_with_output().expect("wait docker build");
-    ok(&out, "build test image");
+    ok_result(
+        run_child_with_timeout(build, Duration::from_secs(180)),
+        "build test image",
+    );
 }
 
 struct HostHttpServer {
@@ -391,6 +488,7 @@ impl HostHttpServer {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                         let _ = stream.set_nodelay(true);
                         thread::spawn(move || {
                             let mut buf = Vec::new();
@@ -547,8 +645,8 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         );
     }
     for name in ["qa-peer", "qa-probe"] {
-        ok(
-            &kubectl(
+        ok_result(
+            kubectl_timeout(
                 &kubeconfig,
                 &[
                     "wait",
@@ -556,6 +654,7 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                     "--timeout=120s",
                     &format!("pod/{name}"),
                 ],
+                Duration::from_secs(150),
             ),
             &format!("wait for pod {name}"),
         );
@@ -591,8 +690,8 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
             .expect("start split-write server in qa-peer"),
     );
 
-    wait_until("qa-peer server ready", Duration::from_secs(15), || {
-        kubectl(
+    wait_until("qa-peer server ready", Duration::from_secs(15), |left| {
+        kubectl_timeout(
             &kubeconfig,
             &[
                 "exec",
@@ -604,9 +703,9 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                 &peer_ip,
                 "1",
             ],
+            left.min(Duration::from_secs(5)),
         )
-        .status
-        .success()
+        .is_ok_and(|o| o.status.success())
     });
 
     // 1) Open ONE persistent keep-alive TCP connection from qa-probe to qa-peer
@@ -740,8 +839,8 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     .trim()
     .to_string();
     assert!(!svc_ip.is_empty(), "qa-svc has empty clusterIP");
-    wait_until("qa-svc endpoints ready", Duration::from_secs(30), || {
-        kubectl(
+    wait_until("qa-svc endpoints ready", Duration::from_secs(30), |left| {
+        kubectl_timeout(
             &kubeconfig,
             &[
                 "exec",
@@ -753,9 +852,9 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                 &svc_ip,
                 "1",
             ],
+            left.min(Duration::from_secs(5)),
         )
-        .status
-        .success()
+        .is_ok_and(|o| o.status.success())
     });
     let svc_out = ok(
         &kubectl(
@@ -826,8 +925,8 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     wait_until(
         "bridged docker server ready",
         Duration::from_secs(15),
-        || {
-            docker(
+        |left| {
+            docker_timeout(
                 &docker_host,
                 &[
                     "run",
@@ -841,9 +940,9 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
                     &srv_ip,
                     "1",
                 ],
+                left.min(Duration::from_secs(10)),
             )
-            .status
-            .success()
+            .is_ok_and(|o| o.status.success())
         },
     );
 
@@ -1040,10 +1139,11 @@ fn cmdline_opt_out_disables_quickack() {
     }
 
     let docker_host = format!("unix://{}", home.join("run/docker.sock").display());
-    let val = ok(
-        &docker(
+    let val = ok_result(
+        docker_timeout(
             &docker_host,
             &["run", "--rm", BASE_IMAGE, "cat", QUICKACK_PARAM],
+            Duration::from_secs(120),
         ),
         "read kat.quickack under --cmdline kat.quickack=0",
     );
