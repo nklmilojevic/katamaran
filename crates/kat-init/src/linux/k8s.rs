@@ -45,7 +45,45 @@ const BIN_DIR: &str = "/var/lib/katamaran/k3s/bin";
 const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
-const DATA_DIR_STALE_PREFIX: &str = ".data.removing-";
+/// Katamaran-owned directory (next to `DATA_DIR`) that reset renames detached
+/// datastores into. Reclamation only ever deletes entries inside it whose
+/// names reset itself generates ([`is_reset_trash_name`]).
+const RESET_TRASH_DIR: &str = ".katamaran-reset-trash";
+/// Prefix of a detached datastore's name inside [`RESET_TRASH_DIR`].
+const DATA_DIR_STALE_PREFIX: &str = "data-";
+
+/// Whether `name` is one reset generates for a detached datastore:
+/// `data-` followed by a UUID or `<pid>-<nanos>-<seq>` (hex digits and `-`).
+fn is_reset_trash_name(name: &str) -> bool {
+    name.strip_prefix(DATA_DIR_STALE_PREFIX)
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest.len() <= 64
+                && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        })
+}
+
+/// The reset trash directory for `parent` (the directory holding `DATA_DIR`),
+/// created owner-only if missing. Refuses anything that is not a real
+/// directory (for example a symlink).
+fn reset_trash_dir(parent: &Path, create: bool) -> Result<Option<std::path::PathBuf>, String> {
+    let trash = parent.join(RESET_TRASH_DIR);
+    match fs::symlink_metadata(&trash) {
+        Ok(m) if m.file_type().is_dir() => Ok(Some(trash)),
+        Ok(_) => Err(format!(
+            "{} is not a directory; refusing to use it for detached cluster data",
+            trash.display()
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+            std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                .create(&trash)
+                .map_err(|e| format!("create {}: {e}", trash.display()))?;
+            Ok(Some(trash))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat {}: {e}", trash.display())),
+    }
+}
 const DATA_VERSION_FILE: &str = "/var/lib/katamaran/k3s/data/.katamaran-version";
 /// Copy of the datastore version kept beside `state.db` in `server/db/`,
 /// written before every launch of k3s against an existing datastore. Unlike
@@ -147,9 +185,6 @@ fn guard_cleanup_command(cmd: &mut Command) -> &mut Command {
 }
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<SyncLogState> = Mutex::new(SyncLogState::new());
-/// Serializes reclamation of `.data.removing-*` copies between the boot-time
-/// reclaim thread and resets, so two helpers never walk the same tree.
-static RECLAIM_LOCK: Mutex<()> = Mutex::new(());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A k3s child that survived SIGKILL after its `Running` handle was dropped,
 /// tracked by its own exit notification (never by a reusable pid lookup).
@@ -313,15 +348,6 @@ pub fn start_service(
         }),
     });
     let _ = SERVICE.set(svc.clone());
-    // Best-effort: reclaim detached `.data.removing-*` copies left by a reset
-    // whose reclamation was interrupted or timed out, so their disk space never
-    // depends on another reset. Only stale siblings are touched (never
-    // `DATA_DIR`), in the same killable no-follow helper; a concurrent reset
-    // reclaiming the same copies only turns into a harmless warning.
-    let boot_reaper = svc.reaper.clone();
-    let _ = thread::Builder::new()
-        .name("k8s-reclaim".into())
-        .spawn(move || reclaim_stale_at_boot(&boot_reaper));
     let listener = sys::vsock_listen(K8S_PORT)?;
     let s = svc.clone();
     let active = Arc::new(AtomicUsize::new(0));
@@ -2904,11 +2930,6 @@ impl K8s {
                     &may_destroy,
                     |dir, beat| remove_tree_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
                     |parent, beat| {
-                        // Never wait under `op_lock` for the boot-time reclaim:
-                        // it is already removing the same leftovers.
-                        let Ok(_guard) = RECLAIM_LOCK.try_lock() else {
-                            return Err("background reclamation is already running".into());
-                        };
                         reclaim_stale_reaped(&self.reaper, parent, DATA_REMOVE_TIMEOUT, beat)
                     },
                     &mut || {
@@ -3634,6 +3655,7 @@ fn path_exists_checked(path: &Path) -> Result<bool, String> {
 }
 
 fn next_stale_data_dir(parent: &Path) -> Result<std::path::PathBuf, String> {
+    let parent = &reset_trash_dir(parent, true)?.expect("created");
     for _ in 0..16 {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let suffix = fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -3720,19 +3742,19 @@ fn describe_reset_abort(e: String, stream_failed: bool) -> String {
 
 /// Remove active Kubernetes cluster data with exactly one irreversible step.
 ///
-/// 1. Atomically rename `data_dir` to a unique `.data.removing-*` sibling —
+/// 1. Atomically rename `data_dir` to a unique `.katamaran-reset-trash/data-*` sibling —
 ///    the single step that makes the active datastore unreachable.
 /// 2. Remove the k3s kubeconfig and config, then acknowledge with
 ///    `on_active_data_cleared` (the host disables auto-start on this ack).
 /// 3. Best-effort cleanup: remove the legacy pre-migration kubelet directory
-///    with `remove_legacy` and reclaim every `.data.removing-*` sibling with
+///    with `remove_legacy` and reclaim every `.katamaran-reset-trash/data-*` sibling with
 ///    `reclaim_stale`.
 ///
 /// `may_destroy` is checked immediately before steps 1 and 3; if it fails
 /// (VM shutting down or the reply stream to the host already failed) nothing
 /// further is destroyed. If the ack in step 2 fails, cleanup is skipped and
 /// an error is returned. Cleanup failure is not a reset failure: the active
-/// data is already gone and leftovers are retried on the next reset or boot,
+/// data is already gone and leftovers are retried on the next reset,
 /// so it is returned as `Ok(Some(warning))`.
 fn remove_cluster_data_dirs(
     paths: &ClusterDataPaths<'_>,
@@ -3765,7 +3787,7 @@ fn remove_cluster_data_dirs(
     // Everything below is cleanup of data the host already knows is gone.
     if let Err(e) = may_destroy() {
         return Ok(Some(format!(
-            "leftover cluster data not removed ({e}); it is removed on the next reset or boot"
+            "leftover cluster data not removed ({e}); it is removed on the next reset"
         )));
     }
     let mut warnings = Vec::new();
@@ -3778,7 +3800,11 @@ fn remove_cluster_data_dirs(
         }
         Err(e) => warnings.push(e),
     }
-    if let Some(parent) = paths.data_dir.parent()
+    // Re-checked: the legacy cleanup may have run long enough for a progress
+    // write to fail.
+    if let Err(e) = may_destroy() {
+        warnings.push(format!("detached cluster data not reclaimed ({e})"));
+    } else if let Some(parent) = paths.data_dir.parent()
         && let Err(e) = reclaim_stale(parent, &mut beat)
     {
         warnings.push(format!("could not reclaim detached cluster data ({e})"));
@@ -3787,7 +3813,7 @@ fn remove_cluster_data_dirs(
         return Ok(None);
     }
     Ok(Some(format!(
-        "{}; it is retried on the next reset or boot",
+        "{}; it is retried on the next reset",
         warnings.join("; ")
     )))
 }
@@ -3799,6 +3825,10 @@ fn reclaim_stale_dirs(
     parent: &Path,
     remove: &mut dyn FnMut(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
+    let Some(trash) = reset_trash_dir(parent, false)? else {
+        return Ok(());
+    };
+    let parent = trash.as_path();
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -3813,11 +3843,7 @@ fn reclaim_stale_dirs(
     for entry in entries {
         let entry = entry
             .map_err(|e| format!("scan {} for detached cluster data: {e}", parent.display()))?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
-        {
+        if entry.file_name().to_str().is_some_and(is_reset_trash_name) {
             stale.push(entry.path());
         }
     }
@@ -3829,26 +3855,6 @@ fn reclaim_stale_dirs(
         Ok(())
     } else {
         Err(errors.join("; "))
-    }
-}
-
-fn reclaim_stale_at_boot(reaper: &Reaper) {
-    let Some(parent) = Path::new(DATA_DIR).parent() else {
-        return;
-    };
-    let mut any = false;
-    if reclaim_stale_dirs(parent, &mut |_| {
-        any = true;
-        Ok(())
-    })
-    .is_err()
-        || !any
-    {
-        return;
-    }
-    let _guard = RECLAIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = reclaim_stale_reaped(reaper, parent, DATA_REMOVE_TIMEOUT, &mut || {}) {
-        log(&format!("k8s: reclaim detached cluster data: {e}"));
     }
 }
 
@@ -6327,7 +6333,14 @@ fn clear_k8s_images<T>(
     clear_k8s_images_with(
         abort,
         &lease_id,
-        |args, timeout, on_wait| run_ctr_k8s(reaper, args, timeout, on_wait),
+        // Checked immediately before every `ctr` launch (after any progress
+        // write that may just have failed), not only between steps.
+        |args, timeout, on_wait| {
+            if abort() {
+                return Err("aborted: VM is shutting down or the client disconnected".into());
+            }
+            run_ctr_k8s(reaper, args, timeout, on_wait)
+        },
         progress,
     )
 }
@@ -10492,8 +10505,10 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         };
         let ok = || -> Result<(), String> { Ok(()) };
         let stale = || -> Vec<std::path::PathBuf> {
-            let mut v: Vec<_> = fs::read_dir(base)
-                .unwrap()
+            let Ok(rd) = fs::read_dir(base.join(RESET_TRASH_DIR)) else {
+                return Vec::new();
+            };
+            let mut v: Vec<_> = rd
                 .map(|e| e.unwrap().path())
                 .filter(|p| {
                     p.file_name()
@@ -10691,7 +10706,31 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 
         // 9. A scan error while reclaiming is a warning (data already detached).
         let warning = reclaim_stale_dirs(&file_parent, &mut |_| Ok(())).unwrap_err();
-        assert!(warning.contains("for detached cluster data"), "{warning}");
+        assert!(warning.contains("stat "), "{warning}");
+
+        // 10. Only names reset generates, inside the katamaran-owned trash
+        //     directory, are ever reclaimed; a symlinked trash dir is refused.
+        let p2 = base.join("p2");
+        let trash = p2.join(RESET_TRASH_DIR);
+        fs::create_dir_all(trash.join("data-0a1b-2c3d")).unwrap();
+        fs::create_dir_all(trash.join("data-not_ours!")).unwrap();
+        fs::create_dir_all(trash.join("other")).unwrap();
+        fs::create_dir_all(p2.join(".data.removing-custom")).unwrap();
+        let mut seen = Vec::new();
+        reclaim_stale_dirs(&p2, &mut |p| {
+            seen.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["data-0a1b-2c3d".to_string()]);
+        let p3 = base.join("p3");
+        fs::create_dir_all(&p3).unwrap();
+        std::os::unix::fs::symlink(&trash, p3.join(RESET_TRASH_DIR)).unwrap();
+        let err = reclaim_stale_dirs(&p3, &mut |_| {
+            panic!("must not follow a symlinked trash dir")
+        })
+        .unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
     }
 
     #[test]

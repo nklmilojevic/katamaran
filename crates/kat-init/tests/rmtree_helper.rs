@@ -60,20 +60,41 @@ fn rmtree_helper_removes_tree_without_following_symlinks() {
 fn rmtree_helper_reclaims_only_stale_siblings() {
     let tmp = TempDir::new("kat-rmtree-stale");
     let parent = &tmp.0;
-    for name in [".data.removing-1/x", ".data.removing-2", "data/server"] {
+    for name in [
+        ".katamaran-reset-trash/data-1a/x",
+        ".katamaran-reset-trash/data-2b",
+        ".katamaran-reset-trash/unrelated",
+        ".data.removing-custom",
+        "data/server",
+    ] {
         fs::create_dir_all(parent.join(name)).unwrap();
     }
-    fs::write(parent.join(".data.removing-1/x/f"), b"x").unwrap();
+    fs::write(parent.join(".katamaran-reset-trash/data-1a/x/f"), b"x").unwrap();
     fs::write(parent.join("data/server/state.db"), b"live").unwrap();
 
     let out = kat_init(&["--stale-in".as_ref(), parent.as_os_str()]);
     assert!(out.status.success(), "{out:?}");
-    let mut left: Vec<String> = fs::read_dir(parent)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    left.sort();
-    assert_eq!(left, vec!["data".to_string()]);
+    let list = |p: &Path| {
+        let mut v: Vec<String> = fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    };
+    // Only reset-generated names inside the trash dir are removed.
+    assert_eq!(
+        list(parent),
+        vec![
+            ".data.removing-custom".to_string(),
+            ".katamaran-reset-trash".to_string(),
+            "data".to_string()
+        ]
+    );
+    assert_eq!(
+        list(&parent.join(".katamaran-reset-trash")),
+        vec!["unrelated".to_string()]
+    );
     assert!(Path::new(&parent.join("data/server/state.db")).exists());
 }
 

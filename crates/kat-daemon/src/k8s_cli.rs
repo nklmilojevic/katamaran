@@ -287,31 +287,41 @@ impl ProgressPrinter {
     }
 }
 
-/// Write `buf` to stderr without blocking past `timeout` (an undrained pipe
-/// just loses the rest of the line).
+/// Write `buf` to stderr without ever blocking: stderr is switched to
+/// `O_NONBLOCK` for the duration (the CLI is about to exit), so a full or
+/// undrained pipe just loses the rest of the line instead of hanging. Waits
+/// for writability at most until `timeout`.
 fn write_stderr_bounded(mut buf: &[u8], timeout: Duration) {
+    let fd = libc::STDERR_FILENO;
+    // SAFETY: fcntl on our own stderr descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return;
+    }
     let deadline = std::time::Instant::now() + timeout;
     while !buf.is_empty() {
+        // SAFETY: `buf` is valid for `buf.len()` bytes; the fd is non-blocking.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+            continue;
+        }
+        let e = std::io::Error::last_os_error();
         let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if n == 0 || e.kind() != std::io::ErrorKind::WouldBlock || left.is_zero() {
+            break;
+        }
         let mut pfd = libc::pollfd {
-            fd: libc::STDERR_FILENO,
+            fd,
             events: libc::POLLOUT,
             revents: 0,
         };
-        let ms = left.as_millis().min(i32::MAX as u128) as i32;
-        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
-        if left.is_zero() || unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
-            return;
-        }
-        // SAFETY: POLLOUT guarantees at least PIPE_BUF bytes can be written
-        // atomically without blocking; writing at most that many never blocks.
-        let chunk = buf.len().min(libc::PIPE_BUF);
-        let n = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), chunk) };
-        if n <= 0 {
-            return;
-        }
-        buf = &buf[n as usize..];
+        let ms = left.as_millis().clamp(1, 50) as i32;
+        // SAFETY: `pfd` is valid for the duration of the call.
+        unsafe { libc::poll(&mut pfd, 1, ms) };
     }
+    // SAFETY: restore the original flags on our own stderr descriptor.
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
 }
 
 fn report_error_bounded(printer: ProgressPrinter, err: &anyhow::Error) -> anyhow::Error {
