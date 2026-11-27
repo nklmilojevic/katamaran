@@ -3384,13 +3384,33 @@ fn split_yaml_anchor(s: &str) -> Option<(&str, &str)> {
     Some((name, after.trim_start_matches([' ', '\t'])))
 }
 
+/// Split a leading YAML tag property off `s`, returning `(tag, rest)`.
+///
+/// Verbatim tags (`!<...>`) run to the closing `>` so URI characters such as
+/// the `,` in `!<tag:yaml.org,2002:str>` stay part of the tag, mirroring
+/// go-yaml's `yaml_parser_scan_tag`. Shorthand tags (`!`, `!!str`, `!x!y`)
+/// stop at whitespace or a flow indicator. Either form must be followed by
+/// whitespace, a line break, or end of input; anything else is rejected.
 fn split_yaml_tag(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix('!')?;
-    let end = rest
-        .find(|c: char| {
+    let end = if let Some(verbatim) = rest.strip_prefix('<') {
+        let close = verbatim.find('>')?;
+        let uri = &verbatim[..close];
+        if uri.is_empty()
+            || uri.contains(|c: char| {
+                matches!(c, ' ' | '\t' | '{' | '}' | '<') || is_yaml_line_break_char(c)
+            })
+        {
+            return None;
+        }
+        // `<` + uri + `>`
+        close + 2
+    } else {
+        rest.find(|c: char| {
             matches!(c, ' ' | '\t' | '[' | ']' | '{' | '}' | ',') || is_yaml_line_break_char(c)
         })
-        .unwrap_or(rest.len());
+        .unwrap_or(rest.len())
+    };
     let after = &rest[end..];
     if !after.is_empty()
         && !after.starts_with(|c: char| matches!(c, ' ' | '\t') || is_yaml_line_break_char(c))
@@ -11361,6 +11381,11 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "etcd-s3-proxy:\n  - !!str http://proxy.example.com:8080\n",
             "{etcd-s3-proxy: !!str \"http://proxy.example.com:8080\"}\n",
             "etcd-s3-proxy: !!str\n  http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: !<tag:yaml.org,2002:str> http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: !<tag:yaml.org,2002:str> \"http://proxy.example.com:8080\"\n",
+            "etcd-s3-proxy: [!<tag:yaml.org,2002:str> http://proxy.example.com:8080]\n",
+            "{etcd-s3-proxy: !<tag:yaml.org,2002:str> \"http://proxy.example.com:8080\"}\n",
+            "x-proxy: &p !<tag:yaml.org,2002:str> http://proxy.example.com:8080\netcd-s3-proxy: *p\n",
             "other:\n- &p http://proxy.example.com:8080\netcd-s3-proxy: *p\n",
             "etcd-s3-proxy: [\n  \"http://proxy1.example.com:8080\",\n  \"http://proxy2.example.com:8080\"\n]\n",
             "etcd-s3-proxy:\n  [\n    \"http://proxy.example.com:8080\"\n  ]\n",
@@ -11508,6 +11533,23 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             (
                 "explicit !!str tag on malformed URL",
                 format!("etcd-s3-proxy: !!str {bad_url}\n"),
+            ),
+            (
+                "verbatim str tag on malformed URL",
+                format!("etcd-s3-proxy: !<tag:yaml.org,2002:str> {bad_url}\n"),
+            ),
+            (
+                "verbatim str tag in flow sequence on malformed URL",
+                format!("etcd-s3-proxy: [!<tag:yaml.org,2002:str> \"{bad_url}\"]\n"),
+            ),
+            (
+                "verbatim non-str tag is rejected",
+                "etcd-s3-proxy: !<tag:yaml.org,2002:binary> aHR0cDovL3g=\n".to_string(),
+            ),
+            (
+                "unterminated verbatim tag is rejected",
+                "etcd-s3-proxy: !<tag:yaml.org,2002:str http://proxy.example.com:8080\n"
+                    .to_string(),
             ),
             (
                 "explicit !!str null is literal string not YAML null",
