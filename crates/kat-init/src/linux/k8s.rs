@@ -3091,6 +3091,52 @@ fn is_valid_go_proxy_url(s: &str) -> bool {
     true
 }
 
+fn is_yaml_line_break_char(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+fn trim_yaml_ws(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+fn trim_yaml_flow_ws(s: &str) -> &str {
+    s.trim_matches(|c: char| matches!(c, ' ' | '\t') || is_yaml_line_break_char(c))
+}
+
+fn is_yaml_blank_line(l: &str) -> bool {
+    l.bytes().all(|b| matches!(b, b' ' | b'\t'))
+}
+
+/// True when `s` contains a YAML double-quoted escape that can synthesize ASCII
+/// identifier characters (`\x`, `\u`, `\U`) or join split lines (`\` + break).
+/// Plain escaped backslashes (`\\`) and ordinary escapes (`\"`, `\n`, etc.)
+/// cannot obfuscate `etcd-s3-proxy` and return `false`.
+fn has_yaml_key_obfuscating_escape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            match bytes.get(i + 1) {
+                Some(b'\\') => {
+                    i += 2;
+                    continue;
+                }
+                Some(b'x' | b'u' | b'U' | b'\n' | b'\r') => return true,
+                Some(_) => {
+                    if let Some(rest) = s.get(i + 1..)
+                        && rest.starts_with(['\u{0085}', '\u{2028}', '\u{2029}'])
+                    {
+                        return true;
+                    }
+                }
+                None => return true,
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn parse_yaml_single_quoted(s: &str) -> Result<(String, &str), ()> {
     let rest = s.strip_prefix('\'').ok_or(())?;
     let mut out = String::new();
@@ -3113,7 +3159,7 @@ fn parse_yaml_single_quoted(s: &str) -> Result<(String, &str), ()> {
 fn parse_yaml_double_quoted(s: &str) -> Result<(String, &str), ()> {
     let rest = s.strip_prefix('"').ok_or(())?;
     let mut out = String::new();
-    let mut chars = rest.char_indices();
+    let mut chars = rest.char_indices().peekable();
     while let Some((idx, ch)) = chars.next() {
         match ch {
             '"' => return Ok((out, &rest[idx + 1..])),
@@ -3123,12 +3169,21 @@ fn parse_yaml_double_quoted(s: &str) -> Result<(String, &str), ()> {
                     '"' => out.push('"'),
                     '\\' => out.push('\\'),
                     '/' => out.push('/'),
+                    ' ' => out.push(' '),
                     '0' => out.push('\0'),
                     'b' => out.push('\x08'),
                     'f' => out.push('\x0c'),
                     'n' => out.push('\n'),
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
+                    '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
+                        if esc == '\r' && matches!(chars.peek(), Some(&(_, '\n'))) {
+                            chars.next();
+                        }
+                        while matches!(chars.peek(), Some(&(_, ' ' | '\t'))) {
+                            chars.next();
+                        }
+                    }
                     'x' | 'u' | 'U' => {
                         let digits = match esc {
                             'x' => 2,
@@ -3170,17 +3225,66 @@ fn strip_yaml_inline_comment(s: &str) -> &str {
 fn split_yaml_anchor(s: &str) -> Option<(&str, &str)> {
     let rest = s.strip_prefix('&')?;
     let end = rest
-        .find(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '{' | '}' | ','))
+        .find(|c: char| {
+            matches!(c, ' ' | '\t' | '[' | ']' | '{' | '}' | ',') || is_yaml_line_break_char(c)
+        })
         .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }
     let name = &rest[..end];
     let after = &rest[end..];
-    if !after.is_empty() && !after.starts_with([' ', '\t']) {
+    if !after.is_empty()
+        && !after.starts_with(|c: char| matches!(c, ' ' | '\t') || is_yaml_line_break_char(c))
+    {
         return None;
     }
     Some((name, after.trim_start_matches([' ', '\t'])))
+}
+
+fn split_yaml_tag(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix('!')?;
+    let end = rest
+        .find(|c: char| {
+            matches!(c, ' ' | '\t' | '[' | ']' | '{' | '}' | ',') || is_yaml_line_break_char(c)
+        })
+        .unwrap_or(rest.len());
+    let after = &rest[end..];
+    if !after.is_empty()
+        && !after.starts_with(|c: char| matches!(c, ' ' | '\t') || is_yaml_line_break_char(c))
+    {
+        return None;
+    }
+    Some((&s[..1 + end], after.trim_start_matches([' ', '\t'])))
+}
+
+/// Strip at most one optional `&anchor` and at most one optional `!tag`
+/// property (in either order) without recursion. Returns `Err(())` if a
+/// property kind is repeated or malformed.
+fn strip_yaml_key_properties(s: &str) -> Result<(&str, usize), ()> {
+    let mut cur = s;
+    let mut saw_anchor = false;
+    let mut saw_tag = false;
+    loop {
+        if cur.starts_with('&') {
+            if saw_anchor {
+                return Err(());
+            }
+            let (_, after) = split_yaml_anchor(cur).ok_or(())?;
+            saw_anchor = true;
+            cur = trim_yaml_flow_ws(after);
+        } else if cur.starts_with('!') {
+            if saw_tag {
+                return Err(());
+            }
+            let (_, after) = split_yaml_tag(cur).ok_or(())?;
+            saw_tag = true;
+            cur = trim_yaml_flow_ws(after);
+        } else {
+            break;
+        }
+    }
+    Ok((cur, s.len() - cur.len()))
 }
 
 /// Decode a single YAML scalar value without any anchor/alias/tag properties.
@@ -3227,23 +3331,213 @@ fn parse_yaml_inline_scalar(raw: &str) -> Result<String, ()> {
     parse_yaml_plain_or_quoted_scalar(val_rest)
 }
 
-fn json_scalar_to_proxy_string(v: &serde_json::Value) -> Result<String, ()> {
-    match v {
-        serde_json::Value::Null => Ok(String::new()),
-        serde_json::Value::String(s) => Ok(s.clone()),
-        serde_json::Value::Bool(b) => Ok(b.to_string()),
-        serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(()),
+fn skip_flow_ws_and_comments(s: &str, mut i: usize) -> usize {
+    loop {
+        let Some(rest) = s.get(i..) else {
+            return s.len();
+        };
+        let Some(ch) = rest.chars().next() else {
+            return i;
+        };
+        if matches!(ch, ' ' | '\t') || is_yaml_line_break_char(ch) {
+            i += ch.len_utf8();
+        } else if ch == '#' {
+            i += 1;
+            if let Some(comment_rest) = s.get(i..) {
+                match comment_rest.find(is_yaml_line_break_char) {
+                    Some(off) => {
+                        let c_len = comment_rest[off..].chars().next().map_or(0, char::len_utf8);
+                        i += off + c_len;
+                    }
+                    None => return s.len(),
+                }
+            }
+        } else {
+            return i;
+        }
     }
 }
 
-fn json_value_to_proxy_string(v: &serde_json::Value) -> Result<Option<String>, ()> {
-    match v {
-        serde_json::Value::Array(arr) => match arr.last() {
-            Some(last) => json_scalar_to_proxy_string(last).map(Some),
-            None => Ok(None),
-        },
-        other => json_scalar_to_proxy_string(other).map(Some),
+fn skip_flow_quoted_double(s: &str, start: usize) -> Result<usize, ()> {
+    let rest = s.get(start..).and_then(|r| r.strip_prefix('"')).ok_or(())?;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((off, ch)) = chars.next() {
+        match ch {
+            '"' => return Ok(start + 1 + off + 1),
+            '\\' => {
+                let (_, esc) = chars.next().ok_or(())?;
+                if esc == '\r' && matches!(chars.peek(), Some(&(_, '\n'))) {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(())
+}
+
+fn skip_flow_quoted_single(s: &str, start: usize) -> Result<usize, ()> {
+    let rest = s
+        .get(start..)
+        .and_then(|r| r.strip_prefix('\''))
+        .ok_or(())?;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((off, ch)) = chars.next() {
+        if ch == '\'' {
+            if let Some(&(_, '\'')) = chars.peek() {
+                chars.next();
+            } else {
+                return Ok(start + 1 + off + 1);
+            }
+        }
+    }
+    Err(())
+}
+
+/// Advance past one YAML flow-mapping value (up to its terminating `,` or `}`
+/// at depth 0), skipping quoted strings, comments, and nested `{...}` / `[...]`
+/// iteratively without recursion.
+fn skip_flow_value(s: &str, start: usize) -> Result<usize, ()> {
+    let mut i = start;
+    let mut stack: Vec<u8> = Vec::new();
+    let mut prev_ws = true;
+    let mut at_token_start = true;
+    while let Some(rest) = s.get(i..) {
+        let Some(ch) = rest.chars().next() else {
+            return Err(());
+        };
+        match ch {
+            '"' if at_token_start => {
+                i = skip_flow_quoted_double(s, i)?;
+                prev_ws = false;
+                at_token_start = false;
+            }
+            '\'' if at_token_start => {
+                i = skip_flow_quoted_single(s, i)?;
+                prev_ws = false;
+                at_token_start = false;
+            }
+            '#' if prev_ws => {
+                i = skip_flow_ws_and_comments(s, i);
+                prev_ws = true;
+                at_token_start = true;
+            }
+            '{' => {
+                stack.push(b'}');
+                i += 1;
+                prev_ws = false;
+                at_token_start = true;
+            }
+            '[' => {
+                stack.push(b']');
+                i += 1;
+                prev_ws = false;
+                at_token_start = true;
+            }
+            '}' | ']' => match stack.last().copied() {
+                None => return if ch == '}' { Ok(i) } else { Err(()) },
+                Some(expected) if expected == ch as u8 => {
+                    stack.pop();
+                    i += 1;
+                    prev_ws = false;
+                    at_token_start = false;
+                }
+                Some(_) => return Err(()),
+            },
+            ',' if stack.is_empty() => return Ok(i),
+            ',' | ':' => {
+                i += 1;
+                prev_ws = false;
+                at_token_start = true;
+            }
+            c if matches!(c, ' ' | '\t') || is_yaml_line_break_char(c) => {
+                i += c.len_utf8();
+                prev_ws = true;
+                at_token_start = true;
+            }
+            c => {
+                i += c.len_utf8();
+                prev_ws = false;
+                at_token_start = false;
+            }
+        }
+    }
+    Err(())
+}
+
+fn find_flow_key_end(s: &str) -> Result<usize, ()> {
+    let mut chars = s.char_indices().peekable();
+    let mut prev_ws = true;
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            ',' | '}' | ']' | '[' | '{' => return Ok(idx),
+            ':' => {
+                let next_is_sep = match chars.peek() {
+                    None => true,
+                    Some(&(_, n)) => {
+                        matches!(n, ' ' | '\t' | ',' | '}' | ']' | '[' | '{')
+                            || is_yaml_line_break_char(n)
+                    }
+                };
+                if next_is_sep {
+                    return Ok(idx);
+                }
+                prev_ws = false;
+            }
+            '#' if prev_ws => return Ok(idx),
+            c if matches!(c, ' ' | '\t') || is_yaml_line_break_char(c) => {
+                prev_ws = true;
+            }
+            _ => prev_ws = false,
+        }
+    }
+    Err(())
+}
+
+/// Decode a single scalar inside a YAML flow mapping (after any single leading
+/// `&anchor` has been stripped). Rejects multiline plain continuations,
+/// repeated anchors, aliases, tags, and nested flow collections.
+fn parse_yaml_flow_plain_or_quoted_scalar(raw: &str) -> Result<String, ()> {
+    let start = skip_flow_ws_and_comments(raw, 0);
+    let s = raw.get(start..).ok_or(())?;
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    if s.starts_with('"') {
+        let (val, rem) = parse_yaml_double_quoted(s)?;
+        if skip_flow_ws_and_comments(rem, 0) != rem.len() {
+            return Err(());
+        }
+        return Ok(val);
+    }
+    if s.starts_with('\'') {
+        let (val, rem) = parse_yaml_single_quoted(s)?;
+        if skip_flow_ws_and_comments(rem, 0) != rem.len() {
+            return Err(());
+        }
+        return Ok(val);
+    }
+    if s.starts_with(['&', '*', '!', '{', '[', '|', '>']) {
+        return Err(());
+    }
+    let mut end = s.len();
+    let mut prev_ws = true;
+    for (idx, ch) in s.char_indices() {
+        if is_yaml_line_break_char(ch) || (ch == '#' && prev_ws) {
+            end = idx;
+            break;
+        }
+        prev_ws = matches!(ch, ' ' | '\t');
+    }
+    let rem = s.get(end..).ok_or(())?;
+    if skip_flow_ws_and_comments(rem, 0) != rem.len() {
+        return Err(());
+    }
+    let plain = trim_yaml_ws(&s[..end]);
+    if matches!(plain, "~" | "null" | "Null" | "NULL") {
+        Ok(String::new())
+    } else {
+        Ok(plain.to_string())
     }
 }
 
@@ -3251,23 +3545,22 @@ fn parse_yaml_flow_sequence_last(s: &str) -> Result<Option<String>, ()> {
     let inner_and_rest = s.strip_prefix('[').ok_or(())?;
     let mut last: Option<String> = None;
     let mut i = 0;
-    let bytes = inner_and_rest.as_bytes();
     loop {
-        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
-            i += 1;
-        }
-        if i >= bytes.len() {
+        i = skip_flow_ws_and_comments(inner_and_rest, i);
+        let rem = inner_and_rest.get(i..).ok_or(())?;
+        if rem.is_empty() {
             return Err(());
         }
-        if bytes[i] == b']' {
-            if !trailing_is_yaml_comment_or_empty(&inner_and_rest[i + 1..]) {
+        if rem.starts_with(']') {
+            let after_close = inner_and_rest.get(i + 1..).ok_or(())?;
+            if skip_flow_ws_and_comments(after_close, 0) != after_close.len() {
                 return Err(());
             }
             break;
         }
-        let rem = &inner_and_rest[i..];
         let (val_rem, anchor_consumed) = if let Some((_, after)) = split_yaml_anchor(rem) {
-            (after, rem.len() - after.len())
+            let trimmed = trim_yaml_flow_ws(after);
+            (trimmed, rem.len() - trimmed.len())
         } else {
             (rem, 0)
         };
@@ -3281,12 +3574,24 @@ fn parse_yaml_flow_sequence_last(s: &str) -> Result<Option<String>, ()> {
             // Reject repeated anchors, aliases (`*`), tags, block headers, and nested flow structures.
             return Err(());
         } else {
-            let end = val_rem.find([',', ']']).ok_or(())?;
+            let mut end = None;
+            let mut prev_ws = true;
+            for (idx, ch) in val_rem.char_indices() {
+                if matches!(ch, ',' | ']') || (ch == '#' && prev_ws) {
+                    end = Some(idx);
+                    break;
+                }
+                prev_ws = matches!(ch, ' ' | '\t') || is_yaml_line_break_char(ch);
+            }
+            let end = end.ok_or(())?;
             if end == 0 {
                 return Err(());
             }
-            let raw_item = val_rem[..end].trim();
-            let v = if matches!(raw_item, "" | "~" | "null" | "Null" | "NULL") {
+            let raw_item = trim_yaml_flow_ws(&val_rem[..end]);
+            if raw_item.is_empty() || raw_item.contains(is_yaml_line_break_char) {
+                return Err(());
+            }
+            let v = if matches!(raw_item, "~" | "null" | "Null" | "NULL") {
                 String::new()
             } else {
                 raw_item.to_string()
@@ -3295,16 +3600,13 @@ fn parse_yaml_flow_sequence_last(s: &str) -> Result<Option<String>, ()> {
         };
         last = Some(item);
         i += anchor_consumed + val_consumed;
-        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i = skip_flow_ws_and_comments(inner_and_rest, i);
+        let sep = inner_and_rest.get(i..).ok_or(())?;
+        if sep.starts_with(',') {
             i += 1;
-        }
-        if i >= bytes.len() {
-            return Err(());
-        }
-        if bytes[i] == b',' {
-            i += 1;
-        } else if bytes[i] == b']' {
-            if !trailing_is_yaml_comment_or_empty(&inner_and_rest[i + 1..]) {
+        } else if sep.starts_with(']') {
+            let after_close = inner_and_rest.get(i + 1..).ok_or(())?;
+            if skip_flow_ws_and_comments(after_close, 0) != after_close.len() {
                 return Err(());
             }
             break;
@@ -3315,32 +3617,227 @@ fn parse_yaml_flow_sequence_last(s: &str) -> Result<Option<String>, ()> {
     Ok(last)
 }
 
-fn split_yaml_lines(text: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut chars = text.char_indices().peekable();
+fn split_first_yaml_line(s: &str) -> (&str, &str, usize) {
+    let mut chars = s.char_indices().peekable();
     while let Some((idx, ch)) = chars.next() {
         match ch {
             '\r' => {
-                lines.push(&text[start..idx]);
-                if let Some(&(_, '\n')) = chars.peek() {
-                    chars.next();
-                    start = idx + 2;
+                let consumed = if matches!(chars.peek(), Some(&(_, '\n'))) {
+                    idx + 2
                 } else {
-                    start = idx + 1;
-                }
+                    idx + 1
+                };
+                return (&s[..idx], &s[consumed..], consumed);
             }
             '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
-                lines.push(&text[start..idx]);
-                start = idx + ch.len_utf8();
+                let consumed = idx + ch.len_utf8();
+                return (&s[..idx], &s[consumed..], consumed);
             }
             _ => {}
         }
     }
-    if start < text.len() {
-        lines.push(&text[start..]);
+    (s, "", s.len())
+}
+
+fn split_yaml_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (line, next_rest, _) = split_first_yaml_line(rest);
+        lines.push(line);
+        rest = next_rest;
     }
     lines
+}
+
+fn find_root_flow_map_start(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut saw_doc_start = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (line, next_rest, line_len) = split_first_yaml_line(rest);
+        let trimmed = trim_yaml_ws(line);
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            offset += line_len;
+            rest = next_rest;
+            continue;
+        }
+        if !saw_doc_start && line.starts_with('%') {
+            offset += line_len;
+            rest = next_rest;
+            continue;
+        }
+        if is_yaml_doc_marker(line) {
+            if line.starts_with("---") {
+                saw_doc_start = true;
+            }
+            offset += line_len;
+            rest = next_rest;
+            continue;
+        }
+        let mut col = 0;
+        if let Some(after_doc) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("---\t"))
+        {
+            col = line.len() - after_doc.len();
+        }
+        let after_ws = line[col..].trim_start_matches([' ', '\t']);
+        col = line.len() - after_ws.len();
+        let (after_props, prop_consumed) = strip_yaml_key_properties(after_ws).ok()?;
+        col += prop_consumed;
+        return after_props.starts_with('{').then_some(offset + col);
+    }
+    None
+}
+
+fn extract_etcd_s3_proxy_from_flow_map(
+    doc: &str,
+    open_brace_idx: usize,
+) -> Result<Option<String>, ()> {
+    let mut i = open_brace_idx + 1;
+    let mut plain_found: Option<String> = None;
+    let mut append_found: Option<String> = None;
+    loop {
+        i = skip_flow_ws_and_comments(doc, i);
+        let rest = doc.get(i..).ok_or(())?;
+        if rest.starts_with('}') {
+            i += 1;
+            break;
+        }
+        let rest = if rest.starts_with('?')
+            && rest.get(1..).is_some_and(|after_q| {
+                after_q
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(c, ' ' | '\t') || is_yaml_line_break_char(c))
+            }) {
+            i = skip_flow_ws_and_comments(doc, i + 1);
+            doc.get(i..).ok_or(())?
+        } else {
+            rest
+        };
+        let (key_rest, key_prop_consumed) = strip_yaml_key_properties(rest)?;
+        i += key_prop_consumed;
+        let (key, key_consumed) = if key_rest.starts_with('"') {
+            let (k, after) = parse_yaml_double_quoted(key_rest)?;
+            (k, key_rest.len() - after.len())
+        } else if key_rest.starts_with('\'') {
+            let (k, after) = parse_yaml_single_quoted(key_rest)?;
+            (k, key_rest.len() - after.len())
+        } else if key_rest.starts_with(['*', '&', '!', '{', '[']) {
+            return Err(());
+        } else {
+            let end = find_flow_key_end(key_rest)?;
+            let k = trim_yaml_flow_ws(&key_rest[..end]);
+            if k.is_empty() || k.contains(is_yaml_line_break_char) {
+                return Err(());
+            }
+            (k.to_string(), end)
+        };
+        i += key_consumed;
+        i = skip_flow_ws_and_comments(doc, i);
+        let after_key = doc.get(i..).ok_or(())?;
+        let has_value = if after_key.starts_with(':') {
+            i += 1;
+            true
+        } else if after_key.starts_with([',', '}']) {
+            false
+        } else {
+            return Err(());
+        };
+
+        if key == "<<" {
+            if doc.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(doc) {
+                return Err(());
+            }
+            if has_value {
+                i = skip_flow_value(doc, i)?;
+            }
+        } else {
+            let is_append = key.ends_with('+');
+            let norm_key = key.strip_suffix('+').unwrap_or(&key);
+            if norm_key != "etcd-s3-proxy" {
+                if has_value {
+                    i = skip_flow_value(doc, i)?;
+                }
+            } else if !has_value {
+                if !is_append {
+                    plain_found = Some(String::new());
+                }
+            } else {
+                let val_start = skip_flow_ws_and_comments(doc, i);
+                let val_end = skip_flow_value(doc, val_start)?;
+                let val_raw = trim_yaml_flow_ws(doc.get(val_start..val_end).ok_or(())?);
+                let val_after_anchor = match split_yaml_anchor(val_raw) {
+                    Some((_, after)) => {
+                        let off = skip_flow_ws_and_comments(after, 0);
+                        after.get(off..).unwrap_or("")
+                    }
+                    None => val_raw,
+                };
+                let mut record = |val: String| {
+                    if is_append {
+                        append_found = Some(val);
+                    } else {
+                        plain_found = Some(val);
+                    }
+                };
+                if val_after_anchor.is_empty() {
+                    if !is_append {
+                        record(String::new());
+                    }
+                } else if val_after_anchor.starts_with('[') {
+                    match parse_yaml_flow_sequence_last(val_after_anchor)? {
+                        Some(last) => record(last),
+                        None if !is_append => record(String::new()),
+                        None => {}
+                    }
+                } else {
+                    let val = parse_yaml_flow_plain_or_quoted_scalar(val_after_anchor)?;
+                    let is_yaml_null = val.is_empty() && !val_after_anchor.starts_with(['"', '\'']);
+                    if !(is_append && is_yaml_null) {
+                        record(val);
+                    }
+                }
+                i = val_end;
+            }
+        }
+
+        i = skip_flow_ws_and_comments(doc, i);
+        let next = doc.get(i..).ok_or(())?;
+        if next.starts_with(',') {
+            i += 1;
+        } else if next.starts_with('}') {
+            i += 1;
+            break;
+        } else {
+            return Err(());
+        }
+    }
+
+    // Verify trailing text on the closing line and subsequent lines before any
+    // next YAML document marker contains only YAML whitespace or comments.
+    if let Some(after_close) = doc.get(i..) {
+        let (same_line, mut rest_lines, _) = split_first_yaml_line(after_close);
+        if !trailing_is_yaml_comment_or_empty(same_line) {
+            return Err(());
+        }
+        while !rest_lines.is_empty() {
+            let (line, next_rest, _) = split_first_yaml_line(rest_lines);
+            let t = trim_yaml_ws(line);
+            if t.is_empty() || t.starts_with('#') {
+                rest_lines = next_rest;
+                continue;
+            }
+            if is_yaml_doc_marker(line) {
+                break;
+            }
+            return Err(());
+        }
+    }
+
+    resolve_file_proxy_values(plain_found, append_found)
 }
 
 fn skip_yaml_block_scalar(
@@ -3353,7 +3850,7 @@ fn skip_yaml_block_scalar(
     let mut j = start;
     while j < lines.len() {
         let l = lines[j];
-        if l.trim().is_empty() {
+        if is_yaml_blank_line(l) {
             j += 1;
             continue;
         }
@@ -3382,7 +3879,9 @@ fn read_yaml_block_scalar(
     let mut content_indent: Option<usize> = explicit_indent.map(|n| parent_indent + n);
     while j < lines.len() {
         let l = lines[j];
-        if l.trim().is_empty() {
+        let l_indent = l.bytes().take_while(|&b| b == b' ').count();
+        if l_indent == l.len() {
+            // Pure ASCII-space (or empty) YAML blank line.
             block_lines.push(l);
             j += 1;
             continue;
@@ -3390,13 +3889,7 @@ fn read_yaml_block_scalar(
         if l.starts_with('\t') {
             return Err(());
         }
-        let l_indent = l.bytes().take_while(|&b| b == b' ').count();
         match content_indent {
-            Some(req) if explicit_indent.is_some() => {
-                if l_indent < req {
-                    break;
-                }
-            }
             Some(req) => {
                 if l_indent <= parent_indent {
                     break;
@@ -3416,10 +3909,17 @@ fn read_yaml_block_scalar(
         j += 1;
     }
     let trim_n = content_indent.unwrap_or(0);
-    let mut stripped_lines: Vec<&str> = block_lines
-        .into_iter()
-        .map(|l| if l.len() >= trim_n { &l[trim_n..] } else { "" })
-        .collect();
+    let mut stripped_lines = Vec::with_capacity(block_lines.len());
+    for l in block_lines {
+        let spaces = l.bytes().take_while(|&b| b == b' ').count();
+        if spaces >= trim_n {
+            stripped_lines.push(l.get(trim_n..).ok_or(())?);
+        } else if spaces == l.len() {
+            stripped_lines.push("");
+        } else {
+            return Err(());
+        }
+    }
     let trailing_empty = stripped_lines
         .iter()
         .rev()
@@ -3487,7 +3987,7 @@ fn is_yaml_doc_marker(line: &str) -> bool {
 /// continuation).
 fn has_indented_continuation(lines: &[&str], start: usize, root_indent: usize) -> bool {
     for &l in &lines[start..] {
-        let t = l.trim();
+        let t = trim_yaml_ws(l);
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
@@ -3552,73 +4052,20 @@ fn resolve_file_proxy_values(
 /// when present, and `Err(())` when the entry cannot be parsed safely.
 fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let lines = split_yaml_lines(text);
 
     // Handle flow-style JSON/YAML top-level mapping documents (`{...}`, including `--- {...}`).
-    let first_non_meta = lines.iter().copied().find(|l| {
-        let t = l.trim();
-        !t.is_empty() && !t.starts_with('#') && !l.starts_with('%') && !is_yaml_doc_marker(l)
-    });
-    let starts_with_flow_map = first_non_meta.is_some_and(|l| {
-        let l = l
-            .strip_prefix("--- ")
-            .or_else(|| l.strip_prefix("---\t"))
-            .unwrap_or(l)
-            .trim_start();
-        l.starts_with('{')
-    });
-    if starts_with_flow_map {
-        let stripped: String = lines
-            .iter()
-            .filter_map(|&l| {
-                let t = l.trim();
-                if t.is_empty() || t.starts_with('#') || l.starts_with('%') || is_yaml_doc_marker(l)
-                {
-                    return None;
-                }
-                Some(
-                    l.strip_prefix("--- ")
-                        .or_else(|| l.strip_prefix("---\t"))
-                        .unwrap_or(l)
-                        .trim(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(&stripped)
-        {
-            let mut plain_found = None;
-            let mut append_found = None;
-            for (k, v) in &map {
-                let is_append = k.ends_with('+');
-                let norm = k.strip_suffix('+').unwrap_or(k);
-                if norm == "etcd-s3-proxy" {
-                    let val = json_value_to_proxy_string(v)?;
-                    match (is_append, val) {
-                        (false, Some(s)) => plain_found = Some(s),
-                        (false, None) => plain_found = Some(String::new()),
-                        (true, Some(s)) if !v.is_null() => append_found = Some(s),
-                        (true, _) => {}
-                    }
-                }
-            }
-            return resolve_file_proxy_values(plain_found, append_found);
-        }
-        return if text.contains("etcd-s3-proxy") || text.contains('\\') {
-            Err(())
-        } else {
-            Ok(None)
-        };
+    if let Some(open_brace_idx) = find_root_flow_map_start(text) {
+        return extract_etcd_s3_proxy_from_flow_map(text, open_brace_idx);
     }
 
+    let lines = split_yaml_lines(text);
     let mut plain_found: Option<String> = None;
     let mut append_found: Option<String> = None;
     let mut root_indent: Option<usize> = None;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
-        let trimmed = line.trim();
+        let trimmed = trim_yaml_ws(line);
         if trimmed.is_empty() || trimmed.starts_with('#') {
             i += 1;
             continue;
@@ -3638,7 +4085,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         let indent = line.bytes().take_while(|&b| b == b' ').count();
         let after_indent = &line[indent..];
         if after_indent.starts_with('\t') {
-            if line.contains("etcd-s3-proxy") || line.contains('\\') {
+            if line.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(line) {
                 return Err(());
             }
             i += 1;
@@ -3651,7 +4098,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                     continue;
                 }
                 if indent < r {
-                    if text.contains("etcd-s3-proxy") || text.contains('\\') {
+                    if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
                         return Err(());
                     }
                     i += 1;
@@ -3665,22 +4112,24 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             }
         };
 
-        // Fail closed on explicit YAML complex keys (`? ...`) and anchored/tagged/aliased
-        // top-level keys when the document could define `etcd-s3-proxy`.
+        // Fail closed on explicit YAML complex keys (`? ...`) or alias keys
+        // (`*...`) when the document could define `etcd-s3-proxy`.
         if after_indent.starts_with("? ")
             || after_indent.starts_with("?\t")
             || after_indent == "?"
-            || after_indent.starts_with(['&', '*', '!'])
+            || after_indent.starts_with('*')
         {
-            if text.contains("etcd-s3-proxy") || text.contains('\\') {
+            if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
                 return Err(());
             }
             i += 1;
             continue;
         }
-        let Some((key, after_colon)) = parse_yaml_mapping_key(after_indent) else {
-            if after_indent.starts_with(['"', '\''])
-                && (after_indent.contains("etcd-s3-proxy") || after_indent.contains('\\'))
+        let (key_slice, _) = strip_yaml_key_properties(after_indent)?;
+        let Some((key, after_colon)) = parse_yaml_mapping_key(key_slice) else {
+            if key_slice.starts_with(['"', '\''])
+                && (key_slice.contains("etcd-s3-proxy")
+                    || has_yaml_key_obfuscating_escape(key_slice))
             {
                 return Err(());
             }
@@ -3689,7 +4138,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         };
         if key == "<<" {
             // Fail closed on YAML merge keys when the file may merge an `etcd-s3-proxy` entry.
-            if text.contains("etcd-s3-proxy") || text.contains('\\') {
+            if text.contains("etcd-s3-proxy") || has_yaml_key_obfuscating_escape(text) {
                 return Err(());
             }
             i += 1;
@@ -3753,7 +4202,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             let mut saw_seq = false;
             while j < lines.len() {
                 let l = lines[j];
-                let t = l.trim();
+                let t = trim_yaml_ws(l);
                 if t.is_empty() || t.starts_with('#') {
                     j += 1;
                     continue;
@@ -3794,10 +4243,12 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                 } else {
                     parse_yaml_inline_scalar(line)?
                 };
-                let is_yaml_null = matches!(
-                    strip_yaml_inline_comment(line).trim(),
-                    "~" | "null" | "Null" | "NULL"
-                );
+                let unanchored = if has_anchor {
+                    line
+                } else {
+                    split_yaml_anchor(line).map_or(line, |(_, after)| after)
+                };
+                let is_yaml_null = val.is_empty() && !unanchored.starts_with(['"', '\'']);
                 if !(is_append && is_yaml_null) {
                     record(val);
                 }
@@ -3814,10 +4265,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         // Any single leading `&anchor` was already stripped above, so a second
         // `&anchor`, malformed `&`, or `*alias` is rejected without recursion.
         let val = parse_yaml_plain_or_quoted_scalar(rest)?;
-        let is_yaml_null = matches!(
-            strip_yaml_inline_comment(rest).trim(),
-            "~" | "null" | "Null" | "NULL"
-        );
+        let is_yaml_null = val.is_empty() && !rest.starts_with(['"', '\'']);
         if !(is_append && is_yaml_null) {
             record(val);
         }
@@ -9592,6 +10040,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "etcd-s3-proxy: [&p http://proxy.example.com:8080]\n",
             "etcd-s3-proxy: |2-\n  http://proxy.example.com:8080\n",
             "{\"etcd-s3-proxy\": \"none\"}\n",
+            "{disable: [traefik], kube-apiserver-arg: [\"audit-policy=foo\\\\bar\"]}\n",
+            "{disable: [traefik], note: \"a\\nb\", nested: {re: \"foo\\\\d+\"}}\n",
+            "{disable: [traefik], note: it's a path\\foo, nested: {k:\"v\\\\}\"}}\n",
+            "--- {disable: [traefik], etcd-s3-proxy: http://proxy.example.com:8080, note: \"a\\\\b\"}\n...\n",
+            "defaults: &d\n  note: \"a\\\\b\"\n<<: *d\n",
+            "&k disable:\n  - traefik\nnote: \"a\\\\b\"\n",
         ] {
             validate_k3s_config_yaml(&cfg_path, ok_yaml)
                 .unwrap_or_else(|e| panic!("expected {ok_yaml:?} ok, got: {e}"));
@@ -9757,6 +10211,40 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 format!(
                     "{{\"etcd-s3-proxy+\": \"{bad_url}\", \"etcd-s3-proxy\": \"http://proxy.example.com:8080\"}}\n"
                 ),
+            ),
+            (
+                "unicode NBSP crossing block scalar indentation offset",
+                format!(
+                    "etcd-s3-proxy: |-\n  http://user:{secret_pw}@{bad_host}:8080\n \u{00a0}\n"
+                ),
+            ),
+            (
+                "unicode NBSP leading block scalar line",
+                format!(
+                    "etcd-s3-proxy: |-\n \u{00a0}\n  http://user:{secret_pw}@{bad_host}:8080\n"
+                ),
+            ),
+            (
+                "unicode NBSP under explicit block scalar indentation",
+                format!(
+                    "etcd-s3-proxy: |2-\n \u{00a0}\n  http://user:{secret_pw}@{bad_host}:8080\n"
+                ),
+            ),
+            (
+                "unicode NBSP continuation after inline proxy",
+                format!("etcd-s3-proxy: http://user:{secret_pw}@{bad_host}:8080\n  \u{00a0}\n"),
+            ),
+            (
+                "escaped proxy key inside non-JSON YAML flow map",
+                format!("{{disable: [traefik], \"etcd-s3-\\u0070roxy\": \"{bad_url}\"}}\n"),
+            ),
+            (
+                "multiline escaped proxy key inside YAML flow map",
+                format!("{{disable: [traefik], \"etcd-s3-\\\n  proxy\": \"{bad_url}\"}}\n"),
+            ),
+            (
+                "single-quoted proxy key inside YAML flow map",
+                format!("{{disable: [traefik], 'etcd-s3-proxy': '{bad_url}'}}\n"),
             ),
         ];
         for (label, yaml) in &bad_cases {
