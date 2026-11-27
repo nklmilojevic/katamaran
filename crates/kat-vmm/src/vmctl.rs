@@ -125,6 +125,7 @@ fn init_signals_with(
     read_slot: &AtomicI32,
     write_slot: &AtomicI32,
     set_action: impl Fn(libc::c_int, &libc::sigaction, Option<&mut libc::sigaction>) -> io::Result<()>,
+    unblock: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
     if installed.load(Ordering::Acquire) {
         return Ok(());
@@ -162,7 +163,9 @@ fn init_signals_with(
         close_pipe();
         return Err(e);
     }
-    if let Err(e) = set_action(RESUME_SIGNAL, &sa, None) {
+    // SAFETY: zeroed storage populated by sigaction's oldact out-parameter.
+    let mut old_resume: libc::sigaction = unsafe { std::mem::zeroed() };
+    if let Err(e) = set_action(RESUME_SIGNAL, &sa, Some(&mut old_resume)) {
         let _ = set_action(PAUSE_SIGNAL, &old_pause, None);
         close_pipe();
         return Err(e);
@@ -174,8 +177,9 @@ fn init_signals_with(
     // run, so pause and resume (and `pause_on_sleep`) silently did nothing.
     // This runs on the main thread before any other thread starts, so every
     // later thread inherits the unblocked mask.
-    if let Err(e) = unblock_control_signals() {
+    if let Err(e) = unblock() {
         let _ = set_action(PAUSE_SIGNAL, &old_pause, None);
+        let _ = set_action(RESUME_SIGNAL, &old_resume, None);
         close_pipe();
         return Err(e);
     }
@@ -206,6 +210,7 @@ pub fn block_signals() -> io::Result<()> {
         &SIGNAL_READ_FD,
         &SIGNAL_WRITE_FD,
         sys_sigaction,
+        unblock_control_signals,
     )
 }
 
@@ -269,24 +274,84 @@ pub fn serve_signals(handle: VmmHandle) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn block_signals_unblocks_inherited_control_signals() {
-        // Simulate the mask a spawned VM process inherits from the supervisor.
-        let t = thread::spawn(|| unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, PAUSE_SIGNAL);
-            libc::sigaddset(&mut set, RESUME_SIGNAL);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-            unblock_control_signals().unwrap();
+    fn control_signals_blocked() -> (bool, bool) {
+        // SAFETY: queries the calling thread's mask into initialized storage.
+        unsafe {
             let mut cur: libc::sigset_t = std::mem::zeroed();
             libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
             (
-                libc::sigismember(&cur, PAUSE_SIGNAL),
-                libc::sigismember(&cur, RESUME_SIGNAL),
+                libc::sigismember(&cur, PAUSE_SIGNAL) == 1,
+                libc::sigismember(&cur, RESUME_SIGNAL) == 1,
             )
+        }
+    }
+
+    #[test]
+    fn init_unblocks_control_signals_inherited_from_the_supervisor() {
+        // A thread that starts like katamaran-vm's main thread: both control
+        // signals blocked by the supervisor's inherited mask.
+        let t = thread::spawn(|| {
+            // SAFETY: blocks two signals on this test thread only.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, PAUSE_SIGNAL);
+                libc::sigaddset(&mut set, RESUME_SIGNAL);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            }
+            assert_eq!(control_signals_blocked(), (true, true));
+            let installed = AtomicBool::new(false);
+            let read_slot = AtomicI32::new(-1);
+            let write_slot = AtomicI32::new(-1);
+            init_signals_with(
+                &installed,
+                &read_slot,
+                &write_slot,
+                |_sig, _act, _old| Ok(()),
+                unblock_control_signals,
+            )
+            .unwrap();
+            unsafe {
+                libc::close(read_slot.load(Ordering::Acquire));
+                libc::close(write_slot.load(Ordering::Acquire));
+            }
+            control_signals_blocked()
         });
-        assert_eq!(t.join().unwrap(), (0, 0));
+        assert_eq!(t.join().unwrap(), (false, false));
+    }
+
+    #[test]
+    fn failed_unblock_rolls_back_both_handlers_and_does_not_publish() {
+        let installed = AtomicBool::new(false);
+        let read_slot = AtomicI32::new(-1);
+        let write_slot = AtomicI32::new(-1);
+        let calls = Mutex::new(Vec::<(i32, bool)>::new());
+        let err = init_signals_with(
+            &installed,
+            &read_slot,
+            &write_slot,
+            |sig, _act, old| {
+                // (signal, whether this call saved the previous action)
+                calls.lock().unwrap().push((sig, old.is_some()));
+                Ok(())
+            },
+            || Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        assert!(!installed.load(Ordering::Acquire));
+        assert_eq!(read_slot.load(Ordering::Acquire), -1);
+        assert_eq!(write_slot.load(Ordering::Acquire), -1);
+        // Install both (saving the old actions), then restore both.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                (PAUSE_SIGNAL, true),
+                (RESUME_SIGNAL, true),
+                (PAUSE_SIGNAL, false),
+                (RESUME_SIGNAL, false)
+            ]
+        );
     }
 
     #[test]
@@ -313,17 +378,23 @@ mod tests {
         let write_slot = AtomicI32::new(-1);
         let calls = Mutex::new(Vec::<i32>::new());
 
-        let err = init_signals_with(&installed, &read_slot, &write_slot, |sig, _act, old| {
-            let mut c = calls.lock().unwrap();
-            c.push(sig);
-            if sig == RESUME_SIGNAL {
-                return Err(io::Error::from_raw_os_error(libc::EINVAL));
-            }
-            if let Some(o) = old {
-                *o = unsafe { std::mem::zeroed() };
-            }
-            Ok(())
-        })
+        let err = init_signals_with(
+            &installed,
+            &read_slot,
+            &write_slot,
+            |sig, _act, old| {
+                let mut c = calls.lock().unwrap();
+                c.push(sig);
+                if sig == RESUME_SIGNAL {
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                if let Some(o) = old {
+                    *o = unsafe { std::mem::zeroed() };
+                }
+                Ok(())
+            },
+            || Ok(()),
+        )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
         assert!(!installed.load(Ordering::Acquire));
@@ -336,9 +407,13 @@ mod tests {
         );
 
         // A subsequent call retries and succeeds once sigaction works.
-        init_signals_with(&installed, &read_slot, &write_slot, |_sig, _act, _old| {
-            Ok(())
-        })
+        init_signals_with(
+            &installed,
+            &read_slot,
+            &write_slot,
+            |_sig, _act, _old| Ok(()),
+            || Ok(()),
+        )
         .unwrap();
         assert!(installed.load(Ordering::Acquire));
         let rfd = read_slot.swap(-1, Ordering::AcqRel);
