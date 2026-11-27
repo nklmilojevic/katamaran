@@ -158,4 +158,34 @@ fn k8s_reset_exits_nonzero_on_rpc_error_even_when_stderr_pipe_is_full_and_unread
         stderr_buf.contains("simulated reset failure"),
         "missing terminal error diagnostic in stderr: {stderr_buf}"
     );
+
+    // 3. Daemon connection failure with a full, unread stderr pipe also exits
+    //    nonzero promptly without hanging on stderr.
+    let missing_home = TempDirGuard::create("kat-rst-no");
+    let (_unread_pipe_read3, full_pipe_write3) = make_full_pipe();
+    let mut child3 = Command::new(env!("CARGO_BIN_EXE_katamaran"))
+        .args(["k8s", "reset"])
+        .env("KATAMARAN_HOME", &missing_home.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(full_pipe_write3))
+        .spawn()
+        .unwrap();
+    let started3 = Instant::now();
+    let status3 = loop {
+        if let Some(st) = child3.try_wait().unwrap() {
+            break st;
+        }
+        if started3.elapsed() >= Duration::from_secs(5) {
+            let _ = child3.kill();
+            let _ = child3.wait();
+            panic!("katamaran k8s reset hung on connect failure with full unread stderr pipe");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        !status3.success(),
+        "expected nonzero exit status on daemon connect error, got {status3}"
+    );
+    drop(_unread_pipe_read3);
 }

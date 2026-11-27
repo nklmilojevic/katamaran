@@ -235,10 +235,10 @@ impl ProgressPrinter {
         let worker = std::thread::Builder::new()
             .name("k8s-reset-progress".into())
             .spawn(move || {
+                let mut progress_failed = false;
                 while let Ok(line) = rx.recv() {
-                    if writer.write_all(line.as_bytes()).is_err() {
-                        let _ = done_tx.try_send(());
-                        return;
+                    if !progress_failed && writer.write_all(line.as_bytes()).is_err() {
+                        progress_failed = true;
                     }
                 }
                 if let Ok(final_line) = terminal_rx.try_recv() {
@@ -280,8 +280,14 @@ impl ProgressPrinter {
 }
 
 fn reset(images: bool) -> anyhow::Result<()> {
-    let mut c = Client::connect_default()?;
     let mut printer = ProgressPrinter::spawn(RawStderr);
+    let mut c = match Client::connect_default() {
+        Ok(c) => c,
+        Err(e) => {
+            printer.finish(Some(format!("Error: {e:?}\n")), Duration::from_millis(250));
+            return Err(ReportedError.into());
+        }
+    };
     let res = reset_with_client(&mut c, images, &mut |msg| printer.send(msg));
     if let Err(e) = res {
         printer.finish(Some(format!("Error: {e:?}\n")), Duration::from_millis(250));
@@ -922,5 +928,46 @@ mod tests {
         );
         drop(unblock_tx);
         srv.join().unwrap();
+
+        // 3. Transient WouldBlock during progress stops progress writes without
+        //    dropping the worker, so restoring writability before `finish` still
+        //    writes the terminal error diagnostic.
+        struct TransientWouldBlockWriter {
+            writable: Arc<std::sync::atomic::AtomicBool>,
+            captured: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for TransientWouldBlockWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if !self.writable.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "pipe full"));
+                }
+                self.captured.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut printer3 = ProgressPrinter::spawn(TransientWouldBlockWriter {
+            writable: writable.clone(),
+            captured: captured.clone(),
+        });
+        printer3.send("stopping k3s");
+        printer3.send("removing cluster data");
+        // Give the worker time to observe WouldBlock on progress before restoring writability.
+        thread::sleep(Duration::from_millis(30));
+        writable.store(true, std::sync::atomic::Ordering::SeqCst);
+        printer3.finish(
+            Some("Error: cluster data deleted, cleanup failed\n".into()),
+            Duration::from_millis(250),
+        );
+        let out = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("Error: cluster data deleted, cleanup failed"),
+            "terminal diagnostic lost after transient progress WouldBlock: {out:?}"
+        );
     }
 }
