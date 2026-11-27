@@ -72,6 +72,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
 const IMAGE_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+const CONTAINERD_RPC_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTAINERD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAGE_RM_BATCH_SIZE: usize = 64;
 const IMAGE_LS_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAGE_LS_STDOUT_LIMIT: usize = 8 << 20;
@@ -2711,7 +2713,7 @@ impl K8s {
                 // the datastore underneath a live k3s.
                 ensure_no_unreaped_k3s()
             },
-            |progress| wait_containerd_with_progress(progress),
+            |progress| preflight_containerd_for_image_reset(&self.reaper, progress),
             |progress| {
                 // Remove the managed config copy first: if that fails, nothing has
                 // been destroyed yet and the reset error is accurate.
@@ -5589,10 +5591,9 @@ fn clear_k8s_images<T>(
     if SHUTTING_DOWN.load(Ordering::SeqCst) {
         return Err("aborted: VM is shutting down".into());
     }
-    // Remove any lingering k8s.io tasks/containers (for example from an unclean
-    // shutdown when k3s was already in the "stopped" phase) so nothing pins snapshots.
-    progress("stopping lingering k8s.io containers");
-    stop_k8s_containers_with_progress(reaper, progress);
+    // `preflight_containerd_for_image_reset` already stopped lingering `k8s.io`
+    // containers before cluster data was detached; `clear_k8s_images_with`
+    // still re-verifies no workloads remain before deleting image refs.
     let lease_id = next_gc_lease_id();
     clear_k8s_images_with(
         || SHUTTING_DOWN.load(Ordering::SeqCst),
@@ -5689,22 +5690,75 @@ fn plan_image_rm_batches(refs: &[String], batch_size: usize) -> Vec<&[String]> {
     refs.chunks(batch_size).collect()
 }
 
-fn clear_k8s_images_with<S, R, P>(
+/// Wait until containerd answers gRPC RPCs (`ctr version`) within
+/// `total_timeout`. Retries fast non-zero exits (e.g. startup races right
+/// after the socket is bound), while returning immediately on VM shutdown or
+/// probe timeouts/spawn errors (e.g. a listening-but-hung daemon).
+fn wait_containerd_rpc_with<S, R>(
     shutting_down: S,
-    lease_id: &str,
+    total_timeout: Duration,
+    probe_timeout: Duration,
     mut run: R,
-    mut progress: P,
+    progress: &mut dyn FnMut(&str),
 ) -> Result<(), String>
 where
     S: Fn() -> bool,
     R: FnMut(&[&str], Duration, Option<&mut dyn FnMut()>) -> Result<ReapedOutput, String>,
-    P: FnMut(&str),
+{
+    let deadline = Instant::now() + total_timeout;
+    let mut last_beat = Instant::now();
+    let mut last_err: Option<String> = None;
+    let msg = "waiting for containerd";
+    loop {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = remaining.min(probe_timeout);
+        let mut beat = || {
+            progress(msg);
+            last_beat = Instant::now();
+        };
+        let out = run(&["version"], attempt_timeout, Some(&mut beat))?;
+        if out.code == 0 {
+            return Ok(());
+        }
+        last_err = Some(format!(
+            "containerd RPC not ready (ctr version): {}",
+            ctr_error_detail(&out.stdout, &out.stderr)
+        ));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
+            progress(msg);
+            last_beat = Instant::now();
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    Err(last_err.unwrap_or_else(|| "containerd RPC not ready (ctr version): timed out".into()))
+}
+
+fn verify_no_k8s_workloads_with<S, R>(
+    shutting_down: S,
+    mut run: R,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String>
+where
+    S: Fn() -> bool,
+    R: FnMut(&[&str], Duration, Option<&mut dyn FnMut()>) -> Result<ReapedOutput, String>,
 {
     if shutting_down() {
         return Err("aborted: VM is shutting down".into());
     }
-    progress("verifying k8s.io tasks and containers are stopped");
-    let tasks_out = run(&["tasks", "ls", "-q"], IMAGE_LS_TIMEOUT, None)?;
+    let msg = "verifying k8s.io tasks and containers are stopped";
+    progress(msg);
+    let mut beat = || progress(msg);
+    let tasks_out = run(&["tasks", "ls", "-q"], IMAGE_LS_TIMEOUT, Some(&mut beat))?;
     if tasks_out.code != 0 {
         return Err(format!(
             "ctr tasks ls (k8s.io) failed: {}",
@@ -5728,7 +5782,12 @@ where
     if shutting_down() {
         return Err("aborted: VM is shutting down".into());
     }
-    let containers_out = run(&["containers", "ls", "-q"], IMAGE_LS_TIMEOUT, None)?;
+    let mut beat = || progress(msg);
+    let containers_out = run(
+        &["containers", "ls", "-q"],
+        IMAGE_LS_TIMEOUT,
+        Some(&mut beat),
+    )?;
     if containers_out.code != 0 {
         return Err(format!(
             "ctr containers ls (k8s.io) failed: {}",
@@ -5749,6 +5808,48 @@ where
             format_remaining_ids(&remaining_containers)
         ));
     }
+    Ok(())
+}
+
+/// Verify containerd is not just listening on its socket but answering gRPC
+/// RPCs, stop any lingering `k8s.io` containers from an unclean shutdown, and
+/// confirm no tasks/containers remain — all before detaching active cluster data.
+fn preflight_containerd_for_image_reset(
+    reaper: &Reaper,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    wait_containerd_with_progress(progress)?;
+    wait_containerd_rpc_with(
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        CONTAINERD_RPC_WAIT_TIMEOUT,
+        CONTAINERD_PROBE_TIMEOUT,
+        |args, timeout, on_wait| run_ctr_k8s(reaper, args, timeout, on_wait),
+        progress,
+    )?;
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return Err("aborted: VM is shutting down".into());
+    }
+    progress("stopping lingering k8s.io containers");
+    stop_k8s_containers_with_progress(reaper, progress);
+    verify_no_k8s_workloads_with(
+        || SHUTTING_DOWN.load(Ordering::SeqCst),
+        |args, timeout, on_wait| run_ctr_k8s(reaper, args, timeout, on_wait),
+        progress,
+    )
+}
+
+fn clear_k8s_images_with<S, R, P>(
+    shutting_down: S,
+    lease_id: &str,
+    mut run: R,
+    mut progress: P,
+) -> Result<(), String>
+where
+    S: Fn() -> bool,
+    R: FnMut(&[&str], Duration, Option<&mut dyn FnMut()>) -> Result<ReapedOutput, String>,
+    P: FnMut(&str),
+{
+    verify_no_k8s_workloads_with(&shutting_down, &mut run, &mut progress)?;
 
     if shutting_down() {
         return Err("aborted: VM is shutting down".into());
@@ -9872,6 +9973,73 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 .any(|m| m == "waiting for background image sync to stop"),
             "expected sync-lock heartbeat, got: {progress:?}"
         );
+
+        // Also verify that an unresponsive containerd RPC preflight failure leaves
+        // cluster data untouched once the sync lock is acquired, while a transient
+        // non-zero startup error retries and succeeds.
+        drop(_held);
+        let mut attempts = 0;
+        wait_containerd_rpc_with(
+            || false,
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+            |args, _, _| {
+                assert_eq!(args, ["version"]);
+                attempts += 1;
+                Ok(ReapedOutput {
+                    code: if attempts == 1 { 1 } else { 0 },
+                    stdout: String::new(),
+                    stderr: if attempts == 1 {
+                        "unavailable".into()
+                    } else {
+                        String::new()
+                    },
+                    stdout_truncated: false,
+                })
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+
+        let mut remove_data_called2 = false;
+        let mut clear_images_called2 = false;
+        let err2 = execute_reset_sequence(
+            true,
+            &sync_lock,
+            Duration::from_millis(90),
+            Duration::from_millis(30),
+            || false,
+            &mut |_| {},
+            |_| Ok(()),
+            |progress| {
+                wait_containerd_rpc_with(
+                    || false,
+                    Duration::from_millis(500),
+                    Duration::from_millis(50),
+                    |args, _, _| {
+                        assert_eq!(args, ["version"]);
+                        Err("ctr version: \"/usr/bin/ctr\" timed out".into())
+                    },
+                    progress,
+                )
+            },
+            |_| {
+                remove_data_called2 = true;
+                Ok(())
+            },
+            |_, _| {
+                clear_images_called2 = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err2.contains("timed out"), "{err2}");
+        assert!(
+            !remove_data_called2,
+            "unresponsive containerd preflight must not delete cluster data"
+        );
+        assert!(!clear_images_called2);
     }
 
     #[test]
@@ -10321,6 +10489,36 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(
             moby_snapshots_before > 0,
             "expected unpacked moby snapshots"
+        );
+
+        // Verify containerd RPC readiness check succeeds against live containerd
+        // and fails cleanly against a listening-but-unresponsive socket.
+        wait_containerd_rpc_with(
+            || false,
+            CONTAINERD_RPC_WAIT_TIMEOUT,
+            CONTAINERD_PROBE_TIMEOUT,
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &socket, args, timeout, on_wait)
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let hung_sock_path = base.join("hung.sock");
+        let _hung_listener = std::os::unix::net::UnixListener::bind(&hung_sock_path).unwrap();
+        let hung_sock = hung_sock_path.to_string_lossy().into_owned();
+        let hung_err = wait_containerd_rpc_with(
+            || false,
+            Duration::from_millis(500),
+            Duration::from_millis(250),
+            |args, timeout, on_wait| {
+                run_ctr_k8s_at(&reaper, &ctr_bin, &hung_sock, args, timeout, on_wait)
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            hung_err.contains("timed out") || hung_err.contains("not ready"),
+            "expected unresponsive socket preflight failure, got: {hung_err}"
         );
 
         let mut progress = Vec::new();
