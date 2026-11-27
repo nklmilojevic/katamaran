@@ -311,14 +311,19 @@ fn write_token(path: &Path) -> anyhow::Result<()> {
 pub enum ForwardError {
     /// gvproxy could not be reached yet (socket not up / transient I/O).
     Transient(String),
-    /// gvproxy answered and refused the port (e.g. already in use).
+    /// The daemon's listener descriptor budget is currently full; retain the
+    /// port and retry when another listener closes.
+    CapacityExhausted(String),
+    /// gvproxy or the host refused the port (e.g. already in use).
     Refused(String),
 }
 
 impl std::fmt::Display for ForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ForwardError::Transient(m) | ForwardError::Refused(m) => f.write_str(m),
+            ForwardError::Transient(m)
+            | ForwardError::CapacityExhausted(m)
+            | ForwardError::Refused(m) => f.write_str(m),
         }
     }
 }
@@ -341,6 +346,11 @@ pub trait ForwardApi {
     /// [`Self::unexpose`] when the guest removes the port.
     fn has_pending_cleanup(&self, _proto: PortProto, _port: u16) -> bool {
         false
+    }
+    /// Shared listener descriptor budget backing this API, if any, so the
+    /// worker can wake and retry capacity-blocked ports when listeners close.
+    fn listener_budget(&self) -> Option<crate::autofwd::RelayBudget> {
+        None
     }
     /// The Mac addresses `port` is actually listening on (or configured to
     /// listen on when not yet active).
@@ -587,17 +597,20 @@ impl ForwardApi for AddressesApi {
             return match self.ensure_upstream_exposed(port, &sock) {
                 Ok(()) => Ok(()),
                 Err(e @ ForwardError::Transient(_)) => Err(e),
+                Err(e @ ForwardError::CapacityExhausted(_)) => Err(e),
                 Err(e @ ForwardError::Refused(_)) => {
                     self.listeners.remove(port);
                     Err(e)
                 }
             };
         }
-        // Fail fast before creating a gvproxy Unix socket when the daemon's
-        // listener descriptor budget is already full; `listeners.add` below
-        // still acquires the permit atomically and rolls back on race.
-        if let Err(e) = self.listeners.check_listener_capacity() {
-            return Err(ForwardError::Refused(e.to_string()));
+        // Fail fast before creating a gvproxy Unix socket when fewer than the
+        // minimum descriptors needed by any valid bind remain; `listeners.add`
+        // below acquires exact per-socket permits and rolls back on failure.
+        if let Err(crate::autofwd::AddError::CapacityExhausted(why)) =
+            self.listeners.check_listener_capacity()
+        {
+            return Err(ForwardError::CapacityExhausted(why));
         }
         // Have gvproxy listen on the per-port Unix socket before opening the
         // Mac's TCP listeners, so the very first accepted connection never
@@ -606,7 +619,13 @@ impl ForwardApi for AddressesApi {
         self.ensure_upstream_exposed(port, &sock)?;
         match self.listeners.add(port) {
             Ok(_) => Ok(()),
-            Err(e) => {
+            Err(crate::autofwd::AddError::CapacityExhausted(why)) => {
+                if self.unexpose_upstream(port, &sock).is_ok() {
+                    let _ = fs::remove_file(&sock);
+                }
+                Err(ForwardError::CapacityExhausted(why))
+            }
+            Err(crate::autofwd::AddError::Io(e)) => {
                 if self.unexpose_upstream(port, &sock).is_ok() {
                     let _ = fs::remove_file(&sock);
                 }
@@ -635,6 +654,10 @@ impl ForwardApi for AddressesApi {
 
     fn has_pending_cleanup(&self, proto: PortProto, port: u16) -> bool {
         proto == PortProto::Tcp && self.upstream.contains_key(&port)
+    }
+
+    fn listener_budget(&self) -> Option<crate::autofwd::RelayBudget> {
+        Some(self.listeners.budget().clone())
     }
 
     fn port_addrs(&self, proto: PortProto, port: u16) -> Vec<Ipv4Addr> {
@@ -733,6 +756,7 @@ pub enum Event {
     Refused(PortProto, u16, String),
     RefusedCleared(PortProto, u16),
     Transient(PortProto, u16, String),
+    CapacityWait(PortProto, u16, String),
     Removed(PortProto, u16),
     RemoveFailed(PortProto, u16, String),
 }
@@ -758,6 +782,9 @@ impl<A: ForwardApi> Forwards<A> {
                     None
                 }
                 Err(ForwardError::Transient(e)) => Some(Event::Transient(proto, port, e)),
+                Err(ForwardError::CapacityExhausted(e)) => {
+                    Some(Event::CapacityWait(proto, port, e))
+                }
                 Err(ForwardError::Refused(e)) => {
                     self.active.remove(&key);
                     self.remove_failed.remove(&key);
@@ -789,6 +816,12 @@ impl<A: ForwardApi> Forwards<A> {
                 }
                 self.refused.insert(key, e.clone());
                 Some(Event::Refused(proto, port, e))
+            }
+            Err(ForwardError::CapacityExhausted(e)) => {
+                if self.api.has_pending_cleanup(proto, port) {
+                    self.cleanup_pending.insert(key);
+                }
+                Some(Event::CapacityWait(proto, port, e))
             }
             Err(ForwardError::Transient(e)) => {
                 if self.api.has_pending_cleanup(proto, port) {
@@ -854,19 +887,32 @@ pub enum PortChange {
     Remove(PortProto, u16),
 }
 
+enum WorkerMsg {
+    Change(PortChange),
+    CapacityAvailable,
+    Shutdown,
+}
+
 /// Handle to the port-forwarder worker thread. Dropping it signals shutdown,
 /// closes the command channel, and waits for any in-flight operation plus RAII
 /// listener and socket cleanup before a restart can bind them again.
 pub struct Forwarder {
     shutdown: Arc<AtomicBool>,
-    tx: Option<Sender<PortChange>>,
+    _capacity_sub: Option<crate::autofwd::CapacitySubscription>,
+    tx: Option<Sender<WorkerMsg>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Forwarder {
     pub fn send(&self, change: PortChange) -> Result<(), mpsc::SendError<PortChange>> {
         match &self.tx {
-            Some(tx) => tx.send(change),
+            Some(tx) => {
+                tx.send(WorkerMsg::Change(change))
+                    .map_err(|mpsc::SendError(msg)| match msg {
+                        WorkerMsg::Change(c) => mpsc::SendError(c),
+                        WorkerMsg::CapacityAvailable | WorkerMsg::Shutdown => unreachable!(),
+                    })
+            }
             None => Err(mpsc::SendError(change)),
         }
     }
@@ -875,7 +921,10 @@ impl Forwarder {
 impl Drop for Forwarder {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        self.tx.take();
+        self._capacity_sub.take();
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(WorkerMsg::Shutdown);
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -906,15 +955,23 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
     retry_base: Duration,
     mut on_event: impl FnMut(Event) + Send + 'static,
 ) -> anyhow::Result<Forwarder> {
-    let (tx, rx) = mpsc::channel::<PortChange>();
+    let (tx, rx) = mpsc::channel::<WorkerMsg>();
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
+    let capacity_sub = api.listener_budget().map(|budget| {
+        let wake_tx = tx.clone();
+        budget.subscribe_listener_release(move || {
+            let _ = wake_tx.send(WorkerMsg::CapacityAvailable);
+        })
+    });
     let thread = thread::Builder::new()
         .name("port-forward".into())
         .spawn(move || {
             let mut fwd = Forwards::new(api);
             let mut pending: BTreeMap<(PortProto, u16), (PendingOp, Instant, u32)> =
                 BTreeMap::new();
+            // FIFO queue of ports waiting for daemon listener descriptors.
+            let mut capacity_wait: Vec<(PortProto, u16)> = Vec::new();
             let retry_max = TRANSIENT_RETRY_MAX.max(retry_base);
             loop {
                 if worker_shutdown.load(Ordering::SeqCst) {
@@ -929,13 +986,19 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     return;
                 }
                 match got {
-                    Ok(PortChange::Add(proto, port)) => {
+                    Ok(WorkerMsg::Change(PortChange::Add(proto, port))) => {
                         let key = (proto, port);
                         pending.remove(&key);
+                        capacity_wait.retain(|&k| k != key);
                         match fwd.add(proto, port) {
                             Some(e @ Event::Transient(..)) => {
                                 pending
                                     .insert(key, (PendingOp::Add, Instant::now() + retry_base, 1));
+                                report(&e, &fwd.port_label(proto, port));
+                                on_event(e);
+                            }
+                            Some(e @ Event::CapacityWait(..)) => {
+                                capacity_wait.push(key);
                                 report(&e, &fwd.port_label(proto, port));
                                 on_event(e);
                             }
@@ -946,9 +1009,12 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             None => {}
                         }
                     }
-                    Ok(PortChange::Remove(proto, port)) => {
+                    Ok(WorkerMsg::Change(PortChange::Remove(proto, port))) => {
                         let key = (proto, port);
                         pending.remove(&key);
+                        let before = capacity_wait.len();
+                        capacity_wait.retain(|&k| k != key);
+                        let was_waiting = capacity_wait.len() != before;
                         let label = fwd.port_label(proto, port);
                         match fwd.remove(proto, port) {
                             Some(e @ Event::RemoveFailed(..)) => {
@@ -963,9 +1029,40 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                 report(&e, &label);
                                 on_event(e);
                             }
+                            None if was_waiting => {
+                                on_event(Event::RefusedCleared(proto, port));
+                            }
                             None => {}
                         }
                     }
+                    Ok(WorkerMsg::CapacityAvailable) => {
+                        let queued = std::mem::take(&mut capacity_wait);
+                        for (proto, port) in queued {
+                            if worker_shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let key = (proto, port);
+                            match fwd.add(proto, port) {
+                                Some(Event::CapacityWait(..)) => {
+                                    capacity_wait.push(key);
+                                }
+                                Some(e @ Event::Transient(..)) => {
+                                    pending.insert(
+                                        key,
+                                        (PendingOp::Add, Instant::now() + retry_base, 1),
+                                    );
+                                    report(&e, &fwd.port_label(proto, port));
+                                    on_event(e);
+                                }
+                                Some(e) => {
+                                    report(&e, &fwd.port_label(proto, port));
+                                    on_event(e);
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    Ok(WorkerMsg::Shutdown) => return,
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -994,6 +1091,13 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                         (PendingOp::Add, Instant::now() + delay, attempts + 1),
                                     );
                                 } else {
+                                    report(&e, &fwd.port_label(proto, port));
+                                    on_event(e);
+                                }
+                            }
+                            Some(e @ Event::CapacityWait(..)) => {
+                                if !capacity_wait.contains(&key) {
+                                    capacity_wait.push(key);
                                     report(&e, &fwd.port_label(proto, port));
                                     on_event(e);
                                 }
@@ -1035,6 +1139,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
         })?;
     Ok(Forwarder {
         shutdown,
+        _capacity_sub: capacity_sub,
         tx: Some(tx),
         thread: Some(thread),
     })
@@ -1056,6 +1161,10 @@ fn report(e: &Event, addrs: &str) {
         Event::RefusedCleared(..) => {}
         Event::Transient(proto, port, why) => eprintln!(
             "katamaran: transient error forwarding {addrs}:{port}/{} ({why})",
+            proto.as_str()
+        ),
+        Event::CapacityWait(proto, port, why) => eprintln!(
+            "katamaran: deferring forward {addrs}:{port}/{} ({why}); will retry when a listener closes",
             proto.as_str()
         ),
         Event::Removed(proto, port) => {
@@ -1148,6 +1257,13 @@ pub enum AcceptOne {
     Rejected,
 }
 
+/// Why [`LoopbackTcpListener::bind_on_reserved`] failed.
+#[derive(Debug)]
+pub(crate) enum BindError {
+    CapacityExhausted,
+    Io(io::Error),
+}
+
 impl LoopbackTcpListener {
     pub fn bind(port: u16) -> io::Result<Self> {
         Self::bind_on(&[Ipv4Addr::LOCALHOST], port)
@@ -1157,10 +1273,31 @@ impl LoopbackTcpListener {
     /// loopback interface is skipped, so a typo never opens a port to the
     /// network; so is one whose port is taken, as long as one address binds.
     pub fn bind_on(addrs: &[Ipv4Addr], port: u16) -> io::Result<Self> {
-        Self::bind_on_inner(addrs, port, false)
+        Self::bind_on_inner(addrs, port, false, &mut || Some(()))
+            .map(|(l, _)| l)
+            .map_err(|e| match e {
+                BindError::Io(io_err) => io_err,
+                BindError::CapacityExhausted => unreachable!(),
+            })
     }
 
-    fn bind_on_inner(addrs: &[Ipv4Addr], port: u16, force_lo0_scope: bool) -> io::Result<Self> {
+    /// Like [`Self::bind_on`], but acquires one reservation via `acquire_slot`
+    /// before opening each socket and drops failed or discarded reservations
+    /// (including when switching to a single macOS privileged wildcard socket).
+    pub(crate) fn bind_on_reserved<P>(
+        addrs: &[Ipv4Addr],
+        port: u16,
+        mut acquire_slot: impl FnMut() -> Option<P>,
+    ) -> Result<(Self, Vec<P>), BindError> {
+        Self::bind_on_inner(addrs, port, false, &mut acquire_slot)
+    }
+
+    fn bind_on_inner<P>(
+        addrs: &[Ipv4Addr],
+        port: u16,
+        force_lo0_scope: bool,
+        acquire_slot: &mut impl FnMut() -> Option<P>,
+    ) -> Result<(Self, Vec<P>), BindError> {
         let mut seen = BTreeSet::new();
         let addrs: Vec<Ipv4Addr> = addrs
             .iter()
@@ -1168,12 +1305,13 @@ impl LoopbackTcpListener {
             .filter(|a| seen.insert(*a) && is_loopback_interface_addr(*a))
             .collect();
         if addrs.is_empty() {
-            return Err(io::Error::new(
+            return Err(BindError::Io(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 "no forward address is assigned to lo0",
-            ));
+            )));
         }
         let mut inner = Vec::with_capacity(addrs.len());
+        let mut permits = Vec::with_capacity(addrs.len());
         let mut bound = Vec::with_capacity(addrs.len());
         let mut filter_endpoints = Vec::with_capacity(addrs.len());
         let mut failed = Vec::new();
@@ -1181,12 +1319,27 @@ impl LoopbackTcpListener {
         for &a in &addrs {
             let is_alias = a != Ipv4Addr::LOCALHOST;
             let scope_lo0 = is_alias || force_lo0_scope;
+            let Some(slot) = acquire_slot() else {
+                drop(inner);
+                drop(permits);
+                return Err(BindError::CapacityExhausted);
+            };
             match bind_specific(a, bind_port, scope_lo0) {
                 Ok(l) => {
                     if bind_port == 0 {
-                        bind_port = l.local_addr()?.port();
+                        bind_port = match l.local_addr() {
+                            Ok(sa) => sa.port(),
+                            Err(e) => {
+                                drop(l);
+                                drop(slot);
+                                drop(inner);
+                                drop(permits);
+                                return Err(BindError::Io(e));
+                            }
+                        };
                     }
                     inner.push(l);
+                    permits.push(slot);
                     bound.push(a);
                     filter_endpoints.push(scope_lo0);
                 }
@@ -1195,26 +1348,43 @@ impl LoopbackTcpListener {
                     if port > 0 && port < 1024 && e.kind() == io::ErrorKind::PermissionDenied =>
                 {
                     drop(inner);
-                    return Ok(Self {
-                        inner: vec![bind_darwin_lo0(Ipv4Addr::UNSPECIFIED, port)?],
-                        addrs,
-                        filter_endpoints: vec![true],
-                    });
+                    drop(permits);
+                    let wildcard = match bind_darwin_lo0(Ipv4Addr::UNSPECIFIED, port) {
+                        Ok(l) => l,
+                        Err(we) => {
+                            drop(slot);
+                            return Err(BindError::Io(we));
+                        }
+                    };
+                    return Ok((
+                        Self {
+                            inner: vec![wildcard],
+                            addrs,
+                            filter_endpoints: vec![true],
+                        },
+                        vec![slot],
+                    ));
                 }
-                Err(e) => failed.push((a, e)),
+                Err(e) => {
+                    drop(slot);
+                    failed.push((a, e));
+                }
             }
         }
         if inner.is_empty() {
-            return Err(failed.swap_remove(0).1);
+            return Err(BindError::Io(failed.swap_remove(0).1));
         }
         for (a, e) in failed {
             eprintln!("katamaran: cannot listen on {a}:{port} ({e}); skipped");
         }
-        Ok(Self {
-            inner,
-            addrs: bound,
-            filter_endpoints,
-        })
+        Ok((
+            Self {
+                inner,
+                addrs: bound,
+                filter_endpoints,
+            },
+            permits,
+        ))
     }
 
     #[cfg(test)]
@@ -2912,8 +3082,8 @@ mod tests {
 
         let err = api.expose(TCP, p3).unwrap_err();
         assert!(
-            matches!(err, ForwardError::Refused(ref msg) if msg.contains("forward descriptor limit reached")),
-            "expected descriptor limit refusal, got {err:?}"
+            matches!(err, ForwardError::CapacityExhausted(ref msg) if msg.contains("forward descriptor limit reached")),
+            "expected descriptor limit capacity error, got {err:?}"
         );
         assert!(
             !crate::autofwd::Upstream::socket(&dir, p3).exists(),
@@ -2934,6 +3104,192 @@ mod tests {
         drop(api);
         assert_eq!(budget.listener_fds(), 0);
         assert_eq!(budget.active_fds(), 0);
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addresses_api_preflight_allows_smaller_bind_with_missing_alias_and_low_port() {
+        let missing = Ipv4Addr::new(198, 51, 100, 200);
+        assert!(
+            !is_loopback_interface_addr(missing),
+            "test expects {missing} not to be assigned to lo0"
+        );
+        let dir = std::env::temp_dir().join(format!("kat-addr-small-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+
+        // Exactly 3 listener descriptors: fits one socket + wakeup pipe, even
+        // though `forward_addresses` lists two entries (localhost + missing).
+        let budget = crate::autofwd::RelayBudget::with_limits(3, 4);
+        let configured = [Ipv4Addr::LOCALHOST, missing];
+        let mut api = AddressesApi::with_budget(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &configured,
+            budget.clone(),
+        );
+
+        for port in [free_high_port(), free_low_port()] {
+            api.expose(TCP, port).unwrap();
+            assert_eq!(budget.listener_fds(), 3);
+            assert_eq!(api.port_addrs(TCP, port), vec![Ipv4Addr::LOCALHOST]);
+            assert_eq!(
+                tcp_echo(Ipv4Addr::LOCALHOST, port, &format!("s{port}")),
+                format!("gv:s{port}")
+            );
+            api.unexpose(TCP, port).unwrap();
+            assert_eq!(budget.listener_fds(), 0);
+            assert_port_rebindable(port);
+        }
+        drop(api);
+
+        // If a real lo0 alias is configured, a privileged port (<1024) served
+        // by macOS's single lo0-scoped wildcard socket also fits in 3 fds.
+        if let Some(alias) = TestLo0Alias::acquire() {
+            let both = [Ipv4Addr::LOCALHOST, alias.addr];
+            let mut api2 = AddressesApi::with_budget(
+                GvproxyApi {
+                    socket: fake.api_sock.clone(),
+                    guest: GUEST,
+                },
+                &dir,
+                &both,
+                budget.clone(),
+            );
+            let low = free_low_port();
+            api2.expose(TCP, low).unwrap();
+            assert_eq!(budget.listener_fds(), 3);
+            assert_eq!(api2.port_addrs(TCP, low), both.to_vec());
+            assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, low, "lo"), "gv:lo");
+            assert_eq!(tcp_echo(alias.addr, low, "al"), "gv:al");
+            api2.unexpose(TCP, low).unwrap();
+            assert_eq!(budget.listener_fds(), 0);
+            assert_port_rebindable(low);
+            drop(api2);
+        }
+
+        drop(fake);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forwarder_retries_published_port_when_listener_capacity_returns() {
+        let dir = std::env::temp_dir().join(format!("kat-fwd-capwait-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = FakeGvproxy::start(&dir);
+
+        // 6 listener fds = 2 single-address ports.
+        let budget = crate::autofwd::RelayBudget::with_limits(6, 4);
+        let api = AddressesApi::with_budget(
+            GvproxyApi {
+                socket: fake.api_sock.clone(),
+                guest: GUEST,
+            },
+            &dir,
+            &[Ipv4Addr::LOCALHOST],
+            budget.clone(),
+        );
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let worker = spawn_forwarder_with(api, Duration::from_millis(10), move |e| {
+            let _ = ev_tx.send(e);
+        })
+        .unwrap();
+
+        let p1 = free_high_port();
+        let p2 = free_high_port();
+        let p3 = free_high_port();
+        let p4 = free_high_port();
+
+        worker.send(PortChange::Add(TCP, p1)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p1, vec![Ipv4Addr::LOCALHOST])
+        );
+        worker.send(PortChange::Add(TCP, p2)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p2, vec![Ipv4Addr::LOCALHOST])
+        );
+        assert_eq!(budget.listener_fds(), 6);
+
+        // Pool is full: send ONE Add for p3 and ONE Add for p4 -> both enter
+        // CapacityWait rather than Refused and leave no gvproxy sockets.
+        worker.send(PortChange::Add(TCP, p3)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::CapacityWait(TCP, p, _) if p == p3
+        ));
+        assert!(!crate::autofwd::Upstream::socket(&dir, p3).exists());
+
+        worker.send(PortChange::Add(TCP, p4)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::CapacityWait(TCP, p, _) if p == p4
+        ));
+        // Guest cancels p4 before capacity returns.
+        worker.send(PortChange::Remove(TCP, p4)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RefusedCleared(TCP, p4)
+        );
+
+        // Removing p1 releases 3 descriptors and automatically forwards p3
+        // without any second PortChange::Add from the guest.
+        worker.send(PortChange::Remove(TCP, p1)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, p1)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p3, vec![Ipv4Addr::LOCALHOST])
+        );
+        assert_eq!(tcp_echo(Ipv4Addr::LOCALHOST, p3, "resumed"), "gv:resumed");
+        assert!(!crate::autofwd::Upstream::socket(&dir, p4).exists());
+
+        // Cross-forwarder release: an automatic listener sharing the same
+        // RelayBudget frees a slot and wakes the published worker for p5.
+        worker.send(PortChange::Remove(TCP, p2)).unwrap();
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, p2)
+        );
+        let mut auto = crate::autofwd::AutoForwards::with_limits_and_budget(
+            crate::autofwd::Upstream::PerPort(dir.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            crate::autofwd::ConnLimit::Shared(2),
+            None,
+            budget.clone(),
+        );
+        let a1 = free_high_port();
+        assert!(auto.add(a1).unwrap());
+        assert_eq!(budget.listener_fds(), 6);
+
+        let p5 = free_high_port();
+        worker.send(PortChange::Add(TCP, p5)).unwrap();
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::CapacityWait(TCP, p, _) if p == p5
+        ));
+        assert!(auto.remove(a1));
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Forwarded(TCP, p5, vec![Ipv4Addr::LOCALHOST])
+        );
+        assert_eq!(
+            tcp_echo(Ipv4Addr::LOCALHOST, p5, "cross-wake"),
+            "gv:cross-wake"
+        );
+
+        drop(auto);
+        drop(worker);
+        assert_eq!(budget.listener_fds(), 0);
         drop(fake);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3061,7 +3417,9 @@ mod tests {
         assert_eq!(bound_if_index(plain.raw_fds()[0]), 0);
 
         // Specific-address alias scope: IP_BOUND_IF == lo0 + local peer filter.
-        let scoped = LoopbackTcpListener::bind_on_inner(&[Ipv4Addr::LOCALHOST], 0, true).unwrap();
+        let (scoped, _) =
+            LoopbackTcpListener::bind_on_inner(&[Ipv4Addr::LOCALHOST], 0, true, &mut || Some(()))
+                .unwrap();
         assert_eq!(scoped.filter_endpoints, vec![true]);
         assert_eq!(bound_if_index(scoped.raw_fds()[0]), lo0);
         let port = scoped.local_addr().unwrap().port();

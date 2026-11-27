@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::net::{AcceptOne, LoopbackTcpListener, addrs_label};
+use crate::net::{AcceptOne, BindError, LoopbackTcpListener, addrs_label};
 
 pub const MAX_CONNS: usize = 256;
 /// Default per-port connection ceiling for published ports (isolates a busy
@@ -53,6 +53,63 @@ const MAX_ACCEPT_BATCH: usize = 16;
 const COPY_BUF_SIZE: usize = 64 << 10;
 const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// Why [`AutoForwards::add`] failed to start listening on a port.
+#[derive(Debug)]
+pub enum AddError {
+    /// The daemon's listener descriptor budget is currently full; callers
+    /// should retain the port and retry when another listener closes.
+    CapacityExhausted(String),
+    /// Binding or setup failed on the host (e.g. port already in use or no
+    /// configured address assigned to `lo0`).
+    Io(io::Error),
+}
+
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddError::CapacityExhausted(msg) => f.write_str(msg),
+            AddError::Io(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AddError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AddError::CapacityExhausted(_) => None,
+            AddError::Io(e) => Some(e),
+        }
+    }
+}
+
+impl From<io::Error> for AddError {
+    fn from(e: io::Error) -> Self {
+        AddError::Io(e)
+    }
+}
+
+type ReleaseCallback = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct ReleaseSubscribers {
+    next_id: u64,
+    callbacks: BTreeMap<u64, ReleaseCallback>,
+}
+
+/// RAII handle removing a [`RelayBudget::subscribe_listener_release`] callback
+/// when dropped.
+pub struct CapacitySubscription {
+    id: u64,
+    subs: Arc<Mutex<ReleaseSubscribers>>,
+}
+
+impl Drop for CapacitySubscription {
+    fn drop(&mut self) {
+        let mut st = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+        st.callbacks.remove(&self.id);
+    }
+}
+
 /// Daemon-wide forwarding descriptor and relay budget derived from
 /// `RLIMIT_NOFILE` and shared across automatic and published forwarders (and
 /// across VM restarts).
@@ -64,12 +121,27 @@ const ACCEPT_ERR_BACKOFF: Duration = Duration::from_millis(50);
 /// - `active_relays` (`<= max_relays`, `FDS_PER_RELAY` fds each): active client
 ///   relays, preventing traffic bursts from starving either control-plane RPCs
 ///   or newly published port bindings.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RelayBudget {
     listener_fds: Arc<AtomicUsize>,
     max_listener_fds: usize,
     active_relays: Arc<AtomicUsize>,
     max_relays: usize,
+    /// Serializes local loopback listener binds across forwarders so temporary
+    /// partial reservations from one `add()` cannot transiently starve another.
+    listener_bind_lock: Arc<Mutex<()>>,
+    release_subs: Arc<Mutex<ReleaseSubscribers>>,
+}
+
+impl std::fmt::Debug for RelayBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayBudget")
+            .field("listener_fds", &self.listener_fds.load(Ordering::Relaxed))
+            .field("max_listener_fds", &self.max_listener_fds)
+            .field("active_relays", &self.active_relays.load(Ordering::Relaxed))
+            .field("max_relays", &self.max_relays)
+            .finish()
+    }
 }
 
 impl RelayBudget {
@@ -85,6 +157,8 @@ impl RelayBudget {
             max_listener_fds,
             active_relays: Arc::new(AtomicUsize::new(0)),
             max_relays,
+            listener_bind_lock: Arc::new(Mutex::new(())),
+            release_subs: Arc::new(Mutex::new(ReleaseSubscribers::default())),
         }
     }
 
@@ -126,6 +200,38 @@ impl RelayBudget {
             .saturating_add(self.active().saturating_mul(FDS_PER_RELAY))
     }
 
+    /// Register a non-blocking notification fired whenever an active listener
+    /// closes and returns descriptors to this shared budget.
+    pub fn subscribe_listener_release(
+        &self,
+        cb: impl Fn() + Send + Sync + 'static,
+    ) -> CapacitySubscription {
+        let mut st = self.release_subs.lock().unwrap_or_else(|e| e.into_inner());
+        st.next_id += 1;
+        let id = st.next_id;
+        st.callbacks.insert(id, Arc::new(cb));
+        CapacitySubscription {
+            id,
+            subs: self.release_subs.clone(),
+        }
+    }
+
+    fn notify_listener_released(&self) {
+        let cbs: Vec<ReleaseCallback> = {
+            let st = self.release_subs.lock().unwrap_or_else(|e| e.into_inner());
+            st.callbacks.values().cloned().collect()
+        };
+        for cb in cbs {
+            cb();
+        }
+    }
+
+    fn lock_listener_bind(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.listener_bind_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn has_listener_headroom(
         &self,
         fds: usize,
@@ -154,8 +260,8 @@ impl RelayBudget {
         };
         let listener_fds = UnitsGuard::try_acquire(&self.listener_fds, fds, self.max_listener_fds)?;
         Some(ListenerPermit {
-            listener_fds,
-            class_listener_fds,
+            _listener_fds: listener_fds,
+            _class_listener_fds: class_listener_fds,
         })
     }
 
@@ -285,7 +391,7 @@ struct Forward {
     thread: JoinHandle<()>,
     /// Released after `wake_w` closes and `thread.join()` drops `listener` and
     /// `wake_r`, so descriptor accounting never undercounts open fds.
-    fd_permit: ListenerPermit,
+    fd_permits: Vec<ListenerPermit>,
 }
 
 /// RAII guard for `count` units against an atomic ceiling.
@@ -319,14 +425,6 @@ impl UnitsGuard {
             }
         }
     }
-
-    fn shrink_to(&mut self, new_count: usize) {
-        if new_count < self.count {
-            let excess = self.count - new_count;
-            self.counter.fetch_sub(excess, Ordering::Release);
-            self.count = new_count;
-        }
-    }
 }
 
 impl Drop for UnitsGuard {
@@ -337,20 +435,11 @@ impl Drop for UnitsGuard {
     }
 }
 
-/// RAII permit accounting for a forwarded port's TCP listening sockets plus
+/// RAII permit accounting for a forwarded port's TCP listening sockets or
 /// wakeup pipe descriptors against the shared [`RelayBudget`].
 struct ListenerPermit {
-    listener_fds: UnitsGuard,
-    class_listener_fds: Option<UnitsGuard>,
-}
-
-impl ListenerPermit {
-    fn shrink_to(&mut self, actual_fds: usize) {
-        self.listener_fds.shrink_to(actual_fds);
-        if let Some(g) = &mut self.class_listener_fds {
-            g.shrink_to(actual_fds);
-        }
-    }
+    _listener_fds: UnitsGuard,
+    _class_listener_fds: Option<UnitsGuard>,
 }
 
 /// Create a non-blocking, `O_CLOEXEC` wakeup pipe.
@@ -614,58 +703,71 @@ impl AutoForwards {
         self.active.keys().copied().collect()
     }
 
-    fn worst_case_port_fds(&self) -> usize {
-        let mut unique = self.addrs.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        unique.len().max(1) + WAKEUP_PIPE_FDS
+    pub fn budget(&self) -> &RelayBudget {
+        &self.budget
     }
 
-    fn listener_limit_error(&self) -> io::Error {
-        io::Error::other(format!(
+    fn listener_limit_msg(&self) -> String {
+        format!(
             "forward descriptor limit reached ({} listener / {} total fds)",
             self.budget.max_listener_fds(),
             self.budget.max_fds()
-        ))
+        )
     }
 
-    /// Best-effort check for whether adding a new port fits the listener
-    /// descriptor budget (used to fail fast before asking gvproxy to expose an
-    /// upstream Unix socket; [`Self::add`] still acquires the permit atomically).
-    pub fn check_listener_capacity(&self) -> io::Result<()> {
+    /// Best-effort preflight check requiring only the minimum descriptors any
+    /// valid port bind needs (one socket + wakeup pipe), so a smaller bind
+    /// (e.g. skipped unassigned alias or privileged wildcard) is never blocked.
+    pub fn check_listener_capacity(&self) -> Result<(), AddError> {
         if self.budget.has_listener_headroom(
-            self.worst_case_port_fds(),
+            MIN_LISTENER_FDS,
             &self.class_listener_fds,
             self.max_class_listener_fds,
         ) {
             Ok(())
         } else {
-            Err(self.listener_limit_error())
+            Err(AddError::CapacityExhausted(self.listener_limit_msg()))
         }
     }
 
-    /// Listen on `port` of each forward address. Fails if the Mac already
-    /// uses it or the daemon's forwarding descriptor budget is exhausted; the
-    /// guest reports the port again only after it stops and starts again.
-    pub fn add(&mut self, port: u16) -> io::Result<bool> {
+    /// Listen on `port` of each forward address. Fails with [`AddError::Io`] if
+    /// the Mac already uses it or no address is assigned to `lo0`, or
+    /// [`AddError::CapacityExhausted`] if the daemon's listener descriptor
+    /// budget is currently full.
+    pub fn add(&mut self, port: u16) -> Result<bool, AddError> {
         if self.active.contains_key(&port) {
             return Ok(false);
         }
-        // Reserve worst-case descriptors (one listening socket per distinct
-        // configured address plus the two wakeup-pipe fds) before opening any
-        // sockets or pipes, then shrink to the actual bound count.
-        let reserved_fds = self.worst_case_port_fds();
-        let mut fd_permit = self
+        let _bind_lock = self.budget.lock_listener_bind();
+        // Reserve the wakeup pipe up front, then acquire one listener permit
+        // per eligible socket inside `bind_on_reserved` (reclaiming failed
+        // binds and discarded specific-address sockets on wildcard fallback).
+        // Keep `fd_permits` declared before `listener` and the wakeup pipe so
+        // early-return drops close OS descriptors before returning permits.
+        let pipe_permit = self
             .budget
             .try_acquire_listener(
-                reserved_fds,
+                WAKEUP_PIPE_FDS,
                 &self.class_listener_fds,
                 self.max_class_listener_fds,
             )
-            .ok_or_else(|| self.listener_limit_error())?;
-        let listener = LoopbackTcpListener::bind_on(&self.addrs, port)?;
-        let actual_fds = listener.raw_fds().len() + WAKEUP_PIPE_FDS;
-        fd_permit.shrink_to(actual_fds);
+            .ok_or_else(|| AddError::CapacityExhausted(self.listener_limit_msg()))?;
+        let mut fd_permits = vec![pipe_permit];
+        let (listener, socket_permits) =
+            LoopbackTcpListener::bind_on_reserved(&self.addrs, port, || {
+                self.budget.try_acquire_listener(
+                    1,
+                    &self.class_listener_fds,
+                    self.max_class_listener_fds,
+                )
+            })
+            .map_err(|e| match e {
+                BindError::CapacityExhausted => {
+                    AddError::CapacityExhausted(self.listener_limit_msg())
+                }
+                BindError::Io(io_err) => AddError::Io(io_err),
+            })?;
+        fd_permits.extend(socket_permits);
         let bound = listener.addrs().to_vec();
         listener.set_nonblocking(true)?;
         let (wake_r, wake_w) = wakeup_pipe()?;
@@ -699,7 +801,7 @@ impl AutoForwards {
                 stop,
                 wake_w,
                 thread,
-                fd_permit,
+                fd_permits,
             },
         );
         Ok(true)
@@ -718,8 +820,10 @@ impl AutoForwards {
         drop(f.wake_w);
         let _ = f.thread.join();
         // Only return descriptor accounting after `wake_w`, `wake_r`, and all
-        // listening sockets owned by `f.thread` have actually closed.
-        drop(f.fd_permit);
+        // listening sockets owned by `f.thread` have actually closed, then
+        // wake any forwarders waiting for listener capacity.
+        drop(f.fd_permits);
+        self.budget.notify_listener_released();
         true
     }
 
@@ -1266,8 +1370,8 @@ mod tests {
         drop(probe);
         let err = fwd.add(p3).unwrap_err();
         assert!(
-            err.to_string().contains("forward descriptor limit reached"),
-            "unexpected error: {err}"
+            matches!(err, AddError::CapacityExhausted(ref msg) if msg.contains("forward descriptor limit reached")),
+            "unexpected error: {err:?}"
         );
         assert_eq!(shared.listener_fds(), 6);
         assert!(!fwd.contains(p3));
@@ -1289,6 +1393,64 @@ mod tests {
         assert_eq!(shared.active(), 0);
         assert_eq!(shared.active_fds(), 0);
         let _ = p2;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn listener_budget_charges_only_bound_sockets_with_missing_alias_and_low_port() {
+        let missing = Ipv4Addr::new(198, 51, 100, 200);
+        assert!(
+            !crate::net::is_loopback_interface_addr(missing),
+            "test expects {missing} not to be assigned to lo0"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("kat-autofwd-missing-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Only 3 listener fds available (2 wakeup pipe + 1 socket), yet two
+        // addresses are configured (localhost + an unassigned alias). Filtering
+        // unassigned addresses first lets localhost bind within 3 fds.
+        let shared = RelayBudget::with_limits(3, 4);
+        let mut fwd = AutoForwards::with_limits_and_budget(
+            Upstream::AutoForward(fake_guest(&dir)),
+            &[Ipv4Addr::LOCALHOST, missing],
+            ConnLimit::Shared(4),
+            None,
+            shared.clone(),
+        );
+
+        let high = add_free_port(&mut fwd);
+        assert_eq!(shared.listener_fds(), 3);
+        assert_eq!(fwd.bound_addrs(high), Some(&[Ipv4Addr::LOCALHOST][..]));
+        assert_eq!(round_trip(high, "hi"), format!("{high}:hi"));
+        assert!(fwd.remove(high));
+        assert_eq!(shared.listener_fds(), 0);
+
+        // Privileged low port also succeeds in 3 fds.
+        let low = crate::net::claim_test_low_port();
+        assert!(fwd.add(low).unwrap());
+        assert_eq!(shared.listener_fds(), 3);
+        assert_eq!(round_trip(low, "low"), format!("{low}:low"));
+        assert!(fwd.remove(low));
+        assert_eq!(shared.listener_fds(), 0);
+
+        // Direct bind_on_reserved check: when a bind runs out of slots, zero
+        // reservations remain leaked.
+        let slots = Arc::new(AtomicUsize::new(0));
+        let low2 = crate::net::claim_test_low_port();
+        let (listener, permits) =
+            LoopbackTcpListener::bind_on_reserved(&[Ipv4Addr::LOCALHOST, missing], low2, || {
+                UnitsGuard::try_acquire(&slots, 1, 1)
+            })
+            .unwrap();
+        assert_eq!(permits.len(), 1);
+        assert_eq!(slots.load(Ordering::Acquire), 1);
+        drop(listener);
+        drop(permits);
+        assert_eq!(slots.load(Ordering::Acquire), 0);
+
+        drop(fwd);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

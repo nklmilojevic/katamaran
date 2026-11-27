@@ -131,6 +131,120 @@ enum Input {
     Forward(u64, net::Event),
     /// Result of mounting the guest's NFS share for VM session `.0`.
     Mounted(u64, PathBuf, Result<Duration, String>),
+    /// Shared listener descriptors were freed for VM session `.0`; retry any
+    /// capacity-blocked automatic forwards.
+    ListenerCapacityAvailable(u64),
+}
+
+/// Coordinates guest `AutoForwardAdd` / `AutoForwardRemove` events with
+/// [`crate::autofwd::AutoForwards`], retaining ports blocked by the listener
+/// descriptor budget and retrying them as soon as capacity frees up.
+struct AutoForwardTracker {
+    forwards: crate::autofwd::AutoForwards,
+    /// FIFO queue of `(proto, port)` waiting for listener descriptors.
+    pending_capacity: Vec<(PortProto, u16)>,
+}
+
+impl AutoForwardTracker {
+    fn new(forwards: crate::autofwd::AutoForwards) -> Self {
+        Self {
+            forwards,
+            pending_capacity: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
+        match self.forwards.add(port) {
+            Ok(true) => {
+                self.pending_capacity.retain(|&(_, p)| p != port);
+                let addrs = self
+                    .forwards
+                    .bound_addrs(port)
+                    .map(<[std::net::Ipv4Addr]>::to_vec)
+                    .unwrap_or_else(|| vec![std::net::Ipv4Addr::LOCALHOST]);
+                println!(
+                    "katamaran: auto-forwarding {}:{port}/{}",
+                    net::addrs_label(&addrs),
+                    proto.as_str()
+                );
+                on_event(Event::PortAdd(proto, port, addrs));
+            }
+            Ok(false) => {
+                self.pending_capacity.retain(|&(_, p)| p != port);
+            }
+            Err(crate::autofwd::AddError::CapacityExhausted(why)) => {
+                if !self.pending_capacity.iter().any(|&(_, p)| p == port) {
+                    self.pending_capacity.push((proto, port));
+                    eprintln!(
+                        "katamaran: deferring auto-forward {}:{port}/{} ({why}); will retry when a listener closes",
+                        self.forwards.label(),
+                        proto.as_str()
+                    );
+                    on_event(Event::PortFailed(proto, port, why));
+                }
+            }
+            Err(crate::autofwd::AddError::Io(e)) => {
+                self.pending_capacity.retain(|&(_, p)| p != port);
+                eprintln!(
+                    "katamaran: cannot auto-forward {}:{port}/{} ({e}); skipped",
+                    self.forwards.label(),
+                    proto.as_str()
+                );
+                on_event(Event::PortFailed(proto, port, e.to_string()));
+            }
+        }
+    }
+
+    fn remove(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
+        self.pending_capacity.retain(|&(_, p)| p != port);
+        let label = self.forwards.bound_label(port);
+        if self.forwards.remove(port) {
+            println!(
+                "katamaran: stopped auto-forwarding {label}:{port}/{}",
+                proto.as_str()
+            );
+            on_event(Event::PortRemove(proto, port));
+            self.retry_pending(on_event);
+        } else {
+            on_event(Event::PortErrorClear(proto, port));
+        }
+    }
+
+    fn retry_pending(&mut self, on_event: &mut dyn FnMut(Event)) {
+        if self.pending_capacity.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.pending_capacity);
+        for (proto, port) in queued {
+            match self.forwards.add(port) {
+                Ok(true) => {
+                    let addrs = self
+                        .forwards
+                        .bound_addrs(port)
+                        .map(<[std::net::Ipv4Addr]>::to_vec)
+                        .unwrap_or_else(|| vec![std::net::Ipv4Addr::LOCALHOST]);
+                    println!(
+                        "katamaran: auto-forwarding {}:{port}/{}",
+                        net::addrs_label(&addrs),
+                        proto.as_str()
+                    );
+                    on_event(Event::PortAdd(proto, port, addrs));
+                }
+                Ok(false) => {}
+                Err(crate::autofwd::AddError::CapacityExhausted(_)) => {
+                    self.pending_capacity.push((proto, port));
+                }
+                Err(crate::autofwd::AddError::Io(e)) => {
+                    eprintln!(
+                        "katamaran: cannot auto-forward {}:{port}/{} ({e}); skipped",
+                        self.forwards.label(),
+                        proto.as_str()
+                    );
+                    on_event(Event::PortFailed(proto, port, e.to_string()));
+                }
+            }
+        }
+    }
 }
 
 /// How a VM session ended.
@@ -508,13 +622,20 @@ fn session(
         crate::autofwd::auto_conn_limit_for_budget(relay_budget, uses_published_relays);
     let auto_listener_fds =
         crate::autofwd::auto_listener_fd_limit_for_budget(relay_budget, uses_published_relays);
-    let mut auto_forwards = crate::autofwd::AutoForwards::with_limits_and_budget(
-        crate::autofwd::Upstream::AutoForward(autofwd_sock.clone()),
-        &args.forward_addresses,
-        auto_limit,
-        auto_listener_fds,
-        relay_budget.clone(),
-    );
+    let mut auto_forwards =
+        AutoForwardTracker::new(crate::autofwd::AutoForwards::with_limits_and_budget(
+            crate::autofwd::Upstream::AutoForward(autofwd_sock.clone()),
+            &args.forward_addresses,
+            auto_limit,
+            auto_listener_fds,
+            relay_budget.clone(),
+        ));
+    let _auto_capacity_sub = {
+        let cap_tx = tx.clone();
+        relay_budget.subscribe_listener_release(move || {
+            let _ = cap_tx.send(Input::ListenerCapacityAvailable(id));
+        })
+    };
     let mut mounted = false;
     let mut paused = false;
     let mount_cancel = Arc::new(AtomicBool::new(false));
@@ -525,6 +646,7 @@ fn session(
             Ok(Input::Guest(from, _))
             | Ok(Input::Forward(from, _))
             | Ok(Input::Mounted(from, _, _))
+            | Ok(Input::ListenerCapacityAvailable(from))
                 if from != id => {}
             Ok(Input::Guest(_, Some(Msg::ServiceReady { name, .. }))) => {
                 println!(
@@ -599,49 +721,22 @@ fn session(
             Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
                 on_event(Event::PortRemove(proto, port));
             }
-            Ok(Input::Forward(_, net::Event::Refused(proto, port, why))) => {
+            Ok(Input::Forward(_, net::Event::Refused(proto, port, why)))
+            | Ok(Input::Forward(_, net::Event::CapacityWait(proto, port, why))) => {
                 on_event(Event::PortFailed(proto, port, why));
             }
             Ok(Input::Forward(_, net::Event::RefusedCleared(proto, port))) => {
                 on_event(Event::PortErrorClear(proto, port));
             }
             Ok(Input::Forward(_, net::Event::Transient(..) | net::Event::RemoveFailed(..))) => {}
+            Ok(Input::ListenerCapacityAvailable(_)) => {
+                auto_forwards.retry_pending(on_event);
+            }
             Ok(Input::Guest(_, Some(Msg::AutoForwardAdd { proto, port }))) => {
-                match auto_forwards.add(port) {
-                    Ok(true) => {
-                        let addrs = auto_forwards
-                            .bound_addrs(port)
-                            .map(<[std::net::Ipv4Addr]>::to_vec)
-                            .unwrap_or_else(|| vec![std::net::Ipv4Addr::LOCALHOST]);
-                        println!(
-                            "katamaran: auto-forwarding {}:{port}/{}",
-                            net::addrs_label(&addrs),
-                            proto.as_str()
-                        );
-                        on_event(Event::PortAdd(proto, port, addrs));
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "katamaran: cannot auto-forward {}:{port}/{} ({e}); skipped",
-                            auto_forwards.label(),
-                            proto.as_str()
-                        );
-                        on_event(Event::PortFailed(proto, port, e.to_string()));
-                    }
-                }
+                auto_forwards.add(proto, port, on_event);
             }
             Ok(Input::Guest(_, Some(Msg::AutoForwardRemove { proto, port }))) => {
-                let label = auto_forwards.bound_label(port);
-                if auto_forwards.remove(port) {
-                    println!(
-                        "katamaran: stopped auto-forwarding {label}:{port}/{}",
-                        proto.as_str()
-                    );
-                    on_event(Event::PortRemove(proto, port));
-                } else {
-                    on_event(Event::PortErrorClear(proto, port));
-                }
+                auto_forwards.remove(proto, port, on_event);
             }
             Ok(Input::Guest(
                 _,
@@ -864,5 +959,173 @@ mod tests {
                 "expected forward_addresses validation error for {bad:?}, got {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn auto_forward_tracker_resumes_capacity_blocked_port_and_cancels_on_remove() {
+        use std::io::{Read, Write};
+        use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("kat-run-autofwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Tiny guest echo server for Upstream::AutoForward.
+        let guest_sock = dir.join("autofwd.sock");
+        let guest_listener = UnixListener::bind(&guest_sock).unwrap();
+        let guest_stop = Arc::new(AtomicBool::new(false));
+        let g_stop = guest_stop.clone();
+        let g_path = guest_sock.clone();
+        let guest_thread = thread::spawn(move || {
+            while let Ok((mut s, _)) = guest_listener.accept() {
+                if g_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut hdr = [0u8; 2];
+                if s.read_exact(&mut hdr).is_err() {
+                    continue;
+                }
+                let p = u16::from_le_bytes(hdr);
+                let _ = s.write_all(format!("{p}:").as_bytes());
+                let mut data = Vec::new();
+                let _ = s.read_to_end(&mut data);
+                let _ = s.write_all(&data);
+                let _ = s.shutdown(Shutdown::Write);
+            }
+        });
+
+        let free_port = || {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        // Shared budget of 6 listener fds (2 single-address ports total).
+        let budget = crate::autofwd::RelayBudget::with_limits(6, 4);
+        let mut tracker =
+            AutoForwardTracker::new(crate::autofwd::AutoForwards::with_limits_and_budget(
+                crate::autofwd::Upstream::AutoForward(guest_sock),
+                &[Ipv4Addr::LOCALHOST],
+                crate::autofwd::ConnLimit::Shared(4),
+                None,
+                budget.clone(),
+            ));
+        let mut events = Vec::new();
+
+        let p1 = free_port();
+        let p2 = free_port();
+        let p3 = free_port();
+        let p4 = free_port();
+
+        // Ordinary host conflict (port already in use) stays on the permanent
+        // failure path even with capacity available.
+        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        tracker.add(PortProto::Tcp, busy_port, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == busy_port
+        ));
+        assert!(tracker.pending_capacity.is_empty());
+
+        // Fill both available listener slots.
+        tracker.add(PortProto::Tcp, p1, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortAdd(PortProto::Tcp, p, ref a)) if p == p1 && a == &[Ipv4Addr::LOCALHOST]
+        ));
+        tracker.add(PortProto::Tcp, p2, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortAdd(PortProto::Tcp, p, ref a)) if p == p2 && a == &[Ipv4Addr::LOCALHOST]
+        ));
+        assert_eq!(budget.listener_fds(), 6);
+
+        // Next two ports are capacity-blocked and retained as pending.
+        tracker.add(PortProto::Tcp, p3, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == p3
+        ));
+        tracker.add(PortProto::Tcp, p4, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == p4
+        ));
+
+        // Guest cancels p4 before any slot frees up.
+        tracker.remove(PortProto::Tcp, p4, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortErrorClear(PortProto::Tcp, p)) if p == p4
+        ));
+
+        // Drop busy socket to verify ordinary bind failures are NOT retried
+        // when capacity frees up.
+        drop(busy);
+
+        // Stopping p1 frees 3 descriptors and automatically resumes p3 without
+        // a second AutoForwardAdd from the guest.
+        tracker.remove(PortProto::Tcp, p1, &mut |e| events.push(e));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], Event::PortRemove(PortProto::Tcp, p) if p == p1));
+        assert!(matches!(
+            events[1],
+            Event::PortAdd(PortProto::Tcp, p, ref a) if p == p3 && a == &[Ipv4Addr::LOCALHOST]
+        ));
+        events.clear();
+        assert!(!tracker.forwards.contains(p4));
+        assert!(!tracker.forwards.contains(busy_port));
+
+        let mut s = TcpStream::connect(("127.0.0.1", p3)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"ok").unwrap();
+        s.shutdown(Shutdown::Write).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert_eq!(resp, format!("{p3}:ok"));
+
+        // Cross-forwarder release: a published forwarder releasing a slot fires
+        // the subscription callback so `retry_pending` resumes an auto port.
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let _sub = budget.subscribe_listener_release(move || {
+            let _ = wake_tx.send(());
+        });
+        tracker.remove(PortProto::Tcp, p2, &mut |e| events.push(e));
+        events.clear();
+        while wake_rx.try_recv().is_ok() {}
+
+        let mut published = crate::autofwd::AutoForwards::with_limits_and_budget(
+            crate::autofwd::Upstream::PerPort(dir.clone()),
+            &[Ipv4Addr::LOCALHOST],
+            crate::autofwd::ConnLimit::Shared(2),
+            None,
+            budget.clone(),
+        );
+        let pub_port = free_port();
+        assert!(published.add(pub_port).unwrap());
+        assert_eq!(budget.listener_fds(), 6);
+
+        let p5 = free_port();
+        tracker.add(PortProto::Tcp, p5, &mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortFailed(PortProto::Tcp, p, _)) if p == p5
+        ));
+        assert!(published.remove(pub_port));
+        wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        tracker.retry_pending(&mut |e| events.push(e));
+        assert!(matches!(
+            events.pop(),
+            Some(Event::PortAdd(PortProto::Tcp, p, ref a)) if p == p5 && a == &[Ipv4Addr::LOCALHOST]
+        ));
+
+        drop(published);
+        drop(tracker);
+        assert_eq!(budget.listener_fds(), 0);
+        guest_stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&g_path);
+        let _ = guest_thread.join();
+        let _ = fs::remove_dir_all(&dir);
     }
 }
