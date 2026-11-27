@@ -3268,13 +3268,24 @@ fn split_yaml_tag(s: &str) -> Option<(&str, &str)> {
     Some((&s[..1 + end], after.trim_start_matches([' ', '\t'])))
 }
 
+fn is_yaml_str_tag(tag: &str) -> bool {
+    matches!(tag, "!" | "!!str" | "!<tag:yaml.org,2002:str>")
+}
+
+struct YamlNodeProps<'a> {
+    anchor: Option<&'a str>,
+    tag: Option<&'a str>,
+    rest: &'a str,
+    consumed: usize,
+}
+
 /// Strip at most one optional `&anchor` and at most one optional `!tag`
-/// property (in either order) without recursion. Returns `(anchor_name, rest, consumed)`,
-/// or `Err(())` if a property kind is repeated or malformed.
-fn strip_yaml_key_properties(s: &str) -> Result<(Option<&str>, &str, usize), ()> {
+/// property (in either order) without recursion. Returns `Err(())` if a
+/// property kind is repeated or malformed.
+fn strip_yaml_key_properties(s: &str) -> Result<YamlNodeProps<'_>, ()> {
     let mut cur = s;
     let mut anchor: Option<&str> = None;
-    let mut saw_tag = false;
+    let mut tag: Option<&str> = None;
     loop {
         if cur.starts_with('&') {
             if anchor.is_some() {
@@ -3284,17 +3295,56 @@ fn strip_yaml_key_properties(s: &str) -> Result<(Option<&str>, &str, usize), ()>
             anchor = Some(name);
             cur = trim_yaml_flow_ws(after);
         } else if cur.starts_with('!') {
-            if saw_tag {
+            if tag.is_some() {
                 return Err(());
             }
-            let (_, after) = split_yaml_tag(cur).ok_or(())?;
-            saw_tag = true;
+            let (t, after) = split_yaml_tag(cur).ok_or(())?;
+            tag = Some(t);
             cur = trim_yaml_flow_ws(after);
         } else {
             break;
         }
     }
-    Ok((anchor, cur, s.len() - cur.len()))
+    Ok(YamlNodeProps {
+        anchor,
+        tag,
+        rest: cur,
+        consumed: s.len() - cur.len(),
+    })
+}
+
+/// Strip at most one optional `&anchor` and at most one optional string tag
+/// (`!`, `!!str`, `!<tag:yaml.org,2002:str>`) in either order, without
+/// recursion. Returns `(anchor, forced_str, rest, consumed)`.
+fn strip_yaml_proxy_scalar_properties(s: &str) -> Result<(Option<&str>, bool, &str, usize), ()> {
+    let mut cur = s;
+    let mut anchor: Option<&str> = None;
+    let mut forced_str = false;
+    loop {
+        if cur.starts_with('&') {
+            if anchor.is_some() {
+                return Err(());
+            }
+            let (name, after) = split_yaml_anchor(cur).ok_or(())?;
+            anchor = Some(name);
+            let off = skip_flow_ws_and_comments(after, 0);
+            cur = after.get(off..).unwrap_or("");
+        } else if cur.starts_with('!') {
+            if forced_str {
+                return Err(());
+            }
+            let (tag, after) = split_yaml_tag(cur).ok_or(())?;
+            if !is_yaml_str_tag(tag) {
+                return Err(());
+            }
+            forced_str = true;
+            let off = skip_flow_ws_and_comments(after, 0);
+            cur = after.get(off..).unwrap_or("");
+        } else {
+            break;
+        }
+    }
+    Ok((anchor, forced_str, cur, s.len() - cur.len()))
 }
 
 /// Shared, reference-counted YAML scalar stored in the per-document anchor map
@@ -3342,11 +3392,19 @@ fn resolve_yaml_alias<'a>(
 
 /// Decode a single YAML scalar value without any anchor/alias/tag properties.
 /// Rejects repeated anchor properties, aliases (`*`), tags (`!`), and flow
-/// collections without recursion.
-fn parse_yaml_plain_or_quoted_scalar(raw: &str) -> Result<AnchorScalar, ()> {
+/// collections without recursion. When `forced_str` is true (`!!str`), plain
+/// `null`/`~` values decode as literal strings rather than YAML null.
+fn parse_yaml_plain_or_quoted_scalar(raw: &str, forced_str: bool) -> Result<AnchorScalar, ()> {
     let s = raw.trim_start_matches([' ', '\t']);
     if s.is_empty() || s.starts_with('#') {
-        return Ok(AnchorScalar::null());
+        return Ok(if forced_str {
+            AnchorScalar {
+                value: Arc::from(""),
+                is_null: false,
+            }
+        } else {
+            AnchorScalar::null()
+        });
     }
     if s.starts_with('"') {
         let (val, rem) = parse_yaml_double_quoted(s)?;
@@ -3366,7 +3424,7 @@ fn parse_yaml_plain_or_quoted_scalar(raw: &str) -> Result<AnchorScalar, ()> {
         return Err(());
     }
     let plain = strip_yaml_inline_comment(s).trim_end_matches([' ', '\t']);
-    if matches!(plain, "~" | "null" | "Null" | "NULL") {
+    if !forced_str && matches!(plain, "~" | "null" | "Null" | "NULL") {
         Ok(AnchorScalar::null())
     } else {
         Ok(AnchorScalar {
@@ -3376,26 +3434,37 @@ fn parse_yaml_plain_or_quoted_scalar(raw: &str) -> Result<AnchorScalar, ()> {
     }
 }
 
-/// Decode a YAML scalar with at most one optional leading `&anchor` property,
-/// or resolve a `*alias` against `anchors`, without recursion.
+/// Decode a YAML scalar with optional `&anchor` and/or `!!str` properties
+/// (at most one of each, rejecting duplicates with any already-parsed outer
+/// properties), or resolve an unanchored/untagged `*alias` against `anchors`,
+/// without recursion.
 fn parse_yaml_inline_scalar(
     raw: &str,
     anchors: &mut HashMap<String, Option<AnchorScalar>>,
+    outer_has_anchor: bool,
+    outer_forced_str: bool,
 ) -> Result<AnchorScalar, ()> {
     let s = raw.trim_start_matches([' ', '\t']);
-    if let Some((anchor, after)) = split_yaml_anchor(s) {
-        let val = parse_yaml_plain_or_quoted_scalar(after)?;
-        anchors.insert(anchor.to_string(), Some(val.clone()));
-        return Ok(val);
+    let (anchor, inner_forced_str, val_rest, _) = strip_yaml_proxy_scalar_properties(s)?;
+    if (outer_has_anchor && anchor.is_some()) || (outer_forced_str && inner_forced_str) {
+        return Err(());
     }
-    if s.starts_with('*') {
-        let (val, rem) = resolve_yaml_alias(s, anchors)?;
+    let forced_str = outer_forced_str || inner_forced_str;
+    if val_rest.starts_with('*') {
+        if outer_has_anchor || anchor.is_some() || forced_str {
+            return Err(());
+        }
+        let (val, rem) = resolve_yaml_alias(val_rest, anchors)?;
         if !trailing_is_yaml_comment_or_empty(rem) {
             return Err(());
         }
         return Ok(val);
     }
-    parse_yaml_plain_or_quoted_scalar(s)
+    let val = parse_yaml_plain_or_quoted_scalar(val_rest, forced_str)?;
+    if let Some(a) = anchor {
+        anchors.insert(a.to_string(), Some(val.clone()));
+    }
+    Ok(val)
 }
 
 fn skip_flow_ws_and_comments(s: &str, mut i: usize) -> usize {
@@ -3478,39 +3547,66 @@ fn scan_flow_value_anchors(
     let mut i = start;
     let mut stack: Vec<u8> = Vec::new();
     let mut prev_ws = true;
-    let mut at_token_start = true;
+    // True only at the start of a flow node (after `{`, `[`, `,`, mapping `:`,
+    // explicit `? `, or a leading node property). Whitespace and comments inside
+    // a plain scalar do NOT reset this, preventing text like `[a &p b]` from
+    // being mistaken for a YAML anchor.
+    let mut at_node_start = true;
+    let mut prev_was_quoted = false;
+    let mut pending_tag: Option<&str> = None;
     while let Some(rest) = s.get(i..) {
         let Some(ch) = rest.chars().next() else {
             return Err(());
         };
         match ch {
-            '"' if at_token_start => {
+            '"' if at_node_start => {
                 i = skip_flow_quoted_double(s, i)?;
                 prev_ws = false;
-                at_token_start = false;
+                at_node_start = false;
+                prev_was_quoted = true;
+                pending_tag = None;
             }
-            '\'' if at_token_start => {
+            '\'' if at_node_start => {
                 i = skip_flow_quoted_single(s, i)?;
                 prev_ws = false;
-                at_token_start = false;
+                at_node_start = false;
+                prev_was_quoted = true;
+                pending_tag = None;
             }
             '#' if prev_ws => {
                 i = skip_flow_ws_and_comments(s, i);
                 prev_ws = true;
-                at_token_start = true;
+                // Preserve `at_node_start`, `prev_was_quoted`, and `pending_tag`.
             }
-            '!' if at_token_start => {
-                if let Some((_, after_tag)) = split_yaml_tag(rest) {
+            '?' if at_node_start
+                && rest.get(1..).is_some_and(|r| {
+                    r.chars()
+                        .next()
+                        .is_some_and(|c| matches!(c, ' ' | '\t') || is_yaml_line_break_char(c))
+                }) =>
+            {
+                i += 1;
+                prev_ws = false;
+                at_node_start = true;
+                prev_was_quoted = false;
+                pending_tag = None;
+            }
+            '!' if at_node_start => {
+                if let Some((tag, after_tag)) = split_yaml_tag(rest) {
                     i += rest.len() - after_tag.len();
                     prev_ws = true;
-                    at_token_start = true;
+                    at_node_start = true;
+                    prev_was_quoted = false;
+                    pending_tag = Some(tag);
                 } else {
                     i += 1;
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = false;
+                    pending_tag = None;
                 }
             }
-            '&' if at_token_start => {
+            '&' if at_node_start => {
                 let after_amp = &rest[1..];
                 let name_end = after_amp
                     .find(|c: char| {
@@ -3521,19 +3617,31 @@ fn scan_flow_value_anchors(
                 if name_end == 0 {
                     i += 1;
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = false;
+                    pending_tag = None;
                     continue;
                 }
                 let name = &after_amp[..name_end];
                 let after_name = &after_amp[name_end..];
+                let mut node_tag = pending_tag.take();
                 if after_name.starts_with([',', ']', '}']) {
                     // Empty/null node anchored immediately before a flow delimiter (`[&p]`, `{k: &p}`).
                     if let Some(map) = anchors.as_deref_mut() {
-                        map.insert(name.to_string(), Some(AnchorScalar::null()));
+                        let val = match node_tag {
+                            None => Some(AnchorScalar::null()),
+                            Some(t) if is_yaml_str_tag(t) => Some(AnchorScalar {
+                                value: Arc::from(""),
+                                is_null: false,
+                            }),
+                            Some(_) => None,
+                        };
+                        map.insert(name.to_string(), val);
                     }
                     i += 1 + name_end;
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = false;
                     continue;
                 }
                 if !after_name.is_empty()
@@ -3543,15 +3651,22 @@ fn scan_flow_value_anchors(
                 {
                     i += 1;
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = false;
                     continue;
                 }
                 i += 1 + name_end;
                 i = skip_flow_ws_and_comments(s, i);
+                let mut bad_tag = false;
                 if let Some(after_ws) = s.get(i..)
                     && after_ws.starts_with('!')
-                    && let Some((_, after_tag)) = split_yaml_tag(after_ws)
+                    && let Some((tag, after_tag)) = split_yaml_tag(after_ws)
                 {
+                    if node_tag.is_some() {
+                        bad_tag = true;
+                    } else {
+                        node_tag = Some(tag);
+                    }
                     i += after_ws.len() - after_tag.len();
                     i = skip_flow_ws_and_comments(s, i);
                 }
@@ -3563,10 +3678,13 @@ fn scan_flow_value_anchors(
                 };
                 if anchors.is_none() {
                     prev_ws = true;
-                    at_token_start = true;
+                    at_node_start = true;
+                    prev_was_quoted = false;
                     continue;
                 }
                 let map = anchors.as_deref_mut().unwrap();
+                let allowed_tag = !bad_tag && node_tag.is_none_or(is_yaml_str_tag);
+                let forced_str = node_tag.is_some_and(is_yaml_str_tag);
                 if val_rest.starts_with('"') {
                     if let Ok((decoded, after_q)) = parse_yaml_double_quoted(val_rest) {
                         let consumed = val_rest.len() - after_q.len();
@@ -3576,7 +3694,7 @@ fn scan_flow_value_anchors(
                             .is_some_and(|r| r.is_empty() || r.starts_with([',', ']', '}', ':']));
                         map.insert(
                             name.to_string(),
-                            clean_end.then(|| AnchorScalar::from_string(decoded)),
+                            (allowed_tag && clean_end).then(|| AnchorScalar::from_string(decoded)),
                         );
                         i += consumed;
                     } else {
@@ -3584,7 +3702,8 @@ fn scan_flow_value_anchors(
                         i = skip_flow_quoted_double(s, i)?;
                     }
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = true;
                 } else if val_rest.starts_with('\'') {
                     if let Ok((decoded, after_q)) = parse_yaml_single_quoted(val_rest) {
                         let consumed = val_rest.len() - after_q.len();
@@ -3594,7 +3713,7 @@ fn scan_flow_value_anchors(
                             .is_some_and(|r| r.is_empty() || r.starts_with([',', ']', '}', ':']));
                         map.insert(
                             name.to_string(),
-                            clean_end.then(|| AnchorScalar::from_string(decoded)),
+                            (allowed_tag && clean_end).then(|| AnchorScalar::from_string(decoded)),
                         );
                         i += consumed;
                     } else {
@@ -3602,14 +3721,16 @@ fn scan_flow_value_anchors(
                         i = skip_flow_quoted_single(s, i)?;
                     }
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = true;
                 } else if val_rest.starts_with(['{', '[', '&', '*', '!']) {
                     // Collection, repeated anchor, alias, or malformed tag:
                     // poison any stale scalar for `name` and keep scanning from
                     // `i` so nested anchors inside `{...}`/`[...]` are visited.
                     map.insert(name.to_string(), None);
                     prev_ws = true;
-                    at_token_start = true;
+                    at_node_start = true;
+                    prev_was_quoted = false;
                 } else {
                     let mut end = val_rest.len();
                     let mut p_ws = true;
@@ -3645,9 +3766,11 @@ fn scan_flow_value_anchors(
                         }
                     }
                     let raw_plain = trim_yaml_flow_ws(&val_rest[..end]);
-                    if raw_plain.contains(is_yaml_line_break_char) {
+                    if !allowed_tag || raw_plain.contains(is_yaml_line_break_char) {
                         map.insert(name.to_string(), None);
-                    } else if matches!(raw_plain, "" | "~" | "null" | "Null" | "NULL") {
+                    } else if !forced_str
+                        && matches!(raw_plain, "" | "~" | "null" | "Null" | "NULL")
+                    {
                         map.insert(name.to_string(), Some(AnchorScalar::null()));
                     } else {
                         map.insert(
@@ -3660,20 +3783,25 @@ fn scan_flow_value_anchors(
                     }
                     i += end;
                     prev_ws = end == 0;
-                    at_token_start = end == 0;
+                    at_node_start = end == 0;
+                    prev_was_quoted = false;
                 }
             }
             '{' => {
                 stack.push(b'}');
                 i += 1;
                 prev_ws = false;
-                at_token_start = true;
+                at_node_start = true;
+                prev_was_quoted = false;
+                pending_tag = None;
             }
             '[' => {
                 stack.push(b']');
                 i += 1;
                 prev_ws = false;
-                at_token_start = true;
+                at_node_start = true;
+                prev_was_quoted = false;
+                pending_tag = None;
             }
             '}' | ']' => match stack.last().copied() {
                 None => {
@@ -3690,25 +3818,49 @@ fn scan_flow_value_anchors(
                         return Ok(i);
                     }
                     prev_ws = false;
-                    at_token_start = false;
+                    at_node_start = false;
+                    prev_was_quoted = false;
+                    pending_tag = None;
                 }
                 Some(_) => return Err(()),
             },
             ',' if stack.is_empty() && stop_at_top_delim => return Ok(i),
-            ',' | ':' => {
+            ',' => {
                 i += 1;
                 prev_ws = false;
-                at_token_start = true;
+                at_node_start = true;
+                prev_was_quoted = false;
+                pending_tag = None;
+            }
+            ':' => {
+                let next_is_sep = rest.get(1..).is_none_or(|r| {
+                    r.chars().next().is_none_or(|n| {
+                        matches!(n, ' ' | '\t' | ',' | ']' | '}' | '[' | '{')
+                            || is_yaml_line_break_char(n)
+                    })
+                });
+                i += 1;
+                prev_ws = false;
+                if prev_was_quoted || next_is_sep {
+                    at_node_start = true;
+                    pending_tag = None;
+                } else {
+                    at_node_start = false;
+                }
+                prev_was_quoted = false;
             }
             c if matches!(c, ' ' | '\t') || is_yaml_line_break_char(c) => {
                 i += c.len_utf8();
                 prev_ws = true;
-                at_token_start = true;
+                // Do not set `at_node_start` here so spaces inside a plain
+                // scalar never make `&...` look like a YAML anchor.
             }
             c => {
                 i += c.len_utf8();
                 prev_ws = false;
-                at_token_start = false;
+                at_node_start = false;
+                prev_was_quoted = false;
+                pending_tag = None;
             }
         }
     }
@@ -3748,11 +3900,18 @@ fn find_flow_key_end(s: &str) -> Result<usize, ()> {
 /// `&anchor` has been stripped). Rejects multiline plain continuations,
 /// repeated anchors, aliases (handled by caller when unanchored), tags, and
 /// nested flow collections.
-fn parse_yaml_flow_plain_or_quoted_scalar(raw: &str) -> Result<AnchorScalar, ()> {
+fn parse_yaml_flow_plain_or_quoted_scalar(raw: &str, forced_str: bool) -> Result<AnchorScalar, ()> {
     let start = skip_flow_ws_and_comments(raw, 0);
     let s = raw.get(start..).ok_or(())?;
     if s.is_empty() {
-        return Ok(AnchorScalar::null());
+        return Ok(if forced_str {
+            AnchorScalar {
+                value: Arc::from(""),
+                is_null: false,
+            }
+        } else {
+            AnchorScalar::null()
+        });
     }
     if s.starts_with('"') {
         let (val, rem) = parse_yaml_double_quoted(s)?;
@@ -3785,7 +3944,7 @@ fn parse_yaml_flow_plain_or_quoted_scalar(raw: &str) -> Result<AnchorScalar, ()>
         return Err(());
     }
     let plain = trim_yaml_ws(&s[..end]);
-    if matches!(plain, "~" | "null" | "Null" | "NULL") {
+    if !forced_str && matches!(plain, "~" | "null" | "Null" | "NULL") {
         Ok(AnchorScalar::null())
     } else {
         Ok(AnchorScalar {
@@ -3818,14 +3977,8 @@ fn parse_yaml_flow_sequence_last(
             }
             break;
         }
-        let (item_anchor, val_rem, anchor_consumed) =
-            if let Some((anchor, after)) = split_yaml_anchor(rem) {
-                let off = skip_flow_ws_and_comments(after, 0);
-                let trimmed = after.get(off..).unwrap_or("");
-                (Some(anchor), trimmed, rem.len() - trimmed.len())
-            } else {
-                (None, rem, 0)
-            };
+        let (item_anchor, forced_str, val_rem, prop_consumed) =
+            strip_yaml_proxy_scalar_properties(rem)?;
         let (item, val_consumed) = if val_rem.starts_with('"') {
             let (v, after) = parse_yaml_double_quoted(val_rem)?;
             (AnchorScalar::from_string(v), val_rem.len() - after.len())
@@ -3833,13 +3986,13 @@ fn parse_yaml_flow_sequence_last(
             let (v, after) = parse_yaml_single_quoted(val_rem)?;
             (AnchorScalar::from_string(v), val_rem.len() - after.len())
         } else if val_rem.starts_with('*') {
-            if item_anchor.is_some() {
+            if item_anchor.is_some() || forced_str {
                 return Err(());
             }
             let (v, after) = resolve_yaml_alias(val_rem, anchors)?;
             (v, val_rem.len() - after.len())
         } else if val_rem.starts_with(['&', '!', '{', '[', '|', '>']) {
-            // Reject repeated anchors, tags, block headers, and nested flow structures.
+            // Reject repeated anchors, unsupported tags, block headers, and nested flow structures.
             return Err(());
         } else {
             let mut end = None;
@@ -3859,7 +4012,7 @@ fn parse_yaml_flow_sequence_last(
             if raw_item.is_empty() || raw_item.contains(is_yaml_line_break_char) {
                 return Err(());
             }
-            let v = if matches!(raw_item, "~" | "null" | "Null" | "NULL") {
+            let v = if !forced_str && matches!(raw_item, "~" | "null" | "Null" | "NULL") {
                 AnchorScalar::null()
             } else {
                 AnchorScalar {
@@ -3873,7 +4026,7 @@ fn parse_yaml_flow_sequence_last(
             anchors.insert(a.to_string(), Some(item.clone()));
         }
         last = Some(item);
-        i += anchor_consumed + val_consumed;
+        i += prop_consumed + val_consumed;
         i = skip_flow_ws_and_comments(inner_and_rest, i);
         let sep = inner_and_rest.get(i..).ok_or(())?;
         if sep.starts_with(',') {
@@ -4132,7 +4285,12 @@ fn extract_etcd_s3_proxy_from_flow_map(
         } else {
             rest
         };
-        let (key_anchor, key_rest, key_prop_consumed) = strip_yaml_key_properties(rest)?;
+        let YamlNodeProps {
+            anchor: key_anchor,
+            rest: key_rest,
+            consumed: key_prop_consumed,
+            ..
+        } = strip_yaml_key_properties(rest)?;
         i += key_prop_consumed;
         let (raw_key, key_consumed) = if key_rest.starts_with('"') {
             let (k, after) = parse_yaml_double_quoted(key_rest)?;
@@ -4196,19 +4354,29 @@ fn extract_etcd_s3_proxy_from_flow_map(
                 // the proxy value directly below so anchors update once in order.
                 let val_end = scan_flow_value_anchors(doc, val_start, None, true)?;
                 let val_raw = trim_yaml_flow_ws(doc.get(val_start..val_end).ok_or(())?);
-                let (val_anchor, val_after_anchor) = match split_yaml_anchor(val_raw) {
-                    Some((a, after)) => {
-                        let off = skip_flow_ws_and_comments(after, 0);
-                        (Some(a), after.get(off..).unwrap_or(""))
-                    }
-                    None => (None, val_raw),
-                };
+                let (val_anchor, forced_str, val_after_anchor, _) =
+                    strip_yaml_proxy_scalar_properties(val_raw)?;
                 if val_after_anchor.is_empty() {
+                    let scalar = if forced_str {
+                        AnchorScalar {
+                            value: Arc::from(""),
+                            is_null: false,
+                        }
+                    } else {
+                        AnchorScalar::null()
+                    };
                     if let Some(a) = val_anchor {
-                        anchors.insert(a.to_string(), Some(AnchorScalar::null()));
+                        anchors.insert(a.to_string(), Some(scalar.clone()));
                     }
-                    values.record(&raw_key, (!is_append).then(|| Arc::from("")));
+                    if is_append && scalar.is_null {
+                        values.record(&raw_key, None);
+                    } else {
+                        values.record(&raw_key, Some(scalar.value));
+                    }
                 } else if val_after_anchor.starts_with('[') {
+                    if forced_str {
+                        return Err(());
+                    }
                     if let Some(a) = val_anchor {
                         anchors.insert(a.to_string(), None);
                     }
@@ -4218,7 +4386,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
                         None => values.record(&raw_key, None),
                     }
                 } else if val_after_anchor.starts_with('*') {
-                    if val_anchor.is_some() {
+                    if val_anchor.is_some() || forced_str {
                         return Err(());
                     }
                     let (resolved, rem) = resolve_yaml_alias(val_after_anchor, &anchors)?;
@@ -4231,7 +4399,7 @@ fn extract_etcd_s3_proxy_from_flow_map(
                         values.record(&raw_key, Some(resolved.value));
                     }
                 } else {
-                    let val = parse_yaml_flow_plain_or_quoted_scalar(val_after_anchor)?;
+                    let val = parse_yaml_flow_plain_or_quoted_scalar(val_after_anchor, forced_str)?;
                     if let Some(a) = val_anchor {
                         anchors.insert(a.to_string(), Some(val.clone()));
                     }
@@ -4482,8 +4650,8 @@ fn scan_block_value_anchors(
     anchors: &mut HashMap<String, Option<AnchorScalar>>,
 ) -> Result<usize, ()> {
     let (line, line_offset) = lines[i];
-    let (anchor_opt, val_rest) = match strip_yaml_key_properties(raw_val) {
-        Ok((a, rest, _)) => (a, rest),
+    let (anchor_opt, tag_opt, val_rest) = match strip_yaml_key_properties(raw_val) {
+        Ok(p) => (p.anchor, p.tag, p.rest),
         Err(()) => {
             if let Some((a, _)) = split_yaml_anchor(raw_val) {
                 anchors.insert(a.to_string(), None);
@@ -4491,6 +4659,8 @@ fn scan_block_value_anchors(
             return Ok(i + 1);
         }
     };
+    let allowed_tag = tag_opt.is_none_or(is_yaml_str_tag);
+    let forced_str = tag_opt.is_some_and(is_yaml_str_tag);
     if let Some((style, chomp, explicit_indent)) = is_yaml_block_scalar_header(val_rest) {
         if let Some(a) = anchor_opt {
             match read_yaml_block_scalar(
@@ -4502,7 +4672,10 @@ fn scan_block_value_anchors(
                 explicit_indent,
             ) {
                 Ok((val, next_i)) => {
-                    anchors.insert(a.to_string(), Some(AnchorScalar::from_string(val)));
+                    anchors.insert(
+                        a.to_string(),
+                        allowed_tag.then(|| AnchorScalar::from_string(val)),
+                    );
                     return Ok(next_i);
                 }
                 Err(()) => {
@@ -4539,7 +4712,10 @@ fn scan_block_value_anchors(
             && trailing_is_yaml_comment_or_empty(rem)
         {
             if let Some(a) = anchor_opt {
-                anchors.insert(a.to_string(), Some(AnchorScalar::from_string(val)));
+                anchors.insert(
+                    a.to_string(),
+                    allowed_tag.then(|| AnchorScalar::from_string(val)),
+                );
             }
             return Ok(i + 1);
         }
@@ -4558,7 +4734,10 @@ fn scan_block_value_anchors(
             && trailing_is_yaml_comment_or_empty(rem)
         {
             if let Some(a) = anchor_opt {
-                anchors.insert(a.to_string(), Some(AnchorScalar::from_string(val)));
+                anchors.insert(
+                    a.to_string(),
+                    allowed_tag.then(|| AnchorScalar::from_string(val)),
+                );
             }
             return Ok(i + 1);
         }
@@ -4608,7 +4787,11 @@ fn scan_block_value_anchors(
                 j += 1;
             }
             if simple_scalar && let Some(sl) = single_line {
-                let parsed = parse_yaml_plain_or_quoted_scalar(sl).ok();
+                let parsed = if allowed_tag {
+                    parse_yaml_plain_or_quoted_scalar(sl, forced_str).ok()
+                } else {
+                    None
+                };
                 anchors.insert(a.to_string(), parsed);
                 return Ok(j);
             }
@@ -4618,7 +4801,11 @@ fn scan_block_value_anchors(
         } else if has_indented_continuation(line_strs, i + 1, line_indent) {
             anchors.insert(a.to_string(), None);
         } else {
-            let parsed = parse_yaml_plain_or_quoted_scalar(val_rest).ok();
+            let parsed = if allowed_tag {
+                parse_yaml_plain_or_quoted_scalar(val_rest, forced_str).ok()
+            } else {
+                None
+            };
             anchors.insert(a.to_string(), parsed);
         }
     }
@@ -4703,17 +4890,23 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         }
         let root = match root_indent {
             Some(r) => {
-                if indent > r {
-                    // Track anchors inside nested mappings, sequences, block
-                    // scalars, and flow collections so top-level aliases match
-                    // k3s (`yaml.v2`) anchor semantics.
+                let is_indentless_seq = indent == r
+                    && (after_indent.starts_with("- ")
+                        || after_indent.starts_with("-\t")
+                        || after_indent == "-");
+                if indent > r || is_indentless_seq {
+                    // Track anchors inside nested mappings, indented or
+                    // indentless block sequences, block scalars, and flow
+                    // collections so top-level aliases match k3s (`yaml.v2`).
                     let mut cur = after_indent;
+                    let mut dash_indent = indent;
                     let mut cur_indent = indent;
                     while let Some(after_dash) = cur
                         .strip_prefix("- ")
                         .or_else(|| cur.strip_prefix("-\t"))
                         .or_else(|| (cur == "-").then_some(""))
                     {
+                        dash_indent = line.len() - cur.len();
                         let trimmed_item = after_dash.trim_start_matches([' ', '\t']);
                         cur_indent = line.len() - trimmed_item.len();
                         cur = trimmed_item;
@@ -4727,14 +4920,14 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                             &lines,
                             &line_strs,
                             i,
-                            cur_indent,
+                            dash_indent,
                             q_val,
                             &mut anchors,
                         )?;
                         continue;
                     }
                     let (nested_key_anchor, nested_slice) = match strip_yaml_key_properties(cur) {
-                        Ok((a, s, _)) => (a, s),
+                        Ok(p) => (p.anchor, p.rest),
                         Err(()) => (None, cur),
                     };
                     if let Some((nested_key, after_colon)) = parse_yaml_mapping_key(nested_slice) {
@@ -4758,7 +4951,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                             &lines,
                             &line_strs,
                             i,
-                            cur_indent,
+                            dash_indent,
                             cur,
                             &mut anchors,
                         )?;
@@ -4793,7 +4986,11 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             i += 1;
             continue;
         }
-        let (key_anchor, key_slice, _) = strip_yaml_key_properties(after_indent)?;
+        let YamlNodeProps {
+            anchor: key_anchor,
+            rest: key_slice,
+            ..
+        } = strip_yaml_key_properties(after_indent)?;
         if key_slice.starts_with(['[', '{']) {
             return Err(());
         }
@@ -4843,10 +5040,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             continue;
         }
 
-        let (proxy_anchor, rest) = match split_yaml_anchor(raw_rest) {
-            Some((anchor, val_rest)) => (Some(anchor), val_rest),
-            None => (None, raw_rest),
-        };
+        let (proxy_anchor, forced_str, rest, _) = strip_yaml_proxy_scalar_properties(raw_rest)?;
 
         if let Some((style, chomp, explicit_indent)) = is_yaml_block_scalar_header(rest) {
             let (val, next_i) =
@@ -4861,7 +5055,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         }
 
         if rest.starts_with('[') {
-            if has_indented_continuation(&line_strs, i + 1, root) {
+            if forced_str || has_indented_continuation(&line_strs, i + 1, root) {
                 return Err(());
             }
             if let Some(a) = proxy_anchor {
@@ -4902,8 +5096,16 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                         .or_else(|| l_after.strip_prefix("-\t"))
                         .or_else(|| (l_after == "-").then_some(""))
                 {
+                    if forced_str {
+                        return Err(());
+                    }
                     saw_seq = true;
-                    last_seq = Some(parse_yaml_inline_scalar(item_rest, &mut anchors)?);
+                    last_seq = Some(parse_yaml_inline_scalar(
+                        item_rest,
+                        &mut anchors,
+                        false,
+                        false,
+                    )?);
                     j += 1;
                     continue;
                 }
@@ -4925,11 +5127,12 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                     Some(last_seq.map_or_else(|| Arc::from(""), |s| s.value)),
                 );
             } else if let Some(line) = scalar_line {
-                let scalar = if proxy_anchor.is_some() {
-                    parse_yaml_plain_or_quoted_scalar(line)?
-                } else {
-                    parse_yaml_inline_scalar(line, &mut anchors)?
-                };
+                let scalar = parse_yaml_inline_scalar(
+                    line,
+                    &mut anchors,
+                    proxy_anchor.is_some(),
+                    forced_str,
+                )?;
                 if let Some(a) = proxy_anchor {
                     anchors.insert(a.to_string(), Some(scalar.clone()));
                 }
@@ -4939,10 +5142,22 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
                     values.record(&raw_key, Some(scalar.value));
                 }
             } else {
+                let scalar = if forced_str {
+                    AnchorScalar {
+                        value: Arc::from(""),
+                        is_null: false,
+                    }
+                } else {
+                    AnchorScalar::null()
+                };
                 if let Some(a) = proxy_anchor {
-                    anchors.insert(a.to_string(), Some(AnchorScalar::null()));
+                    anchors.insert(a.to_string(), Some(scalar.clone()));
                 }
-                values.record(&raw_key, (!is_append).then(|| Arc::from("")));
+                if is_append && scalar.is_null {
+                    values.record(&raw_key, None);
+                } else {
+                    values.record(&raw_key, Some(scalar.value));
+                }
             }
             i = j;
             continue;
@@ -4951,11 +5166,11 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
         if has_indented_continuation(&line_strs, i + 1, root) {
             return Err(());
         }
-        // Any single leading `&anchor` was already stripped above; reject a
-        // second `&anchor` or `&anchor *alias` without recursion, while
-        // resolving an unanchored `*alias` against `anchors`.
+        // Any single leading `&anchor` and/or `!!str` tag was already stripped
+        // above; reject duplicates or anchored/tagged aliases without recursion,
+        // while resolving an unanchored, untagged `*alias` against `anchors`.
         let scalar = if rest.starts_with('*') {
-            if proxy_anchor.is_some() {
+            if proxy_anchor.is_some() || forced_str {
                 return Err(());
             }
             let (resolved, rem) = resolve_yaml_alias(rest, &anchors)?;
@@ -4964,7 +5179,7 @@ fn extract_etcd_s3_proxy_from_yaml(text: &str) -> Result<Option<String>, ()> {
             }
             resolved
         } else {
-            let parsed = parse_yaml_plain_or_quoted_scalar(rest)?;
+            let parsed = parse_yaml_plain_or_quoted_scalar(rest, forced_str)?;
             if let Some(a) = proxy_anchor {
                 anchors.insert(a.to_string(), Some(parsed.clone()));
             }
@@ -10755,7 +10970,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "{\"etcd-s3-proxy \": \"  http://proxy.example.com:8080  \"}\n",
             "{disable: [traefik], kube-apiserver-arg: [\"audit-policy=foo\\\\bar\"]}\n",
             "{disable: [traefik], note: \"a\\nb\", nested: {re: \"foo\\\\d+\"}}\n",
-            "{disable: [traefik], note: it's a path\\foo, nested: {k:\"v\\\\}\"}}\n",
+            "{disable: [traefik], note: it's a path\\foo, nested: {\"k\":\"v\\\\}\", u: \"w\\\\}\"}}\n",
             "--- {disable: [traefik], etcd-s3-proxy: http://proxy.example.com:8080, note: \"a\\\\b\"}\n...\n",
             "defaults: &d\n  note: \"a\\\\b\"\n<<: *d\n",
             "&k disable:\n  - traefik\nnote: \"a\\\\b\"\n",
@@ -10774,6 +10989,17 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "{x-proxy: &p \"http://proxy.example.com:8080\", etcd-s3-proxy: [*p]}\n",
             "x-proxy: &p http://proxy.example.com:8080\nnote: \"line 1\n  &p not-an-anchor\"\netcd-s3-proxy: *p\n",
             "x-proxy: &p http://proxy.example.com:8080\nnote: line 1\n  &p not-an-anchor\netcd-s3-proxy: *p\n",
+            "etcd-s3-proxy: !!str http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: !!str \"http://proxy.example.com:8080\"\n",
+            "etcd-s3-proxy: !!str none\n",
+            "etcd-s3-proxy: &p !!str http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: !!str &p http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: !!str |-\n  http://proxy.example.com:8080\n",
+            "etcd-s3-proxy: [!!str http://proxy.example.com:8080]\n",
+            "etcd-s3-proxy:\n  - !!str http://proxy.example.com:8080\n",
+            "{etcd-s3-proxy: !!str \"http://proxy.example.com:8080\"}\n",
+            "etcd-s3-proxy: !!str\n  http://proxy.example.com:8080\n",
+            "other:\n- &p http://proxy.example.com:8080\netcd-s3-proxy: *p\n",
         ] {
             validate_k3s_config_yaml(&cfg_path, ok_yaml)
                 .unwrap_or_else(|e| panic!("expected {ok_yaml:?} ok, got: {e}"));
@@ -10879,6 +11105,38 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 "alias redefined as collection poisons stale scalar",
                 "old: &p http://proxy.example.com:8080\nother: &p [\"bad\"]\netcd-s3-proxy: *p\n"
                     .to_string(),
+            ),
+            (
+                "alias redefined in indentless block sequence",
+                format!(
+                    "old: &p http://proxy.example.com:8080\nother:\n- &p {bad_url}\netcd-s3-proxy: *p\n"
+                ),
+            ),
+            (
+                "alias redefined via block scalar in indentless block sequence",
+                format!(
+                    "old: &p http://proxy.example.com:8080\nother:\n- &p |-\n  {bad_url}\netcd-s3-proxy: *p\n"
+                ),
+            ),
+            (
+                "anchor-like text inside plain flow scalar does not override prior bad anchor",
+                format!(
+                    "x-proxy: &p {bad_url}\nother: [hello &p http://proxy.example.com:8080]\netcd-s3-proxy: *p\n"
+                ),
+            ),
+            (
+                "anchor-like text inside plain flow map scalar does not override prior bad anchor",
+                format!(
+                    "{{x-proxy: &p \"{bad_url}\", other: hello &p http://proxy.example.com:8080, etcd-s3-proxy: *p}}\n"
+                ),
+            ),
+            (
+                "explicit !!str tag on malformed URL",
+                format!("etcd-s3-proxy: !!str {bad_url}\n"),
+            ),
+            (
+                "explicit !!str null is literal string not YAML null",
+                "etcd-s3-proxy: !!str null\n".to_string(),
             ),
             (
                 "unresolved alias",
