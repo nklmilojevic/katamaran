@@ -54,18 +54,23 @@ fn unsupported(line: usize, what: &str) -> String {
 /// Parse `yaml` as the supported subset, validate `etcd-s3-proxy`, and return
 /// the canonical JSON document to hand to k3s.
 pub(super) fn normalize_k3s_config_yaml(yaml: &str) -> Result<String, String> {
+    normalize(yaml, true)
+}
+
+/// `check_keys` is false only in tests that exercise the YAML subset itself.
+fn normalize(yaml: &str, check_keys: bool) -> Result<String, String> {
     let entries = parse_subset(yaml)?;
     let (order, values) = merge_like_k3s(entries);
-    // Settings katamaran manages (data dir, kubelet root, kube-proxy mode, ...)
-    // are refused here as in `k8s_args`; for list flags such as `kubelet-arg`
-    // the YAML entries would otherwise be passed alongside the guest's own.
-    for key in &order {
+    // Only allowlisted k3s settings (the same list as `k8s_args`, plus
+    // credential settings) are accepted, and component arguments that would
+    // override a katamaran-managed setting are refused.
+    for key in order.iter().filter(|_| check_keys) {
         let items: Vec<&str> = match &values[key] {
             Value::Null => Vec::new(),
             Value::Str(s) => vec![s.as_str()],
             Value::List(l) => l.iter().map(|i| i.as_deref().unwrap_or("")).collect(),
         };
-        kat_proto::k8s::check_managed_k3s_setting(key, &items)
+        kat_proto::k8s::check_k3s_config_setting(key, &items)
             .map_err(|e| format!("k3s-config.yaml: {e}"))?;
     }
     if let Some(v) = values.get("etcd-s3-proxy") {
@@ -854,8 +859,9 @@ fn is_valid_go_proxy_url(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Subset parsing only; key allowlisting is covered separately.
     fn norm(yaml: &str) -> String {
-        normalize_k3s_config_yaml(yaml).unwrap_or_else(|e| panic!("{yaml:?}: {e}"))
+        normalize(yaml, false).unwrap_or_else(|e| panic!("{yaml:?}: {e}"))
     }
 
     #[test]
@@ -1003,8 +1009,7 @@ mod tests {
             "null: x\n".to_string(),
         ];
         for yaml in &cases {
-            let err =
-                normalize_k3s_config_yaml(yaml).expect_err(&format!("{yaml:?} should be rejected"));
+            let err = normalize(yaml, false).expect_err(&format!("{yaml:?} should be rejected"));
             assert!(err.starts_with("k3s-config.yaml line "), "{yaml:?}: {err}");
             assert!(!err.contains(m), "{yaml:?} echoed its value: {err}");
         }
@@ -1013,6 +1018,10 @@ mod tests {
     #[test]
     fn rejects_settings_katamaran_manages() {
         for yaml in [
+            "bind-address: 0.0.0.0\n",
+            "with-node-id: true\n",
+            "made-up-flag: x\n",
+            "kube-controller-arg: [cluster-cidr=10.8.0.0/16]\n",
             "data-dir: /tmp/k3s\n",
             "d: /tmp/k3s\n",
             "config: /tmp/x.yaml\n",
@@ -1025,7 +1034,10 @@ mod tests {
             let err = normalize_k3s_config_yaml(yaml).expect_err(yaml);
             assert!(err.starts_with("k3s-config.yaml: --"), "{yaml:?}: {err}");
         }
-        norm("kubelet-arg: [max-pods=200]\nkube-proxy-arg: [metrics-bind-address=0.0.0.0:10249]\n");
+        normalize_k3s_config_yaml(
+            "disable: [traefik]\nkubelet-arg: [max-pods=200]\nkube-proxy-arg: [metrics-bind-address=0.0.0.0:10249]\ntoken: abc\netcd-s3-proxy: none\nnode-label+: [a=b]\n",
+        )
+        .unwrap();
     }
 
     /// The parser runs in PID 1 (built with `panic = "abort"`), so no input may

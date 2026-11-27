@@ -1168,7 +1168,7 @@ impl Daemon {
             PathBuf,
         )> {
             // Validate config.toml / k3s-config.yaml and guest support before
-            // spending time downloading and installing k3s.
+            // downloading and installing k3s (the VM is already up here).
             let start_msg = crate::k8s::build_start_msg(&self.home)?;
             crate::k8s::ensure_start_supported(&self.home, &start_msg)?;
             crate::k8s::ensure_installed(&self.home, progress)?;

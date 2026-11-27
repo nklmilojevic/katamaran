@@ -455,7 +455,9 @@ fn should_show_k8s_restart_hint(
     view: &ConfigView,
     k8s_state: Option<&str>,
 ) -> bool {
-    k8s_opts_set && !view.k8s_toggled && matches!(k8s_state, Some("running" | "starting"))
+    // Only a running cluster needs a restart: a start still in progress reads
+    // the saved settings when it sends the start request.
+    k8s_opts_set && !view.k8s_toggled && k8s_state == Some("running")
 }
 
 /// `["cpus", "2"]` or `["cpus=2", "memory=8G"]`.
@@ -669,7 +671,7 @@ mod tests {
 
         // Running cluster receiving unchanged kubernetes=on + new k8s_disable shows the hint.
         assert!(should_show_k8s_restart_hint(true, &view, Some("running")));
-        assert!(should_show_k8s_restart_hint(true, &view, Some("starting")));
+        assert!(!should_show_k8s_restart_hint(true, &view, Some("starting")));
         assert!(!should_show_k8s_restart_hint(true, &view, Some("stopped")));
         assert!(!should_show_k8s_restart_hint(false, &view, Some("running")));
 

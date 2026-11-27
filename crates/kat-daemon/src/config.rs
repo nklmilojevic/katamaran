@@ -255,9 +255,7 @@ impl Config {
             other => bail!("unknown key {other}; use one of {}", KEYS.join(", ")),
         }
         next.validate(host)?;
-        if matches!(key, "k8s_disable" | "k8s_args") {
-            next.validate_k8s_settings()?;
-        }
+        next.validate_k8s_key(key)?;
         *self = next;
         Ok(())
     }
@@ -313,19 +311,33 @@ impl Config {
     }
 
     /// Full check of `k8s_disable` and `k8s_args`, the same one the guest
-    /// applies before starting k3s. Run by `set` for those keys (so `kat
-    /// config set` never saves values the guest would reject, such as an
-    /// inline token) and at every Kubernetes start.
+    /// applies before starting k3s. Run at every Kubernetes start; `set`
+    /// checks only the key being set (see [`Config::validate_k8s_key`]).
     pub fn validate_k8s_settings(&self) -> anyhow::Result<()> {
-        let mut total_k8s_bytes = 0usize;
-        for component in &self.k8s_disable {
-            validate_k8s_disable_item(component)?;
-            total_k8s_bytes = total_k8s_bytes.saturating_add("--disable=".len() + component.len());
+        self.validate_k8s_key("k8s_disable")?;
+        self.validate_k8s_key("k8s_args")
+    }
+
+    /// Check one of `k8s_disable` / `k8s_args`, plus the combined size limit.
+    /// Checking only the key being set lets `kat config set` repair a
+    /// hand-edited config.toml in which both keys are invalid.
+    fn validate_k8s_key(&self, key: &str) -> anyhow::Result<()> {
+        match key {
+            "k8s_disable" => {
+                for component in &self.k8s_disable {
+                    validate_k8s_disable_item(component)?;
+                }
+            }
+            "k8s_args" => kat_proto::k8s::validate_k3s_extra_args(&self.k8s_args)
+                .map_err(anyhow::Error::msg)?,
+            _ => return Ok(()),
         }
-        kat_proto::k8s::validate_k3s_extra_args(&self.k8s_args).map_err(anyhow::Error::msg)?;
-        for arg in &self.k8s_args {
-            total_k8s_bytes = total_k8s_bytes.saturating_add(arg.len());
-        }
+        let total_k8s_bytes = self
+            .k8s_disable
+            .iter()
+            .map(|c| "--disable=".len() + c.len())
+            .chain(self.k8s_args.iter().map(String::len))
+            .fold(0usize, usize::saturating_add);
         if total_k8s_bytes > MAX_K8S_ARGS_BYTES {
             bail!("k8s_disable and k8s_args exceed maximum size of {MAX_K8S_ARGS_BYTES} bytes");
         }
@@ -843,7 +855,7 @@ mod tests {
 
         cfg.set(
             "k8s_args",
-            "--kube-apiserver-arg=feature-gates=Foo=true --node-label='env=my dev' --note=\"a'b\"",
+            "--kube-apiserver-arg=feature-gates=Foo=true --node-label='env=my dev' --node-taint=\"a'b\"",
             &HOST,
         )
         .unwrap();
@@ -852,7 +864,7 @@ mod tests {
             vec![
                 "--kube-apiserver-arg=feature-gates=Foo=true",
                 "--node-label=env=my dev",
-                "--note=a'b",
+                "--node-taint=a'b",
             ]
         );
         assert_eq!(
@@ -862,7 +874,7 @@ mod tests {
                 "--disable=servicelb",
                 "--kube-apiserver-arg=feature-gates=Foo=true",
                 "--node-label=env=my dev",
-                "--note=a'b",
+                "--node-taint=a'b",
             ]
         );
 
@@ -947,10 +959,10 @@ mod tests {
             Config::parse("k8s_args = [\"--token=x\", \"\"]\nk8s_disable = [\"traefik \"]\n")
                 .unwrap();
         assert!(loaded.validate_k8s_settings().is_err());
+        // Each bad key can be repaired on its own, in either order.
         loaded.set("cpus", "2", &host).unwrap();
-        loaded.set("k8s_args", "", &host).unwrap_err(); // k8s_disable is still bad
-        loaded.set("k8s_disable", "traefik", &host).unwrap_err(); // k8s_args still bad
-        loaded.k8s_args.clear();
+        loaded.set("k8s_args", "", &host).unwrap();
+        assert!(loaded.validate_k8s_settings().is_err()); // k8s_disable still bad
         loaded.set("k8s_disable", "traefik", &host).unwrap();
         loaded.validate_k8s_settings().unwrap();
     }

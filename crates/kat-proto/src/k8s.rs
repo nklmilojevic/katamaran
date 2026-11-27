@@ -325,24 +325,97 @@ fn parse_k3s_flag(arg: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
-/// `k3s server` settings the guest sets itself or depends on. `k8s_args` are
-/// appended after the guest's flags, so for single-value flags the user's
-/// value would win; katamaran's relay, image sync, stop/reset and pod routing
-/// all depend on these.
-const MANAGED_K3S_FLAGS: &[&str] = &[
-    "data-dir",
-    "d",
-    "write-kubeconfig",
-    "o",
-    "write-kubeconfig-mode",
-    "https-listen-port",
-    "container-runtime-endpoint",
-    "node-name",
-    "flannel-backend",
-    "cluster-cidr",
-    "service-cidr",
-    "cluster-dns",
-    "disable-kube-proxy",
+/// `k3s server` flags (k3s v1.31–v1.37 names) accepted in `k8s_args` and
+/// `k3s-config.yaml`: logging, component arguments, labels/taints/SANs,
+/// optional components and features. Everything else is rejected, because
+/// the guest sets or depends on it (data dir, kubeconfig, API listener and
+/// ports, node identity, networking, container runtime, control-plane
+/// components, joining other servers) or because it is not useful in the
+/// single-node guest. An allowlist, so new or obscure k3s flags fail closed.
+const ALLOWED_K3S_FLAGS: &[&str] = &[
+    "debug",
+    "v",
+    "vmodule",
+    "log",
+    "alsologtostderr",
+    "disable",
+    "disable-cloud-controller",
+    "disable-helm-controller",
+    "disable-network-policy",
+    "disable-default-registry-endpoint",
+    "kube-apiserver-arg",
+    "kube-scheduler-arg",
+    "kube-controller-manager-arg",
+    "kube-controller-arg",
+    "kube-cloud-controller-manager-arg",
+    "kube-cloud-controller-arg",
+    "kubelet-arg",
+    "kube-proxy-arg",
+    "helm-controller-arg",
+    "node-label",
+    "node-taint",
+    "tls-san",
+    "tls-san-security",
+    "service-node-port-range",
+    "cluster-domain",
+    "default-local-storage-path",
+    "secrets-encryption",
+    "secrets-encryption-provider",
+    "embedded-registry",
+    "system-default-registry",
+    "private-registry",
+    "pause-image",
+    "egress-selector-mode",
+    "servicelb-namespace",
+    "protect-kernel-defaults",
+    "enable-pprof",
+    "supervisor-metrics",
+    "image-credential-provider-bin-dir",
+    "image-credential-provider-config",
+    "helm-job-image",
+    "nonroot-devices",
+    "token-file",
+    "agent-token-file",
+    "vpn-auth-file",
+];
+
+/// Datastore and snapshot settings, also accepted (in `k8s_args` only when
+/// not in [`CREDENTIAL_K3S_FLAGS`]). They change where cluster state lives;
+/// `kat k8s reset` only wipes the local data directory.
+const DATASTORE_K3S_FLAGS: &[&str] = &[
+    "cluster-init",
+    "datastore-endpoint",
+    "datastore-cafile",
+    "datastore-certfile",
+    "datastore-keyfile",
+    "etcd-disable-snapshots",
+    "etcd-expose-metrics",
+    "etcd-arg",
+    "etcd-snapshot-compress",
+    "etcd-snapshot-dir",
+    "etcd-snapshot-name",
+    "etcd-snapshot-reconcile-interval",
+    "etcd-snapshot-retention",
+    "etcd-snapshot-schedule-cron",
+    "etcd-s3",
+    "etcd-s3-bucket",
+    "etcd-s3-bucket-lookup-type",
+    "etcd-s3-config-secret",
+    "etcd-s3-endpoint",
+    "etcd-s3-endpoint-ca",
+    "etcd-s3-folder",
+    "etcd-s3-insecure",
+    "etcd-s3-region",
+    "etcd-s3-retention",
+    "etcd-s3-skip-ssl-verify",
+    "etcd-s3-timeout",
+    "etcd-s3-access-key",
+    "etcd-s3-secret-key",
+    "etcd-s3-session-token",
+    "etcd-s3-proxy",
+    "token",
+    "agent-token",
+    "vpn-auth",
 ];
 
 /// Component settings that would override something katamaran manages,
@@ -387,12 +460,11 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Flags whose value can carry credentials. `k8s_args` end up on the k3s
-/// process command line, which `k3s --debug` also writes to its log.
+/// Settings whose value can carry credentials: accepted only in
+/// `k3s-config.yaml`. `k8s_args` end up on the k3s process command line,
+/// which `k3s --debug` also writes to its log.
 const CREDENTIAL_K3S_FLAGS: &[&str] = &[
     "token",
-    "t",
-    "cluster-secret",
     "agent-token",
     "datastore-endpoint",
     "etcd-s3-access-key",
@@ -411,23 +483,27 @@ fn component_arg_key(value: &str) -> String {
     key.trim_end_matches(['+', '-']).replace('_', "-")
 }
 
-/// Reject a k3s setting (`name` without dashes, as a flag or a
-/// `k3s-config.yaml` key) that katamaran manages. `values` are the values it
-/// is given (inspected for `kubelet-arg` / `kube-proxy-arg`). Errors never
-/// echo values.
-pub fn check_managed_k3s_setting(name: &str, values: &[&str]) -> Result<(), String> {
-    if name == "config" || name == "c" {
-        return Err(
-            "--config (-c) cannot be set; put k3s settings in ~/.katamaran/k3s-config.yaml instead"
-                .into(),
-        );
-    }
-    if MANAGED_K3S_FLAGS.contains(&name) {
+/// Check one k3s setting (`name` without dashes; `values` are the values it
+/// is given) against the allowlist and the reserved component settings.
+/// Errors name the flag but never echo values.
+fn check_k3s_setting(name: &str, values: &[&str], in_args: bool) -> Result<(), String> {
+    let allowed = ALLOWED_K3S_FLAGS.contains(&name) || DATASTORE_K3S_FLAGS.contains(&name);
+    if !allowed {
         return Err(format!(
-            "--{name} cannot be set: katamaran manages it for the guest cluster"
+            "--{name} is not supported: katamaran only passes k3s settings that cannot conflict with how it runs the guest cluster (see the Kubernetes docs for the list)"
         ));
     }
-    if let Some((_, managed)) = MANAGED_COMPONENT_ARGS.iter().find(|(f, _)| *f == name) {
+    if in_args && CREDENTIAL_K3S_FLAGS.contains(&name) {
+        return Err(format!(
+            "--{name} can carry credentials and would appear in the k3s process command line and, with --debug, its log; set `{name}:` in ~/.katamaran/k3s-config.yaml (or use the matching *-file flag) instead"
+        ));
+    }
+    let component = match name {
+        "kube-controller-arg" => "kube-controller-manager-arg",
+        "kube-cloud-controller-arg" => "kube-cloud-controller-manager-arg",
+        other => other,
+    };
+    if let Some((_, managed)) = MANAGED_COMPONENT_ARGS.iter().find(|(f, _)| *f == component) {
         for v in values {
             let key = component_arg_key(v);
             if managed.contains(&key.as_str()) {
@@ -438,6 +514,11 @@ pub fn check_managed_k3s_setting(name: &str, values: &[&str]) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// Check one `k3s-config.yaml` key and its values (see [`check_k3s_setting`]).
+pub fn check_k3s_config_setting(name: &str, values: &[&str]) -> Result<(), String> {
+    check_k3s_setting(name, values, false)
 }
 
 /// Validate `k8s_args` before they are saved (host) and before `k3s server`
@@ -454,12 +535,7 @@ pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
             continue;
         };
         let value = inline.or_else(|| args.get(i + 1).map(String::as_str));
-        check_managed_k3s_setting(name, value.as_slice()).map_err(|e| format!("k8s_args: {e}"))?;
-        if CREDENTIAL_K3S_FLAGS.contains(&name) {
-            return Err(format!(
-                "k8s_args cannot pass --{name}, whose value can carry credentials and would appear in the k3s process command line and, with --debug, its log; set `{name}:` in ~/.katamaran/k3s-config.yaml (or use the matching *-file flag) instead"
-            ));
-        }
+        check_k3s_setting(name, value.as_slice(), true).map_err(|e| format!("k8s_args: {e}"))?;
     }
     Ok(())
 }
@@ -488,6 +564,7 @@ mod tests {
 
         let marker = "placeholder-marker-3310";
         for flag in [
+            // managed by the guest / conflicts with how it runs the cluster
             "data-dir",
             "d",
             "write-kubeconfig",
@@ -502,9 +579,21 @@ mod tests {
             "cluster-dns",
             "config",
             "c",
+            "disable-kube-proxy",
+            "bind-address",
+            "with-node-id",
+            "disable-apiserver",
+            "advertise-port",
+            "supervisor-port",
+            "server",
+            "snapshotter",
+            "node-ip",
+            "disable-agent",
+            "resolv-conf",
+            "made-up-flag",
+            // credentials
             "token",
             "t",
-            "cluster-secret",
             "agent-token",
             "datastore-endpoint",
             "etcd-s3-access-key",
@@ -524,6 +613,11 @@ mod tests {
                 assert!(!err.contains(marker), "{args:?} echoed its value: {err}");
             }
         }
+        // Credentials are fine in k3s-config.yaml; unknown/managed keys are not.
+        super::check_k3s_config_setting("token", &["x"]).unwrap();
+        super::check_k3s_config_setting("etcd-s3-proxy", &["none"]).unwrap();
+        super::check_k3s_config_setting("bind-address", &["x"]).unwrap_err();
+        super::check_k3s_config_setting("kube-controller-arg", &["cluster-cidr=x"]).unwrap_err();
         for kubelet in [
             vec!["--kubelet-arg=root-dir=/x"],
             vec!["--kubelet-arg=--root-dir=/x"],
@@ -545,6 +639,7 @@ mod tests {
             vec!["--kube-apiserver-arg=service-cluster-ip-range=10.9.0.0/16"],
             vec!["--kube-controller-manager-arg=cluster-cidr=10.8.0.0/16"],
             vec!["--kube-controller-manager-arg=allocate_node_cidrs=false"],
+            vec!["--kube-controller-arg=cluster-cidr=10.8.0.0/16"],
         ] {
             assert!(v(&kubelet).is_err(), "{kubelet:?}");
         }

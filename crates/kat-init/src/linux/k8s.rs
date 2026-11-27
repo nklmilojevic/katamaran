@@ -2665,6 +2665,9 @@ impl K8s {
         // stop_locked reports success even if k3s survived SIGKILL; never delete
         // the datastore underneath a live k3s.
         ensure_no_unreaped_k3s()?;
+        // Remove the managed config copy first: if that fails, nothing has
+        // been destroyed yet and the reset error is accurate.
+        sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
         let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
         unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
         if Path::new(DATA_DIR).exists() {
@@ -2682,7 +2685,6 @@ impl K8s {
                 .map_err(|e| format!("remove {LEGACY_KUBELET_DIR}: {e}"))?;
         }
         let _ = fs::remove_file(KUBECONFIG);
-        sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
         log("k3s cluster data reset");
         Ok(())
     }
