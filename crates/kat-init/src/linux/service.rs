@@ -3,11 +3,11 @@
 //! reporting to the host.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -69,6 +69,7 @@ pub struct PgrpTarget {
 }
 
 /// How to signal a spawned child without racing PID reuse.
+#[derive(Debug)]
 pub enum ChildTarget {
     /// Kernel pidfd: `pidfd_send_signal` returns `ESRCH` once reaped.
     PidFd(OwnedFd),
@@ -99,173 +100,324 @@ impl Reaper {
         let (target, rx) = self.spawn_pgrp(cmd)?;
         Ok((target.pid, rx))
     }
+}
 
-    /// Spawn `cmd` without holding PID 1's shared reaper lock across `fork`,
-    /// `fchdir`, or `execve`: the child reports its PID right after `fork` and
-    /// pauses on a `go` pipe while the parent briefly acquires `self.watched` to
-    /// register the PID (and optionally open a `pidfd`), then releases the lock
-    /// before `post_reg` and `execve` run. A stalled filesystem in `post_reg` or
-    /// `execve` can therefore never block child reaping across the VM.
-    pub fn spawn_pgrp_unlocked<F>(
-        &self,
-        cmd: Command,
-        post_reg: F,
-    ) -> io::Result<(PgrpTarget, Receiver<i32>)>
-    where
-        F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
-    {
-        let (_, pgrp, rx) = self.spawn_unlocked_inner(cmd, false, post_reg)?;
-        Ok((pgrp, rx))
+/// Specification for [`Reaper::spawn_unlocked`], which spawns a child directly
+/// via `fork` + `execve` without holding PID 1's shared reaper lock across
+/// `fork`, `fchdir`, `cgroup.procs`, or `execve`, and leaves `reap_loop` as the
+/// sole child-reaping owner on both success and failure.
+pub struct UnlockedSpawnSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub stdin: OwnedFd,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
+    pub cwd_fd: OwnedFd,
+    pub cgroup_procs_fd: Option<OwnedFd>,
+    /// True for PTY sessions (`setsid` + `TIOCSCTTY` + `pidfd_open`); false
+    /// for piped sessions (`setpgid(0, 0)`).
+    pub pty: bool,
+}
+
+fn last_errno() -> libc::c_int {
+    io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+unsafe fn fail_child(err_fd: RawFd, errno: libc::c_int) -> ! {
+    let bytes = errno.to_ne_bytes();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let rc = unsafe { libc::write(err_fd, bytes[off..].as_ptr().cast(), bytes.len() - off) };
+        if rc > 0 {
+            off += rc as usize;
+        } else if rc < 0 && last_errno() == libc::EINTR {
+            continue;
+        } else {
+            break;
+        }
+    }
+    unsafe { libc::_exit(127) }
+}
+
+unsafe fn dup_ge7(fd: RawFd, err_fd: RawFd) -> RawFd {
+    let r = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 7) };
+    if r < 0 {
+        unsafe { fail_child(err_fd, last_errno()) };
+    }
+    r
+}
+
+unsafe fn dup2_retry(src: RawFd, dst: RawFd, err_fd: RawFd) {
+    loop {
+        let rc = unsafe { libc::dup2(src, dst) };
+        if rc >= 0 {
+            return;
+        }
+        let e = last_errno();
+        if e != libc::EINTR {
+            unsafe { fail_child(err_fd, e) };
+        }
+    }
+}
+
+unsafe fn dup2_cloexec(src: RawFd, dst: RawFd, err_fd: RawFd) {
+    unsafe { dup2_retry(src, dst, err_fd) };
+    if unsafe { libc::fcntl(dst, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        unsafe { fail_child(err_fd, last_errno()) };
+    }
+}
+
+unsafe fn close_fds_from(first: u32, max_fd: u32) {
+    // Linux generic __NR_close_range (436 since Linux 5.9).
+    const SYS_CLOSE_RANGE: libc::c_long = 436;
+    let rc = unsafe { libc::syscall(SYS_CLOSE_RANGE, first as libc::c_uint, u32::MAX, 0u32) };
+    if rc < 0 {
+        for fd in first..max_fd {
+            unsafe {
+                let _ = libc::close(fd as RawFd);
+            }
+        }
+    }
+}
+
+unsafe fn write_all_raw(fd: RawFd, data: &[u8]) -> Result<(), libc::c_int> {
+    let mut off = 0usize;
+    while off < data.len() {
+        let rc = unsafe { libc::write(fd, data[off..].as_ptr().cast(), data.len() - off) };
+        if rc > 0 {
+            off += rc as usize;
+        } else if rc == 0 {
+            return Err(libc::EIO);
+        } else {
+            let e = last_errno();
+            if e != libc::EINTR {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_exec_tables(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> io::Result<(Vec<CString>, Vec<CString>, Vec<CString>)> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "NUL byte in exec spec");
+    if program.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty executable",
+        ));
     }
 
-    /// Like [`Self::spawn_pgrp_unlocked`], also opening a `pidfd` under the
-    /// brief watch-table lock before `post_reg` and `execve` run.
-    pub fn spawn_pidfd_pgrp_unlocked<F>(
-        &self,
-        cmd: Command,
-        post_reg: F,
-    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)>
-    where
-        F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
-    {
-        self.spawn_unlocked_inner(cmd, true, post_reg)
+    // Deduplicate env entries preserving order (last value wins), matching `Command::env`.
+    let mut dedup_env: Vec<(&str, &str)> = Vec::with_capacity(env.len());
+    for (k, v) in env {
+        if let Some(existing) = dedup_env.iter_mut().find(|(ek, _)| *ek == k.as_str()) {
+            existing.1 = v.as_str();
+        } else {
+            dedup_env.push((k.as_str(), v.as_str()));
+        }
     }
 
-    fn spawn_unlocked_inner<F>(
+    let mut candidates = Vec::new();
+    if program.contains('/') {
+        candidates.push(CString::new(program).map_err(|_| invalid())?);
+    } else if let Some((_, path)) = dedup_env.iter().find(|(k, _)| *k == "PATH") {
+        for dir in path.split(':') {
+            let full = if dir.is_empty() {
+                program.to_string()
+            } else {
+                format!("{dir}/{program}")
+            };
+            candidates.push(CString::new(full).map_err(|_| invalid())?);
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push(CString::new(program).map_err(|_| invalid())?);
+    }
+
+    let mut argv = Vec::with_capacity(1 + args.len());
+    argv.push(CString::new(program).map_err(|_| invalid())?);
+    for a in args {
+        argv.push(CString::new(a.as_str()).map_err(|_| invalid())?);
+    }
+
+    let mut envp = Vec::with_capacity(dedup_env.len());
+    for (k, v) in dedup_env {
+        envp.push(CString::new(format!("{k}={v}")).map_err(|_| invalid())?);
+    }
+
+    Ok((candidates, argv, envp))
+}
+
+impl Reaper {
+    /// Spawn a child from `spec` without holding PID 1's shared reaper lock
+    /// across `fork`, `fchdir`, `cgroup.procs`, or `execve`.
+    ///
+    /// Immediately after `fork`, the child packs only its owned descriptors
+    /// into `0..=6` and closes all other inherited descriptors (preventing
+    /// deadlocks with concurrent `Command::spawn` exec-status sockets) before
+    /// pausing on the registration gate. The parent briefly acquires
+    /// `self.watched` to register the PID (and open a `pidfd` for PTY
+    /// sessions), releases the lock and gate, and reads any exec failure from
+    /// an `O_CLOEXEC` status pipe while leaving `reap_loop` as the single
+    /// child-reaping owner on both success and failure.
+    pub fn spawn_unlocked(
         &self,
-        mut cmd: Command,
-        open_pidfd: bool,
-        post_reg: F,
-    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)>
-    where
-        F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
-    {
-        let (pid_r, pid_w) = cmd::pipe()?;
+        spec: UnlockedSpawnSpec,
+    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)> {
+        self.spawn_unlocked_inner(spec, None)
+    }
+
+    fn spawn_unlocked_inner(
+        &self,
+        spec: UnlockedSpawnSpec,
+        before_reg: Option<Box<dyn FnOnce()>>,
+    ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)> {
+        let (candidates, argv, envp) = prepare_exec_tables(&spec.program, &spec.args, &spec.env)?;
+        let candidate_ptrs: Vec<*const libc::c_char> =
+            candidates.iter().map(|c| c.as_ptr()).collect();
+        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+
         let (go_r, go_w) = cmd::pipe()?;
-        let pid_w_raw = pid_w.as_raw_fd();
-        let go_r_raw = go_r.as_raw_fd();
-        let mut post_reg = Some(post_reg);
-        let got_pid = Arc::new(AtomicBool::new(false));
-        let got_pid_spawner = got_pid.clone();
+        let (err_r, err_w) = cmd::pipe()?;
+        let sc = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max_fd: u32 = if sc > 0 {
+            (sc as u64).clamp(1024, 65536) as u32
+        } else {
+            4096
+        };
 
-        // SAFETY: `getpid`, `write`, `read`, and caller's `post_reg` are
-        // async-signal-safe; no allocations or locks occur in the child.
-        unsafe {
-            cmd.pre_exec(move || {
-                let pid_bytes = libc::getpid().to_ne_bytes();
-                let mut off = 0usize;
-                while off < pid_bytes.len() {
-                    let rc = libc::write(
-                        pid_w_raw,
-                        pid_bytes[off..].as_ptr().cast(),
-                        pid_bytes.len() - off,
-                    );
-                    if rc > 0 {
-                        off += rc as usize;
-                    } else if rc < 0
-                        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                    {
-                        continue;
-                    } else {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
+        let stdin_raw = spec.stdin.as_raw_fd();
+        let stdout_raw = spec.stdout.as_raw_fd();
+        let stderr_raw = spec.stderr.as_raw_fd();
+        let go_r_raw = go_r.as_raw_fd();
+        let err_w_raw = err_w.as_raw_fd();
+        let cwd_raw = spec.cwd_fd.as_raw_fd();
+        let procs_raw = spec.cgroup_procs_fd.as_ref().map(AsRawFd::as_raw_fd);
+        let pty = spec.pty;
+
+        // SAFETY: The child branch runs strictly async-signal-safe syscalls
+        // using pre-allocated slices and exits via `_exit(127)` on any error.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                let r_err = dup_ge7(err_w_raw, err_w_raw);
+                let r_in = dup_ge7(stdin_raw, r_err);
+                let r_out = dup_ge7(stdout_raw, r_err);
+                let r_stderr = dup_ge7(stderr_raw, r_err);
+                let r_go = dup_ge7(go_r_raw, r_err);
+                let r_cwd = dup_ge7(cwd_raw, r_err);
+                let r_procs = procs_raw.map(|fd| dup_ge7(fd, r_err));
+
+                dup2_retry(r_in, 0, r_err);
+                dup2_retry(r_out, 1, r_err);
+                dup2_retry(r_stderr, 2, r_err);
+                dup2_cloexec(r_go, 3, r_err);
+                dup2_cloexec(r_err, 4, r_err);
+                dup2_cloexec(r_cwd, 5, 4);
+                let close_from: u32 = if let Some(rp) = r_procs {
+                    dup2_cloexec(rp, 6, 4);
+                    7
+                } else {
+                    6
+                };
+
+                // Close EVERY unrelated inherited descriptor (including any
+                // concurrent `Command::spawn` exec-status socket) BEFORE
+                // waiting at the registration gate.
+                close_fds_from(close_from, max_fd);
+
+                let mut empty: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut empty);
+                libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+
+                // Wait for the parent to register our PID and release the gate.
                 let mut gate = [0u8; 1];
                 loop {
-                    let rc = libc::read(go_r_raw, gate.as_mut_ptr().cast(), 1);
-                    if rc >= 0 {
+                    let rc = libc::read(3, gate.as_mut_ptr().cast(), 1);
+                    if rc == 1 {
+                        if gate[0] != 1 {
+                            libc::_exit(127);
+                        }
                         break;
                     }
-                    if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                        return Err(io::Error::last_os_error());
+                    if rc == 0 {
+                        libc::_exit(127);
+                    }
+                    let e = last_errno();
+                    if e != libc::EINTR {
+                        fail_child(4, e);
                     }
                 }
-                if let Some(f) = post_reg.take() {
-                    f()?;
-                }
-                Ok(())
-            });
-        }
+                let _ = libc::close(3);
 
-        let spawner = thread::Builder::new()
-            .name("reaper-spawn".into())
-            .spawn(move || {
-                let res = cmd.spawn();
-                if res.is_err() && !got_pid_spawner.load(Ordering::Acquire) {
-                    // Wake the caller explicitly with sentinel pid 0 even if an
-                    // unrelated concurrent fork transiently inherited `pid_w`.
-                    let zero = 0i32.to_ne_bytes();
-                    let mut off = 0usize;
-                    while off < zero.len() {
-                        let rc = unsafe {
-                            libc::write(
-                                pid_w.as_raw_fd(),
-                                zero[off..].as_ptr().cast(),
-                                zero.len() - off,
-                            )
-                        };
-                        if rc > 0 {
-                            off += rc as usize;
-                        } else if rc < 0
-                            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-                        {
-                            continue;
-                        } else {
+                if r_procs.is_some() {
+                    if let Err(e) = write_all_raw(6, b"0\n") {
+                        fail_child(4, e);
+                    }
+                    let _ = libc::close(6);
+                }
+                if libc::fchdir(5) < 0 {
+                    fail_child(4, last_errno());
+                }
+                let _ = libc::close(5);
+
+                if pty {
+                    if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        fail_child(4, last_errno());
+                    }
+                } else if libc::setpgid(0, 0) < 0 {
+                    fail_child(4, last_errno());
+                }
+
+                let mut saved_eacces: Option<libc::c_int> = None;
+                let mut final_err = libc::ENOENT;
+                for &cand in &candidate_ptrs {
+                    libc::execve(cand, argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+                    let e = last_errno();
+                    match e {
+                        libc::ENOENT | libc::ENOTDIR => final_err = e,
+                        libc::EACCES | libc::EPERM => saved_eacces = Some(e),
+                        other => {
+                            final_err = other;
+                            saved_eacces = None;
                             break;
                         }
                     }
                 }
-                drop(pid_w);
-                drop(go_r);
-                res
-            })?;
-
-        let mut pid_bytes = [0u8; 4];
-        let mut read_off = 0usize;
-        while read_off < pid_bytes.len() {
-            let rc = unsafe {
-                libc::read(
-                    pid_r.as_raw_fd(),
-                    pid_bytes[read_off..].as_mut_ptr().cast(),
-                    pid_bytes.len() - read_off,
-                )
-            };
-            if rc > 0 {
-                read_off += rc as usize;
-            } else if rc == 0 {
-                // Fork failed before `pre_exec` wrote the PID; surface spawn error.
-                drop(go_w);
-                return match spawner.join() {
-                    Ok(Err(e)) => Err(e),
-                    Ok(Ok(_)) => Err(io::Error::other("child exited spawn handshake without pid")),
-                    Err(_) => Err(io::Error::other("spawner thread panicked")),
-                };
-            } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                let e = io::Error::last_os_error();
-                drop(go_w);
-                let _ = spawner.join();
-                return Err(e);
+                fail_child(4, saved_eacces.unwrap_or(final_err));
             }
         }
-        let pid = i32::from_ne_bytes(pid_bytes);
-        if pid <= 0 {
-            drop(pid_r);
-            drop(go_w);
-            return match spawner.join() {
-                Ok(Err(e)) => Err(e),
-                Ok(Ok(_)) => Err(io::Error::other("child exited spawn handshake without pid")),
-                Err(_) => Err(io::Error::other("spawner thread panicked")),
-            };
+
+        // Parent: drop child-side descriptors immediately so only the child
+        // holds `err_w` and `go_r`.
+        drop(go_r);
+        drop(err_w);
+        drop(spec);
+
+        if let Some(hook) = before_reg {
+            hook();
         }
-        got_pid.store(true, Ordering::Release);
-        drop(pid_r);
 
         // Hold `self.watched` ONLY for the microsecond registration + pidfd_open,
-        // never across `fchdir` or `execve`.
+        // never across `fchdir`, `cgroup.procs`, or `execve`.
         let (target, pgrp, rx) = {
             let mut table = self.watched.lock().unwrap();
             let (token, rx) = table.register(pid);
-            let target = if open_pidfd {
+            let target = if pty {
                 match sys::pidfd_open(pid) {
                     Ok(fd) => ChildTarget::PidFd(fd),
                     Err(e) if e.raw_os_error() == Some(libc::ESRCH) => ChildTarget::Exited,
@@ -277,12 +429,11 @@ impl Reaper {
             (target, PgrpTarget { pid, token }, rx)
         };
 
-        // Release the child with an explicit byte (not just EOF) so an
-        // unrelated concurrent fork transiently inheriting `go_w` cannot stall
-        // the child before `post_reg` and `execve`.
-        let go_byte: u8 = 1;
+        // Release the child with an explicit byte so any unrelated concurrent
+        // fork transiently inheriting `go_w` cannot stall the gate.
+        let go_byte = [1u8];
         loop {
-            let rc = unsafe { libc::write(go_w.as_raw_fd(), (&go_byte as *const u8).cast(), 1) };
+            let rc = unsafe { libc::write(go_w.as_raw_fd(), go_byte.as_ptr().cast(), 1) };
             if rc >= 0 {
                 break;
             }
@@ -291,21 +442,61 @@ impl Reaper {
             }
         }
         drop(go_w);
-        match spawner.join() {
-            Ok(Ok(_child)) => Ok((target, pgrp, rx)),
-            Ok(Err(e)) => {
-                // If `Command::spawn()` reaped the failed child before
-                // `reap_loop`, remove our token-matched watch entry now.
-                let mut table = self.watched.lock().unwrap();
-                if table.matches(pgrp.pid, pgrp.token) {
-                    table.children.remove(&pgrp.pid);
-                }
-                Err(e)
+
+        let mut err_buf = [0u8; 4];
+        let mut err_off = 0usize;
+        while err_off < err_buf.len() {
+            let rc = unsafe {
+                libc::read(
+                    err_r.as_raw_fd(),
+                    err_buf[err_off..].as_mut_ptr().cast(),
+                    err_buf.len() - err_off,
+                )
+            };
+            if rc > 0 {
+                err_off += rc as usize;
+            } else if rc == 0 {
+                break;
+            } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                let e = io::Error::last_os_error();
+                self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                return Err(e);
             }
-            Err(_) => Err(io::Error::other("spawner thread panicked")),
+        }
+        drop(err_r);
+
+        if err_off == 0 {
+            return Ok((target, pgrp, rx));
+        }
+
+        self.finish_failed_unlocked_child(pgrp, &target, &rx);
+        if err_off == 4 {
+            Err(io::Error::from_raw_os_error(i32::from_ne_bytes(err_buf)))
+        } else {
+            Err(io::Error::other("child terminated before completing exec"))
         }
     }
 
+    /// Wait for `reap_loop` (the sole reaping owner) to collect a child that
+    /// failed before `execve`, and clear any stale watch entry if the child had
+    /// already been reaped before `register` ran.
+    fn finish_failed_unlocked_child(
+        &self,
+        pgrp: PgrpTarget,
+        target: &ChildTarget,
+        rx: &Receiver<i32>,
+    ) {
+        if !matches!(target, ChildTarget::Exited) {
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
+        let mut table = self.watched.lock().unwrap();
+        if table.matches(pgrp.pid, pgrp.token) {
+            table.children.remove(&pgrp.pid);
+        }
+    }
+}
+
+impl Reaper {
     /// Spawn `cmd` and return a token-pinned [`PgrpTarget`] plus a channel
     /// yielding its wait status. The lock is held across spawn and
     /// registration so an immediate exit cannot be reaped before it is watched.
@@ -1272,46 +1463,107 @@ mod tests {
         assert!(table.matches(4242, tok2));
     }
 
+    fn open_dir_fd(path: &str) -> OwnedFd {
+        let c = CString::new(path).unwrap();
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }
+    }
+
+    fn open_devnull_fd() -> OwnedFd {
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }
+    }
+
     #[test]
-    fn spawn_unlocked_does_not_hold_reaper_lock_during_post_reg() {
+    fn spawn_unlocked_closes_unrelated_fds_before_gate_avoiding_deadlock() {
         let reaper = Reaper::start();
-        let watched = reaper.watched.clone();
-        let (done_tx, done_rx) = mpsc::channel();
-        let (gate_r, gate_w) = cmd::pipe().unwrap();
-        let gate_r_raw = gate_r.as_raw_fd();
-        let (notify_r, notify_w) = cmd::pipe().unwrap();
-        let notify_w_raw = notify_w.as_raw_fd();
+        let (at_gate_tx, at_gate_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        // Keep an extra O_CLOEXEC pipe open in the parent to verify the
+        // unlocked child does NOT hold it open while waiting at the gate.
+        let (extra_r, extra_w) = cmd::pipe().unwrap();
+        let (out_r, out_w) = cmd::pipe().unwrap();
 
         let r2 = reaper.clone();
-        let handle = thread::spawn(move || {
-            let cmd = Command::new("/bin/true");
-            let res = r2.spawn_pidfd_pgrp_unlocked(cmd, move || {
-                let b = [1u8];
-                let _ = unsafe { libc::write(notify_w_raw, b.as_ptr().cast(), 1) };
-                let mut g = [0u8; 1];
-                let _ = unsafe { libc::read(gate_r_raw, g.as_mut_ptr().cast(), 1) };
-                Ok(())
-            });
-            drop(gate_r);
-            drop(notify_w);
-            let _ = done_tx.send(res.is_ok());
+        let unlocked = thread::spawn(move || {
+            let spec = UnlockedSpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo ok".into()],
+                env: vec![("PATH".into(), PATH.into())],
+                stdin: open_devnull_fd(),
+                stdout: out_w,
+                stderr: open_devnull_fd(),
+                cwd_fd: open_dir_fd("/"),
+                cgroup_procs_fd: None,
+                pty: false,
+            };
+            r2.spawn_unlocked_inner(
+                spec,
+                Some(Box::new(move || {
+                    let _ = at_gate_tx.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                })),
+            )
         });
 
-        let mut b = [0u8; 1];
-        assert_eq!(
-            unsafe { libc::read(notify_r.as_raw_fd(), b.as_mut_ptr().cast(), 1) },
-            1
-        );
+        // Child has forked and is parked at `go_r`; parent has NOT locked
+        // `reaper.watched` yet.
+        at_gate_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        // While the child is paused inside `post_reg` (simulating a stalled
-        // filesystem during fchdir/execve), PID 1's reaper lock must be FREE.
+        // Dropping `extra_w` in the parent must immediately yield EOF on
+        // `extra_r` because the unlocked child closed unrelated fds before `go_r`.
+        drop(extra_w);
+        let mut pfd = libc::pollfd {
+            fd: extra_r.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         assert!(
-            watched.try_lock().is_ok(),
-            "reaper watch lock was held across post_reg/execve"
+            unsafe { libc::poll(&mut pfd, 1, 1000) } > 0,
+            "unlocked child retained an unrelated inherited fd while paused at gate"
         );
 
-        drop(gate_w);
-        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
-        handle.join().unwrap();
+        // Meanwhile, a concurrent `reaper.spawn` (holding `self.watched`) must
+        // complete cleanly without deadlocking against the paused unlocked child.
+        let (_, rx_other) = reaper.spawn(&mut Command::new("/bin/true")).unwrap();
+        let status_other = rx_other.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(status_other, 0);
+
+        let _ = release_tx.send(());
+        let (_, _, rx_unlocked) = unlocked.join().unwrap().unwrap();
+        let status_unlocked = rx_unlocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(status_unlocked, 0);
+        drop(out_r);
+    }
+
+    #[test]
+    fn spawn_unlocked_exec_failure_reaps_without_panicking_and_reaper_continues() {
+        let reaper = Reaper::start();
+        for _ in 0..8 {
+            let spec = UnlockedSpawnSpec {
+                program: "/no/such/binary-kat-test".into(),
+                args: vec![],
+                env: vec![("PATH".into(), PATH.into())],
+                stdin: open_devnull_fd(),
+                stdout: open_devnull_fd(),
+                stderr: open_devnull_fd(),
+                cwd_fd: open_dir_fd("/"),
+                cgroup_procs_fd: None,
+                pty: false,
+            };
+            let err = reaper.spawn_unlocked(spec).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        }
+        // Reaper continues handling ordinary spawns cleanly after failed execs.
+        let (_, rx) = reaper.spawn(&mut Command::new("/bin/true")).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
     }
 }

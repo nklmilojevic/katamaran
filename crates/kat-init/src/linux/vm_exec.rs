@@ -13,7 +13,6 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
@@ -23,7 +22,7 @@ use kat_proto::VM_EXEC_PORT;
 use kat_proto::vm_exec::{self, CHUNK, ExecSpec, Tty, VmExecMsg};
 
 use super::machines::cmd;
-use super::service::{ChildTarget, PgrpTarget, Reaper};
+use super::service::{ChildTarget, PgrpTarget, Reaper, UnlockedSpawnSpec};
 use super::sys;
 
 const DEFAULT_SHELL: &str = "/bin/sh";
@@ -59,6 +58,9 @@ const STDIN_BUF_CAP: usize = 128 << 10;
 /// guest socket writer so backpressure stays bounded without holding a socket
 /// mutex across blocking writes.
 const GUEST_OUT_QUEUE_CAP: usize = 2;
+/// Maximum queued control-reply frames (`SignalAck`) held when a peer stops
+/// reading, preventing unbounded heap growth under in-band `Signal` floods.
+const GUEST_CTRL_QUEUE_CAP: usize = 16;
 const CGROUP_PARENT: &str = "/sys/fs/cgroup/kat-vm-exec";
 
 type SharedChildHandle = Arc<Mutex<Option<ChildHandle>>>;
@@ -317,6 +319,7 @@ struct GuestWriter {
     state: Mutex<GuestWriterState>,
     cv: Condvar,
     wake_w: OwnedFd,
+    ctrl_space_w: OwnedFd,
 }
 
 impl GuestWriter {
@@ -325,13 +328,15 @@ impl GuestWriter {
         host_disconnected: Arc<AtomicBool>,
         disconnect_w: OwnedFd,
         backpressure_probe: Duration,
-    ) -> io::Result<(Arc<Self>, thread::JoinHandle<()>)> {
+    ) -> io::Result<(Arc<Self>, OwnedFd, thread::JoinHandle<()>)> {
         stream.set_nonblocking(true)?;
         let (wake_r, wake_w) = pipe_nonblock()?;
+        let (ctrl_space_r, ctrl_space_w) = pipe_nonblock()?;
         let writer = Arc::new(Self {
             state: Mutex::new(GuestWriterState::default()),
             cv: Condvar::new(),
             wake_w,
+            ctrl_space_w,
         });
         let writer_bg = writer.clone();
         let handle = thread::Builder::new()
@@ -346,7 +351,7 @@ impl GuestWriter {
                     backpressure_probe,
                 );
             })?;
-        Ok((writer, handle))
+        Ok((writer, ctrl_space_r, handle))
     }
 
     fn send_output(&self, frame: Vec<u8>) -> io::Result<()> {
@@ -363,9 +368,14 @@ impl GuestWriter {
         Ok(())
     }
 
+    fn ctrl_has_space(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        !st.closed && st.ctrl.len() < GUEST_CTRL_QUEUE_CAP
+    }
+
     fn send_ctrl(&self, frame: Vec<u8>) {
         let mut st = self.state.lock().unwrap();
-        if st.closed {
+        if st.closed || st.ctrl.len() >= GUEST_CTRL_QUEUE_CAP {
             return;
         }
         st.ctrl.push_back(frame);
@@ -416,6 +426,7 @@ impl GuestWriter {
         self.cv.notify_all();
         drop(st);
         notify_wake(&self.wake_w);
+        notify_wake(&self.ctrl_space_w);
     }
 }
 
@@ -435,20 +446,29 @@ fn guest_writer_worker(
         if out_off == out_buf.len() {
             out_buf.clear();
             out_off = 0;
-            let mut st = writer.state.lock().unwrap();
-            if st.closed {
-                return;
+            let mut wake_ctrl_space = false;
+            {
+                let mut st = writer.state.lock().unwrap();
+                if st.closed {
+                    return;
+                }
+                if let Some(frame) = st.ctrl.pop_front() {
+                    if st.ctrl.len() < GUEST_CTRL_QUEUE_CAP {
+                        wake_ctrl_space = true;
+                    }
+                    out_buf = frame;
+                } else if let Some(frame) = st.queue.pop_front() {
+                    out_buf = frame;
+                    writer.cv.notify_all();
+                } else if st.probe_pending {
+                    st.probe_pending = false;
+                    out_buf = VmExecMsg::Pong.encode();
+                } else if st.finish {
+                    return;
+                }
             }
-            if let Some(frame) = st.ctrl.pop_front() {
-                out_buf = frame;
-            } else if let Some(frame) = st.queue.pop_front() {
-                out_buf = frame;
-                writer.cv.notify_all();
-            } else if st.probe_pending {
-                st.probe_pending = false;
-                out_buf = VmExecMsg::Pong.encode();
-            } else if st.finish {
-                return;
+            if wake_ctrl_space {
+                notify_wake(&writer.ctrl_space_w);
             }
         }
 
@@ -1175,6 +1195,7 @@ fn stdin_worker(
     writer: Arc<GuestWriter>,
     cancel_r: OwnedFd,
     disconnect_r: OwnedFd,
+    ctrl_space_r: OwnedFd,
     mut stdin: Option<OwnedFd>,
     master: Option<OwnedFd>,
     tty: bool,
@@ -1193,7 +1214,8 @@ fn stdin_worker(
     let mut last_probe: Option<Instant> = None;
 
     'outer: loop {
-        let can_read = pending.len() < STDIN_BUF_CAP;
+        let ctrl_ok = writer.ctrl_has_space();
+        let can_read = pending.len() < STDIN_BUF_CAP && ctrl_ok;
         let poll_timeout_ms = if can_read {
             last_probe = None;
             -1
@@ -1237,15 +1259,24 @@ fn stdin_worker(
                 revents: 0,
             },
             libc::pollfd {
+                fd: if ctrl_ok {
+                    -1
+                } else {
+                    ctrl_space_r.as_raw_fd()
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
                 fd: stdin.as_ref().map_or(-1, AsRawFd::as_raw_fd),
                 events: libc::POLLOUT,
                 revents: 0,
             },
         ];
         let nfds = if stdin.is_some() && !pending.is_empty() {
-            4
+            5
         } else {
-            3
+            4
         };
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, poll_timeout_ms) };
         if rc < 0 {
@@ -1272,9 +1303,12 @@ fn stdin_worker(
             disconnected = true;
             break;
         }
-        if nfds == 4 && pfds[3].revents != 0 {
-            if (pfds[3].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-                && (pfds[3].revents & libc::POLLOUT) == 0
+        if pfds[3].revents != 0 {
+            drain_wake(&ctrl_space_r);
+        }
+        if nfds == 5 && pfds[4].revents != 0 {
+            if (pfds[4].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                && (pfds[4].revents & libc::POLLOUT) == 0
             {
                 stdin = None;
                 pending.clear();
@@ -1292,7 +1326,7 @@ fn stdin_worker(
         }
         if pfds[2].revents != 0 {
             if can_read {
-                while pending.len() < STDIN_BUF_CAP {
+                while pending.len() < STDIN_BUF_CAP && writer.ctrl_has_space() {
                     match frames.poll_frame(reader.as_raw_fd()) {
                         Ok(PollFrame::Msg(m)) => match m {
                             VmExecMsg::Data(d) => {
@@ -1706,7 +1740,14 @@ fn open_workdir_fd(cwd: &str) -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn build_command(spec: &ExecSpec) -> Result<(Command, String, OwnedFd), String> {
+struct BuiltCommand {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd_fd: OwnedFd,
+}
+
+fn build_command(spec: &ExecSpec) -> Result<BuiltCommand, String> {
     let cwd_fd = open_workdir_fd(&spec.cwd)?;
     for (k, v) in &spec.env {
         if !vm_exec::env_name_ok(k) {
@@ -1736,17 +1777,16 @@ fn build_command(spec: &ExecSpec) -> Result<(Command, String, OwnedFd), String> 
         (&spec.argv[0], &spec.argv[1..], false)
     };
 
-    let mut c = Command::new(program);
-    c.args(args)
-        .env_clear()
-        .env("PATH", VM_PATH)
-        .env("HOME", DEFAULT_HOME)
-        .env("USER", "root")
-        .env("LOGNAME", "root")
-        .env("SHELL", DEFAULT_SHELL)
-        .env("CHARSET", "UTF-8");
+    let mut env = vec![
+        ("PATH".into(), VM_PATH.into()),
+        ("HOME".into(), DEFAULT_HOME.into()),
+        ("USER".into(), "root".into()),
+        ("LOGNAME".into(), "root".into()),
+        ("SHELL".into(), DEFAULT_SHELL.into()),
+        ("CHARSET".into(), "UTF-8".into()),
+    ];
     if is_shell {
-        c.env("PS1", DEFAULT_PS1);
+        env.push(("PS1".into(), DEFAULT_PS1.into()));
     }
     if let Some(term) = spec
         .tty
@@ -1754,12 +1794,17 @@ fn build_command(spec: &ExecSpec) -> Result<(Command, String, OwnedFd), String> 
         .map(|t| t.term.as_str())
         .filter(|t| !t.is_empty())
     {
-        c.env("TERM", term);
+        env.push(("TERM".into(), term.into()));
     }
     for (k, v) in &spec.env {
-        c.env(k, v);
+        env.push((k.clone(), v.clone()));
     }
-    Ok((c, program.to_string(), cwd_fd))
+    Ok(BuiltCommand {
+        program: program.to_string(),
+        args: args.to_vec(),
+        env,
+        cwd_fd,
+    })
 }
 
 fn exit_code(status: i32) -> i32 {
@@ -1788,8 +1833,8 @@ fn exec_with_timeouts(
     cgroup_mode: CgroupMode<'_>,
 ) -> Result<(), String> {
     let mut conn = conn.map_err(|e| format!("clone stream: {e}"))?;
-    let (mut c, program, cwd_fd) = build_command(spec)?;
-    let cwd_raw = cwd_fd.as_raw_fd();
+    let built = build_command(spec)?;
+    let program = built.program.clone();
 
     let reader = conn.try_clone().map_err(|e| format!("clone stream: {e}"))?;
 
@@ -1810,7 +1855,6 @@ fn exec_with_timeouts(
             Err(_) => (None, None),
         },
     };
-    let procs_raw = procs_fd.as_ref().map(AsRawFd::as_raw_fd);
 
     let (handle, exited, stdin, master, out_specs) = match &spec.tty {
         Some(t) => {
@@ -1823,39 +1867,20 @@ fn exec_with_timeouts(
                 .try_clone()
                 .map_err(|e| format!("pty master dup: {e}"))?;
             let (out_wake_r, out_wake_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
-            c.stdin(Stdio::from(
-                slave.try_clone().map_err(|e| format!("pty stdin: {e}"))?,
-            ))
-            .stdout(Stdio::from(
-                slave.try_clone().map_err(|e| format!("pty stdout: {e}"))?,
-            ))
-            .stderr(Stdio::from(slave));
+            let spawn_spec = UnlockedSpawnSpec {
+                program: built.program,
+                args: built.args,
+                env: built.env,
+                stdin: slave.try_clone().map_err(|e| format!("pty stdin: {e}"))?,
+                stdout: slave.try_clone().map_err(|e| format!("pty stdout: {e}"))?,
+                stderr: slave,
+                cwd_fd: built.cwd_fd,
+                cgroup_procs_fd: procs_fd,
+                pty: true,
+            };
             let (target, pgrp, exited) = reaper
-                .spawn_pidfd_pgrp_unlocked(c, move || {
-                    if let Some(pfd) = procs_raw {
-                        let n = unsafe { libc::write(pfd, b"0\n".as_ptr().cast(), 2) };
-                        if n != 2 {
-                            return Err(if n < 0 {
-                                io::Error::last_os_error()
-                            } else {
-                                io::Error::new(
-                                    io::ErrorKind::WriteZero,
-                                    "short write to cgroup.procs",
-                                )
-                            });
-                        }
-                    }
-                    if unsafe { libc::fchdir(cwd_raw) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if unsafe { libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 } {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                })
+                .spawn_unlocked(spawn_spec)
                 .map_err(|e| format!("exec {program:?}: {e}"))?;
-            drop(cwd_fd);
-            drop(procs_fd);
             (
                 ChildHandle::Pty { target, pgrp },
                 exited,
@@ -1878,35 +1903,20 @@ fn exec_with_timeouts(
             set_nonblocking(&err_r).map_err(|e| format!("stderr nonblocking: {e}"))?;
             let (out_wake_r, out_wake_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
             let (err_wake_r, err_wake_w) = cmd::pipe().map_err(|e| format!("pipe: {e}"))?;
-            c.stdin(Stdio::from(in_r))
-                .stdout(Stdio::from(out_w))
-                .stderr(Stdio::from(err_w));
-            let (pgrp, exited) = reaper
-                .spawn_pgrp_unlocked(c, move || {
-                    if let Some(pfd) = procs_raw {
-                        let n = unsafe { libc::write(pfd, b"0\n".as_ptr().cast(), 2) };
-                        if n != 2 {
-                            return Err(if n < 0 {
-                                io::Error::last_os_error()
-                            } else {
-                                io::Error::new(
-                                    io::ErrorKind::WriteZero,
-                                    "short write to cgroup.procs",
-                                )
-                            });
-                        }
-                    }
-                    if unsafe { libc::fchdir(cwd_raw) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if unsafe { libc::setpgid(0, 0) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                })
+            let spawn_spec = UnlockedSpawnSpec {
+                program: built.program,
+                args: built.args,
+                env: built.env,
+                stdin: in_r,
+                stdout: out_w,
+                stderr: err_w,
+                cwd_fd: built.cwd_fd,
+                cgroup_procs_fd: procs_fd,
+                pty: false,
+            };
+            let (_, pgrp, exited) = reaper
+                .spawn_unlocked(spawn_spec)
                 .map_err(|e| format!("exec {program:?}: {e}"))?;
-            drop(cwd_fd);
-            drop(procs_fd);
             (
                 ChildHandle::Pipe(pgrp),
                 exited,
@@ -1952,13 +1962,13 @@ fn exec_with_timeouts(
         }
     }
 
-    let (writer, writer_thread) = match GuestWriter::start(
+    let (writer, ctrl_space_r, writer_thread) = match GuestWriter::start(
         conn,
         host_disconnected.clone(),
         disconnect_w,
         backpressure_probe,
     ) {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) => {
             log(&format!("start writer thread: {e}"));
             signal_handle(reaper, &handle, libc::SIGKILL);
@@ -1985,6 +1995,7 @@ fn exec_with_timeouts(
                 w_in,
                 stdin_cancel_r,
                 disconnect_r,
+                ctrl_space_r,
                 stdin,
                 master,
                 tty,
@@ -2117,7 +2128,7 @@ mod tests {
 
     #[test]
     fn builds_default_shell_and_exec_commands() {
-        let (cmd, prog, _cwd_fd) = build_command(&ExecSpec {
+        let built = build_command(&ExecSpec {
             cwd: "/".into(),
             env: vec![("FOO".into(), "bar".into())],
             argv: vec![],
@@ -2128,43 +2139,38 @@ mod tests {
             }),
         })
         .unwrap();
-        assert_eq!(prog, DEFAULT_SHELL);
-        assert_eq!(cmd.get_program(), DEFAULT_SHELL);
-        assert_eq!(cmd.get_args().count(), 0);
-        let envs: Vec<(String, String)> = cmd
-            .get_envs()
-            .filter_map(|(k, v)| {
-                Some((
-                    k.to_string_lossy().into_owned(),
-                    v?.to_string_lossy().into_owned(),
-                ))
-            })
-            .collect();
+        assert_eq!(built.program, DEFAULT_SHELL);
+        assert!(built.args.is_empty());
         assert!(
-            envs.iter()
+            built
+                .env
+                .iter()
                 .any(|(k, v)| k == "PATH" && v.contains("k3s/bin"))
         );
-        assert!(envs.iter().any(|(k, v)| k == "PS1" && v == DEFAULT_PS1));
         assert!(
-            envs.iter()
+            built
+                .env
+                .iter()
+                .any(|(k, v)| k == "PS1" && v == DEFAULT_PS1)
+        );
+        assert!(
+            built
+                .env
+                .iter()
                 .any(|(k, v)| k == "TERM" && v == "xterm-256color")
         );
-        assert!(envs.iter().any(|(k, v)| k == "FOO" && v == "bar"));
+        assert!(built.env.iter().any(|(k, v)| k == "FOO" && v == "bar"));
 
-        let (cmd, prog, _cwd_fd) = build_command(&ExecSpec {
+        let built = build_command(&ExecSpec {
             cwd: "/".into(),
             env: vec![],
             argv: vec!["sysctl".into(), "-n".into(), "kernel.ostype".into()],
             tty: None,
         })
         .unwrap();
-        assert_eq!(prog, "sysctl");
-        let args: Vec<_> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, vec!["-n", "kernel.ostype"]);
-        assert!(!cmd.get_envs().any(|(k, _)| k == "PS1"));
+        assert_eq!(built.program, "sysctl");
+        assert_eq!(built.args, vec!["-n", "kernel.ostype"]);
+        assert!(!built.env.iter().any(|(k, _)| k == "PS1"));
     }
 
     #[test]
@@ -2554,7 +2560,7 @@ mod tests {
         shrink_pair(&host, &guest, 8192);
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) =
+        let (writer, _ctrl_space_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let payload = vec![b'A'; 48 << 10];
@@ -2615,7 +2621,7 @@ mod tests {
         shrink_pair(&host, &guest, 4096);
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) =
+        let (writer, _ctrl_space_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let writer_clone = writer.clone();
@@ -2689,7 +2695,7 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) =
+        let (writer, _ctrl_space_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
 
         let mut wf = std::fs::File::from(w_pipe);
@@ -2728,7 +2734,7 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) =
+        let (writer, _ctrl_space_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(50)).unwrap();
         let stop_spam = Arc::new(AtomicBool::new(false));
         let stop_spam_w = stop_spam.clone();
@@ -3010,7 +3016,7 @@ mod tests {
         let (host, guest) = UnixStream::pair().unwrap();
         let disc = Arc::new(AtomicBool::new(false));
         let (_disc_r, disc_w) = pipe_nonblock().unwrap();
-        let (writer, writer_thread) =
+        let (writer, _ctrl_space_r, writer_thread) =
             GuestWriter::start(guest, disc.clone(), disc_w, Duration::from_millis(40)).unwrap();
 
         // Simulate leader exit handing disconnect monitoring to the writer
@@ -3022,6 +3028,29 @@ mod tests {
         assert!(disc.load(Ordering::Acquire));
         assert!(t.elapsed() < Duration::from_secs(2));
         drop(host);
+    }
+
+    #[test]
+    fn ctrl_queue_is_bounded_when_peer_stops_reading() {
+        let (_host, guest) = UnixStream::pair().unwrap();
+        let disc = Arc::new(AtomicBool::new(false));
+        let (_disc_r, disc_w) = pipe_nonblock().unwrap();
+        let (writer, _ctrl_space_r, writer_thread) =
+            GuestWriter::start(guest, disc, disc_w, Duration::from_millis(50)).unwrap();
+
+        // Enqueue far more SignalAck frames than GUEST_CTRL_QUEUE_CAP while
+        // the peer never reads; the control queue must stay bounded.
+        for _ in 0..(GUEST_CTRL_QUEUE_CAP * 8) {
+            writer.send_ctrl(VmExecMsg::SignalAck.encode());
+        }
+        let queued = writer.state.lock().unwrap().ctrl.len();
+        assert!(
+            queued <= GUEST_CTRL_QUEUE_CAP,
+            "ctrl queue grew beyond cap ({queued} > {GUEST_CTRL_QUEUE_CAP})"
+        );
+
+        writer.abort();
+        writer_thread.join().unwrap();
     }
 
     #[test]

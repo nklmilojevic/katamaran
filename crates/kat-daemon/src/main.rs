@@ -74,6 +74,9 @@ enum Command {
     /// Open a root shell or run commands inside the Linux VM itself.
     #[command(subcommand)]
     Vm(vm_cli::VmCmd),
+    /// Internal ordered blocking-output relay helper for `kat vm shell`/`exec`.
+    #[command(hide = true)]
+    VmIoRelay,
     /// Open a shell (or run a command) in a Linux machine.
     Shell(machine_cli::ShellArgs),
     /// SSH into a Linux machine through the katamaran SSH config.
@@ -95,6 +98,11 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Fast-path the internal ordered I/O relay helper before clap parsing so
+    // it adds minimal startup overhead and never touches stdout/stderr (0/1/2).
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("vm-io-relay")) {
+        vm_cli::run_io_relay_helper();
+    }
     match Cli::parse().command {
         Command::Start(args) => cli::start(args),
         Command::Stop => cli::stop(),
@@ -109,6 +117,7 @@ fn main() -> anyhow::Result<()> {
         Command::Machine(cmd) => machine_cli::machine(cmd),
         Command::K8s(cmd) => k8s_cli::run(cmd),
         Command::Vm(cmd) => vm_cli::run(cmd),
+        Command::VmIoRelay => vm_cli::run_io_relay_helper(),
         Command::Shell(args) => machine_cli::shell(args),
         Command::Ssh(args) => machine_cli::ssh(args),
         Command::SshProxy => ssh::proxy(),

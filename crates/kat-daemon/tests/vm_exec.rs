@@ -825,3 +825,90 @@ fn non_pty_sigterm_restores_shared_pipe_flags_in_subprocess() {
     drop(err_w);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Exercise the real `katamaran vm exec` binary (and its hidden `vm-io-relay`
+/// helper) with distinct dup'd stdout/stderr descriptors (`2>&1`) on a blocking
+/// pipe, verifying exact frame ordering and untouched `O_NONBLOCK` flags.
+#[test]
+fn merged_stdout_and_stderr_preserve_order_in_subprocess() {
+    use kat_proto::vm_exec::{self, VmExecMsg};
+    use std::os::unix::net::UnixListener;
+
+    let dir = PathBuf::from(format!("/tmp/kve-merged-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run_dir = dir.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let sock = run_dir.join("vm-exec.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let mut expected = Vec::new();
+    let mut frames = Vec::new();
+    for i in 0..80u32 {
+        let o = format!("OUT-{i:03}\n");
+        let e = format!("ERR-{i:03}\n");
+        expected.extend_from_slice(o.as_bytes());
+        expected.extend_from_slice(e.as_bytes());
+        frames.push(VmExecMsg::Stdout(o.into_bytes()));
+        frames.push(VmExecMsg::Stderr(e.into_bytes()));
+    }
+
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        assert_eq!(vm_exec::read(&mut conn).unwrap(), Some(VmExecMsg::Ping));
+        vm_exec::write(&mut conn, &VmExecMsg::Pong).unwrap();
+        assert!(matches!(
+            vm_exec::read(&mut conn).unwrap(),
+            Some(VmExecMsg::Exec(_))
+        ));
+        vm_exec::write(&mut conn, &VmExecMsg::Started { token: [2; 16] }).unwrap();
+        for f in frames {
+            vm_exec::write(&mut conn, &f).unwrap();
+        }
+        vm_exec::write(&mut conn, &VmExecMsg::Exit { code: 0 }).unwrap();
+    });
+
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (merged_r, merged_w) = unsafe {
+        let r = OwnedFd::from_raw_fd(fds[0]);
+        let w = OwnedFd::from_raw_fd(fds[1]);
+        libc::fcntl(r.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(w.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        (r, w)
+    };
+    let out_child = merged_w.try_clone().unwrap();
+    let err_child = merged_w.try_clone().unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_katamaran"));
+    cmd.args(["vm", "exec", "--", "true"])
+        .env("KATAMARAN_HOME", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_child))
+        .stderr(Stdio::from(err_child));
+    let mut child = ChildGuard::new(cmd.spawn().expect("spawn katamaran vm exec"));
+    drop(cmd);
+    drop(merged_w);
+
+    let reader = thread::spawn(move || {
+        let mut f = std::fs::File::from(merged_r);
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "katamaran vm exec did not exit promptly"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "expected exit 0, got {status}");
+    assert_eq!(reader.join().unwrap(), expected);
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -2,6 +2,7 @@
 //! the Linux VM's own namespaces (not an LXC machine), relayed over
 //! `<home>/run/vm-exec.sock` (see [`kat_proto::vm_exec`]).
 
+use std::ffi::CString;
 #[cfg(test)]
 use std::io::Write;
 use std::io::{self, IsTerminal};
@@ -203,19 +204,214 @@ impl Drop for RawMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HelperFinish {
+const RELAY_DEST_STDOUT: u8 = 1;
+const RELAY_DEST_STDERR: u8 = 2;
+
+#[derive(Debug)]
+enum RelayFinish {
     Drained,
     BrokenPipe,
+    Error(io::Error),
     Cancelled,
 }
 
-fn dup_ge3(fd: RawFd) -> io::Result<OwnedFd> {
-    let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+fn dup_ge(fd: RawFd, min_fd: RawFd) -> io::Result<OwnedFd> {
+    let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min_fd) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+fn needs_blocking_relay(fd: RawFd) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 || (fl & libc::O_NONBLOCK) != 0 {
+        return false;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    !(unsafe { libc::fstat(fd, &mut st) } == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+/// Entrypoint for the hidden `katamaran vm-io-relay` helper process.
+///
+/// Reads destination-tagged frames from fd 3 and writes them in strict FIFO
+/// order to inherited stdout (fd 4) or stderr (fd 5), reporting any write
+/// `errno` on fd 6 before exiting. Never touches fds 0/1/2 (`/dev/null`).
+pub fn run_io_relay_helper() -> ! {
+    let code = run_output_relay_fds(3, 4, 5, 6);
+    unsafe { libc::_exit(code) }
+}
+
+fn relay_read_exact(fd: RawFd, buf: &mut [u8]) -> io::Result<bool> {
+    let mut off = 0usize;
+    while off < buf.len() {
+        let rc = unsafe { libc::read(fd, buf[off..].as_mut_ptr().cast(), buf.len() - off) };
+        if rc > 0 {
+            off += rc as usize;
+        } else if rc == 0 {
+            return Ok(false);
+        } else {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+    }
+    Ok(true)
+}
+
+fn relay_write_all(fd: RawFd, data: &[u8]) -> Result<(), libc::c_int> {
+    let mut off = 0usize;
+    while off < data.len() {
+        let rc = unsafe { libc::write(fd, data[off..].as_ptr().cast(), data.len() - off) };
+        if rc > 0 {
+            off += rc as usize;
+            continue;
+        }
+        if rc == 0 {
+            return Err(libc::EPIPE);
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                // Support callers where one of stdout/stderr was already
+                // O_NONBLOCK while the other was blocking.
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let prc = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if prc < 0 {
+                    let pe = io::Error::last_os_error();
+                    if pe.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(pe.raw_os_error().unwrap_or(libc::EIO));
+                }
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                    && (pfd.revents & libc::POLLOUT) == 0
+                {
+                    return Err(libc::EPIPE);
+                }
+            }
+            _ => return Err(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+    Ok(())
+}
+
+fn report_relay_errno(status_fd: RawFd, errno: libc::c_int) {
+    let bytes = errno.to_le_bytes();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let rc = unsafe { libc::write(status_fd, bytes[off..].as_ptr().cast(), bytes.len() - off) };
+        if rc > 0 {
+            off += rc as usize;
+        } else if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+fn run_output_relay_fds(in_fd: RawFd, out_fd: RawFd, err_fd: RawFd, status_fd: RawFd) -> i32 {
+    // Ignore SIGPIPE so downstream broken pipes return EPIPE explicitly and
+    // can be reported over `status_fd`.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    let mut hdr = [0u8; 5];
+    let mut buf = Vec::new();
+    loop {
+        match relay_read_exact(in_fd, &mut hdr) {
+            Ok(true) => {}
+            Ok(false) => return 0,
+            Err(_) => return 1,
+        }
+        let target = match hdr[0] {
+            RELAY_DEST_STDOUT => out_fd,
+            RELAY_DEST_STDERR => err_fd,
+            _ => return 1,
+        };
+        let len = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        if len > kat_proto::MAX_FRAME {
+            return 1;
+        }
+        buf.resize(len, 0);
+        match relay_read_exact(in_fd, &mut buf) {
+            Ok(true) => {}
+            Ok(false) => return 0,
+            Err(_) => return 1,
+        }
+        if let Err(errno) = relay_write_all(target, &buf) {
+            report_relay_errno(status_fd, errno);
+            return 1;
+        }
+    }
+}
+
+struct SpawnActionsGuard(libc::posix_spawn_file_actions_t);
+impl Drop for SpawnActionsGuard {
+    fn drop(&mut self) {
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
+    }
+}
+
+struct SpawnAttrGuard(libc::posix_spawnattr_t);
+impl Drop for SpawnAttrGuard {
+    fn drop(&mut self) {
+        unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
+    }
+}
+
+fn init_helper_spawn_attr(reset_sigpipe: bool) -> io::Result<SpawnAttrGuard> {
+    let mut attr_raw: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::posix_spawnattr_init(&mut attr_raw) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    let mut attr = SpawnAttrGuard(attr_raw);
+
+    let mut sigmask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut sigmask);
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM] {
+            libc::sigaddset(&mut sigmask, sig);
+        }
+    }
+    let mut flags: libc::c_short = libc::POSIX_SPAWN_SETSIGMASK as libc::c_short;
+    #[cfg(target_os = "macos")]
+    {
+        flags |= libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short;
+    }
+    if reset_sigpipe {
+        let mut sigdef: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sigdef);
+            libc::sigaddset(&mut sigdef, libc::SIGPIPE);
+        }
+        flags |= libc::POSIX_SPAWN_SETSIGDEF as libc::c_short;
+        let rc = unsafe { libc::posix_spawnattr_setsigdefault(&mut attr.0, &sigdef) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    for rc in [
+        unsafe { libc::posix_spawnattr_setsigmask(&mut attr.0, &sigmask) },
+        unsafe { libc::posix_spawnattr_setflags(&mut attr.0, flags) },
+    ] {
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    Ok(attr)
 }
 
 struct HelperProc {
@@ -224,35 +420,18 @@ struct HelperProc {
 
 impl HelperProc {
     /// Spawn `/bin/cat` via `posix_spawn` with `stdin_fd -> 0`, `stdout_fd -> 1`,
-    /// `/dev/null -> 2`, `POSIX_SPAWN_CLOEXEC_DEFAULT` (so no unrelated fd from
-    /// any concurrent thread can leak into the helper), `[SIGINT, SIGQUIT,
-    /// SIGHUP, SIGTERM]` blocked (preventing spurious terminal-signal EOF while
-    /// `SIGKILL` still terminates immediately), and `SIGPIPE` reset to `SIG_DFL`.
+    /// `/dev/null -> 2`, `POSIX_SPAWN_CLOEXEC_DEFAULT`, `[SIGINT, SIGQUIT,
+    /// SIGHUP, SIGTERM]` blocked, and `SIGPIPE` reset to `SIG_DFL`.
     fn spawn_cat(stdin_fd: RawFd, stdout_fd: RawFd) -> io::Result<Self> {
-        // Duplicate both source fds to >= 3 so `dup2(..., 0)` and `dup2(..., 1)`
-        // can never clobber each other even if fd 0/1/2 was closed by caller.
-        let in_dup = dup_ge3(stdin_fd)?;
-        let out_dup = dup_ge3(stdout_fd)?;
-
-        struct ActionsGuard(libc::posix_spawn_file_actions_t);
-        impl Drop for ActionsGuard {
-            fn drop(&mut self) {
-                unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
-            }
-        }
-        struct AttrGuard(libc::posix_spawnattr_t);
-        impl Drop for AttrGuard {
-            fn drop(&mut self) {
-                unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
-            }
-        }
+        let in_dup = dup_ge(stdin_fd, 3)?;
+        let out_dup = dup_ge(stdout_fd, 3)?;
 
         let mut actions_raw: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::posix_spawn_file_actions_init(&mut actions_raw) };
         if rc != 0 {
             return Err(io::Error::from_raw_os_error(rc));
         }
-        let mut actions = ActionsGuard(actions_raw);
+        let mut actions = SpawnActionsGuard(actions_raw);
 
         for rc in [
             unsafe {
@@ -276,39 +455,7 @@ impl HelperProc {
             }
         }
 
-        let mut attr_raw: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::posix_spawnattr_init(&mut attr_raw) };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-        let mut attr = AttrGuard(attr_raw);
-
-        let mut sigmask: libc::sigset_t = unsafe { std::mem::zeroed() };
-        let mut sigdef: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigemptyset(&mut sigmask);
-            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM] {
-                libc::sigaddset(&mut sigmask, sig);
-            }
-            libc::sigemptyset(&mut sigdef);
-            libc::sigaddset(&mut sigdef, libc::SIGPIPE);
-        }
-        let mut flags: libc::c_short =
-            (libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF) as libc::c_short;
-        #[cfg(target_os = "macos")]
-        {
-            flags |= libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short;
-        }
-        for rc in [
-            unsafe { libc::posix_spawnattr_setsigmask(&mut attr.0, &sigmask) },
-            unsafe { libc::posix_spawnattr_setsigdefault(&mut attr.0, &sigdef) },
-            unsafe { libc::posix_spawnattr_setflags(&mut attr.0, flags) },
-        ] {
-            if rc != 0 {
-                return Err(io::Error::from_raw_os_error(rc));
-            }
-        }
-
+        let attr = init_helper_spawn_attr(true)?;
         let mut pid: libc::pid_t = 0;
         let mut argv = [c"/bin/cat".as_ptr().cast_mut(), std::ptr::null_mut()];
         let mut envp: [*mut libc::c_char; 1] = [std::ptr::null_mut()];
@@ -328,26 +475,151 @@ impl HelperProc {
         Ok(Self { pid: Some(pid) })
     }
 
-    fn try_wait(&mut self) -> io::Result<Option<libc::c_int>> {
-        let Some(pid) = self.pid else {
-            return Ok(Some(0));
+    /// Spawn the single ordered output relay helper via `posix_spawn` with
+    /// `0/1/2 -> /dev/null`, `3 -> cmd_r`, `4 -> out_fd` (or `/dev/null`),
+    /// `5 -> err_fd` (or `/dev/null`), `6 -> status_w`, and
+    /// `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+    fn spawn_output_relay(
+        cmd_r: RawFd,
+        out_fd: Option<RawFd>,
+        err_fd: Option<RawFd>,
+        status_w: RawFd,
+    ) -> io::Result<Self> {
+        let exe = std::env::current_exe()?;
+        let exe_c = CString::new(exe.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in executable path"))?;
+
+        // Relocate every source descriptor to >= 7 so target fds 0..=6 never collide.
+        let in_dup = dup_ge(cmd_r, 7)?;
+        let out_dup = match out_fd.filter(|&fd| fd >= 0) {
+            Some(fd) => Some(dup_ge(fd, 7)?),
+            None => None,
         };
+        let err_dup = match err_fd.filter(|&fd| fd >= 0) {
+            Some(fd) => Some(dup_ge(fd, 7)?),
+            None => None,
+        };
+        let status_dup = dup_ge(status_w, 7)?;
+
+        let mut actions_raw: libc::posix_spawn_file_actions_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::posix_spawn_file_actions_init(&mut actions_raw) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        let mut actions = SpawnActionsGuard(actions_raw);
+
+        let add_devnull = |actions: &mut libc::posix_spawn_file_actions_t,
+                           dst: RawFd,
+                           flags: libc::c_int|
+         -> libc::c_int {
+            unsafe {
+                libc::posix_spawn_file_actions_addopen(
+                    actions,
+                    dst,
+                    c"/dev/null".as_ptr(),
+                    flags,
+                    0,
+                )
+            }
+        };
+
+        for rc in [
+            add_devnull(&mut actions.0, 0, libc::O_RDONLY),
+            add_devnull(&mut actions.0, 1, libc::O_WRONLY),
+            add_devnull(&mut actions.0, 2, libc::O_WRONLY),
+            unsafe {
+                libc::posix_spawn_file_actions_adddup2(&mut actions.0, in_dup.as_raw_fd(), 3)
+            },
+            match &out_dup {
+                Some(fd) => unsafe {
+                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, fd.as_raw_fd(), 4)
+                },
+                None => add_devnull(&mut actions.0, 4, libc::O_WRONLY),
+            },
+            match &err_dup {
+                Some(fd) => unsafe {
+                    libc::posix_spawn_file_actions_adddup2(&mut actions.0, fd.as_raw_fd(), 5)
+                },
+                None => add_devnull(&mut actions.0, 5, libc::O_WRONLY),
+            },
+            unsafe {
+                libc::posix_spawn_file_actions_adddup2(&mut actions.0, status_dup.as_raw_fd(), 6)
+            },
+        ] {
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+        }
+
+        let attr = init_helper_spawn_attr(false)?;
+        let mut pid: libc::pid_t = 0;
+
+        #[cfg(not(test))]
+        let rc = {
+            let mut argv = [
+                exe_c.as_ptr().cast_mut(),
+                c"vm-io-relay".as_ptr().cast_mut(),
+                std::ptr::null_mut(),
+            ];
+            let mut envp: [*mut libc::c_char; 1] = [std::ptr::null_mut()];
+            unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    exe_c.as_ptr(),
+                    &actions.0,
+                    &attr.0,
+                    argv.as_mut_ptr(),
+                    envp.as_mut_ptr(),
+                )
+            }
+        };
+
+        #[cfg(test)]
+        let rc = {
+            let mut argv = [
+                exe_c.as_ptr().cast_mut(),
+                c"--exact".as_ptr().cast_mut(),
+                c"vm_cli::tests::io_relay_helper_entrypoint"
+                    .as_ptr()
+                    .cast_mut(),
+                c"--ignored".as_ptr().cast_mut(),
+                c"--nocapture".as_ptr().cast_mut(),
+                c"--test-threads=1".as_ptr().cast_mut(),
+                std::ptr::null_mut(),
+            ];
+            let mut envp = [
+                c"KATAMARAN_TEST_IO_RELAY=1".as_ptr().cast_mut(),
+                std::ptr::null_mut(),
+            ];
+            unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    exe_c.as_ptr(),
+                    &actions.0,
+                    &attr.0,
+                    argv.as_mut_ptr(),
+                    envp.as_mut_ptr(),
+                )
+            }
+        };
+
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        Ok(Self { pid: Some(pid) })
+    }
+
+    fn wait(&mut self) -> Option<libc::c_int> {
+        let pid = self.pid.take()?;
         let mut status: libc::c_int = 0;
         loop {
-            let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if rc == 0 {
-                return Ok(None);
-            }
+            let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
             if rc > 0 {
-                self.pid = None;
-                return Ok(Some(status));
+                return Some(status);
             }
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return None;
             }
-            self.pid = None;
-            return Err(e);
         }
     }
 
@@ -373,95 +645,259 @@ impl Drop for HelperProc {
     }
 }
 
-/// Relays output written to a private nonblocking pipe into an inherited
-/// blocking output fd via a dedicated `/bin/cat` helper process so
-/// `run_session_io` NEVER sets `O_NONBLOCK` on any inherited descriptor (even
-/// when `stdin` and `stdout`/`stderr` share the same open file description,
-/// such as an interactive TTY or full-duplex socketpair), yet output writes
-/// remain immediately cancellable on termination signals.
-struct OutputHelper {
+/// Single ordered output relay helper for blocking inherited stdout/stderr fds.
+///
+/// Receives destination-tagged frames over one private nonblocking pipe and
+/// writes them to inherited stdout and stderr in exact guest frame order
+/// without ever setting `O_NONBLOCK` on any inherited descriptor (preserving
+/// blocking semantics even when `stdin`, `stdout`, and `stderr` share an open
+/// file description, and preserving byte order when `2>&1` merges streams onto
+/// distinct descriptor numbers). Also exposes a pollable `status_r` pipe that
+/// wakes the session immediately if a downstream reader closes (`EPIPE`) even
+/// when the guest produces no further output.
+struct OutputRelay {
     proc: HelperProc,
-    write_end: Option<OwnedFd>,
+    cmd_w: Option<OwnedFd>,
+    status_r: OwnedFd,
+    handles_out: bool,
+    handles_err: bool,
 }
 
-impl OutputHelper {
-    fn maybe_spawn(out_fd: RawFd) -> io::Result<Option<Self>> {
-        if out_fd < 0 {
+impl OutputRelay {
+    fn maybe_spawn(out_fd: Option<RawFd>, err_fd: Option<RawFd>) -> io::Result<Option<Self>> {
+        let need_out = out_fd.is_some_and(needs_blocking_relay);
+        let need_err = err_fd.is_some_and(needs_blocking_relay);
+        if !need_out && !need_err {
             return Ok(None);
         }
-        let fl = unsafe { libc::fcntl(out_fd, libc::F_GETFL) };
-        if fl < 0 || (fl & libc::O_NONBLOCK) != 0 {
-            return Ok(None);
-        }
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(out_fd, &mut st) } == 0
-            && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
-        {
-            // Regular file writes do not block on pipes/sockets; no helper needed.
-            return Ok(None);
-        }
-        let (read_end, write_end) = pipe_cloexec(false)?;
+        let (cmd_r, cmd_w) = pipe_cloexec(false)?;
         unsafe {
-            let wfl = libc::fcntl(write_end.as_raw_fd(), libc::F_GETFL);
-            if wfl < 0
-                || libc::fcntl(write_end.as_raw_fd(), libc::F_SETFL, wfl | libc::O_NONBLOCK) < 0
+            let wfl = libc::fcntl(cmd_w.as_raw_fd(), libc::F_GETFL);
+            if wfl < 0 || libc::fcntl(cmd_w.as_raw_fd(), libc::F_SETFL, wfl | libc::O_NONBLOCK) < 0
             {
                 return Err(io::Error::last_os_error());
             }
         }
-        let proc = HelperProc::spawn_cat(read_end.as_raw_fd(), out_fd)?;
-        drop(read_end);
+        let (status_r, status_w) = pipe_cloexec(false)?;
+        let proc = HelperProc::spawn_output_relay(
+            cmd_r.as_raw_fd(),
+            out_fd,
+            err_fd,
+            status_w.as_raw_fd(),
+        )?;
+        drop(cmd_r);
+        drop(status_w);
         Ok(Some(Self {
             proc,
-            write_end: Some(write_end),
+            cmd_w: Some(cmd_w),
+            status_r,
+            handles_out: out_fd.is_some(),
+            handles_err: err_fd.is_some(),
         }))
     }
 
-    fn as_raw_fd(&self) -> RawFd {
-        self.write_end
-            .as_ref()
-            .expect("OutputHelper already closed")
-            .as_raw_fd()
+    fn status_fd(&self) -> RawFd {
+        self.status_r.as_raw_fd()
     }
 
-    /// Close `write_end` and wait for `/bin/cat` to flush buffered output to
-    /// the inherited descriptor, aborting immediately if `term_wake_r` fires.
-    fn finish(&mut self, term_wake_r: RawFd) -> HelperFinish {
-        self.write_end.take();
-        let mut wait_ms = 1i32;
-        loop {
-            match self.proc.try_wait() {
-                Ok(Some(status)) => {
-                    return if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-                        HelperFinish::Drained
-                    } else {
-                        HelperFinish::BrokenPipe
+    /// Read an optional 4-byte `errno` reported on `status_r`. Returns `None`
+    /// on clean EOF (0 bytes).
+    fn read_status_errno(&self) -> Option<libc::c_int> {
+        let mut buf = [0u8; 4];
+        let mut off = 0usize;
+        while off < buf.len() {
+            let rc = unsafe {
+                libc::read(
+                    self.status_r.as_raw_fd(),
+                    buf[off..].as_mut_ptr().cast(),
+                    buf.len() - off,
+                )
+            };
+            if rc > 0 {
+                off += rc as usize;
+            } else if rc == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        if off == 4 {
+            Some(i32::from_le_bytes(buf))
+        } else {
+            None
+        }
+    }
+
+    /// Interpret a `status_r` wakeup during an active session (before `cmd_w`
+    /// has been closed) as either `LocalBrokenPipe` or `LocalError`.
+    fn classify_active_failure(&self) -> RelayOutcome {
+        match self.read_status_errno() {
+            None | Some(libc::EPIPE) => RelayOutcome::LocalBrokenPipe,
+            Some(errno) => RelayOutcome::LocalError(io::Error::from_raw_os_error(errno)),
+        }
+    }
+
+    fn write_slice_cancellable(
+        &self,
+        data: &[u8],
+        term_wake_r: Option<RawFd>,
+    ) -> io::Result<WriteOutcome> {
+        let fd = self
+            .cmd_w
+            .as_ref()
+            .expect("OutputRelay already closed")
+            .as_raw_fd();
+        let status_fd = self.status_r.as_raw_fd();
+        let mut offset = 0usize;
+        while offset < data.len() {
+            if term_wake_r.is_some_and(fd_ready) {
+                return Ok(WriteOutcome::Cancelled);
+            }
+            if fd_ready(status_fd) {
+                return match self.read_status_errno() {
+                    None | Some(libc::EPIPE) => Ok(WriteOutcome::BrokenPipe),
+                    Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                };
+            }
+            let rc =
+                unsafe { libc::write(fd, data[offset..].as_ptr().cast(), data.len() - offset) };
+            if rc > 0 {
+                offset += rc as usize;
+                continue;
+            }
+            if rc == 0 {
+                return Ok(WriteOutcome::BrokenPipe);
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::BrokenPipe => {
+                    return match self.read_status_errno() {
+                        None | Some(libc::EPIPE) => Ok(WriteOutcome::BrokenPipe),
+                        Some(errno) => Err(io::Error::from_raw_os_error(errno)),
                     };
                 }
-                Ok(None) => {}
-                Err(_) => return HelperFinish::Drained,
+                io::ErrorKind::WouldBlock => {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd,
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: status_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: term_wake_r.unwrap_or(-1),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    let nfds = if term_wake_r.is_some() { 3 } else { 2 };
+                    let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+                    if prc < 0 {
+                        let pe = io::Error::last_os_error();
+                        if pe.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(pe);
+                    }
+                    if nfds == 3 && pfds[2].revents != 0 {
+                        return Ok(WriteOutcome::Cancelled);
+                    }
+                    if pfds[1].revents != 0 {
+                        return match self.read_status_errno() {
+                            None | Some(libc::EPIPE) => Ok(WriteOutcome::BrokenPipe),
+                            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                        };
+                    }
+                    if (pfds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                        && (pfds[0].revents & libc::POLLOUT) == 0
+                    {
+                        return match self.read_status_errno() {
+                            None | Some(libc::EPIPE) => Ok(WriteOutcome::BrokenPipe),
+                            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                        };
+                    }
+                }
+                _ => return Err(e),
             }
-            let mut pfd = libc::pollfd {
-                fd: term_wake_r,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
-            if rc > 0 && pfd.revents != 0 {
+        }
+        Ok(WriteOutcome::Written)
+    }
+
+    fn write_frame_cancellable(
+        &self,
+        dest: u8,
+        data: &[u8],
+        term_wake_r: Option<RawFd>,
+    ) -> io::Result<WriteOutcome> {
+        if data.is_empty() {
+            return Ok(WriteOutcome::Written);
+        }
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        let hdr = [dest, len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]];
+        match self.write_slice_cancellable(&hdr, term_wake_r)? {
+            WriteOutcome::Written => self.write_slice_cancellable(data, term_wake_r),
+            other => Ok(other),
+        }
+    }
+
+    /// Close `cmd_w` and wait for the ordered relay helper to drain all
+    /// already-queued frames, aborting immediately if `term_wake_r` fires.
+    fn finish(&mut self, term_wake_r: RawFd) -> RelayFinish {
+        self.cmd_w.take();
+        loop {
+            let mut pfds = [
+                libc::pollfd {
+                    fd: self.status_r.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: term_wake_r,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+            if rc < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 self.proc.kill_and_wait();
-                return HelperFinish::Cancelled;
+                return RelayFinish::Drained;
             }
-            wait_ms = (wait_ms * 2).min(20);
+            if pfds[1].revents != 0 {
+                self.proc.kill_and_wait();
+                return RelayFinish::Cancelled;
+            }
+            if pfds[0].revents != 0 {
+                let err = self.read_status_errno();
+                let status = self.proc.wait();
+                return match err {
+                    Some(libc::EPIPE) => RelayFinish::BrokenPipe,
+                    Some(errno) => RelayFinish::Error(io::Error::from_raw_os_error(errno)),
+                    None => {
+                        if status.is_none_or(|st| libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0)
+                        {
+                            RelayFinish::Drained
+                        } else {
+                            RelayFinish::BrokenPipe
+                        }
+                    }
+                };
+            }
         }
     }
 
     fn abort(&mut self) {
-        self.write_end.take();
+        self.cmd_w.take();
         self.proc.kill_and_wait();
     }
 }
 
-impl Drop for OutputHelper {
+impl Drop for OutputRelay {
     fn drop(&mut self) {
         self.abort();
     }
@@ -479,18 +915,7 @@ struct StdinHelper {
 
 impl StdinHelper {
     fn maybe_spawn(stdin_fd: RawFd) -> io::Result<Option<Self>> {
-        if stdin_fd < 0 {
-            return Ok(None);
-        }
-        let fl = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-        if fl < 0 || (fl & libc::O_NONBLOCK) != 0 {
-            return Ok(None);
-        }
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(stdin_fd, &mut st) } == 0
-            && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
-        {
-            // Regular file reads never block; no helper needed.
+        if !needs_blocking_relay(stdin_fd) {
             return Ok(None);
         }
         let (read_end, write_end) = pipe_cloexec(false)?;
@@ -1597,14 +2022,22 @@ enum ReadOutcome {
     Msg(VmExecMsg),
     Eof,
     Cancelled,
+    RelayFailed,
 }
 
 fn read_frame_cancellable(
     conn: &UnixStream,
     frames: &mut FrameReader,
     term_wake_r: Option<RawFd>,
+    relay_status_r: Option<RawFd>,
 ) -> io::Result<ReadOutcome> {
     loop {
+        if term_wake_r.is_some_and(fd_ready) {
+            return Ok(ReadOutcome::Cancelled);
+        }
+        if relay_status_r.is_some_and(fd_ready) {
+            return Ok(ReadOutcome::RelayFailed);
+        }
         match frames.poll_frame(conn.as_raw_fd())? {
             PollFrame::Msg(m) => return Ok(ReadOutcome::Msg(m)),
             PollFrame::Eof => return Ok(ReadOutcome::Eof),
@@ -1617,13 +2050,38 @@ fn read_frame_cancellable(
                 revents: 0,
             },
             libc::pollfd {
-                fd: term_wake_r.unwrap_or(-1),
-                events: libc::POLLIN,
+                fd: -1,
+                events: 0,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: -1,
+                events: 0,
                 revents: 0,
             },
         ];
-        let nfds = if term_wake_r.is_some() { 2 } else { 1 };
-        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+        let mut nfds = 1usize;
+        let term_idx = term_wake_r.map(|fd| {
+            let i = nfds;
+            pfds[i] = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+            i
+        });
+        let relay_idx = relay_status_r.map(|fd| {
+            let i = nfds;
+            pfds[i] = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+            i
+        });
+        let prc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, -1) };
         if prc < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -1631,10 +2089,28 @@ fn read_frame_cancellable(
             }
             return Err(e);
         }
-        if nfds == 2 && pfds[1].revents != 0 {
+        if let Some(i) = term_idx
+            && pfds[i].revents != 0
+        {
             return Ok(ReadOutcome::Cancelled);
         }
+        if let Some(i) = relay_idx
+            && pfds[i].revents != 0
+        {
+            return Ok(ReadOutcome::RelayFailed);
+        }
     }
+}
+
+/// Distinguishes guest-side exits and disconnects (where already-received
+/// buffered output must still be drained) from local output failures and
+/// signal cancellations.
+enum RelayOutcome {
+    GuestExit(i32),
+    GuestError(anyhow::Error),
+    LocalBrokenPipe,
+    LocalError(io::Error),
+    Cancelled,
 }
 
 /// Relay stdio for an already-`Started` VM exec session; returns how the
@@ -1697,10 +2173,10 @@ fn run_session_io(
     let raw_active = raw.is_some();
 
     // NEVER call `F_SETFL(O_NONBLOCK)` on any inherited stdio descriptor
-    // (`stdin`, `stdout`, or `stderr`) because inherited descriptors frequently
-    // share an open file description (e.g. an interactive TTY, socketpair, or
-    // `2>&1`). Relay blocking stdin and blocking output sinks through private
-    // nonblocking pipes backed by `/bin/cat` helpers instead.
+    // (`stdin`, `stdout`, or `stderr`). Relay blocking stdin via `StdinHelper`
+    // and blocking stdout/stderr through ONE ordered `OutputRelay` helper so
+    // merged `2>&1` pipes keep exact guest frame order and downstream `EPIPE`
+    // wakes the session promptly.
     let stdin_helper = StdinHelper::maybe_spawn(stdin_fd)?;
     let worker_stdin_fd = stdin_helper
         .as_ref()
@@ -1720,19 +2196,7 @@ fn run_session_io(
         #[cfg(not(test))]
         OutputSink::_Marker(_) => None,
     };
-    let mut out_helper = match out_raw_fd {
-        Some(fd) => OutputHelper::maybe_spawn(fd)?,
-        None => None,
-    };
-    let share_out_helper = out_raw_fd.is_some() && out_raw_fd == err_raw_fd && out_helper.is_some();
-    let mut err_helper = if share_out_helper {
-        None
-    } else {
-        match err_raw_fd {
-            Some(fd) => OutputHelper::maybe_spawn(fd)?,
-            None => None,
-        }
-    };
+    let mut output_relay = OutputRelay::maybe_spawn(out_raw_fd, err_raw_fd)?;
 
     // macOS XNU ignores MSG_DONTWAIT on AF_UNIX SOCK_STREAM sends; put the
     // shared socket open file description in nonblocking mode so writer_worker
@@ -1777,17 +2241,12 @@ fn run_session_io(
                 }
                 let sig = i32::from(b[0]);
                 if raw_active || sig != libc::SIGINT {
-                    // Cancel lock-free: wake relay_output (both reads and
-                    // blocked output writes) and unblock any socket writes so
-                    // RawMode restores before re-raise.
                     let _ =
                         terminated_by.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire);
                     let _ = shutdown_sock.shutdown(Shutdown::Both);
                     notify_wake(&term_wake_w);
                     return;
                 }
-                // Non-raw SIGINT: a second SIGINT while the previous OOB
-                // delivery is still awaiting guest SignalAck cancels locally.
                 if sigint_in_flight.swap(true, Ordering::AcqRel) {
                     let _ =
                         terminated_by.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire);
@@ -1796,8 +2255,6 @@ fn run_session_io(
                     return;
                 }
                 if sigint_tx.send(sig).is_err() {
-                    // Session is already tearing down (e.g. draining output);
-                    // interrupt any blocked OutputHelper drain promptly.
                     let _ =
                         terminated_by.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire);
                     notify_wake(&term_wake_w);
@@ -1929,24 +2386,18 @@ fn run_session_io(
         let _ = tx.send(());
     }
 
-    let mut res = {
-        let mut relay_out_fd = out_helper.as_ref().map(|h| OutputSink::Fd(h.as_raw_fd()));
-        let mut relay_err_fd = if share_out_helper {
-            out_helper.as_ref().map(|h| OutputSink::Fd(h.as_raw_fd()))
-        } else {
-            err_helper.as_ref().map(|h| OutputSink::Fd(h.as_raw_fd()))
-        };
-        let relay_out = relay_out_fd.as_mut().unwrap_or(out);
-        let relay_err = relay_err_fd.as_mut().unwrap_or(err);
-        relay_output_cancellable(conn, relay_out, relay_err, Some(term_wake_r.as_raw_fd()))
-    };
+    let outcome = relay_output_cancellable(
+        conn,
+        out,
+        err,
+        output_relay.as_ref(),
+        Some(term_wake_r.as_raw_fd()),
+    );
 
     // Shut down the socket lock-free BEFORE joining relay workers so a blocked
     // writer cannot hang cleanup (e.g. after BrokenPipe on stdout) and the
     // guest observes disconnect promptly.
     let _ = shutdown_sock.shutdown(Shutdown::Both);
-    // Stop and join relay workers and terminate/reap any blocking-stdin helper
-    // so no reader remains on `stdin_fd`.
     drop(stop_w);
     let _ = writer_thread.join();
     if let Some(h) = resize_thread {
@@ -1957,34 +2408,22 @@ fn run_session_io(
     }
     drop(stdin_helper);
 
-    // On clean exit, drain buffered output through any OutputHelper while
-    // remaining interruptible on termination signals; on signal cancellation,
-    // broken pipe, or error, abort output helpers immediately.
-    let mut drain_broken_pipe = false;
+    // Drain buffered output on EVERY guest exit (including status 141) AND on
+    // guest disconnect/protocol errors (preserving already-received diagnostics)
+    // while keeping the drain interruptible on termination signals. Abort
+    // immediately only on local sink failure or signal cancellation.
+    let mut drain_outcome: Option<RelayFinish> = None;
     let should_drain = terminated_by.load(Ordering::Acquire) == 0
-        && matches!(res, Ok(code) if code != 128 + libc::SIGPIPE);
+        && matches!(
+            outcome,
+            RelayOutcome::GuestExit(_) | RelayOutcome::GuestError(_)
+        );
     if should_drain {
-        if let Some(mut h) = out_helper.take()
-            && matches!(h.finish(term_wake_r.as_raw_fd()), HelperFinish::BrokenPipe)
-        {
-            drain_broken_pipe = true;
+        if let Some(mut relay) = output_relay.take() {
+            drain_outcome = Some(relay.finish(term_wake_r.as_raw_fd()));
         }
-        if terminated_by.load(Ordering::Acquire) == 0 {
-            if let Some(mut h) = err_helper.take()
-                && matches!(h.finish(term_wake_r.as_raw_fd()), HelperFinish::BrokenPipe)
-            {
-                drain_broken_pipe = true;
-            }
-        } else if let Some(mut h) = err_helper.take() {
-            h.abort();
-        }
-    } else {
-        if let Some(mut h) = out_helper.take() {
-            h.abort();
-        }
-        if let Some(mut h) = err_helper.take() {
-            h.abort();
-        }
+    } else if let Some(mut relay) = output_relay.take() {
+        relay.abort();
     }
 
     drop(raw);
@@ -1995,42 +2434,79 @@ fn run_session_io(
     if sig != 0 {
         return Ok(SessionExit::Signal(sig));
     }
-    if drain_broken_pipe && matches!(res, Ok(0)) {
-        res = Ok(128 + libc::SIGPIPE);
+    match outcome {
+        RelayOutcome::GuestExit(code) => match drain_outcome {
+            Some(RelayFinish::BrokenPipe) => Ok(SessionExit::Code(128 + libc::SIGPIPE)),
+            Some(RelayFinish::Error(e)) => Err(e.into()),
+            _ => Ok(SessionExit::Code(code)),
+        },
+        RelayOutcome::GuestError(e) => Err(e),
+        RelayOutcome::LocalBrokenPipe => Ok(SessionExit::Code(128 + libc::SIGPIPE)),
+        RelayOutcome::LocalError(e) => Err(e.into()),
+        RelayOutcome::Cancelled => Ok(SessionExit::Code(0)),
     }
-    res.map(SessionExit::Code)
 }
 
-/// Read output/exit frames from `conn` into `out` and `err`, waking immediately
-/// on `term_wake_r` whether blocked in socket reads or output writes.
+/// Read output/exit frames from `conn` into `output_relay` (or direct `out` /
+/// `err` sinks), waking immediately on `term_wake_r` or downstream helper
+/// failure (`status_fd`) even if the guest sends no further frames.
 fn relay_output_cancellable(
     conn: UnixStream,
     out: &mut OutputSink<'_>,
     err: &mut OutputSink<'_>,
+    output_relay: Option<&OutputRelay>,
     term_wake_r: Option<RawFd>,
-) -> anyhow::Result<i32> {
+) -> RelayOutcome {
     let mut frames = FrameReader::default();
+    let relay_status_r = output_relay.map(OutputRelay::status_fd);
     loop {
-        match read_frame_cancellable(&conn, &mut frames, term_wake_r)? {
-            ReadOutcome::Msg(VmExecMsg::Stdout(d)) => {
-                match write_cancellable(out, &d, term_wake_r)? {
-                    WriteOutcome::Written => {}
-                    WriteOutcome::BrokenPipe => return Ok(128 + libc::SIGPIPE),
-                    WriteOutcome::Cancelled => return Ok(0),
+        match read_frame_cancellable(&conn, &mut frames, term_wake_r, relay_status_r) {
+            Ok(ReadOutcome::Msg(VmExecMsg::Stdout(d))) => {
+                let wr = match output_relay {
+                    Some(r) if r.handles_out => {
+                        r.write_frame_cancellable(RELAY_DEST_STDOUT, &d, term_wake_r)
+                    }
+                    _ => write_cancellable(out, &d, term_wake_r),
+                };
+                match wr {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::BrokenPipe) => return RelayOutcome::LocalBrokenPipe,
+                    Ok(WriteOutcome::Cancelled) => return RelayOutcome::Cancelled,
+                    Err(e) => return RelayOutcome::LocalError(e),
                 }
             }
-            ReadOutcome::Msg(VmExecMsg::Stderr(d)) => {
-                match write_cancellable(err, &d, term_wake_r)? {
-                    WriteOutcome::Written => {}
-                    WriteOutcome::BrokenPipe => return Ok(128 + libc::SIGPIPE),
-                    WriteOutcome::Cancelled => return Ok(0),
+            Ok(ReadOutcome::Msg(VmExecMsg::Stderr(d))) => {
+                let wr = match output_relay {
+                    Some(r) if r.handles_err => {
+                        r.write_frame_cancellable(RELAY_DEST_STDERR, &d, term_wake_r)
+                    }
+                    _ => write_cancellable(err, &d, term_wake_r),
+                };
+                match wr {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::BrokenPipe) => return RelayOutcome::LocalBrokenPipe,
+                    Ok(WriteOutcome::Cancelled) => return RelayOutcome::Cancelled,
+                    Err(e) => return RelayOutcome::LocalError(e),
                 }
             }
-            ReadOutcome::Msg(VmExecMsg::Exit { code }) => return Ok(code),
-            ReadOutcome::Msg(VmExecMsg::Error(e)) => bail!("{e}"),
-            ReadOutcome::Msg(_) => {}
-            ReadOutcome::Cancelled => return Ok(0),
-            ReadOutcome::Eof => bail!("the guest closed the connection"),
+            Ok(ReadOutcome::Msg(VmExecMsg::Exit { code })) => return RelayOutcome::GuestExit(code),
+            Ok(ReadOutcome::Msg(VmExecMsg::Error(e))) => {
+                return RelayOutcome::GuestError(anyhow::anyhow!("{e}"));
+            }
+            Ok(ReadOutcome::Msg(_)) => {}
+            Ok(ReadOutcome::Cancelled) => return RelayOutcome::Cancelled,
+            Ok(ReadOutcome::RelayFailed) => {
+                return output_relay.map_or(
+                    RelayOutcome::LocalBrokenPipe,
+                    OutputRelay::classify_active_failure,
+                );
+            }
+            Ok(ReadOutcome::Eof) => {
+                return RelayOutcome::GuestError(anyhow::anyhow!(
+                    "the guest closed the connection"
+                ));
+            }
+            Err(e) => return RelayOutcome::GuestError(e.into()),
         }
     }
 }
@@ -2272,9 +2748,9 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let code = relay_output_cancellable(host, &mut out, &mut err, None).unwrap();
+        let outcome = relay_output_cancellable(host, &mut out, &mut err, None, None);
         peer.join().unwrap();
-        assert_eq!(code, 7);
+        assert!(matches!(outcome, RelayOutcome::GuestExit(7)));
         assert_eq!(out_buf, b"hello vm\n");
         assert_eq!(err_buf, b"warn\n");
     }
@@ -2286,12 +2762,20 @@ mod tests {
         let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
         let mut out = OutputSink::Writer(&mut out_buf);
         let mut err = OutputSink::Writer(&mut err_buf);
-        let e = relay_output_cancellable(host, &mut out, &mut err, None).unwrap_err();
+        let RelayOutcome::GuestError(e) =
+            relay_output_cancellable(host, &mut out, &mut err, None, None)
+        else {
+            panic!("expected GuestError");
+        };
         assert!(e.to_string().contains("boom"), "{e}");
 
         let (host, guest) = UnixStream::pair().unwrap();
         drop(guest);
-        let e = relay_output_cancellable(host, &mut out, &mut err, None).unwrap_err();
+        let RelayOutcome::GuestError(e) =
+            relay_output_cancellable(host, &mut out, &mut err, None, None)
+        else {
+            panic!("expected GuestError");
+        };
         assert!(e.to_string().contains("closed"), "{e}");
     }
 
@@ -3410,6 +3894,266 @@ mod tests {
         assert_eq!(session.join().unwrap().unwrap(), SessionExit::Code(0));
         drop(master);
         drop(slave);
+    }
+
+    #[test]
+    #[ignore = "internal OutputRelay helper entrypoint invoked by unit tests"]
+    fn io_relay_helper_entrypoint() {
+        if std::env::var_os("KATAMARAN_TEST_IO_RELAY").is_some() {
+            let code = run_output_relay_fds(3, 4, 5, 6);
+            unsafe { libc::_exit(code) };
+        }
+    }
+
+    #[test]
+    fn merged_stdout_and_stderr_preserve_frame_order_across_distinct_fds() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (merged_r, out_w) = pipe_cloexec(false).unwrap();
+        // Distinct descriptor number pointing to the exact same pipe writer (2>&1).
+        let err_w = out_w.try_clone().unwrap();
+        assert_ne!(out_w.as_raw_fd(), err_w.as_raw_fd());
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(out_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(err_w.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+
+        let reader = thread::spawn(move || {
+            let mut f = std::fs::File::from(merged_r);
+            let mut buf = Vec::new();
+            io::Read::read_to_end(&mut f, &mut buf).unwrap();
+            buf
+        });
+
+        let mut expected = Vec::new();
+        for i in 0..100u32 {
+            let o = format!("O{i:03}\n");
+            let e = format!("E{i:03}\n");
+            expected.extend_from_slice(o.as_bytes());
+            expected.extend_from_slice(e.as_bytes());
+            vm_exec::write(&mut guest, &VmExecMsg::Stdout(o.into_bytes())).unwrap();
+            vm_exec::write(&mut guest, &VmExecMsg::Stderr(e.into_bytes())).unwrap();
+        }
+        vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 0 }).unwrap();
+
+        assert_eq!(session.join().unwrap().unwrap(), SessionExit::Code(0));
+        drop(out_w);
+        drop(err_w);
+        let received = reader.join().unwrap();
+        assert_eq!(received, expected);
+        drop(stdin_w);
+        drop(stdin_r);
+    }
+
+    #[test]
+    fn broken_downstream_pipe_wakes_idle_session_without_further_guest_frames() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (_err_r, err_w) = pipe_cloexec(false).unwrap();
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Close downstream reader, send ONE small stdout frame, and keep the
+        // guest socket completely open and idle.
+        drop(out_r);
+        let t = Instant::now();
+        vm_exec::write(&mut guest, &VmExecMsg::Stdout(b"single-chunk\n".to_vec())).unwrap();
+
+        let exit = session.join().unwrap().unwrap();
+        assert_eq!(exit, SessionExit::Code(128 + libc::SIGPIPE));
+        assert!(t.elapsed() < Duration::from_secs(2));
+
+        // Guest must observe socket shutdown promptly.
+        let mut ds = DeadlineStream::new(
+            &mut guest,
+            Instant::now() + Duration::from_secs(2),
+            "guest did not observe disconnect".into(),
+        );
+        assert!(matches!(vm_exec::read(&mut ds), Ok(None) | Err(_)));
+        drop(ds);
+        drop(out_w);
+        drop(err_w);
+        drop(stdin_w);
+        drop(stdin_r);
+    }
+
+    #[test]
+    fn guest_exit_141_drains_buffered_output_to_slow_reader() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (_err_r, err_w) = pipe_cloexec(false).unwrap();
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Send enough output to keep bytes buffered in the output relay while
+        // the downstream reader is paused, then exit with guest status 141.
+        let payload = vec![b'Z'; 96 << 10];
+        let guest_bg = {
+            let payload = payload.clone();
+            thread::spawn(move || {
+                vm_exec::write(&mut guest, &VmExecMsg::Stdout(payload)).unwrap();
+                vm_exec::write(&mut guest, &VmExecMsg::Exit { code: 141 }).unwrap();
+            })
+        };
+
+        thread::sleep(Duration::from_millis(80));
+        let reader = thread::spawn(move || {
+            let mut f = std::fs::File::from(out_r);
+            let mut buf = Vec::new();
+            io::Read::read_to_end(&mut f, &mut buf).unwrap();
+            buf
+        });
+
+        let exit = session.join().unwrap().unwrap();
+        assert_eq!(exit, SessionExit::Code(141));
+        drop(out_w);
+        drop(err_w);
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
+        guest_bg.join().unwrap();
+        drop(stdin_w);
+        drop(stdin_r);
+    }
+
+    #[test]
+    fn guest_disconnect_flushes_received_output_before_returning_error() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (stdin_r, stdin_w) = pipe_cloexec(false).unwrap();
+        let (out_r, out_w) = pipe_cloexec(false).unwrap();
+        let (_err_r, err_w) = pipe_cloexec(false).unwrap();
+
+        let (host, mut guest) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stdin_fd = stdin_r.as_raw_fd();
+        let out_fd = out_w.as_raw_fd();
+        let err_fd = err_w.as_raw_fd();
+
+        let session = thread::spawn(move || {
+            let mut out = OutputSink::Fd(out_fd);
+            let mut err = OutputSink::Fd(err_fd);
+            run_session_io(
+                host,
+                [0; 16],
+                no_ctrl,
+                None,
+                stdin_fd,
+                out_fd,
+                &mut out,
+                &mut err,
+                || (24, 80),
+                SIGINT_DELIVERY_TIMEOUT,
+                Some(ready_tx),
+            )
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let payload = vec![b'D'; 96 << 10];
+        let guest_bg = {
+            let payload = payload.clone();
+            thread::spawn(move || {
+                vm_exec::write(&mut guest, &VmExecMsg::Stdout(payload)).unwrap();
+                // Disconnect abruptly without sending Exit.
+                drop(guest);
+            })
+        };
+
+        thread::sleep(Duration::from_millis(80));
+        let reader = thread::spawn(move || {
+            let mut f = std::fs::File::from(out_r);
+            let mut buf = Vec::new();
+            io::Read::read_to_end(&mut f, &mut buf).unwrap();
+            buf
+        });
+
+        let err = session.join().unwrap().unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err:#}");
+        drop(out_w);
+        drop(err_w);
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
+        guest_bg.join().unwrap();
+        drop(stdin_w);
+        drop(stdin_r);
     }
 
     struct SharedVec(Arc<Mutex<Vec<u8>>>);
