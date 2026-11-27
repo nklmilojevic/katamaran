@@ -4976,7 +4976,7 @@ docker.io/library/web:1   application/vnd.oci.image.manifest.v1+json           s
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::Skip
+            SyncAction::ReportDivergedTag
         );
 
         // Missing or mismatched ctr platform row produces `platforms: None` -> Relist.
@@ -5183,7 +5183,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             SyncAction::ReportUnownedDestination
         );
 
-        // 2. Verified complete local arm64 content in k8s.io -> Present -> Skip (preserve!).
+        // 2. Verified complete local arm64 content in k8s.io -> Present: preserved, but reported because it differs from Docker.
         let complete_probe: Result<NativeAvailability, String> = Ok(NativeAvailability::Present);
         let dest_complete = classify_dest_native_availability(
             Some(&k8s_multi_index),
@@ -5201,7 +5201,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Enabled,
                 "arm64"
             ),
-            SyncAction::Skip
+            SyncAction::ReportDivergedTag
         );
 
         // 3. Probe error on k8s.io -> ProbeFailed -> ReportProbeError (preserve!).
@@ -5317,7 +5317,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Enabled,
                 "arm64"
             ),
-            SyncAction::Skip
+            SyncAction::ReportDivergedTag
         );
         let k8s_unlabelled_drifted = CtrImage {
             digest: "sha256:drifted".into(),
@@ -5411,9 +5411,10 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
             SyncAction::ReportUnownedDestination
         );
 
-        // Emulation disabled for an amd64-only index: retire Katamaran's rewritten
-        // alias instead of falling through to native export, and leave unrelated
-        // Kubernetes images untouched (even if another label value contains commas).
+        // Emulation disabled for an amd64-only index: keep (never delete)
+        // Katamaran's rewritten alias, and never touch unrelated Kubernetes
+        // images (even if another label value contains commas); a different
+        // unrelated image under the same name is reported, not claimed synced.
         assert_eq!(
             plan_sync_action(
                 "app:dev",
@@ -5436,7 +5437,7 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 EmulationMode::Disabled,
                 "arm64"
             ),
-            SyncAction::Skip
+            SyncAction::ReportDivergedTag
         );
         assert_eq!(
             plan_sync_action(

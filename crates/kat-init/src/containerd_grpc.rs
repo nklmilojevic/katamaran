@@ -82,7 +82,6 @@ const CRI_MANAGED_LABEL: &str = "io.cri-containerd.image";
 /// Per-RPC timeout sent via `grpc-timeout` on `Images.Delete` when replacing an
 /// existing `k8s.io` tag so a stalled connection fails promptly into recovery.
 const DELETE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
-const RECOVERY_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// OCI content descriptor (`containerd.types.Descriptor`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -426,7 +425,6 @@ fn publish_rewritten_image_with_delete_timeout(
     let mut keep_lease = false;
     let publish_res = publish_under_lease(
         &mut conn,
-        socket_path,
         name,
         source_digest_label,
         expected_k8s,
@@ -457,13 +455,13 @@ fn cleanup_lease_best_effort(
 }
 
 /// Recreate `old_image` (whose content is pinned under `lease_id`) if its tag
-/// is absent, over a fresh bounded connection.
+/// is absent. If the connection is broken this fails, and the caller keeps the
+/// lease pinned.
 fn restore_if_absent(
-    socket_path: &Path,
+    conn: &mut GrpcConn,
     lease_id: &str,
     old_image: &ContainerdImage,
 ) -> Result<(), String> {
-    let mut conn = GrpcConn::connect(socket_path, Instant::now() + RECOVERY_OP_TIMEOUT)?;
     match conn.get_image("k8s.io", &old_image.name)? {
         Some(_) => Ok(()),
         None => match conn.create_image("k8s.io", Some(lease_id), old_image)? {
@@ -499,7 +497,6 @@ fn stamp_publication_id(manifest: &[u8], publication_id: &str) -> Result<Vec<u8>
 #[allow(clippy::too_many_arguments)]
 fn publish_under_lease(
     conn: &mut GrpcConn,
-    socket_path: &Path,
     name: &str,
     source_digest_label: &str,
     expected_k8s: Option<ExpectedK8sTarget<'_>>,
@@ -701,7 +698,7 @@ fn publish_under_lease(
                     });
                 }
                 Err(e) => {
-                    return Err(match restore_if_absent(socket_path, lease_id, &old_image) {
+                    return Err(match restore_if_absent(conn, lease_id, &old_image) {
                         Ok(()) => PublishError::Failed(format!(
                             "create {name}: {e}; previous mirror restored"
                         )),
@@ -4752,9 +4749,9 @@ mod tests {
             ..Default::default()
         }));
 
-        // Connection 1: publish_rewritten_image (delete commits, create fails)
-        // Connection 2: recovery fresh dial (Images.Get -> NOT_FOUND -> Images.Create restores old_image)
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        // One connection: delete commits, create fails, and the previous
+        // mirror is restored on the same connection (Get -> NOT_FOUND -> Create).
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
 
         let err = publish_rewritten_image(
             &sock,
@@ -4799,13 +4796,13 @@ mod tests {
     }
 
     /// Regression test: if `Images.Delete`'s outcome is uncertain (connection
-    /// drops after delete commits) AND a competing writer (e.g. a native
-    /// kubelet pull) creates a new tag in `k8s.io`, recovery runs conditional
-    /// `Delete(old_digest)` + create-only `Create(new_image)` over a fresh
-    /// connection, observes `AlreadyExists`, leaves the competing tag untouched,
-    /// cleans up the lease, and returns `DestinationChanged`.
+    /// drops after the delete commits) and a competing writer (e.g. a native
+    /// kubelet pull) creates a new tag, publication stops: nothing is created,
+    /// the competing tag is untouched, the lease pinning the previous content
+    /// is NOT released, and `ReplacementUncertain` is returned for the caller
+    /// to report and re-list.
     #[test]
-    fn publish_rewritten_image_recovery_preserves_competing_writer_after_uncertain_delete() {
+    fn publish_rewritten_image_uncertain_delete_keeps_lease_and_reports() {
         let (dir, sock) = temp_sock("uncertain");
         let listener = UnixListener::bind(&sock).unwrap();
 
@@ -4866,9 +4863,9 @@ mod tests {
             ..Default::default()
         }));
 
-        // Connection 1: publish (drops after delete commits, inserting competing image)
-        // Connection 2: fresh recovery connection (Delete(old) -> NOT_FOUND, Create(new) -> ALREADY_EXISTS)
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        // Connection 1: publish (drops after the delete commits, inserting a
+        // competing image). Nothing else runs: no recovery connection.
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
 
         let err = publish_rewritten_image(
             &sock,
@@ -4880,18 +4877,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, PublishError::DestinationChanged { .. }),
-            "expected DestinationChanged for competing writer, got {err:?}"
+            matches!(err, PublishError::ReplacementUncertain(_)),
+            "expected ReplacementUncertain, got {err:?}"
         );
 
         let st = state.lock().unwrap();
         assert_eq!(st.images_update_calls, 0);
-        assert!(st.leases.is_empty());
+        assert_eq!(
+            st.k8s_create_calls, 0,
+            "nothing is created after an uncertain delete"
+        );
+        assert_eq!(
+            st.leases.len(),
+            1,
+            "the lease (pinning the previous content) must not be released"
+        );
         assert_eq!(
             st.images
                 .get(&("k8s.io".into(), "docker.io/library/app:dev".into())),
             Some(&competing),
-            "recovery must never overwrite a competing writer's tag"
+            "a competing writer's tag is never touched"
         );
         drop(st);
 
@@ -4956,7 +4961,7 @@ mod tests {
             ..Default::default()
         }));
 
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
         let err = publish_rewritten_image(
             &sock,
             "docker.io/library/app:dev",
@@ -5086,18 +5091,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Regression test: a delayed conditional delete of an earlier mirror
-    /// digest that executes only after a SECOND replacement (Docker retagged a
-    /// new outer index wrapping the same amd64 leaf, so the rewrite plan is
-    /// byte-identical) must not remove the current tag: every publication's
-    /// manifest carries a unique publication ID, so digests never recur.
+    /// Regression test: a replacement whose `Images.Delete` stays in flight
+    /// (uncertain) is reported and keeps its lease; the caller's re-list then
+    /// replaces the still-present old mirror under a FRESH publication digest,
+    /// so when the delayed delete of the old digest finally executes it cannot
+    /// remove the current tag (every publication's digest is unique, even for
+    /// a byte-identical plan).
     #[test]
     fn publish_rewritten_image_delayed_delete_cannot_hit_later_republication() {
         let (dir, sock) = temp_sock("recycle");
         let listener = UnixListener::bind(&sock).unwrap();
 
         let layer_digest = format!("sha256:{}", "f".repeat(64));
-        let mut plan = sample_plan(
+        let plan = sample_plan(
             &layer_digest,
             br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
         );
@@ -5112,7 +5118,7 @@ mod tests {
                 moby_source(name, "sha256:source-amd64"),
                 (
                     ("k8s.io".into(), name.into()),
-                    // The existing mirror already uses the canonical digest.
+                    // The existing mirror uses the canonical (unstamped) digest.
                     katamaran_mirror(name, &canonical, "sha256:older-outer-index"),
                 ),
             ]),
@@ -5121,10 +5127,29 @@ mod tests {
             ..Default::default()
         }));
 
-        // Connections 1+2: first replacement (uncertain delete + recovery).
-        // Connection 3: second replacement after Docker retags a new outer index.
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 3, 65_535);
-        let first = publish_rewritten_image(
+        // Connection 1: first replacement (delete held in flight, uncertain).
+        // Connection 2: the re-list's replacement.
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        let err = publish_rewritten_image(
+            &sock,
+            name,
+            "io.katamaran.k8s.source-digest",
+            Some(expected_mirror(&canonical)),
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PublishError::ReplacementUncertain(_)),
+            "expected ReplacementUncertain, got {err:?}"
+        );
+        assert_eq!(
+            state.lock().unwrap().leases.len(),
+            1,
+            "lease must stay pinned"
+        );
+
+        let second = publish_rewritten_image(
             &sock,
             name,
             "io.katamaran.k8s.source-digest",
@@ -5133,28 +5158,11 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        assert_ne!(first.manifest, canonical);
-
-        state.lock().unwrap().images.insert(
-            ("moby".into(), name.into()),
-            moby_source(name, "sha256:newer-outer-index").1,
-        );
-        plan.source_digest = "sha256:newer-outer-index".into();
-        let second = publish_rewritten_image(
-            &sock,
-            name,
-            "io.katamaran.k8s.source-digest",
-            Some(expected_mirror(&first.manifest)),
-            &plan,
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        assert_ne!(second.manifest, first.manifest);
         assert_ne!(second.manifest, canonical);
 
         assert!(
             !delayed_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
-            "delayed delete of the original digest must not match the current tag"
+            "delayed delete of the old digest must not match the current tag"
         );
         let st = state.lock().unwrap();
         let cur = &st.images[&("k8s.io".into(), name.into())];
@@ -5163,7 +5171,7 @@ mod tests {
             cur.labels
                 .get("io.katamaran.k8s.source-digest")
                 .map(String::as_str),
-            Some("sha256:newer-outer-index")
+            Some("sha256:source-amd64")
         );
         drop(st);
 
@@ -5216,7 +5224,6 @@ mod tests {
             },
         };
 
-        let (delayed_tx, delayed_rx) = std::sync::mpsc::channel();
         let state = Arc::new(Mutex::new(MockContainerdState {
             shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
             ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
@@ -5240,11 +5247,10 @@ mod tests {
                 ),
             ]),
             remaining_disk_bytes: 1 << 20,
-            delayed_k8s_delete: Some((Duration::from_millis(80), delayed_tx)),
             ..Default::default()
         }));
 
-        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
         let rewritten = publish_rewritten_image(
             &sock,
             "docker.io/library/app:dev",
@@ -5257,10 +5263,6 @@ mod tests {
         assert_ne!(
             rewritten.manifest, same_manifest_digest,
             "relabelled manifest must get a distinct digest before conditional delete"
-        );
-        assert!(
-            !delayed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "stale delayed delete of old digest must not delete the relabelled tag"
         );
         assert_eq!(
             state.lock().unwrap().images[&("k8s.io".into(), "docker.io/library/app:dev".into())]
