@@ -20,7 +20,6 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::oci_rewrite::{RewritePlan, Rewritten, is_digest_reference};
@@ -65,8 +64,6 @@ const GRPC_ALREADY_EXISTS: &str = "6";
 const LEASE_HEADER: &str = "containerd-lease";
 const LEASE_EXPIRE_LABEL: &str = "containerd.io/gc.expire";
 const LEASE_TTL_SECS: u64 = 600;
-
-static LEASE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// OCI content descriptor (`containerd.types.Descriptor`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -161,6 +158,45 @@ pub fn list_images(
     }
     let body = resp.messages.first().map(Vec::as_slice).unwrap_or(&[]);
     decode_list_images_response(body)
+}
+
+/// List all committed content blobs in `namespace` via
+/// `/containerd.services.content.v1.Content/List`, returning authoritative
+/// `digest -> size` metadata so callers can reject over-budget blobs before
+/// fetching payloads. Fails explicitly if the stream exceeds `max_response_bytes`.
+pub fn list_content_sizes(
+    socket_path: &Path,
+    namespace: &str,
+    max_response_bytes: usize,
+    timeout: Duration,
+) -> Result<HashMap<String, u64>, String> {
+    let deadline = Instant::now() + timeout;
+    let mut conn = GrpcConn::connect(socket_path, deadline)?;
+    let resp = conn.unary_rpc(
+        "/containerd.services.content.v1.Content/List",
+        namespace,
+        None,
+        &[],
+        max_response_bytes,
+    )?;
+    if resp.grpc_status != GRPC_OK {
+        return Err(format!(
+            "containerd Content.List ({namespace}) failed (grpc-status {}): {}",
+            resp.grpc_status, resp.grpc_message
+        ));
+    }
+    let mut sizes = HashMap::new();
+    for msg in &resp.messages {
+        for info in decode_list_content_response(msg)? {
+            if info.digest.is_empty() {
+                continue;
+            }
+            let size = u64::try_from(info.size)
+                .map_err(|_| format!("invalid negative size {} for {}", info.size, info.digest))?;
+            sizes.insert(info.digest, size);
+        }
+    }
+    Ok(sizes)
 }
 
 /// Call containerd's `/containerd.services.images.v1.Images/Delete` RPC in
@@ -267,12 +303,12 @@ pub fn publish_rewritten_image(
         unique_layers.push((digest.as_str(), info.size));
     }
 
-    // 3. Create a temporary GC lease in `k8s.io` with a fallback expiration
-    //    timestamp and guaranteed deletion before returning.
-    let seq = LEASE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let lease_id = format!("katamaran-rewrite-{}-{seq}", std::process::id());
+    // 3. Create a temporary GC lease in `k8s.io` with a server-generated random
+    //    ID (so lease IDs never repeat across guest boots), a fallback
+    //    expiration timestamp, and guaranteed deletion before returning.
     let expire = rfc3339_utc_after(LEASE_TTL_SECS);
-    conn.create_lease("k8s.io", &lease_id, &[(LEASE_EXPIRE_LABEL, &expire)])
+    let lease_id = conn
+        .create_lease("k8s.io", &[(LEASE_EXPIRE_LABEL, &expire)])
         .map_err(PublishError::Failed)?;
 
     let publish_res = publish_under_lease(
@@ -869,13 +905,8 @@ impl GrpcConn {
         }
     }
 
-    fn create_lease(
-        &mut self,
-        namespace: &str,
-        id: &str,
-        labels: &[(&str, &str)],
-    ) -> Result<(), String> {
-        let req = encode_create_lease_request(id, labels);
+    fn create_lease(&mut self, namespace: &str, labels: &[(&str, &str)]) -> Result<String, String> {
+        let req = encode_create_lease_request(labels);
         let resp = self.unary_rpc(
             "/containerd.services.leases.v1.Leases/Create",
             namespace,
@@ -884,9 +915,18 @@ impl GrpcConn {
             DEFAULT_UNARY_RESPONSE_LIMIT,
         )?;
         match resp.grpc_status.as_str() {
-            GRPC_OK => Ok(()),
+            GRPC_OK => {
+                let body = resp.messages.first().map(Vec::as_slice).unwrap_or(&[]);
+                let id = decode_create_lease_response(body)?;
+                if id.is_empty() {
+                    return Err(format!(
+                        "containerd Leases.Create ({namespace}) returned empty lease ID"
+                    ));
+                }
+                Ok(id)
+            }
             code => Err(format!(
-                "containerd Leases.Create {id} ({namespace}) failed (grpc-status {code}): {}",
+                "containerd Leases.Create ({namespace}) failed (grpc-status {code}): {}",
                 resp.grpc_message
             )),
         }
@@ -1338,13 +1378,10 @@ fn encode_update_image_request(img: &ContainerdImage, mask_paths: &[&str]) -> Ve
 }
 
 /// `containerd.services.leases.v1.CreateRequest`:
-/// - field 1 (string): `id`
+/// - field 1 (string): `id` (omitted so containerd generates a unique random ID)
 /// - field 3 (map<string, string>): `labels`
-fn encode_create_lease_request(id: &str, labels: &[(&str, &str)]) -> Vec<u8> {
+fn encode_create_lease_request(labels: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
-    if !id.is_empty() {
-        encode_proto_bytes(&mut out, 1, id.as_bytes());
-    }
     for &(k, v) in labels {
         encode_proto_map_entry(&mut out, 3, k, v);
     }
@@ -1643,6 +1680,55 @@ fn decode_content_info_response(mut data: &[u8]) -> Result<Option<ContentInfo>, 
         }
     }
     Ok(info)
+}
+
+fn decode_list_content_response(mut data: &[u8]) -> Result<Vec<ContentInfo>, String> {
+    let mut infos = Vec::new();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (bytes, next) = decode_len_delimited(rest)?;
+                infos.push(decode_content_info(bytes)?);
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(infos)
+}
+
+/// Decode `containerd.services.leases.v1.CreateResponse`:
+/// - field 1 (message `Lease`):
+///   - field 1 (string): `id`
+fn decode_create_lease_response(mut data: &[u8]) -> Result<String, String> {
+    let mut lease_id = String::new();
+    while !data.is_empty() {
+        let (tag, rest) = decode_varint(data)?;
+        let field = tag >> 3;
+        let wt = tag & 0x7;
+        match (field, wt) {
+            (1, 2) => {
+                let (mut lease, next) = decode_len_delimited(rest)?;
+                while !lease.is_empty() {
+                    let (lt, lr) = decode_varint(lease)?;
+                    match (lt >> 3, lt & 0x7) {
+                        (1, 2) => {
+                            let (bytes, ln) = decode_len_delimited(lr)?;
+                            lease_id = String::from_utf8_lossy(bytes).into_owned();
+                            lease = ln;
+                        }
+                        _ => lease = skip_proto_field(lt & 0x7, lr)?,
+                    }
+                }
+                data = next;
+            }
+            _ => data = skip_proto_field(wt, rest)?,
+        }
+    }
+    Ok(lease_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,6 +2195,7 @@ mod tests {
     use std::fs;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -2778,6 +2865,8 @@ mod tests {
         images: HashMap<(String, String), ContainerdImage>,
         /// Active leases: (ns, lease_id) -> labels.
         leases: HashMap<(String, String), HashMap<String, String>>,
+        /// Server-side counter for generating unique lease IDs when `CreateRequest.id` is omitted.
+        next_lease_seq: u64,
         /// Simulated remaining disk headroom on the shared data disk (bytes).
         remaining_disk_bytes: i64,
         /// Total raw payload bytes written into ingest files across all Content.Write calls.
@@ -3113,13 +3202,98 @@ mod tests {
                                         send_grpc_err(&mut conn, sid, "5", "not%20found");
                                     }
                                 }
+                                "/containerd.services.content.v1.Content/List" => {
+                                    // Stream multiple batched ListContentResponse messages like containerd.
+                                    let mut items: Vec<(String, i64)> = st
+                                        .ns_content
+                                        .iter()
+                                        .filter(|((n, _), _)| n == &ns)
+                                        .map(|((_, d), (sz, _))| (d.clone(), *sz))
+                                        .collect();
+                                    items.sort_by(|a, b| a.0.cmp(&b.0));
+                                    drop(st);
+                                    let mut hdr = vec![0x88];
+                                    encode_hpack_huffman_header(
+                                        &mut hdr,
+                                        "content-type",
+                                        "application/grpc",
+                                        false,
+                                    );
+                                    let _ = write_frame(
+                                        &mut conn,
+                                        FRAME_HEADERS,
+                                        FLAG_END_HEADERS,
+                                        sid,
+                                        &hdr,
+                                    );
+                                    for batch in items.chunks(2) {
+                                        let mut resp_msg = Vec::new();
+                                        for (digest, size) in batch {
+                                            let mut info = Vec::new();
+                                            encode_proto_bytes(&mut info, 1, digest.as_bytes());
+                                            encode_proto_varint(&mut info, 2, *size as u64);
+                                            encode_proto_bytes(&mut resp_msg, 1, &info);
+                                        }
+                                        let framed = frame_grpc_message(&resp_msg).unwrap();
+                                        let mut failed = false;
+                                        for chunk in framed.chunks(DEFAULT_MAX_FRAME_SIZE) {
+                                            if write_frame(&mut conn, FRAME_DATA, 0, sid, chunk)
+                                                .is_err()
+                                            {
+                                                failed = true;
+                                                break;
+                                            }
+                                        }
+                                        if failed {
+                                            break;
+                                        }
+                                    }
+                                    let mut trl = Vec::new();
+                                    encode_hpack_huffman_header(
+                                        &mut trl,
+                                        "grpc-status",
+                                        "0",
+                                        false,
+                                    );
+                                    let _ = write_frame(
+                                        &mut conn,
+                                        FRAME_HEADERS,
+                                        FLAG_END_HEADERS | FLAG_END_STREAM,
+                                        sid,
+                                        &trl,
+                                    );
+                                    let _ = conn.flush();
+                                }
                                 "/containerd.services.content.v1.Content/Abort" => {
                                     send_grpc_ok(&mut conn, sid, &[]);
                                 }
                                 "/containerd.services.leases.v1.Leases/Create" => {
-                                    let (id, labels) = decode_create_lease_req(&req_proto);
-                                    st.leases.insert((ns.clone(), id), labels);
-                                    send_grpc_ok(&mut conn, sid, &[]);
+                                    let (req_id, labels) = decode_create_lease_req(&req_proto);
+                                    let id = if req_id.is_empty() {
+                                        loop {
+                                            st.next_lease_seq += 1;
+                                            let cand = format!("srv-lease-{}", st.next_lease_seq);
+                                            if !st.leases.contains_key(&(ns.clone(), cand.clone()))
+                                            {
+                                                break cand;
+                                            }
+                                        }
+                                    } else {
+                                        req_id
+                                    };
+                                    let key = (ns.clone(), id.clone());
+                                    if let std::collections::hash_map::Entry::Vacant(e) =
+                                        st.leases.entry(key)
+                                    {
+                                        e.insert(labels);
+                                        let mut lease = Vec::new();
+                                        encode_proto_bytes(&mut lease, 1, id.as_bytes());
+                                        let mut out = Vec::new();
+                                        encode_proto_bytes(&mut out, 1, &lease);
+                                        send_grpc_ok(&mut conn, sid, &out);
+                                    } else {
+                                        send_grpc_err(&mut conn, sid, "6", "lease%20exists");
+                                    }
                                 }
                                 "/containerd.services.leases.v1.Leases/Delete" => {
                                     let id = decode_first_string(&req_proto);
@@ -3422,5 +3596,110 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("digest-qualified"), "{err}");
+    }
+
+    /// Regression test: an unexpired lease left behind by an earlier guest boot
+    /// (for example after an unexpected VM restart while `/var/lib/containerd`
+    /// survived) must not collide with a subsequent rewrite publish or be
+    /// deleted by it.
+    #[test]
+    fn publish_rewritten_image_uses_server_generated_lease_id_across_restarts() {
+        let (dir, sock) = temp_sock("lease-restart");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let layer_digest = format!("sha256:{}", "f".repeat(64));
+        let plan = sample_plan(
+            &layer_digest,
+            br#"{"architecture":"arm64","os":"linux"}"#.to_vec(),
+        );
+        let prior_boot_lease = ("k8s.io".to_string(), "srv-lease-1".to_string());
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            shared_store: HashMap::from([(layer_digest.clone(), 4096)]),
+            ns_content: HashMap::from([(("moby".into(), layer_digest), (4096, HashMap::new()))]),
+            images: HashMap::from([(
+                ("moby".into(), "docker.io/library/app:dev".into()),
+                ContainerdImage {
+                    name: "docker.io/library/app:dev".into(),
+                    labels: HashMap::new(),
+                    target: Descriptor {
+                        media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                        digest: "sha256:source-amd64".into(),
+                        size: 128,
+                    },
+                },
+            )]),
+            leases: HashMap::from([(
+                prior_boot_lease.clone(),
+                HashMap::from([(
+                    "containerd.io/gc.expire".into(),
+                    "2099-01-01T00:00:00Z".into(),
+                )]),
+            )]),
+            remaining_disk_bytes: 1 << 20,
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 1, 65_535);
+        publish_rewritten_image(
+            &sock,
+            "docker.io/library/app:dev",
+            "io.katamaran.k8s.source-digest",
+            &plan,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.leases.len(),
+            1,
+            "publisher must delete only its own server-generated lease"
+        );
+        assert!(
+            st.leases.contains_key(&prior_boot_lease),
+            "pre-existing lease from prior boot must remain untouched"
+        );
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_content_sizes_streams_multiple_batches_and_enforces_limit() {
+        let (dir, sock) = temp_sock("content-list");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let mut ns_content = HashMap::new();
+        for i in 0..5u64 {
+            ns_content.insert(
+                ("moby".into(), format!("sha256:{i:064x}")),
+                (((i + 1) * 1024) as i64, HashMap::new()),
+            );
+        }
+        ns_content.insert(
+            ("k8s.io".into(), format!("sha256:{}", "9".repeat(64))),
+            (999, HashMap::new()),
+        );
+        let state = Arc::new(Mutex::new(MockContainerdState {
+            ns_content,
+            ..Default::default()
+        }));
+
+        let server = spawn_mock_containerd(listener, Arc::clone(&state), 2, 65_535);
+
+        let sizes = list_content_sizes(&sock, "moby", 1 << 20, Duration::from_secs(5)).unwrap();
+        assert_eq!(sizes.len(), 5);
+        for i in 0..5u64 {
+            assert_eq!(
+                sizes.get(&format!("sha256:{i:064x}")),
+                Some(&((i + 1) * 1024))
+            );
+        }
+
+        let err = list_content_sizes(&sock, "moby", 128, Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
+
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -3573,7 +3573,7 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
         });
         let checks = need_probe.then(|| check_ctr_native_complete(reaper, "moby"));
 
-        let mut content_store: Option<Result<MobyContentStore<'_>, String>> = None;
+        let mut content_sizes: Option<Result<HashMap<String, u64>, String>> = None;
         let mut retry_refs: HashSet<String> = HashSet::new();
 
         for (name, img) in candidates {
@@ -3641,11 +3641,15 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                     }
                 }
                 SyncAction::MirrorRewrite => {
-                    let store_res = content_store.get_or_insert_with(|| {
-                        list_ctr_content_digests(reaper, "moby")
-                            .map(|digests| MobyContentStore { reaper, digests })
+                    let sizes_res = content_sizes.get_or_insert_with(|| {
+                        containerd_grpc::list_content_sizes(
+                            Path::new(CONTAINERD_SOCKET),
+                            "moby",
+                            IMAGE_LIST_LIMIT,
+                            Duration::from_secs(15),
+                        )
                     });
-                    let store = match store_res {
+                    let sizes = match sizes_res {
                         Ok(s) => s,
                         Err(e) => {
                             log(&format!("mirror image {name}: {e}"));
@@ -3653,10 +3657,14 @@ fn sync_moby_images(reaper: &Reaper) -> Result<(), String> {
                             continue;
                         }
                     };
+                    let mut store =
+                        SizedContentStore::new(sizes, |digest: &str, max_bytes: usize| {
+                            get_ctr_content_blob(reaper, "moby", digest, max_bytes)
+                        });
                     let plan = match oci_rewrite::prepare_rewrite_from_store(
                         &img.digest,
                         NATIVE_ARCH,
-                        store,
+                        &mut store,
                     ) {
                         Ok(oci_rewrite::PrepareRewrite::Ready(plan)) => *plan,
                         Ok(oci_rewrite::PrepareRewrite::RootMissing) => {
@@ -4014,14 +4022,29 @@ fn clear_source_digest_label(reaper: &Reaper, name: &str) -> Result<(), String> 
     Err(format!("ctr images label {name} exited {code}: {detail}"))
 }
 
-struct MobyContentStore<'a> {
-    reaper: &'a Reaper,
-    digests: HashSet<String>,
+/// Content store adapter backed by authoritative containerd blob sizes
+/// (`Content.List`) that rejects over-budget metadata blobs BEFORE invoking
+/// `fetch` (`ctr content get`), keeping the bounded stdout read as a backstop.
+struct SizedContentStore<'a, F> {
+    sizes: &'a HashMap<String, u64>,
+    fetch: F,
 }
 
-impl oci_rewrite::BlobStore for MobyContentStore<'_> {
+impl<'a, F> SizedContentStore<'a, F>
+where
+    F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
+{
+    fn new(sizes: &'a HashMap<String, u64>, fetch: F) -> Self {
+        Self { sizes, fetch }
+    }
+}
+
+impl<F> oci_rewrite::BlobStore for SizedContentStore<'_, F>
+where
+    F: FnMut(&str, usize) -> Result<Vec<u8>, oci_rewrite::BlobReadError>,
+{
     fn has_blob(&self, digest: &str) -> bool {
-        self.digests.contains(digest)
+        self.sizes.contains_key(digest)
     }
 
     fn read_json_blob(
@@ -4029,29 +4052,18 @@ impl oci_rewrite::BlobStore for MobyContentStore<'_> {
         digest: &str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, oci_rewrite::BlobReadError> {
-        get_ctr_content_blob(self.reaper, "moby", digest, max_bytes)
+        let Some(&size) = self.sizes.get(digest) else {
+            return Err(oci_rewrite::BlobReadError::Other(format!(
+                "blob {digest} missing from moby content store"
+            )));
+        };
+        if size > max_bytes as u64 {
+            return Err(oci_rewrite::BlobReadError::TooLarge(format!(
+                "blob {digest} ({size} bytes) exceeds {max_bytes}-byte remaining budget"
+            )));
+        }
+        (self.fetch)(digest, max_bytes)
     }
-}
-
-fn list_ctr_content_digests(reaper: &Reaper, ns: &str) -> Result<HashSet<String>, String> {
-    let mut cmd = Command::new("/usr/bin/ctr");
-    cmd.args(["-a", CONTAINERD_SOCKET, "-n", ns, "content", "ls", "-q"]);
-    let (code, stdout, stderr) =
-        run_reaped_bytes(reaper, &mut cmd, Duration::from_secs(15), IMAGE_LIST_LIMIT)
-            .map_err(|e| format!("ctr content ls ({ns}): {e}"))?;
-    if code != 0 {
-        return Err(format!(
-            "ctr content ls ({ns}) exited {code}: {}",
-            stderr.trim()
-        ));
-    }
-    let text = String::from_utf8_lossy(&stdout);
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
 }
 
 fn get_ctr_content_blob(
@@ -4901,6 +4913,101 @@ docker.io/library/app:single application/vnd.docker.distribution.manifest.v2+jso
                 clear_source_label: false
             }
         );
+
+        // Compatible 32-bit ARM image (accepted by containerd's arm64 default
+        // platform matcher) is mirrored natively unchanged rather than skipped.
+        let arm_v7 = ctr_img("sha256:armv7", "linux/arm/v7", &[]);
+        let native_armv7 =
+            classify_native_availability("app:armv7", &arm_v7, None, None, true, "arm64");
+        assert_eq!(native_armv7, NativeAvailability::Present);
+        assert_eq!(
+            plan_sync_action("app:armv7", &arm_v7, None, native_armv7, true, "arm64"),
+            SyncAction::MirrorNative {
+                clear_source_label: false
+            }
+        );
+    }
+
+    /// Regression test: `SizedContentStore` must reject blobs whose
+    /// authoritative containerd size exceeds `max_bytes` BEFORE invoking the
+    /// payload fetcher, while still inspecting a smaller usable amd64 sibling.
+    #[test]
+    fn sized_content_store_rejects_oversized_siblings_without_fetching_payload() {
+        use sha2::{Digest, Sha256};
+
+        let sha = |b: &[u8]| -> String {
+            let hex: String = Sha256::digest(b)
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect();
+            format!("sha256:{hex}")
+        };
+
+        let layer_d = format!("sha256:{}", "2".repeat(64));
+        let huge_a = format!("sha256:{}", "a".repeat(64));
+        let huge_b = format!("sha256:{}", "b".repeat(64));
+
+        let cfg = serde_json::to_vec(&serde_json::json!({"architecture": "amd64", "os": "linux"}))
+            .unwrap();
+        let cfg_d = sha(&cfg);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": cfg_d, "size": cfg.len()},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": layer_d, "size": 512}],
+        }))
+        .unwrap();
+        let manifest_d = sha(&manifest);
+        let root = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_a, "size": 10},
+                {"mediaType": "application/vnd.oci.image.index.v1+json", "digest": huge_b, "size": 10},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": manifest_d,
+                 "size": manifest.len(), "platform": {"os": "linux", "architecture": "amd64"}},
+            ],
+        }))
+        .unwrap();
+        let root_d = sha(&root);
+
+        let sizes = HashMap::from([
+            (root_d.clone(), root.len() as u64),
+            (
+                huge_a.clone(),
+                (oci_rewrite::MAX_TOTAL_METADATA_BYTES as u64) + 1,
+            ),
+            (
+                huge_b.clone(),
+                (oci_rewrite::MAX_TOTAL_METADATA_BYTES as u64) + 8192,
+            ),
+            (manifest_d.clone(), manifest.len() as u64),
+            (cfg_d.clone(), cfg.len() as u64),
+            (layer_d.clone(), 512),
+        ]);
+        let payloads =
+            HashMap::from([(root_d.clone(), root), (manifest_d, manifest), (cfg_d, cfg)]);
+
+        let mut fetched = Vec::new();
+        let mut store = SizedContentStore::new(&sizes, |digest: &str, _max: usize| {
+            assert_ne!(digest, huge_a, "oversized sibling A must not be fetched");
+            assert_ne!(digest, huge_b, "oversized sibling B must not be fetched");
+            fetched.push(digest.to_string());
+            payloads
+                .get(digest)
+                .cloned()
+                .ok_or_else(|| oci_rewrite::BlobReadError::Other(format!("missing {digest}")))
+        });
+
+        let oci_rewrite::PrepareRewrite::Ready(plan) =
+            oci_rewrite::prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected Ready plan for small sibling after oversized siblings");
+        };
+        assert_eq!(plan.layer_digests, vec![layer_d]);
+        assert!(!fetched.contains(&huge_a) && !fetched.contains(&huge_b));
     }
 
     #[test]

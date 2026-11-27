@@ -61,7 +61,8 @@ pub trait BlobStore {
     fn has_blob(&self, digest: &str) -> bool;
 
     /// Read a JSON metadata blob, failing with [`BlobReadError::TooLarge`]
-    /// without allocating past `max_bytes`.
+    /// before fetching its payload when the blob's authoritative stored size
+    /// exceeds `max_bytes`.
     fn read_json_blob(&mut self, digest: &str, max_bytes: usize) -> Result<Vec<u8>, BlobReadError>;
 }
 
@@ -80,11 +81,28 @@ pub fn is_digest_reference(name: &str) -> bool {
     )
 }
 
-/// Platforms listed by `ctr images ls` that the CRI accepts without help.
+/// Platforms listed by `ctr images ls` that containerd's default platform
+/// matcher accepts without rewriting (matching `containerd/platforms`'s
+/// `Only(DefaultSpec())` rules, including compatible 32-bit ARM fallbacks
+/// `linux/arm/v5..=v8` on `arm64` and `linux/386` on `amd64`).
 pub fn has_native_platform(platforms: &str, native_arch: &str) -> bool {
     let (want_arch, _) = normalize_arch_variant(native_arch, None);
-    platform_list(platforms).any(|(os, arch, _)| {
-        os.eq_ignore_ascii_case("linux") && normalize_arch_variant(arch, None).0 == want_arch
+    platform_list(platforms).any(|(os, arch, variant)| {
+        if !os.eq_ignore_ascii_case("linux") {
+            return false;
+        }
+        let (norm_arch, norm_var) = normalize_arch_variant(arch, variant);
+        if norm_arch == want_arch {
+            return true;
+        }
+        match want_arch.as_str() {
+            "arm64" => {
+                norm_arch == "arm"
+                    && matches!(norm_var.as_deref(), None | Some("v5" | "v6" | "v7" | "v8"))
+            }
+            "amd64" => norm_arch == "386" && norm_var.is_none(),
+            _ => false,
+        }
     })
 }
 
@@ -117,6 +135,7 @@ fn normalize_arch_variant(arch: &str, variant: Option<&str>) -> (String, Option<
             let v = variant.filter(|v| v != "v1");
             ("amd64".into(), v)
         }
+        "i386" | "386" => ("386".into(), variant),
         "arm64" | "aarch64" => {
             let v = match variant.as_deref() {
                 None | Some("8" | "v8" | "v8.0") => None,
@@ -124,6 +143,16 @@ fn normalize_arch_variant(arch: &str, variant: Option<&str>) -> (String, Option<
                 Some(other) => Some(other.into()),
             };
             ("arm64".into(), v)
+        }
+        "arm" | "armhf" | "armel" => {
+            let v = match variant.as_deref() {
+                None | Some("7" | "v7") => Some("v7".into()),
+                Some("5" | "v5") => Some("v5".into()),
+                Some("6" | "v6") => Some("v6".into()),
+                Some("8" | "v8") => Some("v8".into()),
+                Some(other) => Some(other.into()),
+            };
+            ("arm".into(), v)
         }
         _ => (arch, variant),
     }
@@ -1381,8 +1410,13 @@ mod tests {
         assert!(has_native_platform("linux/arm64", "arm64"));
         assert!(has_native_platform("linux/amd64,linux/arm64/v8", "arm64"));
         assert!(has_native_platform("linux/aarch64", "arm64"));
+        assert!(has_native_platform("linux/arm/v7", "arm64"));
+        assert!(has_native_platform("linux/arm/v6", "arm64"));
+        assert!(has_native_platform("linux/arm/v5", "arm64"));
+        assert!(has_native_platform("linux/arm", "arm64"));
+        assert!(!has_native_platform("linux/arm/v4", "arm64"));
         assert!(!has_native_platform("linux/amd64", "arm64"));
-        assert!(!has_native_platform("linux/arm/v7", "arm64"));
+        assert!(!has_native_platform("linux/s390x", "arm64"));
         assert!(!has_native_platform("", "arm64"));
         assert!(!has_native_platform("-", "arm64"));
 
@@ -1400,5 +1434,106 @@ mod tests {
         assert!(is_digest_reference("sha256:deadbeef"));
         assert!(!is_digest_reference("docker.io/library/app:dev"));
         assert!(!is_digest_reference("localhost:5000/app:latest"));
+    }
+
+    /// Regression test: oversized metadata siblings must be rejected before
+    /// fetching their payloads (based on authoritative stored size, not the
+    /// index's declared size) and must not block a smaller valid amd64 sibling
+    /// listed afterward.
+    #[test]
+    fn oversized_siblings_reject_before_fetching_payload_and_allow_later_small_candidate() {
+        struct SizeGuardedStore {
+            sizes: HashMap<String, u64>,
+            blobs: HashMap<String, Vec<u8>>,
+            fetched: Vec<String>,
+        }
+        impl BlobStore for SizeGuardedStore {
+            fn has_blob(&self, digest: &str) -> bool {
+                self.sizes.contains_key(digest)
+            }
+            fn read_json_blob(
+                &mut self,
+                digest: &str,
+                max_bytes: usize,
+            ) -> Result<Vec<u8>, BlobReadError> {
+                let &size = self
+                    .sizes
+                    .get(digest)
+                    .ok_or_else(|| BlobReadError::Other(format!("missing {digest}")))?;
+                if size > max_bytes as u64 {
+                    return Err(BlobReadError::TooLarge(format!(
+                        "{digest} ({size} bytes) exceeds {max_bytes}-byte budget"
+                    )));
+                }
+                self.fetched.push(digest.to_string());
+                Ok(self.blobs[digest].clone())
+            }
+        }
+
+        let mut store = SizeGuardedStore {
+            sizes: HashMap::new(),
+            blobs: HashMap::new(),
+            fetched: Vec::new(),
+        };
+        let layer_d = format!("sha256:{}", "1".repeat(64));
+        store.sizes.insert(layer_d.clone(), 1024);
+
+        // Two oversized local siblings whose index descriptors falsely claim size: 64.
+        let oversized_a = format!("sha256:{}", "a".repeat(64));
+        let oversized_b = format!("sha256:{}", "b".repeat(64));
+        store
+            .sizes
+            .insert(oversized_a.clone(), (MAX_TOTAL_METADATA_BYTES as u64) + 1);
+        store.sizes.insert(
+            oversized_b.clone(),
+            (MAX_TOTAL_METADATA_BYTES as u64) + 4096,
+        );
+
+        let cfg = serde_json::to_vec(&json!({"architecture": "amd64", "os": "linux"})).unwrap();
+        let cfg_d = format!("sha256:{}", sha256(&cfg));
+        store.sizes.insert(cfg_d.clone(), cfg.len() as u64);
+        store.blobs.insert(cfg_d.clone(), cfg);
+
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": cfg_d, "size": 36},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": layer_d, "size": 1024}],
+        }))
+        .unwrap();
+        let manifest_d = format!("sha256:{}", sha256(&manifest));
+        store
+            .sizes
+            .insert(manifest_d.clone(), manifest.len() as u64);
+        store.blobs.insert(manifest_d.clone(), manifest);
+
+        let root = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": MT_OCI_INDEX,
+            "manifests": [
+                {"mediaType": MT_OCI_INDEX, "digest": oversized_a, "size": 64},
+                {"mediaType": MT_OCI_INDEX, "digest": oversized_b, "size": 64},
+                {"mediaType": MT_OCI_MANIFEST, "digest": manifest_d, "size": 256,
+                 "platform": {"os": "linux", "architecture": "amd64"}},
+            ],
+        }))
+        .unwrap();
+        let root_d = format!("sha256:{}", sha256(&root));
+        store.sizes.insert(root_d.clone(), root.len() as u64);
+        store.blobs.insert(root_d.clone(), root);
+
+        let PrepareRewrite::Ready(plan) =
+            prepare_rewrite_from_store(&root_d, "arm64", &mut store).unwrap()
+        else {
+            panic!("expected small candidate after oversized siblings to succeed");
+        };
+        assert_eq!(plan.layer_digests, vec![layer_d]);
+        assert!(
+            !store.fetched.contains(&oversized_a) && !store.fetched.contains(&oversized_b),
+            "oversized siblings must never have their payloads fetched: {:?}",
+            store.fetched
+        );
     }
 }
