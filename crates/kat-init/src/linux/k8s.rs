@@ -9292,15 +9292,201 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     }
 
     #[test]
-    #[ignore = "requires live containerd + ctr via KAT_TEST_CTR_BIN and KAT_TEST_CONTAINERD_SOCK"]
+    #[ignore = "requires bundled containerd + ctr binaries via KAT_TEST_CONTAINERD_BIN and KAT_TEST_CTR_BIN"]
     fn clear_k8s_images_against_live_containerd() {
+        use sha2::{Digest, Sha256};
+
+        let containerd_bin = std::env::var("KAT_TEST_CONTAINERD_BIN")
+            .expect("set KAT_TEST_CONTAINERD_BIN to the bundled containerd binary");
         let ctr_bin = std::env::var("KAT_TEST_CTR_BIN")
             .expect("set KAT_TEST_CTR_BIN to the bundled ctr binary");
-        let socket = std::env::var("KAT_TEST_CONTAINERD_SOCK")
-            .expect("set KAT_TEST_CONTAINERD_SOCK to a live containerd socket");
-        let reaper = Reaper::start();
 
-        let count_lines = |ns: &str, args: &[&str]| -> usize {
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "kat-init-live-ctr-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp_guard = TempDirGuard(base.clone());
+        let root_dir = base.join("root");
+        let state_dir = base.join("state");
+        let socket_path = state_dir.join("containerd.sock");
+        let config_path = base.join("config.toml");
+        let log_path = base.join("containerd.log");
+        let image_tar = base.join("fixture.tar");
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let toml_str = |p: &Path| serde_json::to_string(&p.display().to_string()).unwrap();
+        let config_toml = format!(
+            "version = 3\n\
+             root = {}\n\
+             state = {}\n\
+             disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.cri.v1.images\", \"io.containerd.cri.v1.runtime\"]\n\
+             [grpc]\n\
+               address = {}\n",
+            toml_str(&root_dir),
+            toml_str(&state_dir),
+            toml_str(&socket_path),
+        );
+        fs::write(&config_path, config_toml).unwrap();
+
+        // Build a minimal self-contained OCI image archive so this test needs no
+        // external fixture files or network access.
+        let sha256_hex = |data: &[u8]| -> String {
+            Sha256::digest(data)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let add_entry = |builder: &mut tar::Builder<File>, path: &str, data: &[u8]| {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            builder
+                .append_data(&mut h, path, io::Cursor::new(data))
+                .unwrap();
+        };
+        {
+            let mut builder = tar::Builder::new(File::create(&image_tar).unwrap());
+            let layer = vec![0u8; 1024];
+            let layer_hex = sha256_hex(&layer);
+            let layer_digest = format!("sha256:{layer_hex}");
+            add_entry(&mut builder, &format!("blobs/sha256/{layer_hex}"), &layer);
+
+            let config_json = serde_json::to_vec(&serde_json::json!({
+                "architecture": NATIVE_ARCH,
+                "os": "linux",
+                "rootfs": {
+                    "type": "layers",
+                    "diff_ids": [layer_digest],
+                },
+            }))
+            .unwrap();
+            let config_hex = sha256_hex(&config_json);
+            let config_digest = format!("sha256:{config_hex}");
+            add_entry(
+                &mut builder,
+                &format!("blobs/sha256/{config_hex}"),
+                &config_json,
+            );
+
+            let manifest_json = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": config_digest,
+                    "size": config_json.len(),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_digest,
+                    "size": layer.len(),
+                }],
+            }))
+            .unwrap();
+            let manifest_hex = sha256_hex(&manifest_json);
+            let manifest_digest = format!("sha256:{manifest_hex}");
+            add_entry(
+                &mut builder,
+                &format!("blobs/sha256/{manifest_hex}"),
+                &manifest_json,
+            );
+
+            let index_json = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": manifest_digest,
+                    "size": manifest_json.len(),
+                    "platform": {
+                        "architecture": NATIVE_ARCH,
+                        "os": "linux",
+                    },
+                    "annotations": {
+                        "io.containerd.image.name": "docker.io/library/fixture:base",
+                    },
+                }],
+            }))
+            .unwrap();
+            add_entry(
+                &mut builder,
+                "oci-layout",
+                br#"{"imageLayoutVersion":"1.0.0"}"#,
+            );
+            add_entry(&mut builder, "index.json", &index_json);
+            builder.finish().unwrap();
+        }
+
+        struct DisposableContainerd {
+            reaper: Reaper,
+            target: crate::linux::service::ChildTarget,
+            exited: Receiver<i32>,
+            already_exited: bool,
+        }
+        impl Drop for DisposableContainerd {
+            fn drop(&mut self) {
+                if !self.already_exited {
+                    self.reaper.signal_target(&self.target, libc::SIGTERM);
+                    if self.exited.recv_timeout(Duration::from_secs(5)).is_err() {
+                        self.reaper.signal_target(&self.target, libc::SIGKILL);
+                        let _ = self.exited.recv_timeout(Duration::from_secs(2));
+                    }
+                }
+            }
+        }
+
+        let reaper = Reaper::start();
+        let log_file = File::create(&log_path).unwrap();
+        let log_err = log_file.try_clone().unwrap();
+        let mut containerd_cmd = Command::new(&containerd_bin);
+        containerd_cmd
+            .args(["--config"])
+            .arg(&config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_err));
+        let (target, exited) = reaper.spawn_pidfd(&mut containerd_cmd).unwrap();
+        let mut daemon = DisposableContainerd {
+            reaper: reaper.clone(),
+            target,
+            exited,
+            already_exited: false,
+        };
+
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if UnixStream::connect(&socket_path).is_ok() {
+                break;
+            }
+            if let Ok(status) = daemon.exited.try_recv() {
+                daemon.already_exited = true;
+                let logs = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "disposable containerd exited early ({}):\n{logs}",
+                    describe_status(status)
+                );
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "disposable containerd socket {} not ready:\n{}",
+                socket_path.display(),
+                fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let socket = socket_path.to_string_lossy().into_owned();
+        let run_ctr = |ns: &str, args: &[&str]| -> ReapedOutput {
             let mut cmd = Command::new(&ctr_bin);
             cmd.args(["-a", &socket, "-n", ns]);
             cmd.args(args);
@@ -9313,20 +9499,38 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 None,
             )
             .unwrap();
-            assert_eq!(out.code, 0, "ctr {ns} {args:?} failed: {}", out.stderr);
-            parse_ctr_image_refs(&out.stdout).len()
+            assert_eq!(
+                out.code, 0,
+                "ctr {ns} {args:?} failed: stdout={} stderr={}",
+                out.stdout, out.stderr
+            );
+            out
         };
+        let count_lines = |ns: &str, args: &[&str]| -> usize {
+            parse_ctr_image_refs(&run_ctr(ns, args).stdout).len()
+        };
+
+        // Populate both `moby` and `k8s.io` on our private containerd instance,
+        // adding enough tags in `k8s.io` to exercise multiple `images rm --` batches.
+        let tar_str = image_tar.to_string_lossy().into_owned();
+        run_ctr("moby", &["images", "import", "--no-unpack", &tar_str]);
+        run_ctr("k8s.io", &["images", "import", "--no-unpack", &tar_str]);
+        let base_ref = parse_ctr_image_refs(&run_ctr("k8s.io", &["images", "ls", "-q"]).stdout)
+            .into_iter()
+            .next()
+            .expect("imported fixture ref");
+        for i in 1..=(IMAGE_RM_BATCH_SIZE + 1) {
+            let extra = format!("docker.io/library/fixture:extra-{i}");
+            run_ctr("k8s.io", &["images", "tag", &base_ref, &extra]);
+        }
 
         let k8s_images_before = count_lines("k8s.io", &["images", "ls", "-q"]);
         let k8s_content_before = count_lines("k8s.io", &["content", "ls", "-q"]);
         let moby_images_before = count_lines("moby", &["images", "ls", "-q"]);
         let moby_content_before = count_lines("moby", &["content", "ls", "-q"]);
-        assert!(
-            k8s_images_before > IMAGE_RM_BATCH_SIZE,
-            "expected multi-batch k8s.io fixture (> {IMAGE_RM_BATCH_SIZE} refs), got {k8s_images_before}"
-        );
+        assert_eq!(k8s_images_before, IMAGE_RM_BATCH_SIZE + 2);
         assert!(k8s_content_before > 0, "expected k8s.io content blobs");
-        assert!(moby_images_before > 0, "expected moby image to preserve");
+        assert_eq!(moby_images_before, 1);
         assert!(moby_content_before > 0, "expected moby content to preserve");
 
         let mut progress = Vec::new();
@@ -9387,6 +9591,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert_eq!(
             count_lines("moby", &["images", "ls", "-q"]),
             moby_images_before
+        );
+        drop(daemon);
+        drop(tmp_guard);
+        assert!(
+            !base.exists(),
+            "disposable containerd temp dir was not cleaned up"
         );
     }
 }
