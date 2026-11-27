@@ -680,6 +680,11 @@ pub struct AutoForwards {
     active: BTreeMap<u16, Forward>,
     active_conns: Arc<AtomicUsize>,
     conn_limit: ConnLimit,
+    /// Per-port relay counters for [`ConnLimit::PerPort`], kept across
+    /// remove/re-add of the same port: `remove` lets established relays drain,
+    /// so a fresh counter on re-add would let one busy service exceed its
+    /// per-port cap. Entries are pruned once inactive and fully drained.
+    port_conns: BTreeMap<u16, Arc<AtomicUsize>>,
     class_listener_fds: Arc<AtomicUsize>,
     max_class_listener_fds: Option<usize>,
     budget: RelayBudget,
@@ -755,6 +760,7 @@ impl AutoForwards {
             active: BTreeMap::new(),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_limit,
+            port_conns: BTreeMap::new(),
             class_listener_fds: Arc::new(AtomicUsize::new(0)),
             max_class_listener_fds,
             budget,
@@ -877,7 +883,11 @@ impl AutoForwards {
         let (max_total_conns, port_conns, max_port_conns) = match self.conn_limit {
             ConnLimit::Shared(max) => (max, None, None),
             ConnLimit::PerPort { per_port, total } => {
-                (total, Some(Arc::new(AtomicUsize::new(0))), Some(per_port))
+                let active = &self.active;
+                self.port_conns
+                    .retain(|p, c| active.contains_key(p) || c.load(Ordering::Acquire) > 0);
+                let counter = self.port_conns.entry(port).or_default().clone();
+                (total, Some(counter), Some(per_port))
             }
         };
         let ctx = AcceptCtx {
@@ -2100,6 +2110,60 @@ mod tests {
 
         drop(a2);
         drop(b1);
+        fwd.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn per_port_limit_counts_draining_relays_after_port_is_re_added() {
+        let dir = std::env::temp_dir().join(format!("kat-autofwd-readd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fwd = AutoForwards::with_limit(
+            Upstream::AutoForward(fake_guest(&dir)),
+            &[Ipv4Addr::LOCALHOST],
+            ConnLimit::PerPort {
+                per_port: 2,
+                total: 8,
+            },
+        );
+        let open_active = |port: u16, tag: &[u8]| -> TcpStream {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(tag).unwrap();
+            let mut buf = vec![0u8; format!("{port}:").len() + tag.len()];
+            s.read_exact(&mut buf).unwrap();
+            s
+        };
+
+        // Fill the port's quota, then remove it: established relays drain.
+        let a = add_free_port(&mut fwd);
+        let mut a1 = open_active(a, b"1");
+        let a2 = open_active(a, b"2");
+        assert!(fwd.remove(a));
+        a1.write_all(b"still").unwrap();
+        let mut echo = [0u8; 5];
+        a1.read_exact(&mut echo).unwrap();
+        assert_eq!(&echo, b"still");
+
+        // Re-adding the port must still count those draining relays.
+        assert!(fwd.add(a).unwrap());
+        assert_conn_rejected(a);
+
+        // Once they close, the port gets its quota back.
+        drop(a1);
+        drop(a2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while fwd.active_conns.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(round_trip(a, "back"), format!("{a}:back"));
+
+        // Inactive, drained counters are pruned on the next add.
+        fwd.remove(a);
+        add_free_port(&mut fwd);
+        assert!(!fwd.port_conns.contains_key(&a));
+
         fwd.clear();
         std::fs::remove_dir_all(&dir).unwrap();
     }
