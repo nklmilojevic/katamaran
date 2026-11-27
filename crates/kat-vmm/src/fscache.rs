@@ -769,7 +769,9 @@ fn serve_with<N: Nodes, S>(
     loop {
         let now = Instant::now();
         let idle_deadline = if stream.is_some() {
-            Some(idle_since.map_or(now + idle_stop, |t| t + idle_stop))
+            let at = idle_since.map_or(now + idle_stop, |t| t + idle_stop);
+            // Teardown waits for a pending catch-up recheck, so do not wake before it.
+            Some(rescan_again.map_or(at, |r| at.max(r)))
         } else {
             stream_retry_at
         };
@@ -875,6 +877,7 @@ fn serve_with<N: Nodes, S>(
             if !any_active {
                 // Dormant: nothing cached in any share, no FSEvents stream running.
                 stream_retry_at = None;
+                rescan_again = None;
                 if guest_connected && debug_on() {
                     eprintln!("fscache: guest connected, dormant (no cached share entries)");
                 }
@@ -2115,6 +2118,112 @@ mod tests {
             ),
             "path match in DirIndex must catch recreated excluded directories"
         );
+    }
+
+    #[test]
+    fn idle_deadline_does_not_busy_loop_while_rescan_recheck_is_pending() {
+        let t = Tmp::new("idle-rescan-no-spin");
+        fs::create_dir_all(t.0.join("proj")).unwrap();
+        let table = Table::default();
+        table.hold_root(&t.0, 1);
+        table.hold(&t.0.join("proj"), 2, Some((1, "proj")));
+
+        let (mut guest_rx, host_tx) = UnixStream::pair().unwrap();
+        guest_rx
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicU64::new(0));
+        let active = Arc::new(AtomicBool::new(false));
+
+        struct ActiveStream(Arc<AtomicBool>);
+        impl Drop for ActiveStream {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let root = t.0.clone();
+        let table_bg = table.clone();
+        let overflow_bg = Arc::clone(&overflow);
+        let wake_bg = Arc::clone(&wake_pending);
+        let polls_bg = Arc::clone(&polls);
+        let active_bg = Arc::clone(&active);
+        let h = thread::spawn(move || {
+            serve_with(
+                &rx,
+                &overflow_bg,
+                &wake_bg,
+                &[root],
+                &[],
+                |_| {
+                    polls_bg.fetch_add(1, Ordering::Relaxed);
+                    Some(table_bg.clone())
+                },
+                &table_bg,
+                |_, _| {
+                    active_bg.store(true, Ordering::SeqCst);
+                    Ok(ActiveStream(Arc::clone(&active_bg)))
+                },
+                Duration::from_millis(120),
+                Duration::from_millis(150),
+            );
+        });
+
+        let mut buf = Vec::new();
+        tx.send(Input::Guest(host_tx)).unwrap();
+        // Initial stream-start rescan + delayed recheck.
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+
+        // Become idle and let idle_since age past idle_stop - recheck (30 ms).
+        table.forget(2);
+        tx.send(Input::Wake).unwrap();
+        thread::sleep(Duration::from_millis(80));
+
+        // Trigger overflow so rescan_again (now + 120 ms) lands AFTER idle_since + 150 ms.
+        polls.store(0, Ordering::Relaxed);
+        tx.send(Input::Overflow).unwrap();
+        // Immediate overflow rescan.
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        // Delayed overflow recheck (~120 ms later).
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        // Root ExpireDir sent as idle teardown runs right after the recheck.
+        assert!(
+            kat_proto::fscache::read_frame(&mut guest_rx, &mut buf)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(buf, encode(&[Inval::ExpireDir { share: 0, dir: 1 }])[0]);
+        thread::sleep(Duration::from_millis(20));
+        assert!(!active.load(Ordering::SeqCst));
+
+        let n = polls.load(Ordering::Relaxed);
+        assert!(
+            n < 20,
+            "serve_with busy-looped while rescan_again was pending ({n} iterations)"
+        );
+
+        drop(tx);
+        h.join().unwrap();
     }
 
     #[test]
