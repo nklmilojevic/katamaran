@@ -148,10 +148,32 @@ enum Input {
 /// Coordinates guest `AutoForwardAdd` / `AutoForwardRemove` events with
 /// [`crate::autofwd::AutoForwards`], retaining ports blocked by the listener
 /// descriptor budget and retrying them as soon as capacity frees up.
+///
+/// It also covers the published-to-automatic handoff: the guest sends
+/// `PortRemove` before `AutoForwardAdd` for the same port, but the published
+/// worker may not have closed its listener yet. An automatic add that hits
+/// `AddrInUse` on a port the published worker still holds waits for that
+/// port's `Removed` event instead of failing for good.
 struct AutoForwardTracker {
     forwards: crate::autofwd::AutoForwards,
     /// FIFO queue of `(proto, port)` waiting for listener descriptors.
     pending_capacity: Vec<(PortProto, u16)>,
+    /// Ports waiting for the published worker to release the same port.
+    pending_release: Vec<(PortProto, u16)>,
+    /// Ports the published worker reported `Forwarded` and has not yet
+    /// reported `Removed`.
+    published_held: std::collections::BTreeSet<(PortProto, u16)>,
+}
+
+/// Why [`AutoForwardTracker::attempt`] is binding a port.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// A guest `AutoForwardAdd`.
+    Guest,
+    /// Retrying after listener capacity was released.
+    Capacity,
+    /// Retrying after the published worker released the port.
+    Release,
 }
 
 impl AutoForwardTracker {
@@ -159,13 +181,30 @@ impl AutoForwardTracker {
         Self {
             forwards,
             pending_capacity: Vec::new(),
+            pending_release: Vec::new(),
+            published_held: std::collections::BTreeSet::new(),
         }
     }
 
     fn add(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
+        self.attempt(proto, port, Attempt::Guest, on_event);
+    }
+
+    fn attempt(
+        &mut self,
+        proto: PortProto,
+        port: u16,
+        why: Attempt,
+        on_event: &mut dyn FnMut(Event),
+    ) {
+        let key = (proto, port);
         match self.forwards.add(port) {
-            Ok(true) => {
-                self.pending_capacity.retain(|&(_, p)| p != port);
+            Ok(added) => {
+                self.pending_capacity.retain(|&k| k != key);
+                self.pending_release.retain(|&k| k != key);
+                if !added {
+                    return;
+                }
                 let addrs = self
                     .forwards
                     .bound_addrs(port)
@@ -178,22 +217,42 @@ impl AutoForwardTracker {
                 );
                 on_event(Event::PortAdd(PortOrigin::Automatic, proto, port, addrs));
             }
-            Ok(false) => {
-                self.pending_capacity.retain(|&(_, p)| p != port);
+            Err(crate::autofwd::AddError::CapacityExhausted(reason)) => {
+                self.pending_release.retain(|&k| k != key);
+                if !self.pending_capacity.contains(&key) {
+                    self.pending_capacity.push(key);
+                    if why != Attempt::Capacity {
+                        eprintln!(
+                            "katamaran: deferring auto-forward {}:{port}/{} ({reason}); will retry when a listener closes",
+                            self.forwards.label(),
+                            proto.as_str()
+                        );
+                        on_event(Event::PortFailed(
+                            PortOrigin::Automatic,
+                            proto,
+                            port,
+                            reason,
+                        ));
+                    }
+                }
             }
-            Err(crate::autofwd::AddError::CapacityExhausted(why)) => {
-                if !self.pending_capacity.iter().any(|&(_, p)| p == port) {
-                    self.pending_capacity.push((proto, port));
+            Err(crate::autofwd::AddError::Io(e))
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && self.published_held.contains(&key) =>
+            {
+                self.pending_capacity.retain(|&k| k != key);
+                if !self.pending_release.contains(&key) {
+                    self.pending_release.push(key);
                     eprintln!(
-                        "katamaran: deferring auto-forward {}:{port}/{} ({why}); will retry when a listener closes",
+                        "katamaran: auto-forward {}:{port}/{} waits for the published forward to release the port",
                         self.forwards.label(),
                         proto.as_str()
                     );
-                    on_event(Event::PortFailed(PortOrigin::Automatic, proto, port, why));
                 }
             }
             Err(crate::autofwd::AddError::Io(e)) => {
-                self.pending_capacity.retain(|&(_, p)| p != port);
+                self.pending_capacity.retain(|&k| k != key);
+                self.pending_release.retain(|&k| k != key);
                 eprintln!(
                     "katamaran: cannot auto-forward {}:{port}/{} ({e}); skipped",
                     self.forwards.label(),
@@ -210,7 +269,9 @@ impl AutoForwardTracker {
     }
 
     fn remove(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
-        self.pending_capacity.retain(|&(_, p)| p != port);
+        let key = (proto, port);
+        self.pending_capacity.retain(|&k| k != key);
+        self.pending_release.retain(|&k| k != key);
         let label = self.forwards.bound_label(port);
         if self.forwards.remove(port) {
             println!(
@@ -225,43 +286,24 @@ impl AutoForwardTracker {
     }
 
     fn retry_pending(&mut self, on_event: &mut dyn FnMut(Event)) {
-        if self.pending_capacity.is_empty() {
-            return;
+        for (proto, port) in std::mem::take(&mut self.pending_capacity) {
+            self.attempt(proto, port, Attempt::Capacity, on_event);
         }
-        let queued = std::mem::take(&mut self.pending_capacity);
-        for (proto, port) in queued {
-            match self.forwards.add(port) {
-                Ok(true) => {
-                    let addrs = self
-                        .forwards
-                        .bound_addrs(port)
-                        .map(<[std::net::Ipv4Addr]>::to_vec)
-                        .unwrap_or_else(|| vec![std::net::Ipv4Addr::LOCALHOST]);
-                    println!(
-                        "katamaran: auto-forwarding {}:{port}/{}",
-                        net::addrs_label(&addrs),
-                        proto.as_str()
-                    );
-                    on_event(Event::PortAdd(PortOrigin::Automatic, proto, port, addrs));
-                }
-                Ok(false) => {}
-                Err(crate::autofwd::AddError::CapacityExhausted(_)) => {
-                    self.pending_capacity.push((proto, port));
-                }
-                Err(crate::autofwd::AddError::Io(e)) => {
-                    eprintln!(
-                        "katamaran: cannot auto-forward {}:{port}/{} ({e}); skipped",
-                        self.forwards.label(),
-                        proto.as_str()
-                    );
-                    on_event(Event::PortFailed(
-                        PortOrigin::Automatic,
-                        proto,
-                        port,
-                        e.to_string(),
-                    ));
-                }
-            }
+    }
+
+    /// The published worker now listens on `port`.
+    fn published_forwarded(&mut self, proto: PortProto, port: u16) {
+        self.published_held.insert((proto, port));
+    }
+
+    /// The published worker closed `port`: retry an automatic forward that
+    /// was waiting for it.
+    fn published_removed(&mut self, proto: PortProto, port: u16, on_event: &mut dyn FnMut(Event)) {
+        let key = (proto, port);
+        self.published_held.remove(&key);
+        if self.pending_release.contains(&key) {
+            self.pending_release.retain(|&k| k != key);
+            self.attempt(proto, port, Attempt::Release, on_event);
         }
     }
 }
@@ -736,10 +778,12 @@ fn session(
                 }
             }
             Ok(Input::Forward(_, net::Event::Forwarded(proto, port, addrs))) => {
+                auto_forwards.published_forwarded(proto, port);
                 on_event(Event::PortAdd(PortOrigin::Published, proto, port, addrs));
             }
             Ok(Input::Forward(_, net::Event::Removed(proto, port))) => {
                 on_event(Event::PortRemove(PortOrigin::Published, proto, port));
+                auto_forwards.published_removed(proto, port, on_event);
             }
             Ok(Input::Forward(_, net::Event::Refused(proto, port, why)))
             | Ok(Input::Forward(_, net::Event::CapacityWait(proto, port, why))) => {
@@ -979,6 +1023,61 @@ mod tests {
                 "expected forward_addresses validation error for {bad:?}, got {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn auto_forward_waits_for_published_release_during_handoff() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let budget = crate::autofwd::RelayBudget::with_limits(64, 16);
+        let mut tracker =
+            AutoForwardTracker::new(crate::autofwd::AutoForwards::with_limits_and_budget(
+                crate::autofwd::Upstream::AutoForward(PathBuf::from("/nonexistent")),
+                &[Ipv4Addr::LOCALHOST],
+                crate::autofwd::ConnLimit::Shared(4),
+                None,
+                budget,
+            ));
+        let mut events = Vec::new();
+
+        // The published worker still holds the port: the guest already sent
+        // PortRemove, then AutoForwardAdd arrives before `Removed`.
+        let published = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = published.local_addr().unwrap().port();
+        tracker.published_forwarded(PortProto::Tcp, port);
+        tracker.add(PortProto::Tcp, port, &mut |e| events.push(e));
+        assert!(events.is_empty(), "handoff conflict reported: {events:?}");
+        assert_eq!(tracker.pending_release, vec![(PortProto::Tcp, port)]);
+        assert!(!tracker.forwards.contains(port));
+
+        // The published worker closes the port: the automatic forward binds
+        // without a second AutoForwardAdd.
+        drop(published);
+        tracker.published_removed(PortProto::Tcp, port, &mut |e| events.push(e));
+        assert!(matches!(
+            events.as_slice(),
+            [Event::PortAdd(PortOrigin::Automatic, PortProto::Tcp, p, a)]
+                if *p == port && a == &[Ipv4Addr::LOCALHOST]
+        ));
+        assert!(tracker.pending_release.is_empty());
+        assert!(tracker.forwards.contains(port));
+        events.clear();
+        tracker.remove(PortProto::Tcp, port, &mut |e| events.push(e));
+        events.clear();
+
+        // If the guest drops the automatic port before the release, the
+        // release does not resurrect it.
+        let published = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = published.local_addr().unwrap().port();
+        tracker.published_forwarded(PortProto::Tcp, port);
+        tracker.add(PortProto::Tcp, port, &mut |e| events.push(e));
+        tracker.remove(PortProto::Tcp, port, &mut |e| events.push(e));
+        assert!(tracker.pending_release.is_empty());
+        events.clear();
+        drop(published);
+        tracker.published_removed(PortProto::Tcp, port, &mut |e| events.push(e));
+        assert!(events.is_empty());
+        assert!(!tracker.forwards.contains(port));
     }
 
     #[test]
