@@ -1,5 +1,10 @@
 //! Validation and normalization of the host's `~/.katamaran/k3s-config.yaml`.
 //!
+//! Shared between host (`kat-daemon`, which validates before downloading or
+//! sending `k3s-config.yaml` and tracks applied settings on running clusters)
+//! and guest (`kat-init`, which writes the normalized JSON before launching
+//! `k3s server`).
+//!
 //! k3s reads its config file with `gopkg.in/yaml.v2` (v2.4.0 in every k3s
 //! release katamaran accepts, v1.31 through v1.37). Several go-yaml failure
 //! modes quote raw scalars in the error k3s writes to its log (for example
@@ -32,8 +37,9 @@
 //! flags k3s would have generated from the original.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
-pub(super) const INVALID_ETCD_S3_PROXY_ERR: &str = "invalid etcd-s3-proxy in k3s config YAML: must be \"none\" or a valid URL with scheme and host (for example http://proxy.example.com:8080)";
+pub const INVALID_ETCD_S3_PROXY_ERR: &str = "invalid etcd-s3-proxy in k3s config YAML: must be \"none\" or a valid URL with scheme and host (for example http://proxy.example.com:8080)";
 
 const MAX_KEY_LEN: usize = 128;
 
@@ -51,9 +57,9 @@ fn unsupported(line: usize, what: &str) -> String {
     )
 }
 
-/// Parse `yaml` as the supported subset, validate `etcd-s3-proxy`, and return
-/// the canonical JSON document to hand to k3s.
-pub(super) fn normalize_k3s_config_yaml(yaml: &str) -> Result<String, String> {
+/// Parse `yaml` as the supported subset, validate settings and `etcd-s3-proxy`,
+/// and return the canonical JSON document to hand to k3s.
+pub fn normalize_k3s_config_yaml(yaml: &str) -> Result<String, String> {
     normalize(yaml, true)
 }
 
@@ -63,14 +69,15 @@ fn normalize(yaml: &str, check_keys: bool) -> Result<String, String> {
     let (order, values) = merge_like_k3s(entries);
     // Only allowlisted k3s settings (the same list as `k8s_args`, plus
     // credential settings) are accepted, and component arguments that would
-    // override a katamaran-managed setting are refused.
+    // override a katamaran-managed setting or log inline credentials are
+    // refused.
     for key in order.iter().filter(|_| check_keys) {
         let items: Vec<&str> = match &values[key] {
             Value::Null => Vec::new(),
             Value::Str(s) => vec![s.as_str()],
             Value::List(l) => l.iter().map(|i| i.as_deref().unwrap_or("")).collect(),
         };
-        kat_proto::k8s::check_k3s_config_setting(key, &items)
+        crate::k8s::check_k3s_config_setting(key, &items)
             .map_err(|e| format!("k3s-config.yaml: {e}"))?;
     }
     if let Some(v) = values.get("etcd-s3-proxy") {
@@ -125,18 +132,38 @@ fn merge_like_k3s(entries: Vec<(String, Value)>) -> (Vec<String>, HashMap<String
     (order, values)
 }
 
-fn emit_json(order: &[String], values: &HashMap<String, Value>) -> String {
-    fn s(v: &str) -> String {
-        serde_json::to_string(v).expect("string serialization cannot fail")
+/// Encode a UTF-8 string as an RFC 8259 JSON string literal.
+fn encode_json_string(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
     }
+    out.push('"');
+    out
+}
+
+fn emit_json(order: &[String], values: &HashMap<String, Value>) -> String {
     let mut out = String::from("{");
     for (i, key) in order.iter().enumerate() {
         out.push_str(if i == 0 { "\n  " } else { ",\n  " });
-        out.push_str(&s(key));
+        out.push_str(&encode_json_string(key));
         out.push_str(": ");
         match &values[key] {
             Value::Null => out.push_str("null"),
-            Value::Str(v) => out.push_str(&s(v)),
+            Value::Str(v) => out.push_str(&encode_json_string(v)),
             Value::List(items) => {
                 out.push('[');
                 for (j, item) in items.iter().enumerate() {
@@ -144,7 +171,7 @@ fn emit_json(order: &[String], values: &HashMap<String, Value>) -> String {
                         out.push_str(", ");
                     }
                     match item {
-                        Some(v) => out.push_str(&s(v)),
+                        Some(v) => out.push_str(&encode_json_string(v)),
                         None => out.push_str("null"),
                     }
                 }
@@ -569,7 +596,7 @@ fn is_timestamp_prefix(s: &str) -> bool {
 
 // ---- etcd-s3-proxy URL validation (mirrors Go net/url as used by k3s) ----
 
-pub(super) fn is_valid_etcd_s3_proxy(val: &str) -> bool {
+pub fn is_valid_etcd_s3_proxy(val: &str) -> bool {
     // Match k3s `configfilearg.ToString`, which applies Go `strings.TrimSpace`
     // (identical to Rust `str::trim`) before passing the flag to `s3.GetClient`.
     let val = val.trim();
@@ -887,6 +914,19 @@ mod tests {
         assert_eq!(norm("# only comments\n\n"), "{}\n");
         // Values keep characters JSON must escape; single quotes may hold `"` and `\`.
         assert_eq!(norm("k: 'a\"b\\c'\n"), "{\n  \"k\": \"a\\\"b\\\\c\"\n}\n");
+        // Non-ASCII UTF-8 passes through unescaped, matching RFC 8259 / serde_json.
+        assert_eq!(
+            norm("k: 'caf\u{e9} \u{2713}'\n"),
+            "{\n  \"k\": \"caf\u{e9} \u{2713}\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn json_string_encoder_escapes_control_and_special_chars() {
+        assert_eq!(
+            encode_json_string("a\"b\\c\n\r\t\u{08}\u{0c}\u{01}\u{1f}"),
+            "\"a\\\"b\\\\c\\n\\r\\t\\b\\f\\u0001\\u001f\""
+        );
     }
 
     /// Duplicate keys and `key+` appends follow k3s `readConfigFile`.
@@ -1016,26 +1056,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_settings_katamaran_manages() {
+    fn rejects_settings_katamaran_manages_and_leaky_credentials() {
+        let secret = "placeholder-secret-8842";
         for yaml in [
-            "bind-address: 0.0.0.0\n",
-            "with-node-id: true\n",
-            "made-up-flag: x\n",
-            "kube-controller-arg: [cluster-cidr=10.8.0.0/16]\n",
-            "data-dir: /tmp/k3s\n",
-            "d: /tmp/k3s\n",
-            "config: /tmp/x.yaml\n",
-            "disable-kube-proxy: true\n",
-            "kubelet-arg: [root-dir=/x]\n",
-            "kubelet-arg:\n  - max-pods=200\n  - root_dir=/x\n",
-            "kubelet-arg: max-pods=200\nkubelet-arg+: [container-runtime-endpoint=unix:///x]\n",
-            "kube-proxy-arg: proxy-mode=iptables\n",
+            "bind-address: 0.0.0.0\n".to_string(),
+            "with-node-id: true\n".to_string(),
+            "embedded-registry: true\n".to_string(),
+            "made-up-flag: x\n".to_string(),
+            // External datastores and experimental VPN are excluded; passwords never appear in errors.
+            format!("datastore-endpoint: postgres://ops:{secret}@db.example.com:badport/k3s\n"),
+            "datastore-cafile: /etc/ca.pem\n".to_string(),
+            format!("vpn-auth: name=tailscale,joinKey={secret}\n"),
+            "vpn-auth-file: /etc/vpn-auth\n".to_string(),
+            // etcd-s3-endpoint must not accept schemes or credentials.
+            format!("etcd-s3-endpoint: https://ops:{secret}@s3.example.com\n"),
+            format!("etcd-s3-endpoint: ops:{secret}@s3.example.com:9000\n"),
+            "etcd-s3-endpoint: s3.example.com:badport\n".to_string(),
+            // Managed flags and component args.
+            "kube-controller-arg: [cluster-cidr=10.8.0.0/16]\n".to_string(),
+            "kube-controller-manager-arg: [kubeconfig=/tmp/kc]\n".to_string(),
+            "kube-scheduler-arg: [kubeconfig=/tmp/kc]\n".to_string(),
+            "kube-proxy-arg: [kubeconfig=/tmp/kc]\n".to_string(),
+            "kube-cloud-controller-arg: [kubeconfig=/tmp/kc]\n".to_string(),
+            "helm-controller-arg: [kubeconfig=/tmp/kc]\n".to_string(),
+            "data-dir: /tmp/k3s\n".to_string(),
+            "d: /tmp/k3s\n".to_string(),
+            "config: /tmp/x.yaml\n".to_string(),
+            "disable-kube-proxy: true\n".to_string(),
+            "kubelet-arg: [root-dir=/x]\n".to_string(),
+            "kubelet-arg: [fail-swap-on=true]\n".to_string(),
+            "kubelet-arg: [node-ip=10.0.0.2]\n".to_string(),
+            "kubelet-arg: [resolv-conf=/etc/alt.conf]\n".to_string(),
+            "kubelet-arg:\n  - max-pods=200\n  - root_dir=/x\n".to_string(),
+            "kubelet-arg: max-pods=200\nkubelet-arg+: [container-runtime-endpoint=unix:///x]\n"
+                .to_string(),
+            "kube-proxy-arg: proxy-mode=iptables\n".to_string(),
+            // Embedded etcd data/WAL/config overrides.
+            "etcd-arg: [data-dir=/tmp/etcd]\n".to_string(),
+            "etcd-arg: ['  --data-dir=/tmp/etcd']\n".to_string(),
+            "etcd-arg: [wal-dir=/tmp/wal]\n".to_string(),
+            "etcd-arg: [config-file=/tmp/etcd.yaml]\n".to_string(),
+            // Leading whitespace trimmed by k3s configfilearg.ToString before forwarding.
+            "kube-apiserver-arg: [\"  bind-address=0.0.0.0\"]\n".to_string(),
+            "kube-apiserver-arg: \"  --secure-port=7443\"\n".to_string(),
+            "kubelet-arg: ['  fail-swap-on=true']\n".to_string(),
+            // Inline kubelet manifest credentials logged at info level by k3s.
+            format!("kubelet-arg: ['manifest-url-header=Authorization:Bearer {secret}']\n"),
+            format!("kubelet-arg: ['  --manifest-url-header=X-Auth:{secret}']\n"),
+            format!("kubelet-arg: ['manifest-url=https://ops:{secret}@example.com/pod.yaml']\n"),
+            // kube-apiserver datastore override.
+            format!("kube-apiserver-arg: ['etcd-servers=https://ops:{secret}@etcd:2379']\n"),
         ] {
-            let err = normalize_k3s_config_yaml(yaml).expect_err(yaml);
+            let err = normalize_k3s_config_yaml(&yaml).expect_err(&yaml);
             assert!(err.starts_with("k3s-config.yaml: --"), "{yaml:?}: {err}");
+            assert!(!err.contains(secret), "{yaml:?} echoed secret: {err}");
         }
+        // Credential-specific diagnostic for manifest-url-header.
+        let hdr_err = normalize_k3s_config_yaml(
+            "kubelet-arg:\n  - 'manifest-url-header=Authorization:Bearer topsecret'\n",
+        )
+        .unwrap_err();
+        assert!(hdr_err.contains("credentials"), "{hdr_err}");
+        assert!(!hdr_err.contains("topsecret"), "{hdr_err}");
+
         normalize_k3s_config_yaml(
-            "disable: [traefik]\nkubelet-arg: [max-pods=200]\nkube-proxy-arg: [metrics-bind-address=0.0.0.0:10249]\ntoken: abc\netcd-s3-proxy: none\nnode-label+: [a=b]\n",
+            "disable: [traefik]\nkubelet-arg: [max-pods=200]\nkube-proxy-arg: [metrics-bind-address=0.0.0.0:10249]\netcd-arg: [quota-backend-bytes=4294967296]\ntoken: abc\netcd-s3-endpoint: minio.local:9000\netcd-s3-proxy: none\nnode-label+: [a=b]\n",
         )
         .unwrap();
     }

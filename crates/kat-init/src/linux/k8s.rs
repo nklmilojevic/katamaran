@@ -26,10 +26,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kat_proto::k3s_config::normalize_k3s_config_yaml;
 use kat_proto::k8s::{self, CHUNK, K8sInfo, K8sMsg};
 use kat_proto::{K8S_PORT, Msg};
 
-use super::k3s_config::normalize_k3s_config_yaml;
 use super::machines::cmd::{pipe, run_status as run_reaped};
 use super::service::{
     CONTAINERD_SOCKET, DOCKER_SOCKET, DockerStack, Notifier, Reaper, describe_status,
@@ -175,8 +175,23 @@ pub fn forwarded_ports() -> BTreeSet<u16> {
     FORWARDED.lock().unwrap().clone()
 }
 
-/// The `k8s_args` and raw `k3s-config.yaml` a k3s instance was started with.
+/// The `k8s_args` and canonical JSON output of `k3s-config.yaml` (or `None`
+/// when absent) a k3s instance was started with.
 type StartSettings = (Vec<String>, Option<String>);
+
+fn check_running_settings_match(
+    running: &StartSettings,
+    requested_args: &[String],
+    requested_config_json: Option<&str>,
+) -> Result<(), String> {
+    if running.0 == requested_args && running.1.as_deref() == requested_config_json {
+        return Ok(());
+    }
+    Err(
+        "Kubernetes is already running with different k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
+            .into(),
+    )
+}
 
 struct Running {
     pid: i32,
@@ -2162,20 +2177,32 @@ impl K8s {
             return Err("aborted: VM is shutting down".into());
         }
         ensure_no_unreaped_k3s()?;
+        // Validate extra_args and normalize config_yaml before checking
+        // already-running state so invalid inputs always return their
+        // validation error and the running-settings comparison uses canonical
+        // JSON (comment-only YAML edits match).
+        let server_args = build_k3s_server_args(extra_args)?;
+        // k3s reads a canonical JSON rewrite of the host YAML, never the raw
+        // file; see `kat_proto::k3s_config` for the accepted subset and why.
+        let managed_config = match config_yaml {
+            Some(yaml) => Some(normalize_k3s_config_yaml(yaml)?),
+            None => None,
+        };
         {
             let st = self.state.lock().unwrap();
             if st.phase == "running" && st.api_ready {
                 // Never report success while silently ignoring new settings.
-                let same = st.running.as_ref().is_some_and(|r| {
-                    r.settings.0 == extra_args && r.settings.1.as_deref() == config_yaml
-                });
-                drop(st);
-                if !same {
-                    return Err(
+                let cmp = match st.running.as_ref() {
+                    Some(r) => {
+                        check_running_settings_match(&r.settings, extra_args, managed_config.as_deref())
+                    }
+                    None => Err(
                         "Kubernetes is already running with different k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
                             .into(),
-                    );
-                }
+                    ),
+                };
+                drop(st);
+                cmp?;
                 return Ok(self.info());
             }
         }
@@ -2199,16 +2226,9 @@ impl K8s {
             &state_db_probe(),
             |cmd| self.run_sqlite_cmd(cmd),
         )?;
-        let server_args = build_k3s_server_args(extra_args)?;
-        // k3s reads a canonical JSON rewrite of the host YAML, never the raw
-        // file; see `k3s_config` for the accepted subset and why.
-        let managed_config = match config_yaml {
-            Some(yaml) => {
-                reject_managed_config_dropins(Path::new(K3S_CONFIG_PATH))?;
-                Some(normalize_k3s_config_yaml(yaml)?)
-            }
-            None => None,
-        };
+        if managed_config.is_some() {
+            reject_managed_config_dropins(Path::new(K3S_CONFIG_PATH))?;
+        }
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("preparing k3s environment".into()),
@@ -2330,7 +2350,7 @@ impl K8s {
             st.error.clear();
             st.running = Some(Running {
                 pid,
-                settings: (extra_args.to_vec(), config_yaml.map(str::to_string)),
+                settings: (extra_args.to_vec(), managed_config),
                 exit_rx,
                 exited: exited.clone(),
                 sync_stop: sync_stop.clone(),
@@ -8273,5 +8293,40 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn running_settings_compare_normalized_json_and_json_round_trips() {
+        let yaml_a = "# original comment\ndisable:\n  - traefik\nkubelet-arg: [max-pods=200]\n";
+        let yaml_b = "# edited comment\ndisable: [traefik]\nkubelet-arg:\n  - max-pods=200\n";
+        let yaml_c = "disable: [servicelb]\n";
+
+        let json_a = normalize_k3s_config_yaml(yaml_a).unwrap();
+        let json_b = normalize_k3s_config_yaml(yaml_b).unwrap();
+        let json_c = normalize_k3s_config_yaml(yaml_c).unwrap();
+        assert_eq!(json_a, json_b);
+        assert_ne!(json_a, json_c);
+
+        // Verify pure-std JSON emitter produces valid JSON matching serde_json.
+        let parsed: serde_json::Value = serde_json::from_str(&json_a).unwrap();
+        assert_eq!(parsed["disable"], serde_json::json!(["traefik"]));
+        assert_eq!(parsed["kubelet-arg"], serde_json::json!(["max-pods=200"]));
+        let special = normalize_k3s_config_yaml("node-label: ['a\"b\\c=caf\u{e9}']\n").unwrap();
+        let parsed_special: serde_json::Value = serde_json::from_str(&special).unwrap();
+        assert_eq!(
+            parsed_special["node-label"],
+            serde_json::json!(["a\"b\\c=caf\u{e9}"])
+        );
+
+        let running = (vec!["--debug".to_string()], Some(json_a));
+        // Comment/formatting-only YAML edit matches.
+        check_running_settings_match(&running, &["--debug".to_string()], Some(&json_b)).unwrap();
+        // Changed YAML, removed YAML, or changed extra_args are refused.
+        assert!(
+            check_running_settings_match(&running, &["--debug".to_string()], Some(&json_c))
+                .is_err()
+        );
+        assert!(check_running_settings_match(&running, &["--debug".to_string()], None).is_err());
+        assert!(check_running_settings_match(&running, &[], Some(&json_b)).is_err());
     }
 }

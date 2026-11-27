@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 
 pub mod backoff;
 pub mod fscache;
+pub mod k3s_config;
 pub mod k8s;
 pub mod machine;
 

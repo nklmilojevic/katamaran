@@ -204,6 +204,7 @@ struct K8sRuntime {
     api_proxy: Option<crate::k8s::ApiProxy>,
     dns: Option<crate::k8s::DnsServer>,
     kubeconfig: Option<PathBuf>,
+    started_settings: Option<crate::k8s::K8sStartSettings>,
     error: Option<String>,
     /// Set while `k8s_reset` temporarily boots a stopped VM so Docker
     /// readiness does not auto-start k3s before the reset runs.
@@ -220,6 +221,7 @@ impl Default for K8sRuntime {
             api_proxy: None,
             dns: None,
             kubeconfig: None,
+            started_settings: None,
             error: None,
             suppress_autostart: false,
         }
@@ -543,6 +545,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.state = "stopped".into();
             }
             let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
@@ -554,6 +557,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.state = "failed".into();
                 k.error = Some(err);
             }
@@ -605,6 +609,7 @@ impl Daemon {
             k.api_proxy = None;
             k.dns = None;
             k.kubeconfig = None;
+            k.started_settings = None;
             k.state = "stopped".into();
         }
         let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
@@ -1137,21 +1142,30 @@ impl Daemon {
             return Ok(self.k8s_status(false));
         }
 
-        let (vm_gen, k8s_epoch, already_running) = {
+        let (vm_gen, k8s_epoch, already_running_settings) = {
             let g = self.lock();
             if g.state != VmState::Running {
                 return Err(failed("the VM is no longer running".into()));
             }
             let mut k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
             if k.state == "running" && k.api_proxy.is_some() {
-                (g.generation, k.epoch, true)
+                (g.generation, k.epoch, Some(k.started_settings.clone()))
             } else {
                 k.state = "starting".into();
                 k.error = None;
-                (g.generation, k.epoch, false)
+                (g.generation, k.epoch, None)
             }
         };
-        if already_running {
+        if let Some(started) = already_running_settings {
+            // Never report success while silently ignoring changed or invalid settings.
+            let prepared =
+                crate::k8s::prepare_start(&self.home).map_err(|e| failed(format!("{e:#}")))?;
+            if started.as_ref() != Some(&prepared.settings) {
+                return Err(failed(
+                    "Kubernetes is already running with different k8s_version, k8s_disable, k8s_args or k3s-config.yaml settings; run `kat k8s stop` and start it again to apply them"
+                        .into(),
+                ));
+            }
             if persist_enabled {
                 self.persist_k8s_enabled(true)
                     .map_err(|e| failed(format!("{e:#}")))?;
@@ -1166,13 +1180,14 @@ impl Daemon {
             crate::k8s::ApiProxy,
             crate::k8s::DnsServer,
             PathBuf,
+            crate::k8s::K8sStartSettings,
         )> {
-            // Validate config.toml / k3s-config.yaml and guest support before
-            // downloading and installing k3s (the VM is already up here).
-            let start_msg = crate::k8s::build_start_msg(&self.home)?;
-            crate::k8s::ensure_start_supported(&self.home, &start_msg)?;
-            crate::k8s::ensure_installed(&self.home, progress)?;
-            let info = match crate::k8s::request(&self.home, &start_msg, progress)? {
+            // Validate config.toml and k3s-config.yaml and check guest support
+            // before downloading and installing k3s (the VM is already up here).
+            let prepared = crate::k8s::prepare_start(&self.home)?;
+            crate::k8s::ensure_start_supported(&self.home, &prepared.msg)?;
+            crate::k8s::ensure_installed(&self.home, &prepared.settings.version, progress)?;
+            let info = match crate::k8s::request(&self.home, &prepared.msg, progress)? {
                 kat_proto::k8s::K8sMsg::StatusInfo(info) => info,
                 other => anyhow::bail!("unexpected k8s start reply {other:?}"),
             };
@@ -1192,7 +1207,7 @@ impl Daemon {
             progress("updating ~/.kube/config");
             let kc_path = crate::k8s::write_and_merge_kubeconfig(&self.home, &raw_kc, proxy.port)?;
             kubeconfig_merged = true;
-            Ok((info, proxy, dns, kc_path))
+            Ok((info, proxy, dns, kc_path, prepared.settings))
         })();
 
         let is_fresh = |g: &Inner, k: &K8sRuntime| {
@@ -1218,7 +1233,7 @@ impl Daemon {
         };
 
         let e = match res {
-            Ok((info, proxy, dns, kc_path)) => {
+            Ok((info, proxy, dns, kc_path, started_settings)) => {
                 let stale = {
                     let g = self.lock();
                     let k = self.k8s.lock().unwrap_or_else(|e| e.into_inner());
@@ -1255,6 +1270,7 @@ impl Daemon {
                     k.api_proxy = Some(proxy);
                     k.dns = Some(dns);
                     k.kubeconfig = Some(kc_path);
+                    k.started_settings = Some(started_settings);
                     k.error = None;
                     drop(k);
                     drop(g);
@@ -1286,6 +1302,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.error = Some(msg.clone());
             }
         }
@@ -1354,6 +1371,7 @@ impl Daemon {
             k.api_proxy = None;
             k.dns = None;
             k.kubeconfig = None;
+            k.started_settings = None;
             k.state = "stopped".into();
             k.error = None;
         }
@@ -1438,6 +1456,7 @@ impl Daemon {
                 k.api_proxy = None;
                 k.dns = None;
                 k.kubeconfig = None;
+                k.started_settings = None;
                 k.state = "stopped".into();
                 k.error = reset_res.as_ref().err().map(|e| e.message.clone());
             }
@@ -2399,6 +2418,113 @@ mod tests {
         let get = d.handle(&Call::ConfigGet).unwrap();
         assert!(get.get("k8s_toggled").is_none());
 
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn k8s_start_refuses_silent_noop_when_settings_changed_while_running() {
+        let home = temp("k8s-run");
+        fs::create_dir_all(home.join("run")).unwrap();
+        let d = Daemon::new(home.clone());
+
+        let host = Host {
+            cpus: 255,
+            memory_mib: 32768,
+        };
+        let mut cfg = Config::default();
+        cfg.set("k8s_disable", "traefik", &host).unwrap();
+        cfg.set("k8s_args", "--debug", &host).unwrap();
+        cfg.save(&home).unwrap();
+        let yaml_path = crate::k8s::k3s_config_path(&home);
+        fs::write(&yaml_path, "# initial\ndisable:\n  - metrics-server\n").unwrap();
+
+        let initial = crate::k8s::prepare_start(&home).unwrap();
+        let proxy = crate::k8s::ApiProxy::start(&home).unwrap();
+        {
+            let mut g = d.lock();
+            g.generation = 1;
+            g.state = VmState::Running;
+            let mut run = Run::new(cfg.clone(), None);
+            run.docker = DockerState::Ready;
+            g.run = Some(run);
+            let mut k = d.k8s.lock().unwrap();
+            k.state = "running".into();
+            k.api_proxy = Some(proxy);
+            k.started_settings = Some(initial.settings);
+        }
+
+        let mut noop = |_: &str| {};
+        // 1. Identical settings succeed as a no-op.
+        let st = d.k8s_start_inner(false, false, false, &mut noop).unwrap();
+        assert_eq!(st.state, "running");
+
+        // 2. Comment/formatting-only YAML edit still matches normalized JSON.
+        fs::write(&yaml_path, "# edited comment\ndisable: [metrics-server]\n").unwrap();
+        let st = d.k8s_start_inner(false, false, false, &mut noop).unwrap();
+        assert_eq!(st.state, "running");
+
+        // 3. Changing k8s_disable is refused instead of silently returning Ok,
+        //    and leaves the running cluster intact.
+        let mut changed_disable = cfg.clone();
+        changed_disable
+            .set("k8s_disable", "traefik,servicelb", &host)
+            .unwrap();
+        changed_disable.save(&home).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+        assert_eq!(d.k8s.lock().unwrap().state, "running");
+        cfg.save(&home).unwrap();
+
+        // 4. Changing k8s_args is refused.
+        let mut changed_args = cfg.clone();
+        changed_args
+            .set("k8s_args", "--debug --kubelet-arg=max-pods=200", &host)
+            .unwrap();
+        changed_args.save(&home).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+        cfg.save(&home).unwrap();
+
+        // 5. Changing k8s_version is refused.
+        let mut changed_ver = cfg.clone();
+        changed_ver
+            .set("k8s_version", "v1.32.5+k3s1", &host)
+            .unwrap();
+        changed_ver.save(&home).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+        cfg.save(&home).unwrap();
+
+        // 6. Changing k3s-config.yaml content is refused.
+        fs::write(&yaml_path, "disable: [servicelb]\n").unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+
+        // 7. Removing k3s-config.yaml is refused.
+        fs::remove_file(&yaml_path).unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("kat k8s stop"), "got: {}", err.message);
+
+        // 8. Invalid k3s-config.yaml returns the validation error and keeps state running.
+        fs::write(&yaml_path, "bind-address: 0.0.0.0\n").unwrap();
+        let err = d
+            .k8s_start_inner(false, false, false, &mut noop)
+            .unwrap_err();
+        assert!(err.message.contains("bind-address"), "got: {}", err.message);
+        assert_eq!(d.k8s.lock().unwrap().state, "running");
+
+        // Clean up ApiProxy before removing temp dir.
+        d.k8s.lock().unwrap().api_proxy = None;
         fs::remove_dir_all(&home).unwrap();
     }
 }

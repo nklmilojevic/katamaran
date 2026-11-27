@@ -330,8 +330,9 @@ fn parse_k3s_flag(arg: &str) -> Option<(&str, Option<&str>)> {
 /// optional components and features. Everything else is rejected, because
 /// the guest sets or depends on it (data dir, kubeconfig, API listener and
 /// ports, node identity, networking, container runtime, control-plane
-/// components, joining other servers) or because it is not useful in the
-/// single-node guest. An allowlist, so new or obscure k3s flags fail closed.
+/// components, joining other servers, external datastores, experimental VPN)
+/// or because it is not useful in the single-node guest. An allowlist, so new
+/// or obscure k3s flags fail closed.
 const ALLOWED_K3S_FLAGS: &[&str] = &[
     "debug",
     "v",
@@ -361,7 +362,6 @@ const ALLOWED_K3S_FLAGS: &[&str] = &[
     "default-local-storage-path",
     "secrets-encryption",
     "secrets-encryption-provider",
-    "embedded-registry",
     "system-default-registry",
     "private-registry",
     "pause-image",
@@ -376,18 +376,17 @@ const ALLOWED_K3S_FLAGS: &[&str] = &[
     "nonroot-devices",
     "token-file",
     "agent-token-file",
-    "vpn-auth-file",
 ];
 
-/// Datastore and snapshot settings, also accepted (in `k8s_args` only when
-/// not in [`CREDENTIAL_K3S_FLAGS`]). They change where cluster state lives;
-/// `kat k8s reset` only wipes the local data directory.
+/// Embedded etcd, snapshot and token settings, also accepted (in `k8s_args`
+/// only when not in [`CREDENTIAL_K3S_FLAGS`]). External datastores
+/// (`datastore-endpoint` and its TLS flags) and experimental VPN (`vpn-auth*`)
+/// are intentionally excluded: Kine and k3s can log malformed DSNs or URLs
+/// with embedded credentials to `/var/log/k3s.log`, and Katamaran's reset and
+/// minor-version downgrade guard assume cluster state lives under the managed
+/// local data directory.
 const DATASTORE_K3S_FLAGS: &[&str] = &[
     "cluster-init",
-    "datastore-endpoint",
-    "datastore-cafile",
-    "datastore-certfile",
-    "datastore-keyfile",
     "etcd-disable-snapshots",
     "etcd-expose-metrics",
     "etcd-arg",
@@ -415,16 +414,16 @@ const DATASTORE_K3S_FLAGS: &[&str] = &[
     "etcd-s3-proxy",
     "token",
     "agent-token",
-    "vpn-auth",
 ];
 
 /// Component settings that would override something katamaran manages,
 /// directly or through the component's own config file: the kubelet root
 /// that stop/reset unmount, swap tolerance (the guest runs zram swap), the
-/// kubelet and API server credentials k3s generates, the shared containerd,
-/// the node name, the pod and
-/// service CIDRs and cluster DNS, kube-proxy's nftables mode (stop/reset only
-/// delete its nftables table), and the API server address the relay uses.
+/// embedded etcd data/WAL directories that reset deletes, the node IP and
+/// resolver config, the component kubeconfigs and TLS credentials k3s
+/// generates, the shared containerd, the node name, the pod and service CIDRs
+/// and cluster DNS, kube-proxy's nftables mode (stop/reset only delete its
+/// nftables table), and internal control-plane ports/addresses.
 /// Other component arguments pass through unchecked.
 const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
     (
@@ -432,12 +431,20 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
         &[
             "root-dir",
             "container-runtime-endpoint",
+            "image-service-endpoint",
             "hostname-override",
             "cluster-dns",
             "fail-swap-on",
+            "node-ip",
+            "resolv-conf",
             "kubeconfig",
             "bootstrap-kubeconfig",
             "cert-dir",
+            "tls-cert-file",
+            "tls-private-key-file",
+            "client-ca-file",
+            "address",
+            "port",
             "config",
             "config-dir",
         ],
@@ -448,6 +455,10 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
             "proxy-mode",
             "cluster-cidr",
             "hostname-override",
+            "kubeconfig",
+            "master",
+            "healthz-bind-address",
+            "healthz-port",
             "config",
             "write-config-to",
         ],
@@ -458,10 +469,27 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
             "secure-port",
             "bind-address",
             "advertise-address",
+            "advertise-port",
             "service-cluster-ip-range",
+            "cert-dir",
             "tls-cert-file",
             "tls-private-key-file",
             "client-ca-file",
+            "storage-backend",
+            "etcd-servers",
+            "etcd-servers-overrides",
+            "etcd-cafile",
+            "etcd-certfile",
+            "etcd-keyfile",
+            "kubelet-client-certificate",
+            "kubelet-client-key",
+            "kubelet-certificate-authority",
+            "proxy-client-cert-file",
+            "proxy-client-key-file",
+            "requestheader-client-ca-file",
+            "service-account-key-file",
+            "service-account-signing-key-file",
+            "service-account-issuer",
         ],
     ),
     (
@@ -470,9 +498,84 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
             "cluster-cidr",
             "service-cluster-ip-range",
             "allocate-node-cidrs",
+            "kubeconfig",
+            "authorization-kubeconfig",
+            "authentication-kubeconfig",
+            "master",
+            "bind-address",
+            "secure-port",
+            "tls-cert-file",
+            "tls-private-key-file",
+            "root-ca-file",
+            "service-account-private-key-file",
+        ],
+    ),
+    (
+        "kube-scheduler-arg",
+        &[
+            "kubeconfig",
+            "authorization-kubeconfig",
+            "authentication-kubeconfig",
+            "master",
+            "bind-address",
+            "secure-port",
+            "tls-cert-file",
+            "tls-private-key-file",
+            "config",
+            "write-config-to",
+        ],
+    ),
+    (
+        "kube-cloud-controller-manager-arg",
+        &[
+            "kubeconfig",
+            "authorization-kubeconfig",
+            "authentication-kubeconfig",
+            "master",
+            "cluster-cidr",
+            "allocate-node-cidrs",
+            "bind-address",
+            "secure-port",
+        ],
+    ),
+    (
+        "helm-controller-arg",
+        &["kubeconfig", "master-url", "node-name"],
+    ),
+    (
+        "etcd-arg",
+        &[
+            "data-dir",
+            "wal-dir",
+            "config-file",
+            "name",
+            "listen-client-urls",
+            "listen-client-http-urls",
+            "listen-peer-urls",
+            "advertise-client-urls",
+            "initial-advertise-peer-urls",
+            "initial-cluster",
+            "initial-cluster-state",
+            "initial-cluster-token",
+            "client-transport-security",
+            "peer-transport-security",
+            "cert-file",
+            "key-file",
+            "trusted-ca-file",
+            "client-cert-auth",
+            "peer-cert-file",
+            "peer-key-file",
+            "peer-trusted-ca-file",
+            "peer-client-cert-auth",
         ],
     ),
 ];
+
+/// Component arguments that can carry inline credentials and are logged
+/// verbatim at info level by k3s (`daemonconfig.ArgString`), so they are
+/// rejected in both `k8s_args` and `k3s-config.yaml`.
+const CREDENTIAL_COMPONENT_ARGS: &[(&str, &[&str])] =
+    &[("kubelet-arg", &["manifest-url-header", "manifest-url"])];
 
 /// Settings whose value can carry credentials: accepted only in
 /// `k3s-config.yaml`. `k8s_args` end up on the k3s process command line,
@@ -480,20 +583,73 @@ const MANAGED_COMPONENT_ARGS: &[(&str, &[&str])] = &[
 const CREDENTIAL_K3S_FLAGS: &[&str] = &[
     "token",
     "agent-token",
-    "datastore-endpoint",
     "etcd-s3-access-key",
     "etcd-s3-secret-key",
     "etcd-s3-session-token",
     "etcd-s3-proxy",
-    "vpn-auth",
 ];
+
+fn is_valid_port_str(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+/// k3s logs `etcd-s3-endpoint` at info level (`s3.GetClient`) and passes it to
+/// `minio.New`, which expects `host` or `host:port` with no scheme, path or
+/// userinfo. Reject anything else with a fixed error so credentials placed here
+/// by mistake never reach `/var/log/k3s.log`.
+fn is_valid_etcd_s3_endpoint(val: &str) -> bool {
+    let val = val.trim();
+    if val.is_empty() {
+        return true;
+    }
+    if val
+        .bytes()
+        .any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\'))
+    {
+        return false;
+    }
+    if let Some(after_open) = val.strip_prefix('[') {
+        let Some((inside, after_close)) = after_open.split_once(']') else {
+            return false;
+        };
+        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        if after_close.is_empty() {
+            return true;
+        }
+        let Some(port) = after_close.strip_prefix(':') else {
+            return false;
+        };
+        return is_valid_port_str(port);
+    }
+    if val.contains(['[', ']']) {
+        return false;
+    }
+    let (host, port) = match val.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (val, None),
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    {
+        return false;
+    }
+    port.is_none_or(is_valid_port_str)
+}
 
 /// The setting a component argument such as `root-dir=/x`, `--root_dir=/x`
 /// or `root-dir+=/x` addresses, normalized the way kubelet/kube-proxy
-/// (`_` == `-`) and k3s (`+=`/`-=` suffixes) read it.
+/// (`_` == `-`), k3s (`+=`/`-=` suffixes and `configfilearg.ToString`
+/// whitespace trimming) and `urfave/cli/v2` (`StringSlice.Set` trimming when
+/// `KeepSpace` is false) read it.
 fn component_arg_key(value: &str) -> String {
-    let setting = value.trim_start_matches('-');
-    let key = setting.split_once('=').map_or(setting, |(k, _)| k);
+    let setting = value.trim().trim_start_matches('-');
+    let key = setting.split_once('=').map_or(setting, |(k, _)| k).trim();
     key.trim_end_matches(['+', '-']).replace('_', "-")
 }
 
@@ -512,11 +668,30 @@ fn check_k3s_setting(name: &str, values: &[&str], in_args: bool) -> Result<(), S
             "--{name} can carry credentials and would appear in the k3s process command line and, with --debug, its log; set `{name}:` in ~/.katamaran/k3s-config.yaml (or use the matching *-file flag) instead"
         ));
     }
+    if name == "etcd-s3-endpoint" && values.iter().any(|v| !is_valid_etcd_s3_endpoint(v)) {
+        return Err(
+            "--etcd-s3-endpoint must be a host or host:port without a scheme, path or credentials"
+                .into(),
+        );
+    }
     let component = match name {
         "kube-controller-arg" => "kube-controller-manager-arg",
         "kube-cloud-controller-arg" => "kube-cloud-controller-manager-arg",
         other => other,
     };
+    if let Some((_, forbidden)) = CREDENTIAL_COMPONENT_ARGS
+        .iter()
+        .find(|(f, _)| *f == component)
+    {
+        for v in values {
+            let key = component_arg_key(v);
+            if forbidden.contains(&key.as_str()) {
+                return Err(format!(
+                    "--{name} cannot set {key}: k3s logs component arguments at info level, which would expose inline credentials in /var/log/k3s.log"
+                ));
+            }
+        }
+    }
     if let Some((_, managed)) = MANAGED_COMPONENT_ARGS.iter().find(|(f, _)| *f == component) {
         for v in values {
             let key = component_arg_key(v);
@@ -540,7 +715,6 @@ const BOOL_K3S_FLAGS: &[&str] = &[
     "disable-network-policy",
     "disable-default-registry-endpoint",
     "secrets-encryption",
-    "embedded-registry",
     "protect-kernel-defaults",
     "enable-pprof",
     "supervisor-metrics",
@@ -556,8 +730,11 @@ const BOOL_K3S_FLAGS: &[&str] = &[
 ];
 
 /// Check one `k3s-config.yaml` key and its values (see [`check_k3s_setting`]).
+/// Values are trimmed the way k3s `configfilearg.ToString` trims them before
+/// turning config entries into CLI arguments.
 pub fn check_k3s_config_setting(name: &str, values: &[&str]) -> Result<(), String> {
-    check_k3s_setting(name, values, false)
+    let trimmed: Vec<&str> = values.iter().map(|v| v.trim()).collect();
+    check_k3s_setting(name, &trimmed, false)
 }
 
 /// Validate `k8s_args` before they are saved (host) and before `k3s server`
@@ -572,8 +749,10 @@ pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         let Some((name, inline)) = parse_k3s_flag(&args[i]) else {
-            i += 1;
-            continue;
+            return Err(
+                "k8s_args: unexpected non-flag argument (every entry must be a k3s server flag or its value)"
+                    .into(),
+            );
         };
         // Like Go's flag parser, a non-boolean flag without `=value` takes
         // the next argument as its value even if it starts with `-`.
@@ -584,6 +763,9 @@ pub fn validate_k3s_extra_args(args: &[String]) -> Result<(), String> {
             inline
         };
         check_k3s_setting(name, value.as_slice(), true).map_err(|e| format!("k8s_args: {e}"))?;
+        if takes_next && value.is_none() {
+            return Err(format!("k8s_args: --{name} requires a value"));
+        }
         i += if takes_next { 2 } else { 1 };
     }
     Ok(())
@@ -612,6 +794,18 @@ mod tests {
         v(&["--kubelet-arg", "--root-dir=/x"]).unwrap_err();
         // A boolean flag does not consume the next argument.
         v(&["--debug", "--bind-address=0.0.0.0"]).unwrap_err();
+        // Bare positional tokens and missing values for non-bool flags are rejected without echoing.
+        let bare_err = v(&["placeholder-bare-secret"]).unwrap_err();
+        assert!(!bare_err.contains("placeholder-bare-secret"), "{bare_err}");
+        assert!(v(&["--debug", "true"]).is_err());
+        assert!(v(&["--", "--debug"]).is_err());
+        assert!(v(&["--kubelet-arg"]).is_err());
+        // Valid etcd-s3-endpoint forms pass; schemes, paths and credentials are rejected.
+        v(&["--etcd-s3-endpoint=s3.amazonaws.com"]).unwrap();
+        v(&["--etcd-s3-endpoint=minio.local:9000"]).unwrap();
+        v(&["--etcd-s3-endpoint=[::1]:9000"]).unwrap();
+        v(&["--etcd-arg=quota-backend-bytes=4294967296"]).unwrap();
+        v(&["--kube-apiserver-arg=feature-gates=Foo=true,Bar=false"]).unwrap();
 
         assert!(v(&[""]).is_err());
         assert!(v(&["--foo=\0bar"]).is_err());
@@ -644,17 +838,22 @@ mod tests {
             "node-ip",
             "disable-agent",
             "resolv-conf",
+            "embedded-registry",
+            "datastore-endpoint",
+            "datastore-cafile",
+            "datastore-certfile",
+            "datastore-keyfile",
+            "vpn-auth",
+            "vpn-auth-file",
             "made-up-flag",
-            // credentials
+            // credentials (YAML-only)
             "token",
             "t",
             "agent-token",
-            "datastore-endpoint",
             "etcd-s3-access-key",
             "etcd-s3-secret-key",
             "etcd-s3-session-token",
             "etcd-s3-proxy",
-            "vpn-auth",
         ] {
             for args in [
                 vec![format!("--{flag}={marker}")],
@@ -667,33 +866,111 @@ mod tests {
                 assert!(!err.contains(marker), "{args:?} echoed its value: {err}");
             }
         }
-        // Credentials are fine in k3s-config.yaml; unknown/managed keys are not.
+        // etcd-s3-endpoint with scheme/credentials/bad port is rejected without echoing.
+        for bad_ep in [
+            format!("https://ops:{marker}@s3.example.com"),
+            format!("ops:{marker}@s3.example.com:9000"),
+            format!("s3.example.com/{marker}"),
+            "s3.example.com:badport".to_string(),
+            "s3.example.com:0".to_string(),
+        ] {
+            let err = v(&[&format!("--etcd-s3-endpoint={bad_ep}")]).unwrap_err();
+            assert!(!err.contains(marker), "{bad_ep} echoed value: {err}");
+            let yerr = super::check_k3s_config_setting("etcd-s3-endpoint", &[&bad_ep]).unwrap_err();
+            assert!(!yerr.contains(marker), "{bad_ep} echoed value: {yerr}");
+        }
+
+        // Credentials are fine in k3s-config.yaml; unknown/managed/excluded keys are not.
         super::check_k3s_config_setting("token", &["x"]).unwrap();
         super::check_k3s_config_setting("etcd-s3-proxy", &["none"]).unwrap();
+        super::check_k3s_config_setting("etcd-s3-endpoint", &["  minio.local:9000  "]).unwrap();
         super::check_k3s_config_setting("bind-address", &["x"]).unwrap_err();
+        super::check_k3s_config_setting("embedded-registry", &["true"]).unwrap_err();
         super::check_k3s_config_setting("kube-controller-arg", &["cluster-cidr=x"]).unwrap_err();
+        // External datastores and VPN auth are excluded even in YAML, with no secret echoed.
+        let pg_err = super::check_k3s_config_setting(
+            "datastore-endpoint",
+            &[&format!("postgres://ops:{marker}@db:badport/k3s")],
+        )
+        .unwrap_err();
+        assert!(!pg_err.contains(marker), "{pg_err}");
+        let vpn_err = super::check_k3s_config_setting(
+            "vpn-auth",
+            &[&format!("name=tailscale,joinKey={marker}")],
+        )
+        .unwrap_err();
+        assert!(!vpn_err.contains(marker), "{vpn_err}");
+        // Leading/trailing whitespace in YAML component args (trimmed by k3s
+        // configfilearg.ToString) is caught for managed and credential keys.
+        super::check_k3s_config_setting("kube-apiserver-arg", &["  bind-address=0.0.0.0"])
+            .unwrap_err();
+        super::check_k3s_config_setting("kubelet-arg", &["  fail-swap-on=true"]).unwrap_err();
+        super::check_k3s_config_setting("etcd-arg", &["  data-dir=/tmp/etcd"]).unwrap_err();
+        let yaml_hdr_err = super::check_k3s_config_setting(
+            "kubelet-arg",
+            &[&format!(
+                "  manifest-url-header=Authorization:Bearer {marker}"
+            )],
+        )
+        .unwrap_err();
+        assert!(yaml_hdr_err.contains("credentials"), "{yaml_hdr_err}");
+        assert!(!yaml_hdr_err.contains(marker), "{yaml_hdr_err}");
+
+        // CLI credential component arg gives a credential-specific error and never echoes secrets.
+        let cli_hdr_err = v(&[&format!(
+            "--kubelet-arg=manifest-url-header=Authorization:Bearer {marker}"
+        )])
+        .unwrap_err();
+        assert!(cli_hdr_err.contains("credentials"), "{cli_hdr_err}");
+        assert!(!cli_hdr_err.contains(marker), "{cli_hdr_err}");
+
         for kubelet in [
             vec!["--kubelet-arg=root-dir=/x"],
             vec!["--kubelet-arg=--root-dir=/x"],
             vec!["--kubelet-arg", "root-dir=/x"],
+            vec!["--kubelet-arg", "  root-dir=/x"],
             vec!["--kubelet-arg=root_dir=/x"],
             vec!["--kubelet-arg=root-dir+=/x"],
             vec!["--kubelet-arg=root-dir-=/x"],
             vec!["-kubelet-arg=container-runtime-endpoint=unix:///x"],
             vec!["--kubelet-arg=container_runtime_endpoint=unix:///x"],
+            vec!["--kubelet-arg=image-service-endpoint=unix:///x"],
             vec!["--kubelet-arg=root-dir"],
+            vec!["--kubelet-arg=node-ip=10.0.0.2"],
+            vec!["--kubelet-arg=resolv-conf=/etc/alt.conf"],
+            vec!["--kubelet-arg=tls-cert-file=/x"],
+            vec!["--kubelet-arg=manifest-url-header=Authorization:Bearer x"],
+            vec!["--kubelet-arg=manifest-url=https://user:pass@example.com/pod.yaml"],
             vec!["--kube-proxy-arg=proxy-mode=iptables"],
             vec!["--kube-proxy-arg", "proxy_mode=ipvs"],
+            vec!["--kube-proxy-arg=kubeconfig=/tmp/kc"],
+            vec!["--kube-proxy-arg=master=https://10.0.0.1:6443"],
             vec!["--kube-proxy-arg=config=/var/lib/kp.yaml"],
             vec!["--kube-proxy-arg=write-config-to=/tmp/x"],
             vec!["--kubelet-arg=config=/etc/kubelet.yaml"],
             vec!["--kubelet-arg=config-dir=/etc/kubelet.d"],
             vec!["--kubelet-arg=hostname-override=x"],
             vec!["--kube-apiserver-arg=secure-port=7443"],
+            vec!["--kube-apiserver-arg= bind-address=0.0.0.0"],
             vec!["--kube-apiserver-arg=service-cluster-ip-range=10.9.0.0/16"],
+            vec!["--kube-apiserver-arg=etcd-servers=https://etcd:2379"],
             vec!["--kube-controller-manager-arg=cluster-cidr=10.8.0.0/16"],
             vec!["--kube-controller-manager-arg=allocate_node_cidrs=false"],
+            vec!["--kube-controller-manager-arg=kubeconfig=/tmp/kc"],
+            vec!["--kube-controller-manager-arg=authorization-kubeconfig=/tmp/kc"],
             vec!["--kube-controller-arg=cluster-cidr=10.8.0.0/16"],
+            vec!["--kube-controller-arg=kubeconfig=/tmp/kc"],
+            vec!["--kube-scheduler-arg=kubeconfig=/tmp/kc"],
+            vec!["--kube-scheduler-arg=config=/tmp/sched.yaml"],
+            vec!["--kube-cloud-controller-manager-arg=kubeconfig=/tmp/kc"],
+            vec!["--kube-cloud-controller-arg=kubeconfig=/tmp/kc"],
+            vec!["--helm-controller-arg=kubeconfig=/tmp/kc"],
+            vec!["--etcd-arg=data-dir=/tmp/etcd"],
+            vec!["--etcd-arg=--data-dir=/tmp/etcd"],
+            vec!["--etcd-arg", "  data-dir=/tmp/etcd"],
+            vec!["--etcd-arg=wal-dir=/tmp/wal"],
+            vec!["--etcd-arg=config-file=/tmp/etcd.yaml"],
+            vec!["--etcd-arg=listen-client-urls=https://0.0.0.0:2379"],
             vec!["--kubelet-arg=fail-swap-on=true"],
             vec!["--kubelet-arg=fail_swap_on=true"],
             vec!["--kubelet-arg=cert-dir=/x"],

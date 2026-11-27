@@ -123,17 +123,52 @@ pub fn read_k3s_config(home: &Path) -> anyhow::Result<Option<String>> {
     Ok(Some(yaml))
 }
 
-/// Build the guest `K8sMsg::Start` request from `config.toml` and optional `<home>/k3s-config.yaml`.
-pub fn build_start_msg(home: &Path) -> anyhow::Result<K8sMsg> {
+/// Effective settings a running k3s instance was started with (used on the
+/// host to refuse silent no-op starts when any setting changed, while treating
+/// comment-only edits to `k3s-config.yaml` as unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct K8sStartSettings {
+    pub version: String,
+    pub extra_args: Vec<String>,
+    /// Canonical JSON output of `normalize_k3s_config_yaml`, or `None` when no
+    /// host `k3s-config.yaml` exists.
+    pub config_json: Option<String>,
+}
+
+/// Validated guest `K8sMsg::Start` request together with its effective settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStart {
+    pub msg: K8sMsg,
+    pub settings: K8sStartSettings,
+}
+
+/// Load and validate `config.toml` (`k8s_version`, `k8s_disable`, `k8s_args`)
+/// and optional `<home>/k3s-config.yaml` before downloading k3s or sending a
+/// `Start` request to the guest.
+pub fn prepare_start(home: &Path) -> anyhow::Result<PreparedStart> {
     let cfg = crate::config::Config::load(home)?;
     // config.toml may have been edited by hand: report invalid k8s_disable /
     // k8s_args here, before anything reaches the guest.
     cfg.validate_k8s_settings()?;
+    let version = cfg.k3s_version().to_string();
     let extra_args = cfg.k8s_server_extra_args();
     let config_yaml = read_k3s_config(home)?;
-    Ok(K8sMsg::Start {
-        extra_args,
-        config_yaml,
+    let config_json = match config_yaml.as_deref() {
+        Some(yaml) => Some(
+            kat_proto::k3s_config::normalize_k3s_config_yaml(yaml).map_err(anyhow::Error::msg)?,
+        ),
+        None => None,
+    };
+    Ok(PreparedStart {
+        msg: K8sMsg::Start {
+            extra_args: extra_args.clone(),
+            config_yaml,
+        },
+        settings: K8sStartSettings {
+            version,
+            extra_args,
+            config_json,
+        },
     })
 }
 
@@ -275,20 +310,23 @@ pub fn ensure_start_supported(home: &Path, msg: &K8sMsg) -> anyhow::Result<()> {
 
 /// Download `k3s-arm64` into `<home>/cache/k3s/<version>/k3s-arm64` if not
 /// already cached and verified, then stream it into the guest if the guest
-/// doesn't already have this version installed.
-pub fn ensure_installed(home: &Path, progress: &mut dyn FnMut(&str)) -> anyhow::Result<()> {
-    let version = crate::config::Config::load(home)?.k3s_version().to_string();
+/// doesn't already have `version` installed.
+pub fn ensure_installed(
+    home: &Path,
+    version: &str,
+    progress: &mut dyn FnMut(&str),
+) -> anyhow::Result<()> {
     let info = guest_status(home)?;
     if info.installed && info.version == version {
         return Ok(());
     }
-    let cached = ensure_cached_binary(home, &version, progress)?;
+    let cached = ensure_cached_binary(home, version, progress)?;
     progress(&format!("transferring k3s {version} to VM"));
     let mut s = connect(home)?;
     k8s::write(
         &mut s,
         &K8sMsg::Install {
-            version: version.clone(),
+            version: version.to_string(),
         },
     )?;
     let mut f = File::open(&cached).with_context(|| format!("open {}", cached.display()))?;
@@ -1971,7 +2009,7 @@ users:
     }
 
     #[test]
-    fn build_start_msg_includes_config_flags_and_k3s_config_yaml() {
+    fn prepare_start_includes_config_flags_and_validates_k3s_config_yaml() {
         let home = std::env::temp_dir().join(format!(
             "kat-k8s-start-msg-{}-{}",
             std::process::id(),
@@ -1981,7 +2019,7 @@ users:
 
         // Empty defaults when neither config.toml nor k3s-config.yaml exist.
         assert_eq!(
-            build_start_msg(&home).unwrap(),
+            prepare_start(&home).unwrap().msg,
             K8sMsg::Start {
                 extra_args: vec![],
                 config_yaml: None,
@@ -1998,11 +2036,12 @@ users:
         cfg.set("k8s_args", "--debug --node-label=env=dev", &host)
             .unwrap();
         cfg.save(&home).unwrap();
-        let yaml = "write-kubeconfig-mode: '0600'\n";
+        let yaml = "disable:\n  - metrics-server\n";
         fs::write(k3s_config_path(&home), yaml).unwrap();
 
+        let prepared = prepare_start(&home).unwrap();
         assert_eq!(
-            build_start_msg(&home).unwrap(),
+            prepared.msg,
             K8sMsg::Start {
                 extra_args: vec![
                     "--disable=traefik".into(),
@@ -2013,13 +2052,43 @@ users:
                 config_yaml: Some(yaml.into()),
             }
         );
+        assert_eq!(prepared.settings.version, K3S_VERSION);
+        assert_eq!(
+            prepared.settings.config_json.as_deref(),
+            Some("{\n  \"disable\": [\"metrics-server\"]\n}\n")
+        );
+
+        // Comment-only YAML edits keep the same normalized settings.
+        fs::write(
+            k3s_config_path(&home),
+            "# harmless comment\ndisable: [metrics-server]\n",
+        )
+        .unwrap();
+        assert_eq!(prepare_start(&home).unwrap().settings, prepared.settings);
+
+        // Host pre-flight validation rejects reserved settings, unsupported YAML,
+        // excluded datastore endpoints and leaky credentials before contacting the guest.
+        for bad in [
+            "write-kubeconfig-mode: '0600'\n",
+            "disable: &a [traefik]\n",
+            "datastore-endpoint: postgres://ops:placeholder-pw@db:badport/k3s\n",
+            "kubelet-arg: ['manifest-url-header=Authorization:Bearer placeholder-pw']\n",
+            "etcd-s3-proxy: http://ops:placeholder-pw@proxy.invalid:badport\n",
+        ] {
+            fs::write(k3s_config_path(&home), bad).unwrap();
+            let err = prepare_start(&home).unwrap_err();
+            assert!(
+                !err.to_string().contains("placeholder-pw"),
+                "{bad}: {err:#}"
+            );
+        }
 
         // Rejects invalid UTF-8 and oversized k3s-config.yaml.
         fs::write(k3s_config_path(&home), [0xff, 0xfe]).unwrap();
-        assert!(build_start_msg(&home).is_err());
+        assert!(prepare_start(&home).is_err());
 
         fs::write(k3s_config_path(&home), vec![b'a'; MAX_K3S_CONFIG_BYTES + 1]).unwrap();
-        assert!(build_start_msg(&home).is_err());
+        assert!(prepare_start(&home).is_err());
 
         let _ = fs::remove_dir_all(&home);
     }
