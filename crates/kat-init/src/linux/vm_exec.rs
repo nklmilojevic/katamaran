@@ -3467,12 +3467,15 @@ mod tests {
         ));
 
         // Fill guest stdin pipe + user-space buffer.
+        host.set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let chunk = vec![b'x'; CHUNK];
         for _ in 0..6 {
             if vm_exec::write(&mut host, &VmExecMsg::Data(chunk.clone())).is_err() {
                 break;
             }
         }
+        host.set_write_timeout(None).unwrap();
         // Shut down ONLY the host read half so the guest does NOT get POLLRDHUP
         // on `reader` (simulating libkrun's WaitingCreditUpdate when the vsock
         // receive window is full); the guest must still detect disconnect via
@@ -3531,12 +3534,15 @@ mod tests {
 
         // Stop reading stdout (backpressuring guest->host) AND flood stdin
         // (backpressuring host->guest) so both directions stall simultaneously.
+        host.set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let chunk = vec![b'x'; CHUNK];
         for _ in 0..6 {
             if vm_exec::write(&mut host, &VmExecMsg::Data(chunk.clone())).is_err() {
                 break;
             }
         }
+        host.set_write_timeout(None).unwrap();
         thread::sleep(Duration::from_millis(80));
 
         // Shut down ONLY host read (no POLLRDHUP on guest reader); the
@@ -3597,12 +3603,15 @@ mod tests {
         };
 
         // Stall BOTH directions (do not read stdout, flood stdin).
+        host.set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let chunk = vec![b'x'; CHUNK];
         for _ in 0..6 {
             if vm_exec::write(&mut host, &VmExecMsg::Data(chunk.clone())).is_err() {
                 break;
             }
         }
+        host.set_write_timeout(None).unwrap();
         thread::sleep(Duration::from_millis(60));
 
         // Deliver SIGINT out-of-band even when active_sessions is at MAX_CONNS.
