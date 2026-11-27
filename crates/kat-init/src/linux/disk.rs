@@ -239,4 +239,105 @@ mod tests {
         assert_eq!(&exact_dev2.name[..15], b"2:107374182400\0");
         assert!(exact_dev2.name[14..].iter().all(|&b| b == 0));
     }
+
+    #[test]
+    fn btrfs_ioctl_constants_and_layouts_match_linux_uapi() {
+        use std::mem::{offset_of, size_of};
+        use std::process::Command;
+
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("kat-btrfs-uapi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = DirGuard(dir.clone());
+        let src = dir.join("check.c");
+        let bin = dir.join("check");
+
+        // Compile and run against the host Linux UAPI `<linux/btrfs.h>` header
+        // so every hand-written ioctl number, struct size, and field offset is
+        // verified directly against the kernel ABI on Linux CI.
+        let program = r#"
+#include <linux/btrfs.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+
+int main(void) {
+    printf("%lu %lu %lu\n",
+        (unsigned long)BTRFS_IOC_RESIZE,
+        (unsigned long)BTRFS_IOC_DEV_INFO,
+        (unsigned long)BTRFS_IOC_FS_INFO);
+    printf("%zu %zu %zu\n",
+        sizeof(struct btrfs_ioctl_vol_args),
+        offsetof(struct btrfs_ioctl_vol_args, fd),
+        offsetof(struct btrfs_ioctl_vol_args, name));
+    printf("%zu %zu %zu %zu %zu %zu\n",
+        sizeof(struct btrfs_ioctl_dev_info_args),
+        offsetof(struct btrfs_ioctl_dev_info_args, devid),
+        offsetof(struct btrfs_ioctl_dev_info_args, uuid),
+        offsetof(struct btrfs_ioctl_dev_info_args, bytes_used),
+        offsetof(struct btrfs_ioctl_dev_info_args, total_bytes),
+        offsetof(struct btrfs_ioctl_dev_info_args, path));
+    printf("%zu %zu %zu %zu %zu\n",
+        sizeof(struct btrfs_ioctl_fs_info_args),
+        offsetof(struct btrfs_ioctl_fs_info_args, max_id),
+        offsetof(struct btrfs_ioctl_fs_info_args, num_devices),
+        offsetof(struct btrfs_ioctl_fs_info_args, fsid),
+        offsetof(struct btrfs_ioctl_fs_info_args, sectorsize));
+    return 0;
+}
+"#;
+        std::fs::write(&src, program).unwrap();
+        let compile = Command::new("cc")
+            .args([
+                "-Wall",
+                "-Werror",
+                src.to_str().unwrap(),
+                "-o",
+                bin.to_str().unwrap(),
+            ])
+            .output()
+            .expect("invoke cc to verify <linux/btrfs.h> UAPI");
+        assert!(
+            compile.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&bin)
+            .output()
+            .expect("run compiled btrfs UAPI layout probe");
+        assert!(
+            run.status.success(),
+            "probe failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let expected = format!(
+            "{} {} {}\n{} {} {}\n{} {} {} {} {} {}\n{} {} {} {} {}\n",
+            BTRFS_IOC_RESIZE,
+            BTRFS_IOC_DEV_INFO,
+            BTRFS_IOC_FS_INFO,
+            size_of::<BtrfsIoctlVolArgs>(),
+            offset_of!(BtrfsIoctlVolArgs, fd),
+            offset_of!(BtrfsIoctlVolArgs, name),
+            size_of::<BtrfsIoctlDevInfoArgs>(),
+            offset_of!(BtrfsIoctlDevInfoArgs, devid),
+            offset_of!(BtrfsIoctlDevInfoArgs, uuid),
+            offset_of!(BtrfsIoctlDevInfoArgs, bytes_used),
+            offset_of!(BtrfsIoctlDevInfoArgs, total_bytes),
+            offset_of!(BtrfsIoctlDevInfoArgs, path),
+            size_of::<BtrfsIoctlFsInfoArgs>(),
+            offset_of!(BtrfsIoctlFsInfoArgs, max_id),
+            offset_of!(BtrfsIoctlFsInfoArgs, num_devices),
+            offset_of!(BtrfsIoctlFsInfoArgs, fsid),
+            offset_of!(BtrfsIoctlFsInfoArgs, sectorsize),
+        );
+        assert_eq!(String::from_utf8(run.stdout).unwrap(), expected);
+    }
 }
