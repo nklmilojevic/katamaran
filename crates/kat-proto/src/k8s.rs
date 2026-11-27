@@ -9,7 +9,7 @@
 //! | `Install`              | the `k3s` binary as `Data`..., `DataEnd`                                    | `Progress`…, then `Done` / `Error`                                                                                              |
 //! | `Start`                | optional `extra_args`, `config_yaml`                                        | `Progress`…, then `StatusInfo` / `Error`                                                                                        |
 //! | `Stop`                 | –                                                                           | `Progress`…, then `Done` / `Error`                                                                                              |
-//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | `Progress`…, then `Done` / `Error` (with `images` = `1`: `ResetAccepted`, `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error`) |
+//! | `Reset`                | No follow-up; `Reset` may carry one `images` byte (`0` or `1`, default `0`) | `Progress`…, `ResetDataCleared`, `Progress`…, then `Done` / `Error` (with `images` = `1`: starts with `ResetAccepted`) |
 //! | `Kubeconfig`           | –                                                                           | `KubeconfigData`, or `Error`                                                                                                    |
 //! | `Connect`              | `Data`… (`DataEnd` closes the write side)                                   | `Done` then `Data`…, `DataEnd`; or `Error`                                                                                      |
 //! | `SyncImages`           | –                                                                           | `Done`, or `Error`                                                                                                              |
@@ -78,11 +78,11 @@ pub enum K8sMsg {
     /// so the host can distinguish an accepted reset from an older guest closing
     /// the connection after rejecting the flag byte.
     ResetAccepted,
-    /// Emitted by compatible guests once active cluster data has been removed or
-    /// atomically detached, before deferred disk reclamation or image cleanup
-    /// completes (and on plain resets only if deferred reclamation fails after
-    /// detachment), so the host still disables Kubernetes auto-start and reports
-    /// a partial outcome.
+    /// Emitted by compatible guests as soon as active cluster data has been
+    /// removed or atomically detached, before deferred disk reclamation or
+    /// image cleanup runs, so the host disables Kubernetes auto-start and
+    /// reports a partial outcome even if reclamation, image purge, or the
+    /// guest connection fails afterwards.
     ResetDataCleared,
 }
 

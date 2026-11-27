@@ -174,9 +174,18 @@ fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_progress_line(w: &mut impl std::io::Write, msg: &str) {
+    // Ignore stderr write errors (such as BrokenPipe when output is piped) so
+    // the CLI keeps reading notifications until the terminal reset result arrives.
+    let _ = std::io::Write::write_fmt(w, format_args!("katamaran: {msg}\n"));
+}
+
 fn reset(images: bool) -> anyhow::Result<()> {
     let mut c = Client::connect_default()?;
-    reset_with_client(&mut c, images, &mut |msg| eprintln!("katamaran: {msg}"))?;
+    let mut stderr = std::io::stderr();
+    reset_with_client(&mut c, images, &mut |msg| {
+        write_progress_line(&mut stderr, msg);
+    })?;
     if images {
         println!("katamaran: Kubernetes cluster reset (k8s.io images cleared)");
     } else {
@@ -704,5 +713,58 @@ mod tests {
         .unwrap();
         assert!(legacy_progress.is_empty());
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn reset_keeps_reading_result_when_progress_writer_returns_broken_pipe() {
+        use std::io::{self, BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        struct BrokenPipeWriter(usize);
+        impl Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = TempDirGuard::create("kat-cli-ep");
+        let sock = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let srv = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            let id = req.id.unwrap();
+            for msg in ["stopping k3s", "removing cluster data"] {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": msg }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let mut sink = BrokenPipeWriter(0);
+        reset_with_client(&mut client, false, &mut |msg| {
+            write_progress_line(&mut sink, msg);
+        })
+        .unwrap();
+        srv.join().unwrap();
+        assert_eq!(sink.0, 2);
     }
 }

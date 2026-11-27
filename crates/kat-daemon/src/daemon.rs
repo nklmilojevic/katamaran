@@ -1766,9 +1766,7 @@ impl Daemon {
             let rm_res = self.remove_kubeconfig_with_progress(&ctx, progress);
             if let Err(e) = rm_res {
                 dlog!("k8s reset: remove kubeconfig failed: {e:#}");
-                if remove_images {
-                    kubeconfig_err = Some(e);
-                }
+                kubeconfig_err = Some(e);
             }
         }
 
@@ -1781,7 +1779,7 @@ impl Daemon {
                     )
                 } else {
                     format!(
-                        "Kubernetes cluster data was deleted, but reclaiming old cluster files failed: {}",
+                        "Kubernetes cluster data was deleted, but finishing cluster reset failed: {}",
                         reset_err.message
                     )
                 };
@@ -1803,8 +1801,14 @@ impl Daemon {
                 return Err(failed(msg));
             }
             if guest_reset_attempted {
-                self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error =
-                    Some(reset_err.message.clone());
+                let mut msg = reset_err.message;
+                if let Some(ke) = kubeconfig_err {
+                    msg.push_str(&format!(
+                        " (also failed to clean up ~/.kube/config: {ke:#})"
+                    ));
+                }
+                self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
+                return Err(failed(msg));
             }
             return Err(reset_err);
         }
@@ -1836,9 +1840,15 @@ impl Daemon {
             return Err(failed(msg));
         }
         if let Some(ke) = kubeconfig_err {
-            let msg = format!(
-                "Kubernetes cluster data and cached k8s.io images were reset, but cleaning up ~/.kube/config failed: {ke:#}"
-            );
+            let msg = if remove_images {
+                format!(
+                    "Kubernetes cluster data and cached k8s.io images were reset, but cleaning up ~/.kube/config failed: {ke:#}"
+                )
+            } else {
+                format!(
+                    "Kubernetes cluster data was reset, but cleaning up ~/.kube/config failed: {ke:#}"
+                )
+            };
             self.k8s.lock().unwrap_or_else(|e| e.into_inner()).error = Some(msg.clone());
             return Err(failed(msg));
         }
@@ -3561,6 +3571,75 @@ mod tests {
             "k8s_op lock must be released after kubectl timeout"
         );
         fs::remove_dir_all(&root2).unwrap();
+
+        // 3. Plain reset with stuck shared kubeconfig lock: also reports partial outcome
+        //    (without claiming cached images were cleared) and persists kubernetes = false.
+        let root3 = temp("k8s-kcto3");
+        let home3 = root3.join("h");
+        let user3 = root3.join("u");
+        let kube3 = user3.join(".kube");
+        fs::create_dir_all(&home3).unwrap();
+        fs::create_dir_all(&kube3).unwrap();
+        fs::write(kube3.join("config"), "apiVersion: v1\nkind: Config\n").unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home3)
+        .unwrap();
+
+        let lock3 = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(kube3.join(".katamaran-kubeconfig.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock3.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let mut d3 = Daemon::new_for_test(home3.clone(), user3, "katamaran-test-kcto3");
+        {
+            let dm = Arc::get_mut(&mut d3).unwrap();
+            dm.test_heartbeat_interval = Some(Duration::from_millis(40));
+            dm.test_kubeconfig_timeout = Some(Duration::from_millis(180));
+        }
+        let sock3 = crate::k8s::socket_path(&home3);
+        fs::create_dir_all(sock3.parent().unwrap()).unwrap();
+        let listener3 = UnixListener::bind(&sock3).unwrap();
+        {
+            let mut g = d3.lock();
+            g.state = VmState::Running;
+            d3.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest3 = thread::spawn(move || {
+            let (mut conn, _) = listener3.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+        });
+
+        let mut beats3 = Vec::new();
+        let err3 = d3
+            .k8s_reset(false, &mut |m| beats3.push(m.to_string()))
+            .unwrap_err();
+        guest3.join().unwrap();
+        assert!(
+            err3.message.contains(
+                "Kubernetes cluster data was reset, but cleaning up ~/.kube/config failed"
+            ),
+            "expected plain-reset partial outcome, got: {}",
+            err3.message
+        );
+        assert!(
+            !err3.message.contains("cached k8s.io images"),
+            "plain reset must not claim cached images were cleared: {}",
+            err3.message
+        );
+        assert!(err3.message.contains("timed out"), "got: {}", err3.message);
+        assert!(!Config::load(&home3).unwrap().kubernetes);
+        drop(lock3);
+        fs::remove_dir_all(&root3).unwrap();
     }
 
     #[test]
@@ -3621,6 +3700,7 @@ mod tests {
             d.k8s.lock().unwrap().state = "running".into();
         }
         let guest = thread::spawn(move || {
+            // 1. Reclamation error after ResetDataCleared.
             let (mut conn, _) = listener.accept().unwrap();
             let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
             assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
@@ -3630,18 +3710,46 @@ mod tests {
                 &kat_proto::k8s::K8sMsg::Error("remove .data.removing-1: timed out".into()),
             )
             .unwrap();
+
+            // 2. Lost connection after ResetDataCleared (during deferred reclamation).
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            drop(conn);
         });
         let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
-        guest.join().unwrap();
         assert!(
             err.message.contains("cluster data was deleted")
-                && err.message.contains("reclaiming old cluster files failed"),
+                && err.message.contains("finishing cluster reset failed")
+                && err.message.contains("remove .data.removing-1: timed out"),
             "got: {}",
             err.message
         );
         assert!(
             !Config::load(&home).unwrap().kubernetes,
             "kubernetes auto-start must be disabled after detached datastore failure"
+        );
+
+        // Re-enable kubernetes and verify a lost guest reply after immediate
+        // ResetDataCleared still disables auto-start.
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        let err2 = d.k8s_reset(false, &mut |_| {}).unwrap_err();
+        guest.join().unwrap();
+        assert!(
+            err2.message.contains("cluster data was deleted")
+                && err2.message.contains("closed the Kubernetes connection"),
+            "got: {}",
+            err2.message
+        );
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must be disabled if guest disconnects after ResetDataCleared"
         );
         fs::remove_dir_all(&root).unwrap();
     }

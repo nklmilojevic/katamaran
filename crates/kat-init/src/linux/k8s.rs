@@ -2690,7 +2690,6 @@ impl K8s {
             k8s::write(&mut *conn, &K8sMsg::ResetAccepted)
                 .map_err(|e| format!("send reset ack: {e}"))?;
         }
-        let mut active_data_cleared = false;
         let mut ack_err: Option<String> = None;
         let paths = ClusterDataPaths {
             data_dir: Path::new(DATA_DIR),
@@ -2740,10 +2739,7 @@ impl K8s {
                     },
                     |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
                     &mut || {
-                        active_data_cleared = true;
-                        if remove_images
-                            && let Err(e) = k8s::write(&*conn, &K8sMsg::ResetDataCleared)
-                        {
+                        if let Err(e) = k8s::write(&*conn, &K8sMsg::ResetDataCleared) {
                             ack_err = Some(format!("send reset data-cleared ack: {e}"));
                         }
                     },
@@ -2758,14 +2754,7 @@ impl K8s {
         if let Some(e) = ack_err {
             return Err(e);
         }
-        if let Err(e) = res {
-            if !remove_images && active_data_cleared {
-                // Active DATA_DIR was already detached before deferred reclamation
-                // failed; notify compatible daemons so auto-start is disabled.
-                let _ = k8s::write(&mut *conn, &K8sMsg::ResetDataCleared);
-            }
-            return Err(e);
-        }
+        res?;
         log(if remove_images {
             "k3s cluster data and k8s.io images reset"
         } else {
