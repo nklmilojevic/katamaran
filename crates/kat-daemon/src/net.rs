@@ -1310,21 +1310,81 @@ impl LoopbackTcpListener {
                 "no forward address is assigned to lo0",
             )));
         }
+        Self::bind_eligible_addrs_reserved(
+            addrs,
+            port,
+            force_lo0_scope,
+            acquire_slot,
+            &mut bind_specific,
+        )
+    }
+
+    fn bind_eligible_addrs_reserved<P>(
+        addrs: Vec<Ipv4Addr>,
+        port: u16,
+        force_lo0_scope: bool,
+        acquire_slot: &mut impl FnMut() -> Option<P>,
+        bind_fn: &mut impl FnMut(Ipv4Addr, u16, bool) -> io::Result<TcpListener>,
+    ) -> Result<(Self, Vec<P>), BindError> {
         let mut inner = Vec::with_capacity(addrs.len());
         let mut permits = Vec::with_capacity(addrs.len());
         let mut bound = Vec::with_capacity(addrs.len());
         let mut filter_endpoints = Vec::with_capacity(addrs.len());
         let mut failed = Vec::new();
         let mut bind_port = port;
-        for &a in &addrs {
+        for (idx, &a) in addrs.iter().enumerate() {
             let is_alias = a != Ipv4Addr::LOCALHOST;
             let scope_lo0 = is_alias || force_lo0_scope;
             let Some(slot) = acquire_slot() else {
-                drop(inner);
-                drop(permits);
-                return Err(BindError::CapacityExhausted);
+                if inner.is_empty() {
+                    return Err(BindError::CapacityExhausted);
+                }
+                // Probe remaining addresses one at a time without closing the
+                // already-bound listeners: `AutoForwards::add` reserves the two
+                // wakeup-pipe descriptors before calling `bind_on_reserved` and
+                // opens the pipe only after it returns, so one temporary probe
+                // socket stays strictly within the already-held descriptor
+                // budget (`k + 1 < k + WAKEUP_PIPE_FDS`).
+                for &rem in &addrs[idx..] {
+                    let rem_scope = rem != Ipv4Addr::LOCALHOST || force_lo0_scope;
+                    match bind_fn(rem, bind_port, rem_scope) {
+                        Ok(probe_listener) => {
+                            drop(probe_listener);
+                            drop(inner);
+                            drop(permits);
+                            return Err(BindError::CapacityExhausted);
+                        }
+                        #[cfg(target_os = "macos")]
+                        Err(e)
+                            if port > 0
+                                && port < 1024
+                                && e.kind() == io::ErrorKind::PermissionDenied =>
+                        {
+                            drop(inner);
+                            let keep = permits.pop().expect("inner is non-empty");
+                            drop(permits);
+                            let wildcard = match bind_darwin_lo0(Ipv4Addr::UNSPECIFIED, port) {
+                                Ok(l) => l,
+                                Err(we) => {
+                                    drop(keep);
+                                    return Err(BindError::Io(we));
+                                }
+                            };
+                            return Ok((
+                                Self {
+                                    inner: vec![wildcard],
+                                    addrs,
+                                    filter_endpoints: vec![true],
+                                },
+                                vec![keep],
+                            ));
+                        }
+                        Err(e) => failed.push((rem, e)),
+                    }
+                }
+                break;
             };
-            match bind_specific(a, bind_port, scope_lo0) {
+            match bind_fn(a, bind_port, scope_lo0) {
                 Ok(l) => {
                     if bind_port == 0 {
                         bind_port = match l.local_addr() {
@@ -2813,9 +2873,31 @@ mod tests {
         out
     }
 
+    /// Hand out distinct high ports across parallel tests without opening a
+    /// throwaway listening socket (which a parallel test subprocess could
+    /// briefly inherit during macOS's non-atomic `socket()` + `FIOCLEX` window).
     fn free_high_port() -> u16 {
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
+        static NEXT: Mutex<u16> = Mutex::new(0);
+        let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+        if *next == 0 {
+            *next = 40_000 + ((std::process::id() % 1000) as u16) * 20;
+        }
+        loop {
+            let candidate = *next;
+            *next = if candidate >= 59_999 {
+                40_000
+            } else {
+                candidate + 1
+            };
+            if TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, candidate)),
+                Duration::from_millis(20),
+            )
+            .is_err()
+            {
+                return candidate;
+            }
+        }
     }
 
     /// Confirm `port` can be rebound once closed, polling briefly on
@@ -3235,10 +3317,132 @@ mod tests {
                 assert_eq!(budget.listener_fds(), 0);
                 drop(api_tight);
             }
+
+            // High port with 3 fds and real alias busy: partial bind on
+            // localhost succeeds within 3 fds.
+            let busy_alias = TcpListener::bind((alias.addr, 0)).unwrap();
+            let partial_port = busy_alias.local_addr().unwrap().port();
+            let mut api_partial = AddressesApi::with_budget(
+                GvproxyApi {
+                    socket: fake.api_sock.clone(),
+                    guest: GUEST,
+                },
+                &dir,
+                &both,
+                budget.clone(),
+            );
+            api_partial.expose(TCP, partial_port).unwrap();
+            assert_eq!(budget.listener_fds(), 3);
+            assert_eq!(
+                api_partial.port_addrs(TCP, partial_port),
+                vec![Ipv4Addr::LOCALHOST]
+            );
+            assert_eq!(
+                tcp_echo(Ipv4Addr::LOCALHOST, partial_port, "p3fd"),
+                "gv:p3fd"
+            );
+            api_partial.unexpose(TCP, partial_port).unwrap();
+            assert_eq!(budget.listener_fds(), 0);
+            drop(busy_alias);
+            drop(api_partial);
         }
 
         drop(fake);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bind_reserved_preserves_partial_bind_when_second_addr_is_busy_at_single_slot() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Slot {
+            active: Arc<AtomicUsize>,
+        }
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let make_tracker = || {
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            (active, peak)
+        };
+        let try_slot = |active: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>| -> Option<Slot> {
+            let cur = active.load(Ordering::SeqCst);
+            if cur >= 1 {
+                return None;
+            }
+            active.fetch_add(1, Ordering::SeqCst);
+            peak.fetch_max(cur + 1, Ordering::SeqCst);
+            Some(Slot {
+                active: active.clone(),
+            })
+        };
+
+        let alias = Ipv4Addr::new(172, 16, 1, 200);
+        let two_addrs = vec![Ipv4Addr::LOCALHOST, alias];
+
+        // Case 1: Only 1 socket slot remains (3 fds with wakeup pipe), addr 1
+        // is bindable, and addr 2 is busy (AddrInUse). Partial bind on addr 1
+        // must succeed without ever exceeding 1 held slot.
+        let (active, peak) = make_tracker();
+        let (listener, permits) = LoopbackTcpListener::bind_eligible_addrs_reserved(
+            two_addrs.clone(),
+            0,
+            false,
+            &mut || try_slot(&active, &peak),
+            &mut |addr, port, _| {
+                if addr == alias {
+                    Err(io::Error::new(io::ErrorKind::AddrInUse, "alias busy"))
+                } else {
+                    TcpListener::bind((addr, port))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.len(), 1);
+        assert_eq!(listener.addrs(), &[Ipv4Addr::LOCALHOST]);
+        let bound_port = listener.local_addr().unwrap().port();
+        let srv = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            s.write_all(&buf).unwrap();
+        });
+        let mut cli = TcpStream::connect((Ipv4Addr::LOCALHOST, bound_port)).unwrap();
+        cli.write_all(b"part").unwrap();
+        let mut out = [0u8; 4];
+        cli.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"part");
+        srv.join().unwrap();
+        drop(permits);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+
+        // Case 2: Only 1 socket slot remains, and BOTH addresses are actually
+        // free/bindable. Must report CapacityExhausted and release all slots
+        // without ever exceeding 1 held slot.
+        let (active2, peak2) = make_tracker();
+        let res = LoopbackTcpListener::bind_eligible_addrs_reserved(
+            two_addrs,
+            0,
+            false,
+            &mut || try_slot(&active2, &peak2),
+            &mut |addr, port, _| {
+                if addr == alias {
+                    // Simulate a distinct free alias address at the same port.
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                } else {
+                    TcpListener::bind((addr, port))
+                }
+            },
+        );
+        assert!(matches!(res, Err(BindError::CapacityExhausted)));
+        assert_eq!(peak2.load(Ordering::SeqCst), 1);
+        assert_eq!(active2.load(Ordering::SeqCst), 0);
     }
 
     #[test]
