@@ -777,11 +777,11 @@ pub enum Event {
     CapacityWait(PortProto, u16, String),
     Removed(PortProto, u16),
     RemoveFailed(PortProto, u16, String),
-    /// The worker finished handling `PortChange::Remove` number `.2` for the
-    /// port: emitted exactly once per remove, after its other events, whether
-    /// it closed a listener, found none, gave up after retries, or was
-    /// superseded by a later change for the same port. The session matches
-    /// it against the latest remove it sent.
+    /// The worker made its first attempt at `PortChange::Remove` number `.2`
+    /// for the port: emitted exactly once per remove, right after that
+    /// attempt's own events. A failed attempt keeps retrying in the
+    /// background and reports `Removed` / `RefusedCleared` on success. The
+    /// session matches it against the latest remove it sent.
     RemoveDone(PortProto, u16, u64),
 }
 
@@ -964,8 +964,7 @@ const MAX_TRANSIENT_RETRIES: u32 = 30;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingOp {
     Add,
-    /// A remove being retried, with its [`PortChange::Remove`] sequence number.
-    Remove(u64),
+    Remove,
 }
 
 /// Apply guest port changes on a worker thread, so a slow gvproxy call never
@@ -1015,9 +1014,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                 match got {
                     Ok(WorkerMsg::Change(PortChange::Add(proto, port))) => {
                         let key = (proto, port);
-                        if let Some((PendingOp::Remove(seq), ..)) = pending.remove(&key) {
-                            on_event(Event::RemoveDone(proto, port, seq));
-                        }
+                        pending.remove(&key);
                         capacity_wait.retain(|&k| k != key);
                         match fwd.add(proto, port) {
                             Some(e @ Event::Transient(..)) => {
@@ -1040,9 +1037,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                     }
                     Ok(WorkerMsg::Change(PortChange::Remove(proto, port, seq))) => {
                         let key = (proto, port);
-                        if let Some((PendingOp::Remove(old), ..)) = pending.remove(&key) {
-                            on_event(Event::RemoveDone(proto, port, old));
-                        }
+                        pending.remove(&key);
                         let before = capacity_wait.len();
                         capacity_wait.retain(|&k| k != key);
                         let was_waiting = capacity_wait.len() != before;
@@ -1051,7 +1046,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e @ Event::RemoveFailed(..)) => {
                                 pending.insert(
                                     key,
-                                    (PendingOp::Remove(seq), Instant::now() + retry_base, 1),
+                                    (PendingOp::Remove, Instant::now() + retry_base, 1),
                                 );
                                 report(&e, &label);
                                 on_event(e);
@@ -1059,14 +1054,16 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             Some(e) => {
                                 report(&e, &label);
                                 on_event(e);
-                                on_event(Event::RemoveDone(proto, port, seq));
                             }
                             None if was_waiting => {
                                 on_event(Event::RefusedCleared(proto, port));
-                                on_event(Event::RemoveDone(proto, port, seq));
                             }
-                            None => on_event(Event::RemoveDone(proto, port, seq)),
+                            None => {}
                         }
+                        // The first attempt is done; failures keep retrying
+                        // in the background and report `Removed` or
+                        // `RefusedCleared` when they succeed.
+                        on_event(Event::RemoveDone(proto, port, seq));
                     }
                     Ok(WorkerMsg::CapacityAvailable) => {
                         let queued = std::mem::take(&mut capacity_wait);
@@ -1141,7 +1138,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                             }
                             None => {}
                         },
-                        PendingOp::Remove(seq) => {
+                        PendingOp::Remove => {
                             let label = fwd.port_label(proto, port);
                             match fwd.remove(proto, port) {
                                 Some(e @ Event::RemoveFailed(..)) => {
@@ -1149,7 +1146,7 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                         pending.insert(
                                             key,
                                             (
-                                                PendingOp::Remove(seq),
+                                                PendingOp::Remove,
                                                 Instant::now() + delay,
                                                 attempts + 1,
                                             ),
@@ -1157,15 +1154,13 @@ fn spawn_forwarder_with<A: ForwardApi + Send + 'static>(
                                     } else {
                                         report(&e, &label);
                                         on_event(e);
-                                        on_event(Event::RemoveDone(proto, port, seq));
                                     }
                                 }
                                 Some(e) => {
                                     report(&e, &label);
                                     on_event(e);
-                                    on_event(Event::RemoveDone(proto, port, seq));
                                 }
-                                None => on_event(Event::RemoveDone(proto, port, seq)),
+                                None => {}
                             }
                         }
                     }
@@ -1959,14 +1954,15 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveFailed(TCP, 9100, _)
         ));
-        assert_eq!(
-            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Event::Removed(TCP, 9100)
-        );
-        // The retried remove completes exactly once.
+        // The first attempt is reported done right away, exactly once; the
+        // background retry then reports the removal.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveDone(TCP, 9100, 1)
+        );
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Removed(TCP, 9100)
         );
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 2);
@@ -1996,12 +1992,11 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveFailed(TCP, 9101, _)
         ));
-        tx.send(PortChange::Add(TCP, 9101)).unwrap();
-        // The superseded remove still completes, exactly once.
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveDone(TCP, 9101, 1)
         );
+        tx.send(PortChange::Add(TCP, 9101)).unwrap();
         assert!(ev_rx.recv_timeout(Duration::from_millis(150)).is_err());
         assert_eq!(unexpose_calls.load(Ordering::SeqCst), 1);
         drop(tx);
@@ -3137,6 +3132,10 @@ mod tests {
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RemoveFailed(TCP, p, _) if p == busy2_port
         ));
+        assert_eq!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::RemoveDone(TCP, busy2_port, 1)
+        );
         assert_eq!(
             ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::RefusedCleared(TCP, busy2_port)
