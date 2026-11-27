@@ -2764,7 +2764,15 @@ impl K8s {
                             _ => Ok(()),
                         }
                     },
-                    |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
+                    |dir, beat| {
+                        remove_tree_bounded(
+                            dir,
+                            DATA_REMOVE_TIMEOUT,
+                            PROGRESS_HEARTBEAT_INTERVAL,
+                            || SHUTTING_DOWN.load(Ordering::SeqCst),
+                            beat,
+                        )
+                    },
                     &mut || {
                         if let Err(e) =
                             writer.write_required(&K8sMsg::reset_data_cleared(remove_images))
@@ -3680,37 +3688,85 @@ fn remove_cluster_data_dirs(
     Ok(())
 }
 
-/// Remove `path` recursively via `/bin/rm -rf -- <path>` under PID 1's reaper
-/// with a finite deadline, shutdown abort, and periodic heartbeats. Running in
-/// a killable child avoids both unbounded stalls and a detached Rust thread
-/// continuing to unlink files after a timeout.
-fn rm_rf_reaped(
-    reaper: &Reaper,
-    path: &Path,
+/// Recursively remove `root` without following symlinks, enforcing a finite
+/// `timeout`, checking `shutting_down`, and emitting `beat` heartbeats at
+/// `heartbeat` intervals. Runs inline with an explicit heap stack — no external
+/// `/bin/rm` binary, no deep recursion, and no detached background thread that
+/// keeps unlinking after a timeout or shutdown abort.
+fn remove_tree_bounded(
+    root: &Path,
     timeout: Duration,
+    heartbeat: Duration,
+    shutting_down: impl Fn() -> bool,
     beat: &mut dyn FnMut(),
 ) -> Result<(), String> {
-    let mut cmd = Command::new("/bin/rm");
-    cmd.args(["-rf", "--"]).arg(path);
-    let out = run_reaped_split_checked(reaper, &mut cmd, timeout, 64 << 10, true, Some(beat))
-        .map_err(|e| format!("remove {}: {e}", path.display()))?;
-    if out.code != 0 {
-        let detail = ctr_error_detail(&out.stdout, &out.stderr);
-        return Err(if detail.is_empty() {
-            format!(
-                "remove {}: rm exited with status {}",
-                path.display(),
-                out.code
-            )
-        } else {
-            format!("remove {}: {detail}", path.display())
-        });
+    let deadline = Instant::now() + timeout;
+    let mut last_beat = Instant::now();
+    let mut check_budget = || -> Result<(), String> {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("remove {}: timed out", root.display()));
+        }
+        if last_beat.elapsed() >= heartbeat {
+            beat();
+            last_beat = Instant::now();
+        }
+        Ok(())
+    };
+
+    check_budget()?;
+    let meta = match fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("stat {}: {e}", root.display())),
+    };
+    if !meta.file_type().is_dir() {
+        return match fs::remove_file(root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove {}: {e}", root.display())),
+        };
     }
-    if path_exists_checked(path)? {
-        return Err(format!(
-            "remove {}: path still exists after rm",
-            path.display()
-        ));
+
+    let mut stack: Vec<(std::path::PathBuf, bool)> = vec![(root.to_path_buf(), false)];
+    while let Some((dir, expanded)) = stack.pop() {
+        check_budget()?;
+        if expanded {
+            match fs::remove_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", dir.display())),
+            }
+            continue;
+        }
+        stack.push((dir.clone(), true));
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            check_budget()?;
+            let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("stat {}: {e}", path.display())),
+            };
+            if ft.is_dir() {
+                // `DirEntry::file_type()` never follows symlinks on Unix/Linux.
+                stack.push((path, false));
+            } else {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("remove {}: {e}", path.display())),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -10066,6 +10122,104 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     }
 
     #[test]
+    fn remove_tree_bounded_clears_trees_preserves_symlink_targets_and_enforces_limits() {
+        let guard = TempDirGuard::create("kat-rmt");
+        let base = &guard.0;
+
+        // 1. Nested tree containing files, subdirs, and a symlink pointing outside
+        //    the tree removes the tree without touching the external target.
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let outside_file = outside.join("keep");
+        fs::write(&outside_file, b"preserve").unwrap();
+
+        let tree = base.join("tree");
+        fs::create_dir_all(tree.join("a/b/c")).unwrap();
+        fs::write(tree.join("a/b/c/file.txt"), b"data").unwrap();
+        fs::write(tree.join("top"), b"top").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("a/link-to-outside")).unwrap();
+
+        let mut beats = 0usize;
+        remove_tree_bounded(
+            &tree,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            || false,
+            &mut || beats += 1,
+        )
+        .unwrap();
+        assert!(!tree.exists());
+        assert!(
+            outside_file.exists(),
+            "must never follow symlinks outside tree"
+        );
+        assert!(
+            beats >= 2,
+            "expected heartbeats during traversal, got {beats}"
+        );
+
+        // 2. Root symlink to a directory unlinks only the symlink, preserving target.
+        let root_link = base.join("root-link");
+        std::os::unix::fs::symlink(&outside, &root_link).unwrap();
+        remove_tree_bounded(
+            &root_link,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            || false,
+            &mut || {},
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(&root_link).is_err());
+        assert!(outside_file.exists());
+
+        // 3. Missing path succeeds cleanly; single regular file is deleted.
+        remove_tree_bounded(
+            &base.join("does-not-exist"),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            || false,
+            &mut || {},
+        )
+        .unwrap();
+        let single = base.join("single-file");
+        fs::write(&single, b"x").unwrap();
+        remove_tree_bounded(
+            &single,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            || false,
+            &mut || {},
+        )
+        .unwrap();
+        assert!(!single.exists());
+
+        // 4. Expired deadline and shutdown flag abort immediately without deleting.
+        let untouched = base.join("untouched");
+        fs::create_dir(&untouched).unwrap();
+        let err_to = remove_tree_bounded(
+            &untouched,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            || false,
+            &mut || {},
+        )
+        .unwrap_err();
+        assert!(err_to.contains("timed out"), "{err_to}");
+        assert!(untouched.exists());
+
+        let err_sd = remove_tree_bounded(
+            &untouched,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            || true,
+            &mut || {},
+        )
+        .unwrap_err();
+        assert!(err_sd.contains("shutting down"), "{err_sd}");
+        assert!(untouched.exists());
+    }
+
+    #[test]
     fn image_reset_sync_lock_timeout_leaves_cluster_data_untouched() {
         let sync_lock = Mutex::new(());
         let _held = sync_lock.lock().unwrap();
@@ -10732,12 +10886,6 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             moby_images_before
         );
         assert_eq!(count_snapshots("moby"), moby_snapshots_before);
-        // Also exercise bounded `/bin/rm -rf --` removal under the live reaper.
-        let scratch_dir = base.join("scratch-rm");
-        fs::create_dir_all(scratch_dir.join("nested")).unwrap();
-        fs::write(scratch_dir.join("nested/data"), b"cluster-data").unwrap();
-        rm_rf_reaped(&reaper, &scratch_dir, Duration::from_secs(10), &mut || {}).unwrap();
-        assert!(!scratch_dir.exists());
 
         drop(daemon);
         drop(tmp_guard);
