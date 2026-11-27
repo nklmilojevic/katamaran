@@ -73,6 +73,20 @@ THREE_HDR = (
     b"\r\n"
 )
 FULL_CHUNKS = 48
+SPLIT20_FIRST_LEN = 20480
+SPLIT20_SECOND = b"u" * 4096
+_split20_hdr = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Length: XXXXX\r\n"
+    b"Connection: keep-alive\r\n"
+    b"\r\n"
+)
+SPLIT20_HDR = _split20_hdr.replace(
+    b"XXXXX",
+    str(SPLIT20_FIRST_LEN - len(_split20_hdr) + len(SPLIT20_SECOND)).encode(),
+)
+assert len(SPLIT20_HDR) == len(_split20_hdr)
+SPLIT20_FIRST = SPLIT20_HDR + b"u" * (SPLIT20_FIRST_LEN - len(SPLIT20_HDR))
 TWO_WRITE = 2048
 _two_hdr = (
     b"HTTP/1.1 200 OK\r\n"
@@ -146,6 +160,12 @@ def handle(conn):
                 conn.sendall(THREE_MID)
                 wait_outq_empty(conn, SIOCOUTQNSD, "three-write middle chunk to be sent")
                 conn.sendall(THREE_TAIL)
+            elif req_hdr.startswith(b"GET /split20k "):
+                # 20 KiB first write (header + body start), then a 4 KiB tail
+                # Nagle holds until the first write is ACKed. Both are far
+                # below the 64 KiB MSS but above any fixed small-write cutoff.
+                conn.sendall(SPLIT20_FIRST)
+                conn.sendall(SPLIT20_SECOND)
             elif req_hdr.startswith(b"GET /two2k "):
                 conn.sendall(TWO_FIRST)
                 conn.sendall(TWO_SECOND)
@@ -188,7 +208,8 @@ while True:
 /// 32 MiB sustained download, `short` for an unpaced 512x4 KiB short-write
 /// stream, `paced` for a 32x4 KiB paced short-write stream that lets the reader
 /// drain between writes, `pushed` for a 48x60000B pushed multi-segment stream,
-/// `fullmss` for 48 exactly-one-MSS PSH segments paced 12 ms apart, or
+/// `fullmss` for 48 exactly-one-MSS PSH segments paced 12 ms apart,
+/// `split20k <count>` for 20 KiB + 4 KiB split-write responses, or
 /// `rcvlowat <N>` to set `SO_RCVLOWAT` and gate reads on `select.poll()`),
 /// and prints two space-separated floats flushed after each workload command.
 /// Passing an optional count on argv runs a single burst and exits; adding
@@ -204,6 +225,7 @@ bulk_req = b"GET /bulk HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 short_req = b"GET /short HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 paced_req = b"GET /paced HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 pushed_req = b"GET /pushed HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
+split20k_req = b"GET /split20k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 two2k_req = b"GET /two2k HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 fullmss_req = b"GET /fullmss HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n"
 
@@ -216,6 +238,12 @@ def tcp_out_segs():
         if keys and keys[0] == "Tcp:" and "OutSegs" in keys:
             return int(vals[keys.index("OutSegs")])
     raise RuntimeError("OutSegs not found in /proc/net/snmp")
+
+def content_length(hdr):
+    for line in hdr.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            return int(line.split(b":", 1)[1].strip())
+    raise RuntimeError("missing Content-Length")
 
 def recv_exact(sock, n, buf):
     lowered = False
@@ -265,7 +293,7 @@ cur_lowat = 1
 use_poll = False
 buf = b""
 
-def run_burst(count, req_bytes=req, body_len=10240):
+def run_burst(count, req_bytes=req):
     global buf
     times_ms = []
     t_all = time.monotonic()
@@ -283,6 +311,7 @@ def run_burst(count, req_bytes=req, body_len=10240):
             buf += chunk
         hdr, buf = buf.split(b"\r\n\r\n", 1)
         assert b"200 OK" in hdr, hdr
+        body_len = content_length(hdr)
         body, buf = recv_exact(sock, body_len, buf)
         assert len(body) == body_len
         times_ms.append((time.monotonic() - t0) * 1000.0)
@@ -327,13 +356,12 @@ if len(sys.argv) > 3 and sys.argv[3] == "two2k":
     # Fresh connection: warm it with repeated two-write 2 KiB responses (rcv_mss
     # settles at 2 KiB, pingpong mode, quickack budget spent), then measure them
     # with SO_RCVLOWAT=3072 so the first write alone cannot wake poll().
-    two_body = 2 * 2048 - len(b"HTTP/1.1 200 OK\r\nContent-Length: XXXX\r\nConnection: keep-alive\r\n\r\n")
     with open(os.devnull, "w") as devnull:
         stdout, sys.stdout = sys.stdout, devnull
-        run_burst(30, two2k_req, two_body)
+        run_burst(30, two2k_req)
         sys.stdout = stdout
     set_lowat(3072)
-    run_burst(int(sys.argv[2]), two2k_req, two_body)
+    run_burst(int(sys.argv[2]), two2k_req)
 elif len(sys.argv) > 2:
     run_burst(int(sys.argv[2]))
 else:
@@ -353,12 +381,105 @@ else:
             run_stream(fullmss_req, None)
         elif line.startswith("three "):
             run_burst(int(line.split()[1]), three_req)
+        elif line.startswith("split20k "):
+            run_burst(int(line.split()[1]), split20k_req)
         elif line.startswith("rcvlowat "):
             set_lowat(int(line.split()[1]))
             print(f"{cur_lowat} 0.000", flush=True)
         else:
             run_burst(int(line))
 sock.close()
+"#;
+
+/// Receiver side of the accepted-connection near-MSS probe, listening on
+/// port 8081. The receiving socket is the *accepted* one, so the handshake
+/// has already deducted the TCP timestamp option from its `advmss`. Each
+/// message is a near-MSS first write plus a 1 KiB tail; the receiver polls
+/// with `SO_RCVLOWAT` above the first write, reads the whole message, and
+/// replies with one byte. The first message announces the sizes as
+/// `<first> <tail>\n`.
+const NEAR_MSS_RECEIVER_PY: &str = r#"
+import select, socket, threading
+
+def handle(conn):
+    try:
+        meta = b""
+        while not meta.endswith(b"\n"):
+            b = conn.recv(1)
+            if not b:
+                return
+            meta += b
+        first, tail = (int(x) for x in meta.split())
+        total = first + tail
+        lowat = first + tail // 2
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
+        poller = select.poll()
+        poller.register(conn, select.POLLIN)
+        conn.sendall(b"k")
+        while True:
+            if not poller.poll(10000):
+                raise RuntimeError("poll timed out")
+            got = 0
+            while got < total:
+                if total - got < lowat:
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+                chunk = conn.recv(total - got)
+                if not chunk:
+                    return
+                got += len(chunk)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, lowat)
+            conn.sendall(b"k")
+    finally:
+        conn.close()
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+# A fixed large buffer keeps the window open, so poll() wakes only on
+# SO_RCVLOWAT rather than on receive-window pressure.
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+srv.bind(("0.0.0.0", 8081))
+srv.listen(8)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+"#;
+
+/// Sender side of the accepted-connection near-MSS probe (Nagle enabled).
+/// Connects to `argv[1]:8081`, sends `<count>` messages of a first write of
+/// `MSS - 8` bytes (just below the full-sized payload, but above it if the
+/// timestamp option were deducted twice) followed by a 1 KiB tail that Nagle
+/// holds until the first write is ACKed, after 30 warm-up messages that
+/// settle the receiver's rcv_mss and pingpong mode. Prints `<p50> <total>`.
+const NEAR_MSS_SENDER_PY: &str = r#"
+import socket, sys, time
+
+sock = socket.create_connection((sys.argv[1], 8081), timeout=10)
+sock.settimeout(10)
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+opts = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+mss = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
+first, tail = mss - 8, 1024
+sock.sendall(f"{first} {tail}\n".encode())
+assert sock.recv(1) == b"k"
+first_buf, tail_buf = b"n" * first, b"t" * tail
+
+def exchange():
+    t0 = time.monotonic()
+    sock.sendall(first_buf)
+    sock.sendall(tail_buf)
+    if sock.recv(1) != b"k":
+        raise RuntimeError("bad reply")
+    return (time.monotonic() - t0) * 1000.0
+
+for _ in range(30):
+    exchange()
+t_all = time.monotonic()
+times = sorted(exchange() for _ in range(int(sys.argv[2])))
+total = (time.monotonic() - t_all) * 1000.0
+# struct tcp_info byte 5 is tcpi_options; bit 0 is TCPI_OPT_TIMESTAMPS, which
+# the case under test needs.
+assert opts[5] & 1, "TCP timestamps not negotiated"
+print(f"{times[len(times) // 2]:.3f} {total:.3f}", flush=True)
 "#;
 
 /// Probes whether Linux's delayed-ACK timer fires (`TcpExt: DelayedACKs` in
@@ -1054,6 +1175,65 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         .is_ok_and(|o| o.status.success())
     });
 
+    // Receiver for the accepted-connection near-MSS probe (qa-peer:8081).
+    let _peer_recv = ChildGuard(
+        Command::new("kubectl")
+            .arg("--kubeconfig")
+            .arg(&kubeconfig)
+            .args([
+                "exec",
+                "qa-peer",
+                "--",
+                "python3",
+                "-c",
+                NEAR_MSS_RECEIVER_PY,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start near-MSS receiver in qa-peer"),
+    );
+    let near_mss = |count: &str, timeout: Duration| -> Result<Output, String> {
+        kubectl_timeout(
+            &kubeconfig,
+            &[
+                "exec",
+                "qa-probe",
+                "--",
+                "python3",
+                "-c",
+                NEAR_MSS_SENDER_PY,
+                &peer_ip,
+                count,
+            ],
+            timeout,
+        )
+    };
+    wait_until(
+        "qa-peer near-MSS receiver ready",
+        Duration::from_secs(30),
+        |left| near_mss("1", left.min(Duration::from_secs(10))).is_ok_and(|o| o.status.success()),
+    );
+    // Accepted socket receiving a write just below the full-sized payload
+    // (MSS - 8) under SO_RCVLOWAT: the handshake already deducted the TCP
+    // timestamp option from its advmss, so deducting it again would misjudge
+    // that write as full-sized and leave the Nagle-held tail waiting for the
+    // stock delayed-ACK timer.
+    let run_near_mss = |what: &str| -> (f64, f64) {
+        let out = ok_result(near_mss("15", Duration::from_secs(60)), what);
+        parse_latencies(&out, what)
+    };
+    let (near_on_p50, near_on_total) =
+        run_near_mss("accepted-socket near-MSS split write (quickack=Y)");
+    eprintln!(
+        "pod-to-pod accepted-socket near-MSS split write (quickack=Y): p50={near_on_p50:.2}ms total={near_on_total:.2}ms"
+    );
+    assert!(
+        near_on_p50 < 15.0,
+        "accepted-socket near-MSS split write stalled with quickack=Y (p50={near_on_p50:.2}ms total={near_on_total:.2}ms)"
+    );
+
     // 1) Open ONE persistent keep-alive TCP connection from qa-probe to qa-peer
     //    and exercise three bursts on that exact established socket:
     //    - quickack=Y (default): fast (< 1 ms/req, no delayed-ACK stall)
@@ -1178,6 +1358,22 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         "SO_RCVLOWAT=4096 three-write hit stock delayed-ACK stall with quickack=Y (p50={three_on_p50:.2}ms total={three_on_total:.2}ms)"
     );
 
+    // 20 KiB + 4 KiB split write with SO_RCVLOWAT=22528 on the warmed
+    // connection (rcv_mss ~64 KiB): the 20 KiB first write is short relative
+    // to the peer's MSS, so it is ACKed early and Nagle releases the tail.
+    send_cmd("rcvlowat 22528", "set SO_RCVLOWAT=22528");
+    let (split20_on_p50, split20_on_total) = send_cmd(
+        "split20k 10",
+        "SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=Y)",
+    );
+    eprintln!(
+        "pod-to-pod SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=Y): p50={split20_on_p50:.2}ms total={split20_on_total:.2}ms"
+    );
+    assert!(
+        split20_on_p50 < 15.0,
+        "SO_RCVLOWAT=22528 20KiB+4KiB split write stalled with quickack=Y (p50={split20_on_p50:.2}ms total={split20_on_total:.2}ms)"
+    );
+
     // Repeated two-write 2 KiB responses on a fresh connection whose adaptive
     // rcv_mss settles at 2 KiB, polled with SO_RCVLOWAT=3072: the first write
     // is still a short push (judged against the advertised MSS, not rcv_mss),
@@ -1212,8 +1408,9 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
     );
 
     // Multi-segment pushed stream with SO_RCVLOWAT=262144 (>4 segments):
-    // 60000B segments exceed the 16 KiB short-push ceiling, so the SO_RCVLOWAT
-    // override stays out and stock pacing applies (compared with quickack=N).
+    // 60000B pushes are short relative to the ~64 KiB MSS, but
+    // !after(rcv_wup, copied_seq) limits immediate ACKs to one per unread
+    // batch and the capped timer batches the rest (compared with quickack=N).
     send_cmd("rcvlowat 262144", "set SO_RCVLOWAT=262144");
     let (pushed_acks_on, pushed_ms_on) = median_of_3(
         &mut send_cmd,
@@ -1286,6 +1483,28 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         assert!(
             three_off_p50 >= 35.0,
             "expected SO_RCVLOWAT=4096 three-write stall with quickack=0 (got p50={three_off_p50:.2}ms total={three_off_total:.2}ms)"
+        );
+
+        send_cmd("rcvlowat 22528", "set SO_RCVLOWAT=22528 (quickack=N)");
+        let (split20_off_p50, split20_off_total) = send_cmd(
+            "split20k 6",
+            "SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=N)",
+        );
+        eprintln!(
+            "pod-to-pod SO_RCVLOWAT=22528 20KiB+4KiB split write (quickack=N): p50={split20_off_p50:.2}ms total={split20_off_total:.2}ms"
+        );
+        assert!(
+            split20_off_p50 >= 25.0,
+            "expected SO_RCVLOWAT=22528 20KiB+4KiB split-write stall with quickack=0 (got p50={split20_off_p50:.2}ms total={split20_off_total:.2}ms)"
+        );
+        let (near_off_p50, near_off_total) =
+            run_near_mss("accepted-socket near-MSS split write (quickack=N)");
+        eprintln!(
+            "pod-to-pod accepted-socket near-MSS split write (quickack=N): p50={near_off_p50:.2}ms total={near_off_total:.2}ms"
+        );
+        assert!(
+            near_off_p50 >= 25.0,
+            "expected accepted-socket near-MSS split-write stall with quickack=0 (got p50={near_off_p50:.2}ms total={near_off_total:.2}ms)"
         );
 
         let (two_off_p50, two_off_total) = two2k("SO_RCVLOWAT=3072 two-write 2KiB (quickack=N)");
@@ -1373,7 +1592,11 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         // Stock bulk ACK counts swing widely with vCPU scheduling and receive
         // buffer state (tens to ~100 OutSegs per 32 MiB), so sample quickack=Y
         // on both sides of the quickack=N sample and compare the smaller
-        // median: a real 2x ACK doubling inflates both.
+        // median. The server writes 32 x 1 MiB chunks, each ending in PSH, so
+        // the drain-path quick ACK may legitimately add up to one ACK per
+        // write (+32). A real regression (ACKing every segment of the
+        // ~512-segment stream, or doubling stock pacing) means hundreds of
+        // extra ACKs and trips the absolute bound.
         let (bulk_acks_on2, bulk_ms_on2) = median_of_3(
             &mut send_cmd,
             "bulk",
@@ -1384,7 +1607,7 @@ fn pod_and_bridge_split_write_keepalive_has_no_delack_stall() {
         );
         let bulk_on = bulk_acks_on.min(bulk_acks_on2);
         assert!(
-            bulk_on < 260.0 && bulk_on <= bulk_acks_off * 1.4 + 16.0,
+            bulk_on < 260.0 && bulk_on <= bulk_acks_off * 1.4 + 48.0,
             "quickack=Y inflated sustained bulk ACK traffic (on={bulk_acks_on:.0}/{bulk_acks_on2:.0}, off={bulk_acks_off:.0})"
         );
     }
