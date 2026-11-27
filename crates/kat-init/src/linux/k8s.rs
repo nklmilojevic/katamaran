@@ -358,7 +358,9 @@ fn read_trimmed_file(path: &Path) -> Result<Option<String>, String> {
 /// older releases would fail to start kube-proxy. k3s v1.31.0–v1.31.5 bundle
 /// k3s-root v0.14.0 without `nft`; kube-proxy then resolves the rootfs
 /// `nftables` package's `/usr/sbin/nft` through `PATH` (see `guest/rootfs/build.sh`
-/// and `path_resolves_rootfs_nft_for_oldest_supported_k3s`).
+/// and `path_resolves_rootfs_nft_for_oldest_supported_k3s`). `scripts/k3s-nft-check.sh`
+/// runs a release in the guest's pinned Alpine image with these flags and checks that
+/// kube-proxy builds its nftables tables with the rootfs `nft`.
 const MIN_K8S_MINOR: u32 = 31;
 const SQLITE3_BIN: &str = "/usr/bin/sqlite3";
 /// Scratch root for WAL/journal inspection copies of `state.db`. `/run` is a
@@ -698,28 +700,6 @@ fn for_each_proto_field<'a>(
     Some(())
 }
 
-fn extract_kubelet_version_from_node_json(buf: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(buf).ok()?;
-    if let Some(kind) = v.get("kind").and_then(serde_json::Value::as_str)
-        && !kind.is_empty()
-        && kind != "Node"
-    {
-        return None;
-    }
-    if let Some(api_version) = v.get("apiVersion").and_then(serde_json::Value::as_str)
-        && !api_version.is_empty()
-        && api_version != "v1"
-    {
-        return None;
-    }
-    v.get("status")?
-        .get("nodeInfo")?
-        .get("kubeletVersion")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 /// Extract `status.nodeInfo.kubeletVersion` from a serialized Kubernetes
 /// `core/v1.Node` protobuf message (`Node.status = 3`, `NodeStatus.nodeInfo = 7`,
 /// `NodeSystemInfo.kubeletVersion = 7`).
@@ -755,8 +735,10 @@ fn extract_kubelet_version_from_node_proto(buf: &[u8]) -> Option<String> {
 }
 
 /// Extract `status.nodeInfo.kubeletVersion` from a Kubernetes `Node` object
-/// stored in kine's `value` column (either `k8s\0` + `runtime.Unknown` protobuf
-/// envelope or plain JSON).
+/// stored in kine's `value` column. Only the encoding kube-apiserver uses for
+/// core types is accepted: the `k8s\0` prefix and an uncompressed
+/// `runtime.Unknown` protobuf envelope with `apiVersion: v1`, `kind: Node`, and
+/// a protobuf body. Anything else (JSON, compression, other kinds) is rejected.
 fn extract_kubelet_version_from_node_blob(blob: &[u8]) -> Option<String> {
     if let Some(body) = blob.strip_prefix(b"k8s\0") {
         let mut api_version = "";
@@ -811,27 +793,14 @@ fn extract_kubelet_version_from_node_blob(blob: &[u8]) -> Option<String> {
             }
             Some(())
         })?;
-        if !content_encoding.is_empty() {
+        if !content_encoding.is_empty()
+            || api_version != "v1"
+            || kind != "Node"
+            || !matches!(content_type, "" | "application/vnd.kubernetes.protobuf")
+        {
             return None;
         }
-        if !api_version.is_empty() && api_version != "v1" {
-            return None;
-        }
-        if !kind.is_empty() && kind != "Node" {
-            return None;
-        }
-        let raw = raw.filter(|r| !r.is_empty())?;
-        return match content_type {
-            "" | "application/vnd.kubernetes.protobuf" => {
-                extract_kubelet_version_from_node_proto(raw)
-            }
-            "application/json" => extract_kubelet_version_from_node_json(raw),
-            _ => None,
-        };
-    }
-    let trimmed = blob.trim_ascii_start();
-    if trimmed.starts_with(b"{") {
-        return extract_kubelet_version_from_node_json(trimmed);
+        return extract_kubelet_version_from_node_proto(raw.filter(|r| !r.is_empty())?);
     }
     None
 }
@@ -883,84 +852,72 @@ fn detect_datastore_version_from_state_db_with(
         log(&format!("skip state.db detection: {e}"));
         return None;
     }
-    let journal_len = match inspect_regular_companion(&journal_path) {
-        Ok(v) => v,
+    // kine runs SQLite in WAL mode; a non-empty rollback journal means an
+    // interrupted non-WAL write that only a writable open would recover, so fail
+    // closed instead of emulating it.
+    match inspect_regular_companion(&journal_path) {
+        Ok(None | Some(0)) => {}
+        Ok(Some(_)) => {
+            log("skip state.db detection: state.db-journal is not empty");
+            return None;
+        }
         Err(e) => {
             log(&format!("skip state.db detection: {e}"));
             return None;
         }
-    };
+    }
 
-    let (_scratch, sqlite_target) = if wal_len.unwrap_or(0) == 0 && journal_len.unwrap_or(0) == 0 {
-        if !db_path.is_absolute() {
-            return None;
-        }
-        (
-            None,
-            format!("file:{}?immutable=1", encode_sqlite_uri_path(&db_path)),
-        )
-    } else {
-        let total = wal_len.unwrap_or(0)
-            + journal_len.unwrap_or(0)
-            + fs::symlink_metadata(&db_path)
-                .map(|m| m.len())
-                .unwrap_or(u64::MAX);
-        if total > STATE_DB_MAX_SCRATCH_BYTES {
-            log(&format!(
-                "skip state.db detection: {total} bytes exceeds the \
-                 {STATE_DB_MAX_SCRATCH_BYTES}-byte inspection limit"
-            ));
-            return None;
-        }
-        if let Err(e) = DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(probe.scratch_root)
-        {
-            log(&format!(
-                "create state.db scratch root {}: {e}",
-                probe.scratch_root.display()
-            ));
-            return None;
-        }
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let scratch_path = probe
-            .scratch_root
-            .join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
-        if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
-            log(&format!(
-                "create state.db scratch dir {}: {e}",
-                scratch_path.display()
-            ));
-            return None;
-        }
-        let guard = ScratchDir(scratch_path);
-        let scratch_db = guard.0.join("state.db");
-        let mut budget = STATE_DB_MAX_SCRATCH_BYTES;
-        if let Err(e) = copy_regular_file_bounded(&db_path, &scratch_db, &mut budget) {
-            log(&format!("copy state.db for inspection: {e}"));
-            return None;
-        }
-        if wal_len.is_some()
-            && let Err(e) =
-                copy_regular_file_bounded(&wal_path, &guard.0.join("state.db-wal"), &mut budget)
-        {
-            log(&format!("copy state.db-wal for inspection: {e}"));
-            return None;
-        }
-        if journal_len.is_some()
-            && let Err(e) = copy_regular_file_bounded(
-                &journal_path,
-                &guard.0.join("state.db-journal"),
-                &mut budget,
-            )
-        {
-            log(&format!("copy state.db-journal for inspection: {e}"));
-            return None;
-        }
-        let uri = format!("file:{}", encode_sqlite_uri_path(&scratch_db));
-        (Some(guard), uri)
-    };
+    // Always inspect a private copy (database plus WAL) on the /run tmpfs, so the
+    // live files are never opened by sqlite3 and the copy never reaches the disk.
+    let total = wal_len.unwrap_or(0).saturating_add(
+        fs::symlink_metadata(&db_path)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX),
+    );
+    if total > STATE_DB_MAX_SCRATCH_BYTES {
+        log(&format!(
+            "skip state.db detection: {total} bytes exceeds the \
+             {STATE_DB_MAX_SCRATCH_BYTES}-byte inspection limit"
+        ));
+        return None;
+    }
+    if let Err(e) = DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(probe.scratch_root)
+    {
+        log(&format!(
+            "create state.db scratch root {}: {e}",
+            probe.scratch_root.display()
+        ));
+        return None;
+    }
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let scratch_path = probe
+        .scratch_root
+        .join(format!(".state-db-inspect.{}.{seq}", std::process::id()));
+    if let Err(e) = DirBuilder::new().mode(0o700).create(&scratch_path) {
+        log(&format!(
+            "create state.db scratch dir {}: {e}",
+            scratch_path.display()
+        ));
+        return None;
+    }
+    let scratch = ScratchDir(scratch_path);
+    let scratch_db = scratch.0.join("state.db");
+    let mut budget = STATE_DB_MAX_SCRATCH_BYTES;
+    if let Err(e) = copy_regular_file_bounded(&db_path, &scratch_db, &mut budget) {
+        log(&format!("copy state.db for inspection: {e}"));
+        return None;
+    }
+    if wal_len.is_some()
+        && let Err(e) =
+            copy_regular_file_bounded(&wal_path, &scratch.0.join("state.db-wal"), &mut budget)
+    {
+        log(&format!("copy state.db-wal for inspection: {e}"));
+        return None;
+    }
+    let sqlite_target = format!("file:{}", encode_sqlite_uri_path(&scratch_db));
 
     let mut query = |sql: &str| -> Option<String> {
         let mut cmd = Command::new(sqlite3_bin);
@@ -1097,27 +1054,44 @@ fn mark_datastore_version_at_with(
             return Err(format!("stat {}: {e}", data_version_file.display()));
         }
     }
-    if let Some(detected) = detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd)
-        && let (Some(supplied_mm), Some(detected_mm)) = (
+    // mark-version is only for datastores whose version is genuinely unknown.
+    // A stamp (even a corrupt one) or a trusted pre-tracking node record already
+    // determines the version, and marking over it could let a skipped minor or
+    // a downgrade through.
+    let stamp = server_version_stamp(data_dir);
+    match read_marker_file(&stamp)? {
+        MarkerFile::Missing => {}
+        MarkerFile::Present(stamped) => {
+            return Err(format!(
+                "{} already records this datastore's k3s version ({stamped}); \
+                 refusing to mark it. Start Kubernetes with a compatible k8s_version instead.",
+                stamp.display()
+            ));
+        }
+        MarkerFile::Empty | MarkerFile::NonRegular => {
+            return Err(corrupt_datastore_version_error(
+                &stamp,
+                "exists but is not a valid version stamp",
+            ));
+        }
+    }
+    if let Some(detected) = detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd) {
+        if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) {
+            return Err(format!(
+                "server/db/state.db shows this datastore was last run by {detected}, which \
+                 katamaran already accepts without a marker; refusing to mark it. Start \
+                 Kubernetes with a compatible k8s_version instead."
+            ));
+        }
+        if let (Some(supplied_mm), Some(detected_mm)) = (
             parse_strict_k3s_tag(version),
             parse_strict_k3s_tag(&detected),
-        )
-        && supplied_mm < detected_mm
-    {
-        return Err(format!(
-            "refusing to mark datastore as {version}: server/db/state.db already records newer k3s {detected}"
-        ));
-    }
-    if let MarkerFile::Present(stamped) = read_marker_file(&server_version_stamp(data_dir))?
-        && let (Some(supplied_mm), Some(stamped_mm)) = (
-            parse_strict_k3s_tag(version),
-            parse_strict_k3s_tag(&stamped),
-        )
-        && supplied_mm < stamped_mm
-    {
-        return Err(format!(
-            "refusing to mark datastore as {version}: server/db/{SERVER_VERSION_STAMP} records newer k3s {stamped}"
-        ));
+        ) && supplied_mm < detected_mm
+        {
+            return Err(format!(
+                "refusing to mark datastore as {version}: server/db/state.db already records newer k3s {detected}"
+            ));
+        }
     }
     write_atomic_new(data_version_file, format!("{version}\n").as_bytes())
 }
@@ -1143,14 +1117,14 @@ fn effective_datastore_version_with(
     if !datastore_exists(data_dir)? {
         return Ok(None);
     }
-    match read_marker_file(data_version_file)? {
-        MarkerFile::Present(v) => newer_of_marker_and_stamp(data_dir, v).map(Some),
+    let recorded = match read_marker_file(data_version_file)? {
+        MarkerFile::Present(v) => Some(newer_of_marker_and_stamp(data_dir, v)?),
         MarkerFile::Missing => {
             let stamp = server_version_stamp(data_dir);
             match read_marker_file(&stamp)? {
                 // Written before every tracking-era launch, so it is at least the
-                // newest k3s that opened this `server/`.
-                MarkerFile::Present(v) => return Ok(Some(v)),
+                // newest k3s that a tracking-enabled release ran against `server/`.
+                MarkerFile::Present(v) => Some(v),
                 MarkerFile::Empty => {
                     return Err(corrupt_datastore_version_error(&stamp, "is empty"));
                 }
@@ -1162,30 +1136,52 @@ fn effective_datastore_version_with(
                 }
                 // No tracking-enabled release ever launched k3s against this
                 // `server/`, so only a pre-tracking pinned build can have opened it.
-                MarkerFile::Missing => {}
-            }
-            match detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd) {
-                Some(detected) if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) => {
-                    Ok(Some(detected))
-                }
-                Some(detected) => Err(format!(
-                    "{} The node record in server/db/state.db reports k3s {detected}, \
-                     which no pre-tracking katamaran release ran, so it is only a lower \
-                     bound (a newer k3s server may have opened this datastore before its \
-                     kubelet reported status) and cannot be used to verify compatibility.",
-                    missing_datastore_version_error(data_dir, data_version_file)
-                )),
-                None => Err(missing_datastore_version_error(data_dir, data_version_file)),
+                MarkerFile::Missing => None,
             }
         }
-        MarkerFile::Empty => Err(corrupt_datastore_version_error(
-            data_version_file,
-            "is empty",
+        MarkerFile::Empty => {
+            return Err(corrupt_datastore_version_error(
+                data_version_file,
+                "is empty",
+            ));
+        }
+        MarkerFile::NonRegular => {
+            return Err(corrupt_datastore_version_error(
+                data_version_file,
+                "is not a regular file",
+            ));
+        }
+    };
+    // The node record is always a lower bound: k3s's kubelet reports the server's
+    // own release, so whatever it records has opened this datastore. That catches
+    // data run by a release that did not update the marker or stamp (for example
+    // an older katamaran after a rollback).
+    let detected = detect_datastore_version_from_state_db_with(data_dir, probe, run_cmd);
+    match (recorded, detected) {
+        (Some(recorded), detected) => Ok(Some(newer_minor(recorded, detected))),
+        (None, Some(detected)) if PRE_TRACKING_K3S_VERSIONS.contains(&detected.as_str()) => {
+            Ok(Some(detected))
+        }
+        (None, Some(detected)) => Err(format!(
+            "{} The node record in server/db/state.db reports k3s {detected}, \
+             which no pre-tracking katamaran release ran, so it is only a lower \
+             bound (a newer k3s server may have opened this datastore before its \
+             kubelet reported status) and cannot be used to verify compatibility.",
+            missing_datastore_version_error(data_dir, data_version_file)
         )),
-        MarkerFile::NonRegular => Err(corrupt_datastore_version_error(
-            data_version_file,
-            "is not a regular file",
-        )),
+        (None, None) => Err(missing_datastore_version_error(data_dir, data_version_file)),
+    }
+}
+
+/// `recorded`, unless the state.db node record shows a newer minor.
+fn newer_minor(recorded: String, detected: Option<String>) -> String {
+    match (detected, parse_k3s_minor(&recorded)) {
+        (Some(d), Some(recorded_mm))
+            if parse_k3s_minor(&d).is_some_and(|d_mm| d_mm > recorded_mm) =>
+        {
+            d
+        }
+        _ => recorded,
     }
 }
 
@@ -2312,6 +2308,36 @@ impl K8s {
             Err(err)
         };
 
+        // Stop a running-but-unready k3s and fail the start. Marks stopping first so
+        // the exit watcher does not race us, then reaps k3s and cleans up workloads
+        // before restoring sysctls.
+        let fail_running_startup = |err: String| -> Result<K8sInfo, String> {
+            let running = {
+                let mut st = self.state.lock().unwrap();
+                st.phase = "stopping".into();
+                st.api_ready = false;
+                st.running.take()
+            };
+            let reaped = running.is_none_or(terminate_running);
+            stop_k8s_workloads(&self.reaper);
+            if reaped {
+                rollback_versions_if_untouched(
+                    Path::new(DATA_DIR),
+                    before_datastore.as_ref(),
+                    restore_versions,
+                );
+            }
+            ACTIVE.store(false, Ordering::SeqCst);
+            FORWARDED.lock().unwrap().clear();
+            restore_bridge_netfilter();
+            let mut st = self.state.lock().unwrap();
+            if st.generation == my_gen {
+                st.phase = "failed".into();
+                st.error = err.clone();
+            }
+            Err(err)
+        };
+
         let _ = k8s::write(
             &mut *conn,
             &K8sMsg::Progress("waiting for Kubernetes API server".into()),
@@ -2329,36 +2355,10 @@ impl K8s {
                 break;
             }
             if Instant::now() >= deadline {
-                let err = format!(
+                return fail_running_startup(format!(
                     "Kubernetes API not ready after {}s; see {LOG_FILE}",
                     READY_TIMEOUT.as_secs()
-                );
-                // Mark stopping first so the exit watcher does not race us,
-                // then reap k3s and clean up workloads before restoring sysctls.
-                let running = {
-                    let mut st = self.state.lock().unwrap();
-                    st.phase = "stopping".into();
-                    st.api_ready = false;
-                    st.running.take()
-                };
-                let reaped = running.is_none_or(terminate_running);
-                stop_k8s_workloads(&self.reaper);
-                if reaped {
-                    rollback_versions_if_untouched(
-                        Path::new(DATA_DIR),
-                        before_datastore.as_ref(),
-                        restore_versions,
-                    );
-                }
-                ACTIVE.store(false, Ordering::SeqCst);
-                FORWARDED.lock().unwrap().clear();
-                restore_bridge_netfilter();
-                let mut st = self.state.lock().unwrap();
-                if st.generation == my_gen {
-                    st.phase = "failed".into();
-                    st.error = err.clone();
-                }
-                return Err(err);
+                ));
             }
             thread::sleep(Duration::from_millis(250));
         }
@@ -2366,11 +2366,15 @@ impl K8s {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return abort_for_shutdown();
         }
+        // Never report a cluster ready without its datastore version stamp: k3s's
+        // SQLite datastore lives in server/db/, so it must exist once the API is up.
         stamp_fresh_datastore(&mut fresh_stamp_pending);
         if fresh_stamp_pending {
-            log(
-                "new datastore has no server/db yet; its version stamp will be written on the next start",
-            );
+            return fail_running_startup(format!(
+                "could not record the k3s version in {}; stopped Kubernetes \
+                 (see {LOG_FILE} and the kat-init log)",
+                server_version_stamp(Path::new(DATA_DIR)).display()
+            ));
         }
         {
             let mut st = self.state.lock().unwrap();
@@ -4428,7 +4432,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
     }
 
     #[test]
-    fn extracts_kubelet_version_from_k8s_protobuf_and_json_nodes() {
+    fn extracts_kubelet_version_only_from_k8s_protobuf_nodes() {
         let proto = encode_k8s_node_proto("v1.37.2+k3s1");
         assert_eq!(
             extract_kubelet_version_from_node_blob(&proto).as_deref(),
@@ -4443,30 +4447,34 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             Some("v1.37.2+k3s1")
         );
 
-        // Plain JSON Node.
+        // JSON (plain or inside the envelope) is not an encoding kube-apiserver uses
+        // for core types in kine, so it is rejected rather than parsed.
         let json = br#"{"apiVersion":"v1","kind":"Node","status":{"nodeInfo":{"kubeletVersion":"v1.32.5+k3s1"}}}"#;
-        assert_eq!(
-            extract_kubelet_version_from_node_blob(json).as_deref(),
-            Some("v1.32.5+k3s1")
-        );
-
-        // JSON wrapped inside k8s\0 runtime.Unknown envelope.
+        assert_eq!(extract_kubelet_version_from_node_blob(json), None);
         let mut unknown_json = b"k8s\0".to_vec();
+        let mut type_meta = Vec::new();
+        push_proto_bytes(&mut type_meta, 1, b"v1");
+        push_proto_bytes(&mut type_meta, 2, b"Node");
+        push_proto_bytes(&mut unknown_json, 1, &type_meta);
         push_proto_bytes(&mut unknown_json, 2, json);
         push_proto_bytes(&mut unknown_json, 4, b"application/json");
-        assert_eq!(
-            extract_kubelet_version_from_node_blob(&unknown_json).as_deref(),
-            Some("v1.32.5+k3s1")
-        );
+        assert_eq!(extract_kubelet_version_from_node_blob(&unknown_json), None);
 
         // Non-empty contentEncoding, wrong kind, truncated protobuf, or missing field fail closed.
         let mut compressed = proto.clone();
         push_proto_bytes(&mut compressed, 3, b"gzip");
         assert_eq!(extract_kubelet_version_from_node_blob(&compressed), None);
 
-        let wrong_kind =
-            br#"{"apiVersion":"v1","kind":"Pod","status":{"nodeInfo":{"kubeletVersion":"v1.37.2+k3s1"}}}"#;
-        assert_eq!(extract_kubelet_version_from_node_blob(wrong_kind), None);
+        let wrong_kind = encode_k8s_node_proto("v1.37.2+k3s1")
+            .windows(4)
+            .position(|w| w == b"Node")
+            .map(|i| {
+                let mut b = encode_k8s_node_proto("v1.37.2+k3s1");
+                b[i..i + 4].copy_from_slice(b"Pods");
+                b
+            })
+            .unwrap();
+        assert_eq!(extract_kubelet_version_from_node_blob(&wrong_kind), None);
 
         assert_eq!(
             extract_kubelet_version_from_node_blob(&proto[..proto.len() - 3]),
@@ -4528,6 +4536,11 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let err =
             check_datastore_compatible(&data_dir, &data_version_file, "v1.39.0+k3s1").unwrap_err();
         assert!(err.contains("skipping minor versions"), "{err}");
+        // A trusted pre-tracking node record cannot be re-marked (e.g. as v1.39 to
+        // skip a minor).
+        let err =
+            mark_datastore_version_at(&data_dir, &data_version_file, "v1.39.0+k3s1").unwrap_err();
+        assert!(err.contains("already accepts without a marker"), "{err}");
         assert_eq!(snapshot_datastore(&data_dir).unwrap(), before);
         assert!(!data_version_file.exists());
 
@@ -4655,14 +4668,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             .collect();
         assert!(leftover_scratch.is_empty(), "{leftover_scratch:?}");
 
-        // 4. JSON-encoded Node row is also detected accurately; a non-pre-tracking version
-        // (v1.36.4+k3s1) is a lower bound only, even for its own release.
-        let json_data = dir.join("json-case/data");
+        // 4. A non-pre-tracking version (v1.36.4+k3s1) is a lower bound only, even for
+        // its own release.
+        let json_data = dir.join("lower-bound-case/data");
         let json_marker = json_data.join(".katamaran-version");
         fs::create_dir_all(json_data.join("server/db")).unwrap();
-        let json_blob = hex_upper(
-            br#"{"apiVersion":"v1","kind":"Node","status":{"nodeInfo":{"kubeletVersion":"v1.36.4+k3s1"}}}"#,
-        );
+        let json_blob = hex_upper(&encode_k8s_node_proto("v1.36.4+k3s1"));
         sqlite_exec(
             &json_data.join("server/db/state.db"),
             &format!(
@@ -4794,8 +4805,12 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let err = check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
         assert!(err.contains("v1.38.0+k3s1"), "{err}");
         check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
-        let err = mark_datastore_version_at(&data_dir, &marker, "v1.37.2+k3s1").unwrap_err();
-        assert!(err.contains("records newer k3s v1.38.0+k3s1"), "{err}");
+        // mark-version cannot override a stamp in either direction.
+        for v in ["v1.37.2+k3s1", "v1.39.0+k3s1"] {
+            let err = mark_datastore_version_at(&data_dir, &marker, v).unwrap_err();
+            assert!(err.contains("already records"), "{err}");
+            assert!(err.contains("v1.38.0+k3s1"), "{err}");
+        }
         assert!(!marker.exists());
 
         // An untouched failed upgrade restores each file to its prior state: with no
@@ -4832,6 +4847,16 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         fs::write(&marker, "v1.38.0+k3s1\n").unwrap();
         restore_server_version_stamp(&data_dir, Some("v1.37.2+k3s1"));
         assert!(check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").is_err());
+        check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
+        fs::remove_file(&marker).unwrap();
+
+        // The node record is a lower bound even with a marker and stamp: data last
+        // run by v1.37.2 (e.g. an older katamaran after a rollback) refuses v1.36.
+        fs::write(&marker, "v1.36.4+k3s1\n").unwrap();
+        restore_server_version_stamp(&data_dir, Some("v1.36.4+k3s1"));
+        let err = check_datastore_compatible(&data_dir, &marker, "v1.36.4+k3s1").unwrap_err();
+        assert!(err.contains("v1.37.2+k3s1"), "{err}");
+        check_datastore_compatible(&data_dir, &marker, "v1.37.2+k3s1").unwrap();
         check_datastore_compatible(&data_dir, &marker, "v1.38.0+k3s1").unwrap();
         fs::remove_file(&marker).unwrap();
 

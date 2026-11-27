@@ -77,23 +77,27 @@ katamaran downloads that release's `k3s-arm64` into `~/.katamaran/cache/k3s/<ver
 
 Katamaran records the cluster's `k3s` release tag in `/var/lib/katamaran/k3s/data/.katamaran-version` and never falls back to `/var/lib/katamaran/k3s/bin/version`, so an unmarked restored datastore can never inherit an unrelated installed binary's version.
 
-When starting a healthy cluster initialized by an older katamaran release that did not write `.katamaran-version`, katamaran automatically inspects `/var/lib/katamaran/k3s/data/server/db/state.db` read-only (including any uncheckpointed SQLite WAL) to read the node's recorded `kubeletVersion`. If it is `v1.37.2+k3s1`, the only `k3s` build that katamaran releases before version tracking ever ran, katamaran verifies minor-version compatibility against the selected `k3s` release and writes `.katamaran-version` before launching `k3s`, so normal upgrades need no manual action. Any inspection copy needed for the WAL is made on the guest's `/run` tmpfs, never on the data disk.
+Katamaran decides which `k3s` release last opened an existing datastore from three records, using the newest minor among those available:
 
-A node record is not proof of which control plane last opened the datastore: a newer `k3s` server can open the database and stop before its kubelet reports status. Katamaran therefore also writes the version to `server/db/.katamaran-k3s-version` (beside `state.db`) before every launch, and for a new cluster as soon as `k3s` creates `server/db/`, so it travels with any backup of `server/` or `server/db/`. When `.katamaran-version` is missing, that stamp takes precedence, and if the two disagree (one restored without the other) the newer minor wins. The node record is trusted only when `server/` has no stamp (no tracking-enabled release ever launched `k3s` against it) and the record matches a build older katamaran releases could have run. Any other recorded version is treated only as a lower bound. Always back up `.katamaran-version` together with `server/`.
+- `/var/lib/katamaran/k3s/data/.katamaran-version`, written before every launch.
+- `/var/lib/katamaran/k3s/data/server/db/.katamaran-k3s-version`, a copy written beside `state.db` before every launch (and, for a new cluster, as soon as `k3s` creates `server/db/`; startup fails if it cannot be written). It travels with any backup of `server/` or `server/db/`.
+- The node's `kubeletVersion` in `server/db/state.db`, read from a private copy on the guest's `/run` tmpfs (including any uncheckpointed WAL) without opening the live files. It is always a lower bound, so data last run by a release that did not update the other two records (for example an older katamaran after a rollback) still refuses a downgrade.
 
-If the node record shows any other version, or katamaran cannot read it (for example after an incomplete initialization before the node registered, a corrupt or unreadable `state.db`, or an unmarked backup without a node record), startup fails closed rather than guessing from `/var/lib/katamaran/k3s/bin/version`. To migrate a datastore whose version you **know** independently (do not use this for an unknown backup restore, and never guess the version from whichever `k3s` binary is currently installed):
+A node record alone is not proof of which control plane last opened the datastore: a newer `k3s` server can open the database and stop before its kubelet reports status. So when neither version file exists, katamaran accepts the datastore only if the node record is `v1.37.2+k3s1`, the only build that katamaran releases before version tracking ever ran. Tracking-enabled releases always write both files before launching `k3s`, so a datastore without either one was last opened by such a release. This makes a normal upgrade from an older katamaran release automatic. An empty or non-regular version file fails closed. Always back up `.katamaran-version` together with `server/`.
+
+If the node record shows any other version, or katamaran cannot read it (for example after an incomplete initialization before the node registered, a corrupt or unreadable `state.db`, a datastore over 256 MiB, or an unmarked backup without a node record), startup fails closed rather than guessing from `/var/lib/katamaran/k3s/bin/version`. To migrate a datastore whose version you **know** independently (do not use this for an unknown backup restore, and never guess the version from whichever `k3s` binary is currently installed):
 
 1. Make sure the VM is running and Kubernetes is stopped:
    - If the VM is already running (for example after upgrading when Kubernetes auto-start refused the unmarked datastore), run `kat k8s stop` if Kubernetes is still active.
    - If the VM is stopped, disable Kubernetes auto-start first (`kat config set kubernetes=off`) so booting does not attempt to start Kubernetes, then start the VM (`kat start`).
-2. Independently verify the exact `k3s` release tag that last opened the datastore — for example, confirm the pinned `k3s` release shipped by that older katamaran version (such as `v1.37.2+k3s1` in katamaran v0.10.0) or verify from your cluster logs/records from before stopping.
+2. Independently verify the exact `k3s` release tag that last opened the datastore, for example from the backup's records or your cluster logs from before stopping.
 3. Record that exact verified tag from macOS using `kat k8s mark-version`:
 
    ```sh
-   kat k8s mark-version v1.37.2+k3s1
+   kat k8s mark-version v1.36.4+k3s1
    ```
 
-   `kat k8s mark-version` validates the release tag, requires the VM to be running with Kubernetes stopped and an existing unmarked datastore to be present, writes `/var/lib/katamaran/k3s/data/.katamaran-version` inside the VM, refuses to overwrite any existing marker (or mark a lower minor than `state.db` already records), and never infers the version from `/var/lib/katamaran/k3s/bin/version`.
+   `kat k8s mark-version` validates the release tag, requires the VM to be running with Kubernetes stopped and an existing unmarked datastore to be present, writes `/var/lib/katamaran/k3s/data/.katamaran-version` inside the VM, refuses to overwrite any existing marker, refuses when the version is already known (a `server/db/.katamaran-k3s-version` stamp exists, or the node record is `v1.37.2+k3s1`), refuses a lower minor than `state.db` already records, and never infers the version from `/var/lib/katamaran/k3s/bin/version`.
 4. Start Kubernetes (`kat k8s start`) with a compatible `k8s_version` (same minor or one minor newer) — this also re-enables Kubernetes auto-start — or run `kat k8s reset` if you prefer to start fresh instead of migrating.
 
 ## Connect with `kubectl`
