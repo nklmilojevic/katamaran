@@ -248,10 +248,18 @@ fn verify_host_pty_shell_and_resize(home: &Path) {
     );
     let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
-    unsafe {
-        libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-    }
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0,
+        "fcntl(master, F_SETFD, FD_CLOEXEC) failed: {}",
+        io::Error::last_os_error()
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0,
+        "fcntl(slave, F_SETFD, FD_CLOEXEC) failed: {}",
+        io::Error::last_os_error()
+    );
 
     let mut before: libc::termios = unsafe { std::mem::zeroed() };
     assert_eq!(

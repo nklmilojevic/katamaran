@@ -400,7 +400,12 @@ fn relay_read_exact(fd: RawFd, buf: &mut [u8]) -> io::Result<bool> {
 fn relay_note_progress(progress_fd: RawFd) {
     if progress_fd >= 0 {
         let b = [0u8; 1];
-        let _ = unsafe { libc::write(progress_fd, b.as_ptr().cast(), 1) };
+        loop {
+            let rc = unsafe { libc::write(progress_fd, b.as_ptr().cast(), 1) };
+            if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
     }
 }
 
@@ -1697,15 +1702,14 @@ fn pipe_cloexec(nonblock_both: bool) -> io::Result<(OwnedFd, OwnedFd)> {
     }
     let r = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let w = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    unsafe {
-        libc::fcntl(r.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(w.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+    for fd in [r.as_raw_fd(), w.as_raw_fd()] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         if nonblock_both {
-            for fd in [r.as_raw_fd(), w.as_raw_fd()] {
-                let fl = libc::fcntl(fd, libc::F_GETFL);
-                if fl >= 0 {
-                    libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-                }
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if fl < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0 {
+                return Err(io::Error::last_os_error());
             }
         }
     }
@@ -1714,8 +1718,11 @@ fn pipe_cloexec(nonblock_both: bool) -> io::Result<(OwnedFd, OwnedFd)> {
 
 fn notify_wake(w: &OwnedFd) {
     let b: u8 = 1;
-    unsafe {
-        let _ = libc::write(w.as_raw_fd(), (&b as *const u8).cast(), 1);
+    loop {
+        let rc = unsafe { libc::write(w.as_raw_fd(), (&b as *const u8).cast(), 1) };
+        if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
     }
 }
 
@@ -1723,9 +1730,13 @@ fn drain_wake(r: &OwnedFd) {
     let mut buf = [0u8; 64];
     loop {
         let rc = unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if rc <= 0 {
-            break;
+        if rc > 0 {
+            continue;
         }
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
     }
 }
 
@@ -1778,24 +1789,24 @@ extern "C" fn signal_handler(sig: libc::c_int) {
 
 struct SignalGuard {
     saved: Vec<(libc::c_int, libc::sigaction)>,
-    sig_w: OwnedFd,
+    sig_w: Option<OwnedFd>,
     dispatcher: Option<thread::JoinHandle<()>>,
 }
 
 impl SignalGuard {
     fn install(signals: &[libc::c_int]) -> io::Result<(Self, OwnedFd)> {
         let (sig_r, sig_w) = pipe_cloexec(false)?;
-        unsafe {
-            let fl = libc::fcntl(sig_w.as_raw_fd(), libc::F_GETFL);
-            if fl >= 0 {
-                libc::fcntl(sig_w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
-            }
+        let fl = unsafe { libc::fcntl(sig_w.as_raw_fd(), libc::F_GETFL) };
+        if fl < 0
+            || unsafe { libc::fcntl(sig_w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error());
         }
 
         SIGNAL_PIPE_FD.store(sig_w.as_raw_fd(), Ordering::Release);
         let mut guard = SignalGuard {
             saved: Vec::with_capacity(signals.len()),
-            sig_w,
+            sig_w: Some(sig_w),
             dispatcher: None,
         };
 
@@ -1833,10 +1844,17 @@ impl Drop for SignalGuard {
             }
         }
         SIGNAL_PIPE_FD.store(-1, Ordering::Release);
-        // Wake and join the dispatcher thread before closing `sig_w`.
-        let stop: u8 = 0;
-        unsafe {
-            let _ = libc::write(self.sig_w.as_raw_fd(), (&stop as *const u8).cast(), 1);
+        // Wake the dispatcher via a stop byte and close the write end so the
+        // reader observes EOF even if the pipe was already full of signals.
+        if let Some(sig_w) = self.sig_w.take() {
+            let stop: u8 = 0;
+            loop {
+                let rc = unsafe { libc::write(sig_w.as_raw_fd(), (&stop as *const u8).cast(), 1) };
+                if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+            drop(sig_w);
         }
         if let Some(h) = self.dispatcher.take() {
             let _ = h.join();
@@ -3131,9 +3149,17 @@ fn run_session_io_windowed(
 
     // Install signal wakeups BEFORE entering raw mode or starting the stdin
     // relay so catchable termination signals always unwind cleanly and
-    // restore host termios.
-    let sig_setup =
-        SignalGuard::install(&[libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT]).ok();
+    // restore host termios. Propagate setup failure rather than entering raw
+    // mode unprotected.
+    let (mut sig_guard, sig_r) =
+        match SignalGuard::install(&[libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT]) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = conn.shutdown(Shutdown::Both);
+                return Err(anyhow::Error::new(e)
+                    .context("failed to install signal handlers; the command was hung up"));
+            }
+        };
 
     let raw = if want_raw {
         RawMode::enter_fd(stdin_fd).ok()
@@ -3182,7 +3208,7 @@ fn run_session_io_windowed(
     let sigint_in_flight = Arc::new(AtomicBool::new(false));
     let terminated_by = Arc::new(AtomicI32::new(0));
 
-    let mut sig_guard = sig_setup.map(|(mut guard, sig_r)| {
+    {
         let shutdown_sock = shutdown_sock.clone();
         let term_wake_w = term_wake_w.clone();
         let sigint_tx = sigint_tx.clone();
@@ -3226,9 +3252,8 @@ fn run_session_io_windowed(
                 notify_wake(&sigint_wake_w);
             }
         });
-        guard.attach_dispatcher(handle);
-        guard
-    });
+        sig_guard.attach_dispatcher(handle);
+    }
 
     let writer_thread = {
         let stop_fd = stop_r.try_clone()?;
@@ -3404,7 +3429,7 @@ fn run_session_io_windowed(
 
     drop(raw);
     drop(stop_r);
-    drop(sig_guard.take());
+    drop(sig_guard);
 
     let sig = terminated_by.load(Ordering::Acquire);
     if sig != 0 {

@@ -345,7 +345,7 @@ impl Reaper {
     fn spawn_unlocked_inner(
         &self,
         spec: UnlockedSpawnSpec,
-        before_reg: Option<Box<dyn FnOnce()>>,
+        before_reg: Option<Box<dyn FnOnce(libc::pid_t)>>,
     ) -> io::Result<(ChildTarget, PgrpTarget, Receiver<i32>)> {
         let cancel_fd = spec.cancel_fd;
         if cancel_fd_closed(cancel_fd) {
@@ -532,7 +532,7 @@ impl Reaper {
         drop(spec);
 
         if let Some(hook) = before_reg {
-            hook();
+            hook(pid);
         }
 
         // Hold `self.watched` ONLY for the microsecond registration + pidfd_open,
@@ -555,12 +555,22 @@ impl Reaper {
         // Release the child with an explicit byte so any unrelated concurrent
         // fork transiently inheriting `go_w` cannot stall the gate.
         let go_byte = [1u8];
+        let mut gate_err = None;
         loop {
             let rc = unsafe { libc::write(go_w.as_raw_fd(), go_byte.as_ptr().cast(), 1) };
-            if rc >= 0 {
+            if rc == 1 {
                 break;
             }
-            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            if rc == 0 {
+                gate_err = Some(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short write to child registration gate",
+                ));
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                gate_err = Some(e);
                 break;
             }
         }
@@ -645,6 +655,15 @@ impl Reaper {
         drop(err_r);
 
         if err_off == 0 {
+            if let Some(e) = gate_err {
+                self.signal_target(&target, libc::SIGKILL);
+                let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
+                self.finish_failed_unlocked_child(pgrp, &target, &rx);
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("failed to release child registration gate: {e}"),
+                ));
+            }
             if cancel_fd_closed(cancel_fd) {
                 self.signal_target(&target, libc::SIGKILL);
                 let _ = self.signal_pgrp_target(pgrp, libc::SIGKILL);
@@ -1693,7 +1712,7 @@ mod tests {
             };
             r2.spawn_unlocked_inner(
                 spec,
-                Some(Box::new(move || {
+                Some(Box::new(move |_pid| {
                     let _ = at_gate_tx.send(());
                     let _ = release_rx.recv_timeout(Duration::from_secs(5));
                 })),
@@ -1752,6 +1771,44 @@ mod tests {
         // Reaper continues handling ordinary spawns cleanly after failed execs.
         let (_, rx) = reaper.spawn(&mut Command::new("/bin/true")).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+
+    #[test]
+    fn spawn_unlocked_fails_when_child_dies_before_gate_release() {
+        let reaper = Reaper::shared_for_tests();
+        let spec = UnlockedSpawnSpec {
+            program: "/bin/true".into(),
+            args: vec![],
+            env: vec![("PATH".into(), PATH.into())],
+            stdin: open_devnull_fd(),
+            stdout: open_devnull_fd(),
+            stderr: open_devnull_fd(),
+            cwd: c"/".into(),
+            cgroup_procs_fd: None,
+            pty: false,
+            cancel_fd: None,
+        };
+        let err = match reaper.spawn_unlocked_inner(
+            spec,
+            Some(Box::new(|pid| {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if unsafe { libc::kill(pid, 0) } < 0
+                        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })),
+        ) {
+            Ok(_) => panic!("child killed before gate release must not report spawn success"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
     }
 
     #[test]

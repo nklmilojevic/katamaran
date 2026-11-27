@@ -268,8 +268,11 @@ fn pipe_nonblock() -> io::Result<(OwnedFd, OwnedFd)> {
 
 fn notify_wake(w: &OwnedFd) {
     let b: u8 = 1;
-    unsafe {
-        let _ = libc::write(w.as_raw_fd(), (&b as *const u8).cast(), 1);
+    loop {
+        let rc = unsafe { libc::write(w.as_raw_fd(), (&b as *const u8).cast(), 1) };
+        if rc >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
     }
 }
 
@@ -277,9 +280,13 @@ fn drain_wake(r: &OwnedFd) {
     let mut buf = [0u8; 64];
     loop {
         let rc = unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if rc <= 0 {
-            break;
+        if rc > 0 {
+            continue;
         }
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
     }
 }
 
@@ -847,8 +854,11 @@ fn close_pty_master(handle: &Mutex<Option<ChildHandle>>) {
     }
 }
 
+/// Conservatively treat anything other than an explicit `populated 0` line as
+/// populated so truncated or unexpected `cgroup.events` reads never cause
+/// disconnect cleanup to skip `cgroup.kill`.
 fn cgroup_events_populated(text: &str) -> bool {
-    text.lines().any(|line| line.trim() == "populated 1")
+    !text.lines().any(|line| line.trim() == "populated 0")
 }
 
 enum CgroupMode<'a> {
@@ -955,24 +965,70 @@ impl SessionCgroup {
 
     fn is_populated(&self) -> bool {
         let mut buf = [0u8; 128];
-        let n = unsafe {
-            libc::pread(
-                self.events_fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                0,
-            )
+        let n = loop {
+            let rc = unsafe {
+                libc::pread(
+                    self.events_fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                )
+            };
+            if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break rc;
         };
         if n <= 0 {
-            return false;
+            // Conservatively assume still populated on read error/EOF so
+            // cleanup does not skip `cgroup.kill` and leak descendants.
+            return true;
         }
-        let text = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+        let Ok(text) = std::str::from_utf8(&buf[..n as usize]) else {
+            return true;
+        };
         cgroup_events_populated(text)
     }
 
-    fn kill(&self) {
-        unsafe {
-            let _ = libc::pwrite(self.kill_fd.as_raw_fd(), b"1\n".as_ptr().cast(), 2, 0);
+    fn kill(&self) -> io::Result<()> {
+        let payload = b"1\n";
+        let mut off = 0usize;
+        while off < payload.len() {
+            let rc = unsafe {
+                libc::pwrite(
+                    self.kill_fd.as_raw_fd(),
+                    payload[off..].as_ptr().cast(),
+                    payload.len() - off,
+                    off as libc::off_t,
+                )
+            };
+            if rc > 0 {
+                off += rc as usize;
+                continue;
+            }
+            if rc == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short write to cgroup.kill",
+                ));
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn kill_or_log(&self) {
+        if let Err(e) = self.kill()
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            log(&format!(
+                "failed to write {}/cgroup.kill: {e}",
+                self.path.display()
+            ));
         }
     }
 
@@ -1047,7 +1103,17 @@ impl SessionCgroup {
             signal_handle(reaper, handle, libc::SIGKILL);
         }
         if self.is_populated() {
-            self.kill();
+            if let Err(e) = self.kill()
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                log(&format!(
+                    "failed to write {}/cgroup.kill: {e}",
+                    self.path.display()
+                ));
+                if leader_exited {
+                    signal_handle(reaper, handle, libc::SIGKILL);
+                }
+            }
             let _ = self.wait_empty(Duration::from_millis(500));
         }
     }
@@ -2345,7 +2411,7 @@ fn exec_with_timeouts(
                 Ok(t) => t,
                 Err(e) => {
                     if let Some(cg) = &cgroup {
-                        cg.kill();
+                        cg.kill_or_log();
                     }
                     return Err(spawn_error(&program, &e));
                 }
@@ -2396,7 +2462,7 @@ fn exec_with_timeouts(
                 Ok(t) => t,
                 Err(e) => {
                     if let Some(cg) = &cgroup {
-                        cg.kill();
+                        cg.kill_or_log();
                     }
                     return Err(spawn_error(&program, &e));
                 }
@@ -2445,7 +2511,7 @@ fn exec_with_timeouts(
         {
             signal_handle(reaper, &handle, libc::SIGKILL);
             if let Some(cg) = &cgroup {
-                cg.kill();
+                cg.kill_or_log();
             }
             *handle.lock().unwrap() = None;
             let _ = exited.recv_timeout(Duration::from_secs(2));
@@ -2471,7 +2537,7 @@ fn exec_with_timeouts(
             log(&format!("start writer thread: {e}"));
             signal_handle(reaper, &handle, libc::SIGKILL);
             if let Some(cg) = &cgroup {
-                cg.kill();
+                cg.kill_or_log();
             }
             *handle.lock().unwrap() = None;
             let _ = exited.recv_timeout(Duration::from_secs(2));
@@ -2509,7 +2575,7 @@ fn exec_with_timeouts(
         Err(e) => {
             signal_handle(reaper, &handle, libc::SIGKILL);
             if let Some(cg) = &cgroup {
-                cg.kill();
+                cg.kill_or_log();
             }
             *handle.lock().unwrap() = None;
             writer.finish_with(Some(
@@ -2537,7 +2603,7 @@ fn exec_with_timeouts(
             Err(e) => {
                 signal_handle(reaper, &handle, libc::SIGKILL);
                 if let Some(cg) = &cgroup {
-                    cg.kill();
+                    cg.kill_or_log();
                 }
                 *handle.lock().unwrap() = None;
                 // Same two-stage shutdown as a normal exit: keep `stdin_worker`
@@ -2600,7 +2666,7 @@ fn exec_with_timeouts(
         if let Some(cg) = cg
             && cg.is_populated()
         {
-            cg.kill();
+            cg.kill_or_log();
             let _ = cg.wait_empty(Duration::from_millis(500));
         }
     };
@@ -2791,7 +2857,30 @@ mod tests {
     fn parses_cgroup_events_populated() {
         assert!(cgroup_events_populated("populated 1\nfrozen 0\n"));
         assert!(!cgroup_events_populated("populated 0\nfrozen 0\n"));
-        assert!(!cgroup_events_populated(""));
+        assert!(cgroup_events_populated(""));
+        assert!(cgroup_events_populated("frozen 0\n"));
+    }
+
+    #[test]
+    fn cgroup_io_errors_fail_conservatively() {
+        // Non-seekable pipe fds make `pread` and `pwrite` fail with ESPIPE,
+        // verifying that `is_populated` treats read errors as populated and
+        // `kill` surfaces write errors instead of silently ignoring them.
+        let (r, w) = cmd::pipe().unwrap();
+        let cg = SessionCgroup {
+            id: usize::MAX,
+            path: PathBuf::from("/nonexistent/kat-test-cg"),
+            kill_fd: w,
+            events_fd: r,
+        };
+        assert!(
+            cg.is_populated(),
+            "pread error must conservatively report populated"
+        );
+        let err = cg
+            .kill()
+            .expect_err("pwrite error must be returned by cgroup.kill");
+        assert_eq!(err.raw_os_error(), Some(libc::ESPIPE));
     }
 
     #[test]
