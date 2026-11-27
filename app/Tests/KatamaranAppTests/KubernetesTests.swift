@@ -579,14 +579,16 @@ private func runningDaemonStatus(proxySocket: String) -> DaemonStatus {
     }
     let recorder = Recorder()
 
-    // Serve 3 reset calls:
-    //   1. k8s.reset (plain) -> ok
-    //   2. k8s.reset_images (compatible daemon) -> progress + ok
-    //   3. k8s.reset_images (pre-feature daemon) -> METHOD_NOT_FOUND (-32601)
+    // Serve 4 reset calls:
+    //   1. k8s.reset (plain, new daemon) -> progress notifications exceeding idleTimeout + ok
+    //   2. k8s.reset (plain, pre-feature daemon ignoring params) -> ok without notifications
+    //   3. k8s.reset_images (compatible daemon) -> progress + ok
+    //   4. k8s.reset_images (pre-feature daemon) -> METHOD_NOT_FOUND (-32601)
     let stop = DispatchSemaphore(value: 0)
     Thread {
+        var plainResetCalls = 0
         var resetImagesCalls = 0
-        for _ in 0..<3 {
+        for _ in 0..<4 {
             let c = accept(fd, nil, nil)
             if c < 0 { break }
             var buf = [UInt8](repeating: 0, count: 4096)
@@ -594,8 +596,18 @@ private func runningDaemonStatus(proxySocket: String) -> DaemonStatus {
             let line = n > 0 ? Data(buf[0..<n]) : Data()
             let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
             let method = obj?["method"] as? String ?? ""
+            let params = obj?["params"] as? [String: Any]
             recorder.record(method)
             if method == "k8s.reset" {
+                plainResetCalls += 1
+                #expect(params?["progress"] as? Bool == true)
+                if plainResetCalls == 1 {
+                    for i in 1...3 {
+                        Thread.sleep(forTimeInterval: 0.15)
+                        let note = "{\"jsonrpc\":\"2.0\",\"method\":\"k8s.progress\",\"params\":{\"message\":\"waiting \(i)\"}}\n"
+                        _ = note.withCString { write(c, $0, strlen($0)) }
+                    }
+                }
                 let resp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n"
                 _ = resp.withCString { write(c, $0, strlen($0)) }
             } else if method == "k8s.reset_images" {
@@ -625,10 +637,18 @@ private func runningDaemonStatus(proxySocket: String) -> DaemonStatus {
     // Prevent post-action refresh() from opening extra connections on our mock socket.
     model.fake(nil)
 
-    let okPlain: Bool = await withCheckedContinuation { cont in
-        model.k8sReset(images: false) { ok in cont.resume(returning: ok) }
+    // Plain reset with progress notifications arriving over 0.45s succeeds with 0.35s idleTimeout.
+    let okPlainNotified: Bool = await withCheckedContinuation { cont in
+        model.k8sReset(images: false, idleTimeout: 0.35) { ok in cont.resume(returning: ok) }
     }
-    #expect(okPlain)
+    #expect(okPlainNotified)
+    #expect(model.lastError == nil)
+
+    // Plain reset against a pre-feature daemon that ignores params and sends no notifications.
+    let okPlainLegacy: Bool = await withCheckedContinuation { cont in
+        model.k8sReset(images: false, idleTimeout: 0.35) { ok in cont.resume(returning: ok) }
+    }
+    #expect(okPlainLegacy)
     #expect(model.lastError == nil)
 
     let okImages: Bool = await withCheckedContinuation { cont in
@@ -643,5 +663,5 @@ private func runningDaemonStatus(proxySocket: String) -> DaemonStatus {
     #expect(!okOldDaemon)
     #expect(model.lastError?.contains("unknown method k8s.reset_images") == true)
 
-    #expect(recorder.snapshot == ["k8s.reset", "k8s.reset_images", "k8s.reset_images"])
+    #expect(recorder.snapshot == ["k8s.reset", "k8s.reset", "k8s.reset_images", "k8s.reset_images"])
 }

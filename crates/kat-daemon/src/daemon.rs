@@ -1054,8 +1054,12 @@ impl Daemon {
                 }
                 continue;
             }
-            if let Call::K8sReset { images: true } = &call {
-                if self.serve_k8s_reset_images(id, &mut out).is_err() {
+            if let Call::K8sReset {
+                images,
+                progress: true,
+            } = &call
+            {
+                if self.serve_k8s_reset(id, *images, &mut out).is_err() {
                     return;
                 }
                 continue;
@@ -1097,7 +1101,12 @@ impl Daemon {
         }
     }
 
-    fn serve_k8s_reset_images(self: &Arc<Self>, id: Value, out: &mut UnixStream) -> Result<(), ()> {
+    fn serve_k8s_reset(
+        self: &Arc<Self>,
+        id: Value,
+        remove_images: bool,
+        out: &mut UnixStream,
+    ) -> Result<(), ()> {
         let prev_write_timeout = out.write_timeout().ok().flatten();
         let write_timeout = self.progress_write_timeout();
         let mut write_failed = false;
@@ -1115,7 +1124,7 @@ impl Daemon {
                     write_failed = true;
                 }
             };
-            self.k8s_reset(true, &mut progress)
+            self.k8s_reset(remove_images, &mut progress)
         };
         if write_failed {
             // A progress write failed or timed out (possibly leaving a partial
@@ -1216,7 +1225,7 @@ impl Daemon {
                 self.k8s_stop(true)?;
                 Ok(Value::Null)
             }
-            Call::K8sReset { images } => {
+            Call::K8sReset { images, .. } => {
                 self.k8s_reset(*images, &mut |_| {})?;
                 Ok(Value::Null)
             }
@@ -1718,16 +1727,8 @@ impl Daemon {
         })();
 
         let stop_res = if was_stopped {
-            if remove_images {
-                progress("stopping temporary VM");
-            }
-            let res = self
-                .stop_with_progress(true, &mut |m| {
-                    if remove_images {
-                        progress(m);
-                    }
-                })
-                .map_err(failed);
+            progress("stopping temporary VM");
+            let res = self.stop_with_progress(true, progress).map_err(failed);
             self.k8s
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1762,11 +1763,7 @@ impl Daemon {
                 k.error = None;
             }
             let _ = fs::remove_file(crate::k8s::kubeconfig_path(&self.home));
-            let rm_res = if remove_images {
-                self.remove_kubeconfig_with_progress(&ctx, progress)
-            } else {
-                self.remove_kubeconfig(&ctx)
-            };
+            let rm_res = self.remove_kubeconfig_with_progress(&ctx, progress);
             if let Err(e) = rm_res {
                 dlog!("k8s reset: remove kubeconfig failed: {e:#}");
                 if remove_images {
@@ -3021,8 +3018,14 @@ mod tests {
         let srv = thread::spawn(move || daemon_srv.serve(server_sock));
 
         let mut writer = client_sock.try_clone().unwrap();
-        let mut line =
-            serde_json::to_vec(&Request::new(1, &Call::K8sReset { images: true })).unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: true,
+                progress: true,
+            },
+        ))
+        .unwrap();
         line.push(b'\n');
         writer.write_all(&line).unwrap();
         writer.shutdown(std::net::Shutdown::Write).unwrap();
@@ -3053,6 +3056,142 @@ mod tests {
         );
         let resp = final_resp.expect("expected terminal response");
         assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_streams_progress_for_plain_k8s_reset_only_when_requested() {
+        let root = temp("k8s-plain-p");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+
+        let mut d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-plain-p");
+        Arc::get_mut(&mut d).unwrap().test_heartbeat_interval = Some(Duration::from_millis(30));
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let guest_listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut conn, _) = guest_listener.accept().unwrap();
+                let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+                assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+                kat_proto::k8s::write(
+                    &mut conn,
+                    &kat_proto::k8s::K8sMsg::Progress("removing cluster data".into()),
+                )
+                .unwrap();
+                kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared)
+                    .unwrap();
+                kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::Done).unwrap();
+            }
+        });
+
+        // 1. Plain reset with `progress: true` streams lock-wait and guest progress.
+        let held_op = d.k8s_op.lock().unwrap();
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: false,
+                progress: true,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+
+        let mut reader = BufReader::new(client_sock);
+        let mut notifications = Vec::new();
+        let mut final_resp = None;
+        let mut raw = String::new();
+        let mut held_op = Some(held_op);
+        while reader.read_line(&mut raw).unwrap() > 0 {
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                assert_eq!(v["method"], "k8s.progress");
+                let msg = v["params"]["message"].as_str().unwrap().to_string();
+                if msg == "waiting for active Kubernetes operation" {
+                    held_op.take();
+                }
+                notifications.push(msg);
+            } else {
+                final_resp = Some(v);
+            }
+            raw.clear();
+        }
+        drop(held_op);
+        srv.join().unwrap();
+
+        assert!(
+            notifications
+                .iter()
+                .any(|m| m == "waiting for active Kubernetes operation"),
+            "expected op-lock heartbeat, got: {notifications:?}"
+        );
+        assert!(
+            notifications.iter().any(|m| m == "removing cluster data"),
+            "expected guest progress, got: {notifications:?}"
+        );
+        let resp = final_resp.expect("expected terminal response");
+        assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none());
+
+        // 2. Legacy plain reset without `progress` emits zero notifications.
+        let (client_sock, server_sock) = UnixStream::pair().unwrap();
+        let daemon_srv = d.clone();
+        let srv = thread::spawn(move || daemon_srv.serve(server_sock));
+
+        let mut writer = client_sock.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            2,
+            &Call::K8sReset {
+                images: false,
+                progress: false,
+            },
+        ))
+        .unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+        writer.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(writer);
+
+        let mut reader = BufReader::new(client_sock);
+        let mut legacy_notes = Vec::new();
+        let mut legacy_resp = None;
+        raw.clear();
+        while reader.read_line(&mut raw).unwrap() > 0 {
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            if v.get("id").is_none() {
+                legacy_notes.push(v);
+            } else {
+                legacy_resp = Some(v);
+            }
+            raw.clear();
+        }
+        srv.join().unwrap();
+        guest.join().unwrap();
+
+        assert!(
+            legacy_notes.is_empty(),
+            "legacy k8s.reset must not emit unsolicited notifications: {legacy_notes:?}"
+        );
+        let resp = legacy_resp.expect("expected legacy terminal response");
+        assert_eq!(resp["id"], 2);
         assert!(resp.get("error").is_none());
 
         fs::remove_dir_all(&root).unwrap();
@@ -3108,8 +3247,14 @@ mod tests {
         let daemon_srv = d.clone();
         let srv = thread::spawn(move || daemon_srv.serve(server_sock));
 
-        let mut line =
-            serde_json::to_vec(&Request::new(1, &Call::K8sReset { images: true })).unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: true,
+                progress: true,
+            },
+        ))
+        .unwrap();
         line.push(b'\n');
         client_sock.write_all(&line).unwrap();
         // Keep `client_sock` open without reading until the server finishes.
@@ -3193,8 +3338,14 @@ mod tests {
         let srv = thread::spawn(move || daemon_srv.serve(server_sock));
 
         let mut writer = client_sock.try_clone().unwrap();
-        let mut line =
-            serde_json::to_vec(&Request::new(1, &Call::K8sReset { images: true })).unwrap();
+        let mut line = serde_json::to_vec(&Request::new(
+            1,
+            &Call::K8sReset {
+                images: true,
+                progress: true,
+            },
+        ))
+        .unwrap();
         line.push(b'\n');
         writer.write_all(&line).unwrap();
 

@@ -155,13 +155,19 @@ final class AppModel {
         perform("kubernetes") { _ = try d.call("k8s.start", timeout: 300) }
     }
 
-    func k8sReset(images: Bool = false, idleTimeout: TimeInterval = 90, done: ((Bool) -> Void)? = nil) {
+    func k8sReset(images: Bool = false, idleTimeout: TimeInterval? = nil, done: ((Bool) -> Void)? = nil) {
         let d = daemon
+        // Image resets always stream progress from the daemon (90s idle timeout).
+        // Plain resets opt into progress notifications (`progress: true`) so lock
+        // waits and deletion heartbeats refresh the timeout, while keeping a 300s
+        // fallback window for pre-feature daemons that ignore `params` and send
+        // no notifications.
+        let timeout = idleTimeout ?? (images ? 90 : 300)
         perform("kubernetes", done: done) {
             if images {
-                _ = try d.callNotified("k8s.reset_images", idleTimeout: idleTimeout)
+                _ = try d.callNotified("k8s.reset_images", idleTimeout: timeout)
             } else {
-                _ = try d.call("k8s.reset", timeout: 300)
+                _ = try d.callNotified("k8s.reset", ["progress": true], idleTimeout: timeout)
             }
         }
     }

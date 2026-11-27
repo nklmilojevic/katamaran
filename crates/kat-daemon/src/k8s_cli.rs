@@ -221,11 +221,13 @@ fn reset_with_client(
             on_progress(msg);
         }
     };
-    let res = if images {
-        client.call_notified(&Call::K8sReset { images: true }, &mut on_note)
-    } else {
-        client.call(&Call::K8sReset { images: false })
-    };
+    let res = client.call_notified(
+        &Call::K8sReset {
+            images,
+            progress: true,
+        },
+        &mut on_note,
+    );
     match res {
         Ok(_) => Ok(()),
         Err(e)
@@ -629,5 +631,78 @@ mod tests {
                 "stopping temporary VM",
             ]
         );
+    }
+
+    #[test]
+    fn plain_reset_requests_progress_and_works_with_legacy_and_notified_daemons() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let dir = TempDirGuard::create("kat-cli-pl");
+        let sock = dir.0.join("daemon.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let srv = thread::spawn(move || {
+            // 1. Notified daemon streams progress for plain `k8s.reset`.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "k8s.reset");
+            assert_eq!(req.params, serde_json::json!({ "progress": true }));
+            let id = req.id.unwrap();
+            for msg in [
+                "waiting for active Kubernetes operation",
+                "waiting for active Kubernetes operation",
+                "removing cluster data",
+            ] {
+                let note = crate::api::Notification {
+                    jsonrpc: crate::api::VERSION.into(),
+                    method: "k8s.progress".into(),
+                    params: serde_json::json!({ "message": msg }),
+                };
+                let mut out = serde_json::to_vec(&note).unwrap();
+                out.push(b'\n');
+                conn.write_all(&out).unwrap();
+            }
+            let resp = crate::api::Response::ok(id, Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+
+            // 2. Pre-feature daemon ignores `params` and returns only the response.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let req: crate::api::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(req.method, "k8s.reset");
+            let resp = crate::api::Response::ok(req.id.unwrap(), Value::Null);
+            let mut out = serde_json::to_vec(&resp).unwrap();
+            out.push(b'\n');
+            conn.write_all(&out).unwrap();
+        });
+
+        let mut client = Client::connect(&sock).unwrap();
+        let mut progress = Vec::new();
+        reset_with_client(&mut client, false, &mut |m| progress.push(m.to_string())).unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                "waiting for active Kubernetes operation",
+                "removing cluster data",
+            ]
+        );
+
+        let mut legacy_client = Client::connect(&sock).unwrap();
+        let mut legacy_progress = Vec::new();
+        reset_with_client(&mut legacy_client, false, &mut |m| {
+            legacy_progress.push(m.to_string())
+        })
+        .unwrap();
+        assert!(legacy_progress.is_empty());
+        srv.join().unwrap();
     }
 }
