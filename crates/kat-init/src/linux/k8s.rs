@@ -390,6 +390,49 @@ fn write_atomic_new(target: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+enum MarkerFile {
+    Missing,
+    Empty,
+    NonRegular,
+    Present(String),
+}
+
+fn read_marker_file(path: &Path) -> Result<MarkerFile, String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(MarkerFile::Missing),
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+    };
+    if !meta.file_type().is_file() {
+        return Ok(MarkerFile::NonRegular);
+    }
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut content = String::new();
+    f.read_to_string(&mut content)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(MarkerFile::Empty)
+    } else {
+        Ok(MarkerFile::Present(trimmed.to_string()))
+    }
+}
+
+fn corrupt_datastore_version_error(data_version_file: &Path, reason: &str) -> String {
+    format!(
+        "datastore version marker {} {reason}; cannot verify minor-version compatibility. \
+         While Kubernetes is stopped, either restore a matching datastore backup together \
+         with its {} version marker, or back up any state you need and run `kat k8s reset` \
+         to delete cluster data and persistent volumes before starting fresh.",
+        data_version_file.display(),
+        data_version_file.display(),
+    )
+}
+
 fn missing_datastore_version_error(data_dir: &Path, data_version_file: &Path) -> String {
     format!(
         "existing cluster data under {} has no version marker ({}); \
@@ -421,10 +464,16 @@ fn mark_datastore_version_at(
         ));
     }
     match fs::symlink_metadata(data_version_file) {
-        Ok(_) => {
-            let detail = match read_trimmed_file(data_version_file) {
-                Ok(Some(existing)) => format!(" ({existing})"),
-                _ => String::new(),
+        Ok(meta) => {
+            let detail = if !meta.file_type().is_file() {
+                " (not a regular file)".to_string()
+            } else {
+                match read_marker_file(data_version_file) {
+                    Ok(MarkerFile::Present(existing)) => format!(" ({existing})"),
+                    Ok(MarkerFile::Empty) => " (empty)".to_string(),
+                    Ok(MarkerFile::NonRegular) => " (not a regular file)".to_string(),
+                    Ok(MarkerFile::Missing) | Err(_) => String::new(),
+                }
             };
             return Err(format!(
                 "datastore version marker {} already exists{detail}; \
@@ -445,7 +494,8 @@ fn mark_datastore_version_at(
 /// Uses only `data_version_file` inside `data_dir` (never falling back to
 /// `VERSION_FILE`), so `reset` clears it together with cluster data and an
 /// unmarked restored datastore can never inherit an unrelated installed binary's
-/// version.
+/// version. Only recommends `kat k8s mark-version` when `data_version_file` is
+/// absent (`NotFound`), never when an empty or non-regular marker already exists.
 fn effective_datastore_version(
     data_dir: &Path,
     data_version_file: &Path,
@@ -453,10 +503,18 @@ fn effective_datastore_version(
     if !datastore_exists(data_dir)? {
         return Ok(None);
     }
-    if let Some(v) = read_trimmed_file(data_version_file)? {
-        return Ok(Some(v));
+    match read_marker_file(data_version_file)? {
+        MarkerFile::Present(v) => Ok(Some(v)),
+        MarkerFile::Missing => Err(missing_datastore_version_error(data_dir, data_version_file)),
+        MarkerFile::Empty => Err(corrupt_datastore_version_error(
+            data_version_file,
+            "is empty",
+        )),
+        MarkerFile::NonRegular => Err(corrupt_datastore_version_error(
+            data_version_file,
+            "is not a regular file",
+        )),
     }
-    Err(missing_datastore_version_error(data_dir, data_version_file))
 }
 
 /// Refuse to install or start a lower Kubernetes minor or skip one or more
@@ -1231,7 +1289,10 @@ impl K8s {
         .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
         .stderr(log_file);
 
-        let prev_data_version = read_trimmed_file(Path::new(DATA_VERSION_FILE))?;
+        let prev_data_version = match read_marker_file(Path::new(DATA_VERSION_FILE))? {
+            MarkerFile::Present(v) => Some(v),
+            MarkerFile::Missing | MarkerFile::Empty | MarkerFile::NonRegular => None,
+        };
         let wrote_data_version = prev_data_version.as_deref() != Some(installed_version.as_str());
         let before_datastore = if wrote_data_version {
             match snapshot_datastore(Path::new(DATA_DIR)) {
@@ -3117,11 +3178,25 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         assert!(!data_version_file.exists());
         assert_eq!(fs::read(&db_file).unwrap(), b"v1.37-datastore-bytes");
 
-        // Whitespace-only .katamaran-version is treated the same as a missing marker.
+        // Empty or whitespace-only .katamaran-version is reported as corrupt/empty
+        // rather than missing, and does NOT recommend `kat k8s mark-version` (which
+        // refuses to overwrite any existing marker).
         fs::write(&data_version_file, "   \n").unwrap();
         let err =
             check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
-        assert!(err.contains("no version marker"), "{err}");
+        assert!(err.contains("is empty"), "{err}");
+        assert!(!err.contains("kat k8s mark-version"), "{err}");
+        assert!(err.contains("kat k8s reset"), "{err}");
+
+        // Symlinked (including dangling) .katamaran-version is also rejected as
+        // non-regular rather than missing.
+        fs::remove_file(&data_version_file).unwrap();
+        symlink(dir.join("missing-target"), &data_version_file).unwrap();
+        let err =
+            check_datastore_compatible(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!err.contains("kat k8s mark-version"), "{err}");
+        fs::remove_file(&data_version_file).unwrap();
 
         // Marked v1.37 datastore blocks minor downgrades without modifying data_dir.
         write_atomic(&data_version_file, b"v1.37.2+k3s1\n").unwrap();
@@ -3410,17 +3485,17 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             "v1.37.2+k3s1\n"
         );
 
-        fs::write(&data_version_file, "").unwrap();
+        fs::write(&data_version_file, "  \n").unwrap();
         let err =
             mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
-        assert!(err.contains("already exists"), "{err}");
+        assert!(err.contains("already exists (empty)"), "{err}");
 
         fs::remove_file(&data_version_file).unwrap();
         let target = dir.join("other-file");
         symlink(&target, &data_version_file).unwrap();
         let err =
             mark_datastore_version_at(&data_dir, &data_version_file, "v1.37.2+k3s1").unwrap_err();
-        assert!(err.contains("already exists"), "{err}");
+        assert!(err.contains("already exists (not a regular file)"), "{err}");
         assert!(!target.exists());
 
         let _ = fs::remove_dir_all(&dir);
