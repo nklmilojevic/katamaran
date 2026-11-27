@@ -45,6 +45,7 @@ const BIN_DIR: &str = "/var/lib/katamaran/k3s/bin";
 const BIN: &str = "/var/lib/katamaran/k3s/bin/k3s";
 const VERSION_FILE: &str = "/var/lib/katamaran/k3s/bin/version";
 const DATA_DIR: &str = "/var/lib/katamaran/k3s/data";
+const DATA_DIR_STALE_PREFIX: &str = ".data.removing-";
 const DATA_VERSION_FILE: &str = "/var/lib/katamaran/k3s/data/.katamaran-version";
 /// Copy of the datastore version kept beside `state.db` in `server/db/`,
 /// written before every launch of k3s against an existing datastore. Unlike
@@ -2665,42 +2666,13 @@ impl K8s {
     }
 
     /// Caller must hold `self.op_lock`.
-    fn stop_locked(&self, mut conn: Option<&mut UnixStream>) -> Result<(), String> {
-        let (running, needs_cleanup) = {
-            let mut st = self.state.lock().unwrap();
-            let needs_cleanup = st.running.is_some() || st.phase != "stopped";
-            if !needs_cleanup {
-                st.api_ready = false;
-                ACTIVE.store(false, Ordering::SeqCst);
-                return Ok(());
-            }
-            st.phase = "stopping".into();
-            st.api_ready = false;
-            (st.running.take(), needs_cleanup)
-        };
-        if let Some(c) = conn.as_deref_mut() {
-            let _ = k8s::write(c, &K8sMsg::Progress("stopping k3s".into()));
+    fn stop_locked(&self, conn: Option<&mut UnixStream>) -> Result<(), String> {
+        match conn {
+            Some(c) => self.stop_locked_with_progress(&mut |m| {
+                let _ = k8s::write(&mut *c, &K8sMsg::Progress(m.into()));
+            }),
+            None => self.stop_locked_with_progress(&mut |_| {}),
         }
-        if let Some(r) = running {
-            let _ = terminate_running(r);
-        }
-        if needs_cleanup {
-            match conn {
-                Some(c) => stop_k8s_workloads_with_progress(&self.reaper, &mut |m| {
-                    let _ = k8s::write(&mut *c, &K8sMsg::Progress(m.into()));
-                }),
-                None => stop_k8s_workloads(&self.reaper),
-            }
-        }
-        ACTIVE.store(false, Ordering::SeqCst);
-        FORWARDED.lock().unwrap().clear();
-        restore_bridge_netfilter();
-        let mut st = self.state.lock().unwrap();
-        st.phase = "stopped".into();
-        st.api_ready = false;
-        st.error.clear();
-        log("k3s stopped");
-        Ok(())
     }
 
     fn reset_inner(&self, conn: &mut UnixStream, remove_images: bool) -> Result<(), String> {
@@ -2716,64 +2688,118 @@ impl K8s {
             k8s::write(&mut *conn, &K8sMsg::ResetAccepted)
                 .map_err(|e| format!("send reset ack: {e}"))?;
         }
-        self.stop_locked(Some(&mut *conn))?;
-        // stop_locked reports success even if k3s survived SIGKILL; never delete
-        // the datastore underneath a live k3s.
-        ensure_no_unreaped_k3s()?;
-        // Remove the managed config copy first: if that fails, nothing has
-        // been destroyed yet and the reset error is accurate.
-        sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
-        let _ = k8s::write(
-            &mut *conn,
-            &K8sMsg::Progress("removing cluster data".into()),
+        let mut active_data_cleared = false;
+        let mut ack_err: Option<String> = None;
+        let paths = ClusterDataPaths {
+            data_dir: Path::new(DATA_DIR),
+            legacy_kubelet_dir: Path::new(LEGACY_KUBELET_DIR),
+            kubeconfig: Path::new(KUBECONFIG),
+            k3s_config: Path::new(K3S_CONFIG_PATH),
+        };
+        let res = execute_reset_sequence(
+            remove_images,
+            &IMAGE_SYNC_LOCK,
+            IMAGE_SYNC_WAIT_TIMEOUT,
+            PROGRESS_HEARTBEAT_INTERVAL,
+            || SHUTTING_DOWN.load(Ordering::SeqCst),
+            &mut |msg| {
+                let _ = k8s::write(&*conn, &K8sMsg::Progress(msg.into()));
+            },
+            |progress| {
+                self.stop_locked_with_progress(progress)?;
+                // stop_locked reports success even if k3s survived SIGKILL; never delete
+                // the datastore underneath a live k3s.
+                ensure_no_unreaped_k3s()
+            },
+            |progress| wait_containerd_with_progress(progress),
+            |progress| {
+                // Remove the managed config copy first: if that fails, nothing has
+                // been destroyed yet and the reset error is accurate.
+                sync_k3s_config(Path::new(K3S_CONFIG_PATH), None)?;
+                progress("removing cluster data");
+                unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
+                remove_cluster_data_dirs(
+                    &paths,
+                    |data_dir, beat| {
+                        let mut cmd = Command::new("/sbin/btrfs");
+                        cmd.args(["subvolume", "delete"]);
+                        cmd.arg(data_dir);
+                        match run_reaped_split_checked(
+                            &self.reaper,
+                            &mut cmd,
+                            Duration::from_secs(30),
+                            64 << 10,
+                            true,
+                            Some(beat),
+                        ) {
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e.to_string()),
+                            _ => Ok(()),
+                        }
+                    },
+                    |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
+                    &mut || {
+                        active_data_cleared = true;
+                        if remove_images
+                            && let Err(e) = k8s::write(&*conn, &K8sMsg::ResetDataCleared)
+                        {
+                            ack_err = Some(format!("send reset data-cleared ack: {e}"));
+                        }
+                    },
+                    progress,
+                )
+            },
+            |sync_guard, progress| {
+                progress("removing k8s.io images");
+                clear_k8s_images(&self.reaper, sync_guard, progress)
+            },
         );
-        unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
-        remove_cluster_data_dirs(
-            Path::new(DATA_DIR),
-            Path::new(LEGACY_KUBELET_DIR),
-            Path::new(KUBECONFIG),
-            Path::new(K3S_CONFIG_PATH),
-            |data_dir, beat| {
-                let mut cmd = Command::new("/sbin/btrfs");
-                cmd.args(["subvolume", "delete"]);
-                cmd.arg(data_dir);
-                match run_reaped_split_checked(
-                    &self.reaper,
-                    &mut cmd,
-                    Duration::from_secs(30),
-                    64 << 10,
-                    true,
-                    Some(beat),
-                ) {
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e.to_string()),
-                    _ => Ok(()),
-                }
-            },
-            |dir, beat| rm_rf_reaped(&self.reaper, dir, DATA_REMOVE_TIMEOUT, beat),
-            &mut |m| {
-                let _ = k8s::write(&mut *conn, &K8sMsg::Progress(m.into()));
-            },
-        )?;
-        if remove_images {
-            k8s::write(&mut *conn, &K8sMsg::ResetDataCleared)
-                .map_err(|e| format!("send reset data-cleared ack: {e}"))?;
-            if SHUTTING_DOWN.load(Ordering::SeqCst) {
-                return Err("aborted: VM is shutting down".into());
+        if let Some(e) = ack_err {
+            return Err(e);
+        }
+        if let Err(e) = res {
+            if !remove_images && active_data_cleared {
+                // Active DATA_DIR was already detached before deferred reclamation
+                // failed; notify compatible daemons so auto-start is disabled.
+                let _ = k8s::write(&mut *conn, &K8sMsg::ResetDataCleared);
             }
-            let _ = k8s::write(
-                &mut *conn,
-                &K8sMsg::Progress("removing k8s.io images".into()),
-            );
-            let mut progress = |msg: &str| {
-                let _ = k8s::write(&mut *conn, &K8sMsg::Progress(msg.into()));
-            };
-            clear_k8s_images(&self.reaper, &mut progress)?;
+            return Err(e);
         }
         log(if remove_images {
             "k3s cluster data and k8s.io images reset"
         } else {
             "k3s cluster data reset"
         });
+        Ok(())
+    }
+
+    fn stop_locked_with_progress(&self, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
+        let (running, needs_cleanup) = {
+            let mut st = self.state.lock().unwrap();
+            let needs_cleanup = st.running.is_some() || st.phase != "stopped";
+            if !needs_cleanup {
+                st.api_ready = false;
+                ACTIVE.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+            st.phase = "stopping".into();
+            st.api_ready = false;
+            (st.running.take(), needs_cleanup)
+        };
+        progress("stopping k3s");
+        if let Some(r) = running {
+            let _ = terminate_running(r);
+        }
+        if needs_cleanup {
+            stop_k8s_workloads_with_progress(&self.reaper, progress);
+        }
+        ACTIVE.store(false, Ordering::SeqCst);
+        FORWARDED.lock().unwrap().clear();
+        restore_bridge_netfilter();
+        let mut st = self.state.lock().unwrap();
+        st.phase = "stopped".into();
+        st.api_ready = false;
+        st.error.clear();
+        log("k3s stopped");
         Ok(())
     }
 
@@ -3333,14 +3359,22 @@ fn wait_containerd_with_progress(progress: &mut dyn FnMut(&str)) -> Result<(), S
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
             return Err("aborted: VM is shutting down".into());
         }
-        if UnixStream::connect(CONTAINERD_SOCKET).is_ok() {
+        let attempt_deadline = (Instant::now() + Duration::from_millis(250)).min(deadline);
+        if super::shutdown::connect_unix_until(CONTAINERD_SOCKET, attempt_deadline).is_some() {
             return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
         }
         if last_beat.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL {
             progress("waiting for containerd");
             last_beat = Instant::now();
         }
-        thread::sleep(Duration::from_millis(50));
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        thread::sleep(rem.min(Duration::from_millis(50)));
     }
     Err(format!("containerd socket {CONTAINERD_SOCKET} not ready"))
 }
@@ -3407,33 +3441,148 @@ fn run_reaped_split(
     Ok((out.code, out.stdout, out.stderr))
 }
 
-fn remove_cluster_data_dirs(
-    data_dir: &Path,
-    legacy_kubelet_dir: &Path,
-    kubeconfig: &Path,
-    k3s_config: &Path,
-    mut try_btrfs_delete: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
-    mut remove_dir: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
-    progress: &mut dyn FnMut(&str),
-) -> Result<(), String> {
-    // Remove the legacy pre-migration kubelet directory before deleting
-    // `data_dir` so a failure here leaves active cluster state untouched
-    // and cannot occur after `data_dir` is deleted but before `ResetDataCleared`.
-    let mut beat = || progress("removing cluster data");
-    if legacy_kubelet_dir.exists() {
-        remove_dir(legacy_kubelet_dir, &mut beat)?;
-    }
-    if data_dir.exists() {
-        // Try btrfs subvolume delete first (instant if it is a subvolume),
-        // falling back to bounded recursive removal. Send periodic progress during
-        // both so large cluster-data directories do not trip idle timeouts.
-        try_btrfs_delete(data_dir, &mut beat)?;
-        if data_dir.exists() {
-            remove_dir(data_dir, &mut beat)?;
+struct ClusterDataPaths<'a> {
+    data_dir: &'a Path,
+    legacy_kubelet_dir: &'a Path,
+    kubeconfig: &'a Path,
+    k3s_config: &'a Path,
+}
+
+fn next_stale_data_dir(parent: &Path) -> std::path::PathBuf {
+    for _ in 0..16 {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let suffix = fs::read_to_string("/proc/sys/kernel/random/uuid")
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}-{nanos}-{seq}", std::process::id())
+            });
+        let candidate = parent.join(format!("{DATA_DIR_STALE_PREFIX}{suffix}"));
+        if !candidate.exists() {
+            return candidate;
         }
     }
-    let _ = fs::remove_file(kubeconfig);
-    let _ = fs::remove_file(k3s_config);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        "{DATA_DIR_STALE_PREFIX}{}-{seq}",
+        std::process::id()
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_reset_sequence<T>(
+    remove_images: bool,
+    image_sync_lock: &Mutex<T>,
+    sync_wait_timeout: Duration,
+    heartbeat: Duration,
+    shutting_down: impl Fn() -> bool,
+    progress: &mut dyn FnMut(&str),
+    mut stop: impl FnMut(&mut dyn FnMut(&str)) -> Result<(), String>,
+    mut wait_containerd: impl FnMut(&mut dyn FnMut(&str)) -> Result<(), String>,
+    mut remove_data: impl FnMut(&mut dyn FnMut(&str)) -> Result<(), String>,
+    mut clear_images: impl FnMut(
+        &std::sync::MutexGuard<'_, T>,
+        &mut dyn FnMut(&str),
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    stop(progress)?;
+    // Acquire `IMAGE_SYNC_LOCK` and check containerd readiness BEFORE deleting
+    // cluster data so ordinary sync contention or readiness timeouts leave the
+    // active datastore intact.
+    let sync_guard = if remove_images {
+        let g = try_lock_with_deadline(
+            image_sync_lock,
+            sync_wait_timeout,
+            heartbeat,
+            "waiting for background image sync to stop",
+            &shutting_down,
+            progress,
+        )?;
+        wait_containerd(progress)?;
+        Some(g)
+    } else {
+        None
+    };
+    if shutting_down() {
+        return Err("aborted: VM is shutting down".into());
+    }
+    remove_data(progress)?;
+    if let Some(ref g) = sync_guard {
+        if shutting_down() {
+            return Err("aborted: VM is shutting down".into());
+        }
+        clear_images(g, progress)?;
+    }
+    Ok(())
+}
+
+fn remove_cluster_data_dirs(
+    paths: &ClusterDataPaths<'_>,
+    mut try_btrfs_delete: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
+    mut remove_dir: impl FnMut(&Path, &mut dyn FnMut()) -> Result<(), String>,
+    on_active_data_cleared: &mut dyn FnMut(),
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    // Remove the legacy pre-migration kubelet directory before detaching
+    // `data_dir` so a failure here leaves active cluster state untouched.
+    let mut beat = || progress("removing cluster data");
+    if paths.legacy_kubelet_dir.exists() {
+        remove_dir(paths.legacy_kubelet_dir, &mut beat)?;
+    }
+
+    // Detach the active `data_dir` atomically before any bounded recursive
+    // deletion so a timeout can never leave a partially deleted live datastore.
+    let mut detached: Option<std::path::PathBuf> = None;
+    if paths.data_dir.exists() {
+        try_btrfs_delete(paths.data_dir, &mut beat)?;
+        if paths.data_dir.exists() {
+            let parent = paths.data_dir.parent().ok_or_else(|| {
+                format!("missing parent directory for {}", paths.data_dir.display())
+            })?;
+            let staged = next_stale_data_dir(parent);
+            fs::rename(paths.data_dir, &staged).map_err(|e| {
+                format!(
+                    "detach {} -> {}: {e}",
+                    paths.data_dir.display(),
+                    staged.display()
+                )
+            })?;
+            detached = Some(staged);
+        }
+    }
+    let _ = fs::remove_file(paths.kubeconfig);
+    let _ = fs::remove_file(paths.k3s_config);
+    on_active_data_cleared();
+
+    // Reclaim the newly detached directory plus any leftover `.data.removing-*`
+    // siblings from an earlier timed-out reset.
+    let mut to_reclaim = Vec::new();
+    if let Some(staged) = detached {
+        to_reclaim.push(staged);
+    }
+    if let Some(parent) = paths.data_dir.parent()
+        && let Ok(entries) = fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX))
+            {
+                let p = entry.path();
+                if !to_reclaim.contains(&p) {
+                    to_reclaim.push(p);
+                }
+            }
+        }
+    }
+    for dir in to_reclaim {
+        remove_dir(&dir, &mut beat)?;
+    }
     Ok(())
 }
 
@@ -5409,16 +5558,11 @@ struct CtrPlatformRow {
 /// on a synchronous containerd GC barrier (deleting a short-lived reset-owned
 /// lease with `--sync`) so unreferenced `k8s.io` content blobs and snapshots
 /// are reclaimed before returning — even on a retry that finds no image refs.
-fn clear_k8s_images(reaper: &Reaper, progress: &mut dyn FnMut(&str)) -> Result<(), String> {
-    wait_containerd_with_progress(progress)?;
-    let _sync_guard = try_lock_with_deadline(
-        &IMAGE_SYNC_LOCK,
-        IMAGE_SYNC_WAIT_TIMEOUT,
-        PROGRESS_HEARTBEAT_INTERVAL,
-        "waiting for background image sync to stop",
-        || SHUTTING_DOWN.load(Ordering::SeqCst),
-        progress,
-    )?;
+fn clear_k8s_images<T>(
+    reaper: &Reaper,
+    _sync_guard: &std::sync::MutexGuard<'_, T>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     if SHUTTING_DOWN.load(Ordering::SeqCst) {
         return Err("aborted: VM is shutting down".into());
     }
@@ -9456,20 +9600,25 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         let legacy_dir = base.join("legacy-kubelet");
         let kubeconfig = base.join("kubeconfig.yaml");
         let k3s_cfg = base.join("config.yaml");
+        let paths = ClusterDataPaths {
+            data_dir: &data_dir,
+            legacy_kubelet_dir: &legacy_dir,
+            kubeconfig: &kubeconfig,
+            k3s_config: &k3s_cfg,
+        };
         fs::create_dir_all(data_dir.join("server")).unwrap();
         fs::write(data_dir.join("server/state.db"), b"state").unwrap();
         fs::write(&kubeconfig, b"kubeconfig").unwrap();
         fs::write(&k3s_cfg, b"config").unwrap();
 
         // When legacy kubelet cleanup fails (a regular file triggers ENOTDIR even
-        // under uid 0), active `data_dir` and config files must stay untouched.
+        // under uid 0), active `data_dir` and config files must stay untouched and
+        // `on_active_data_cleared` must NOT fire.
         fs::write(&legacy_dir, b"not-a-directory").unwrap();
         let mut btrfs_called = false;
+        let active_cleared = AtomicBool::new(false);
         let err = remove_cluster_data_dirs(
-            &data_dir,
-            &legacy_dir,
-            &kubeconfig,
-            &k3s_cfg,
+            &paths,
             |_, _| {
                 btrfs_called = true;
                 Ok(())
@@ -9477,6 +9626,7 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             |path, _| {
                 fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
             },
+            &mut || active_cleared.store(true, Ordering::SeqCst),
             &mut |_| {},
         )
         .unwrap_err();
@@ -9485,36 +9635,146 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
             !btrfs_called,
             "must not touch data_dir after legacy failure"
         );
+        assert!(
+            !active_cleared.load(Ordering::SeqCst),
+            "must not report active data cleared after legacy failure"
+        );
         assert!(data_dir.join("server/state.db").is_file());
         assert!(kubeconfig.is_file());
         assert!(k3s_cfg.is_file());
 
         // Replace with a normal legacy directory: legacy cleanup completes BEFORE
-        // `data_dir` deletion starts, then all paths are cleared.
+        // `data_dir` is detached to a sibling; if reclaiming the detached sibling
+        // times out, `data_dir` is ALREADY gone and `on_active_data_cleared` HAS
+        // fired, and `remove_dir` never touches live `data_dir`.
         fs::remove_file(&legacy_dir).unwrap();
         fs::create_dir_all(legacy_dir.join("pods")).unwrap();
         let mut saw_legacy_gone_before_data_delete = false;
-        remove_cluster_data_dirs(
-            &data_dir,
-            &legacy_dir,
-            &kubeconfig,
-            &k3s_cfg,
+        let mut saw_cleared_before_reclaim = false;
+        let mut detached_seen: Option<std::path::PathBuf> = None;
+        let err = remove_cluster_data_dirs(
+            &paths,
             |dir, _| {
                 assert_eq!(dir, data_dir.as_path());
                 saw_legacy_gone_before_data_delete = !legacy_dir.exists();
                 Ok(())
             },
             |path, _| {
+                if path == legacy_dir.as_path() {
+                    fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
+                } else {
+                    assert_ne!(
+                        path,
+                        data_dir.as_path(),
+                        "recursive removal must never walk the live data_dir path"
+                    );
+                    assert!(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with(DATA_DIR_STALE_PREFIX)),
+                        "expected detached sibling path, got {}",
+                        path.display()
+                    );
+                    saw_cleared_before_reclaim =
+                        active_cleared.load(Ordering::SeqCst) && !data_dir.exists();
+                    detached_seen = Some(path.to_path_buf());
+                    Err(format!("remove {}: timed out", path.display()))
+                }
+            },
+            &mut || active_cleared.store(true, Ordering::SeqCst),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(saw_legacy_gone_before_data_delete);
+        assert!(active_cleared.load(Ordering::SeqCst));
+        assert!(saw_cleared_before_reclaim);
+        assert!(!legacy_dir.exists());
+        assert!(
+            !data_dir.exists(),
+            "active data_dir must already be detached"
+        );
+        assert!(!kubeconfig.exists());
+        assert!(!k3s_cfg.exists());
+        let detached_path = detached_seen.expect("expected detached sibling");
+        assert!(
+            detached_path.join("server/state.db").is_file(),
+            "detached sibling should remain for retry reclamation"
+        );
+
+        // Retrying reset discovers and reclaims the leftover detached sibling cleanly.
+        let mut reclaimed_on_retry = Vec::new();
+        remove_cluster_data_dirs(
+            &paths,
+            |_, _| panic!("data_dir no longer exists"),
+            |path, _| {
+                reclaimed_on_retry.push(path.to_path_buf());
                 fs::remove_dir_all(path).map_err(|e| format!("remove {}: {e}", path.display()))
             },
+            &mut || {},
             &mut |_| {},
         )
         .unwrap();
-        assert!(saw_legacy_gone_before_data_delete);
-        assert!(!legacy_dir.exists());
-        assert!(!data_dir.exists());
-        assert!(!kubeconfig.exists());
-        assert!(!k3s_cfg.exists());
+        assert_eq!(reclaimed_on_retry, vec![detached_path.clone()]);
+        assert!(!detached_path.exists());
+    }
+
+    #[test]
+    fn image_reset_sync_lock_timeout_leaves_cluster_data_untouched() {
+        let sync_lock = Mutex::new(());
+        let _held = sync_lock.lock().unwrap();
+        let mut stop_called = false;
+        let mut wait_containerd_called = false;
+        let mut remove_data_called = false;
+        let mut clear_images_called = false;
+        let mut progress = Vec::new();
+
+        let err = execute_reset_sequence(
+            true,
+            &sync_lock,
+            Duration::from_millis(90),
+            Duration::from_millis(30),
+            || false,
+            &mut |m| progress.push(m.to_string()),
+            |_| {
+                stop_called = true;
+                Ok(())
+            },
+            |_| {
+                wait_containerd_called = true;
+                Ok(())
+            },
+            |_| {
+                remove_data_called = true;
+                Ok(())
+            },
+            |_, _| {
+                clear_images_called = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("timed out waiting for background image sync to stop"),
+            "{err}"
+        );
+        assert!(
+            stop_called,
+            "k3s must be stopped before waiting on sync lock"
+        );
+        assert!(!wait_containerd_called);
+        assert!(
+            !remove_data_called,
+            "sync-lock contention timeout must not delete cluster data"
+        );
+        assert!(!clear_images_called);
+        assert!(
+            progress
+                .iter()
+                .any(|m| m == "waiting for background image sync to stop"),
+            "expected sync-lock heartbeat, got: {progress:?}"
+        );
     }
 
     #[test]

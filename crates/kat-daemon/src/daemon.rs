@@ -1777,10 +1777,17 @@ impl Daemon {
 
         if let Err(reset_err) = reset_res {
             if guest_data_deleted {
-                let mut msg = format!(
-                    "Kubernetes cluster data was deleted, but removing cached k8s.io images failed: {}",
-                    reset_err.message
-                );
+                let mut msg = if remove_images {
+                    format!(
+                        "Kubernetes cluster data was deleted, but finishing image reset failed: {}",
+                        reset_err.message
+                    )
+                } else {
+                    format!(
+                        "Kubernetes cluster data was deleted, but reclaiming old cluster files failed: {}",
+                        reset_err.message
+                    )
+                };
                 if let Err(e) = persist_res {
                     msg.push_str(&format!(
                         " (also failed to disable Kubernetes auto-start: {e:#})"
@@ -3438,6 +3445,53 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn k8s_plain_reset_disables_autostart_when_deferred_reclamation_fails_after_detach() {
+        let root = temp("k8s-det");
+        let home = root.join("h");
+        let user_home = root.join("u");
+        fs::create_dir_all(&home).unwrap();
+        Config {
+            kubernetes: true,
+            ..Config::default()
+        }
+        .save(&home)
+        .unwrap();
+        let d = Daemon::new_for_test(home.clone(), user_home, "katamaran-test-det");
+        let sock = crate::k8s::socket_path(&home);
+        fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        {
+            let mut g = d.lock();
+            g.state = VmState::Running;
+            d.k8s.lock().unwrap().state = "running".into();
+        }
+        let guest = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = kat_proto::k8s::read(&mut conn).unwrap().unwrap();
+            assert_eq!(req, kat_proto::k8s::K8sMsg::Reset { images: false });
+            kat_proto::k8s::write(&mut conn, &kat_proto::k8s::K8sMsg::ResetDataCleared).unwrap();
+            kat_proto::k8s::write(
+                &mut conn,
+                &kat_proto::k8s::K8sMsg::Error("remove .data.removing-1: timed out".into()),
+            )
+            .unwrap();
+        });
+        let err = d.k8s_reset(false, &mut |_| {}).unwrap_err();
+        guest.join().unwrap();
+        assert!(
+            err.message.contains("cluster data was deleted")
+                && err.message.contains("reclaiming old cluster files failed"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            !Config::load(&home).unwrap().kubernetes,
+            "kubernetes auto-start must be disabled after detached datastore failure"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

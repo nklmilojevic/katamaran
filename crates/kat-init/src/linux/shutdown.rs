@@ -155,7 +155,7 @@ fn stop_containers(timeout: Duration) -> usize {
 }
 
 /// Connect to a Unix domain stream socket without blocking past `deadline`.
-fn connect_unix_until(path: &str, deadline: Instant) -> Option<UnixStream> {
+pub(super) fn connect_unix_until(path: &str, deadline: Instant) -> Option<UnixStream> {
     crate::unix_connect::connect_unix_until(Path::new(path), deadline).ok()
 }
 

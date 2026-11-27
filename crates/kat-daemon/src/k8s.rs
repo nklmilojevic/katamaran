@@ -259,8 +259,8 @@ pub fn read_reset_answer(
                 *accepted = true;
                 progress("starting Kubernetes cluster reset");
             }
-            Some(K8sMsg::ResetDataCleared) if remove_images => {
-                if !*accepted {
+            Some(K8sMsg::ResetDataCleared) => {
+                if remove_images && !*accepted {
                     bail!("unexpected ResetDataCleared before ResetAccepted");
                 }
                 *data_deleted = true;

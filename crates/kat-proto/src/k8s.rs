@@ -78,9 +78,11 @@ pub enum K8sMsg {
     /// so the host can distinguish an accepted reset from an older guest closing
     /// the connection after rejecting the flag byte.
     ResetAccepted,
-    /// Emitted by compatible guests after cluster data has been removed and before
-    /// image cleanup begins on `Reset { images: true }`, so the host can still
-    /// disable Kubernetes auto-start and report a partial outcome if image cleanup fails.
+    /// Emitted by compatible guests once active cluster data has been removed or
+    /// atomically detached, before deferred disk reclamation or image cleanup
+    /// completes (and on plain resets only if deferred reclamation fails after
+    /// detachment), so the host still disables Kubernetes auto-start and reports
+    /// a partial outcome.
     ResetDataCleared,
 }
 
