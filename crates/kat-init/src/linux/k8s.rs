@@ -20,7 +20,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -72,31 +72,38 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static FORWARDED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 static IMAGE_SYNC_LOCK: Mutex<()> = Mutex::new(());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-/// pid of a k3s that survived SIGKILL after its `Running` handle was dropped
-/// (0 = none). While it is alive, nothing may read or modify the datastore.
-static UNREAPED_K3S_PID: AtomicI32 = AtomicI32::new(0);
-
-fn note_unreaped_k3s(pid: i32) {
-    UNREAPED_K3S_PID.store(pid, Ordering::SeqCst);
+/// A k3s child that survived SIGKILL after its `Running` handle was dropped,
+/// tracked by its own exit notification (never by a reusable pid lookup).
+/// While it has not exited, nothing may read or modify the datastore.
+struct UnreapedK3s {
+    pid: i32,
+    has_exited: Box<dyn FnMut() -> bool + Send>,
 }
 
-/// Refuse datastore operations while an earlier k3s may still be writing to it.
+static UNREAPED_K3S: Mutex<Option<UnreapedK3s>> = Mutex::new(None);
+
+fn note_unreaped_k3s(pid: i32, has_exited: impl FnMut() -> bool + Send + 'static) {
+    *UNREAPED_K3S.lock().unwrap_or_else(|e| e.into_inner()) = Some(UnreapedK3s {
+        pid,
+        has_exited: Box::new(has_exited),
+    });
+}
+
+/// Refuse datastore operations while an earlier k3s child has not exited.
 fn ensure_no_unreaped_k3s() -> Result<(), String> {
-    let pid = UNREAPED_K3S_PID.load(Ordering::SeqCst);
-    if pid == 0 {
+    let mut slot = UNREAPED_K3S.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(unreaped) = slot.as_mut() else {
+        return Ok(());
+    };
+    if (unreaped.has_exited)() {
+        *slot = None;
         return Ok(());
     }
-    // kill(pid, 0) succeeds (or fails with EPERM) while the process exists.
-    let alive = unsafe { libc::kill(pid, 0) } == 0
-        || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    if alive {
-        return Err(format!(
-            "an earlier k3s (pid {pid}) did not exit and may still be using the cluster data; \
-             restart the VM (`kat restart`) before starting, installing, marking, or resetting Kubernetes"
-        ));
-    }
-    let _ = UNREAPED_K3S_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
-    Ok(())
+    Err(format!(
+        "an earlier k3s (pid {}) did not exit and may still be using the cluster data; \
+         restart the VM (`kat restart`) before starting, installing, marking, or resetting Kubernetes",
+        unreaped.pid
+    ))
 }
 
 struct ConnGuard(Arc<AtomicUsize>);
@@ -2338,10 +2345,18 @@ impl K8s {
                                 "k3s did not stop in time after k3s-watch spawn failure, killing it",
                             );
                             unsafe { libc::kill(pid, libc::SIGKILL) };
-                            rx.recv_timeout(Duration::from_secs(3)).is_ok()
+                            let done = rx.recv_timeout(Duration::from_secs(3)).is_ok();
+                            if !done {
+                                // Keep the reaper's own exit channel for this child.
+                                note_unreaped_k3s(pid, move || rx.try_recv().is_ok());
+                            }
+                            done
                         }
                     }
-                    None => false,
+                    None => {
+                        note_unreaped_k3s(pid, || false);
+                        false
+                    }
                 };
                 if reaped {
                     stop_k8s_workloads(&self.reaper);
@@ -2356,7 +2371,6 @@ impl K8s {
                     FORWARDED.lock().unwrap().clear();
                     restore_bridge_netfilter();
                 } else {
-                    note_unreaped_k3s(pid);
                     log(&format!(
                         "k3s pid {pid} did not exit after SIGKILL; skipping workload teardown"
                     ));
@@ -2608,6 +2622,9 @@ impl K8s {
         }
         ensure_no_unreaped_k3s()?;
         self.stop_locked(Some(&mut *conn))?;
+        // stop_locked reports success even if k3s survived SIGKILL; never delete
+        // the datastore underneath a live k3s.
+        ensure_no_unreaped_k3s()?;
         let _ = k8s::write(conn, &K8sMsg::Progress("removing cluster data".into()));
         unmount_paths_under(&[DATA_DIR, LEGACY_KUBELET_DIR])?;
         if Path::new(DATA_DIR).exists() {
@@ -2840,7 +2857,9 @@ fn terminate_running(mut r: Running) -> bool {
         }
     };
     if !reaped {
-        note_unreaped_k3s(r.pid);
+        // The k3s-watch thread records the reaper's exit status in `exited`.
+        let exited = Arc::clone(&r.exited);
+        note_unreaped_k3s(r.pid, move || exited.lock().unwrap().is_some());
     }
     if let Some(t) = r.proxy_thread.take() {
         let _ = t.join();
@@ -4985,14 +5004,17 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
 
     #[test]
     fn unreaped_k3s_blocks_datastore_operations_until_it_exits() {
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        note_unreaped_k3s(child.id() as i32);
+        // Tracked by the child's own exit signal, not a pid lookup that a reused
+        // pid could satisfy.
+        let (tx, rx) = mpsc::channel::<i32>();
+        note_unreaped_k3s(4242, move || rx.try_recv().is_ok());
         let err = ensure_no_unreaped_k3s().unwrap_err();
-        assert!(err.contains("did not exit"), "{err}");
-        child.kill().unwrap();
-        child.wait().unwrap();
+        assert!(err.contains("pid 4242"), "{err}");
+        assert!(ensure_no_unreaped_k3s().is_err());
+        tx.send(0).unwrap();
         ensure_no_unreaped_k3s().unwrap();
-        assert_eq!(UNREAPED_K3S_PID.load(Ordering::SeqCst), 0);
+        assert!(UNREAPED_K3S.lock().unwrap().is_none());
+        ensure_no_unreaped_k3s().unwrap();
     }
 
     #[test]

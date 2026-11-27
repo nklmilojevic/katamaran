@@ -21,10 +21,18 @@ image=$(sed -n 's/^ALPINE_IMAGE=alpine:\${ALPINE_VERSION}@//p' "$here/../guest/r
 version=$(sed -n 's/^ALPINE_VERSION=//p' "$here/../guest/rootfs/build.sh")
 image="alpine:${version}@${image}"
 work=$(mktemp -d)
-name="kat-k3s-nft-check-$$"
+# Random suffix so the name cannot collide with an existing container or volume;
+# cleanup only removes resources this run actually created.
+name="kat-k3s-nft-check-$$-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+created_volume=
+created_container=
 cleanup() {
-    docker "$@" rm -f "$name" >/dev/null 2>&1 || true
-    docker "$@" volume rm "$name" >/dev/null 2>&1 || true
+    if [ -n "$created_container" ]; then
+        docker "$@" rm -f "$name" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$created_volume" ]; then
+        docker "$@" volume rm "$name" >/dev/null 2>&1 || true
+    fi
     rm -rf "$work"
 }
 trap 'cleanup "$@"' EXIT
@@ -35,7 +43,13 @@ curl -fsSL "https://github.com/k3s-io/k3s/releases/download/$url_tag/sha256sum-a
     grep ' k3s-arm64$' | (cd "$work" && shasum -a 256 -c -)
 chmod +x "$work/k3s-arm64"
 
+if docker "$@" volume inspect "$name" >/dev/null 2>&1 ||
+    docker "$@" container inspect "$name" >/dev/null 2>&1; then
+    echo "refusing to reuse existing docker resource $name" >&2
+    exit 1
+fi
 docker "$@" volume create "$name" >/dev/null
+created_volume=1
 # Keep the server flags in sync with `K8s::start_inner` in crates/kat-init/src/linux/k8s.rs.
 # The binary is copied in rather than bind-mounted so this works with engines that
 # cannot share the host's temp directory.
@@ -47,6 +61,7 @@ docker "$@" create --name "$name" --privileged --cgroupns=host \
         --cluster-cidr=10.42.0.0/16 --service-cidr=10.43.0.0/16 --cluster-dns=10.43.0.10 \
         --https-listen-port=6443 --kubelet-arg=fail-swap-on=false \
         --kube-proxy-arg=proxy-mode=nftables' >/dev/null
+created_container=1
 docker "$@" cp "$work/k3s-arm64" "$name":/opt/k3s
 docker "$@" start "$name" >/dev/null
 
