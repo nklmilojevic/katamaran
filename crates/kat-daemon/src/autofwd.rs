@@ -321,35 +321,74 @@ pub fn auto_listener_fd_limit_for_budget(
     uses_published_relays.then(|| budget.max_listener_fds() / 2)
 }
 
-fn target_nofile_for_limits(cur: libc::rlim_t, max: libc::rlim_t) -> Option<libc::rlim_t> {
+#[cfg(target_os = "macos")]
+fn kernel_maxfiles_per_proc() -> Option<u64> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut val as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of::<libc::c_int>() && val > 0 {
+        Some(val as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_maxfiles_per_proc() -> Option<u64> {
+    None
+}
+
+fn effective_nofile_limit(soft: Option<u64>, kernel_max: Option<u64>) -> Option<u64> {
+    match (soft, kernel_max) {
+        (Some(s), Some(k)) => Some(s.min(k)),
+        (Some(s), None) => Some(s),
+        (None, Some(k)) => Some(k),
+        (None, None) => None,
+    }
+}
+
+fn target_nofile_for_limits(
+    cur: libc::rlim_t,
+    max: libc::rlim_t,
+    kernel_max: Option<u64>,
+) -> Option<libc::rlim_t> {
     if cur == libc::RLIM_INFINITY {
         return None;
     }
-    let cap = if max == libc::RLIM_INFINITY {
+    let mut cap = if max == libc::RLIM_INFINITY {
         TARGET_PROCESS_NOFILE
     } else {
         TARGET_PROCESS_NOFILE.min(max)
     };
+    if let Some(k) = kernel_max {
+        cap = cap.min(k as libc::rlim_t);
+    }
     (cur < cap).then_some(cap)
 }
 
 /// Raise this process's soft `RLIMIT_NOFILE` up to [`TARGET_PROCESS_NOFILE`]
-/// (bounded by `rlim_max` and any lower kernel per-process cap) and return the
-/// resulting soft limit (`None` if unlimited or unavailable).
+/// (bounded by `rlim_max` and macOS's `kern.maxfilesperproc`) and return the
+/// effective enforced per-process descriptor ceiling (`None` if unlimited and
+/// no kernel cap is known).
 pub fn raise_nofile_limit() -> Option<u64> {
+    let kernel_max = kernel_maxfiles_per_proc();
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return None;
+        return kernel_max;
     }
-    if lim.rlim_cur == libc::RLIM_INFINITY {
-        return None;
-    }
-    if let Some(cap) = target_nofile_for_limits(lim.rlim_cur, lim.rlim_max) {
-        // Try the target first, then step down if the kernel's per-process
-        // file ceiling (`kern.maxfilesperproc`) is lower.
+    if let Some(cap) = target_nofile_for_limits(lim.rlim_cur, lim.rlim_max, kernel_max) {
+        // Try the target first, then step down if a lower ceiling applies.
         let mut want = cap;
         while want > lim.rlim_cur {
             let next = libc::rlimit {
@@ -357,13 +396,19 @@ pub fn raise_nofile_limit() -> Option<u64> {
                 rlim_max: lim.rlim_max,
             };
             if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
-                lim.rlim_cur = want;
+                let mut updated = lim;
+                if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut updated) } == 0 {
+                    lim = updated;
+                } else {
+                    lim.rlim_cur = want;
+                }
                 break;
             }
             want /= 2;
         }
     }
-    Some(lim.rlim_cur)
+    let soft = (lim.rlim_cur != libc::RLIM_INFINITY).then_some(lim.rlim_cur);
+    effective_nofile_limit(soft, kernel_max)
 }
 
 #[cfg(test)]
@@ -1395,25 +1440,53 @@ mod tests {
         );
 
         // Soft-limit raise calculation: lifts launchd's 256 soft limit to
-        // TARGET_PROCESS_NOFILE, respects lower hard caps, and never lowers.
+        // TARGET_PROCESS_NOFILE, respects lower hard/kernel caps, never lowers.
         assert_eq!(
-            target_nofile_for_limits(256, libc::RLIM_INFINITY),
+            target_nofile_for_limits(256, libc::RLIM_INFINITY, None),
             Some(TARGET_PROCESS_NOFILE)
         );
-        assert_eq!(target_nofile_for_limits(256, 2048), Some(2048));
-        assert_eq!(target_nofile_for_limits(256, 256), None);
         assert_eq!(
-            target_nofile_for_limits(TARGET_PROCESS_NOFILE, libc::RLIM_INFINITY),
+            target_nofile_for_limits(256, libc::RLIM_INFINITY, Some(1024)),
+            Some(1024)
+        );
+        assert_eq!(
+            target_nofile_for_limits(256, 2048, Some(138_240)),
+            Some(2048)
+        );
+        assert_eq!(target_nofile_for_limits(256, 256, Some(138_240)), None);
+        assert_eq!(
+            target_nofile_for_limits(TARGET_PROCESS_NOFILE, libc::RLIM_INFINITY, Some(138_240)),
             None
         );
         assert_eq!(
-            target_nofile_for_limits(TARGET_PROCESS_NOFILE * 4, libc::RLIM_INFINITY),
+            target_nofile_for_limits(TARGET_PROCESS_NOFILE * 4, libc::RLIM_INFINITY, None),
             None
         );
         assert_eq!(
-            target_nofile_for_limits(libc::RLIM_INFINITY, libc::RLIM_INFINITY),
+            target_nofile_for_limits(libc::RLIM_INFINITY, libc::RLIM_INFINITY, Some(1024)),
             None
         );
+
+        // macOS enforces min(RLIMIT_NOFILE, kern.maxfilesperproc), including
+        // when RLIMIT_NOFILE is RLIM_INFINITY.
+        assert_eq!(
+            process_fd_budget(effective_nofile_limit(Some(10_240), Some(1024))),
+            (170, 85)
+        );
+        assert_eq!(
+            process_fd_budget(effective_nofile_limit(None, Some(1024))),
+            (170, 85)
+        );
+        assert_eq!(
+            process_fd_budget(effective_nofile_limit(Some(256), Some(1024))),
+            (42, 21)
+        );
+        assert_eq!(
+            process_fd_budget(effective_nofile_limit(Some(10_240), Some(138_240))),
+            (PROCESS_MAX_LISTENER_FDS, PROCESS_MAX_RELAY_CONNS)
+        );
+        #[cfg(target_os = "macos")]
+        assert!(kernel_maxfiles_per_proc().is_some_and(|n| n > 0));
     }
 
     #[test]
@@ -1422,7 +1495,8 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_some() {
             // Isolated single-test child process: simulate macOS launchd's
             // 256 soft limit and verify `RelayBudget::from_process_limits()`
-            // raises it to the full default forwarding budget.
+            // raises it to the full default forwarding budget (clamped by
+            // `kern.maxfilesperproc` when lower).
             let mut lim = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -1430,7 +1504,9 @@ mod tests {
             assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
             let hard_allows_target =
                 lim.rlim_max == libc::RLIM_INFINITY || lim.rlim_max >= TARGET_PROCESS_NOFILE;
-            if !hard_allows_target {
+            let kernel_allows_target =
+                kernel_maxfiles_per_proc().is_none_or(|k| k >= TARGET_PROCESS_NOFILE);
+            if !hard_allows_target || !kernel_allows_target {
                 return;
             }
             let low = libc::rlimit {
