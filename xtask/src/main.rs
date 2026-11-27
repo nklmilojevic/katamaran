@@ -358,7 +358,11 @@ mod tests {
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         let allowed = require_tool_in("kat-fake-tool", "testing", dir.as_os_str());
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(denied.is_err());
+        // Root on Linux (CAP_DAC_OVERRIDE) can bypass non-executable modes
+        // depending on kernel/filesystem checks, so only assert denial as non-root.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(denied.is_err());
+        }
         allowed.unwrap();
     }
 

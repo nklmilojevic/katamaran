@@ -120,10 +120,13 @@ SIOCOUTQNSD = 0x894B
 
 def wait_outq_empty(conn, req, what):
     deadline = time.monotonic() + 2.0
-    while struct.unpack("i", fcntl.ioctl(conn.fileno(), req, b"\0\0\0\0"))[0] > 0:
-        if time.monotonic() > deadline:
+    while True:
+        if struct.unpack("i", fcntl.ioctl(conn.fileno(), req, b"\0\0\0\0"))[0] <= 0:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise RuntimeError("timed out waiting for " + what)
-        time.sleep(0.0002)
+        time.sleep(min(0.0002, remaining))
 
 def handle(conn):
     try:
@@ -1077,11 +1080,19 @@ fn seed_k3s_cache(home: &Path) {
     };
     let dst_root = home.join("cache/k3s");
     for entry in entries.flatten() {
-        let src_bin = entry.path().join("k3s-arm64");
-        if src_bin.is_file() {
-            let dst_dir = dst_root.join(entry.file_name());
-            if std::fs::create_dir_all(&dst_dir).is_ok() {
-                let _ = std::fs::copy(&src_bin, dst_dir.join("k3s-arm64"));
+        let Ok(files) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if name_str.starts_with("k3s-") && file.path().is_file() {
+                let dst_dir = dst_root.join(entry.file_name());
+                if std::fs::create_dir_all(&dst_dir).is_ok() {
+                    let _ = std::fs::copy(file.path(), dst_dir.join(&name));
+                }
             }
         }
     }
