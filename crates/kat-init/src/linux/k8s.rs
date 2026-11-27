@@ -74,6 +74,9 @@ const OP_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(210);
 /// release `op_lock` before stopping k3s without it (the host allows ~45 s for
 /// the whole shutdown sequence).
 const SHUTDOWN_OP_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Total time VM shutdown spends on k3s (lock wait plus waiting for an
+/// in-flight stop) before leaving the rest to the shutdown process sweep.
+const SHUTDOWN_K8S_BUDGET: Duration = Duration::from_secs(25);
 const RESET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_REMOVE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -299,10 +302,51 @@ pub fn start_service(
 }
 
 /// Stop k3s cleanly during VM shutdown.
+/// Shutdown fallback when `op_lock` could not be acquired in time.
+///
+/// Never runs Kubernetes workload teardown (the lock holder may still be using
+/// it, and the shutdown sweep stops containerd and every remaining process
+/// afterwards). If k3s is still owned by `state.running`, this caller takes
+/// sole ownership and terminates it; if another caller already took it (phase
+/// `stopping`), waits until that stop finishes or `deadline` passes instead of
+/// racing it. Returns a description for the shutdown log.
+fn stop_k3s_without_op_lock(
+    state: &Mutex<State>,
+    deadline: Instant,
+    terminate: impl FnOnce(Running),
+) -> &'static str {
+    let running = {
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        let r = st.running.take();
+        if r.is_some() {
+            st.phase = "stopping".into();
+            st.api_ready = false;
+        }
+        r
+    };
+    if let Some(r) = running {
+        terminate(r);
+        ACTIVE.store(false, Ordering::SeqCst);
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.phase = "stopped".into();
+        return "terminated k3s without the operation lock; workload cleanup left to shutdown";
+    }
+    loop {
+        if state.lock().unwrap_or_else(|e| e.into_inner()).phase != "stopping" {
+            return "in-flight k3s stop finished";
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return "in-flight k3s stop still running; leaving it to the shutdown sweep";
+        }
+        thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
 pub fn stop_for_shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     if let Some(svc) = SERVICE.get() {
-        svc.stop_for_shutdown_bounded(SHUTDOWN_OP_LOCK_WAIT);
+        svc.stop_for_shutdown_bounded(SHUTDOWN_OP_LOCK_WAIT, SHUTDOWN_K8S_BUDGET);
     }
 }
 
@@ -2683,15 +2727,14 @@ impl K8s {
     /// Every guest Kubernetes operation (including reset) checks
     /// `SHUTTING_DOWN` between steps and runs its long work in killable
     /// helpers that abort on shutdown, so the lock is normally released within
-    /// moments. If a holder is still stuck (for example in an uninterruptible
-    /// filesystem call) after `wait`, stop k3s best-effort without the lock so
-    /// shutdown can still reach containerd teardown and the data-disk sync
-    /// instead of the host force-killing the VM.
-    fn stop_for_shutdown_bounded(&self, wait: Duration) {
+    /// moments and the usual locked stop runs. If a holder is still stuck after
+    /// `lock_wait`, see [`stop_k3s_without_op_lock`].
+    fn stop_for_shutdown_bounded(&self, lock_wait: Duration, budget: Duration) {
+        let deadline = Instant::now() + budget;
         match try_lock_with_deadline(
             &self.op_lock,
-            wait,
-            wait,
+            lock_wait,
+            lock_wait,
             "waiting for active guest Kubernetes operation",
             || false,
             &mut |_| {},
@@ -2700,10 +2743,8 @@ impl K8s {
                 let _ = self.stop_locked(None);
             }
             Err(e) => {
-                log(&format!(
-                    "shutdown: {e}; stopping k3s without the operation lock"
-                ));
-                let _ = self.stop_locked(None);
+                let outcome = stop_k3s_without_op_lock(&self.state, deadline, terminate_running);
+                log(&format!("shutdown: {e}; {outcome}"));
             }
         }
     }
@@ -3835,6 +3876,13 @@ pub fn rmtree_main() -> ! {
     let res = match args.as_slice() {
         [flag, parent] if flag == RMTREE_STALE_FLAG => {
             reclaim_stale_dirs(Path::new(parent), &mut |p| {
+                // Detach anything still mounted under a stale datastore (for
+                // example left by an earlier interrupted reset); the walk
+                // itself also refuses to cross mount points.
+                let prefix = p
+                    .to_str()
+                    .ok_or_else(|| format!("non-UTF-8 path {}", p.display()))?;
+                unmount_paths_under(&[prefix])?;
                 remove_tree_nofollow(p, no_check)
             })
         }
@@ -3903,6 +3951,34 @@ fn dir_identity(dir: std::ptr::NonNull<libc::DIR>) -> io::Result<(u64, u64)> {
             return Err(io::Error::last_os_error());
         }
         Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+}
+
+/// Which mount `fd` lives on: the kernel mount ID from
+/// `statx(STATX_MNT_ID)` (btrfs subvolumes share their mount's ID), falling
+/// back to `st_dev` on kernels without it (conservatively treating every
+/// device change as a mount boundary).
+fn mount_key(fd: std::os::fd::RawFd) -> io::Result<(bool, u64)> {
+    // SAFETY: the empty path with AT_EMPTY_PATH stats `fd` itself; `stx` is
+    // plain data fully initialized by zeroing and written by statx.
+    unsafe {
+        let mut stx: libc::statx = std::mem::zeroed();
+        if libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stx,
+        ) == 0
+            && stx.stx_mask & libc::STATX_MNT_ID != 0
+        {
+            return Ok((true, stx.stx_mnt_id));
+        }
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((false, st.st_dev as u64))
     }
 }
 
@@ -4048,6 +4124,10 @@ fn remove_tree_nofollow_with(
         CString::new(name.as_bytes()).map_err(|_| format!("invalid path {}", root.display()))?;
     let err_at = |path: &Path, e: io::Error| format!("remove {}: {e}", path.display());
     let not_a_dir = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP));
+    // Every directory removed must be on the same mount as the parent of
+    // `root`: a mount point inside the tree (or `root` itself being one) is
+    // refused instead of descending into a filesystem outside the cluster.
+    let mount = mount_key(parent_fd).map_err(|e| format!("stat {}: {e}", parent.display()))?;
     let new_frame = |dir, name, path: std::path::PathBuf| -> Result<DirFrame, String> {
         let mut frame = DirFrame {
             dir: Some(dir),
@@ -4056,6 +4136,13 @@ fn remove_tree_nofollow_with(
             id: (0, 0),
             saw_entry: false,
         };
+        let m = mount_key(frame.fd()).map_err(|e| format!("stat {}: {e}", frame.path.display()))?;
+        if m != mount {
+            return Err(format!(
+                "remove {}: refusing to cross a mount point",
+                frame.path.display()
+            ));
+        }
         frame.id = dir_identity(dir).map_err(|e| format!("stat {}: {e}", frame.path.display()))?;
         Ok(frame)
     };
@@ -10670,6 +10757,127 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
                 "moved ancestor must be left in place"
             );
         }
+    }
+
+    fn test_state(phase: &str, running: Option<Running>) -> Mutex<State> {
+        Mutex::new(State {
+            generation: 0,
+            phase: phase.into(),
+            api_ready: true,
+            error: String::new(),
+            running,
+        })
+    }
+
+    #[test]
+    fn shutdown_fallback_waits_for_in_flight_stop_without_tearing_down() {
+        // Another caller already owns termination (phase "stopping", running
+        // taken): the fallback must not terminate anything itself and must
+        // return only once that stop finishes.
+        let state = Arc::new(test_state("stopping", None));
+        let s2 = state.clone();
+        let finisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            s2.lock().unwrap().phase = "stopped".into();
+        });
+        let started = Instant::now();
+        let outcome =
+            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(10), |_| {
+                panic!("must not terminate k3s owned by another stop")
+            });
+        finisher.join().unwrap();
+        assert_eq!(outcome, "in-flight k3s stop finished");
+        assert!(started.elapsed() >= Duration::from_millis(200));
+
+        // Termination still in progress past the budget: give up within the
+        // deadline, still without starting any teardown.
+        let state = test_state("stopping", None);
+        let started = Instant::now();
+        let outcome =
+            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_millis(100), |_| {
+                panic!("must not terminate k3s owned by another stop")
+            });
+        assert!(
+            outcome.contains("leaving it to the shutdown sweep"),
+            "{outcome}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(state.lock().unwrap().phase, "stopping");
+
+        // Nobody owns k3s yet: the fallback takes sole ownership and terminates it.
+        let (_tx, exit_rx) = mpsc::channel();
+        let running = Running {
+            pid: -1,
+            exit_rx,
+            exited: Arc::new(Mutex::new(Some(0))),
+            sync_stop: Arc::new(AtomicBool::new(false)),
+            proxy_thread: None,
+        };
+        let state = test_state("running", Some(running));
+        let mut terminated = false;
+        let outcome =
+            stop_k3s_without_op_lock(&state, Instant::now() + Duration::from_secs(1), |_| {
+                terminated = true
+            });
+        assert!(terminated);
+        assert!(outcome.starts_with("terminated k3s"), "{outcome}");
+        let st = state.lock().unwrap();
+        assert!(st.running.is_none());
+        assert_eq!(st.phase, "stopped");
+    }
+
+    #[test]
+    fn remove_tree_nofollow_refuses_to_cross_mount_points() {
+        // Needs root to mount a tmpfs; skip quietly otherwise.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let guard = TempDirGuard::create("kat-rmt-mnt");
+        let base = &guard.0;
+        let tree = base.join("tree");
+        let mnt = tree.join("sub/mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let c_mnt = CString::new(mnt.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated strings; mounting a private tmpfs.
+        let rc = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                c_mnt.as_ptr(),
+                c"tmpfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            // No CAP_SYS_ADMIN (e.g. unprivileged container): nothing to test.
+            return;
+        }
+        fs::write(mnt.join("outside-data"), b"keep").unwrap();
+        let err = remove_tree_nofollow(&tree, &mut |_| Ok(())).unwrap_err();
+        let still_there = mnt.join("outside-data").exists();
+        // SAFETY: unmount the tmpfs mounted above.
+        unsafe { libc::umount2(c_mnt.as_ptr(), libc::MNT_DETACH) };
+        assert!(err.contains("refusing to cross a mount point"), "{err}");
+        assert!(still_there, "files on another mount must never be removed");
+
+        // A root that is itself a mount point is refused too.
+        fs::create_dir_all(&mnt).unwrap();
+        let rc = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                c_mnt.as_ptr(),
+                c"tmpfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0);
+        fs::write(mnt.join("f"), b"keep").unwrap();
+        let err = remove_tree_nofollow(&mnt, &mut |_| Ok(())).unwrap_err();
+        let kept = mnt.join("f").exists();
+        unsafe { libc::umount2(c_mnt.as_ptr(), libc::MNT_DETACH) };
+        assert!(err.contains("refusing to cross a mount point"), "{err}");
+        assert!(kept);
     }
 
     #[test]
