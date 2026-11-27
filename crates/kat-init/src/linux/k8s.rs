@@ -415,9 +415,13 @@ fn state_db_probe() -> StateDbProbe<'static> {
 /// Strictly parse a k3s release tag (`v<major>.<minor>.<patch>[-<pre>]+k3s<n>`)
 /// with no surrounding whitespace, returning `(major, minor)`.
 fn parse_strict_k3s_tag(v: &str) -> Option<(u32, u32)> {
+    // Digits only, without leading zeros: release tags never pad numbers.
+    let canonical_number = |n: &str| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && (n == "0" || !n.starts_with('0'))
+    };
     let rest = v.strip_prefix('v')?;
     let (kube, build) = rest.split_once("+k3s")?;
-    if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+    if !canonical_number(build) {
         return None;
     }
     let (core, pre) = match kube.split_once('-') {
@@ -432,7 +436,7 @@ fn parse_strict_k3s_tag(v: &str) -> Option<(u32, u32)> {
     let parts: Vec<u32> = core
         .split('.')
         .map(|n| {
-            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            if !canonical_number(n) {
                 return None;
             }
             n.parse().ok()
@@ -1131,7 +1135,7 @@ fn effective_datastore_version_with(
         return Ok(None);
     }
     let recorded = match read_marker_file(data_version_file)? {
-        MarkerFile::Present(v) => Some(newer_of_marker_and_stamp(data_dir, v)?),
+        MarkerFile::Present(v) => Some(newer_of_marker_and_stamp(data_dir, data_version_file, v)?),
         MarkerFile::Missing => {
             let stamp = server_version_stamp(data_dir);
             match read_marker_file(&stamp)? {
@@ -1207,8 +1211,16 @@ fn newer_minor(recorded: String, detected: Option<String>) -> String {
 /// Stamp a datastore that k3s created during this start once its `server/db/`
 /// exists, clearing `*pending` on success (failures are logged and retried).
 fn stamp_new_datastore(data_dir: &Path, version: &str, pending: &mut bool) {
-    if !*pending || !server_db_dir_exists(data_dir).unwrap_or(false) {
+    if !*pending {
         return;
+    }
+    match server_db_dir_exists(data_dir) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            log(&format!("record version stamp for new datastore: {e}"));
+            return;
+        }
     }
     match write_server_version_stamp(data_dir, version) {
         Ok(()) => *pending = false,
@@ -1220,7 +1232,11 @@ fn stamp_new_datastore(data_dir: &Path, version: &str, pending: &mut bool) {
 /// together, so they only disagree when one was restored without the other
 /// (for example `server/db/` from a newer backup beside a stale outer marker).
 /// Use whichever records the newer minor so the downgrade guard still holds.
-fn newer_of_marker_and_stamp(data_dir: &Path, marker: String) -> Result<String, String> {
+fn newer_of_marker_and_stamp(
+    data_dir: &Path,
+    data_version_file: &Path,
+    marker: String,
+) -> Result<String, String> {
     let stamp_path = server_version_stamp(data_dir);
     match read_marker_file(&stamp_path)? {
         MarkerFile::Missing => Ok(marker),
@@ -1233,7 +1249,7 @@ fn newer_of_marker_and_stamp(data_dir: &Path, marker: String) -> Result<String, 
             };
             let Some(marker_mm) = parse_k3s_minor(&marker) else {
                 return Err(corrupt_datastore_version_error(
-                    &data_dir.join(".katamaran-version"),
+                    data_version_file,
                     &format!("records an invalid k3s version {marker:?}"),
                 ));
             };
@@ -4797,6 +4813,8 @@ LoadBalancer TCP:8080:31080 TCP:6443:31443
         }
         assert_eq!(validate_k3s_release_tag("v1.31.0+k3s1"), Ok(()));
         assert!(validate_k3s_release_tag("v1.30.9+k3s1").is_err());
+        assert!(validate_k3s_release_tag("v1.037.2+k3s1").is_err());
+        assert!(validate_k3s_release_tag("v1.37.0+k3s1").is_ok());
     }
 
     #[test]

@@ -280,13 +280,22 @@ const MIN_K8S_MINOR: u32 = 31;
 pub(crate) fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
     let bad = || {
         anyhow::anyhow!(
-            "k8s_version {v:?} is not a k3s release tag such as {}",
-            crate::k8s::K3S_VERSION
+            "k8s_version {v:?} is not a k3s release tag such as {}{}",
+            crate::k8s::K3S_VERSION,
+            if v.starts_with('v') {
+                ""
+            } else {
+                " (config.toml needs the leading `v`)"
+            }
         )
+    };
+    // Digits only, without leading zeros: release tags never pad numbers.
+    let canonical_number = |n: &str| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && (n == "0" || !n.starts_with('0'))
     };
     let rest = v.strip_prefix('v').ok_or_else(bad)?;
     let (kube, build) = rest.split_once("+k3s").ok_or_else(bad)?;
-    if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+    if !canonical_number(build) {
         return Err(bad());
     }
     let (core, pre) = match kube.split_once('-') {
@@ -301,7 +310,7 @@ pub(crate) fn validate_k8s_version(v: &str) -> anyhow::Result<()> {
     let parts: Vec<u32> = core
         .split('.')
         .map(|n| {
-            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            if !canonical_number(n) {
                 return Err(bad());
             }
             n.parse().map_err(|_| bad())
@@ -591,11 +600,20 @@ mod tests {
             "v1.32.5/../+k3s1",
             "v2.0.0+k3s1",
             "v1.30.9+k3s1",
+            "v1.037.2+k3s1",
+            "v1.37.02+k3s1",
+            "v1.37.2+k3s01",
         ] {
             assert!(cfg.set("k8s_version", v, &HOST).is_err(), "{v}");
         }
         assert_eq!(cfg, Config::default());
         assert!(Config::parse("k8s_version = \"v1.28.0+k3s1\"\n").is_err());
+        let err = Config::parse("k8s_version = \"1.32.5+k3s1\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("needs the leading `v`"),
+            "{err:#}"
+        );
+        assert!(cfg.set("k8s_version", "v1.37.0+k3s1", &HOST).is_ok());
     }
 
     #[test]
