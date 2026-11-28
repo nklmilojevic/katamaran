@@ -2589,15 +2589,48 @@ mod tests {
         assert_eq!(cpu_percent(&b, &a), 0.0);
     }
 
+    fn thread_cpu_ns() -> u64 {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(
+            rc,
+            0,
+            "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed: {}",
+            io::Error::last_os_error()
+        );
+        u64::try_from(ts.tv_sec)
+            .unwrap()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::try_from(ts.tv_nsec).unwrap())
+    }
+
     #[test]
     fn reads_own_usage() {
         let (cpu, footprint) = proc_usage(std::process::id()).unwrap();
         assert!(footprint > 0);
-        let spin = Instant::now();
-        while spin.elapsed() < Duration::from_millis(30) {}
+        // Spin until this thread actually accumulates 30 ms of CPU time rather
+        // than wall-clock time so scheduler/VM preemption on CI cannot leave
+        // the process below the threshold.
+        let start_thread = thread_cpu_ns();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while thread_cpu_ns().saturating_sub(start_thread) < 30_000_000 && Instant::now() < deadline
+        {
+            for i in 0..10_000u64 {
+                std::hint::black_box(i);
+            }
+        }
+        let spun_ns = thread_cpu_ns().saturating_sub(start_thread);
+        assert!(
+            spun_ns >= 30_000_000,
+            "timed out waiting for thread CPU time ({spun_ns} ns)"
+        );
         let (cpu2, _) = proc_usage(std::process::id()).unwrap();
-        // ns, not Mach ticks: 30 ms of spinning is at least ~20 ms.
-        assert!(cpu2 - cpu >= 20_000_000, "{} ns", cpu2 - cpu);
+        // ns, not Mach ticks: 30 ms of thread CPU work is at least ~20 ms.
+        let delta = cpu2.saturating_sub(cpu);
+        assert!(
+            delta >= 20_000_000,
+            "{delta} ns (cpu={cpu}, cpu2={cpu2}, thread_spun={spun_ns} ns)"
+        );
         assert!(proc_usage(u32::MAX >> 1).is_none());
     }
 
