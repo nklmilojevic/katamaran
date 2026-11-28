@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.11.1 - 2026-11-28
+
+This release fixes pause and resume of the VM. The `pause_on_sleep` option now works as expected.
+
+### Fixes
+
+- Fix pause and resume of the VM. Before, the VM ignored the pause and resume signals, so `pause_on_sleep` did nothing and the VM kept running during sleep.
+
 ## v0.11.0 - 2026-11-27
 
 This release lets you choose the k3s version, run amd64 images in pods, open a shell in the VM, and grow the data disk. It also fixes file limits and slow container traffic.
